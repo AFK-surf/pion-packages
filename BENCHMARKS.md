@@ -39,12 +39,19 @@
 | `markdown` | CommonMark 0.31.2 `spec.txt` × 12 → HTML | 2,460,323 B | 36.899 ms | 16.917 ms (`rust_pulldown_cmark`) | 0.46x | 32.11 MiB | 13.06 MiB | `110321ab…6da64d4` |
 | `markdown` | Mixed GFM corpus → HTML | 2,503,227 B | 51.712 ms | 22.699 ms (`rust_pulldown_cmark`) | 0.44x | 55.31 MiB | 25.81 MiB | `eb0ade91…af7eba3` |
 | `texmath` | 500 formulas × 20 → MathML | 10,000 ops | 101.844 ms | 227.652 ms (`node-katex`) | **2.24x** | 3.27 MiB | 68.84 MiB | `7c3c8390…db2e9fa` |
-| `mermaid` | 稳态：Parse + canonical JSON（`--iters 50`） | 1,120,750 B × 50 | 45.997 ms | 13,376.880 ms (`node-mermaid`) | **290.82x** | 2.72 MiB | 252.36 MiB | `2f819d7bc0dd394d…` |
-| `mermaid` | 稳态：Layered graph layout（`--iters 20`） | 442,380 B × 20 | 27.840 ms | 8,041.165 ms (`node-dagre`) | **288.84x** | 2.88 MiB | 318.91 MiB | `477f544c81534122…` |
-| `mermaid` | 冷启动：Parse + canonical JSON（`--iters 1`） | 1,120,750 B | 8.518 ms | 381.285 ms (`node-mermaid`) | **44.76x** | 2.64 MiB | 108.47 MiB | `12ff4e02e48548c4…` |
-| `mermaid` | 冷启动：Layered graph layout（`--iters 1`） | 442,380 B | 9.809 ms | 572.356 ms (`node-dagre`) | **58.35x** | 2.88 MiB | 234.11 MiB | `a61c633038f51153…` |
+| `mermaid` | 稳态：Parse + canonical JSON（`--iters 50`） | 22,415 B × 50 (1.12 MB) | 45.997 ms | 13,376.880 ms (`node-mermaid`) | **290.82x** | 2.72 MiB | 252.36 MiB | `2f819d7bc0dd394d…` |
+| `mermaid` | 稳态：Layered graph layout（`--iters 20`） | 22,119 B × 20 (442 KB) | 27.840 ms | 8,041.165 ms (`node-dagre`) | **288.84x** | 2.88 MiB | 318.91 MiB | `477f544c81534122…` |
+| `mermaid` | 冷启动：Parse + canonical JSON（`--iters 1`） | 22,415 B | 8.518 ms | 381.285 ms (`node-mermaid`) | **44.76x** | 2.64 MiB | 108.47 MiB | `12ff4e02e48548c4…` |
+| `mermaid` | 冷启动：Layered graph layout（`--iters 1`） | 22,119 B | 9.809 ms | 572.356 ms (`node-dagre`) | **58.35x** | 2.88 MiB | 234.11 MiB | `a61c633038f51153…` |
 | `time` | RFC 3339 parse + offset shift + format | 200,000 timestamps | 70.775 ms | 45.161 ms (`rust_jiff`) | 0.64x | 22.81 MiB | 7.83 MiB | `1172c154…0585685f` |
 | `time` | Civil calendar & epoch computation | 2,000,000 ops | 114.697 ms | 45.971 ms (`rust_jiff`) | 0.40x | 1.69 MiB | 1.73 MiB | `65a54274…72fc5024` |
+| `toml` | TOML v1.0.0 workspace/service config parse（`× 50`） | 150.5 KB × 50 (7,526,500 B) | 119.644 ms | 178.392 ms (`rust_toml`) | **1.49x** | 4.56 MiB | 7.45 MiB | `96cf0bf395d107be…` |
+| `yaml` | K8s / GitHub Actions / OpenAPI 多文档 parse + canonical JSON | 3,002,682 B (2,037 docs) | 133.488 ms | 119.183 ms (`rust_yaml_rust2`) | 0.89x | 33.95 MiB | 39.34 MiB | `d57e15ae…f449b633` |
+| `diff` | Histogram + indent slider + unified diff（10,029 行 × 50） | 32.4 MB | 115.493 ms | 30.316 ms (`rust-imara-diff`) | 0.26x | 4.44 MiB | 3.39 MiB | `fe0936ea…45a7b906` |
+| `diff` | Myers + indent slider + unified diff（10,029 行 × 30） | 19.4 MB | 174.831 ms | 96.955 ms (`rust-imara-diff`) | 0.55x | 5.00 MiB | 4.03 MiB | `a61a0400…c1a2f038` |
+| `diff` | `helix_syntax.rs` Histogram + unified diff（2,200 行 × 200） | 32.2 MB | 83.214 ms | 26.269 ms (`rust-imara-diff`) | 0.32x | 2.73 MiB | 2.39 MiB | `586c482f…c70e33f8` |
+| `cbor` | Deterministic batch encode（WebAuthn/COSE + Telemetry） | 50,000 ops | 138.962 ms | 120.254 ms (`go_fxamacker`) | 0.87x | 1.78 MiB | 12.33 MiB | `b14fb8d5…a7b61e0b` |
+| `cbor` | Batch decode + tree walk（WebAuthn/COSE + Telemetry） | 23,508,920 B (80,000 ops) | 149.661 ms | 169.493 ms (`go_fxamacker`) | **1.13x** | 9.19 MiB | 24.97 MiB | `3e192925…05a48ece` |
 
 ## 各包明细
 
@@ -138,3 +145,92 @@ SHA-256：`1172c1540ed9d0bc5f41ddce8a7b6253977063fa640aedc9e5eb82000585685f`
 SHA-256：`65a54274c38cb0392b001c91e26123de1ddcff28bddec4044e2e9beb72fc5024`
 
 落后项：Pion 在两项负载上分别为 Rust `jiff` 的 0.64x 与 0.40x，也慢于 Go `time`（Go 相对 `jiff` 为 0.83x / 0.57x）；Civil 负载峰值 RSS 与 `jiff` 持平（1.69 vs 1.73 MiB），RFC 3339 负载约为其 2.9×。
+
+### toml
+
+参考实现：Rust [`toml`](https://crates.io/crates/toml) `0.8`（`--release`）与 Go [`BurntSushi/toml`](https://github.com/BurntSushi/toml) `v1.4.0`。合规性来自官方 [`toml-lang/toml-test`](https://github.com/toml-lang/toml-test) `v1.0.0`。详见 [`packages/toml/README.md`](packages/toml/README.md)。
+
+**稳态解析：150.5 KB 真实 TOML v1.0.0 workspace / service 配置语料 × 50（`7,526,500 B` 输入，stdout `203 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rust_toml` | 178.392 | 158.839 | 184.359 | 42.19 | 3567831.66 | 7.45 MiB | 1.00x (baseline) |
+| `go_burntsushi` | 288.358 | 273.687 | 299.497 | 26.10 | 5767160.84 | 13.50 MiB | 0.62x |
+| `pion` | 119.644 | 102.283 | 130.105 | 62.91 | 2392885.00 | 4.56 MiB | **1.49x** |
+
+SHA-256：包 README 只记录了前 16 位十六进制 `96cf0bf395d107be…`，此处如实照录。
+
+### yaml
+
+参考实现：Rust [`yaml-rust2`](https://github.com/Ethiraric/yaml-rust2) `0.10.4`（`--release`）与 Go [`gopkg.in/yaml.v3`](https://github.com/go-yaml/yaml) `v3.0.1`。合规性来自官方 [`yaml/yaml-test-suite`](https://github.com/yaml/yaml-test-suite)。详见 [`packages/yaml/README.md`](packages/yaml/README.md)。
+
+**多文档 parse + 规范化有序键 JSON：3.00 MB 真实语料（`3,002,682 B`，2,037 篇 K8s Deployment / GitHub Actions / OpenAPI 3.1，stdout `2,234,058 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rust_yaml_rust2` | 119.183 | 82.868 | 196.088 | 25.19 | 39.34 MiB | 1.00x (baseline) |
+| `go_yaml_v3` | 126.812 | 118.331 | 148.825 | 23.68 | 20.94 MiB | 0.94x |
+| `pion_yaml` | 133.488 | 126.385 | 208.556 | 22.49 | 33.95 MiB | 0.89x |
+
+SHA-256：`d57e15ae46b8deb701bd42730f7d034287f48e4e7736d1e71249e80df449b633`
+
+落后项：Pion 为 `yaml-rust2` 的 0.89x，也略慢于 Go `yaml.v3`（0.94x）；峰值 RSS 低于 Rust（33.95 vs 39.34 MiB），但高于 Go（20.94 MiB）。
+
+### diff
+
+参考实现：Rust [`imara-diff`](https://github.com/pascalkuthe/imara-diff) `v0.2.0`（`--release`）。详见 [`packages/diff/README.md`](packages/diff/README.md)。
+
+**1. Histogram diff + indent slider + unified diff（10,029 行重构 × 50，32.4 MB 输入，stdout `67,406 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rust-imara-diff` | 30.316 | 30.020 | 32.131 | 1068.23 | 3.39 MiB | 1.00x (baseline) |
+| `pion` | 115.493 | 113.648 | 121.808 | 280.40 | 4.44 MiB | 0.26x |
+
+SHA-256：`fe0936eaa06404b6d49c707348a6790ff1234d4d3e27f14cc86d325d45a7b906`
+
+**2. Myers diff + indent slider + unified diff（10,029 行重构 × 30，19.4 MB 输入，stdout `238,918 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rust-imara-diff` | 96.955 | 82.300 | 108.232 | 200.41 | 4.03 MiB | 1.00x (baseline) |
+| `pion` | 174.831 | 164.568 | 203.590 | 111.14 | 5.00 MiB | 0.55x |
+
+SHA-256：`a61a0400fdf2028988aac61e9e10d5ee97136d733d2dcb02bbd6a572c1a2f038`
+
+**3. 真实文件 `helix_syntax.rs` Histogram + unified diff（2,200 行 × 200，32.2 MB 输入，stdout `7,131 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rust-imara-diff` | 26.269 | 24.617 | 27.731 | 1224.62 | 2.39 MiB | 1.00x (baseline) |
+| `pion` | 83.214 | 83.037 | 87.081 | 386.59 | 2.73 MiB | 0.32x |
+
+SHA-256：`586c482f0fd9d4a787fbc561f69095e8395a2990128debd8d13230fcc70e33f8`
+
+落后项：三项负载 Pion 均落后，为 `imara-diff` 的 0.26x / 0.55x / 0.32x，峰值 RSS 高约 14%–31%。包 README 归因于 Rust 侧 SIMD `memchr`、`foldhash` 与 LLVM `-O3` + LTO；unified diff 输出逐字节一致。
+
+### cbor
+
+参考实现：Go [`fxamacker/cbor/v2`](https://github.com/fxamacker/cbor) `v2.9.0`（基线）与 Rust [`ciborium`](https://github.com/enarx/ciborium) `0.2`（`--release`）。详见 [`packages/cbor/README.md`](packages/cbor/README.md)。
+
+**1. 确定性批量编码（50,000 条 WebAuthn/COSE + Telemetry，stdout `58 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `go_fxamacker` | 120.254 | 115.331 | 141.477 | 2405.08 | 12.33 MiB | 1.00x (baseline) |
+| `rust_ciborium` | 85.764 | 84.385 | 87.391 | 1715.29 | 2.06 MiB | 1.40x |
+| `pion` | 138.962 | 137.165 | 153.740 | 2779.23 | 1.78 MiB | 0.87x |
+
+SHA-256：`b14fb8d50078493f9c8c4349e6dd969f3289721f95fe1cc96f1cda48a7b61e0b`
+
+**2. 批量解码 + 树遍历（80,000 条，`23,508,920 B` 输入，stdout `67 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `go_fxamacker` | 169.493 | 142.346 | 221.261 | 138.70 | 2118.67 | 24.97 MiB | 1.00x (baseline) |
+| `rust_ciborium` | 139.573 | 127.944 | 159.863 | 168.43 | 1744.67 | 6.72 MiB | 1.21x |
+| `pion` | 149.661 | 139.664 | 159.145 | 157.08 | 1870.76 | 9.19 MiB | **1.13x** |
+
+SHA-256：`3e1929251b4f124f4f35012b86df7c3b1ad83579b233cee32aacc5fb05a48ece`
+
+落后项：编码 Pion 为 Go 的 0.87x，落后 Rust `ciborium`（1.40x）约 38%；解码 Pion 快于 Go（1.13x）但仍慢于 `ciborium`（1.21x，约 7%）。峰值 RSS 编码最低（1.78 MiB），解码高于 `ciborium`（9.19 vs 6.72 MiB）。

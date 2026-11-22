@@ -35,8 +35,12 @@ pionc add <package-name>
 | [`texmath`](packages/texmath) | `0.1.0` | TeX 数学公式解析、KaTeX 兼容 MathML 序列化与 TeXbook 盒模型布局 IR | [`KaTeX/KaTeX`](https://github.com/KaTeX/KaTeX) `v0.19.1` (JavaScript, MIT) | 180 / 180 | ✅ `wasm_smoke` | [10,000 ops MathML](BENCHMARKS.md#texmath) | `pionc add texmath --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`mermaid`](packages/mermaid) | `0.1.0` | Mermaid 流程图 / 时序图 / 状态图 / 类图 / ER 图解析、Sugiyama 分层布局与 SVG 渲染 | [`mermaid-js/mermaid`](https://github.com/mermaid-js/mermaid) + [`dagrejs/dagre`](https://github.com/dagrejs/dagre) (JavaScript, MIT) | 137 / 137 | ✅ `wasm_smoke` | [解析 + 布局（稳态 / 冷启动）](BENCHMARKS.md#mermaid) | `pionc add mermaid --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`time`](packages/time) | `0.1.0` | 公历日期 / 时间 / 时间戳 / 有符号时长值类型，RFC 3339、RFC 2822、HTTP-date 与 ISO 8601 时长解析格式化 | [`BurntSushi/jiff`](https://github.com/BurntSushi/jiff) `0.2` (Rust, MIT/Unlicense) | 249 / 249 | ✅ `wasm_smoke` | [RFC 3339 200k · Civil 2M](BENCHMARKS.md#time) | `pionc add time --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`toml`](packages/toml) | `0.1.0` | TOML v1.0.0 解析、序列化（保留插入顺序、IEEE 754 位精确浮点）与 `toml-test` tagged JSON 编码 | [`toml-lang/toml-test`](https://github.com/toml-lang/toml-test) `v1.0.0`；基准对照 Rust `toml` `0.8` / Go `BurntSushi/toml` `v1.4.0` | 722 / 722 | ✅ `wasm_smoke` | [150.5 KB 配置 × 50](BENCHMARKS.md#toml) | `pionc add toml --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`yaml`](packages/yaml) | `0.1.0` | YAML 1.2（Core Schema）多文档解析、锚点/别名/合并键、Billion Laughs 防护、发射器与规范化 JSON | [`yaml/yaml-test-suite`](https://github.com/yaml/yaml-test-suite)；基准对照 Rust `yaml-rust2` `0.10.4` / Go `yaml.v3` `v3.0.1` | 381 / 381 | ✅ `wasm_smoke` | [3.00 MB K8s/CI/OpenAPI 语料](BENCHMARKS.md#yaml) | `pionc add yaml --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`diff`](packages/diff) | `0.1.0` | Myers / Histogram 行 diff、缩进滑块后处理、unified diff 生成/解析/应用与三路合并 | [`pascalkuthe/imara-diff`](https://github.com/pascalkuthe/imara-diff) `v0.2.0` (Rust, Apache-2.0) | 136 / 136 | ✅ `wasm_smoke` | [Histogram · Myers · helix 实例](BENCHMARKS.md#diff) | `pionc add diff --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`cbor`](packages/cbor) | `0.1.0` | CBOR（RFC 8949）编解码、Core Deterministic / CTAP2 规范编码、float16、诊断记法与 DoS/OOM 防护解码 | [`fxamacker/cbor`](https://github.com/fxamacker/cbor) `v2.9.0` (Go, MIT)；另对照 Rust `ciborium` `0.2` | 209 / 209 | ✅ `wasm_smoke` | [50k 编码 · 80k 解码](BENCHMARKS.md#cbor) | `pionc add cbor --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓合计 **1,268 / 1,268** 单测通过（`sh scripts/verify.sh`）。
+全仓合计 **2,716 / 2,716** 单测通过（`sh scripts/verify.sh`）。
 
 ## 贡献与移植流程
 
