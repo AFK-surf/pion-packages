@@ -77,9 +77,9 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | St
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs go_fxamacker) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 138.962 | 137.165 | 153.740 | 2779.23 | 1.78 MiB | 0.87x |
-| `go_fxamacker` | 120.254 | 115.331 | 141.477 | 2405.08 | 12.33 MiB | 1.00x (baseline) |
-| `rust_ciborium` | 85.764 | 84.385 | 87.391 | 1715.29 | 2.06 MiB | 1.40x |
+| `pion` | 72.339 | 70.518 | 73.202 | 1446.78 | 1.80 MiB | 1.68x |
+| `go_fxamacker` | 121.174 | 119.342 | 125.585 | 2423.48 | 12.20 MiB | 1.00x (baseline) |
+| `rust_ciborium` | 76.984 | 76.011 | 79.241 | 1539.68 | 2.06 MiB | 1.57x |
 
 _SHA-256 verified identical across all implementations and rounds: `b14fb8d50078493f9c8c4349e6dd969f3289721f95fe1cc96f1cda48a7b61e0b`._
 
@@ -89,8 +89,8 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | St
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs go_fxamacker) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 149.661 | 139.664 | 159.145 | 157.08 | 1870.76 | 9.19 MiB | 1.13x |
-| `go_fxamacker` | 169.493 | 142.346 | 221.261 | 138.70 | 2118.67 | 24.97 MiB | 1.00x (baseline) |
-| `rust_ciborium` | 139.573 | 127.944 | 159.863 | 168.43 | 1744.67 | 6.72 MiB | 1.21x |
+| `pion` | 80.204 | 77.939 | 89.195 | 293.11 | 1002.55 | 9.55 MiB | 1.85x |
+| `go_fxamacker` | 148.137 | 145.610 | 153.352 | 158.70 | 1851.72 | 17.56 MiB | 1.00x (baseline) |
+| `rust_ciborium` | 123.136 | 122.112 | 131.406 | 190.92 | 1539.20 | 6.72 MiB | 1.20x |
 
 _SHA-256 verified identical across all implementations and rounds: `3e1929251b4f124f4f35012b86df7c3b1ad83579b233cee32aacc5fb05a48ece`._
