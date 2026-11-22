@@ -3,9 +3,10 @@
 Pure Pion TOML v1.0.0 parser, serializer, and `toml-test` tagged JSON encoder.
 
 - **Zero C glue / zero `World` dependency** — works identically on Native and `wasm32`.
-- **100% TOML v1.0.0 compliant** — passes all **717 / 717** official `toml-lang/toml-test` v1.0.0 test cases (208 valid + 509 invalid, including strict UTF-8 / UTF-16 BOM validation) plus roundtrip and accessor tests (**722 / 722** total).
-- **Deterministic insertion-order tables** — preserves key order for stable `stringify` output while using internal `Map[String, Int]` indexing for O(1) duplicate/conflict checks during parsing.
-- **Bit-exact IEEE 754 float formatting** — preserves full 17-digit double precision on roundtrip.
+- **100% TOML v1.0.0 compliant** — passes all official `toml-lang/toml-test` v2.2.0 TOML 1.0.0 test cases (**205/205** valid, **474/474** invalid, **205/205** encoder) plus in-repo compliance, roundtrip, accessor, and red-team regression tests (**729 / 729** total).
+- **Bit-exact IEEE-754 shortest roundtrip float formatting (Ryu)** — pure Pion 128-bit integer arithmetic guarantees `strtod(fmt(x)) == x` for 100% of finite binary64 doubles (including `DBL_MAX`, `DBL_MIN`, subnormals, `-0.0`, `inf`, `nan`).
+- **Hardened against adversarial inputs** — explicit recursion depth guard (`128` levels for arrays, inline tables, dotted headers/keys), O(1)-amortized inline table sealing, seeded open-addressing hash index (HashDoS-resistant), strict `stringify` validation (duplicate keys & datetime injection rejection), float overflow rejection (`1e400`), UTF-8 BOM support, and character-accurate error locations.
+- **Fast O(1) `toml::get` & direct `TomlValue` construction** — preserves insertion order for deterministic serialization while caching a seeded hash index for wide tables and avoiding intermediate tree copies.
 
 ## API
 
@@ -82,15 +83,15 @@ pionc build --target wasm32 -o /tmp/toml_wasm_smoke.wasm packages/toml/wasm_smok
 
 ## Head-to-Head Benchmark
 
-Steady-state parsing of a realistic 150.5 KB TOML v1.0.0 workspace & service configuration corpus (50 iterations = 7.53 MB total input) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification):
+Steady-state parsing of a realistic 150.5 KB TOML v1.0.0 workspace & service configuration corpus (50 iterations = 7.53 MB total input) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against **Rust `toml 1.2.2`** (`--release`, LTO) and **Go `BurntSushi/toml`**:
 
 Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `203 B` (`sha256:96cf0bf395d107be...`) | Input: `7526500 B` | Ops: `50`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_toml) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_toml 1.2.2) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 119.644 | 102.283 | 130.105 | 62.91 | 2392885.00 | 4.56 MiB | 1.49x |
-| `rust_toml` | 178.392 | 158.839 | 184.359 | 42.19 | 3567831.66 | 7.45 MiB | 1.00x (baseline) |
-| `go_burntsushi` | 288.358 | 273.687 | 299.497 | 26.10 | 5767160.84 | 13.50 MiB | 0.62x |
+| `pion` | 100.995 | 86.022 | 113.517 | 74.52 | 2019898.34 | 3.50 MiB | 0.93x |
+| `rust_toml` | 93.422 | 91.795 | 98.200 | 80.56 | 1868440.00 | 6.92 MiB | 1.00x (baseline) |
+| `go_burntsushi` | 262.027 | 257.532 | 369.302 | 28.72 | 5240550.00 | 15.62 MiB | 0.36x |
 
 Reproduce:
 
