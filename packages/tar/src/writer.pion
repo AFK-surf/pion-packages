@@ -1,0 +1,1239 @@
+///| Streaming TAR Writer (USTAR / PAX / GNU) backed by a chunked `Bytes` slab buffer
+///| with explicit `Int64` 2 GiB archive-size guard (preventing 32-bit length wrap / heap overflow),
+///| zero-copy staging for large payloads, reusable 512B header block, O(n log n) PAX sorting,
+///| and Go `archive/tar` byte-level parity.
+
+///| Maximum safe TAR archive size in bytes (including the 1024-byte EOF trailer):
+///| `INT32_MAX - 1023 = 2_147_482_624` (a 512-byte multiple strictly below `2^31`).
+let max_archive_bytes : Int64 = 2147482624L
+
+///| Payloads at or above this threshold bypass `StringBuilder` and are staged as zero-copy `Bytes` chunks.
+let large_chunk_threshold : Int = 65536
+
+///| Streaming TAR archive writer.
+pub struct Writer {
+  chunks : Array[Bytes]
+  mut sb : StringBuilder
+  mut sb_len : Int
+  mut total_bytes : Int64
+  blk : Bytes
+  zeros : String // 1024 zero bytes for fast padding & EOF trailer writes
+  mut dirty_end : Int
+  mut remaining : Int64
+  mut pad : Int64
+  mut closed : Bool
+}
+
+///| Create a new `Writer`.
+pub fn Writer::new() -> Writer {
+  Writer::with_capacity(8192)
+}
+
+///| Create a new `Writer` with an initial byte capacity hint.
+pub fn Writer::with_capacity(cap : Int) -> Writer {
+  let c = if cap > 1024 { cap } else { 1024 }
+  Writer::{
+    chunks: [],
+    sb: StringBuilder::with_capacity(c),
+    sb_len: 0,
+    total_bytes: 0L,
+    blk: Bytes::new(512),
+    zeros: Bytes::new(1024).to_string(),
+    dirty_end: 0,
+    remaining: 0L,
+    pad: 0L,
+    closed: false,
+  }
+}
+
+///| Check that adding `add` bytes (plus the 1024-byte EOF trailer) stays within `max_archive_bytes`.
+fn writer_check_size(self : Writer, add : Int64) -> Result[Unit, TarError] {
+  if add < 0L || add > max_archive_bytes - 1024L - self.total_bytes {
+    return Err(TarError::LimitExceeded("archive size exceeds 2 GiB Bytes limit"))
+  }
+  Ok(())
+}
+
+///| Flush buffered `StringBuilder` bytes into `self.chunks`.
+fn writer_flush_sb(self : Writer) -> Unit {
+  if self.sb_len > 0 {
+    self.chunks.push(self.sb.to_string().to_bytes())
+    self.sb = StringBuilder::with_capacity(4096)
+    self.sb_len = 0
+  }
+}
+
+///| Concatenate an array of `Bytes` chunks via native `Bytes::concat` (`memcpy`) in balanced order.
+fn concat_chunks(chunks : Array[Bytes]) -> Bytes {
+  let n = chunks.length()
+  if n == 0 {
+    return Bytes::new(0)
+  }
+  if n == 1 {
+    return chunks[0]
+  }
+  let mut cur = chunks
+  while cur.length() > 1 {
+    let next : Array[Bytes] = Array::with_capacity((cur.length() + 1) / 2)
+    let mut i = 0
+    while i + 1 < cur.length() {
+      next.push(cur[i].concat(cur[i + 1]))
+      i = i + 2
+    }
+    if i < cur.length() {
+      next.push(cur[i])
+    }
+    cur = next
+  }
+  cur[0]
+}
+
+///| Append `len` bytes from `src[0..len]` to the writer buffer (guarding total archive size).
+fn writer_append_bytes(self : Writer, src : Bytes, len : Int) -> Result[Unit, TarError] {
+  if len <= 0 {
+    return Ok(())
+  }
+  match writer_check_size(self, len.to_int64()) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  if len >= large_chunk_threshold && len == src.length() {
+    writer_flush_sb(self)
+    self.chunks.push(src)
+    self.total_bytes = self.total_bytes + len.to_int64()
+    return Ok(())
+  }
+  let s = if len == src.length() { src.to_string() } else { src.slice(0, len).to_string() }
+  self.sb.write_string(s)
+  self.sb_len = self.sb_len + len
+  self.total_bytes = self.total_bytes + len.to_int64()
+  Ok(())
+}
+
+///| Append a `String`'s raw bytes to the writer buffer (guarding total archive size).
+fn writer_append_str(self : Writer, s : String) -> Result[Unit, TarError] {
+  let len = s.length()
+  if len <= 0 {
+    return Ok(())
+  }
+  match writer_check_size(self, len.to_int64()) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  self.sb.write_string(s)
+  self.sb_len = self.sb_len + len
+  self.total_bytes = self.total_bytes + len.to_int64()
+  Ok(())
+}
+
+///| Append `len` zero bytes (`len <= 1024`).
+fn writer_append_zeros(self : Writer, len : Int) -> Result[Unit, TarError] {
+  if len <= 0 {
+    return Ok(())
+  }
+  match writer_check_size(self, len.to_int64()) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  self.sb.write_substring(self.zeros, 0, len)
+  self.sb_len = self.sb_len + len
+  self.total_bytes = self.total_bytes + len.to_int64()
+  Ok(())
+}
+
+///| Reset the dirty prefix of the reusable 512-byte header block to all zeros.
+fn clear_block(self : Writer) -> Unit {
+  let end = self.dirty_end
+  if end <= 0 {
+    return
+  }
+  let blk = self.blk
+  let z = (0).to_byte()
+  let mut i = 0
+  while i + 8 <= end {
+    blk[i] = z
+    blk[i + 1] = z
+    blk[i + 2] = z
+    blk[i + 3] = z
+    blk[i + 4] = z
+    blk[i + 5] = z
+    blk[i + 6] = z
+    blk[i + 7] = z
+    i = i + 8
+  }
+  while i < end {
+    blk[i] = z
+    i = i + 1
+  }
+  self.dirty_end = 0
+}
+
+///| Flush pending block padding for the previous entry.
+fn writer_flush_pad(self : Writer) -> Result[Unit, TarError] {
+  if self.remaining > 0L {
+    return Err(TarError::IncompleteWrite(self.remaining))
+  }
+  if self.pad > 0L {
+    match writer_append_zeros(self, self.pad.to_int()) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    self.pad = 0L
+  }
+  Ok(())
+}
+
+///| Returns true if `k` is one of the built-in PAX keys derived from `Header` fields.
+fn is_basic_pax_key(k : String) -> Bool {
+  k == "path" ||
+  k == "linkpath" ||
+  k == "size" ||
+  k == "uid" ||
+  k == "gid" ||
+  k == "uname" ||
+  k == "gname" ||
+  k == "mtime" ||
+  k == "atime" ||
+  k == "ctime"
+}
+
+///| Sort `(key, value)` pairs lexicographically by key in O(n log n) via bottom-up merge sort.
+fn sort_kv_pairs(pairs : Array[(String, String)]) -> Unit {
+  let n = pairs.length()
+  if n <= 16 {
+    let mut i = 1
+    while i < n {
+      let cur = pairs[i]
+      let (ck, _) = cur
+      let mut j = i - 1
+      while j >= 0 {
+        let (jk, _) = pairs[j]
+        if jk > ck {
+          pairs[j + 1] = pairs[j]
+          j = j - 1
+        } else {
+          break
+        }
+      }
+      pairs[j + 1] = cur
+      i = i + 1
+    }
+    return
+  }
+  let aux : Array[(String, String)] = Array::with_capacity(n)
+  let mut k = 0
+  while k < n {
+    aux.push(pairs[k])
+    k = k + 1
+  }
+  let mut width = 1
+  while width < n {
+    let mut left = 0
+    while left < n {
+      let mid = if left + width < n { left + width } else { n }
+      let right = if left + 2 * width < n { left + 2 * width } else { n }
+      let mut i = left
+      let mut j = mid
+      let mut out = left
+      while i < mid && j < right {
+        let (ik, _) = pairs[i]
+        let (jk, _) = pairs[j]
+        if ik <= jk {
+          aux[out] = pairs[i]
+          i = i + 1
+        } else {
+          aux[out] = pairs[j]
+          j = j + 1
+        }
+        out = out + 1
+      }
+      while i < mid {
+        aux[out] = pairs[i]
+        i = i + 1
+        out = out + 1
+      }
+      while j < right {
+        aux[out] = pairs[j]
+        j = j + 1
+        out = out + 1
+      }
+      let mut c = left
+      while c < right {
+        pairs[c] = aux[c]
+        c = c + 1
+      }
+      left = left + 2 * width
+    }
+    width = width * 2
+  }
+}
+
+///| Clean a POSIX slash-separated path matching Go's `path.Clean`.
+fn posix_path_clean(p : String) -> String {
+  let n = p.length()
+  if n == 0 {
+    return "."
+  }
+  let rooted = p.code_unit_at(0) == 47
+  let segs : Array[String] = []
+  let mut i = 0
+  while i < n {
+    while i < n && p.code_unit_at(i) == 47 {
+      i = i + 1
+    }
+    if i >= n {
+      break
+    }
+    let start = i
+    while i < n && p.code_unit_at(i) != 47 {
+      i = i + 1
+    }
+    let seg = p.slice(start, i)
+    if seg == "." {
+      continue
+    } else if seg == ".." {
+      if segs.length() > 0 && segs[segs.length() - 1] != ".." {
+        let _ = segs.pop()
+      } else if !rooted {
+        segs.push("..")
+      }
+    } else {
+      segs.push(seg)
+    }
+  }
+  if segs.length() == 0 {
+    return if rooted { "/" } else { "." }
+  }
+  let sb = StringBuilder::with_capacity(n)
+  if rooted {
+    sb.write_string("/")
+  }
+  let mut j = 0
+  while j < segs.length() {
+    if j > 0 {
+      sb.write_string("/")
+    }
+    sb.write_string(segs[j])
+    j = j + 1
+  }
+  sb.to_string()
+}
+
+///| Build a PAX pseudo-header filename matching Go's `path.Join(dir, "PaxHeaders.0", file)`.
+fn make_pax_header_name(real_name : String) -> String {
+  let n = real_name.length()
+  let mut slash = -1
+  let mut i = n - 1
+  while i >= 0 {
+    if real_name.code_unit_at(i) == 47 {
+      slash = i
+      break
+    }
+    i = i - 1
+  }
+  let dir = if slash >= 0 { real_name.slice(0, slash + 1) } else { "" }
+  let file = if slash >= 0 { real_name.slice(slash + 1, n) } else { real_name }
+  let joined = if dir.length() == 0 {
+    if file.length() == 0 {
+      "PaxHeaders.0"
+    } else {
+      "PaxHeaders.0/" + file
+    }
+  } else if file.length() == 0 {
+    dir + "/PaxHeaders.0"
+  } else {
+    dir + "/PaxHeaders.0/" + file
+  }
+  posix_path_clean(joined)
+}
+
+///| Stamp magic + version + checksum into a 512-byte header block.
+fn finalize_header_block_bounded(blk : Bytes, fmt : TarFormat, scan_end : Int) -> Unit {
+  match fmt {
+    Gnu => {
+      blk[257] = (117).to_byte()
+      blk[258] = (115).to_byte()
+      blk[259] = (116).to_byte()
+      blk[260] = (97).to_byte()
+      blk[261] = (114).to_byte()
+      blk[262] = (32).to_byte()
+      blk[263] = (32).to_byte()
+      blk[264] = (0).to_byte()
+    }
+    Ustar | Pax => {
+      blk[257] = (117).to_byte()
+      blk[258] = (115).to_byte()
+      blk[259] = (116).to_byte()
+      blk[260] = (97).to_byte()
+      blk[261] = (114).to_byte()
+      blk[262] = (0).to_byte()
+      blk[263] = (48).to_byte()
+      blk[264] = (48).to_byte()
+    }
+    _ => ()
+  }
+  stamp_checksum_bounded(blk, 0, scan_end)
+}
+
+///| Write a raw meta-file (PAX extended header or GNU LongName/LongLink) + padded body directly to the buffer.
+fn write_raw_meta_str(
+  self : Writer,
+  raw_name : String,
+  body : String,
+  append_nul : Bool,
+  flag : Byte,
+  fmt : TarFormat,
+) -> Result[Unit, TarError] {
+  let mut name = to_ascii(raw_name)
+  if name.length() > name_size {
+    name = name.slice(0, name_size)
+  }
+  let mut end = name.length()
+  while end > 0 && name.code_unit_at(end - 1) == 47 {
+    end = end - 1
+  }
+  if end < name.length() {
+    name = name.slice(0, end)
+  }
+
+  let body_len = body.length() + (if append_nul { 1 } else { 0 })
+  clear_block(self)
+  self.blk[156] = flag
+  let _ = format_string_into(self.blk, 0, 100, name)
+  write_octal_zero_8(self.blk, 100)
+  write_octal_zero_8(self.blk, 108)
+  write_octal_zero_8(self.blk, 116)
+  if !format_octal_into(self.blk, 124, 12, body_len.to_int64()) {
+    return Err(TarError::FieldTooLong("meta file too large"))
+  }
+  write_octal_zero_12(self.blk, 136)
+  finalize_header_block_bounded(self.blk, fmt, 265)
+  self.dirty_end = 265
+
+  match writer_append_bytes(self, self.blk, 512) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match writer_append_str(self, body) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let mut pad = block_padding(body_len.to_int64()).to_int()
+  if append_nul {
+    pad = pad + 1
+  }
+  if pad > 0 {
+    match writer_append_zeros(self, pad) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  Ok(())
+}
+
+///| Populate common V7 + USTAR/PAX/GNU fields into `self.blk`.
+fn fill_template_block(
+  self : Writer,
+  hdr : Header,
+  typeflag : Byte,
+  name : String,
+  mod_time : Timestamp,
+  need_to_ascii_name : Bool,
+  need_to_ascii_link : Bool,
+  need_to_ascii_uname : Bool,
+  need_to_ascii_gname : Bool,
+  allow_base256 : Bool,
+) -> Unit {
+  clear_block(self)
+  let blk = self.blk
+  let mtime_sec = if mod_time.is_zero() { 0L } else { mod_time.sec }
+  blk[156] = typeflag
+  let s_name = if need_to_ascii_name { to_ascii(name) } else { name }
+  let s_link = if need_to_ascii_link { to_ascii(hdr.linkname) } else { hdr.linkname }
+  let s_uname = if need_to_ascii_uname { to_ascii(hdr.uname) } else { hdr.uname }
+  let s_gname = if need_to_ascii_gname { to_ascii(hdr.gname) } else { hdr.gname }
+  let _ = format_string_into(blk, 0, 100, s_name)
+  if s_link.length() > 0 {
+    let _ = format_string_into(blk, 157, 100, s_link)
+  }
+  if s_uname.length() > 0 {
+    let _ = format_string_into(blk, 265, 32, s_uname)
+  }
+  if s_gname.length() > 0 {
+    let _ = format_string_into(blk, 297, 32, s_gname)
+  }
+  if allow_base256 {
+    let _ = format_numeric_into(blk, 100, 8, hdr.mode)
+    let _ = format_numeric_into(blk, 108, 8, hdr.uid)
+    let _ = format_numeric_into(blk, 116, 8, hdr.gid)
+    let _ = format_numeric_into(blk, 124, 12, hdr.size)
+    let _ = format_numeric_into(blk, 136, 12, mtime_sec)
+    if hdr.devmajor == 0L {
+      write_octal_zero_8(blk, 329)
+    } else {
+      let _ = format_numeric_into(blk, 329, 8, hdr.devmajor)
+    }
+    if hdr.devminor == 0L {
+      write_octal_zero_8(blk, 337)
+    } else {
+      let _ = format_numeric_into(blk, 337, 8, hdr.devminor)
+    }
+  } else {
+    let _ = format_octal_into(blk, 100, 8, hdr.mode)
+    let _ = format_octal_into(blk, 108, 8, hdr.uid)
+    let _ = format_octal_into(blk, 116, 8, hdr.gid)
+    if hdr.size == 0L {
+      write_octal_zero_12(blk, 124)
+    } else {
+      let _ = format_octal_into(blk, 124, 12, hdr.size)
+    }
+    if mtime_sec == 0L {
+      write_octal_zero_12(blk, 136)
+    } else {
+      let _ = format_octal_into(blk, 136, 12, mtime_sec)
+    }
+    if hdr.devmajor == 0L {
+      write_octal_zero_8(blk, 329)
+    } else {
+      let _ = format_octal_into(blk, 329, 8, hdr.devmajor)
+    }
+    if hdr.devminor == 0L {
+      write_octal_zero_8(blk, 337)
+    } else {
+      let _ = format_octal_into(blk, 337, 8, hdr.devminor)
+    }
+  }
+}
+
+///| Write a header and prepare to receive `hdr.size` bytes of payload data.
+pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarError] {
+  if self.closed {
+    return Err(TarError::WriteAfterClose)
+  }
+  match writer_flush_pad(self) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  let mut tf = hdr.typeflag
+  if tf == type_reg_a() {
+    if str_ends_with_slash(hdr.name) {
+      tf = type_dir()
+    } else {
+      tf = type_reg()
+    }
+  }
+
+  let is_fmt_unknown = format_equals(hdr.format, TarFormat::Unknown)
+  let mod_time = if is_fmt_unknown { hdr.mod_time.round_sec() } else { hdr.mod_time }
+  let access_time = if is_fmt_unknown { Timestamp::zero() } else { hdr.access_time }
+  let change_time = if is_fmt_unknown { Timestamp::zero() } else { hdr.change_time }
+
+  // Validate typeflag rules
+  if tf == type_reg() ||
+  tf == type_char() ||
+  tf == type_block() ||
+  tf == type_fifo() ||
+  tf == type_gnu_sparse() {
+    if str_ends_with_slash(hdr.name) {
+      return Err(TarError::InvalidHeader("filename may not have trailing slash"))
+    }
+  }
+  if tf == type_x_header() || tf == type_gnu_long_name() || tf == type_gnu_long_link() {
+    return Err(TarError::InvalidHeader("cannot manually encode meta header type"))
+  }
+  let is_global = tf == type_x_global_header()
+  if is_global {
+    if hdr.linkname.length() > 0 ||
+    hdr.size != 0L ||
+    hdr.mode != 0L ||
+    hdr.uid != 0L ||
+    hdr.gid != 0L ||
+    hdr.uname.length() > 0 ||
+    hdr.gname.length() > 0 ||
+    !mod_time.is_zero() ||
+    !access_time.is_zero() ||
+    !change_time.is_zero() ||
+    hdr.devmajor != 0L ||
+    hdr.devminor != 0L {
+      return Err(TarError::InvalidHeader("only PAXRecords should be set for TypeXGlobalHeader"))
+    }
+  }
+  if !is_header_only_type(tf) && hdr.size < 0L {
+    return Err(TarError::InvalidHeader("negative file size"))
+  }
+
+  // Scan the 4 string fields in-place with zero temporary allocations
+  let (name_nul, name_ascii) = scan_string_flags(hdr.name)
+  if name_nul {
+    return Err(TarError::InvalidHeader("NUL byte in name"))
+  }
+  let (link_nul, link_ascii) = scan_string_flags(hdr.linkname)
+  if link_nul {
+    return Err(TarError::InvalidHeader("NUL byte in linkname"))
+  }
+  let (uname_nul, uname_ascii) = scan_string_flags(hdr.uname)
+  if uname_nul {
+    return Err(TarError::InvalidHeader("NUL byte in uname"))
+  }
+  let (gname_nul, gname_ascii) = scan_string_flags(hdr.gname)
+  if gname_nul {
+    return Err(TarError::InvalidHeader("NUL byte in gname"))
+  }
+
+  let has_user_pax = hdr.xattrs.length() > 0 || hdr.pax_records.length() > 0
+
+  // Fast path: pure USTAR when format is Unknown/Ustar/Pax and all fields fit USTAR directly
+  let ustar_candidate = !has_user_pax &&
+  !is_global &&
+  (is_fmt_unknown ||
+    format_equals(hdr.format, TarFormat::Ustar) ||
+    format_equals(hdr.format, TarFormat::Pax)) &&
+  name_ascii &&
+  link_ascii &&
+  uname_ascii &&
+  gname_ascii &&
+  hdr.name.length() <= 100 &&
+  hdr.linkname.length() <= 100 &&
+  hdr.uname.length() <= 32 &&
+  hdr.gname.length() <= 32 &&
+  fits_in_octal(8, hdr.mode) &&
+  fits_in_octal(8, hdr.uid) &&
+  fits_in_octal(8, hdr.gid) &&
+  fits_in_octal(12, hdr.size) &&
+  fits_in_octal(8, hdr.devmajor) &&
+  fits_in_octal(8, hdr.devminor) &&
+  (mod_time.is_zero() || (fits_in_octal(12, mod_time.sec) && mod_time.nsec == 0)) &&
+  access_time.is_zero() &&
+  change_time.is_zero()
+
+  if ustar_candidate {
+    fill_template_block(
+      self,
+      hdr,
+      tf,
+      hdr.name,
+      mod_time,
+      false,
+      false,
+      false,
+      false,
+      false,
+    )
+    finalize_header_block_bounded(self.blk, TarFormat::Ustar, 345)
+    self.dirty_end = 345
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
+    self.remaining = data_sz
+    self.pad = block_padding(data_sz)
+    return Ok(())
+  }
+
+  // Fast path: explicit GNU format with no user PAX/Xattrs
+  if format_equals(hdr.format, TarFormat::Gnu) &&
+  !has_user_pax &&
+  !is_global &&
+  hdr.uname.length() <= 32 &&
+  hdr.gname.length() <= 32 &&
+  fits_in_base256(8, hdr.mode) &&
+  fits_in_base256(8, hdr.uid) &&
+  fits_in_base256(8, hdr.gid) &&
+  fits_in_base256(12, hdr.size) &&
+  fits_in_base256(8, hdr.devmajor) &&
+  fits_in_base256(8, hdr.devminor) &&
+  (mod_time.is_zero() || fits_in_base256(12, mod_time.sec)) &&
+  (access_time.is_zero() || fits_in_base256(12, access_time.sec)) &&
+  (change_time.is_zero() || fits_in_base256(12, change_time.sec)) {
+    if hdr.name.length() > name_size {
+      match write_raw_meta_str(
+        self,
+        "././@LongLink",
+        hdr.name,
+        true,
+        type_gnu_long_name(),
+        TarFormat::Gnu,
+      ) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    if hdr.linkname.length() > name_size {
+      match write_raw_meta_str(
+        self,
+        "././@LongLink",
+        hdr.linkname,
+        true,
+        type_gnu_long_link(),
+        TarFormat::Gnu,
+      ) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    fill_template_block(
+      self,
+      hdr,
+      tf,
+      hdr.name,
+      mod_time,
+      false,
+      false,
+      false,
+      false,
+      true,
+    )
+    let mut scan_end = 345
+    if !access_time.is_zero() {
+      let _ = format_numeric_into(self.blk, 345, 12, access_time.sec)
+      scan_end = 369
+    }
+    if !change_time.is_zero() {
+      let _ = format_numeric_into(self.blk, 357, 12, change_time.sec)
+      scan_end = 369
+    }
+    finalize_header_block_bounded(self.blk, TarFormat::Gnu, scan_end)
+    self.dirty_end = scan_end
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
+    self.remaining = data_sz
+    self.pad = block_padding(data_sz)
+    return Ok(())
+  }
+
+  // Fast path: explicit PAX format with no user PAX/Xattrs and no atime/ctime
+  if format_equals(hdr.format, TarFormat::Pax) &&
+  !has_user_pax &&
+  !is_global &&
+  access_time.is_zero() &&
+  change_time.is_zero() &&
+  fits_in_octal(8, hdr.mode) &&
+  fits_in_octal(8, hdr.devmajor) &&
+  fits_in_octal(8, hdr.devminor) {
+    let need_gname = !gname_ascii || hdr.gname.length() > 32
+    let need_gid = !fits_in_octal(8, hdr.gid)
+    let need_link = !link_ascii || hdr.linkname.length() > 100
+    let need_mtime = !mod_time.is_zero() && (!fits_in_octal(12, mod_time.sec) || mod_time.nsec != 0)
+    let need_path = !name_ascii || hdr.name.length() > 100
+    let need_size = !fits_in_octal(12, hdr.size)
+    let need_uid = !fits_in_octal(8, hdr.uid)
+    let need_uname = !uname_ascii || hdr.uname.length() > 32
+    if need_gid ||
+    need_gname ||
+    need_link ||
+    need_mtime ||
+    need_path ||
+    need_size ||
+    need_uid ||
+    need_uname {
+      let pax_sb = StringBuilder::with_capacity(256)
+      if need_gid {
+        write_pax_record_unchecked(pax_sb, "gid", hdr.gid.to_string())
+      }
+      if need_gname {
+        write_pax_record_unchecked(pax_sb, "gname", hdr.gname)
+      }
+      if need_link {
+        write_pax_record_unchecked(pax_sb, "linkpath", hdr.linkname)
+      }
+      if need_mtime {
+        write_pax_record_unchecked(pax_sb, "mtime", format_pax_time(mod_time))
+      }
+      if need_path {
+        write_pax_record_unchecked(pax_sb, "path", hdr.name)
+      }
+      if need_size {
+        write_pax_record_unchecked(pax_sb, "size", hdr.size.to_string())
+      }
+      if need_uid {
+        write_pax_record_unchecked(pax_sb, "uid", hdr.uid.to_string())
+      }
+      if need_uname {
+        write_pax_record_unchecked(pax_sb, "uname", hdr.uname)
+      }
+      let pax_str = pax_sb.to_string()
+      if pax_str.length() > 1048576 {
+        return Err(TarError::FieldTooLong("PAX header exceeds 1 MiB"))
+      }
+      let meta_name = make_pax_header_name(hdr.name)
+      match write_raw_meta_str(self, meta_name, pax_str, false, type_x_header(), TarFormat::Pax) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    fill_template_block(
+      self,
+      hdr,
+      tf,
+      hdr.name,
+      mod_time,
+      !name_ascii,
+      !link_ascii,
+      !uname_ascii,
+      !gname_ascii,
+      false,
+    )
+    finalize_header_block_bounded(self.blk, TarFormat::Pax, 345)
+    self.dirty_end = 345
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
+    self.remaining = data_sz
+    self.pad = block_padding(data_sz)
+    return Ok(())
+  }
+
+  // General path: determine allowed formats (1=USTAR, 2=PAX, 4=GNU)
+  let mut allowed = 7
+  let mut prefer_pax = false
+  let pax_hdrs : Array[(String, String)] = []
+  let pax_idx : Map[String, Int] = Map::new()
+
+  // Index user pax_records once in O(n) for O(1) matching-field lookup
+  let user_pax_map : Map[String, String] = Map::new()
+  if hdr.pax_records.length() > 0 {
+    let mut ui = 0
+    while ui < hdr.pax_records.length() {
+      let (pk, pv) = hdr.pax_records[ui]
+      user_pax_map.set(pk, pv)
+      ui = ui + 1
+    }
+  }
+
+  // Name
+  let name_too_long = hdr.name.length() > 100
+  if !name_ascii || name_too_long {
+    let split_ok = match split_ustar_path(hdr.name) {
+      Some(_) => true
+      None => false
+    }
+    if !split_ok {
+      allowed = allowed & 6
+    }
+    kv_set_indexed(pax_hdrs, pax_idx, "path", hdr.name)
+  }
+  match user_pax_map.get("path") {
+    Some(pv) => if pv == hdr.name { kv_set_indexed(pax_hdrs, pax_idx, "path", pv) }
+    None => ()
+  }
+
+  // Linkname
+  if !link_ascii || hdr.linkname.length() > 100 {
+    allowed = allowed & 6
+    kv_set_indexed(pax_hdrs, pax_idx, "linkpath", hdr.linkname)
+  }
+  match user_pax_map.get("linkpath") {
+    Some(pv) => if pv == hdr.linkname { kv_set_indexed(pax_hdrs, pax_idx, "linkpath", pv) }
+    None => ()
+  }
+
+  // Uname
+  if hdr.uname.length() > 32 {
+    allowed = allowed & 3
+  }
+  if !uname_ascii || hdr.uname.length() > 32 {
+    allowed = allowed & 6
+    kv_set_indexed(pax_hdrs, pax_idx, "uname", hdr.uname)
+  }
+  match user_pax_map.get("uname") {
+    Some(pv) => if pv == hdr.uname { kv_set_indexed(pax_hdrs, pax_idx, "uname", pv) }
+    None => ()
+  }
+
+  // Gname
+  if hdr.gname.length() > 32 {
+    allowed = allowed & 3
+  }
+  if !gname_ascii || hdr.gname.length() > 32 {
+    allowed = allowed & 6
+    kv_set_indexed(pax_hdrs, pax_idx, "gname", hdr.gname)
+  }
+  match user_pax_map.get("gname") {
+    Some(pv) => if pv == hdr.gname { kv_set_indexed(pax_hdrs, pax_idx, "gname", pv) }
+    None => ()
+  }
+
+  // Numeric fields
+  if !fits_in_base256(8, hdr.mode) {
+    allowed = allowed & 3
+  }
+  if !fits_in_octal(8, hdr.mode) {
+    allowed = allowed & 4
+  }
+  if !fits_in_base256(8, hdr.uid) {
+    allowed = allowed & 3
+  }
+  if !fits_in_octal(8, hdr.uid) {
+    allowed = allowed & 6
+    kv_set_indexed(pax_hdrs, pax_idx, "uid", hdr.uid.to_string())
+  }
+  match user_pax_map.get("uid") {
+    Some(pv) => if pv == hdr.uid.to_string() { kv_set_indexed(pax_hdrs, pax_idx, "uid", pv) }
+    None => ()
+  }
+  if !fits_in_base256(8, hdr.gid) {
+    allowed = allowed & 3
+  }
+  if !fits_in_octal(8, hdr.gid) {
+    allowed = allowed & 6
+    kv_set_indexed(pax_hdrs, pax_idx, "gid", hdr.gid.to_string())
+  }
+  match user_pax_map.get("gid") {
+    Some(pv) => if pv == hdr.gid.to_string() { kv_set_indexed(pax_hdrs, pax_idx, "gid", pv) }
+    None => ()
+  }
+  if !fits_in_base256(12, hdr.size) {
+    allowed = allowed & 3
+  }
+  if !fits_in_octal(12, hdr.size) {
+    allowed = allowed & 6
+    kv_set_indexed(pax_hdrs, pax_idx, "size", hdr.size.to_string())
+  }
+  match user_pax_map.get("size") {
+    Some(pv) => if pv == hdr.size.to_string() { kv_set_indexed(pax_hdrs, pax_idx, "size", pv) }
+    None => ()
+  }
+  if !fits_in_base256(8, hdr.devmajor) {
+    allowed = allowed & 3
+  }
+  if !fits_in_octal(8, hdr.devmajor) {
+    allowed = allowed & 4
+  }
+  if !fits_in_base256(8, hdr.devminor) {
+    allowed = allowed & 3
+  }
+  if !fits_in_octal(8, hdr.devminor) {
+    allowed = allowed & 4
+  }
+
+  // Time fields
+  if !mod_time.is_zero() {
+    if !fits_in_base256(12, mod_time.sec) {
+      allowed = allowed & 3
+    }
+    let fits_oct = fits_in_octal(12, mod_time.sec)
+    if !fits_oct {
+      allowed = allowed & 6
+    }
+    if !fits_oct || mod_time.nsec != 0 {
+      prefer_pax = true
+      kv_set_indexed(pax_hdrs, pax_idx, "mtime", format_pax_time(mod_time))
+    }
+    match user_pax_map.get("mtime") {
+      Some(pv) =>
+      if pv == format_pax_time(mod_time) {
+        kv_set_indexed(pax_hdrs, pax_idx, "mtime", pv)
+      }
+      None => ()
+    }
+  }
+  if !access_time.is_zero() {
+    if !fits_in_base256(12, access_time.sec) {
+      allowed = allowed & 3
+    }
+    allowed = allowed & 6
+    prefer_pax = true
+    kv_set_indexed(pax_hdrs, pax_idx, "atime", format_pax_time(access_time))
+  }
+  if !change_time.is_zero() {
+    if !fits_in_base256(12, change_time.sec) {
+      allowed = allowed & 3
+    }
+    allowed = allowed & 6
+    prefer_pax = true
+    kv_set_indexed(pax_hdrs, pax_idx, "ctime", format_pax_time(change_time))
+  }
+
+  if is_global {
+    allowed = allowed & 2
+  }
+  if hdr.xattrs.length() > 0 {
+    let mut i = 0
+    while i < hdr.xattrs.length() {
+      let (xk, xv) = hdr.xattrs[i]
+      kv_set_indexed(pax_hdrs, pax_idx, "SCHILY.xattr." + xk, xv)
+      i = i + 1
+    }
+    allowed = allowed & 2
+  }
+  if hdr.pax_records.length() > 0 {
+    let mut i = 0
+    while i < hdr.pax_records.length() {
+      let (pk, pv) = hdr.pax_records[i]
+      let exists = match pax_idx.get(pk) {
+        Some(_) => true
+        None => false
+      }
+      if !exists {
+        if is_global {
+          kv_set_indexed(pax_hdrs, pax_idx, pk, pv)
+        } else if !is_basic_pax_key(pk) && !str_starts_with(pk, "GNU.sparse.") {
+          kv_set_indexed(pax_hdrs, pax_idx, pk, pv)
+        }
+      }
+      i = i + 1
+    }
+    allowed = allowed & 2
+  }
+
+  // Validate PAX records
+  let mut i = 0
+  while i < pax_hdrs.length() {
+    let (pk, pv) = pax_hdrs[i]
+    if !valid_pax_record(pk, pv) {
+      return Err(TarError::InvalidHeader("invalid PAX record: " + pk))
+    }
+    i = i + 1
+  }
+
+  match hdr.format {
+    Ustar => allowed = allowed & 1
+    Pax => {
+      let want = if prefer_pax { 2 } else { 3 }
+      allowed = allowed & want
+    }
+    Gnu => allowed = allowed & 4
+    Unknown => ()
+    _ => return Err(TarError::InvalidHeader("unsupported output format"))
+  }
+
+  if allowed == 0 {
+    return Err(TarError::FieldTooLong("header cannot be encoded in requested format"))
+  }
+
+  if (allowed & 1) != 0 {
+    let mut name_prefix = ""
+    let mut name_suffix = hdr.name
+    match split_ustar_path(hdr.name) {
+      Some((p, s)) => {
+        name_prefix = p
+        name_suffix = s
+      }
+      None => ()
+    }
+    fill_template_block(
+      self,
+      hdr,
+      tf,
+      name_suffix,
+      mod_time,
+      false,
+      false,
+      false,
+      false,
+      false,
+    )
+    let mut scan_end = 345
+    if name_prefix.length() > 0 {
+      let _ = format_string_into(self.blk, 345, 155, name_prefix)
+      scan_end = 500
+    }
+    finalize_header_block_bounded(self.blk, TarFormat::Ustar, scan_end)
+    self.dirty_end = scan_end
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  } else if (allowed & 2) != 0 {
+    if pax_hdrs.length() > 0 || is_global {
+      if pax_hdrs.length() > 1 {
+        sort_kv_pairs(pax_hdrs)
+      }
+      let cap_hint = if pax_hdrs.length() > 8 { pax_hdrs.length() * 32 } else { 256 }
+      let pax_sb = StringBuilder::with_capacity(cap_hint)
+      i = 0
+      while i < pax_hdrs.length() {
+        let (pk, pv) = pax_hdrs[i]
+        write_pax_record_unchecked(pax_sb, pk, pv)
+        i = i + 1
+      }
+      let pax_str = pax_sb.to_string()
+      if pax_str.length() > 1048576 {
+        return Err(TarError::FieldTooLong("PAX header exceeds 1 MiB"))
+      }
+      let meta_name = if is_global {
+        if hdr.name.length() > 0 {
+          hdr.name
+        } else {
+          "GlobalHead.0.0"
+        }
+      } else {
+        make_pax_header_name(hdr.name)
+      }
+      let meta_flag = if is_global { type_x_global_header() } else { type_x_header() }
+      match write_raw_meta_str(self, meta_name, pax_str, false, meta_flag, TarFormat::Pax) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      if is_global {
+        self.remaining = 0L
+        self.pad = 0L
+        return Ok(())
+      }
+    }
+    fill_template_block(
+      self,
+      hdr,
+      tf,
+      hdr.name,
+      mod_time,
+      !name_ascii,
+      !link_ascii,
+      !uname_ascii,
+      !gname_ascii,
+      false,
+    )
+    finalize_header_block_bounded(self.blk, TarFormat::Pax, 345)
+    self.dirty_end = 345
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  } else {
+    if hdr.name.length() > name_size {
+      match write_raw_meta_str(
+        self,
+        "././@LongLink",
+        hdr.name,
+        true,
+        type_gnu_long_name(),
+        TarFormat::Gnu,
+      ) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    if hdr.linkname.length() > name_size {
+      match write_raw_meta_str(
+        self,
+        "././@LongLink",
+        hdr.linkname,
+        true,
+        type_gnu_long_link(),
+        TarFormat::Gnu,
+      ) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    fill_template_block(
+      self,
+      hdr,
+      tf,
+      hdr.name,
+      mod_time,
+      false,
+      false,
+      false,
+      false,
+      true,
+    )
+    let mut scan_end = 345
+    if !access_time.is_zero() {
+      let _ = format_numeric_into(self.blk, 345, 12, access_time.sec)
+      scan_end = 369
+    }
+    if !change_time.is_zero() {
+      let _ = format_numeric_into(self.blk, 357, 12, change_time.sec)
+      scan_end = 369
+    }
+    finalize_header_block_bounded(self.blk, TarFormat::Gnu, scan_end)
+    self.dirty_end = scan_end
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+
+  let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
+  self.remaining = data_sz
+  self.pad = block_padding(data_sz)
+  Ok(())
+}
+
+///| Write payload bytes for the current entry (zero-copy staged for large payloads).
+pub fn Writer::write_data(self : Writer, data : Bytes) -> Result[Unit, TarError] {
+  if self.closed {
+    return Err(TarError::WriteAfterClose)
+  }
+  let n = data.length().to_int64()
+  if n > self.remaining {
+    return Err(TarError::WriteTooLong)
+  }
+  if n > 0L {
+    match writer_append_bytes(self, data, data.length()) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    self.remaining = self.remaining - n
+  }
+  Ok(())
+}
+
+///| Finalize the archive (padding + two 512-byte zero EOF blocks) and return the encoded bytes.
+pub fn Writer::finish(self : Writer) -> Result[Bytes, TarError] {
+  if self.closed {
+    return Err(TarError::WriteAfterClose)
+  }
+  match writer_flush_pad(self) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  if self.total_bytes > max_archive_bytes - 1024L {
+    return Err(TarError::LimitExceeded("archive size exceeds 2 GiB Bytes limit"))
+  }
+  self.sb.write_string(self.zeros)
+  self.sb_len = self.sb_len + 1024
+  self.closed = true
+  if self.chunks.length() == 0 {
+    return Ok(self.sb.to_string().to_bytes())
+  }
+  self.chunks.push(self.sb.to_string().to_bytes())
+  Ok(concat_chunks(self.chunks))
+}
+
+///| Encode an array of `Entry` values into a complete TAR archive with pre-sized buffer.
+pub fn write_all(entries : Array[Entry]) -> Result[Bytes, TarError] {
+  let n = entries.length()
+  let mut est : Int64 = 1024L
+  let mut i = 0
+  while i < n {
+    let h = entries[i].header
+    let dlen = entries[i].data.length().to_int64()
+    let hdr_est : Int64 = if h.name.length() > 100 ||
+    h.linkname.length() > 100 ||
+    h.pax_records.length() > 0 ||
+    h.xattrs.length() > 0 {
+      1536L
+    } else {
+      512L
+    }
+    est = est + hdr_est + dlen + block_padding(dlen)
+    i = i + 1
+  }
+  let cap = if est > 268435456L { 268435456 } else { est.to_int() }
+  let w = Writer::with_capacity(cap)
+  i = 0
+  while i < n {
+    let ent = entries[i]
+    match w.write_header(ent.header) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    if ent.data.length() > 0 {
+      match w.write_data(ent.data) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    i = i + 1
+  }
+  w.finish()
+}

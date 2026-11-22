@@ -1,0 +1,592 @@
+///| Red-team prosecution tests for `packages/tar`.
+///|
+///| Every `p0_*` / `p1_*` / `p2_*` test asserts the behaviour of Go 1.27 `archive/tar` (verified by
+///| `diff/compare.py` against tools/go_tar, see REPORT.md). A FAILING test here is the evidence;
+///| it turns green once the package is fixed. `control_*` tests must pass: they show the harness
+///| itself (block builder, checksum, PAX records) is right.
+///|
+///| Crash / OOM evidence (heap overflow in `Writer::finish`, > 2 GiB archives) lives in `probe/`
+///| because a SIGSEGV would take this whole test binary down with it.
+
+import "tar"
+
+// ---------------------------------------------------------------------------
+// Archive builder (independent of the package under test)
+// ---------------------------------------------------------------------------
+
+///|
+fn put_ascii(b : Bytes, off : Int, s : String) -> Unit {
+  let bs = s.to_bytes()
+  let mut i = 0
+  while i < bs.length() {
+    b[off + i] = bs[i]
+    i = i + 1
+  }
+}
+
+///|
+fn put_octal(b : Bytes, off : Int, width : Int, n : Int64) -> Unit {
+  let mut v = n
+  let mut pos = off + width - 2
+  while pos >= off {
+    b[pos] = (48 + (v & 7L).to_int()).to_byte()
+    v = v >> 3
+    pos = pos - 1
+  }
+  b[off + width - 1] = (0).to_byte()
+}
+
+///|
+fn put_b256(b : Bytes, off : Int, width : Int, n : Int64) -> Unit {
+  let mut v = n
+  let mut i = off + width - 1
+  while i >= off {
+    b[i] = (v & 255L).to_int().to_byte()
+    v = v >> 8
+    i = i - 1
+  }
+  b[off] = (b[off].to_int() | 128).to_byte()
+}
+
+///|
+fn fix_checksum(b : Bytes) -> Unit {
+  let mut sum = 0
+  let mut i = 0
+  while i < 512 {
+    sum = sum + (if i >= 148 && i < 156 { 32 } else { b[i].to_int() })
+    i = i + 1
+  }
+  put_octal(b, 148, 7, sum.to_int64())
+  b[155] = (32).to_byte()
+}
+
+///| A 512-byte header block. `gnu` selects the "ustar  \0" magic, otherwise "ustar\000".
+fn block(name : String, tf : Int, size : Int64, gnu : Bool) -> Bytes {
+  let b = Bytes::new(512)
+  put_ascii(b, 0, name)
+  put_octal(b, 100, 8, 420L)
+  put_octal(b, 108, 8, 1000L)
+  put_octal(b, 116, 8, 1000L)
+  put_octal(b, 124, 12, size)
+  put_octal(b, 136, 12, 1700000000L)
+  b[156] = tf.to_byte()
+  if gnu {
+    put_ascii(b, 257, "ustar  ")
+  } else {
+    put_ascii(b, 257, "ustar")
+    put_ascii(b, 263, "00")
+  }
+  put_octal(b, 329, 8, 0L)
+  put_octal(b, 337, 8, 0L)
+  fix_checksum(b)
+  b
+}
+
+///|
+fn cat(parts : Array[Bytes]) -> Bytes {
+  let mut n = 0
+  let mut i = 0
+  while i < parts.length() {
+    n = n + parts[i].length()
+    i = i + 1
+  }
+  let out = Bytes::new(n)
+  let mut p = 0
+  i = 0
+  while i < parts.length() {
+    let x = parts[i]
+    let mut j = 0
+    while j < x.length() {
+      out[p] = x[j]
+      p = p + 1
+      j = j + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| `data` followed by NUL padding up to the next 512-byte boundary.
+fn padded(data : Bytes) -> Bytes {
+  let n = data.length()
+  let total = (n + 511) / 512 * 512
+  let out = Bytes::new(total)
+  let mut i = 0
+  while i < n {
+    out[i] = data[i]
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn trailer() -> Bytes {
+  Bytes::new(1024)
+}
+
+///|
+fn file(name : String, body : String) -> Bytes {
+  let d = body.to_bytes()
+  cat([block(name, 48, d.length().to_int64(), false), padded(d)])
+}
+
+///| A correctly length-prefixed PAX record "<len> <k>=<v>\n".
+fn rec(k : String, v : String) -> String {
+  let base = k.to_bytes().length() + v.to_bytes().length() + 3
+  let mut n = base + base.to_string().length()
+  if base + n.to_string().length() != n {
+    n = base + n.to_string().length()
+  }
+  n.to_string() + " " + k + "=" + v + "\n"
+}
+
+///| PAX extended header ('x' or 'g') carrying `records` verbatim.
+fn pax(tf : Int, records : String) -> Bytes {
+  let d = records.to_bytes()
+  cat([block("PaxHeaders.0/x", tf, d.length().to_int64(), false), padded(d)])
+}
+
+///| GNU 'L' / 'K' meta entry whose payload is exactly `payload`.
+fn gnu_long(tf : Int, payload : Bytes) -> Bytes {
+  cat([block("././@LongLink", tf, payload.length().to_int64(), true), padded(payload)])
+}
+
+///|
+fn first_entry(ar : Bytes) -> Result[tar::Entry, tar::TarError] {
+  match tar::read_all(ar) {
+    Ok(es) => if es.length() > 0 { Ok(es[0]) } else { Err(tar::TarError::UnexpectedEof) }
+    Err(e) => Err(e)
+  }
+}
+
+///|
+fn go_like_limits() -> tar::Limits {
+  tar::Limits::{
+    max_entries: 2147483647,
+    max_entry_size: 9223372036854775807L,
+    max_pax_bytes: 1048576,
+    max_pax_records: 2147483647,
+    max_sparse_holes: 1048576,
+  }
+}
+
+///| n old-GNU sparse headers: typeflag 'S', physical size 0, realsize `real`, no fragments.
+fn sparse_bomb(n : Int, real : Int64) -> Bytes {
+  let parts : Array[Bytes] = []
+  let mut i = 0
+  while i < n {
+    let b = block("bomb" + i.to_string(), 83, 0L, true)
+    put_octal(b, 483, 12, real)
+    fix_checksum(b)
+    parts.push(b)
+    i = i + 1
+  }
+  parts.push(trailer())
+  cat(parts)
+}
+
+// ---------------------------------------------------------------------------
+// Controls (must PASS)
+// ---------------------------------------------------------------------------
+
+///|
+test "control_builder_produces_archives_the_package_reads" {
+  match first_entry(cat([file("hello.txt", "hello"), trailer()])) {
+    Ok(e) => {
+      debug_assert(e.header.name == "hello.txt", "control: name")
+      debug_assert(e.data.to_string() == "hello", "control: data")
+      debug_assert(tar::format_equals(e.header.format, tar::TarFormat::Ustar), "control: USTAR")
+    }
+    Err(err) => debug_assert(false, "control archive rejected: " + tar::error_message(err))
+  }
+  // PAX record builder: same bytes as the package's own formatter.
+  match tar::format_pax_record("path", "abc") {
+    Ok(s) => debug_assert(s == rec("path", "abc"), "control: PAX record length prefix")
+    Err(_) => debug_assert(false, "control: format_pax_record")
+  }
+  match first_entry(cat([pax(120, rec("path", "pax-path")), file("raw", "hello"), trailer()])) {
+    Ok(e) => debug_assert(e.header.name == "pax-path", "control: PAX path applied")
+    Err(err) => debug_assert(false, "control PAX archive rejected: " + tar::error_message(err))
+  }
+}
+
+///|
+test "control_negative_pax_time_parsing_matches_go" {
+  // Go parsePAXTime: "-1.25" -> Unix(-1, -250000000) == (-2, 750000000); "-0.5" -> (-1, 500000000)
+  match tar::parse_pax_time("-1.25") {
+    Ok(t) => debug_assert(t.sec == -2L && t.nsec == 750000000, "-1.25 -> (-2, 750000000)")
+    Err(_) => debug_assert(false, "-1.25 rejected")
+  }
+  match tar::parse_pax_time("-0.5") {
+    Ok(t) => debug_assert(t.sec == -1L && t.nsec == 500000000, "-0.5 -> (-1, 500000000)")
+    Err(_) => debug_assert(false, "-0.5 rejected")
+  }
+}
+
+///|
+test "control_clean_extract_path_blocks_classic_traversal" {
+  let bad = [
+    "../x", "a/../../x", "a/b/..", "..", "/etc/passwd", "//server/share", "\\\\server\\share",
+    "..\\x", "C:foo", "c:\\x", "a\u{0}b", "", ".", "./",
+  ]
+  let mut i = 0
+  while i < bad.length() {
+    match tar::clean_extract_path(bad[i]) {
+      Ok(p) => debug_assert(false, "traversal accepted: " + bad[i] + " -> " + p)
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+test "control_single_zero_block_then_eof_is_clean_eof" {
+  match tar::read_all(cat([file("a", "hello"), Bytes::new(512)])) {
+    Ok(es) => debug_assert(es.length() == 1, "one entry")
+    Err(e) => debug_assert(false, "single zero block EOF rejected: " + tar::error_message(e))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P0
+// ---------------------------------------------------------------------------
+
+///| P0-2: 2 KiB in, 512 MiB out. `read_all` with the default Limits materialises every sparse
+///| entry at its full logical size and keeps all of them; n entries cost n x 256 MiB of RSS for
+///| n x 512 bytes of input. Go's Reader streams sparse holes (and a caller can skip them with
+///| Next()), so it never needs more than its copy buffer. Expected: an error, or a total that
+///| stays within one max_entry_size budget.
+test "p0_sparse_bomb_read_all_materialises_512MiB_from_2KiB" {
+  let ar = sparse_bomb(2, 268435456L)
+  debug_assert(ar.length() == 2048, "bomb archive is 2 KiB")
+  match tar::read_all(ar) {
+    Ok(es) => {
+      let mut total : Int64 = 0L
+      let mut i = 0
+      while i < es.length() {
+        total = total + es[i].data.length().to_int64()
+        i = i + 1
+      }
+      debug_assert(
+        total <= tar::Limits::default().max_entry_size,
+        "[P0-2] read_all materialised " +
+        total.to_string() +
+        " bytes from a 2048-byte archive under Limits::default()",
+      )
+    }
+    Err(_) => ()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P1
+// ---------------------------------------------------------------------------
+
+///| P1-1: Writer rounds negative sub-second mtimes in the wrong direction. Go's
+///| `ModTime.Round(time.Second)` rounds halves up (towards +inf): -0.5s -> 0, -1.5s -> -1.
+///| Pion writes -1 and -2 (and switches to a PAX header to do it).
+test "p1_writer_negative_half_second_mtime_rounding" {
+  let cases = [(-1L, 500000000L, 0L), (-2L, 500000000L, -1L), (0L, -500000000L, 0L)]
+  let mut i = 0
+  while i < cases.length() {
+    let (sec, nsec, want) = cases[i]
+    let ts = tar::Timestamp::unix(sec, nsec)
+    debug_assert(
+      ts.round_sec().sec == want,
+      "[P1-1] Timestamp(" + sec.to_string() + "s, " + nsec.to_string() + "ns).round_sec() = " +
+      ts.round_sec().sec.to_string() + ", Go Round(time.Second) = " + want.to_string(),
+    )
+    let h = tar::Header::{ ..tar::Header::new("t", 0L), mod_time: ts }
+    match tar::write_all([tar::Entry::new(h, Bytes::new(0))]) {
+      Ok(b) => {
+        debug_assert(
+          b.length() == 1536,
+          "[P1-1] Go writes a single USTAR header (1536 bytes total); Pion wrote " +
+          b.length().to_string(),
+        )
+        match first_entry(b) {
+          Ok(e) =>
+          debug_assert(
+            e.header.mod_time.sec == want,
+            "[P1-1] mtime read back " + e.header.mod_time.sec.to_string() + ", Go writes " +
+            want.to_string(),
+          )
+          Err(err) => debug_assert(false, "re-read failed: " + tar::error_message(err))
+        }
+      }
+      Err(err) => debug_assert(false, "write failed: " + tar::error_message(err))
+    }
+    i = i + 1
+  }
+}
+
+///| P1-2: an empty GNU LongName/LongLink ('L'/'K' whose payload is "" or "\0") wipes the real
+///| name/linkname. Go only applies them when non-empty (`if gnuLongName != ""`).
+test "p1_empty_gnu_longname_or_longlink_clobbers_header_name" {
+  let nul = Bytes::new(1)
+  match first_entry(cat([gnu_long(76, nul), file("raw-kept", "hello"), trailer()])) {
+    Ok(e) =>
+    debug_assert(
+      e.header.name == "raw-kept",
+      "[P1-2] L=\"\\0\": name became \"" + e.header.name + "\", Go keeps \"raw-kept\"",
+    )
+    Err(err) => debug_assert(false, "rejected: " + tar::error_message(err))
+  }
+  match first_entry(cat([gnu_long(76, Bytes::new(0)), file("raw-kept", "hello"), trailer()])) {
+    Ok(e) =>
+    debug_assert(
+      e.header.name == "raw-kept",
+      "[P1-2] L of size 0: name became \"" + e.header.name + "\", Go keeps \"raw-kept\"",
+    )
+    Err(err) => debug_assert(false, "rejected: " + tar::error_message(err))
+  }
+  let sl = block("sl", 50, 0L, false)
+  put_ascii(sl, 157, "target")
+  fix_checksum(sl)
+  match first_entry(cat([gnu_long(75, nul), sl, trailer()])) {
+    Ok(e) =>
+    debug_assert(
+      e.header.linkname == "target",
+      "[P1-2] K=\"\\0\": linkname became \"" + e.header.linkname + "\", Go keeps \"target\"",
+    )
+    Err(err) => debug_assert(false, "rejected: " + tar::error_message(err))
+  }
+}
+
+///| P1-3: `GNU.sparse.size=""` hides `GNU.sparse.realsize`. Go falls back to realsize when size
+///| is empty (100-byte file, 5 data bytes + 95 hole); Pion returns a 5-byte file.
+test "p1_empty_gnu_sparse_size_hides_realsize" {
+  let recs = rec("GNU.sparse.major", "0") +
+  rec("GNU.sparse.minor", "1") +
+  rec("GNU.sparse.size", "") +
+  rec("GNU.sparse.realsize", "100") +
+  rec("GNU.sparse.numblocks", "1") +
+  rec("GNU.sparse.map", "0,5")
+  match first_entry(cat([pax(120, recs), file("raw", "hello"), trailer()])) {
+    Ok(e) => {
+      debug_assert(e.header.size == 100L, "[P1-3] size " + e.header.size.to_string() + ", Go 100")
+      debug_assert(
+        e.data.length() == 100,
+        "[P1-3] data " + e.data.length().to_string() + " bytes, Go 100",
+      )
+    }
+    Err(err) => debug_assert(false, "[P1-3] rejected: " + tar::error_message(err))
+  }
+}
+
+///| P1-4: a header whose size runs past the end of the input is reported as a clean success when
+///| the caller uses `Reader::with_limits` without a size cap: `read_data` returns Ok(0 bytes) and
+///| the next `next()` returns EOF, so a truncated or forged archive looks complete. Go returns
+///| io.ErrUnexpectedEOF from Read. (Int64 overflow of `cur_data_start + cur_data_len`.)
+test "p1_huge_size_reads_as_empty_success_with_uncapped_limits" {
+  let b = block("ovf", 48, 0L, true)
+  put_b256(b, 124, 12, 9223372036854775552L)
+  fix_checksum(b)
+  let r = tar::Reader::with_limits(cat([b, Bytes::new(512)]), go_like_limits())
+  match r.next() {
+    Ok(Some(h)) => debug_assert(h.size == 9223372036854775552L, "size parsed")
+    _ => debug_assert(false, "header not returned")
+  }
+  match r.read_data() {
+    Ok(d) =>
+    debug_assert(
+      false,
+      "[P1-4] read_data returned Ok(" + d.length().to_string() +
+      " bytes) for a 9.2 EB entry backed by 512 bytes (Go: unexpected EOF)",
+    )
+    Err(_) => ()
+  }
+  match r.next() {
+    Ok(None) => debug_assert(false, "[P1-4] next() reports clean EOF after a truncated entry")
+    _ => ()
+  }
+  // Same through a PAX `size` record.
+  let r2 = tar::Reader::with_limits(
+    cat([pax(120, rec("size", "9223372036854775000")), file("raw", "hello"), trailer()]),
+    go_like_limits(),
+  )
+  let _ = r2.next()
+  match r2.read_data() {
+    Ok(d) =>
+    debug_assert(
+      false,
+      "[P1-4] PAX size=9223372036854775000: read_data Ok(" + d.length().to_string() + " bytes)",
+    )
+    Err(_) => ()
+  }
+}
+
+///| P1-5: a bare empty `GNU.sparse.map=` record (no version keys) turns a regular file into an
+///| error. Go only treats it as sparse 0.x when the map is non-empty.
+test "p1_empty_gnu_sparse_map_rejects_regular_file" {
+  match first_entry(cat([pax(120, rec("GNU.sparse.map", "")), file("raw-regular", "hello"), trailer()])) {
+    Ok(e) => debug_assert(e.data.to_string() == "hello", "[P1-5] data")
+    Err(err) =>
+    debug_assert(false, "[P1-5] Go reads this regular file; Pion: " + tar::error_message(err))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P2
+// ---------------------------------------------------------------------------
+
+///| P2-1: PAX numbers with a leading '+' (strconv.ParseInt accepts them).
+test "p2_pax_numbers_with_plus_sign_rejected" {
+  let cases = [
+    (rec("size", "+5"), "size=+5"),
+    (rec("uid", "+7"), "uid=+7"),
+    (rec("mtime", "+5"), "mtime=+5"),
+    ("+13 path=abc\n", "record length +13"),
+  ]
+  let mut i = 0
+  while i < cases.length() {
+    let (recs, label) = cases[i]
+    match first_entry(cat([pax(120, recs), file("raw", "hello"), trailer()])) {
+      Ok(_) => ()
+      Err(err) => debug_assert(false, "[P2-1] Go accepts " + label + "; Pion: " + tar::error_message(err))
+    }
+    i = i + 1
+  }
+}
+
+///| P2-2: old-GNU sparse header whose atime field is not a number (pre-Go1.8 writers put a
+///| USTAR prefix there). Go falls back to the prefix and still reads the sparse map (it checks
+///| the block's magic); Pion downgrades the header to Unknown first and then rejects 'S'.
+test "p2_old_gnu_sparse_with_prefix_in_atime_rejected" {
+  let b = block("s1", 83, 10L, true)
+  put_ascii(b, 345, "{")
+  put_octal(b, 386, 12, 0L)
+  put_octal(b, 398, 12, 5L)
+  put_octal(b, 410, 12, 50L)
+  put_octal(b, 422, 12, 5L)
+  put_octal(b, 483, 12, 100L)
+  fix_checksum(b)
+  match first_entry(cat([b, padded("AAAAABBBBB".to_bytes()), trailer()])) {
+    Ok(e) => {
+      debug_assert(e.header.name == "{/s1", "[P2-2] name (Go: \"{/s1\")")
+      debug_assert(e.data.length() == 100, "[P2-2] sparse expansion")
+    }
+    Err(err) => debug_assert(false, "[P2-2] Go reads it; Pion: " + tar::error_message(err))
+  }
+}
+
+///| P2-3: default Limits reject ordinary archives Go reads: 100,001 entries, and a sparse file
+///| with 70,000 fragments (Go's cap is 1<<20 fragments, Pion's default 65,536).
+test "p2_default_limits_reject_legitimate_archives" {
+  let w = tar::Writer::with_capacity(100001 * 512 + 2048)
+  let mut i = 0
+  while i < 100001 {
+    let _ = w.write_header(tar::Header::new("f" + i.to_string(), 0L))
+    i = i + 1
+  }
+  match w.finish() {
+    Ok(ar) =>
+    match tar::read_all(ar) {
+      Ok(es) => debug_assert(es.length() == 100001, "count")
+      Err(err) =>
+      debug_assert(false, "[P2-3] 100,001 empty files (Go: fine): " + tar::error_message(err))
+    }
+    Err(_) => debug_assert(false, "writer")
+  }
+  let sb = StringBuilder::new()
+  let mut k = 0
+  while k < 70000 {
+    if k > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string((k * 2).to_string() + ",1")
+    k = k + 1
+  }
+  let recs = rec("GNU.sparse.major", "0") +
+  rec("GNU.sparse.minor", "1") +
+  rec("GNU.sparse.realsize", "140000") +
+  rec("GNU.sparse.numblocks", "70000") +
+  rec("GNU.sparse.map", sb.to_string())
+  let body = Bytes::new(70000)
+  match first_entry(cat([pax(120, recs), block("raw", 48, 70000L, false), padded(body), trailer()])) {
+    Ok(e) => debug_assert(e.header.size == 140000L, "size")
+    Err(err) =>
+    debug_assert(false, "[P2-3] 70,000-fragment sparse file (Go: fine): " + tar::error_message(err))
+  }
+}
+
+///| P2-4: Writer accepts TypeXGlobalHeader with fields other than Name/PAXRecords/Xattrs; Go
+///| refuses ("only PAXRecords should be set for TypeXGlobalHeader") instead of silently dropping them.
+test "p2_writer_global_header_accepts_ignored_fields" {
+  let g = tar::Header::{
+    ..tar::Header::new("global", 10L),
+    typeflag: tar::type_x_global_header(),
+    pax_records: [("comment", "x")],
+  }
+  let w = tar::Writer::new()
+  match w.write_header(g) {
+    Ok(_) => debug_assert(false, "[P2-4] global header with size=10, mode=0644 accepted (Go: error)")
+    Err(_) => ()
+  }
+}
+
+///| P2-5: user PAXRecords for uid/gid/size whose value matches the header are kept by Go
+///| (verifyNumeric) and dropped by Pion, so the archive differs from Go's byte-for-byte.
+test "p2_writer_drops_matching_numeric_pax_records" {
+  let h = tar::Header::{ ..tar::Header::new("paxuid-match", 0L), uid: 7L, pax_records: [("uid", "7")] }
+  match tar::write_all([tar::Entry::new(h, Bytes::new(0))]) {
+    Ok(b) =>
+    match first_entry(b) {
+      Ok(e) =>
+      match e.header.pax_get("uid") {
+        Some(v) => debug_assert(v == "7", "uid record value")
+        None => debug_assert(false, "[P2-5] PAX uid=7 record dropped (Go keeps it)")
+      }
+      Err(err) => debug_assert(false, tar::error_message(err))
+    }
+    Err(err) => debug_assert(false, tar::error_message(err))
+  }
+}
+
+///| P2-6: the PAX meta entry name is not path-cleaned like Go's path.Join(dir, "PaxHeaders.0", file).
+test "p2_writer_pax_header_name_not_cleaned" {
+  let sb = StringBuilder::new()
+  sb.write_string("./")
+  let mut i = 0
+  while i < 120 {
+    sb.write_string("f")
+    i = i + 1
+  }
+  let long = sb.to_string()
+  match tar::write_all([tar::Entry::new(tar::Header::new(long, 0L), Bytes::new(0))]) {
+    Ok(b) => {
+      let got = b.slice(0, 15).to_string()
+      debug_assert(got == "PaxHeaders.0/ff", "[P2-6] x-header name starts \"" + got + "\", Go \"PaxHeaders.0/ff\"")
+    }
+    Err(err) => debug_assert(false, tar::error_message(err))
+  }
+}
+
+///| P2-7: Format reported for an entry that combines a GNU LongName with a PAX header (or a
+///| USTAR-magic base block) is GNU; Go reports FormatUnknown because the header uses both.
+test "p2_format_of_mixed_gnu_and_pax_entry" {
+  let nm = "gnu-long".to_bytes()
+  let payload = cat([nm, Bytes::new(1)])
+  match first_entry(cat([gnu_long(76, payload), pax(120, rec("comment", "c")), file("raw", "hello"), trailer()])) {
+    Ok(e) =>
+    debug_assert(
+      tar::format_equals(e.header.format, tar::TarFormat::Unknown),
+      "[P2-7] format " + tar::format_to_string(e.header.format) + ", Go <unknown>",
+    )
+    Err(err) => debug_assert(false, tar::error_message(err))
+  }
+}
+
+///| P2-8: Windows extraction hazards that Go's filepath.IsLocal (windows) rejects: NTFS alternate
+///| data streams (any ':') and reserved device names.
+test "p2_clean_extract_path_windows_devices_and_streams" {
+  let bad = ["a/b:stream", "file.txt::$DATA", "CON", "x/NUL", "aux", "COM1", "lpt1", "dir/PRN"]
+  let mut i = 0
+  while i < bad.length() {
+    match tar::clean_extract_path(bad[i]) {
+      Ok(p) => debug_assert(false, "[P2-8] accepted Windows hazard: " + bad[i] + " -> " + p)
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+}
