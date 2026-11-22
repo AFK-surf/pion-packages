@@ -6,7 +6,8 @@ Pure Pion, zero-`World`, `Send`-safe date and time library ported from Rust [`Bu
 
 - **Value-type core (`pub val struct`)**: zero heap allocation, zero RC overhead for `Date`, `Time`, `DateTime`, `Offset`, `Timestamp`, `SignedDuration`, `IsoWeekDate`, `FixedDateTime`, and `IsoDuration`.
 - **Full proleptic Gregorian calendar (`-9999-01-01` to `9999-12-31`)**:
-  - Branchless O(1) Neri-Schneider `Date::to_epoch_days` / `Date::from_epoch_days`
+  - Branchless O(1) Neri-Schneider `Date::to_epoch_days` / `Date::from_epoch_days` with exact multiply-shift reciprocals (zero hardware divisions)
+  - Zero-allocation unboxed packed civil calendar APIs (`epoch_days_to_packed_date`, `packed_date_to_epoch_days`, `packed_date_add_days`, `packed_date_to_packed_iso_week`)
   - Leap years (including 1900, 2000, 2100, 2400, year 0, negative years), `days_in_month`, `day_of_year`, `day_of_year_no_leap`
   - `Weekday` (Monday/Sunday 0-based & 1-based offsets, wrapping arithmetic)
   - `IsoWeekDate` with exact cross-year week boundaries (`2020-12-31 = 2020-W53-4`, `2021-01-01 = 2020-W53-5`, `2019-12-30 = 2020-W01-1`)
@@ -16,8 +17,8 @@ Pure Pion, zero-`World`, `Send`-safe date and time library ported from Rust [`Bu
   - Infallible `Timestamp::to_datetime(offset)` across the full supported range
 - **`SignedDuration`**:
   - Same-sign `(secs, nanos)` normalization, checked `add`/`sub`/`mul`/`div`/`neg`/`abs`, truncation, and rounding
-- **Strict zero-allocation parsing & `StringBuilder` formatting**:
-  - **RFC 3339 / ISO 8601**: 1–9 digit fractional seconds, `Z`/`z`/`+HH:MM`/`-HH:MM`, strict rejection of invalid dates, leap seconds (`:60`), out-of-range offsets, and trailing garbage
+- **Strict zero-allocation parsing & `StringBuilder`/`Bytes` formatting**:
+  - **RFC 3339 / ISO 8601**: 1–9 digit fractional seconds, `Z`/`z`/`+HH:MM`/`-HH:MM`, zero-copy slice parsers (`Timestamp::parse_rfc3339_slice`, `FixedDateTime::parse_rfc3339_slice`, `parse_rfc3339_slice_raw`), reusable buffer formatters (`Timestamp::write_rfc3339`, `Timestamp::write_rfc3339_with_offset`, `Timestamp::write_rfc3339_bytes`, `FixedDateTime::write_rfc3339`, `format_rfc3339_raw_bytes`), strict rejection of invalid dates, leap seconds (`:60`), out-of-range offsets, and trailing garbage
   - **RFC 2822** & **RFC 9110 HTTP-date (IMF-fixdate)**
   - **ISO 8601 Duration** (`PT1H30M45.5S`, `P1Y2M3DT4H5M6S`, negative durations)
 - **Dual target**: Native + `wasm32` (`packages/time/wasm_smoke`).
@@ -43,9 +44,9 @@ sh packages/time/bench/run_bench.sh
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_jiff`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 70.775 | 66.448 | 73.976 | 88.66 | 353.87 | 22.81 MiB | 0.64x |
-| `rust_jiff` | 45.161 | 42.689 | 45.385 | 138.95 | 225.80 | 7.83 MiB | 1.00x (baseline) |
-| `go_time` | 54.308 | 51.015 | 59.045 | 115.54 | 271.54 | 24.83 MiB | 0.83x |
+| `pion` | 40.610 | 39.981 | 42.562 | 154.52 | 203.05 | 13.69 MiB | 1.05x |
+| `rust_jiff` | 42.550 | 41.564 | 42.780 | 147.47 | 212.75 | 7.83 MiB | 1.00x (baseline) |
+| `go_time` | 51.183 | 48.587 | 52.453 | 122.60 | 255.92 | 24.70 MiB | 0.83x |
 
 _SHA-256 verified identical across all implementations and rounds: `1172c1540ed9d0bc5f41ddce8a7b6253977063fa640aedc9e5eb82000585685f`._
 
@@ -53,8 +54,8 @@ _SHA-256 verified identical across all implementations and rounds: `1172c1540ed9
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_jiff`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 114.697 | 105.852 | 122.772 | 57.35 | 1.69 MiB | 0.40x |
-| `rust_jiff` | 45.971 | 43.239 | 49.788 | 22.99 | 1.73 MiB | 1.00x (baseline) |
-| `go_time` | 80.517 | 76.596 | 84.090 | 40.26 | 4.38 MiB | 0.57x |
+| `pion` | 57.364 | 52.306 | 66.558 | 28.68 | 1.69 MiB | 0.73x |
+| `rust_jiff` | 41.722 | 40.993 | 44.577 | 20.86 | 1.73 MiB | 1.00x (baseline) |
+| `go_time` | 67.916 | 64.846 | 71.258 | 33.96 | 4.39 MiB | 0.61x |
 
 _SHA-256 verified identical across all implementations and rounds: `65a54274c38cb0392b001c91e26123de1ddcff28bddec4044e2e9beb72fc5024`._
