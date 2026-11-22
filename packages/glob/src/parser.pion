@@ -1,0 +1,687 @@
+///| Glob pattern parser (ported from `BurntSushi/globset/src/glob.rs`),
+///| UTF-8 codepoint utilities, strategy analysis, and `escape`.
+
+///| Character range `[lo, hi]` (inclusive Unicode scalar values).
+pub val struct CharRange {
+  pub lo : Int
+  pub hi : Int
+}
+
+///| Parsed glob AST token.
+pub enum Token {
+  Literal(Int)
+  Any
+  ZeroOrMore
+  RecursivePrefix
+  RecursiveSuffix
+  RecursiveZeroOrMore
+  Class(Bool, Array[CharRange])
+  Alternates(Array[Array[Token]])
+}
+
+///| Decode one UTF-8 codepoint from `s` starting at byte offset `pos`.
+///| Returns `(codepoint, next_pos)`. For invalid UTF-8, returns the raw byte and `pos + 1`.
+pub fn decode_utf8(s : String, pos : Int) -> (Int, Int) {
+  let n = s.length()
+  let b0 = s.code_unit_at(pos)
+  if b0 < 0x80 {
+    return (b0, pos + 1)
+  }
+  if b0 >= 0xC2 && b0 <= 0xDF && pos + 1 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    if (b1 & 0xC0) == 0x80 {
+      let cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+      return (cp, pos + 2)
+    }
+  } else if b0 >= 0xE0 && b0 <= 0xEF && pos + 2 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 {
+      let cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+      return (cp, pos + 3)
+    }
+  } else if b0 >= 0xF0 && b0 <= 0xF4 && pos + 3 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    let b3 = s.code_unit_at(pos + 3)
+    if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 {
+      let cp = ((b0 & 0x07) << 18) |
+      ((b1 & 0x3F) << 12) |
+      ((b2 & 0x3F) << 6) |
+      (b3 & 0x3F)
+      return (cp, pos + 4)
+    }
+  }
+  (b0, pos + 1)
+}
+
+///| Write a Unicode codepoint as UTF-8 bytes into a StringBuilder.
+pub fn write_codepoint_utf8(sb : StringBuilder, cp : Int) -> Unit {
+  if cp < 0x80 {
+    sb.write_byte(cp.to_byte())
+  } else if cp < 0x800 {
+    sb.write_byte((0xC0 | (cp >> 6)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else if cp < 0x10000 {
+    sb.write_byte((0xE0 | (cp >> 12)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else {
+    sb.write_byte((0xF0 | (cp >> 18)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 12) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  }
+}
+
+///| ASCII case fold: A-Z -> a-z.
+pub fn ascii_lower(cp : Int) -> Int {
+  if cp >= 65 && cp <= 90 {
+    cp + 32
+  } else {
+    cp
+  }
+}
+
+///| ASCII case swap: A-Z -> a-z, a-z -> A-Z.
+pub fn ascii_swap_case(cp : Int) -> Int {
+  if cp >= 65 && cp <= 90 {
+    cp + 32
+  } else if cp >= 97 && cp <= 122 {
+    cp - 32
+  } else {
+    cp
+  }
+}
+
+struct GlobParser {
+  glob : String
+  len : Int
+  mut pos : Int
+  mut prev : Int // -1 if None
+  mut cur : Int // -1 if None
+  mut found_unclosed_class : Bool
+  opts : GlobOptions
+  alternates_stack : Array[Int]
+  branches : Array[Array[Token]]
+}
+
+fn make_err(glob : String, kind : GlobErrorKind, msg : String) -> GlobError {
+  GlobError::{ kind, pattern: glob, message: msg }
+}
+
+fn GlobParser::bump(self : GlobParser) -> Int {
+  self.prev = self.cur
+  if self.pos >= self.len {
+    self.cur = -1
+    return -1
+  }
+  let (cp, next_pos) = decode_utf8(self.glob, self.pos)
+  self.pos = next_pos
+  self.cur = cp
+  cp
+}
+
+fn GlobParser::peek(self : GlobParser) -> Int {
+  if self.pos >= self.len {
+    return -1
+  }
+  let (cp, _) = decode_utf8(self.glob, self.pos)
+  cp
+}
+
+fn GlobParser::push_token(
+  self : GlobParser,
+  tok : Token,
+) -> Result[Unit, GlobError] {
+  let n = self.branches.length()
+  if n == 0 {
+    return Err(
+      make_err(
+        self.glob,
+        GlobErrorKind::UnopenedAlternates,
+        "unopened alternate group",
+      ),
+    )
+  }
+  self.branches[n - 1].push(tok)
+  Ok(())
+}
+
+fn GlobParser::pop_token(self : GlobParser) -> Result[Token, GlobError] {
+  let n = self.branches.length()
+  if n == 0 {
+    return Err(
+      make_err(
+        self.glob,
+        GlobErrorKind::UnopenedAlternates,
+        "unopened alternate group",
+      ),
+    )
+  }
+  match self.branches[n - 1].pop() {
+    Some(tok) => Ok(tok)
+    None =>
+    Err(
+      make_err(
+        self.glob,
+        GlobErrorKind::UnopenedAlternates,
+        "empty branch on pop",
+      ),
+    )
+  }
+}
+
+fn GlobParser::have_tokens(self : GlobParser) -> Bool {
+  let n = self.branches.length()
+  n > 0 && self.branches[n - 1].length() > 0
+}
+
+fn GlobParser::push_alternate(self : GlobParser) -> Result[Unit, GlobError] {
+  if self.alternates_stack.length() >= 100 {
+    return Err(
+      make_err(
+        self.glob,
+        GlobErrorKind::TooManyNestedAlternates,
+        "alternate groups nested too deeply",
+      ),
+    )
+  }
+  self.alternates_stack.push(self.branches.length())
+  self.branches.push(Array::new())
+  Ok(())
+}
+
+fn GlobParser::pop_alternate(self : GlobParser) -> Result[Unit, GlobError] {
+  let start = match self.alternates_stack.pop() {
+    Some(s) => s
+    None =>
+    return Err(
+      make_err(
+        self.glob,
+        GlobErrorKind::UnopenedAlternates,
+        "unopened alternate group; missing '{'",
+      ),
+    )
+  }
+  let alts : Array[Array[Token]] = Array::new()
+  let mut i = start
+  while i < self.branches.length() {
+    alts.push(self.branches[i])
+    i = i + 1
+  }
+  while self.branches.length() > start {
+    let _ = self.branches.pop()
+  }
+  self.push_token(Token::Alternates(alts))
+}
+
+fn GlobParser::parse_comma(self : GlobParser) -> Result[Unit, GlobError] {
+  if self.alternates_stack.length() == 0 {
+    self.push_token(Token::Literal(44)) // ','
+  } else {
+    self.branches.push(Array::new())
+    Ok(())
+  }
+}
+
+fn GlobParser::parse_backslash(self : GlobParser) -> Result[Unit, GlobError] {
+  if self.opts.backslash_escape {
+    let c = self.bump()
+    if c < 0 {
+      return Err(
+        make_err(self.glob, GlobErrorKind::DanglingEscape, "dangling '\\'"),
+      )
+    }
+    self.push_token(Token::Literal(c))
+  } else {
+    self.push_token(Token::Literal(92)) // '\\'
+  }
+}
+
+fn GlobParser::parse_star(self : GlobParser) -> Result[Unit, GlobError] {
+  let prev = self.prev
+  if self.peek() != 42 { // '*'
+    return self.push_token(Token::ZeroOrMore)
+  }
+  let _ = self.bump() // consume second '*'
+  if !self.have_tokens() {
+    let pk = self.peek()
+    if pk >= 0 && pk != 47 { // not EOF and not '/'
+      let _ = self.push_token(Token::ZeroOrMore)
+      return self.push_token(Token::ZeroOrMore)
+    } else {
+      let _ = self.push_token(Token::RecursivePrefix)
+      let _ = self.bump() // consume '/' or EOF
+      return Ok(())
+    }
+  }
+  if prev != 47 { // '/'
+    if self.branches.length() <= 1 || (prev != 44 && prev != 123) { // ',' or '{'
+      let _ = self.push_token(Token::ZeroOrMore)
+      return self.push_token(Token::ZeroOrMore)
+    }
+  }
+  let pk = self.peek()
+  let mut is_suffix = false
+  if pk < 0 {
+    let _ = self.bump()
+    is_suffix = true
+  } else if (pk == 44 || pk == 125) && self.branches.length() >= 2 { // ',' or '}'
+    is_suffix = true
+  } else if pk == 47 { // '/'
+    let _ = self.bump()
+    is_suffix = false
+  } else {
+    let _ = self.push_token(Token::ZeroOrMore)
+    return self.push_token(Token::ZeroOrMore)
+  }
+  let last_tok = match self.pop_token() {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  match last_tok {
+    Token::RecursivePrefix => self.push_token(Token::RecursivePrefix)
+    Token::RecursiveSuffix => self.push_token(Token::RecursiveSuffix)
+    _ =>
+    if is_suffix {
+      self.push_token(Token::RecursiveSuffix)
+    } else {
+      self.push_token(Token::RecursiveZeroOrMore)
+    }
+  }
+}
+
+fn posix_class_ranges(name : String) -> Option[Array[CharRange]] {
+  if name == "alnum" {
+    Some([
+      CharRange::{ lo: 48, hi: 57 },
+      CharRange::{ lo: 65, hi: 90 },
+      CharRange::{ lo: 97, hi: 122 },
+    ])
+  } else if name == "alpha" {
+    Some([CharRange::{ lo: 65, hi: 90 }, CharRange::{ lo: 97, hi: 122 }])
+  } else if name == "blank" {
+    Some([CharRange::{ lo: 9, hi: 9 }, CharRange::{ lo: 32, hi: 32 }])
+  } else if name == "cntrl" {
+    Some([CharRange::{ lo: 0, hi: 31 }, CharRange::{ lo: 127, hi: 127 }])
+  } else if name == "digit" {
+    Some([CharRange::{ lo: 48, hi: 57 }])
+  } else if name == "graph" {
+    Some([CharRange::{ lo: 33, hi: 126 }])
+  } else if name == "lower" {
+    Some([CharRange::{ lo: 97, hi: 122 }])
+  } else if name == "print" {
+    Some([CharRange::{ lo: 32, hi: 126 }])
+  } else if name == "punct" {
+    Some([
+      CharRange::{ lo: 33, hi: 47 },
+      CharRange::{ lo: 58, hi: 64 },
+      CharRange::{ lo: 91, hi: 96 },
+      CharRange::{ lo: 123, hi: 126 },
+    ])
+  } else if name == "space" {
+    Some([CharRange::{ lo: 9, hi: 13 }, CharRange::{ lo: 32, hi: 32 }])
+  } else if name == "upper" {
+    Some([CharRange::{ lo: 65, hi: 90 }])
+  } else if name == "xdigit" {
+    Some([
+      CharRange::{ lo: 48, hi: 57 },
+      CharRange::{ lo: 65, hi: 70 },
+      CharRange::{ lo: 97, hi: 102 },
+    ])
+  } else {
+    None
+  }
+}
+
+fn GlobParser::try_parse_posix_class(
+  self : GlobParser,
+) -> Option[Array[CharRange]] {
+  let saved_pos = self.pos
+  let saved_prev = self.prev
+  let saved_cur = self.cur
+
+  if self.bump() != 58 { // ':'
+    self.pos = saved_pos
+    self.prev = saved_prev
+    self.cur = saved_cur
+    return None
+  }
+  let sb = StringBuilder::new()
+  let mut name_len = 0
+  while true {
+    let c = self.bump()
+    if c == 58 && self.peek() == 93 { // ':' followed by ']'
+      let _ = self.bump() // consume ']'
+      return posix_class_ranges(sb.to_string())
+    } else if c >= 97 && c <= 122 && name_len < 8 {
+      sb.write_byte(c.to_byte())
+      name_len = name_len + 1
+    } else {
+      self.pos = saved_pos
+      self.prev = saved_prev
+      self.cur = saved_cur
+      return None
+    }
+  }
+  None
+}
+
+fn GlobParser::parse_class(self : GlobParser) -> Result[Unit, GlobError] {
+  let saved_pos = self.pos
+  let saved_prev = self.prev
+  let saved_cur = self.cur
+
+  let ranges : Array[CharRange] = Array::new()
+  let pk = self.peek()
+  let negated = if pk == 33 || pk == 94 { // '!' or '^'
+    let _ = self.bump()
+    true
+  } else {
+    false
+  }
+
+  let mut first = true
+  let mut in_range = false
+  while true {
+    let c = self.bump()
+    if c < 0 {
+      if self.opts.allow_unclosed_class {
+        self.pos = saved_pos
+        self.prev = saved_prev
+        self.cur = saved_cur
+        self.found_unclosed_class = true
+        return self.push_token(Token::Literal(91)) // '['
+      } else {
+        return Err(
+          make_err(
+            self.glob,
+            GlobErrorKind::UnclosedClass,
+            "unclosed character class; missing ']'",
+          ),
+        )
+      }
+    }
+    if c == 93 { // ']'
+      if first {
+        ranges.push(CharRange::{ lo: 93, hi: 93 })
+      } else {
+        break
+      }
+    } else if c == 45 { // '-'
+      if first {
+        ranges.push(CharRange::{ lo: 45, hi: 45 })
+      } else if in_range {
+        let idx = ranges.length() - 1
+        let lo = ranges[idx].lo
+        if 45 < lo {
+          return Err(
+            make_err(
+              self.glob,
+              GlobErrorKind::InvalidRange,
+              "invalid character range",
+            ),
+          )
+        }
+        ranges[idx] = CharRange::{ lo, hi: 45 }
+        in_range = false
+      } else {
+        in_range = true
+      }
+    } else if c == 91 && !in_range && self.peek() == 58 { // '[' followed by ':'
+      match self.try_parse_posix_class() {
+        Some(cr) => {
+          let mut j = 0
+          while j < cr.length() {
+            ranges.push(cr[j])
+            j = j + 1
+          }
+          in_range = false
+        }
+        None => {
+          ranges.push(CharRange::{ lo: 91, hi: 91 })
+          in_range = false
+        }
+      }
+    } else {
+      if in_range {
+        let idx = ranges.length() - 1
+        let lo = ranges[idx].lo
+        if c < lo {
+          return Err(
+            make_err(
+              self.glob,
+              GlobErrorKind::InvalidRange,
+              "invalid character range",
+            ),
+          )
+        }
+        ranges[idx] = CharRange::{ lo, hi: c }
+      } else {
+        ranges.push(CharRange::{ lo: c, hi: c })
+      }
+      in_range = false
+    }
+    first = false
+  }
+  if in_range {
+    ranges.push(CharRange::{ lo: 45, hi: 45 })
+  }
+  self.push_token(Token::Class(negated, ranges))
+}
+
+///| Parse a glob pattern string into a `Token` list.
+pub fn parse_glob_tokens(
+  pattern : String,
+  opts : GlobOptions,
+) -> Result[Array[Token], GlobError] {
+  let branches : Array[Array[Token]] = Array::new()
+  branches.push(Array::new())
+  let p = GlobParser::{
+    glob: pattern,
+    len: pattern.length(),
+    pos: 0,
+    prev: -1,
+    cur: -1,
+    found_unclosed_class: false,
+    opts,
+    alternates_stack: Array::new(),
+    branches,
+  }
+  while true {
+    let c = p.bump()
+    if c < 0 {
+      break
+    }
+    let res = if c == 63 { // '?'
+      p.push_token(Token::Any)
+    } else if c == 42 { // '*'
+      p.parse_star()
+    } else if c == 91 && !p.found_unclosed_class { // '['
+      p.parse_class()
+    } else if c == 123 { // '{'
+      p.push_alternate()
+    } else if c == 125 { // '}'
+      p.pop_alternate()
+    } else if c == 44 { // ','
+      p.parse_comma()
+    } else if c == 92 { // '\\'
+      p.parse_backslash()
+    } else {
+      p.push_token(Token::Literal(c))
+    }
+    match res {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  if p.branches.length() > 1 {
+    return Err(
+      make_err(
+        pattern,
+        GlobErrorKind::UnclosedAlternates,
+        "unclosed alternate group; missing '}'",
+      ),
+    )
+  }
+  Ok(p.branches[0])
+}
+
+///| Check whether a token sequence produces an empty match-only branch (for `empty_alternates`).
+pub fn is_empty_branch(tokens : Array[Token], opts : GlobOptions) -> Bool {
+  if tokens.length() == 0 {
+    return true
+  }
+  let mut i = 0
+  while i < tokens.length() {
+    match tokens[i] {
+      Token::Alternates(alts) => {
+        let mut any_non_empty = false
+        let mut j = 0
+        while j < alts.length() {
+          if !is_empty_branch(alts[j], opts) || opts.empty_alternates {
+            any_non_empty = true
+            break
+          }
+          j = j + 1
+        }
+        if any_non_empty {
+          return false
+        }
+      }
+      _ => return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Try to expand simple brace alternations into at most `max_branches` flat token lists
+///| so fast strategies (Extension, Literal, Prefix, Suffix) can cover `{*.rs,*.pion}` etc.
+pub fn try_expand_alternates(
+  tokens : Array[Token],
+  opts : GlobOptions,
+  max_branches : Int,
+) -> Option[Array[Array[Token]]] {
+  let mut has_alt = false
+  let mut i = 0
+  while i < tokens.length() {
+    match tokens[i] {
+      Token::Alternates(_) => {
+        has_alt = true
+        break
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  if !has_alt {
+    return None
+  }
+  let mut acc : Array[Array[Token]] = Array::new()
+  acc.push(Array::new())
+
+  i = 0
+  while i < tokens.length() {
+    match tokens[i] {
+      Token::Alternates(alts) => {
+        let active : Array[Array[Token]] = Array::new()
+        let mut j = 0
+        while j < alts.length() {
+          if !is_empty_branch(alts[j], opts) || opts.empty_alternates {
+            // Check nested alternates recursively
+            match try_expand_alternates(alts[j], opts, max_branches) {
+              Some(sub) => {
+                let mut k = 0
+                while k < sub.length() {
+                  active.push(sub[k])
+                  k = k + 1
+                }
+              }
+              None => {
+                // Verify no unexpanded nested alternates remain
+                let mut nested = false
+                let mut m = 0
+                while m < alts[j].length() {
+                  match alts[j][m] {
+                    Token::Alternates(_) => {
+                      nested = true
+                      break
+                    }
+                    _ => ()
+                  }
+                  m = m + 1
+                }
+                if nested {
+                  return None
+                }
+                active.push(alts[j])
+              }
+            }
+          }
+          j = j + 1
+        }
+        if active.length() == 0 {
+          // Empty alternation `{}` or `{,}` -> no-op
+          ()
+        } else {
+          if acc.length() * active.length() > max_branches {
+            return None
+          }
+          let next_acc : Array[Array[Token]] = Array::new()
+          let mut a = 0
+          while a < acc.length() {
+            let mut b = 0
+            while b < active.length() {
+              let combined : Array[Token] = Array::new()
+              let mut c = 0
+              while c < acc[a].length() {
+                combined.push(acc[a][c])
+                c = c + 1
+              }
+              c = 0
+              while c < active[b].length() {
+                combined.push(active[b][c])
+                c = c + 1
+              }
+              next_acc.push(combined)
+              b = b + 1
+            }
+            a = a + 1
+          }
+          acc = next_acc
+        }
+      }
+      tok => {
+        let mut a = 0
+        while a < acc.length() {
+          acc[a].push(tok)
+          a = a + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  Some(acc)
+}
+
+///| Escape glob meta-characters using bracket notation (e.g. `*` -> `[*]`).
+pub fn escape(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b == 63 || b == 42 || b == 91 || b == 93 || b == 123 || b == 125 {
+      // ? * [ ] { }
+      sb.write_byte((91).to_byte()) // '['
+      sb.write_byte(b.to_byte())
+      sb.write_byte((93).to_byte()) // ']'
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
