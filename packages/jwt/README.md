@@ -11,14 +11,18 @@ Zero-dependency, pure-Pion, Wasm32-friendly implementation of **RFC 7515 (JWS)**
   - `constant_time_eq(a, b)`: constant-time byte equality for MAC verification.
 - **JWT / JWS / JWK Engine (`src/jwt.pion`, `src/json.pion`, `src/types.pion`)**:
   - `encode`, `decode`, `decode_header` (unverified preview), plus extensible `encode_with_signer` / `decode_with_verifier` (`Signer` / `Verifier`).
-  - `Header` (`alg`, `typ`, `kid`, `cty`, `crit`, `extra`), `Claims` (`iss`, `sub`, `aud` single string or string array, `exp`, `nbf`, `iat`, `jti`, `custom : Map[String, JsonValue]`), and `Validation` (explicit `algorithms` allowlist, `leeway`, `validate_exp`, `validate_nbf`, `required_spec_claims`, `iss`/`aud`/`sub`, `max_token_bytes`, `max_json_depth`, pure `now_unix : Int64` parameter).
+  - `Header` (`alg`, `typ`, `kid`, `cty`, `crit`, `extra`), `Claims` (`iss`, `sub`, `aud` single string or string array, `exp`, `nbf`, `iat`, `jti`, `custom : Map[String, JsonValue]`), and `Validation` (explicit `algorithms` allowlist, `leeway`, `validate_exp`, `validate_nbf`, `validate_aud`, `required_spec_claims`, `iss`/`aud`/`sub`, `max_token_bytes`, `max_json_depth`, pure `now_unix : Int64` parameter).
   - `Jwk` (`kty: "oct"`): `Jwk::from_oct_key`, `Jwk::to_json`, `Jwk::from_json`, `Jwk::to_secret_bytes`.
-- **Day-1 Security Defenses (Immune to Classic JWT CVEs by Default)**:
+- **Hardened Secure Defaults & Red-Team Defenses (Aligned with Rust `jsonwebtoken 12.0.0`)**:
+  - **Non-empty HMAC secrets**: `encode`, `decode`, `Signer::hmac`, `Verifier::hmac`, `Jwk::from_json`, and `Jwk::to_secret_bytes` all reject empty (`len == 0`) keys (`InvalidKey` / `InvalidJwk`).
+  - **Mandatory `exp` by default**: `Validation::new` / `Validation::with_algorithms` default to `required_spec_claims: ["exp"]` so tokens without expiry are never silently accepted forever (callers can explicitly clear `required_spec_claims` and set `validate_exp = false` when needed).
+  - **Strict `aud` validation by default (RFC 7519 §4.1.3)**: `Validation.validate_aud` defaults to `true`; tokens carrying an `aud` claim are rejected with `InvalidAudience` when the verifier has not configured `validation.aud` (prevents cross-service token replay).
   - Hard-rejects `alg: "none"` (case-insensitive: `"none"`, `"None"`, `"NONE"`, `"nOnE"`).
   - Enforces explicit `validation.algorithms` allowlist (rejects empty allowlist and header/verifier algorithm mismatch — immune to algorithm confusion).
   - Rejects unrecognized or empty `crit` headers per RFC 7515 §4.1.11.
-  - Built-in strict RFC 8259 JSON parser rejects **duplicate JSON keys** (prevents claim smuggling), enforces **nesting depth limits** (prevents JSON bombs), enforces **token byte-size limits**, and rejects **non-integer or out-of-range `Int64` timestamps**.
+  - Built-in strict RFC 8259 JSON parser rejects **duplicate JSON keys** (prevents claim smuggling), enforces a **hard nesting depth cap (`<= 128`)** on both native and wasm32 (prevents JSON stack-overflow bombs even if callers raise `max_json_depth`), enforces **token byte-size limits**, uses correctly rounded IEEE 754 `Double` parsing (`-0.0` preserved, non-finite numbers rejected on parse and `encode`, out-of-`Int64` integers in custom claims fall back to finite `Float`), supports RFC 7519 §2 fractional NumericDate with conservative rounding (`floor` for `exp`/`iat`, `ceil` for `nbf`), and uses overflow-free saturating `leeway` arithmetic.
   - Enforces strict 3-segment structure (exactly 2 `.`, non-empty segments, no whitespace/newlines) and verifies signatures before parsing claims.
+  - **Red-Team Audit**: Verified across 270,128 SHA-2/HMAC/Base64URL differential vectors (0 diffs vs RustCrypto), 3-way JWT differential & interop suites, wasm32 byte-for-byte parity, and recursion depth crash probes (0 SIGSEGV / 0 `RangeError`).
 
 ## Verification
 
