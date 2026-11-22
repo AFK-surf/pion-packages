@@ -1,0 +1,642 @@
+///| Red-team audit driver for the Pion `tar` package.
+///|
+///| Modes (all output is the canonical audit dump format shared with tools/go and tools/rust):
+///|   dump <file> [default]          one archive -> canonical dump (Go-equivalent limits unless `default`)
+///|   trunc <file> <stride>          dump every prefix 0..n (step stride, plus n) -> "<len> <fnv> <last line>"
+///|   mutate <file> <seed> <count>   deterministic byte mutations (xorshift64) -> "<i> <fnv> <last line>"
+///|   writespec <spec> <out>         encode the header spec file with tar::Writer
+///|   readbench <file> <rounds>      full-payload read benchmark (every payload byte is hashed)
+///|   scanbench <file> <rounds>      header-only scan benchmark (payloads skipped)
+///|   writebench <spec> <rounds>     encode the spec `rounds` times in memory
+
+import "tar"
+
+///|
+fn hex_digit(v : Int) -> String {
+  "0123456789abcdef".slice(v, v + 1)
+}
+
+///|
+fn hex_bytes(b : Bytes) -> String {
+  let sb = StringBuilder::with_capacity(b.length() * 2 + 1)
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int()
+    sb.write_string(hex_digit(c >> 4))
+    sb.write_string(hex_digit(c & 15))
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn hex_str(s : String) -> String {
+  hex_bytes(s.to_bytes())
+}
+
+///|
+fn u64_hex(v : UInt64) -> String {
+  let sb = StringBuilder::with_capacity(16)
+  let mut shift = 60
+  while shift >= 0 {
+    let d = ((v >> shift.to_int64().to_uint64()) & 15UL).to_int64().to_int()
+    sb.write_string(hex_digit(d))
+    shift = shift - 4
+  }
+  sb.to_string()
+}
+
+///|
+fn fnv_bytes(h0 : UInt64, b : Bytes) -> UInt64 {
+  let mut h = h0
+  let n = b.length()
+  let mut i = 0
+  while i < n {
+    h = (h ^ b[i].to_int().to_int64().to_uint64()) * 1099511628211UL
+    i = i + 1
+  }
+  h
+}
+
+///|
+fn fnv_offset() -> UInt64 {
+  14695981039346656037UL
+}
+
+///|
+fn fmt_time(ts : tar::Timestamp) -> String {
+  if ts.is_zero() {
+    return "-"
+  }
+  let ns = ts.nsec.to_string()
+  let mut pad = ""
+  let mut k = ns.length()
+  while k < 9 {
+    pad = pad + "0"
+    k = k + 1
+  }
+  ts.sec.to_string() + "." + pad + ns
+}
+
+///|
+fn fmt_kv(pairs : Array[(String, String)]) -> String {
+  let n = pairs.length()
+  let keys : Array[(String, String)] = []
+  let mut i = 0
+  while i < n {
+    keys.push(pairs[i])
+    i = i + 1
+  }
+  // insertion sort by key bytes
+  i = 1
+  while i < n {
+    let cur = keys[i]
+    let (ck, _) = cur
+    let mut j = i - 1
+    while j >= 0 {
+      let (jk, _) = keys[j]
+      if jk > ck {
+        keys[j + 1] = keys[j]
+        j = j - 1
+      } else {
+        break
+      }
+    }
+    keys[j + 1] = cur
+    i = i + 1
+  }
+  let sb = StringBuilder::new()
+  i = 0
+  while i < n {
+    let (k, v) = keys[i]
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(hex_str(k))
+    sb.write_string("=")
+    sb.write_string(hex_str(v))
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn go_limits() -> tar::Limits {
+  tar::Limits::{
+    max_entries: 2147483647,
+    max_entry_size: 9223372036854775807L,
+    max_pax_bytes: 1048576,
+    max_pax_records: 2147483647,
+    max_sparse_holes: 2147483647,
+  }
+}
+
+///| Data larger than this is not materialised by any of the dumpers (Go/Rust/Pion alike).
+fn data_cap() -> Int64 {
+  67108864L
+}
+
+///|
+fn dump_archive(data : Bytes, limits : tar::Limits, nofmt : Bool) -> String {
+  let sb = StringBuilder::new()
+  let r = tar::Reader::with_limits(data, limits)
+  while true {
+    match r.next() {
+      Ok(Some(h)) => {
+        sb.write_string("E tf=" + h.typeflag.to_int().to_string())
+        sb.write_string(" name=" + hex_str(h.name))
+        sb.write_string(" link=" + hex_str(h.linkname))
+        sb.write_string(" size=" + h.size.to_string())
+        sb.write_string(" mode=" + h.mode.to_string())
+        sb.write_string(" uid=" + h.uid.to_string())
+        sb.write_string(" gid=" + h.gid.to_string())
+        sb.write_string(" uname=" + hex_str(h.uname))
+        sb.write_string(" gname=" + hex_str(h.gname))
+        sb.write_string(" mtime=" + fmt_time(h.mod_time))
+        sb.write_string(" atime=" + fmt_time(h.access_time))
+        sb.write_string(" ctime=" + fmt_time(h.change_time))
+        sb.write_string(
+          " dev=" + h.devmajor.to_string() + "," + h.devminor.to_string(),
+        )
+        sb.write_string(" fmt=" + (if nofmt { "?" } else { tar::format_to_string(h.format) }))
+        sb.write_string(" pax=" + fmt_kv(h.pax_records))
+        sb.write_string(" xattr=" + fmt_kv(h.xattrs))
+        sb.write_string("\n")
+        if h.size > data_cap() {
+          sb.write_string("D skip\n")
+        } else {
+          match r.read_data() {
+            Ok(b) =>
+            sb.write_string(
+              "D len=" +
+              b.length().to_string() +
+              " fnv=" +
+              u64_hex(fnv_bytes(fnv_offset(), b)) +
+              "\n",
+            )
+            Err(_) => {
+              sb.write_string("ERR data\n")
+              return sb.to_string()
+            }
+          }
+        }
+      }
+      Ok(None) => {
+        sb.write_string("EOF\n")
+        return sb.to_string()
+      }
+      Err(_) => {
+        sb.write_string("ERR next\n")
+        return sb.to_string()
+      }
+    }
+  }
+  sb.to_string()
+}
+
+///|
+fn last_line(s : String) -> String {
+  let n = s.length()
+  if n == 0 {
+    return ""
+  }
+  let mut i = n - 2
+  while i >= 0 && s.code_unit_at(i) != 10 {
+    i = i - 1
+  }
+  s.slice(i + 1, n - 1)
+}
+
+///|
+fn copy_prefix(data : Bytes, n : Int) -> Bytes {
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = data[i]
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn parse_int(s : String) -> Int64 {
+  let mut neg = false
+  let mut i = 0
+  if s.length() > 0 && s.code_unit_at(0) == 45 {
+    neg = true
+    i = 1
+  }
+  let mut acc : Int64 = 0L
+  while i < s.length() {
+    acc = acc * 10L + (s.code_unit_at(i) - 48).to_int64()
+    i = i + 1
+  }
+  if neg {
+    -acc
+  } else {
+    acc
+  }
+}
+
+///|
+fn parse_u64(s : String) -> UInt64 {
+  let mut acc : UInt64 = 0UL
+  let mut i = 0
+  while i < s.length() {
+    acc = acc * 10UL + (s.code_unit_at(i) - 48).to_int64().to_uint64()
+    i = i + 1
+  }
+  acc
+}
+
+///|
+fn xorshift(x0 : UInt64) -> UInt64 {
+  let mut x = x0
+  x = x ^ (x << 13UL)
+  x = x ^ (x >> 7UL)
+  x = x ^ (x << 17UL)
+  x
+}
+
+///| Recompute the unsigned checksum of the 512-byte block starting at `off`.
+fn fix_checksum(b : Bytes, off : Int) -> Unit {
+  let mut sum = 0
+  let mut i = 0
+  while i < 512 {
+    sum = sum + (if i >= 148 && i < 156 { 32 } else { b[off + i].to_int() })
+    i = i + 1
+  }
+  let mut pos = off + 153
+  while pos >= off + 148 {
+    b[pos] = (48 + (sum & 7)).to_byte()
+    sum = sum >> 3
+    pos = pos - 1
+  }
+  b[off + 154] = (0).to_byte()
+  b[off + 155] = (32).to_byte()
+}
+
+///|
+fn hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else {
+    c - 55
+  }
+}
+
+///|
+fn unhex(s : String) -> String {
+  if s == "-" {
+    return ""
+  }
+  let n = s.length() / 2
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = (hex_val(s.code_unit_at(2 * i)) * 16 + hex_val(s.code_unit_at(2 * i + 1))).to_byte()
+    i = i + 1
+  }
+  out.to_string()
+}
+
+///|
+fn split_on(s : String, sep : Int) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  let n = s.length()
+  while i <= n {
+    if i == n || s.code_unit_at(i) == sep {
+      out.push(s.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn parse_time(s : String) -> tar::Timestamp {
+  if s == "-" {
+    return tar::Timestamp::zero()
+  }
+  let parts = split_on(s, 58)
+  tar::Timestamp::unix(parse_int(parts[0]), parse_int(parts[1]))
+}
+
+///|
+fn parse_kv(s : String) -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  if s == "-" {
+    return out
+  }
+  let items = split_on(s, 44)
+  let mut i = 0
+  while i < items.length() {
+    let kv = split_on(items[i], 61)
+    out.push((unhex(kv[0]), unhex(kv[1])))
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn parse_fmt(s : String) -> tar::TarFormat {
+  if s == "ustar" {
+    tar::TarFormat::Ustar
+  } else if s == "pax" {
+    tar::TarFormat::Pax
+  } else if s == "gnu" {
+    tar::TarFormat::Gnu
+  } else {
+    tar::TarFormat::Unknown
+  }
+}
+
+///|
+fn pattern_data(n : Int, seed : Int) -> Bytes {
+  let b = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    b[i] = ((i * 131 + seed) & 255).to_byte()
+    i = i + 1
+  }
+  b
+}
+
+///| Spec line: H tf name link size mode uid gid uname gname mtime atime ctime devmaj devmin fmt pax xattr datalen seed
+fn parse_spec(spec : String) -> Array[(tar::Header, Bytes)] {
+  let lines = split_on(spec, 10)
+  let out : Array[(tar::Header, Bytes)] = []
+  let mut li = 0
+  while li < lines.length() {
+    let line = lines[li]
+    li = li + 1
+    if line.length() == 0 || line.code_unit_at(0) != 72 {
+      continue
+    }
+    let t = split_on(line, 32)
+    let hdr = tar::Header::{
+      typeflag: parse_int(t[1]).to_int().to_byte(),
+      name: unhex(t[2]),
+      linkname: unhex(t[3]),
+      size: parse_int(t[4]),
+      mode: parse_int(t[5]),
+      uid: parse_int(t[6]),
+      gid: parse_int(t[7]),
+      uname: unhex(t[8]),
+      gname: unhex(t[9]),
+      mod_time: parse_time(t[10]),
+      access_time: parse_time(t[11]),
+      change_time: parse_time(t[12]),
+      devmajor: parse_int(t[13]),
+      devminor: parse_int(t[14]),
+      xattrs: parse_kv(t[17]),
+      pax_records: parse_kv(t[16]),
+      format: parse_fmt(t[15]),
+    }
+    out.push((hdr, pattern_data(parse_int(t[18]).to_int(), parse_int(t[19]).to_int())))
+  }
+  out
+}
+
+///|
+fn write_spec(world : World, spec : String, out_path : String) -> Int {
+  let entries = parse_spec(spec)
+  let w = tar::Writer::new()
+  let log = StringBuilder::new()
+  let mut idx = 0
+  while idx < entries.length() {
+    let (hdr, data) = entries[idx]
+    match w.write_header(hdr) {
+      Ok(_) =>
+      if data.length() > 0 {
+        match w.write_data(data) {
+          Ok(_) => log.write_string("W " + idx.to_string() + " OK\n")
+          Err(_) => log.write_string("W " + idx.to_string() + " DATAERR\n")
+        }
+      } else {
+        log.write_string("W " + idx.to_string() + " OK\n")
+      }
+      Err(_) => log.write_string("W " + idx.to_string() + " ERR\n")
+    }
+    idx = idx + 1
+  }
+  match w.finish() {
+    Ok(b) => {
+      match fs_write_bytes(world, out_path, b) {
+        Ok(_) => ()
+        Err(_) => {
+          io_eprintln(world, "cannot write " + out_path)
+          return 2
+        }
+      }
+      log.write_string("FINISH OK\n")
+    }
+    Err(_) => log.write_string("FINISH ERR\n")
+  }
+  io_print(world, log.to_string())
+  0
+}
+
+///| Write benchmark: encode every spec entry `rounds` times into a fresh in-memory archive.
+fn write_bench(spec : String, rounds : Int) -> String {
+  let entries = parse_spec(spec)
+  let mut total : Int64 = 0L
+  let mut r = 0
+  while r < rounds {
+    let w = tar::Writer::new()
+    let mut i = 0
+    while i < entries.length() {
+      let (hdr, data) = entries[i]
+      match w.write_header(hdr) {
+        Ok(_) => ()
+        Err(_) => return "ERR header"
+      }
+      if data.length() > 0 {
+        match w.write_data(data) {
+          Ok(_) => ()
+          Err(_) => return "ERR data"
+        }
+      }
+      i = i + 1
+    }
+    match w.finish() {
+      Ok(b) => total = total + b.length().to_int64()
+      Err(_) => return "ERR finish"
+    }
+    r = r + 1
+  }
+  "bytes=" + total.to_string()
+}
+
+///| Header-only scan benchmark: names + sizes, payloads skipped (never touched) by all impls.
+fn scan_bench(data : Bytes, rounds : Int) -> String {
+  let mut entries : Int64 = 0L
+  let mut sizes : Int64 = 0L
+  let mut h = fnv_offset()
+  let mut r = 0
+  while r < rounds {
+    let rd = tar::Reader::new(data)
+    while true {
+      match rd.next() {
+        Ok(Some(hdr)) => {
+          entries = entries + 1L
+          sizes = sizes + hdr.size
+          h = fnv_bytes(h, hdr.name.to_bytes())
+        }
+        Ok(None) => break
+        Err(_) => return "ERR next"
+      }
+    }
+    r = r + 1
+  }
+  "entries=" + entries.to_string() + " sizes=" + sizes.to_string() + " fnv=" + u64_hex(h)
+}
+
+///| Full-payload read benchmark: every payload byte goes through FNV-1a (same in Go/Rust).
+fn read_bench(data : Bytes, rounds : Int) -> String {
+  let mut entries : Int64 = 0L
+  let mut payload : Int64 = 0L
+  let mut h = fnv_offset()
+  let mut r = 0
+  while r < rounds {
+    let rd = tar::Reader::new(data)
+    while true {
+      match rd.next() {
+        Ok(Some(hdr)) => {
+          entries = entries + 1L
+          h = fnv_bytes(h, hdr.name.to_bytes())
+          match rd.read_data() {
+            Ok(b) => {
+              payload = payload + b.length().to_int64()
+              h = fnv_bytes(h, b)
+            }
+            Err(_) => return "ERR data"
+          }
+        }
+        Ok(None) => break
+        Err(_) => return "ERR next"
+      }
+    }
+    r = r + 1
+  }
+  "entries=" +
+  entries.to_string() +
+  " payload=" +
+  payload.to_string() +
+  " fnv=" +
+  u64_hex(h)
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 3 {
+    io_eprintln(world, "usage: pion_tar dump|trunc|mutate|writespec|readbench <file> ...")
+    return 2
+  }
+  let nofmt = args[args.length() - 1] == "nofmt"
+  let mode = args[1]
+  let data = match fs_read_bytes(world, args[2]) {
+    Ok(b) => b
+    Err(_) => {
+      io_eprintln(world, "cannot read " + args[2])
+      return 2
+    }
+  }
+  if mode == "dump" {
+    let lim = if args.length() > 3 && args[3] == "default" {
+      tar::Limits::default()
+    } else {
+      go_limits()
+    }
+    io_print(world, dump_archive(data, lim, nofmt))
+    return 0
+  }
+  if mode == "trunc" {
+    let stride = parse_int(args[3]).to_int()
+    let n = data.length()
+    let sb = StringBuilder::new()
+    let mut l = 0
+    while l <= n {
+      let d = dump_archive(copy_prefix(data, l), go_limits(), nofmt)
+      sb.write_string(
+        l.to_string() +
+        " " +
+        u64_hex(fnv_bytes(fnv_offset(), d.to_bytes())) +
+        " " +
+        last_line(d) +
+        "\n",
+      )
+      if l == n {
+        break
+      }
+      l = l + stride
+      if l > n {
+        l = n
+      }
+    }
+    io_print(world, sb.to_string())
+    return 0
+  }
+  if mode == "mutate" {
+    let mut st = parse_u64(args[3])
+    if st == 0UL {
+      st = 88172645463325252UL
+    }
+    let count = parse_int(args[4]).to_int()
+    let n = data.length()
+    let sb = StringBuilder::new()
+    let mut i = 0
+    while i < count && n > 0 {
+      let m = copy_prefix(data, n)
+      st = xorshift(st)
+      let k = (st % 4UL).to_int64().to_int() + 1
+      let mut j = 0
+      while j < k {
+        st = xorshift(st)
+        let pos = (st % n.to_int64().to_uint64()).to_int64().to_int()
+        st = xorshift(st)
+        m[pos] = ((st & 255UL).to_int64().to_int()).to_byte()
+        st = xorshift(st)
+        if (st % 3UL) != 0UL && (pos / 512 + 1) * 512 <= n {
+          fix_checksum(m, pos / 512 * 512)
+        }
+        j = j + 1
+      }
+      let d = dump_archive(m, go_limits(), nofmt)
+      sb.write_string(
+        i.to_string() +
+        " " +
+        u64_hex(fnv_bytes(fnv_offset(), d.to_bytes())) +
+        " " +
+        last_line(d) +
+        "\n",
+      )
+      i = i + 1
+    }
+    io_print(world, sb.to_string())
+    return 0
+  }
+  if mode == "writespec" {
+    return write_spec(world, data.to_string(), args[3])
+  }
+  if mode == "writebench" {
+    io_println(world, write_bench(data.to_string(), parse_int(args[3]).to_int()))
+    return 0
+  }
+  if mode == "scanbench" {
+    io_println(world, scan_bench(data, parse_int(args[3]).to_int()))
+    return 0
+  }
+  if mode == "readbench" {
+    io_println(world, read_bench(data, parse_int(args[3]).to_int()))
+    return 0
+  }
+  io_eprintln(world, "unknown mode " + mode)
+  2
+}

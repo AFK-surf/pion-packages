@@ -1,0 +1,266 @@
+///| Crash / resource-exhaustion probes for the Pion `tar` package. Each mode runs in its own
+///| process because the failure being demonstrated is a SIGSEGV/SIGBUS or an OOM, which would
+///| take a test binary down with it. run_audit.sh measures exit status and peak RSS.
+///|
+///|   int-width             prints Int max + 1 (Pion `Int` is 32-bit: Bytes/String lengths are capped)
+///|   big4g-write           one 4.5 GiB entry written in 1.5 GiB chunks, then Writer::finish()
+///|   huge-size-read        base-256 size 0x7fffffffffffff00 with no size cap: next / read_data / next
+///|   big2g-write           one 2.25 GiB entry: finish() + Reader::new on the result
+///|   sparse-bomb <n>       read_all on n old-GNU sparse entries of 256 MiB logical size (512 B each)
+///|   emit-sparse-bomb <n> <path>   write that archive to a file (for the Go/Rust side)
+///|   sparse-stream <n>     same archive, Reader::next + read_data one entry at a time (nothing retained)
+///|   many <n>              read_all on n empty regular files, Limits::default()
+
+import "tar"
+
+///|
+fn put_octal(blk : Bytes, off : Int, width : Int, n : Int64) -> Unit {
+  let mut v = n
+  let mut pos = off + width - 2
+  while pos >= off {
+    blk[pos] = (48 + (v & 7L).to_int()).to_byte()
+    v = v >> 3
+    pos = pos - 1
+  }
+  blk[off + width - 1] = (0).to_byte()
+}
+
+///|
+fn put_ascii(blk : Bytes, off : Int, s : String) -> Unit {
+  let mut i = 0
+  while i < s.length() {
+    blk[off + i] = s.code_unit_at(i).to_byte()
+    i = i + 1
+  }
+}
+
+///|
+fn fix_checksum(b : Bytes, off : Int) -> Unit {
+  let mut sum = 0
+  let mut i = 0
+  while i < 512 {
+    sum = sum + (if i >= 148 && i < 156 { 32 } else { b[off + i].to_int() })
+    i = i + 1
+  }
+  put_octal(b, off + 148, 7, sum.to_int64())
+  b[off + 155] = (32).to_byte()
+}
+
+///| n old-GNU sparse headers ('S', size 0, realsize = `real`, no data fragments) + EOF trailer.
+pub fn sparse_bomb_archive(n : Int, real : Int64) -> Bytes {
+  let out = Bytes::new(n * 512 + 1024)
+  let mut i = 0
+  while i < n {
+    let off = i * 512
+    put_ascii(out, off, "bomb" + i.to_string())
+    put_octal(out, off + 100, 8, 420L)
+    put_octal(out, off + 108, 8, 0L)
+    put_octal(out, off + 116, 8, 0L)
+    put_octal(out, off + 124, 12, 0L)
+    put_octal(out, off + 136, 12, 0L)
+    out[off + 156] = (83).to_byte()
+    put_ascii(out, off + 257, "ustar  ")
+    put_octal(out, off + 483, 12, real)
+    fix_checksum(out, off)
+    i = i + 1
+  }
+  out
+}
+
+///|
+pub fn many_files_archive(n : Int) -> Bytes {
+  let w = tar::Writer::with_capacity(n * 512 + 2048)
+  let mut i = 0
+  while i < n {
+    match w.write_header(tar::Header::new("f" + i.to_string(), 0L)) {
+      Ok(_) => ()
+      Err(_) => return Bytes::new(0)
+    }
+    i = i + 1
+  }
+  match w.finish() {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  let mode = args[1]
+  if mode == "int-width" {
+    let x : Int = 2147483647
+    io_println(world, "Int max + 1 = " + (x + 1).to_string())
+    return 0
+  }
+  if mode == "huge-size-read" {
+    // A 2 KiB GNU archive whose base-256 size field says 0x7fffffffffffff00, read with the
+    // documented `Reader::with_limits` and limits as permissive as Go's (no size cap).
+    let ar = Bytes::new(2048)
+    put_ascii(ar, 0, "ovf")
+    put_octal(ar, 100, 8, 420L)
+    put_octal(ar, 108, 8, 0L)
+    put_octal(ar, 116, 8, 0L)
+    put_octal(ar, 136, 12, 0L)
+    ar[124] = (128).to_byte()
+    ar[128] = (127).to_byte()
+    let mut i = 129
+    while i < 135 {
+      ar[i] = (255).to_byte()
+      i = i + 1
+    }
+    ar[156] = (48).to_byte()
+    put_ascii(ar, 257, "ustar  ")
+    fix_checksum(ar, 0)
+    let lim = tar::Limits::{ ..tar::Limits::default(), max_entry_size: 9223372036854775807L }
+    let r = tar::Reader::with_limits(ar, lim)
+    match r.next() {
+      Ok(Some(h)) => io_println(world, "next OK: size=" + h.size.to_string())
+      Ok(None) => io_println(world, "next: EOF")
+      Err(e) => io_println(world, "next error: " + tar::error_message(e))
+    }
+    match r.read_data() {
+      Ok(b) => io_println(world, "read_data OK: " + b.length().to_string() + " bytes")
+      Err(e) => io_println(world, "read_data error: " + tar::error_message(e))
+    }
+    match r.next() {
+      Ok(Some(_)) => io_println(world, "second next: entry")
+      Ok(None) => io_println(world, "second next: EOF (Go: unexpected EOF)")
+      Err(e) => io_println(world, "second next error: " + tar::error_message(e))
+    }
+    return 0
+  }
+  if mode == "big4g-write" {
+    // 3 x 1.5 GiB chunks = one 4.5 GiB entry. Every chunk is a valid Bytes (< 2^31); the
+    // archive only exists inside the Writer's StringBuilder, and finish() turns it into a String.
+    let chunk = 1610612736
+    let n : Int64 = 3L * chunk.to_int64()
+    let w = tar::Writer::new()
+    match w.write_header(tar::Header::new("big.bin", n)) {
+      Ok(_) => ()
+      Err(e) => {
+        io_println(world, "header error: " + tar::error_message(e))
+        return 1
+      }
+    }
+    let data = Bytes::new(chunk)
+    let mut k = 0
+    while k < 3 {
+      match w.write_data(data) {
+        Ok(_) => ()
+        Err(e) => {
+          io_println(world, "write_data error: " + tar::error_message(e))
+          return 1
+        }
+      }
+      k = k + 1
+    }
+    io_println(world, "wrote 3 x 1.5 GiB, calling finish()")
+    match w.finish() {
+      Ok(b) => io_println(world, "OK: archive length() = " + b.length().to_string())
+      Err(e) => io_println(world, "finish error: " + tar::error_message(e))
+    }
+    return 0
+  }
+  if mode == "big2g-write" {
+    // A 2.25 GiB archive (< 4 GiB, so no heap overflow): what does the caller get back?
+    let chunk = 1207959552
+    let n : Int64 = 2L * chunk.to_int64()
+    let w = tar::Writer::new()
+    match w.write_header(tar::Header::new("big.bin", n)) {
+      Ok(_) => ()
+      Err(e) => {
+        io_println(world, "header error: " + tar::error_message(e))
+        return 1
+      }
+    }
+    let data = Bytes::new(chunk)
+    let _ = w.write_data(data)
+    let _ = w.write_data(data)
+    match w.finish() {
+      Ok(b) => {
+        io_println(world, "finish OK: length() = " + b.length().to_string() + " (expected 2415920128)")
+        match tar::Reader::new(b).next() {
+          Ok(Some(h)) => io_println(world, "re-read: size=" + h.size.to_string())
+          Ok(None) => io_println(world, "re-read: EOF")
+          Err(e) => io_println(world, "re-read error: " + tar::error_message(e))
+        }
+      }
+      Err(e) => io_println(world, "finish error: " + tar::error_message(e))
+    }
+    return 0
+  }
+  let n = if args.length() > 2 {
+    match args[2].to_int() {
+      Some(v) => v
+      None => 4
+    }
+  } else {
+    4
+  }
+  if mode == "emit-sparse-bomb" {
+    match fs_write_bytes(world, args[3], sparse_bomb_archive(n, 268435456L)) {
+      Ok(_) => return 0
+      Err(_) => return 2
+    }
+  }
+  if mode == "sparse-bomb" {
+    let ar = sparse_bomb_archive(n, 268435456L)
+    io_println(world, "archive bytes=" + ar.length().to_string())
+    match tar::read_all(ar) {
+      Ok(es) => {
+        let mut total : Int64 = 0L
+        let mut i = 0
+        while i < es.length() {
+          total = total + es[i].data.length().to_int64()
+          i = i + 1
+        }
+        io_println(
+          world,
+          "read_all OK: entries=" + es.length().to_string() + " materialized_bytes=" + total.to_string(),
+        )
+      }
+      Err(e) => io_println(world, "read_all error: " + tar::error_message(e))
+    }
+    return 0
+  }
+  if mode == "sparse-stream" {
+    let ar = sparse_bomb_archive(n, 268435456L)
+    io_println(world, "archive bytes=" + ar.length().to_string())
+    let r = tar::Reader::new(ar)
+    let mut total : Int64 = 0L
+    let mut k = 0
+    while true {
+      match r.next() {
+        Ok(Some(_)) =>
+        match r.read_data() {
+          Ok(b) => {
+            total = total + b.length().to_int64()
+            k = k + 1
+          }
+          Err(e) => {
+            io_println(world, "read_data error: " + tar::error_message(e))
+            return 0
+          }
+        }
+        Ok(None) => break
+        Err(e) => {
+          io_println(world, "next error: " + tar::error_message(e))
+          return 0
+        }
+      }
+    }
+    io_println(world, "streamed entries=" + k.to_string() + " logical_bytes=" + total.to_string())
+    return 0
+  }
+  if mode == "many" {
+    let ar = many_files_archive(n)
+    match tar::read_all(ar) {
+      Ok(es) => io_println(world, "read_all OK: entries=" + es.length().to_string())
+      Err(e) => io_println(world, "read_all error: " + tar::error_message(e))
+    }
+    return 0
+  }
+  io_eprintln(world, "unknown mode")
+  2
+}
