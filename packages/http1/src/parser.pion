@@ -1,4 +1,267 @@
-///| RFC 9112 HTTP/1.1 Request & Response incremental parser (Red-phase stubs).
+///| RFC 9112 HTTP/1.1 Request & Response incremental Sans-IO parser with
+///| Day-1 HTTP Request Smuggling defenses and 256B LUT + 4-byte window BCE hot loops.
+
+///| Validate a Transfer-Encoding header value (comma-separated list of known RFC 9112 codings).
+///| Updates `seen_chunked` and `last_was_chunked` via returned packed state:
+///| -1 = invalid, 0 = valid no chunked yet, 1 = valid chunked is currently final.
+fn validate_te_value(
+  buf : Bytes,
+  start : Int,
+  end : Int,
+  prev_state : Int,
+) -> Int {
+  if start >= end {
+    return -1
+  }
+  let mut state = prev_state
+  let mut pos = start
+  let mut count = 0
+  while true {
+    while pos < end {
+      let b = buf[pos].to_int()
+      if b == 32 || b == 9 {
+        pos = pos + 1
+      } else {
+        break
+      }
+    }
+    let tok_start = pos
+    while pos < end && buf[pos].to_int() != 44 {
+      pos = pos + 1
+    }
+    let mut tok_end = pos
+    while tok_end > tok_start {
+      let b = buf[tok_end - 1].to_int()
+      if b == 32 || b == 9 {
+        tok_end = tok_end - 1
+      } else {
+        break
+      }
+    }
+    if tok_end <= tok_start {
+      return -1
+    }
+    // If chunked was already seen, NO coding may follow it (neither duplicate chunked nor gzip).
+    if state == 1 {
+      return -1
+    }
+    let tlen = tok_end - tok_start
+    if tlen == 7 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "chunked") {
+      state = 1
+    } else if (tlen == 4 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "gzip")) ||
+    (tlen == 6 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "x-gzip")) ||
+    (tlen == 7 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "deflate")) ||
+    (tlen == 8 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "compress")) {
+      state = 0
+    } else {
+      return -1
+    }
+    count = count + 1
+    if pos >= end {
+      break
+    }
+    // Skip comma ',' and require another non-empty element after it
+    pos = pos + 1
+    if pos >= end {
+      return -1
+    }
+  }
+  if count == 0 {
+    return -1
+  }
+  state
+}
+
+///| Shared header-block parser for both HTTP/1.1 requests and responses.
+///| Returns `Ok(ParseStatus::Complete((headers, framing), next_pos))` where `next_pos` is
+///| the absolute byte index in `buf` immediately after the terminating `\r\n`.
+fn parse_headers_block(
+  buf : Bytes,
+  start : Int,
+  hdr_start : Int,
+  end : Int,
+  limits : Limits,
+  is_request : Bool,
+  version : Version,
+) -> Result[ParseStatus[(Array[Header], Framing)], HttpError] {
+  let tlut = tchar_lut
+  let vlut = header_val_lut
+  let max_hdrs = limits.max_headers
+  let max_hbytes = limits.max_header_bytes
+  let headers : Array[Header] = []
+  let mut pos = hdr_start
+  let mut has_cl = false
+  let mut cl_val : Int64 = 0L
+  let mut has_te = false
+  let mut te_state = 0
+  while true {
+    if (pos - start).to_int64() > max_hbytes {
+      return Err(HttpError::HeaderTooLarge)
+    }
+    if pos >= end {
+      return Ok(ParseStatus::Partial)
+    }
+    let b0 = buf[pos].to_int()
+    if b0 == 13 {
+      if pos + 1 >= end {
+        return Ok(ParseStatus::Partial)
+      }
+      if buf[pos + 1].to_int() == 10 {
+        pos = pos + 2
+        if (pos - start).to_int64() > max_hbytes {
+          return Err(HttpError::HeaderTooLarge)
+        }
+        break
+      }
+      return Err(HttpError::BareCrOrLf)
+    }
+    if b0 == 10 {
+      return Err(HttpError::BareCrOrLf)
+    }
+    if b0 == 32 || b0 == 9 {
+      return Err(HttpError::ObsFold)
+    }
+    if headers.length() >= max_hdrs {
+      return Err(HttpError::TooManyHeaders)
+    }
+    // Scan header name (1*tchar) with 4-byte unrolled window BCE
+    let name_start = pos
+    while pos <= end - 4 {
+      if tlut[buf[pos].to_int()] == 1 &&
+      tlut[buf[pos + 1].to_int()] == 1 &&
+      tlut[buf[pos + 2].to_int()] == 1 &&
+      tlut[buf[pos + 3].to_int()] == 1 {
+        pos = pos + 4
+      } else {
+        break
+      }
+    }
+    while pos < end && tlut[buf[pos].to_int()] == 1 {
+      pos = pos + 1
+    }
+    if (pos - start).to_int64() > max_hbytes {
+      return Err(HttpError::HeaderTooLarge)
+    }
+    if pos >= end {
+      return Ok(ParseStatus::Partial)
+    }
+    let name_end = pos
+    if name_end == name_start || buf[pos].to_int() != 58 {
+      return Err(HttpError::InvalidHeaderName)
+    }
+    pos = pos + 1 // skip ':'
+    // Skip leading OWS (SP / HTAB)
+    while pos < end {
+      let b = buf[pos].to_int()
+      if b == 32 || b == 9 {
+        pos = pos + 1
+      } else {
+        break
+      }
+    }
+    let val_start = pos
+    // Scan header value (header_val_lut) with 4-byte unrolled window BCE
+    while pos <= end - 4 {
+      if vlut[buf[pos].to_int()] == 1 &&
+      vlut[buf[pos + 1].to_int()] == 1 &&
+      vlut[buf[pos + 2].to_int()] == 1 &&
+      vlut[buf[pos + 3].to_int()] == 1 {
+        pos = pos + 4
+      } else {
+        break
+      }
+    }
+    while pos < end && vlut[buf[pos].to_int()] == 1 {
+      pos = pos + 1
+    }
+    if (pos - start).to_int64() > max_hbytes {
+      return Err(HttpError::HeaderTooLarge)
+    }
+    if pos >= end {
+      return Ok(ParseStatus::Partial)
+    }
+    let stop = buf[pos].to_int()
+    if stop == 13 {
+      if pos + 1 >= end {
+        return Ok(ParseStatus::Partial)
+      }
+      if buf[pos + 1].to_int() != 10 {
+        return Err(HttpError::BareCrOrLf)
+      }
+      let mut val_end = pos
+      while val_end > val_start {
+        let tb = buf[val_end - 1].to_int()
+        if tb == 32 || tb == 9 {
+          val_end = val_end - 1
+        } else {
+          break
+        }
+      }
+      pos = pos + 2
+      if (pos - start).to_int64() > max_hbytes {
+        return Err(HttpError::HeaderTooLarge)
+      }
+      // Fast framing & smuggling check on raw name bytes before allocating String
+      let nlen = name_end - name_start
+      if nlen == 14 &&
+      bytes_eq_lower_ascii(buf, name_start, name_end, "content-length") {
+        if has_te {
+          return Err(HttpError::AmbiguousFraming)
+        }
+        if has_cl {
+          return Err(HttpError::InvalidContentLength)
+        }
+        match parse_strict_u63_decimal(buf, val_start, val_end) {
+          Some(v) => {
+            has_cl = true
+            cl_val = v
+          }
+          None => return Err(HttpError::InvalidContentLength)
+        }
+      } else if nlen == 17 &&
+      bytes_eq_lower_ascii(buf, name_start, name_end, "transfer-encoding") {
+        if has_cl {
+          return Err(HttpError::AmbiguousFraming)
+        }
+        if is_request && version_eq(version, Version::Http10) {
+          return Err(HttpError::InvalidTransferEncoding)
+        }
+        let next_te = validate_te_value(buf, val_start, val_end, te_state)
+        if next_te < 0 {
+          return Err(HttpError::InvalidTransferEncoding)
+        }
+        has_te = true
+        te_state = next_te
+      }
+      let hname = buf.slice(name_start, name_end).to_string()
+      let hval = if val_end > val_start {
+        buf.slice(val_start, val_end).to_string()
+      } else {
+        ""
+      }
+      headers.push(Header::{ name: hname, value: hval })
+    } else if stop == 10 {
+      return Err(HttpError::BareCrOrLf)
+    } else {
+      return Err(HttpError::InvalidHeaderValue)
+    }
+  }
+  let framing = if has_te {
+    if is_request && te_state != 1 {
+      return Err(HttpError::InvalidTransferEncoding)
+    }
+    if te_state == 1 {
+      Framing::Chunked
+    } else {
+      Framing::None
+    }
+  } else if has_cl {
+    Framing::ContentLength(cl_val)
+  } else {
+    Framing::None
+  }
+  Ok(ParseStatus::Complete((headers, framing), pos))
+}
 
 ///|
 pub fn parse_request(buf : Bytes) -> Result[ParseStatus[Request], HttpError] {
@@ -20,11 +283,138 @@ pub fn parse_request_at(
   end : Int,
   limits : Limits,
 ) -> Result[ParseStatus[Request], HttpError] {
-  let _ = buf
-  let _ = start
-  let _ = end
-  let _ = limits
-  Err(HttpError::InvalidMethod)
+  let mut pos = start
+  if pos >= end {
+    return Ok(ParseStatus::Partial)
+  }
+  let tlut = tchar_lut
+  let ulut = uri_lut
+  let max_hbytes = limits.max_header_bytes
+  let max_ubytes = limits.max_uri_bytes
+  // 1. Method (1*tchar)
+  let method_start = pos
+  while pos <= end - 4 {
+    if tlut[buf[pos].to_int()] == 1 &&
+    tlut[buf[pos + 1].to_int()] == 1 &&
+    tlut[buf[pos + 2].to_int()] == 1 &&
+    tlut[buf[pos + 3].to_int()] == 1 {
+      pos = pos + 4
+    } else {
+      break
+    }
+  }
+  while pos < end && tlut[buf[pos].to_int()] == 1 {
+    pos = pos + 1
+  }
+  if (pos - start).to_int64() > max_hbytes {
+    return Err(HttpError::HeaderTooLarge)
+  }
+  if pos >= end {
+    return Ok(ParseStatus::Partial)
+  }
+  let method_end = pos
+  if method_end == method_start || buf[pos].to_int() != 32 {
+    return Err(HttpError::InvalidMethod)
+  }
+  pos = pos + 1 // skip SP
+  // 2. Request target (1*VCHAR, no SP/CTL/non-ASCII)
+  if pos >= end {
+    return Ok(ParseStatus::Partial)
+  }
+  let uri_start = pos
+  while pos <= end - 4 {
+    if ulut[buf[pos].to_int()] == 1 &&
+    ulut[buf[pos + 1].to_int()] == 1 &&
+    ulut[buf[pos + 2].to_int()] == 1 &&
+    ulut[buf[pos + 3].to_int()] == 1 {
+      pos = pos + 4
+    } else {
+      break
+    }
+  }
+  while pos < end && ulut[buf[pos].to_int()] == 1 {
+    pos = pos + 1
+  }
+  if (pos - uri_start).to_int64() > max_ubytes {
+    return Err(HttpError::UriTooLarge)
+  }
+  if (pos - start).to_int64() > max_hbytes {
+    return Err(HttpError::HeaderTooLarge)
+  }
+  if pos >= end {
+    return Ok(ParseStatus::Partial)
+  }
+  let uri_end = pos
+  if uri_end == uri_start || buf[pos].to_int() != 32 {
+    return Err(HttpError::InvalidUri)
+  }
+  pos = pos + 1 // skip SP
+  // 3. HTTP-version: "HTTP/1.0" or "HTTP/1.1" followed by CRLF
+  let rem = end - pos
+  if rem >= 1 && buf[pos].to_int() != 72 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 2 && buf[pos + 1].to_int() != 84 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 3 && buf[pos + 2].to_int() != 84 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 4 && buf[pos + 3].to_int() != 80 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 5 && buf[pos + 4].to_int() != 47 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 6 && buf[pos + 5].to_int() != 49 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 7 && buf[pos + 6].to_int() != 46 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem < 8 {
+    return Ok(ParseStatus::Partial)
+  }
+  let vminor = buf[pos + 7].to_int()
+  let version = if vminor == 49 {
+    Version::Http11
+  } else if vminor == 48 {
+    Version::Http10
+  } else {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem < 9 {
+    return Ok(ParseStatus::Partial)
+  }
+  let cr = buf[pos + 8].to_int()
+  if cr == 10 {
+    return Err(HttpError::BareCrOrLf)
+  }
+  if cr != 13 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem < 10 {
+    return Ok(ParseStatus::Partial)
+  }
+  if buf[pos + 9].to_int() != 10 {
+    return Err(HttpError::BareCrOrLf)
+  }
+  pos = pos + 10
+  // 4. Headers
+  match parse_headers_block(buf, start, pos, end, limits, true, version) {
+    Ok(ParseStatus::Complete((headers, framing), next_pos)) => {
+      let req = Request::{
+        method: buf.slice(method_start, method_end).to_string(),
+        path: buf.slice(uri_start, uri_end).to_string(),
+        version: version,
+        headers: headers,
+        framing: framing,
+      }
+      Ok(ParseStatus::Complete(req, next_pos - start))
+    }
+    Ok(ParseStatus::Partial) => Ok(ParseStatus::Partial)
+    Err(e) => Err(e)
+  }
 }
 
 ///|
@@ -47,9 +437,155 @@ pub fn parse_response_at(
   end : Int,
   limits : Limits,
 ) -> Result[ParseStatus[Response], HttpError] {
-  let _ = buf
-  let _ = start
-  let _ = end
-  let _ = limits
-  Err(HttpError::InvalidStatus)
+  let mut pos = start
+  if pos >= end {
+    return Ok(ParseStatus::Partial)
+  }
+  let vlut = header_val_lut
+  let max_hbytes = limits.max_header_bytes
+  // 1. HTTP-version: "HTTP/1.0 " or "HTTP/1.1 "
+  let rem = end - pos
+  if rem >= 1 && buf[pos].to_int() != 72 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 2 && buf[pos + 1].to_int() != 84 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 3 && buf[pos + 2].to_int() != 84 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 4 && buf[pos + 3].to_int() != 80 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 5 && buf[pos + 4].to_int() != 47 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 6 && buf[pos + 5].to_int() != 49 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem >= 7 && buf[pos + 6].to_int() != 46 {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem < 8 {
+    return Ok(ParseStatus::Partial)
+  }
+  let vminor = buf[pos + 7].to_int()
+  let version = if vminor == 49 {
+    Version::Http11
+  } else if vminor == 48 {
+    Version::Http10
+  } else {
+    return Err(HttpError::InvalidVersion)
+  }
+  if rem < 9 {
+    return Ok(ParseStatus::Partial)
+  }
+  if buf[pos + 8].to_int() != 32 {
+    return Err(HttpError::InvalidVersion)
+  }
+  pos = pos + 9
+  // 2. Status code (3 ASCII digits)
+  let srem = end - pos
+  if srem >= 1 {
+    let d0 = buf[pos].to_int()
+    if d0 < 48 || d0 > 57 {
+      return Err(HttpError::InvalidStatus)
+    }
+  }
+  if srem >= 2 {
+    let d1 = buf[pos + 1].to_int()
+    if d1 < 48 || d1 > 57 {
+      return Err(HttpError::InvalidStatus)
+    }
+  }
+  if srem >= 3 {
+    let d2 = buf[pos + 2].to_int()
+    if d2 < 48 || d2 > 57 {
+      return Err(HttpError::InvalidStatus)
+    }
+  }
+  if srem < 3 {
+    return Ok(ParseStatus::Partial)
+  }
+  let status = (buf[pos].to_int() - 48) * 100 +
+  (buf[pos + 1].to_int() - 48) * 10 +
+  (buf[pos + 2].to_int() - 48)
+  pos = pos + 3
+  // 3. Optional SP + reason-phrase + CRLF
+  if pos >= end {
+    return Ok(ParseStatus::Partial)
+  }
+  let mut reason_start = pos
+  let mut reason_end = pos
+  let sep = buf[pos].to_int()
+  if sep == 32 {
+    pos = pos + 1
+    reason_start = pos
+    while pos <= end - 4 {
+      if vlut[buf[pos].to_int()] == 1 &&
+      vlut[buf[pos + 1].to_int()] == 1 &&
+      vlut[buf[pos + 2].to_int()] == 1 &&
+      vlut[buf[pos + 3].to_int()] == 1 {
+        pos = pos + 4
+      } else {
+        break
+      }
+    }
+    while pos < end && vlut[buf[pos].to_int()] == 1 {
+      pos = pos + 1
+    }
+    if (pos - start).to_int64() > max_hbytes {
+      return Err(HttpError::HeaderTooLarge)
+    }
+    if pos >= end {
+      return Ok(ParseStatus::Partial)
+    }
+    let stop = buf[pos].to_int()
+    if stop == 13 {
+      if pos + 1 >= end {
+        return Ok(ParseStatus::Partial)
+      }
+      if buf[pos + 1].to_int() != 10 {
+        return Err(HttpError::BareCrOrLf)
+      }
+      reason_end = pos
+      pos = pos + 2
+    } else if stop == 10 {
+      return Err(HttpError::BareCrOrLf)
+    } else {
+      return Err(HttpError::InvalidReason)
+    }
+  } else if sep == 13 {
+    if pos + 1 >= end {
+      return Ok(ParseStatus::Partial)
+    }
+    if buf[pos + 1].to_int() != 10 {
+      return Err(HttpError::BareCrOrLf)
+    }
+    pos = pos + 2
+  } else if sep == 10 {
+    return Err(HttpError::BareCrOrLf)
+  } else {
+    return Err(HttpError::InvalidStatus)
+  }
+  // 4. Headers
+  match parse_headers_block(buf, start, pos, end, limits, false, version) {
+    Ok(ParseStatus::Complete((headers, framing), next_pos)) => {
+      let reason = if reason_end > reason_start {
+        buf.slice(reason_start, reason_end).to_string()
+      } else {
+        ""
+      }
+      let resp = Response::{
+        version: version,
+        status: status,
+        reason: reason,
+        headers: headers,
+        framing: framing,
+      }
+      Ok(ParseStatus::Complete(resp, next_pos - start))
+    }
+    Ok(ParseStatus::Partial) => Ok(ParseStatus::Partial)
+    Err(e) => Err(e)
+  }
 }

@@ -1,8 +1,17 @@
-///| WHATWG HTML §9.2.6 Server-Sent Events (SSE) streaming decoder (Red-phase stubs).
+///| WHATWG HTML §9.2.6 Server-Sent Events (EventSource / SSE) streaming Sans-IO decoder.
+///| Fast-path direct slice scanning with 4-byte window unrolling + full cross-chunk BOM & CRLF handling.
 
 ///|
 pub struct SseDecoder {
   pub limits : Limits
+  mut bom_state : Int // 0=start, 1=saw 0xEF, 2=saw 0xEF 0xBB, 3=done
+  mut skip_next_lf : Bool
+  mut line_buf : Bytes
+  mut line_len : Int
+  mut event_type : String
+  mut data_sb : StringBuilder
+  mut has_data : Bool
+  mut data_bytes : Int64
   mut last_id : String
   mut retry_ms : Option[Int64]
 }
@@ -14,25 +23,19 @@ pub fn SseDecoder::new() -> SseDecoder {
 
 ///|
 pub fn SseDecoder::with_limits(limits : Limits) -> SseDecoder {
-  SseDecoder::{ limits: limits, last_id: "", retry_ms: None }
-}
-
-///|
-pub fn SseDecoder::feed(
-  self : SseDecoder,
-  chunk : Bytes,
-) -> Result[Array[SseEvent], HttpError] {
-  let _ = self
-  let _ = chunk
-  Ok([])
-}
-
-///|
-pub fn SseDecoder::finish(
-  self : SseDecoder,
-) -> Result[Array[SseEvent], HttpError] {
-  let _ = self
-  Ok([])
+  SseDecoder::{
+    limits: limits,
+    bom_state: 0,
+    skip_next_lf: false,
+    line_buf: Bytes::new(256),
+    line_len: 0,
+    event_type: "",
+    data_sb: StringBuilder::new(),
+    has_data: false,
+    data_bytes: 0L,
+    last_id: "",
+    retry_ms: None,
+  }
 }
 
 ///|
@@ -47,6 +50,362 @@ pub fn SseDecoder::retry(self : SseDecoder) -> Option[Int64] {
 
 ///|
 pub fn SseDecoder::reset(self : SseDecoder) -> Unit {
+  self.bom_state = 0
+  self.skip_next_lf = false
+  self.line_len = 0
+  self.event_type = ""
+  self.data_sb = StringBuilder::new()
+  self.has_data = false
+  self.data_bytes = 0L
   self.last_id = ""
   self.retry_ms = None
+}
+
+///|
+fn SseDecoder::push_line_byte(
+  self : SseDecoder,
+  b : Byte,
+) -> Result[Unit, HttpError] {
+  if self.line_len.to_int64() >= self.limits.max_sse_line_bytes {
+    return Err(HttpError::SseLineTooLarge)
+  }
+  let cap = self.line_buf.length()
+  if self.line_len >= cap {
+    let new_cap = if cap < 256 { 256 } else { cap * 2 }
+    let mut nb = Bytes::new(new_cap)
+    let mut i = 0
+    while i < self.line_len {
+      nb[i] = self.line_buf[i]
+      i = i + 1
+    }
+    self.line_buf = nb
+  }
+  self.line_buf[self.line_len] = b
+  self.line_len = self.line_len + 1
+  Ok(())
+}
+
+///|
+fn SseDecoder::append_line_slice(
+  self : SseDecoder,
+  src : Bytes,
+  start : Int,
+  end : Int,
+) -> Result[Unit, HttpError] {
+  let add = end - start
+  if add <= 0 {
+    return Ok(())
+  }
+  let needed = self.line_len + add
+  if needed.to_int64() > self.limits.max_sse_line_bytes {
+    return Err(HttpError::SseLineTooLarge)
+  }
+  let mut cap = self.line_buf.length()
+  if needed > cap {
+    while cap < needed {
+      cap = if cap < 256 { 256 } else { cap * 2 }
+    }
+    let mut nb = Bytes::new(cap)
+    let mut i = 0
+    while i < self.line_len {
+      nb[i] = self.line_buf[i]
+      i = i + 1
+    }
+    self.line_buf = nb
+  }
+  let dst = self.line_buf
+  let off = self.line_len
+  let mut j = 0
+  while j <= add - 4 {
+    dst[off + j] = src[start + j]
+    dst[off + j + 1] = src[start + j + 1]
+    dst[off + j + 2] = src[start + j + 2]
+    dst[off + j + 3] = src[start + j + 3]
+    j = j + 4
+  }
+  while j < add {
+    dst[off + j] = src[start + j]
+    j = j + 1
+  }
+  self.line_len = needed
+  Ok(())
+}
+
+///|
+fn bytes_has_nul(buf : Bytes, start : Int, end : Int) -> Bool {
+  let mut i = start
+  while i <= end - 4 {
+    if buf[i].to_int() == 0 ||
+    buf[i + 1].to_int() == 0 ||
+    buf[i + 2].to_int() == 0 ||
+    buf[i + 3].to_int() == 0 {
+      return true
+    }
+    i = i + 4
+  }
+  while i < end {
+    if buf[i].to_int() == 0 {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Process one complete SSE line `buf[start..end]` (line ending already stripped).
+fn SseDecoder::process_line(
+  self : SseDecoder,
+  buf : Bytes,
+  start : Int,
+  end : Int,
+  out : Array[SseEvent],
+) -> Result[Unit, HttpError] {
+  let len = end - start
+  if len.to_int64() > self.limits.max_sse_line_bytes {
+    return Err(HttpError::SseLineTooLarge)
+  }
+  // Empty line -> dispatch event if data buffer is non-empty
+  if len == 0 {
+    if self.has_data {
+      let etype = if self.event_type.length() == 0 {
+        "message"
+      } else {
+        self.event_type
+      }
+      let data_str = self.data_sb.to_string()
+      out.push(
+        SseEvent::{
+          event_type: etype,
+          data: data_str,
+          last_event_id: self.last_id,
+          retry: self.retry_ms,
+        },
+      )
+      self.data_sb = StringBuilder::new()
+      self.has_data = false
+      self.data_bytes = 0L
+      self.event_type = ""
+    } else {
+      self.event_type = ""
+    }
+    return Ok(())
+  }
+  // Comment line starting with ':'
+  if buf[start].to_int() == 58 {
+    return Ok(())
+  }
+  // Find first ':'
+  let mut colon = -1
+  let mut i = start
+  while i < end {
+    if buf[i].to_int() == 58 {
+      colon = i
+      break
+    }
+    i = i + 1
+  }
+  let name_end = if colon >= 0 { colon } else { end }
+  let val_start = if colon >= 0 {
+    let vs = colon + 1
+    if vs < end && buf[vs].to_int() == 32 {
+      vs + 1
+    } else {
+      vs
+    }
+  } else {
+    end
+  }
+  let nlen = name_end - start
+  if nlen == 4 &&
+  buf[start].to_int() == 100 &&
+  buf[start + 1].to_int() == 97 &&
+  buf[start + 2].to_int() == 116 &&
+  buf[start + 3].to_int() == 97 {
+    // "data"
+    let vlen = end - val_start
+    let add_bytes = vlen.to_int64() + (if self.has_data { 1L } else { 0L })
+    if self.data_bytes + add_bytes > self.limits.max_sse_event_bytes {
+      return Err(HttpError::SseEventTooLarge)
+    }
+    if self.has_data {
+      self.data_sb.write_string("\n")
+    }
+    if vlen > 0 {
+      self.data_sb.write_string(buf.slice(val_start, end).to_string())
+    }
+    self.has_data = true
+    self.data_bytes = self.data_bytes + add_bytes
+  } else if nlen == 5 &&
+  buf[start].to_int() == 101 &&
+  buf[start + 1].to_int() == 118 &&
+  buf[start + 2].to_int() == 101 &&
+  buf[start + 3].to_int() == 110 &&
+  buf[start + 4].to_int() == 116 {
+    // "event"
+    self.event_type = if end > val_start {
+      buf.slice(val_start, end).to_string()
+    } else {
+      ""
+    }
+  } else if nlen == 2 &&
+  buf[start].to_int() == 105 &&
+  buf[start + 1].to_int() == 100 {
+    // "id" (ignore if value contains NUL byte)
+    if !bytes_has_nul(buf, val_start, end) {
+      self.last_id = if end > val_start {
+        buf.slice(val_start, end).to_string()
+      } else {
+        ""
+      }
+    }
+  } else if nlen == 5 &&
+  buf[start].to_int() == 114 &&
+  buf[start + 1].to_int() == 101 &&
+  buf[start + 2].to_int() == 116 &&
+  buf[start + 3].to_int() == 114 &&
+  buf[start + 4].to_int() == 121 {
+    // "retry" (ASCII digits only)
+    match parse_strict_u63_decimal(buf, val_start, end) {
+      Some(ms) => self.retry_ms = Some(ms)
+      None => ()
+    }
+  }
+  Ok(())
+}
+
+///|
+pub fn SseDecoder::feed(
+  self : SseDecoder,
+  chunk : Bytes,
+) -> Result[Array[SseEvent], HttpError] {
+  let out : Array[SseEvent] = []
+  let clen = chunk.length()
+  if clen == 0 {
+    return Ok(out)
+  }
+  let mut pos = 0
+  // Handle optional UTF-8 BOM (EF BB BF) at the very start of the stream
+  while pos < clen && self.bom_state < 3 {
+    let b = chunk[pos].to_int()
+    if self.bom_state == 0 {
+      if b == 0xEF {
+        self.bom_state = 1
+        pos = pos + 1
+      } else {
+        self.bom_state = 3
+      }
+    } else if self.bom_state == 1 {
+      if b == 0xBB {
+        self.bom_state = 2
+        pos = pos + 1
+      } else {
+        self.bom_state = 3
+        match self.push_line_byte((0xEF).to_byte()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+    } else if self.bom_state == 2 {
+      if b == 0xBF {
+        self.bom_state = 3
+        pos = pos + 1
+      } else {
+        self.bom_state = 3
+        match self.push_line_byte((0xEF).to_byte()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        match self.push_line_byte((0xBB).to_byte()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+    }
+  }
+  // Main scanning loop with 4-byte unrolled newline search
+  while pos < clen {
+    if self.skip_next_lf {
+      self.skip_next_lf = false
+      if chunk[pos].to_int() == 10 {
+        pos = pos + 1
+        continue
+      }
+    }
+    let seg_start = pos
+    // Scan until CR (13) or LF (10)
+    while pos <= clen - 4 {
+      let b0 = chunk[pos].to_int()
+      let b1 = chunk[pos + 1].to_int()
+      let b2 = chunk[pos + 2].to_int()
+      let b3 = chunk[pos + 3].to_int()
+      if b0 != 10 && b0 != 13 &&
+      b1 != 10 && b1 != 13 &&
+      b2 != 10 && b2 != 13 &&
+      b3 != 10 && b3 != 13 {
+        pos = pos + 4
+      } else {
+        break
+      }
+    }
+    while pos < clen {
+      let b = chunk[pos].to_int()
+      if b == 10 || b == 13 {
+        break
+      }
+      pos = pos + 1
+    }
+    if pos < clen {
+      let nl = chunk[pos].to_int()
+      if self.line_len == 0 {
+        // Zero-copy fast path directly on `chunk[seg_start..pos]`!
+        match self.process_line(chunk, seg_start, pos, out) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      } else {
+        match self.append_line_slice(chunk, seg_start, pos) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let llen = self.line_len
+        self.line_len = 0
+        match self.process_line(self.line_buf, 0, llen, out) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      if nl == 13 {
+        if pos + 1 < clen && chunk[pos + 1].to_int() == 10 {
+          pos = pos + 2
+        } else if pos + 1 >= clen {
+          self.skip_next_lf = true
+          pos = pos + 1
+        } else {
+          pos = pos + 1
+        }
+      } else {
+        pos = pos + 1
+      }
+    } else {
+      // Partial line at end of chunk: buffer it
+      match self.append_line_slice(chunk, seg_start, clen) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+  Ok(out)
+}
+
+///| End of stream: per WHATWG HTML §9.2.6, any incomplete event without a trailing blank line is discarded.
+pub fn SseDecoder::finish(
+  self : SseDecoder,
+) -> Result[Array[SseEvent], HttpError] {
+  self.line_len = 0
+  self.event_type = ""
+  self.data_sb = StringBuilder::new()
+  self.has_data = false
+  self.data_bytes = 0L
+  self.skip_next_lf = false
+  Ok([])
 }
