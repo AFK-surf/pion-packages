@@ -1,5 +1,6 @@
 ///| High-performance RFC 4180 + flexible CSV Writer.
-///| Uses 256B `FixedArray` LUTs, 4-byte unrolled `needs_quotes` scanning, and `StringBuilder::write_substring`.
+///| Uses 256B `FixedArray` LUTs, 4-byte unrolled single-pass `needs_quotes` scanning,
+///| and `StringBuilder::write_substring` / `write_string` zero-allocation hot paths.
 
 ///| Top-level read-only 256B LUT for default writer config (`,`, `"`, `\r`, `\n`).
 fn build_default_write_lut() -> FixedArray[Int] {
@@ -67,8 +68,8 @@ fn build_write_lut(cfg : CsvConfig) -> FixedArray[Int] {
   lut
 }
 
-///| Fast 4-byte unrolled check whether `s[start..end]` contains any byte needing quotes.
-fn span_needs_quotes(lut : FixedArray[Int], s : String, start : Int, end : Int) -> Bool {
+///| Fast check using a pre-loaded 256B `lut` (bind top-level `default_write_lut` once outside loop).
+fn find_first_special(lut : FixedArray[Int], s : String, start : Int, end : Int) -> Int {
   let mut i = start
   let end4 = end - 4
   while i <= end4 {
@@ -76,17 +77,26 @@ fn span_needs_quotes(lut : FixedArray[Int], s : String, start : Int, end : Int) 
       lut[s.code_unit_at(i + 1)] |
       lut[s.code_unit_at(i + 2)] |
       lut[s.code_unit_at(i + 3)]) != 0 {
-      return true
+      if lut[s.code_unit_at(i)] != 0 {
+        return i
+      }
+      if lut[s.code_unit_at(i + 1)] != 0 {
+        return i + 1
+      }
+      if lut[s.code_unit_at(i + 2)] != 0 {
+        return i + 2
+      }
+      return i + 3
     }
     i = i + 4
   }
   while i < end {
     if lut[s.code_unit_at(i)] != 0 {
-      return true
+      return i
     }
     i = i + 1
   }
-  false
+  -1
 }
 
 ///| Check whether `s[start..end]` is a valid numeric literal (for `QuoteStyle::NonNumeric`).
@@ -97,7 +107,6 @@ fn span_is_numeric(s : String, start : Int, end : Int) -> Bool {
   let mut i = start
   let first = s.code_unit_at(i)
   if first == 43 || first == 45 {
-    // '+' or '-'
     i = i + 1
     if i >= end {
       return false
@@ -114,7 +123,6 @@ fn span_is_numeric(s : String, start : Int, end : Int) -> Bool {
     }
   }
   if i < end && s.code_unit_at(i) == 46 {
-    // '.'
     i = i + 1
     while i < end {
       let b = s.code_unit_at(i)
@@ -132,7 +140,6 @@ fn span_is_numeric(s : String, start : Int, end : Int) -> Bool {
   if i < end {
     let e = s.code_unit_at(i)
     if e == 101 || e == 69 {
-      // 'e' or 'E'
       i = i + 1
       if i < end {
         let sign = s.code_unit_at(i)
@@ -158,11 +165,12 @@ fn span_is_numeric(s : String, start : Int, end : Int) -> Bool {
   i == end
 }
 
-///| Write a quoted field `s[start..end]` into `sb`, escaping internal quotes.
-fn write_quoted_span(
+///| Write a quoted field `s[start..end]` into `sb`, starting quote scan at `scan_from`.
+fn write_quoted_span_from(
   sb : StringBuilder,
   s : String,
   start : Int,
+  scan_from : Int,
   end : Int,
   quote_byte : Byte,
   quote_int : Int,
@@ -170,23 +178,36 @@ fn write_quoted_span(
   double_quote : Bool,
 ) -> Unit {
   sb.write_byte(quote_byte)
-  let mut i = start
+  let mut i = scan_from
   let mut run_start = start
   while i < end {
-    if s.code_unit_at(i) == quote_int {
-      if i > run_start {
-        sb.write_substring(s, run_start, i)
+    while i <= end - 4 {
+      if s.code_unit_at(i) == quote_int ||
+      s.code_unit_at(i + 1) == quote_int ||
+      s.code_unit_at(i + 2) == quote_int ||
+      s.code_unit_at(i + 3) == quote_int {
+        break
       }
-      if double_quote {
-        sb.write_byte(quote_byte)
-        sb.write_byte(quote_byte)
-      } else {
-        sb.write_byte(escape_byte)
-        sb.write_byte(quote_byte)
-      }
-      run_start = i + 1
+      i = i + 4
+    }
+    while i < end && s.code_unit_at(i) != quote_int {
+      i = i + 1
+    }
+    if i >= end {
+      break
+    }
+    if i > run_start {
+      sb.write_substring(s, run_start, i)
+    }
+    if double_quote {
+      sb.write_byte(quote_byte)
+      sb.write_byte(quote_byte)
+    } else {
+      sb.write_byte(escape_byte)
+      sb.write_byte(quote_byte)
     }
     i = i + 1
+    run_start = i
   }
   if run_start < end {
     sb.write_substring(s, run_start, end)
@@ -204,6 +225,10 @@ pub struct Writer {
   quote_int : Int
   escape_byte : Byte
   double_quote : Bool
+  style_tag : Int
+  term_tag : Int
+  term_byte : Byte
+  is_default_lut : Bool
   mut expected_len : Int
   mut has_expected_len : Bool
 }
@@ -224,6 +249,31 @@ pub fn Writer::with_capacity(config : CsvConfig, capacity : Int) -> Writer {
     Some(b) => b
     None => (92).to_byte()
   }
+  let s_tag = match config.quote_style {
+    QuoteStyle::Necessary => 0
+    QuoteStyle::Always => 1
+    QuoteStyle::NonNumeric => 2
+    QuoteStyle::Never => 3
+  }
+  let (t_tag, t_byte) = match config.terminator {
+    Terminator::LF => (0, (10).to_byte())
+    Terminator::CRLF => (1, (10).to_byte())
+    Terminator::Any(b) => (2, b)
+  }
+  let is_def_term = match config.terminator {
+    Terminator::LF => true
+    Terminator::CRLF => true
+    Terminator::Any(_) => false
+  }
+  let no_cmt = match config.comment {
+    None => true
+    Some(_) => false
+  }
+  let is_def_lut = config.delimiter.to_int() == 44 &&
+  config.quote.to_int() == 34 &&
+  config.double_quote &&
+  is_def_term &&
+  no_cmt
   Writer::{
     config: config,
     lut: build_write_lut(config),
@@ -233,6 +283,10 @@ pub fn Writer::with_capacity(config : CsvConfig, capacity : Int) -> Writer {
     quote_int: config.quote.to_int() & 0xFF,
     escape_byte: esc_byte,
     double_quote: config.double_quote,
+    style_tag: s_tag,
+    term_tag: t_tag,
+    term_byte: t_byte,
+    is_default_lut: is_def_lut,
     expected_len: 0,
     has_expected_len: false,
   }
@@ -240,28 +294,41 @@ pub fn Writer::with_capacity(config : CsvConfig, capacity : Int) -> Writer {
 
 ///| Write record terminator into `sb`.
 fn Writer::write_terminator(self : Writer) -> Unit {
-  match self.config.terminator {
-    Terminator::LF => self.sb.write_byte((10).to_byte())
-    Terminator::CRLF => {
-      self.sb.write_byte((13).to_byte())
-      self.sb.write_byte((10).to_byte())
-    }
-    Terminator::Any(b) => self.sb.write_byte(b)
+  if self.term_tag == 0 {
+    self.sb.write_byte((10).to_byte())
+  } else if self.term_tag == 1 {
+    self.sb.write_byte((13).to_byte())
+    self.sb.write_byte((10).to_byte())
+  } else {
+    self.sb.write_byte(self.term_byte)
   }
 }
 
 ///| Write a single field span `s[start..end]` according to `quote_style`.
 fn Writer::write_field_span(self : Writer, s : String, start : Int, end : Int) -> Unit {
-  let should_q = match self.config.quote_style {
-    QuoteStyle::Always => true
-    QuoteStyle::Never => false
-    QuoteStyle::NonNumeric => !span_is_numeric(s, start, end)
-    QuoteStyle::Necessary => span_needs_quotes(self.lut, s, start, end)
-  }
-  if should_q {
-    write_quoted_span(
+  let tag = self.style_tag
+  if tag == 0 {
+    let first = find_first_special(self.lut, s, start, end)
+    if first >= 0 {
+      write_quoted_span_from(
+        self.sb,
+        s,
+        start,
+        first,
+        end,
+        self.quote_byte,
+        self.quote_int,
+        self.escape_byte,
+        self.double_quote,
+      )
+    } else if start < end {
+      self.sb.write_substring(s, start, end)
+    }
+  } else if tag == 1 {
+    write_quoted_span_from(
       self.sb,
       s,
+      start,
       start,
       end,
       self.quote_byte,
@@ -269,6 +336,22 @@ fn Writer::write_field_span(self : Writer, s : String, start : Int, end : Int) -
       self.escape_byte,
       self.double_quote,
     )
+  } else if tag == 2 {
+    if !span_is_numeric(s, start, end) {
+      write_quoted_span_from(
+        self.sb,
+        s,
+        start,
+        start,
+        end,
+        self.quote_byte,
+        self.quote_int,
+        self.escape_byte,
+        self.double_quote,
+      )
+    } else if start < end {
+      self.sb.write_substring(s, start, end)
+    }
   } else if start < end {
     self.sb.write_substring(s, start, end)
   }
@@ -291,26 +374,171 @@ pub fn Writer::write_record(self : Writer, fields : Array[String]) -> Result[Uni
       )
     }
   }
+  let sb = self.sb
   if n == 1 && fields[0].length() == 0 {
-    // Single empty field must be quoted as "" unless QuoteStyle::Never
-    match self.config.quote_style {
-      QuoteStyle::Never => ()
-      _ => {
-        self.sb.write_byte(self.quote_byte)
-        self.sb.write_byte(self.quote_byte)
-      }
+    if self.style_tag != 3 {
+      sb.write_byte(self.quote_byte)
+      sb.write_byte(self.quote_byte)
     }
     self.write_terminator()
     return Ok(())
   }
-  let mut i = 0
-  while i < n {
-    if i > 0 {
-      self.sb.write_byte(self.delim_byte)
+  let delim = self.delim_byte
+  if self.style_tag == 0 && self.is_default_lut {
+    // Ultra-hot path: default RFC 4180 QuoteStyle::Necessary (all specials <= 44: ',', '"', '\n', '\r')
+    let qbyte = self.quote_byte
+    let esc = self.escape_byte
+    if n > 0 {
+      let f0 = fields[0]
+      let fl0 = f0.length()
+      let mut j0 = 0
+      let mut sp0 = -1
+      while j0 <= fl0 - 4 {
+        if f0.code_unit_at(j0) <= 44 ||
+        f0.code_unit_at(j0 + 1) <= 44 ||
+        f0.code_unit_at(j0 + 2) <= 44 ||
+        f0.code_unit_at(j0 + 3) <= 44 {
+          break
+        }
+        j0 = j0 + 4
+      }
+      while j0 < fl0 {
+        let b = f0.code_unit_at(j0)
+        if b <= 44 && (b == 44 || b == 34 || b == 10 || b == 13) {
+          sp0 = j0
+          break
+        }
+        j0 = j0 + 1
+      }
+      if sp0 >= 0 {
+        write_quoted_span_from(sb, f0, 0, sp0, fl0, qbyte, 34, esc, true)
+      } else if fl0 > 0 {
+        sb.write_string(f0)
+      }
+      let mut i = 1
+      while i < n {
+        sb.write_byte(delim)
+        let f = fields[i]
+        let flen = f.length()
+        let mut j = 0
+        let mut special = -1
+        while j <= flen - 4 {
+          if f.code_unit_at(j) <= 44 ||
+          f.code_unit_at(j + 1) <= 44 ||
+          f.code_unit_at(j + 2) <= 44 ||
+          f.code_unit_at(j + 3) <= 44 {
+            break
+          }
+          j = j + 4
+        }
+        while j < flen {
+          let b = f.code_unit_at(j)
+          if b <= 44 && (b == 44 || b == 34 || b == 10 || b == 13) {
+            special = j
+            break
+          }
+          j = j + 1
+        }
+        if special >= 0 {
+          write_quoted_span_from(sb, f, 0, special, flen, qbyte, 34, esc, true)
+        } else if flen > 0 {
+          sb.write_string(f)
+        }
+        i = i + 1
+      }
     }
-    let f = fields[i]
-    self.write_field_span(f, 0, f.length())
-    i = i + 1
+    if self.term_tag == 0 {
+      sb.write_byte((10).to_byte())
+    } else {
+      self.write_terminator()
+    }
+    return Ok(())
+  } else if self.style_tag == 0 {
+    // Ultra-hot path: QuoteStyle::Necessary with inlined 4-byte unrolled scan + zero-slice write_string
+    let lut = self.lut
+    let qbyte = self.quote_byte
+    let qint = self.quote_int
+    let esc = self.escape_byte
+    let dbl = self.double_quote
+    if n > 0 {
+      let f0 = fields[0]
+      let fl0 = f0.length()
+      let mut j0 = 0
+      let mut sp0 = -1
+      while j0 <= fl0 - 4 {
+        if (lut[f0.code_unit_at(j0)] |
+          lut[f0.code_unit_at(j0 + 1)] |
+          lut[f0.code_unit_at(j0 + 2)] |
+          lut[f0.code_unit_at(j0 + 3)]) != 0 {
+          sp0 = j0
+          break
+        }
+        j0 = j0 + 4
+      }
+      if sp0 < 0 {
+        while j0 < fl0 {
+          if lut[f0.code_unit_at(j0)] != 0 {
+            sp0 = j0
+            break
+          }
+          j0 = j0 + 1
+        }
+      }
+      if sp0 >= 0 {
+        write_quoted_span_from(sb, f0, 0, sp0, fl0, qbyte, qint, esc, dbl)
+      } else if fl0 > 0 {
+        sb.write_string(f0)
+      }
+      let mut i = 1
+      while i < n {
+        sb.write_byte(delim)
+        let f = fields[i]
+        let flen = f.length()
+        let mut j = 0
+        let mut special = -1
+        while j <= flen - 4 {
+          if (lut[f.code_unit_at(j)] |
+            lut[f.code_unit_at(j + 1)] |
+            lut[f.code_unit_at(j + 2)] |
+            lut[f.code_unit_at(j + 3)]) != 0 {
+            special = j
+            break
+          }
+          j = j + 4
+        }
+        if special < 0 {
+          while j < flen {
+            if lut[f.code_unit_at(j)] != 0 {
+              special = j
+              break
+            }
+            j = j + 1
+          }
+        }
+        if special >= 0 {
+          write_quoted_span_from(sb, f, 0, special, flen, qbyte, qint, esc, dbl)
+        } else if flen > 0 {
+          sb.write_string(f)
+        }
+        i = i + 1
+      }
+    }
+    if self.term_tag == 0 {
+      sb.write_byte((10).to_byte())
+    } else {
+      self.write_terminator()
+    }
+    return Ok(())
+  } else {
+    let mut i = 0
+    while i < n {
+      if i > 0 {
+        sb.write_byte(delim)
+      }
+      let f = fields[i]
+      self.write_field_span(f, 0, f.length())
+      i = i + 1
+    }
   }
   self.write_terminator()
   Ok(())
@@ -336,20 +564,18 @@ pub fn Writer::write_csv_record(self : Writer, rec : Record) -> Result[Unit, Csv
   let s = rec.buf
   let spans = rec.spans
   if n == 1 && spans[0] == spans[1] {
-    match self.config.quote_style {
-      QuoteStyle::Never => ()
-      _ => {
-        self.sb.write_byte(self.quote_byte)
-        self.sb.write_byte(self.quote_byte)
-      }
+    if self.style_tag != 3 {
+      self.sb.write_byte(self.quote_byte)
+      self.sb.write_byte(self.quote_byte)
     }
     self.write_terminator()
     return Ok(())
   }
+  let delim = self.delim_byte
   let mut i = 0
   while i < n {
     if i > 0 {
-      self.sb.write_byte(self.delim_byte)
+      self.sb.write_byte(delim)
     }
     let base = i << 1
     self.write_field_span(s, spans[base], spans[base + 1])
