@@ -9,11 +9,11 @@ Pure Pion, zero-`World`, `Send`-safe high-performance glob, multi-pattern `GlobS
   - Full `GlobOptions`: `case_insensitive`, `literal_separator`, `backslash_escape`, `empty_alternates`, `allow_unclosed_class`.
   - Strict compile-time `Result[T, GlobError]` errors for unclosed `[`, invalid ranges `[z-a]`, unclosed/unopened `{}`/`}`, nesting depth > 100, and dangling `\`.
 - **Strategic `GlobSet` multi-pattern acceleration**:
-  - Zero-allocation open-addressing FNV-1a hash tables (`StrTable`) with 64-bit length bitmask prefilters for `Extension`, `BasenameLiteral`, and `Literal` patterns.
-  - Compact `ByteTrie` with 128-entry ASCII root jump table for `Prefix` and reversed `Suffix` patterns.
-  - Controlled brace expansion (≤ 16 branches) so patterns like `**/*.{js,jsx,mjs}` and `{target,dist,build}/**` route directly into O(1) fast tables.
-  - `RequiredExtension` buckets merged into unified multi-pattern automata.
-  - Precompiled ASCII DFA fast path (O(1) array load per byte with dead-state early exit) backed by a linear-time bit-parallel Thompson NFA (O(States × PathLen), zero backtracking, immune to ReDoS).
+  - Single-pass backward basename scan (`make_candidate`) computing both `last_slash` and `last_dot` in one pass.
+  - Unified zero-allocation `ExtTable` (single FNV-1a hash & probe per path serving both pure `*.ext` and `RequiredExtension` multi-DFAs) + `StrTable` with `min_len`/`max_len`, 64-bit length bitmask, and stored hash prefilters for `BasenameLiteral` and `Literal`.
+  - Flat pre-multiplied 128-entry-per-state ASCII `ByteTrie` for zero-pointer-chase `Prefix` and reversed `Suffix` matching.
+  - Controlled brace & small character-class expansion (≤ 16 branches, e.g., `**/*.{js,jsx,mjs}`, `**/*.py[cod]`, `{target,dist,build}/**`) routing directly into O(1) tables.
+  - Precompiled ASCII DFA with pre-multiplied state offsets (O(1) array load per byte, dead-state early exit) backed by a linear-time bit-parallel Thompson NFA (O(States × PathLen), zero backtracking, immune to ReDoS).
 - **Complete `.gitignore` semantics**:
   - Comments (`#`), blank lines, UTF-8 BOM, CRLF/LF, trailing unescaped space trimming (`foo\   ` → `foo `), escaped leading `\#` / `\!`, bare `!` no-op, anchoring (`/foo`, `dir/file`), directory-only rules (`build/`), negation override (`!important.log`), root prefix stripping, and case-insensitive mode.
   - `matched(path, is_dir) -> MatchResult` (`None` / `Ignore(line)` / `Whitelist(line)`), `is_ignored(path, is_dir)`, `matched_path_or_any_parents`, top-down git parent-directory exclusion (`is_ignored_with_parents`), and multi-level nested `.gitignore` priority (`GitignoreStack`).
@@ -56,14 +56,14 @@ pionc build --target wasm32 -o /tmp/glob_wasm_smoke.wasm packages/glob/wasm_smok
 Run via:
 
 ```sh
-sh packages/glob/bench/run_bench.sh 10
+sh packages/glob/bench/run_bench.sh
 ```
 
-### Workload: 50,000 Monorepo Paths × 80 `GlobSet` Rules × 10 iters (500,000 `matches_into` calls)
+### Workload: 50,000 Monorepo Paths × 80 `GlobSet` Rules × 20 iters (1,000,000 `matches_into` calls)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_globset`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 205.746 | 178.726 | 226.584 | 69.48 | 411.49 | 8.05 MiB | 0.75x |
-| `rust_globset` | 154.321 | 146.373 | 184.252 | 92.63 | 308.64 | 5.88 MiB | 1.00x (baseline) |
+| `pion` | 123.861 | 119.863 | 136.977 | 230.83 | 123.86 | 8.23 MiB | **2.48x** |
+| `rust_globset` | 307.405 | 290.437 | 438.753 | 93.01 | 307.40 | 5.86 MiB | 1.00x (baseline) |
 
-_SHA-256 verified identical across all implementations and rounds: `3afdbf9b5b5b7f5edbb60491c7983623946bfbd40c19838e665e0d4a4c7d7ce1`._
+_SHA-256 verified identical across all implementations and rounds: `2d9a2ef2bb80d5efd6926bf1bd5024be7f929dd793d5d4ce76a90316496fe91f`._

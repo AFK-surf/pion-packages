@@ -9,7 +9,7 @@ OUT_DIR="/tmp/pion-glob-bench"
 BIN_DIR="$OUT_DIR/bin"
 PATHS_FILE="$OUT_DIR/paths_50k.txt"
 RULES_FILE="$OUT_DIR/rules_80.txt"
-ITERS="${1:-10}"
+ITERS="${1:-20}"
 
 mkdir -p "$BIN_DIR"
 
