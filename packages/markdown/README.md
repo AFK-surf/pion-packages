@@ -19,9 +19,9 @@ Idiomatic pure Pion port of Rust [`pulldown-cmark`](https://github.com/pulldown-
 | Smart Punctuation (`smart_punct.rs`) | **16 / 16** | O(N) single-pass curly quotes, em/en dashes, ellipses |
 | CJK-Friendly Emphasis (`cjk_friendly_emphasis.rs` + toggle) | **11 / 11** | Full Unicode 17 CJK ranges, IVS & variation selectors |
 | Pathological & Extended Tests (`extensions_test.pion` + 10k stress) | **7 / 7** | Iterative block rendering (50k+ nesting, 0 SIGSEGV), O(N) inline parsing, `parse_with_offsets`, footnotes, YAML/Pluses frontmatter |
-| Red-Team P0 / P1 Audit (`audit/tests/redteam_test.pion`) | **P0 6/6, P1 41/41, OK 8/8** | 0 SIGSEGV, 0 direct-vs-parse divergences across 63,864 differential cases |
+| Red-Team P0 / P1 Audit (`audit/tests/redteam_test.pion`) | **P0 6/6, P1 41/41, OK 8/8** | 0 SIGSEGV, 0 direct-vs-parse divergences across 85,152 differential cases |
 | Upstream `pulldown-cmark 0.13.1` `table` / `strikethrough` / `regression` | **27/28, 14/15, 192/210** | 954 / 1,148 total across all upstream suites |
-| Wasm32 Smoke (`wasm_smoke`) | **PASS** | `pionc build --target wasm32` verified |
+| Wasm32 Smoke (`wasm_smoke`) | **PASS** | `pionc build --release --target wasm32` verified |
 
 ## Public API
 
@@ -59,16 +59,17 @@ let rendered = markdown::render_html(events)
 - `to_html_pulldown(src : String, opts : Options) -> String` (direct zero-Event streaming `pulldown-cmark` HTML renderer)
 - `to_html_extended(src : String, opts : ExtendedOptions) -> String` / `to_html_pulldown_extended(src : String, opts : ExtendedOptions) -> String`
 
-## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=2`, `rounds=9`, SHA-256 Verified)
+## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=1`, `rounds=5`, SHA-256 Verified)
 
-Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte verification against Rust `pulldown-cmark 0.13.6` (`cargo build --release`, `opt-level = 3`, `lto = "thin"`).
+Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte verification against Rust `pulldown-cmark 0.13.6` (`cargo build --release`, `opt-level = 3`, `lto = "thin"`), built with `pionc` (`AFK-surf/pion@a62689d5`).
 
 ### 1. CommonMark 0.31.2 `spec.txt` × 12 (`2,458,295 B` input → `2,690,436 B` HTML)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_pulldown_cmark`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_pulldown_cmark` | 18.065 | 17.162 | 19.137 | 136.08 | 13.03 MiB | 1.00x (baseline) |
-| `pion_markdown` | 23.001 | 21.080 | 23.616 | 106.88 | 15.73 MiB | 0.79x |
+| `rust_pulldown_cmark` | 16.869 | 15.778 | 18.345 | 145.73 | 13.03 MiB | 1.00x (baseline) |
+| `pion_markdown` (`to_html_pulldown`) | 20.201 | 18.211 | 21.171 | 121.69 | 12.30 MiB | 0.84x |
+| `pion_events` (`parse` + `render_html_pulldown`) | 23.980 | 22.771 | 25.473 | 102.52 | 19.31 MiB | 0.70x |
 
 - SHA-256 (identical across all implementations and rounds): `a72cc1c4e54ce0990a10f277818f85a5e87db112e86b0bc84844b3c0ec54620a`
 
@@ -76,30 +77,26 @@ Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte v
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_pulldown_cmark`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_pulldown_cmark` | 23.271 | 21.993 | 24.975 | 107.57 | 24.36 MiB | 1.00x (baseline) |
-| `pion_markdown` | 29.847 | 27.075 | 32.484 | 83.87 | 20.05 MiB | 0.78x |
+| `rust_pulldown_cmark` | 19.904 | 19.675 | 20.742 | 125.76 | 24.36 MiB | 1.00x (baseline) |
+| `pion_markdown` (`to_html_pulldown`) | 23.326 | 22.677 | 23.943 | 107.31 | 18.44 MiB | 0.85x |
+| `pion_events` (`parse` + `render_html_pulldown`) | 29.139 | 28.466 | 29.598 | 85.91 | 35.86 MiB | 0.68x |
 
 - SHA-256 (identical across all implementations and rounds): `eb0ade9169dfd54fc25a08adb046413fa61bfb44182c6fd0a7310bb8aaf7eba3`
 
-### 3. v0.2.0 Re-run After Red-Team Remediation
+### 3. O(N²) DoS Elimination (`sh packages/markdown/audit/run_audit.sh`)
 
-After the red-team fixes, the Mixed GFM corpus re-measures at **31.9–36.3 ms** median across runs (**0.72x–0.77x** of `pulldown-cmark`, Peak RSS **20.05 MiB** vs Rust **24.36 MiB**, SHA-256 identical); CommonMark `spec.txt` × 12 stays at about **0.78x–0.79x**. The tables above are the pre-audit optimization runs.
+| Pathological input | v0.1.0 | P49 (current) | Interleaved vs `pulldown-cmark` |
+| --- | ---: | ---: | ---: |
+| `nested_strong_emph` (224 KB) | 6,019 ms | **8.4 ms** | **1.01x** (56 KB) |
+| `smart_quotes_nested` (64 KB) | 1,039 ms | **5.7 ms** | 1.1x |
+| `unclosed_comments` (64 KB) | 280 ms | **3.5 ms** | **1.04x** (128 KB) |
 
-### 4. O(N²) DoS Elimination (`sh packages/markdown/audit/run_audit.sh`)
-
-| Pathological input | v0.1.0 | v0.2.0 | Interleaved vs `pulldown-cmark` |
-| --- | ---: | ---: | --- |
-| `nested_strong_emph` (224 KB) | 6,019 ms | **11.3 ms** | 0.98x (56 KB) |
-| `smart_quotes_nested` (64 KB) | 1,039 ms | **6.8 ms** | 1.1x |
-| `unclosed_comments` (64 KB) | 280 ms | **3.9 ms** | 1.06x (128 KB) |
-
-50k nested `>` blockquotes and 32k nested lists run with 0 SIGSEGV.
+50k nested `>` blockquotes and 32k nested lists run with 0 SIGSEGV; 3-way differential across 85,152 cases has `0` `direct != events` divergences.
 
 ### Honest Bottleneck Analysis
 
-After eliminating `Array[Event]` materialization (direct streaming HTML path), flattening Phase 1 (`BlockMeta` / `BlockTree` / `LineSpan` POD arenas) and Phase 2 (`InlineNode` / `DelimEntry` / `BracketEntry` POD arenas + reusable `InlineCtx` + O(1) 256-byte LUT + zero-tuple scanners), `pion_markdown` reaches **78%–79%** of Rust `pulldown-cmark --release` throughput (**107 MB/s** CommonMark, **84 MB/s** Mixed GFM — a **~1.95× speedup** over the initial `0.45×`–`0.48×` port) while cutting Peak RSS by **2.0×–2.8×** (**20.05 MiB vs Rust's 24.36 MiB** on Mixed GFM — 18% lower memory than Rust).
+With `StringBuilder::with_capacity` + `StringBuilder::write_substring` (`pion_strbuf_push_slice`), 4×-unrolled 256-byte LUT HTML escaping, zero-allocation `val struct LinkInfo` span links, zero-tuple ref-def/fence scanners, top-level block & simple inline fast paths, and reduced RC traffic in `scan_inlines_to_ctx` / `process_emphasis`, `pion_markdown` reaches **84%–85%** of Rust `pulldown-cmark --release` end-to-end (**121.7 MB/s** CommonMark, **107.3 MB/s** Mixed GFM; in-process compute `9.16 ms` vs Rust `5.82 ms` on CommonMark and `12.11 ms` vs Rust `9.01 ms` on Mixed GFM) while using **6%–24% less Peak RSS than Rust** (`12.30 MiB vs 13.03 MiB` on CommonMark, `18.44 MiB vs 24.36 MiB` on Mixed GFM).
 
-The remaining ~4.9–6.6 ms gap is attributable to three `pionc` / runtime primitives absent in pure Pion:
-1. **No `StringBuilder::write_substring(s, start, end)`**: Pion must either loop `sb.write_byte` (~3.5 ns/byte: 3 loads + 3 stores + NUL write per byte) for short/medium spans (`<= 48 B`), or allocate+copy+free via `s.slice` for longer spans. Micro-benchmarking 2.5 MB HTML escaping shows `8.90 ms` (byte loop) vs `2.72 ms` (chunked `memcpy`) — a **6.2 ms** gap on its own.
-2. **No `StringBuilder::with_capacity(cap)`**: `StringBuilder::new()` starts at 32 B (18 `realloc`s to 8 MiB), whereas Rust pre-allocates `src.len() * 3 / 2` once.
-3. **Scalar QBE loops vs NEON SIMD `memchr`**: Rust uses `memchr` (16 B/cycle NEON) for newline and delimiter searches; QBE compiles 1 B/iter scalar loops with per-byte table bounds checks.
+The remaining **~3.1–3.3 ms** compute gap is attributable to two `pionc` / QBE codegen limits verified via ARM64 disassembly:
+1. **Scalar QBE byte scanning vs NEON SIMD `memchr`**: Rust uses 16 B/cycle NEON `memchr` (~0.23 ms total across 7.5 MB of scans), whereas QBE compiles scalar loops (~1.0–1.3 ms per 2.5 MB pass across line-end scanning, inline trigger scanning, and HTML escaping).
+2. **`[0, 255]` LUT BCE does not propagate across function parameters**: `FixedArray::make(256, ...)` created locally triggers LUT BCE, but `Array[Byte]` / `FixedArray[Byte]` passed as a parameter (even with `if tbl.length() != 256`) still emits `cmp; b.hs _pion_panic_oob` on every byte lookup in `write_html_escaped_span_lut` and `skip_plain_inline`.
