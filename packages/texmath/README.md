@@ -47,9 +47,9 @@ Measured on `tokyo-mac-studio-0` (Apple M5 Max) with `bench/corpus.txt` × 20, `
 | Target | `pion-texmath` Median | `pion-texmath` Peak RSS | `node-katex` Median | `node-katex` Peak RSS | Speedup (vs `node-katex`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Native (`--release`) | 122.69 ms | 3.44 MiB | 282.46 ms | 68.86 MiB | **2.30x** |
-| Wasm32 | 654.94 ms | 837.92 MiB | 282.34 ms | — | 0.43x |
+| Wasm32 (`AFK-surf/pion@69a0189d`) | 343.3 ms | 274.8 MiB | — | — | 0.78x |
 
-Lagging item: the Wasm32 run is 0.43x of Node.js KaTeX with 837.92 MiB peak RSS; it was measured on the `pionc 0.1.0` Wasm runtime before its idle-pool fix and is pending a re-run on `AFK-surf/pion@a62689d`.
+Lagging item: Wasm32 is still 0.78x of Node.js KaTeX. Re-measured on `AFK-surf/pion@69a0189d`: median 343.3 ms and 274.8 MiB peak RSS, down from 654.94 ms / 837.92 MiB / 0.43x on the earlier `pionc 0.1.0` Wasm runtime (−67% peak RSS). Piped stdout is the full 314,336 B with no truncation and its SHA-256 matches Native and Node.js KaTeX.
 
 ### v0.1.0 Head-to-Head (historical, before red-team remediation)
 

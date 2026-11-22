@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0` (`AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`) |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,17 +30,17 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0）
+## 基准总榜（v0.2.0 + Wave 4）
 
-`v0.2.0` 为全部 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `markdown` | CommonMark 0.31.2 `spec.txt` × 12 → HTML | 2,458,295 B | 23.001 ms | 18.065 ms (`rust_pulldown_cmark`) | 0.79x | 15.73 MiB | 13.03 MiB |
-| `markdown` | Mixed GFM corpus → HTML | 2,503,227 B | 29.847 ms（v0.2.0 复测 31.9–36.3 ms） | 23.271 ms (`rust_pulldown_cmark`) | 0.78x（复测 0.72–0.77x） | 20.05 MiB | 24.36 MiB |
-| `markdown` | 对抗：`nested_strong_emph`（v0.1.0 6,019 ms） | 224 KB | 11.3 ms | — | 0.98x（56 KB 交替基准） | — | — |
+| `markdown` | CommonMark 0.31.2 `spec.txt` × 12 → HTML（v0.2.1 P49） | 2,458,295 B | 20.201 ms | 16.869 ms (`rust_pulldown_cmark`) | 0.84x | 12.30 MiB | 13.03 MiB |
+| `markdown` | Mixed GFM corpus → HTML（v0.2.1 P49） | 2,503,227 B | 23.326 ms | 19.904 ms (`rust_pulldown_cmark`) | 0.85x | 18.44 MiB | 24.36 MiB |
+| `markdown` | 对抗：`nested_strong_emph`（v0.1.0 6,019 ms） | 224 KB | 8.4 ms | — | **1.01x**（56 KB 交替基准） | — | — |
 | `texmath` | `bench/corpus.txt` × 20 → MathML（Native） | 10,000 ops | 122.69 ms | 282.46 ms (`node-katex`) | **2.30x** | 3.44 MiB | 68.86 MiB |
-| `texmath` | 同上（Wasm32） | 10,000 ops | 654.94 ms | 282.34 ms (`node-katex`) | 0.43x | 837.92 MiB | — |
+| `texmath` | 同上（Wasm32，`AFK-surf/pion@69a0189d` 复测） | 10,000 ops | 343.3 ms | — (`node-katex`) | 0.78x | 274.8 MiB | — |
 | `mermaid` | 对抗布局 `subgraphs 300` / `dense 40` / `wide 2000` / `scc 200` | — | — | `mermaid` 12.3.0 + `dagre` | **217.2x / 110.1x / 87.3x / 82.3x** | — | — |
 | `mermaid` | 稳态 Parse + canonical JSON（`--iters 50`，v0.1.0 记录） | 1.12 MB | 45.997 ms | 13,376.880 ms (`node-mermaid`) | **290.82x** | 2.72 MiB | 252.36 MiB |
 | `time` | W1 RFC 3339 parse + 偏移 + format（typed `parse_rfc3339_slice`） | 200,000 timestamps | 53.546 ms | 43.817 ms (`rust_jiff`) | 0.82x | 13.70 MiB | 7.83 MiB |
@@ -68,19 +68,33 @@
 | `websocket` | 大帧 `big_1m` 1 MiB × 1,024 | 1.07 GB | 1,633.69 MB/s | 5,956.56 MB/s (`tungstenite`) | 0.27x | — | — |
 | `websocket` | 大帧 `big_16m` 16 MiB × 64 | 1.07 GB | 1,554.29 MB/s | 601.66 MB/s (`tungstenite`) | **2.58x** | — | — |
 | `websocket` | 小帧 `tiny_1m` 5M × 16 B | 110 MB | 382.60 MB/s | 45.46 MB/s (`go_coder_ws`) | **8.42x** | — | — |
+| `tar` | 混合 USTAR/PAX/GNU 全量读 + 全负载 FNV-1a（40,000 entries） | 122.9 MB | 123.035 ms | 153.760 ms (`go_tar`) | **1.25x** | 13.47 MiB | 24.47 MiB |
+| `tar` | 混合 USTAR/PAX/GNU 写（40,000 entries） | 122.9 MB | 81.573 ms | 73.339 ms (`go_tar`) | 0.90x | 30.94 MiB | 41.94 MiB |
+| `tar` | 对抗：写 64 MiB 单文件 ×10 | — | 163.9 ms | 71.5 ms (`go_tar`) | 0.44x | 194.0 MiB | 327.1 MiB |
+| `semver` | `Version::parse` + 全排序 + `to_string` | 400,000 ops | 177.238 ms | 67.990 ms (`rust_semver`) | 0.38x | 4.55 MiB | 4.59 MiB |
+| `semver` | `VersionReq::matches` 矩阵 | 5,000,000 matches | 102.161 ms | 27.603 ms (`rust_semver`) | 0.27x | 3.91 MiB | 3.31 MiB |
+| `semver` | 32-comparator `VersionReq` parse + matches + `to_string` | 60,000 ops | 129.408 ms | 137.344 ms (`rust_semver`) | **1.06x** | 15.97 MiB | 16.53 MiB |
+| `semver` | 脏输入拒收 | 1,000,000 ops | 79.490 ms | 107.903 ms (`rust_semver`) | **1.36x** | 8.92 MiB | 8.50 MiB |
+| `uuid` | UUID 批量 parse + 128-bit 排序 + format（raw / typed `encode_hyphenated`） | 18.58 MB | 58.609 / 81.613 ms | 42.648 ms (`rust_uuid`) | 0.73x / 0.52x | 37.17 MiB | 27.20 MiB |
+| `uuid` | UUID v5 + v7 生成 + format（raw / typed `encode_hyphenated`） | 200,000 pairs | 51.575 / 54.142 ms | 34.020 ms (`rust_uuid`) | 0.66x / 0.63x | 1.72 MiB | 1.81 MiB |
+| `uuid` | ULID 批量 parse + 排序 + format（raw / typed `encode_bytes`） | 13.50 MB | 51.307 / 68.050 ms | 35.727 ms (`rust_ulid`) | 0.70x / 0.53x | 29.33 / 27.48 MiB | 22.38 MiB |
+| `url` | 混合 URL 批量 parse + join + serialize | 14,278,136 B | 114.091 ms | 120.056 ms (`rust_url`) | **1.05x** | 21.25 MiB | 10.59 MiB |
+| `url` | `URLSearchParams` parse + mutate + sort + serialize | 16,996,736 B | 244.434 ms | 237.788 ms (`rust_url`) | 0.97x | 23.33 MiB | 11.75 MiB |
+| `url` | 对抗：`adv_join`（净库时间） | 200,000 cases | 103.7 ms | 55.5 ms (`rust_url`) | 0.54x | — | — |
 
 ## 各包明细
 
 ### markdown
 
-参考实现：Rust [`pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark)（`cargo build --release`，`opt-level = 3`，`lto = "thin"`，基准用 `0.13.6`）。`warmup=2`、`rounds=9`。详见 [`packages/markdown/README.md`](packages/markdown/README.md)。
+参考实现：Rust [`pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark)（`cargo build --release`，`opt-level = 3`，`lto = "thin"`，基准用 `0.13.6`）。`v0.2.1`（P49 性能优化）由 `AFK-surf/pion@a62689d5` 构建，`warmup=1`、`rounds=5`。详见 [`packages/markdown/README.md`](packages/markdown/README.md)。
 
 **1. CommonMark 0.31.2 `spec.txt` × 12（`2,458,295 B` 输入 → `2,690,436 B` HTML）**
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_pulldown_cmark` | 18.065 | 17.162 | 19.137 | 136.08 | 13.03 MiB | 1.00x (baseline) |
-| `pion_markdown` | 23.001 | 21.080 | 23.616 | 106.88 | 15.73 MiB | 0.79x |
+| `rust_pulldown_cmark` | 16.869 | 15.778 | 18.345 | 145.73 | 13.03 MiB | 1.00x (baseline) |
+| `pion_markdown`（`to_html_pulldown`） | 20.201 | 18.211 | 21.171 | 121.69 | 12.30 MiB | 0.84x |
+| `pion_events`（`parse` + `render_html_pulldown`） | 23.980 | 22.771 | 25.473 | 102.52 | 19.31 MiB | 0.70x |
 
 SHA-256：`a72cc1c4e54ce0990a10f277818f85a5e87db112e86b0bc84844b3c0ec54620a`
 
@@ -88,24 +102,25 @@ SHA-256：`a72cc1c4e54ce0990a10f277818f85a5e87db112e86b0bc84844b3c0ec54620a`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_pulldown_cmark` | 23.271 | 21.993 | 24.975 | 107.57 | 24.36 MiB | 1.00x (baseline) |
-| `pion_markdown` | 29.847 | 27.075 | 32.484 | 83.87 | 20.05 MiB | 0.78x |
+| `rust_pulldown_cmark` | 19.904 | 19.675 | 20.742 | 125.76 | 24.36 MiB | 1.00x (baseline) |
+| `pion_markdown`（`to_html_pulldown`） | 23.326 | 22.677 | 23.943 | 107.31 | 18.44 MiB | 0.85x |
+| `pion_events`（`parse` + `render_html_pulldown`） | 29.139 | 28.466 | 29.598 | 85.91 | 35.86 MiB | 0.68x |
 
 SHA-256：`eb0ade9169dfd54fc25a08adb046413fa61bfb44182c6fd0a7310bb8aaf7eba3`
 
-红队修复后复测：Mixed GFM 中位数 31.9–36.3 ms（0.72–0.77x），峰值 RSS 20.05 MiB 仍低于 Rust 的 24.36 MiB；CommonMark 约 0.78–0.79x。
+v0.2.0 对照：CommonMark 23.001 ms（0.79x，15.73 MiB）、Mixed GFM 29.847 ms（0.78x，20.05 MiB）。
 
 **3. 三类 O(N²) DoS 消除（`audit/run_audit.sh`）**
 
-| 病态输入 | v0.1.0 | v0.2.0 | 与 `pulldown-cmark` 交替基准 |
-| --- | ---: | ---: | --- |
-| `nested_strong_emph`（224 KB） | 6,019 ms | 11.3 ms | 0.98x（56 KB） |
-| `smart_quotes_nested`（64 KB） | 1,039 ms | 6.8 ms | 1.1x |
-| `unclosed_comments`（64 KB） | 280 ms | 3.9 ms | 1.06x（128 KB） |
+| 病态输入 | v0.1.0 | v0.2.0 | v0.2.1（P49） | 与 `pulldown-cmark` 交替基准（P49） |
+| --- | ---: | ---: | ---: | --- |
+| `nested_strong_emph`（224 KB） | 6,019 ms | 11.3 ms | 8.4 ms | **1.01x**（56 KB） |
+| `smart_quotes_nested`（64 KB） | 1,039 ms | 6.8 ms | 5.7 ms | 1.1x |
+| `unclosed_comments`（64 KB） | 280 ms | 3.9 ms | 3.5 ms | **1.04x**（128 KB） |
 
-50k 层 `>` 与 32k 层列表 0 SIGSEGV。
+50k 层 `>` 与 32k 层列表 0 SIGSEGV；85,152 例三路差分 `direct != events` 分歧为 0。
 
-落后项：主基准吞吐为 Rust 的 72%–79%。包 README 归因于缺少 `StringBuilder::write_substring` / `with_capacity` 原语与 QBE 后端无 SIMD `memchr`。
+落后项：端到端吞吐为 Rust 的 84%–85%（in-process 计算 CommonMark 9.16 ms vs 5.82 ms，Mixed GFM 12.11 ms vs 9.01 ms），峰值 RSS 低于 Rust 6%–24%。包 README 将剩余约 3.1–3.3 ms 计算差距归因于 QBE 标量字节扫描（无 NEON SIMD `memchr`）与 LUT 边界检查消除不跨函数参数传播。
 
 ### texmath
 
@@ -116,9 +131,9 @@ SHA-256：`eb0ade9169dfd54fc25a08adb046413fa61bfb44182c6fd0a7310bb8aaf7eba3`
 | Target | `pion-texmath` Median | Peak RSS | `node-katex` Median | `node-katex` Peak RSS | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Native (`--release`) | 122.69 ms | 3.44 MiB | 282.46 ms | 68.86 MiB | **2.30x** |
-| Wasm32 | 654.94 ms | 837.92 MiB | 282.34 ms | — | 0.43x |
+| Wasm32（`AFK-surf/pion@69a0189d` 复测） | 343.3 ms | 274.8 MiB | — | — | 0.78x |
 
-落后项：Wasm32 为 KaTeX 的 0.43x，峰值 RSS 837.92 MiB；该数据基于 `pionc 0.1.0` 修复前的 Wasm 运行时，待升级 `AFK-surf/pion@a62689d`（Wasm 空闲池修复）后复测。
+落后项：Wasm32 仍为 KaTeX 的 0.78x。在 `AFK-surf/pion@69a0189d` 上复测中位数 343.3 ms、峰值 RSS 274.8 MiB，较此前 `pionc 0.1.0` Wasm 运行时的 654.94 ms / 837.92 MiB / 0.43x 峰值 RSS 降 67%；管道 stdout 完整 314,336 B 零截断，SHA-256 一致。
 
 红队：185/185 单测、168/168 红队、60/60 布局 0 误差、KaTeX 截图语料 108/127（0 合法拒收）、31 项 DoS 0 SIGSEGV / 0 OOM。v0.1.0 历史数据（500 条公式 × 20，101.844 ms vs 227.652 ms，2.24x）见包 README。
 
@@ -375,3 +390,110 @@ v0.1.0 历史数据（9 语言 token 流 + 无损重建，8,316,000 B：112.973 
 - 落后项：64 KiB–16 MiB 大帧上 Pion 约 1.6 GB/s，明显落后 Go 的 NEON 汇编与 Rust 的字宽 XOR（`big_64k` 仅为 Rust 的 0.15x）；包 README 归因于 `pionc 0.1.0` 逐字节带边界检查的 `Bytes` 索引、无 64 位字或 NEON 向量化。小帧与分片风暴上 Pion 落后 Rust（0.39–0.42x），但快于 Go 6–8 倍。
 - 正确性：186/186 单测；红队 22/23，唯一未过项是已知未实现的 RFC 7692 `permessage-deflate`。
 - v0.1.0 的 50,000 帧混合小帧基准（`bench/run_bench.sh`：131.212 ms，Rust 的 0.58x、Go 的 1.04x）为修复前数据，v0.2.0 未复测。
+
+### tar
+
+参考实现：Go 1.27.3 标准库 [`archive/tar`](https://pkg.go.dev/archive/tar)（基线）与 Rust [`tar`](https://crates.io/crates/tar) `0.4.46`（`--release`，LTO）。`AFK-surf/pion@69a0189d`，`--warmup 1 --rounds 5`，三种读基准都对**全部负载字节**计算 FNV-1a。详见 [`packages/tar/README.md`](packages/tar/README.md)。
+
+**1. 混合 USTAR/PAX/GNU 全量读（20 × 2,000 = 40,000 entries，122.9 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_tar`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 123.035 | 119.883 | 129.687 | 998.99 | 3075.87 | 13.47 MiB | **1.25x** |
+| `go_tar` | 153.760 | 151.349 | 162.253 | 799.37 | 3844.00 | 24.47 MiB | 1.00x (baseline) |
+| `rust_tar` | 117.378 | 116.372 | 117.699 | 1047.14 | 2934.44 | 7.75 MiB | 1.31x |
+
+SHA-256：`5939564e36969c01c2515f273647be551478b5e83f0c0a5cb833e96990af56d6`
+
+**2. 混合 USTAR/PAX/GNU 写（40,000 entries，122.9 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_tar`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 81.573 | 74.858 | 87.505 | 1506.76 | 2039.32 | 30.94 MiB | 0.90x |
+| `go_tar` | 73.339 | 70.686 | 80.267 | 1675.92 | 1833.48 | 41.94 MiB | 1.00x (baseline) |
+| `rust_tar` | 53.750 | 52.196 | 54.971 | 2286.71 | 1343.75 | 18.84 MiB | 1.36x |
+
+SHA-256：`bc3a15c6b5370100c6a5c1e1b2cafd3c8a8808e3576da5d9c404939546a63888`
+
+**3. 对抗压力负载（`audit/run_audit.sh --quick`，中位数 / 峰值 RSS）**
+
+| Workload | `pion` | `go_tar` | `rust_tar` | `pion` vs `go_tar` |
+| --- | ---: | ---: | ---: | ---: |
+| Header scan，64 MiB 单文件 ×100 | 21.1 ms / 129.8 MiB | 17.6 ms / 69.8 MiB | 113.6 ms / 65.9 MiB | 0.83x |
+| Header scan，每头 4,000 条 PAX 记录 ×1 | 99.9 ms / 46.7 MiB | 107.8 ms / 54.7 MiB | 129.2 ms / 24.5 MiB | **1.08x** |
+| 写 64 MiB 单文件 ×10 | 163.9 ms / 194.0 MiB | 71.5 ms / 327.1 MiB | 97.3 ms / 131.0 MiB | 0.44x |
+| 写每头 4,000 条 PAX 记录 ×1 | 375.4 ms / 232.3 MiB | 300.3 ms / 242.9 MiB | — | 0.80x |
+
+红队：35/35 单测（含 34 个 Go `archive/tar/testdata` 归档与红队向量）；差分 154/154 归档（44 Go testdata + 110 对抗语料）读结果与 Go 一致，303/303 写入规格与 Go 逐字节一致。审计发现的 P0（4 GiB 写堆溢出、sparse 放大炸弹）、P1（PAX O(n²)、整包 `String` 拷贝等）已修复，修复后默认 `Limits`、`Int64` 溢出安全运算、2 GiB 写入上限与流式 `read_chunk` 见包 README。落后项：写基准为 Go 的 0.90x、Rust 的 0.66x；64 MiB 单文件写仅 Go 的 0.44x（`finish()` 仍有两次 `Bytes::concat`），64 MiB header scan 峰值 RSS 约为 Go 的 1.9 倍。
+
+### semver
+
+参考实现：Rust [`dtolnay/semver`](https://github.com/dtolnay/semver) `=1.0.28`（`--release`，`opt-level = 3`，`lto = "thin"`，版本锁定）。`AFK-surf/pion@69a0189`，`--warmup 1 --rounds 5`。详见 [`packages/semver/README.md`](packages/semver/README.md)。
+
+| Workload | `pion` Median | `rust_semver` Median | ns/op（Pion / Rust） | Peak RSS（Pion / Rust） | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1. `Version::parse` + 全排序 + `to_string`（400,000 ops） | 177.238 ms | 67.990 ms | 443.10 / 169.98 | 4.55 / 4.59 MiB | 0.38x |
+| 2. `VersionReq::parse` + `matches` 矩阵（5,000,000 matches） | 102.161 ms | 27.603 ms | 20.43 / 5.52 | 3.91 / 3.31 MiB | 0.27x |
+| 3. 32-comparator `VersionReq` parse + matches + `to_string`（60,000 ops） | 129.408 ms | 137.344 ms | 2156.80 / 2289.06 | 15.97 / 16.53 MiB | **1.06x** |
+| 4. 脏输入拒收（1,000,000 ops） | 79.490 ms | 107.903 ms | 79.49 / 107.90 | 8.92 / 8.50 MiB | **1.36x** |
+
+SHA-256：Bench 1 `02415012c4d54846f0f03929fdd05e9c9dd375c43dd34f59cd469811933bb31a`；Bench 2 `b1a5400ab4ce74ab82882bf3f8c09dbdcff5513c351a819ea026a841f78e5605`；Bench 3 `c8a02307acbf6a5d9df9148e2ee3c78a6af80feabbe8b5596a837f4d8f3391f3`；Bench 4 `dc0303b9ce5fa81eefe28b9669a72398c8824bb936bc5c93269b4ce3081f4764`。Bench 1 中 Rust 用稳定 driftsort、Pion 用三数取中快排 + 插入排序，输出逐字节一致但计时包含排序算法差异。
+
+红队：35/35 单测；审计 23/23 通过；166,458/166,458 差分用例与上游逐字节一致（0 mismatch）；`small` + `max` + `u64::MAX` 穷举 `matches` 矩阵（2.96 亿次以上）逐字节一致。审计发现的 P0（`u64` 高半值域被拒）、P1（`VersionReq` / `Version` 缓存失效、上游断言被弱化）已修复。落后项：Bench 1 为 0.38x、Bench 2 为 0.27x，包 README 归因于 `pionc 0.1.0`（QBE）对 RC 管理的 `val struct` 字段读取的代码生成上限。
+
+### uuid
+
+参考实现：Rust [`uuid`](https://crates.io/crates/uuid) `1.29.3` 与 [`ulid`](https://crates.io/crates/ulid) `1.2.1`（`--release`）。`AFK-surf/pion@69a0189d`，`--warmup 1 --rounds 5`。同时报告地道 typed API 与 raw 批量 API。详见 [`packages/uuid/README.md`](packages/uuid/README.md)。
+
+| Workload | Implementation | Median (ms) | ns/op | Peak RSS | Speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1. UUID 批量 parse + 128-bit 排序 + format（500,000，18.58 MB） | `pion_raw` | 58.609 | 117.22 | 37.17 MiB | 0.73x |
+| | `pion_typed_buf` | 81.613 | 163.23 | 37.17 MiB | 0.52x |
+| | `pion_typed_str` | 95.766 | 191.53 | 37.17 MiB | 0.45x |
+| | `rust_uuid` | 42.648 | 85.30 | 27.20 MiB | 1.00x (baseline) |
+| 2. UUID v5（SHA-1）+ v7 生成 + format（200,000 pairs） | `pion_raw` | 51.575 | 257.88 | 1.72 MiB | 0.66x |
+| | `pion_typed_buf` | 54.142 | 270.71 | 1.72 MiB | 0.63x |
+| | `pion_typed_str` | 66.239 | 331.19 | 1.73 MiB | 0.51x |
+| | `rust_uuid` | 34.020 | 170.10 | 1.81 MiB | 1.00x (baseline) |
+| 3. ULID 批量 parse + 排序 + format（500,000，13.50 MB） | `pion_raw` | 51.307 | 102.61 | 29.33 MiB | 0.70x |
+| | `pion_typed_buf` | 68.050 | 136.10 | 27.48 MiB | 0.53x |
+| | `pion_typed_str` | 76.993 | 153.99 | 27.48 MiB | 0.46x |
+| | `rust_ulid` | 35.727 | 71.45 | 22.38 MiB | 1.00x (baseline) |
+
+SHA-256：Bench 1 `bd498b7cbd566a04855c18a2e04f7023b0eecd792506b74294c63ef0cfb86ba6`；Bench 2 `8fdf059e12772e0821eb03434f84da85c291fe48b992f8b125d99411f4e65eaf`；Bench 3 `2e742fca70b81a55e4a9533ada0a80b682b55aafbeee7f62b0b61e3c6b8a4c3a`。
+
+**对抗排序分布（1,000,000 个 128-bit 键，修复后）**：`random` `Uuid::sort` 91.2 ms（0.52x）/ `sort_u128_pairs_raw` 51.3 ms（0.92x）；`dup33` 74.5 ms（0.63x）/ 60.0 ms（0.78x）；`deep33` 105.2 ms（0.51x）/ 87.1 ms（0.62x）；`lastbyte` 52.9 ms（0.77x）/ 41.2 ms（0.99x）；`signed` 83.3 ms（0.56x）/ 65.2 ms（0.72x）；`equal` 44.0 ms（0.69x）/ 34.0 ms（0.89x）。重复与公共前缀分布较修复前提速 1.8–2.6 倍。
+
+**Wasm32（Node `v24.22.2`，基线为 Native Rust）**：UUID 批量 500k `wasm_pion_raw` 132.768 ms（0.32x）；UUID v5+v7 200k 100.029 ms（0.33x）；ULID 批量 500k 110.696 ms（0.36x）。
+
+红队：20/20 单测；审计 8,594 例差分无 P0；P1（批量解析空行缺陷、基准公平性、重复数据排序 4–4.5 倍慢）与 P2（`version()` 变体无关、v1/v6 时间戳、42-bit `V7Context42`、严格 ULID 解析等）已修复或补齐。落后项：全部主基准落后 Rust（raw 0.66–0.73x，typed 0.45–0.63x），Wasm32 为 Native Rust 的 0.27–0.36x。
+
+### url
+
+参考实现：Rust [`servo/rust-url`](https://github.com/servo/rust-url) `url =2.5.9`（`--release`）。`--warmup 1 --rounds 5`。详见 [`packages/url/README.md`](packages/url/README.md)。
+
+| Workload | Implementation | Median (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1. 混合 URL 批量 parse + join + serialize（200,000 ops，14,278,136 B） | `pion` | 114.091 | 125.15 | 570.45 | 21.25 MiB | **1.05x** |
+| | `rust_url` | 120.056 | 118.93 | 600.28 | 10.59 MiB | 1.00x (baseline) |
+| 2. `URLSearchParams` parse + mutate + sort + serialize（200,000 ops，16,996,736 B） | `pion` | 244.434 | 69.54 | 1222.17 | 23.33 MiB | 0.97x |
+| | `rust_url` | 237.788 | 71.48 | 1188.94 | 11.75 MiB | 1.00x (baseline) |
+
+SHA-256：Workload 1 `fca6fb3c1d9083d88088188f61cf4c5826e7590a91413844c11058010c4ae9fa`；Workload 2 `6d553a71ae368c6396941bb3e9f9675f928965d8ecc500d7ea840461612832d0`。
+
+**对抗 / 非模板语料（`audit/run_audit.sh` §6，净库时间，SHA-256 一致）**
+
+| Workload | Cases | Net Pion (ms) | Net Rust (ms) | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `adv_ipv4` | 200,000 | 59.3 | 79.9 | **1.35x** |
+| `adv_setters`（每 URL 7 个 setter） | 40,000 | 107.6 | 104.5 | 0.97x |
+| `adv_ipv6` | 200,000 | 88.3 | 78.2 | 0.89x |
+| `adv_big_url`（325 KB URL） | 200 | 78.3 | 65.6 | 0.84x |
+| `adv_idn`（Unicode 16.0 UTS #46） | 100,000 | 89.0 | 66.4 | 0.75x |
+| `adv_query_sort` | 7,500 | 133.3 | 82.9 | 0.62x |
+| `adv_pct` | 100,000 | 218.8 | 125.6 | 0.57x |
+| `adv_join` | 200,000 | 103.7 | 55.5 | 0.54x |
+
+**DoS 线性扩展（§5，`4n` 输入中位数）**：`n×@` 授权泛洪 78 KB 7.8 ms（Rust 4.8 ms）；`u:` + `n×@` 7.7 ms（4.5 ms）；Punycode 编码上限 117 KB 8.6 ms（5.7 ms）；Punycode 解码上限 58 KB 7.1 ms（5.1 ms）；`1000 × set_hash` 104 KB 27.8 ms（5.5 ms，5.1x）；`1000 × set_query` 110 KB 25.2 ms（7.9 ms，3.2x）。全部线性扩展。
+
+红队：43/43 单测；WPT `urltestdata.json` 869/869、`setters_tests.json` 274/274；`IdnaTestV2.txt` 6,346/6,348（99.97%，`rust-url 2.5.9` / `idna 1.1.0` 为 6,339/6,348 = 99.86%）；审计套件 31/31，15,876 个 URL 0 非幂等往返。审计发现的 P0（`.%2e` 点段、非特殊 scheme `join`、IDNA 映射子集、UTS #46 校验缺失）与 P1（`@` / Punycode 二次复杂度、setter 全量重解析）已修复。落后项：`URLSearchParams` 0.97x，对抗语料中 `adv_join` / `adv_pct` / `adv_query_sort` 为 0.54–0.62x，峰值 RSS 约为 Rust 的 2 倍；`set_hash` / `set_query` 在超长 URL 上仍比 Rust 慢 3–5 倍。

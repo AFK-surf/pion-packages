@@ -31,7 +31,7 @@ pionc add <package-name>
 
 | Package | Version | Description | Upstream Reference | Tests (Native) | Wasm32 | Benchmark | Install |
 | --- | --- | --- | --- | ---: | --- | --- | --- |
-| [`markdown`](packages/markdown) | `0.2.0` | CommonMark 0.31.2 + GFM（表格、删除线、任务列表、自动链接）+ CJK 友好强调的 Markdown 解析与 HTML 渲染 | [`pulldown-cmark/pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark) `v0.13.1` (Rust, MIT) | 708 / 708 | ✅ `wasm_smoke` | [CommonMark 2.46 MB · GFM 2.50 MB · O(N²) DoS 消除](BENCHMARKS.md#markdown) | `pionc add markdown --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`markdown`](packages/markdown) | `0.2.1` | CommonMark 0.31.2 + GFM（表格、删除线、任务列表、自动链接）+ CJK 友好强调的 Markdown 解析与 HTML 渲染 | [`pulldown-cmark/pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark) `v0.13.1` (Rust, MIT) | 708 / 708 | ✅ `wasm_smoke` | [CommonMark 0.84× · GFM 0.85× · O(N²) DoS 消除](BENCHMARKS.md#markdown) | `pionc add markdown --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`texmath`](packages/texmath) | `0.2.0` | TeX 数学公式解析、KaTeX 兼容 MathML 序列化与 TeXbook 盒模型布局 IR | [`KaTeX/KaTeX`](https://github.com/KaTeX/KaTeX) `v0.19.1` (JavaScript, MIT) | 185 / 185 | ✅ `wasm_smoke` | [10,000 ops MathML · Native / Wasm32](BENCHMARKS.md#texmath) | `pionc add texmath --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`mermaid`](packages/mermaid) | `0.2.0` | Mermaid 流程图 / 时序图 / 状态图 / 类图 / ER 图解析、Sugiyama 分层布局与 SVG 渲染 | [`mermaid-js/mermaid`](https://github.com/mermaid-js/mermaid) + [`dagrejs/dagre`](https://github.com/dagrejs/dagre) (JavaScript, MIT) | 137 / 137 | ✅ `wasm_smoke` | [解析 + 布局 · 对抗布局 82–217×](BENCHMARKS.md#mermaid) | `pionc add mermaid --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`time`](packages/time) | `0.2.0` | 公历日期 / 时间 / 时间戳 / 有符号时长值类型，RFC 3339、RFC 2822、HTTP-date 与 ISO 8601 时长解析格式化 | [`BurntSushi/jiff`](https://github.com/BurntSushi/jiff) `0.2` (Rust, MIT/Unlicense) | 262 / 262 | ✅ `wasm_smoke` | [RFC 3339 200k · Civil 2M（typed / raw）](BENCHMARKS.md#time) | `pionc add time --registry https://github.com/AFK-surf/pion-packages.git` |
@@ -43,12 +43,20 @@ pionc add <package-name>
 | [`highlight`](packages/highlight) | `0.2.0` | 24 种语言（含 Java、Kotlin、Swift、C#、PHP、Ruby、Dockerfile、Markdown）零正则回溯、逐行增量（`LineState`）语法高亮与 HTML 序列化 | [`PrismJS/prism`](https://github.com/PrismJS/prism) (JavaScript, MIT) | 216 / 216 | ✅ `wasm_smoke` | [HTML 端到端 6.67–15.55×](BENCHMARKS.md#highlight) | `pionc add highlight --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`glob`](packages/glob) | `0.2.0` | Glob / 多模式 `GlobSet`（字面量/扩展名/前后缀表 + 预乘 DFA）与完整 `.gitignore` 语义（含嵌套栈与父目录排除） | [`BurntSushi/globset`](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset) `0.4` + `ignore` (Rust, MIT/Unlicense) | 188 / 188 | ✅ `wasm_smoke` | [50k 路径 × 80 规则 × 20 · 5000 规则编译](BENCHMARKS.md#glob) | `pionc add glob --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`websocket`](packages/websocket) | `0.2.0` | RFC 6455 Sans-IO WebSocket：Upgrade 握手（内置 SHA-1 / Base64）、帧编解码与掩码、流式分片重组、严格 UTF-8 与关闭码校验 | [`coder/websocket`](https://github.com/coder/websocket) `v1.8.14` (Go, ISC)；另对照 Rust `tungstenite` `0.26.2` | 186 / 186 | ✅ `wasm_smoke` | [大帧 1.63 GB/s · 小帧 / 分片风暴](BENCHMARKS.md#websocket) | `pionc add websocket --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`tar`](packages/tar) | `0.1.0` | USTAR / PAX / GNU（含 4 种 sparse）/ V7 / STAR TAR 流式读写，`Int64` 溢出安全、默认 `Limits` 防 PAX / sparse 炸弹，`clean_extract_path` 路径穿越防护 | Go `archive/tar`（Go 1.27.3 stdlib, BSD-3-Clause）；另对照 Rust `tar` `0.4.46` | 35 / 35 | ✅ `wasm_smoke` | [全量读 1.25× · 写 0.90×（vs Go）](BENCHMARKS.md#tar) | `pionc add tar --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`semver`](packages/semver) | `0.1.0` | SemVer 2.0.0 解析 / 全序 / 优先级比较与 Cargo `VersionReq` 约束匹配（完整 `u64` 值域、32 comparator 上限） | [`dtolnay/semver`](https://github.com/dtolnay/semver) `=1.0.28` (Rust, MIT/Apache-2.0) | 35 / 35 | ✅ `wasm_smoke` | [解析排序 0.38× · matches 0.27× · 复杂 req 1.06× · 脏输入 1.36×](BENCHMARKS.md#semver) | `pionc add semver --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`uuid`](packages/uuid) | `0.1.0` | RFC 9562 UUID（v1/v3/v4/v5/v6/v7/v8/Nil/Max，内置 MD5 / SHA-1）与 Crockford Base32 ULID（含单调生成器），零堆分配 128-bit `val struct` | [`uuid-rs/uuid`](https://github.com/uuid-rs/uuid) `1.29.3` + [`dylanhart/ulid-rs`](https://github.com/dylanhart/ulid-rs) `1.2.1` (Rust) | 20 / 20 | ✅ `wasm_smoke` | [UUID 批量 0.73× · v5+v7 0.66× · ULID 0.70×（raw）](BENCHMARKS.md#uuid) | `pionc add uuid --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`url`](packages/url) | `0.1.0` | WHATWG URL Standard 解析 / 相对解析 / setters、Unicode 16.0.0 UTS #46 IDNA + Punycode、IPv4/IPv6、percent-encoding 与 `QueryParams`（`URLSearchParams`） | [`servo/rust-url`](https://github.com/servo/rust-url) `2.5.9` (Rust, MIT/Apache-2.0) | 43 / 43 | ✅ `wasm_smoke` | [混合解析 1.05× · URLSearchParams 0.97×](BENCHMARKS.md#url) | `pionc add url --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓合计 **3,488 / 3,488** 单测通过（`sh scripts/verify.sh`）。
+全仓 16 个包合计 **3,621 / 3,621** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
 `v0.2.0` 是全部 12 个包经红队对抗审计并修复后的版本。每个包都随附 `packages/<name>/audit/` 审计套件：失败即证据的红队测试、对上游参考实现的差分 / fuzz 脚本、DoS 探针、对抗性头对头基准与 `REPORT.md`（P0 / P1 / P2 发现与复现命令），可用 `sh packages/<name>/audit/run_audit.sh` 一键复现。审计套件不属于 workspace 成员，不计入上表的单测数。修复后的基准见 [`BENCHMARKS.md`](BENCHMARKS.md)。
+
+### Wave 4：`tar` / `semver` / `uuid` / `url` `v0.1.0` 与 `markdown` `v0.2.1`
+
+Wave 4 新增的 4 个包同样按 Red → Green → 红队审计 → 修复流程交付，首发即为红队修复后的版本，各自随附 `packages/<name>/audit/` 套件。`markdown` `v0.2.1` 为 P49 性能优化版（CommonMark 0.84×、Mixed GFM 0.85× 于 Rust `pulldown-cmark`，峰值 RSS 均低于 Rust）。
 
 ## 贡献与移植流程
 
