@@ -41,6 +41,7 @@ pub fn parse(src : String) -> Result[YamlValue, YamlError]
 pub fn parse_all(src : String) -> Result[Array[YamlValue], YamlError]
 pub fn stringify(v : YamlValue) -> String
 pub fn to_canonical_json(v : YamlValue) -> String
+pub fn write_canonical_json_to(sb : StringBuilder, v : YamlValue) -> Unit
 ```
 
 ## Compliance & Verification
@@ -68,8 +69,8 @@ Run reproducibly via `sh packages/yaml/bench/run_bench.sh` (using `scripts/bench
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_yaml_rust2`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_yaml_rust2` (`yaml-rust2 0.10.4`, `--release`) | 119.183 | 82.868 | 196.088 | 25.19 | 39.34 MiB | 1.00x (baseline) |
-| `go_yaml_v3` (`gopkg.in/yaml.v3`) | 126.812 | 118.331 | 148.825 | 23.68 | 20.94 MiB | 0.94x |
-| `pion_yaml` (`packages/yaml`, `--release`) | 133.488 | 126.385 | 208.556 | 22.49 | 33.95 MiB | 0.89x |
+| `pion_yaml` (`packages/yaml`, `--release`) | **50.845** | **50.612** | **78.229** | **59.06** | 33.86 MiB | **1.42x** |
+| `rust_yaml_rust2` (`yaml-rust2 0.10.4`, `--release`) | 72.230 | 70.046 | 82.372 | 41.57 | 39.34 MiB | 1.00x (baseline) |
+| `go_yaml_v3` (`gopkg.in/yaml.v3`) | 110.573 | 108.974 | 218.167 | 27.16 | 22.52 MiB | 0.65x |
 
 _SHA-256 verified identical across all implementations and rounds: `d57e15ae46b8deb701bd42730f7d034287f48e4e7736d1e71249e80df449b633`._
