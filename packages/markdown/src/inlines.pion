@@ -43,18 +43,32 @@ val struct BracketEntry {
   flags : Int // bit 0: is_image, bit 1: active
 }
 
-struct LinkInfo {
+val struct LinkInfo {
   link_type : LinkType
   dest : String
   title : String
   ref_id : String
+  dest_start : Int // >= 0 means zero-copy slice of `s[dest_start..dest_end]`
+  dest_end : Int
+  title_start : Int // >= 0 means zero-copy slice of `s[title_start..title_end]`
+  title_end : Int
+}
+
+fn link_dest_str(s : String, info : LinkInfo) -> String {
+  if info.dest_start >= 0 { s.slice(info.dest_start, info.dest_end) } else { info.dest }
+}
+
+fn link_title_str(s : String, info : LinkInfo) -> String {
+  if info.title_start >= 0 { s.slice(info.title_start, info.title_end) } else { info.title }
 }
 
 ///| Reusable per-document inline parsing context (avoids per-paragraph allocations).
 struct InlineCtx {
   table : Array[Byte] // 256-byte O(1) inline trigger LUT
-  ascii_cls : Array[Byte] // 128-byte ASCII LUT: bit 0 = ws, bit 1 = punct
-  href_tbl : Array[Byte] // 128-byte LUT: 1 = safe href byte
+  ascii_cls : Array[Byte] // 256-byte ASCII LUT: bit 0 = ws, bit 1 = punct (128..255 = 0)
+  href_tbl : Array[Byte] // 256-byte LUT: 1 = safe href byte
+  esc_tbl : Array[Byte] // 256-byte LUT for body HTML escaping
+  esc_attr_tbl : Array[Byte] // 256-byte LUT for attribute HTML escaping (always escapes `"`)
   nodes : Array[InlineNode]
   prevs : Array[Int]
   delims : Array[DelimEntry]
@@ -74,11 +88,13 @@ struct InlineCtx {
   mut tail : Int
   mut delim_tail : Int
   mut bt_init : Bool
+  mut html_fail_init : Bool
   mut has_quotes : Bool
 }
 
 fn make_ascii_cls_table() -> Array[Byte] {
-  let tbl : Array[Byte] = Array::with_capacity(128)
+  let tbl : Array[Byte] = Array::with_capacity(256)
+  let zero = (0).to_byte()
   let mut i = 0
   while i < 128 {
     let mut v = 0
@@ -89,6 +105,10 @@ fn make_ascii_cls_table() -> Array[Byte] {
       v = v | 2
     }
     tbl.push(v.to_byte())
+    i = i + 1
+  }
+  while i < 256 {
+    tbl.push(zero)
     i = i + 1
   }
   tbl
@@ -155,6 +175,8 @@ fn new_inline_ctx(opts : Options, escape_quote : Bool) -> InlineCtx {
     table: make_inline_table(opts, escape_quote),
     ascii_cls: make_ascii_cls_table(),
     href_tbl: make_href_safe_table(),
+    esc_tbl: make_html_escape_table(escape_quote),
+    esc_attr_tbl: make_html_escape_table(true),
     nodes: Array::with_capacity(64),
     prevs: Array::with_capacity(64),
     delims: Array::with_capacity(16),
@@ -174,18 +196,38 @@ fn new_inline_ctx(opts : Options, escape_quote : Bool) -> InlineCtx {
     tail: -1,
     delim_tail: -1,
     bt_init: false,
+    html_fail_init: false,
     has_quotes: false,
   }
 }
 
+fn il_push_fast(
+  nodes : Array[InlineNode],
+  prevs : Array[Int],
+  tail : Int,
+  tag : Int,
+  a : Int,
+  b : Int,
+) -> Int {
+  let idx = nodes.length()
+  nodes.push(InlineNode::{ tag, a, b, next: -1 })
+  prevs.push(tail)
+  if tail >= 0 {
+    let pn = nodes[tail]
+    nodes[tail] = InlineNode::{ tag: pn.tag, a: pn.a, b: pn.b, next: idx }
+  }
+  idx
+}
+
 fn il_push(ctx : InlineCtx, tag : Int, a : Int, b : Int) -> Int {
-  let idx = ctx.nodes.length()
+  let nodes = ctx.nodes
+  let idx = nodes.length()
   let prev = ctx.tail
-  ctx.nodes.push(InlineNode::{ tag, a, b, next: -1 })
+  nodes.push(InlineNode::{ tag, a, b, next: -1 })
   ctx.prevs.push(prev)
   if prev >= 0 {
-    let pn = ctx.nodes[prev]
-    ctx.nodes[prev] = InlineNode::{ tag: pn.tag, a: pn.a, b: pn.b, next: idx }
+    let pn = nodes[prev]
+    nodes[prev] = InlineNode::{ tag: pn.tag, a: pn.a, b: pn.b, next: idx }
   } else {
     ctx.head = idx
   }
@@ -194,12 +236,13 @@ fn il_push(ctx : InlineCtx, tag : Int, a : Int, b : Int) -> Int {
 }
 
 fn il_insert_after(ctx : InlineCtx, after_idx : Int, tag : Int, a : Int, b : Int) -> Int {
-  let idx = ctx.nodes.length()
-  let an = ctx.nodes[after_idx]
+  let nodes = ctx.nodes
+  let idx = nodes.length()
+  let an = nodes[after_idx]
   let nxt = an.next
-  ctx.nodes.push(InlineNode::{ tag, a, b, next: nxt })
+  nodes.push(InlineNode::{ tag, a, b, next: nxt })
   ctx.prevs.push(after_idx)
-  ctx.nodes[after_idx] = InlineNode::{ tag: an.tag, a: an.a, b: an.b, next: idx }
+  nodes[after_idx] = InlineNode::{ tag: an.tag, a: an.a, b: an.b, next: idx }
   if nxt >= 0 {
     ctx.prevs[nxt] = idx
   } else {
@@ -209,14 +252,16 @@ fn il_insert_after(ctx : InlineCtx, after_idx : Int, tag : Int, a : Int, b : Int
 }
 
 fn il_insert_before(ctx : InlineCtx, before_idx : Int, tag : Int, a : Int, b : Int) -> Int {
-  let idx = ctx.nodes.length()
-  let prv = ctx.prevs[before_idx]
-  ctx.nodes.push(InlineNode::{ tag, a, b, next: before_idx })
-  ctx.prevs.push(prv)
-  ctx.prevs[before_idx] = idx
+  let nodes = ctx.nodes
+  let prevs = ctx.prevs
+  let idx = nodes.length()
+  let prv = prevs[before_idx]
+  nodes.push(InlineNode::{ tag, a, b, next: before_idx })
+  prevs.push(prv)
+  prevs[before_idx] = idx
   if prv >= 0 {
-    let pn = ctx.nodes[prv]
-    ctx.nodes[prv] = InlineNode::{ tag: pn.tag, a: pn.a, b: pn.b, next: idx }
+    let pn = nodes[prv]
+    nodes[prv] = InlineNode::{ tag: pn.tag, a: pn.a, b: pn.b, next: idx }
   } else {
     ctx.head = idx
   }
@@ -249,9 +294,9 @@ fn delim_slot(d : Int) -> Int {
 }
 
 ///| Compute CommonMark (or CJK-friendly) flanking flags as a bitmask (bit 0 = can_open, bit 1 = can_close).
-///| Zero tuple allocations on ASCII fast path!
+///| Zero tuple allocations and zero RC on ASCII fast path!
 fn compute_flanking_mask(
-  ctx : InlineCtx,
+  ascii_cls : Array[Byte],
   s : String,
   seg_start : Int,
   seg_end : Int,
@@ -331,10 +376,10 @@ fn compute_flanking_mask(
     return (if co { 1 } else { 0 }) | (if cc { 2 } else { 0 })
   }
 
-  let before_ws = if prev_cp < 128 { (ctx.ascii_cls[prev_cp].to_int() & 1) != 0 } else { is_unicode_ws(prev_cp) }
-  let before_punct = if prev_cp < 128 { (ctx.ascii_cls[prev_cp].to_int() & 2) != 0 } else { is_unicode_punct(prev_cp) }
-  let after_ws = if next_cp < 128 { (ctx.ascii_cls[next_cp].to_int() & 1) != 0 } else { is_unicode_ws(next_cp) }
-  let after_punct = if next_cp < 128 { (ctx.ascii_cls[next_cp].to_int() & 2) != 0 } else { is_unicode_punct(next_cp) }
+  let before_ws = if prev_cp < 128 { (ascii_cls[prev_cp].to_int() & 1) != 0 } else { is_unicode_ws(prev_cp) }
+  let before_punct = if prev_cp < 128 { (ascii_cls[prev_cp].to_int() & 2) != 0 } else { is_unicode_punct(prev_cp) }
+  let after_ws = if next_cp < 128 { (ascii_cls[next_cp].to_int() & 1) != 0 } else { is_unicode_ws(next_cp) }
+  let after_punct = if next_cp < 128 { (ascii_cls[next_cp].to_int() & 2) != 0 } else { is_unicode_punct(next_cp) }
 
   let left_flanking = !after_ws && (!after_punct || before_ws || before_punct)
   let right_flanking = !before_ws && (!before_punct || after_ws || after_punct)
@@ -375,18 +420,20 @@ fn delim_push(ctx : InlineCtx, entry : DelimEntry) -> Unit {
 }
 
 fn delim_unlink(ctx : InlineCtx, idx : Int) -> Unit {
-  let p = ctx.delim_prev[idx]
-  let nx = ctx.delim_next[idx]
+  let dp = ctx.delim_prev
+  let dn = ctx.delim_next
+  let p = dp[idx]
+  let nx = dn[idx]
   if p >= 0 {
-    ctx.delim_next[p] = nx
+    dn[p] = nx
   }
   if nx >= 0 {
-    ctx.delim_prev[nx] = p
+    dp[nx] = p
   } else {
     ctx.delim_tail = p
   }
-  ctx.delim_prev[idx] = -1
-  ctx.delim_next[idx] = -1
+  dp[idx] = -1
+  dn[idx] = -1
 }
 
 ///| Resolve smart quotes (`'` and `"`, InlineNode tag 22) in O(N) linear pass starting from `start_node`,
@@ -432,27 +479,32 @@ fn resolve_smart_quotes(ctx : InlineCtx, start_node : Int) -> Unit {
 ///| Process emphasis, strong, and strikethrough in `ctx.delims[stack_bottom..]` in O(N) time
 ///| using an explicit doubly-linked list (`delim_prev`/`delim_next`) with O(1) unlink and `bottoms`.
 fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
-  let dlen = ctx.delims.length()
+  let delims = ctx.delims
+  let dlen = delims.length()
   if dlen <= stack_bottom {
     return ()
   }
-  let before_bottom = ctx.delim_prev[stack_bottom]
+  let delim_prev = ctx.delim_prev
+  let delim_next = ctx.delim_next
+  let bottoms = ctx.bottoms
+  let nodes = ctx.nodes
+  let before_bottom = delim_prev[stack_bottom]
   let use_bottoms = dlen - stack_bottom > 12
   if use_bottoms {
     let mut bi = 0
     while bi < 18 {
-      ctx.bottoms[bi] = stack_bottom
+      bottoms[bi] = stack_bottom
       bi = bi + 1
     }
   } else {
-    ctx.bottoms[12] = stack_bottom
+    bottoms[12] = stack_bottom
   }
 
   let mut closer_idx = stack_bottom
   while closer_idx >= 0 {
-    let closer = ctx.delims[closer_idx]
+    let closer = delims[closer_idx]
     let c_flags = closer.flags
-    let next_after = ctx.delim_next[closer_idx]
+    let next_after = delim_next[closer_idx]
     if (c_flags & 2) == 0 || closer.len == 0 {
       closer_idx = next_after
       continue
@@ -467,12 +519,12 @@ fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
     } else {
       0
     }
-    let min_opener = if use_bottoms || c_delim == 126 { ctx.bottoms[slot] } else { stack_bottom }
+    let min_opener = if use_bottoms || c_delim == 126 { bottoms[slot] } else { stack_bottom }
 
-    let mut opener_idx = ctx.delim_prev[closer_idx]
+    let mut opener_idx = delim_prev[closer_idx]
     let mut found_opener = -1
     while opener_idx >= min_opener {
-      let op = ctx.delims[opener_idx]
+      let op = delims[opener_idx]
       if (op.flags & 1) != 0 && op.len > 0 && (op.meta & 0xFF) == c_delim {
         let o_orig_len = op.meta >> 8
         if c_delim == 126 {
@@ -491,11 +543,11 @@ fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
           }
         }
       }
-      opener_idx = ctx.delim_prev[opener_idx]
+      opener_idx = delim_prev[opener_idx]
     }
 
     if found_opener >= 0 {
-      let op = ctx.delims[found_opener]
+      let op = delims[found_opener]
       let use_delims = if c_delim == 126 {
         closer.len
       } else if op.len >= 2 && closer.len >= 2 {
@@ -507,30 +559,32 @@ fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
       let new_op_len = op.len - use_delims
       let new_cl_len = closer.len - use_delims
 
-      let (st_tag, et_tag) = if c_delim == 126 {
-        (11, 12)
-      } else if use_delims == 2 {
-        (9, 10)
-      } else {
-        (7, 8)
-      }
+      let st_tag = if c_delim == 126 { 11 } else if use_delims == 2 { 9 } else { 7 }
+      let et_tag = st_tag + 1
 
       // O(1) unlink all delimiters strictly between found_opener and closer_idx!
-      ctx.delim_next[found_opener] = closer_idx
-      ctx.delim_prev[closer_idx] = found_opener
+      delim_next[found_opener] = closer_idx
+      delim_prev[closer_idx] = found_opener
 
       if new_op_len == 0 {
-        il_set_node(ctx, op.node_idx, st_tag, 0, 0)
-        ctx.delims[found_opener] = DelimEntry::{
+        let on = nodes[op.node_idx]
+        nodes[op.node_idx] = InlineNode::{ tag: st_tag, a: 0, b: 0, next: on.next }
+        delims[found_opener] = DelimEntry::{
           node_idx: op.node_idx,
           meta: op.meta,
           len: 0,
           flags: op.flags & 3,
         }
-        delim_unlink(ctx, found_opener)
+        let p = delim_prev[found_opener]
+        let nx = delim_next[found_opener]
+        if p >= 0 { delim_next[p] = nx }
+        if nx >= 0 { delim_prev[nx] = p } else { ctx.delim_tail = p }
+        delim_prev[found_opener] = -1
+        delim_next[found_opener] = -1
       } else {
-        il_set_node(ctx, op.node_idx, 17, c_delim, new_op_len)
-        ctx.delims[found_opener] = DelimEntry::{
+        let on = nodes[op.node_idx]
+        nodes[op.node_idx] = InlineNode::{ tag: 17, a: c_delim, b: new_op_len, next: on.next }
+        delims[found_opener] = DelimEntry::{
           node_idx: op.node_idx,
           meta: op.meta,
           len: new_op_len,
@@ -540,18 +594,25 @@ fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
       }
 
       if new_cl_len == 0 {
-        il_set_node(ctx, closer.node_idx, et_tag, 0, 0)
-        ctx.delims[closer_idx] = DelimEntry::{
+        let cn = nodes[closer.node_idx]
+        nodes[closer.node_idx] = InlineNode::{ tag: et_tag, a: 0, b: 0, next: cn.next }
+        delims[closer_idx] = DelimEntry::{
           node_idx: closer.node_idx,
           meta: closer.meta,
           len: 0,
           flags: c_flags & 3,
         }
-        delim_unlink(ctx, closer_idx)
+        let p = delim_prev[closer_idx]
+        let nx = delim_next[closer_idx]
+        if p >= 0 { delim_next[p] = nx }
+        if nx >= 0 { delim_prev[nx] = p } else { ctx.delim_tail = p }
+        delim_prev[closer_idx] = -1
+        delim_next[closer_idx] = -1
         closer_idx = next_after
       } else {
-        il_set_node(ctx, closer.node_idx, 17, c_delim, new_cl_len)
-        ctx.delims[closer_idx] = DelimEntry::{
+        let cn = nodes[closer.node_idx]
+        nodes[closer.node_idx] = InlineNode::{ tag: 17, a: c_delim, b: new_cl_len, next: cn.next }
+        delims[closer_idx] = DelimEntry::{
           node_idx: closer.node_idx,
           meta: closer.meta,
           len: new_cl_len,
@@ -561,10 +622,15 @@ fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
       }
     } else {
       if use_bottoms || c_delim == 126 {
-        ctx.bottoms[slot] = closer_idx
+        bottoms[slot] = closer_idx
       }
       if !c_can_open {
-        delim_unlink(ctx, closer_idx)
+        let p = delim_prev[closer_idx]
+        let nx = delim_next[closer_idx]
+        if p >= 0 { delim_next[p] = nx }
+        if nx >= 0 { delim_prev[nx] = p } else { ctx.delim_tail = p }
+        delim_prev[closer_idx] = -1
+        delim_next[closer_idx] = -1
       }
       closer_idx = next_after
     }
@@ -572,13 +638,13 @@ fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
 
   // Truncate delimiter stack back to stack_bottom
   if before_bottom >= 0 {
-    ctx.delim_next[before_bottom] = -1
+    delim_next[before_bottom] = -1
   }
   ctx.delim_tail = before_bottom
-  while ctx.delims.length() > stack_bottom {
-    let _ = ctx.delims.pop()
-    let _ = ctx.delim_prev.pop()
-    let _ = ctx.delim_next.pop()
+  while delims.length() > stack_bottom {
+    let _ = delims.pop()
+    let _ = delim_prev.pop()
+    let _ = delim_next.pop()
   }
 }
 
@@ -634,6 +700,27 @@ fn smart_dashes(count : Int) -> String {
   sb.to_string()
 }
 
+///| Tiny loop-versionable leaf scanner: returns the first index in `s[start..end]` with `tbl[b] != 0`, or `end`.
+fn skip_plain_inline(tbl : Array[Byte], s : String, start : Int, end : Int) -> Int {
+  let zero = (0).to_byte()
+  let mut i = start
+  let end4 = end - 3
+  while i < end4 {
+    let m = tbl[s.code_unit_at(i)].to_int() |
+    tbl[s.code_unit_at(i + 1)].to_int() |
+    tbl[s.code_unit_at(i + 2)].to_int() |
+    tbl[s.code_unit_at(i + 3)].to_int()
+    if m != 0 {
+      break
+    }
+    i = i + 4
+  }
+  while i < end && tbl[s.code_unit_at(i)] == zero {
+    i = i + 1
+  }
+  i
+}
+
 ///| Tiny leaf function to find the first inline trigger byte in `s[seg_start..seg_end]`.
 ///| Returns:
 ///|   -1 = plain text, 100% HTML-raw-safe (no inline triggers, no HTML-escape bytes)
@@ -646,34 +733,35 @@ fn find_first_inline_special(
   seg_end : Int,
   sc : ScanOut,
 ) -> Int {
-  let zero = (0).to_byte()
   let one = (1).to_byte()
   let mut saw_esc = false
   let mut i = seg_start
   while i < seg_end {
+    i = skip_plain_inline(tbl, s, i, seg_end)
+    if i >= seg_end {
+      break
+    }
     let b = s.code_unit_at(i)
     let v = tbl[b]
-    if v != zero {
-      if v == one {
-        // Fast skip literal '&' that cannot start an entity (e.g. "A & B")
-        if b == 38 {
-          if i + 2 >= seg_end {
-            saw_esc = true
-            i = i + 1
-            continue
-          }
-          let b1 = s.code_unit_at(i + 1)
-          if b1 != 35 && !((b1 >= 65 && b1 <= 90) || (b1 >= 97 && b1 <= 122)) {
-            saw_esc = true
-            i = i + 1
-            continue
-          }
+    if v == one {
+      // Fast skip literal '&' that cannot start an entity (e.g. "A & B")
+      if b == 38 {
+        if i + 2 >= seg_end {
+          saw_esc = true
+          i = i + 1
+          continue
         }
-        sc.flag = saw_esc
-        return i
+        let b1 = s.code_unit_at(i + 1)
+        if b1 != 35 && !((b1 >= 65 && b1 <= 90) || (b1 >= 97 && b1 <= 122)) {
+          saw_esc = true
+          i = i + 1
+          continue
+        }
       }
-      saw_esc = true
+      sc.flag = saw_esc
+      return i
     }
+    saw_esc = true
     i = i + 1
   }
   if saw_esc { -2 } else { -1 }
@@ -693,19 +781,27 @@ fn scan_inlines_to_ctx(
   opts : Options,
 ) -> Unit {
   let tbl = ctx.table
+  let ascii_cls = ctx.ascii_cls
+  let nodes = ctx.nodes
+  let prevs = ctx.prevs
+  let delims = ctx.delims
+  let delim_prev = ctx.delim_prev
+  let delim_next = ctx.delim_next
+  let brackets = ctx.brackets
+  let sc = ctx.sc
   let zero = (0).to_byte()
   let two = (2).to_byte()
   let mut i = first_special
 
-  ctx.nodes.clear()
-  ctx.prevs.clear()
-  if ctx.delims.length() > 0 {
-    ctx.delims.clear()
-    ctx.delim_prev.clear()
-    ctx.delim_next.clear()
+  nodes.clear()
+  prevs.clear()
+  if delims.length() > 0 {
+    delims.clear()
+    delim_prev.clear()
+    delim_next.clear()
   }
-  if ctx.brackets.length() > 0 {
-    ctx.brackets.clear()
+  if brackets.length() > 0 {
+    brackets.clear()
   }
   if ctx.str_pool.length() > 0 {
     ctx.str_pool.clear()
@@ -716,14 +812,11 @@ fn scan_inlines_to_ctx(
   if ctx.bt_failed_big.length() > 0 {
     ctx.bt_failed_big.clear()
   }
-  ctx.html_fail[0] = -1
-  ctx.html_fail[1] = -1
-  ctx.html_fail[2] = -1
-  ctx.html_fail[3] = -1
-  ctx.head = -1
-  ctx.tail = -1
-  ctx.delim_tail = -1
+  let mut head = -1
+  let mut tail = -1
+  let mut delim_tail = -1
   ctx.bt_init = false
+  ctx.html_fail_init = false
   ctx.has_quotes = false
 
   let has_ref_defs = ref_defs.length() > 0
@@ -734,10 +827,7 @@ fn scan_inlines_to_ctx(
     let b = s.code_unit_at(i)
     let tv = tbl[b]
     if tv == zero {
-      i = i + 1
-      while i < seg_end && tbl[s.code_unit_at(i)] == zero {
-        i = i + 1
-      }
+      i = skip_plain_inline(tbl, s, i + 1, seg_end)
       continue
     }
     if tv == two {
@@ -752,9 +842,11 @@ fn scan_inlines_to_ctx(
         let nb = s.code_unit_at(i + 1)
         if nb == 10 {
           if text_start < i {
-            let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+            tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+            if head < 0 { head = tail }
           }
-          let _ = il_push(ctx, 6, 0, 0)
+          tail = il_push_fast(nodes, prevs, tail, 6, 0, 0)
+          if head < 0 { head = tail }
           i = i + 2
           while i < seg_end && (s.code_unit_at(i) == 32 || s.code_unit_at(i) == 9) {
             i = i + 1
@@ -764,10 +856,12 @@ fn scan_inlines_to_ctx(
           continue
         } else if is_ascii_punct(nb) {
           if text_start < i {
-            let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+            tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+            if head < 0 { head = tail }
           }
           let nb_esc = nb == 38 || nb == 60 || nb == 62 || nb == 34
-          let _ = il_push(ctx, if nb_esc { 20 } else { 0 }, i + 1, i + 2)
+          tail = il_push_fast(nodes, prevs, tail, if nb_esc { 20 } else { 0 }, i + 1, i + 2)
+          if head < 0 { head = tail }
           i = i + 2
           text_start = i
           span_esc = false
@@ -791,13 +885,11 @@ fn scan_inlines_to_ctx(
         }
       }
       if text_start < sp_start {
-        let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, sp_start)
+        tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, sp_start)
+        if head < 0 { head = tail }
       }
-      if trailing_spaces >= 2 {
-        let _ = il_push(ctx, 6, 0, 0)
-      } else {
-        let _ = il_push(ctx, 5, 0, 0)
-      }
+      tail = il_push_fast(nodes, prevs, tail, if trailing_spaces >= 2 { 6 } else { 5 }, 0, 0)
+      if head < 0 { head = tail }
       i = i + 1
       while i < seg_end && (s.code_unit_at(i) == 32 || s.code_unit_at(i) == 9) {
         i = i + 1
@@ -857,7 +949,8 @@ fn scan_inlines_to_ctx(
       }
       if match_pos >= 0 {
         if text_start < run_start {
-          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, run_start)
+          tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, run_start)
+          if head < 0 { head = tail }
         }
         // Check if code span contains '\n', HTML-escape bytes, or is all spaces
         let mut has_nl = false
@@ -886,10 +979,11 @@ fn scan_inlines_to_ctx(
           let ctag = if code_esc { 21 } else { 2 }
           let rlen = match_pos - i
           if rlen >= 2 && !all_spaces && s.code_unit_at(i) == 32 && s.code_unit_at(match_pos - 1) == 32 {
-            let _ = il_push(ctx, ctag, i + 1, match_pos - 1)
+            tail = il_push_fast(nodes, prevs, tail, ctag, i + 1, match_pos - 1)
           } else {
-            let _ = il_push(ctx, ctag, i, match_pos)
+            tail = il_push_fast(nodes, prevs, tail, ctag, i, match_pos)
           }
+          if head < 0 { head = tail }
         } else {
           ctx.code_sb.reset()
           let mut all_sp2 = true
@@ -914,7 +1008,8 @@ fn scan_inlines_to_ctx(
           } else {
             raw_code
           }
-          let _ = il_push(ctx, 3, il_push_str(ctx, final_code), 0)
+          tail = il_push_fast(nodes, prevs, tail, 3, il_push_str(ctx, final_code), 0)
+          if head < 0 { head = tail }
         }
         i = match_pos + ticks
         text_start = i
@@ -932,9 +1027,11 @@ fn scan_inlines_to_ctx(
           match scan_entity(s, i, seg_end) {
             Some((decoded, next_i)) => {
               if text_start < i {
-                let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+                tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+                if head < 0 { head = tail }
               }
-              let _ = il_push(ctx, 1, il_push_str(ctx, decoded), 0)
+              tail = il_push_fast(nodes, prevs, tail, 1, il_push_str(ctx, decoded), 0)
+              if head < 0 { head = tail }
               i = next_i
               text_start = i
               span_esc = false
@@ -954,14 +1051,25 @@ fn scan_inlines_to_ctx(
       match scan_autolink(s, i, seg_end) {
         Some((is_email, inner, next_i)) => {
           if text_start < i {
-            let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+            tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+            if head < 0 { head = tail }
           }
           let lt = if is_email { LinkType::Email } else { LinkType::Autolink }
           let lidx = ctx.link_pool.length()
-          ctx.link_pool.push(LinkInfo::{ link_type: lt, dest: inner, title: "", ref_id: "" })
-          let _ = il_push(ctx, 13, lidx, 0)
-          let _ = il_push(ctx, 1, il_push_str(ctx, inner), 0)
-          let _ = il_push(ctx, 14, 0, 0)
+          ctx.link_pool.push(LinkInfo::{
+            link_type: lt,
+            dest: inner,
+            title: "",
+            ref_id: "",
+            dest_start: -1,
+            dest_end: 0,
+            title_start: -1,
+            title_end: 0,
+          })
+          tail = il_push_fast(nodes, prevs, tail, 13, lidx, 0)
+          if head < 0 { head = tail }
+          tail = il_push_fast(nodes, prevs, tail, 1, il_push_str(ctx, inner), 0)
+          tail = il_push_fast(nodes, prevs, tail, 14, 0, 0)
           i = next_i
           text_start = i
           span_esc = false
@@ -969,12 +1077,21 @@ fn scan_inlines_to_ctx(
         }
         None => ()
       }
+      if !ctx.html_fail_init {
+        ctx.html_fail[0] = -1
+        ctx.html_fail[1] = -1
+        ctx.html_fail[2] = -1
+        ctx.html_fail[3] = -1
+        ctx.html_fail_init = true
+      }
       let html_end = scan_inline_html_cached(s, i, seg_end, ctx.html_fail)
       if html_end > 0 {
         if text_start < i {
-          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+          tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+          if head < 0 { head = tail }
         }
-        let _ = il_push(ctx, 4, i, html_end)
+        tail = il_push_fast(nodes, prevs, tail, 4, i, html_end)
+        if head < 0 { head = tail }
         i = html_end
         text_start = i
         span_esc = false
@@ -992,21 +1109,28 @@ fn scan_inlines_to_ctx(
         i = i + 1
       }
       let run_len = i - run_start
-      let fmask = compute_flanking_mask(ctx, s, seg_start, seg_end, run_start, i, b, opts)
+      let fmask = compute_flanking_mask(ascii_cls, s, seg_start, seg_end, run_start, i, b, opts)
       if fmask != 0 {
         if text_start < run_start {
-          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, run_start)
+          tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, run_start)
+          if head < 0 { head = tail }
         }
-        let nidx = il_push(ctx, 17, b, run_len)
-        delim_push(
-          ctx,
-          DelimEntry::{
-            node_idx: nidx,
-            meta: b | (run_len << 8),
-            len: run_len,
-            flags: fmask | 4,
-          },
-        )
+        let nidx = il_push_fast(nodes, prevs, tail, 17, b, run_len)
+        tail = nidx
+        if head < 0 { head = tail }
+        let didx = delims.length()
+        delims.push(DelimEntry::{
+          node_idx: nidx,
+          meta: b | (run_len << 8),
+          len: run_len,
+          flags: fmask | 4,
+        })
+        delim_prev.push(delim_tail)
+        delim_next.push(-1)
+        if delim_tail >= 0 {
+          delim_next[delim_tail] = didx
+        }
+        delim_tail = didx
         text_start = i
         span_esc = false
       }
@@ -1016,11 +1140,13 @@ fn scan_inlines_to_ctx(
     // 7. Smart punctuation: `"`, `'`, `--`, `---`, `...`
     if opts.smart_punctuation {
       if b == 34 || b == 39 {
-        let fmask = compute_flanking_mask(ctx, s, seg_start, seg_end, i, i + 1, b, opts)
+        let fmask = compute_flanking_mask(ascii_cls, s, seg_start, seg_end, i, i + 1, b, opts)
         if text_start < i {
-          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+          tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+          if head < 0 { head = tail }
         }
-        let _ = il_push(ctx, 22, b, fmask)
+        tail = il_push_fast(nodes, prevs, tail, 22, b, fmask)
+        if head < 0 { head = tail }
         ctx.has_quotes = true
         i = i + 1
         text_start = i
@@ -1033,18 +1159,22 @@ fn scan_inlines_to_ctx(
           i = i + 1
         }
         if text_start < run_start {
-          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, run_start)
+          tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, run_start)
+          if head < 0 { head = tail }
         }
-        let _ = il_push(ctx, 1, il_push_str(ctx, smart_dashes(i - run_start)), 0)
+        tail = il_push_fast(nodes, prevs, tail, 1, il_push_str(ctx, smart_dashes(i - run_start)), 0)
+        if head < 0 { head = tail }
         text_start = i
         span_esc = false
         continue
       }
       if b == 46 && i + 2 < seg_end && s.code_unit_at(i + 1) == 46 && s.code_unit_at(i + 2) == 46 {
         if text_start < i {
-          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+          tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+          if head < 0 { head = tail }
         }
-        let _ = il_push(ctx, 1, il_push_str(ctx, "…"), 0)
+        tail = il_push_fast(nodes, prevs, tail, 1, il_push_str(ctx, "…"), 0)
+        if head < 0 { head = tail }
         i = i + 3
         text_start = i
         span_esc = false
@@ -1056,13 +1186,16 @@ fn scan_inlines_to_ctx(
     if b == 91 || (b == 33 && i + 1 < seg_end && s.code_unit_at(i + 1) == 91) {
       let is_img = b == 33
       if text_start < i {
-        let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+        tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+        if head < 0 { head = tail }
       }
-      let nidx = il_push(ctx, 18, if is_img { 1 } else { 0 }, 0)
+      let nidx = il_push_fast(nodes, prevs, tail, 18, if is_img { 1 } else { 0 }, 0)
+      tail = nidx
+      if head < 0 { head = tail }
       let after = if is_img { i + 2 } else { i + 1 }
-      ctx.brackets.push(BracketEntry::{
+      brackets.push(BracketEntry::{
         node_idx: nidx,
-        delim_idx: ctx.delims.length(),
+        delim_idx: delims.length(),
         text_start: after,
         flags: (if is_img { 1 } else { 0 }) | 2,
       })
@@ -1073,9 +1206,9 @@ fn scan_inlines_to_ctx(
     }
 
     // 9. Link / Image closer: `]`
-    if b == 93 && ctx.brackets.length() > 0 {
-      let br = ctx.brackets[ctx.brackets.length() - 1]
-      let _ = ctx.brackets.pop()
+    if b == 93 && brackets.length() > 0 {
+      let br = brackets[brackets.length() - 1]
+      let _ = brackets.pop()
       if (br.flags & 2) == 0 {
         i = i + 1
         continue
@@ -1085,10 +1218,14 @@ fn scan_inlines_to_ctx(
       let mut dest = ""
       let mut title = ""
       let mut ref_id = ""
+      let mut dest_s = -1
+      let mut dest_e = 0
+      let mut title_s = -1
+      let mut title_e = 0
       let mut link_type = LinkType::Inline
       let mut after_close = i + 1
 
-      // Case A: Inline link `(...)` (zero-tuple scan_link_dest_into / scan_link_title_into!)
+      // Case A: Inline link `(...)` (zero-slice fast path when dest/title have no decodable escapes!)
       if i + 1 < seg_end && s.code_unit_at(i + 1) == 40 {
         let mut p = i + 2
         while p < seg_end && is_ascii_ws(s.code_unit_at(p)) {
@@ -1097,28 +1234,47 @@ fn scan_inlines_to_ctx(
         if p < seg_end && s.code_unit_at(p) == 41 {
           matched = true
           after_close = p + 1
-        } else if scan_link_dest_into(s, p, seg_end, ctx.sc) {
-          let d = ctx.sc.s1
-          let after_d = ctx.sc.a
+        } else if scan_link_dest_span(s, p, seg_end, sc) {
+          let after_d = sc.a
+          let ds = sc.b
+          let de = sc.c
+          let d_unesc = sc.flag
           let mut q = after_d
           while q < seg_end && is_ascii_ws(s.code_unit_at(q)) {
             q = q + 1
           }
           if q < seg_end && s.code_unit_at(q) == 41 {
             matched = true
-            dest = d
+            if d_unesc && span_needs_unescape(s, ds, de) {
+              dest = unescape_span(s, ds, de)
+            } else {
+              dest_s = ds
+              dest_e = de
+            }
             after_close = q + 1
-          } else if q > after_d && scan_link_title_into(s, q, seg_end, ctx.sc) {
-            let t = ctx.sc.s1
-            let after_t = ctx.sc.a
+          } else if q > after_d && scan_link_title_span(s, q, seg_end, sc) {
+            let after_t = sc.a
+            let ts = sc.b
+            let te = sc.c
+            let t_unesc = sc.flag
             let mut r = after_t
             while r < seg_end && is_ascii_ws(s.code_unit_at(r)) {
               r = r + 1
             }
             if r < seg_end && s.code_unit_at(r) == 41 {
               matched = true
-              dest = d
-              title = t
+              if d_unesc && span_needs_unescape(s, ds, de) {
+                dest = unescape_span(s, ds, de)
+              } else {
+                dest_s = ds
+                dest_e = de
+              }
+              if t_unesc && span_needs_unescape(s, ts, te) {
+                title = unescape_span(s, ts, te)
+              } else {
+                title_s = ts
+                title_e = te
+              }
               after_close = r + 1
             }
           }
@@ -1143,9 +1299,9 @@ fn scan_inlines_to_ctx(
               }
               None => ()
             }
-          } else if scan_link_label_into(s, i + 1, seg_end, ctx.sc) {
-            let raw_lbl = s.slice(ctx.sc.a, ctx.sc.b)
-            let after_lbl = ctx.sc.c
+          } else if scan_link_label_into(s, i + 1, seg_end, sc) {
+            let raw_lbl = s.slice(sc.a, sc.b)
+            let after_lbl = sc.c
             let norm = normalize_link_label(raw_lbl)
             match ref_defs.get(norm) {
               Some(def) => {
@@ -1164,7 +1320,7 @@ fn scan_inlines_to_ctx(
         // Case C: Shortcut reference (not followed by `[`)
         if !matched {
           let has_next_label = if i + 1 < seg_end && s.code_unit_at(i + 1) == 91 {
-            if scan_link_label_into(s, i + 1, seg_end, ctx.sc) {
+            if scan_link_label_into(s, i + 1, seg_end, sc) {
               true
             } else {
               i + 2 < seg_end && s.code_unit_at(i + 2) == 93
@@ -1207,24 +1363,45 @@ fn scan_inlines_to_ctx(
 
       if matched {
         if text_start < i {
-          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+          tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, i)
+          if head < 0 { head = tail }
         }
-        process_emphasis(ctx, br.delim_idx)
-        resolve_smart_quotes(ctx, ctx.nodes[br.node_idx].next)
+        if delims.length() > br.delim_idx {
+          ctx.head = head
+          ctx.tail = tail
+          ctx.delim_tail = delim_tail
+          process_emphasis(ctx, br.delim_idx)
+          head = ctx.head
+          tail = ctx.tail
+          delim_tail = ctx.delim_tail
+        }
+        if ctx.has_quotes {
+          resolve_smart_quotes(ctx, nodes[br.node_idx].next)
+        }
         let lidx = ctx.link_pool.length()
-        ctx.link_pool.push(LinkInfo::{ link_type, dest, title, ref_id })
+        ctx.link_pool.push(LinkInfo::{
+          link_type,
+          dest,
+          title,
+          ref_id,
+          dest_start: dest_s,
+          dest_end: dest_e,
+          title_start: title_s,
+          title_end: title_e,
+        })
+        let bn = nodes[br.node_idx]
         if (br.flags & 1) != 0 {
-          il_set_node(ctx, br.node_idx, 15, lidx, 0)
-          let _ = il_push(ctx, 16, 0, 0)
+          nodes[br.node_idx] = InlineNode::{ tag: 15, a: lidx, b: 0, next: bn.next }
+          tail = il_push_fast(nodes, prevs, tail, 16, 0, 0)
         } else {
-          il_set_node(ctx, br.node_idx, 13, lidx, 0)
-          let _ = il_push(ctx, 14, 0, 0)
+          nodes[br.node_idx] = InlineNode::{ tag: 13, a: lidx, b: 0, next: bn.next }
+          tail = il_push_fast(nodes, prevs, tail, 14, 0, 0)
           let mut bi = 0
-          let blen = ctx.brackets.length()
+          let blen = brackets.length()
           while bi < blen {
-            let b_ent = ctx.brackets[bi]
+            let b_ent = brackets[bi]
             if (b_ent.flags & 1) == 0 {
-              ctx.brackets[bi] = BracketEntry::{
+              brackets[bi] = BracketEntry::{
                 node_idx: b_ent.node_idx,
                 delim_idx: b_ent.delim_idx,
                 text_start: b_ent.text_start,
@@ -1248,9 +1425,13 @@ fn scan_inlines_to_ctx(
   }
 
   if text_start < seg_end {
-    let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, seg_end)
+    tail = il_push_fast(nodes, prevs, tail, if span_esc { 20 } else { 0 }, text_start, seg_end)
+    if head < 0 { head = tail }
   }
-  if ctx.delims.length() > 0 {
+  ctx.head = head
+  ctx.tail = tail
+  ctx.delim_tail = delim_tail
+  if delims.length() > 0 {
     process_emphasis(ctx, 0)
   }
   if ctx.has_quotes {
@@ -1370,14 +1551,14 @@ fn write_text_html_span(
   end : Int,
   opts : Options,
   in_link : Int,
-  pulldown_compat : Bool,
+  esc_tbl : Array[Byte],
+  href_tbl : Array[Byte],
 ) -> Bool {
   if start >= end {
     return false
   }
-  let esc_q = !pulldown_compat
   if !opts.autolinks || in_link > 0 || end - start < 5 {
-    write_html_escaped_span(sb, s, start, end, esc_q)
+    write_html_escaped_span_lut(sb, s, start, end, esc_tbl)
     return s.code_unit_at(end - 1) == 10
   }
   let mut mark = start
@@ -1424,15 +1605,15 @@ fn write_text_html_span(
           }
           if has_dot {
             if mark < i {
-              write_html_escaped_span(sb, s, mark, i, esc_q)
+              write_html_escaped_span_lut(sb, s, mark, i, esc_tbl)
             }
             sb.write_string("<a href=\"")
             if is_www {
               sb.write_string("http://")
             }
-            escape_href_span(sb, s, i, trim_end)
+            escape_href_span_lut(sb, s, i, trim_end, href_tbl)
             sb.write_string("\">")
-            write_html_escaped_span(sb, s, i, trim_end, esc_q)
+            write_html_escaped_span_lut(sb, s, i, trim_end, esc_tbl)
             sb.write_string("</a>")
             end_nl = false
             i = trim_end
@@ -1451,12 +1632,12 @@ fn write_text_html_span(
         let mend = scan_gfm_proto_email(s, i + plen, end, is_xmpp)
         if mend > i + plen {
           if mark < i {
-            write_html_escaped_span(sb, s, mark, i, esc_q)
+            write_html_escaped_span_lut(sb, s, mark, i, esc_tbl)
           }
           sb.write_string("<a href=\"")
-          escape_href_span(sb, s, i, mend)
+          escape_href_span_lut(sb, s, i, mend, href_tbl)
           sb.write_string("\">")
-          write_html_escaped_span(sb, s, i, mend, esc_q)
+          write_html_escaped_span_lut(sb, s, i, mend, esc_tbl)
           sb.write_string("</a>")
           end_nl = false
           i = mend
@@ -1507,12 +1688,12 @@ fn write_text_html_span(
       }
       if lstart < i && valid_domain {
         if mark < lstart {
-          write_html_escaped_span(sb, s, mark, lstart, esc_q)
+          write_html_escaped_span_lut(sb, s, mark, lstart, esc_tbl)
         }
         sb.write_string("<a href=\"mailto:")
-        escape_href_span(sb, s, lstart, dend)
+        escape_href_span_lut(sb, s, lstart, dend, href_tbl)
         sb.write_string("\">")
-        write_html_escaped_span(sb, s, lstart, dend, esc_q)
+        write_html_escaped_span_lut(sb, s, lstart, dend, esc_tbl)
         sb.write_string("</a>")
         end_nl = false
         i = dend
@@ -1524,7 +1705,7 @@ fn write_text_html_span(
     i = i + 1
   }
   if mark < end {
-    write_html_escaped_span(sb, s, mark, end, esc_q)
+    write_html_escaped_span_lut(sb, s, mark, end, esc_tbl)
     end_nl = s.code_unit_at(end - 1) == 10
   }
   end_nl
@@ -1549,39 +1730,143 @@ fn render_inlines_html(
   let first_sp = find_first_inline_special(ctx.table, s, seg_start, seg_end, ctx.sc)
   if first_sp < 0 {
     if first_sp == -1 && !opts.autolinks {
-      write_raw_span(sb, s, seg_start, seg_end)
+      sb.write_substring(s, seg_start, seg_end)
       return false
     }
-    return write_text_html_span(sb, s, seg_start, seg_end, opts, 0, pulldown_compat)
+    return write_text_html_span(sb, s, seg_start, seg_end, opts, 0, ctx.esc_tbl, ctx.href_tbl)
+  }
+  // Fast path: single-backtick code span covering up to seg_end (e.g. table cells like `arm64_apple`, `wasm32`)
+  if !opts.autolinks && first_sp + 2 < seg_end && s.code_unit_at(first_sp) == 96 &&
+  s.code_unit_at(first_sp + 1) != 96 && s.code_unit_at(seg_end - 1) == 96 &&
+  s.code_unit_at(seg_end - 2) != 96 {
+    let mut k = first_sp + 1
+    let mut ok = true
+    let mut all_sp = true
+    let mut code_esc = false
+    let cend = seg_end - 1
+    while k < cend {
+      let cb = s.code_unit_at(k)
+      if cb == 96 || cb == 10 {
+        ok = false
+        break
+      }
+      if cb <= 62 {
+        if cb == 38 || cb == 60 || cb == 62 || cb == 34 {
+          code_esc = true
+        }
+        if cb != 32 {
+          all_sp = false
+        }
+      } else {
+        all_sp = false
+      }
+      k = k + 1
+    }
+    if ok {
+      if seg_start < first_sp {
+        if ctx.sc.flag {
+          write_html_escaped_span_lut(sb, s, seg_start, first_sp, ctx.esc_tbl)
+        } else {
+          sb.write_substring(s, seg_start, first_sp)
+        }
+      }
+      sb.write_string("<code>")
+      let mut cs = first_sp + 1
+      let mut ce = cend
+      if ce - cs >= 2 && !all_sp && s.code_unit_at(cs) == 32 && s.code_unit_at(ce - 1) == 32 {
+        cs = cs + 1
+        ce = ce - 1
+      }
+      if cs < ce {
+        if code_esc {
+          write_html_escaped_span_lut(sb, s, cs, ce, ctx.esc_tbl)
+        } else {
+          sb.write_substring(s, cs, ce)
+        }
+      }
+      sb.write_string("</code>")
+      return false
+    }
+  }
+  // Fast path: simple symmetric `*em*`, `**strong**`, or `~~del~~` starting at seg_start with plain inner & tail
+  // (e.g. `**Pass**`, `~~Beta~~ Stable` in GFM tables, simple emphasis headings/cells)
+  if !opts.autolinks && !opts.cjk_friendly && first_sp == seg_start {
+    let db = s.code_unit_at(seg_start)
+    if db == 42 || (db == 126 && opts.strikethrough) {
+      let mut rlen = 1
+      if seg_start + 1 < seg_end && s.code_unit_at(seg_start + 1) == db {
+        rlen = 2
+      }
+      let valid_delim = (db == 42) || (rlen == 2)
+      let inner_s = seg_start + rlen
+      if valid_delim && inner_s + rlen < seg_end {
+        let first_in = s.code_unit_at(inner_s)
+        let zero = (0).to_byte()
+        if first_in != db && first_in < 128 && ctx.ascii_cls[first_in] == zero {
+          let k = skip_plain_inline(ctx.table, s, inner_s, seg_end)
+          if k > inner_s && k + rlen <= seg_end && s.code_unit_at(k) == db &&
+          (rlen == 1 || s.code_unit_at(k + 1) == db) &&
+          (k + rlen == seg_end || s.code_unit_at(k + rlen) != db) {
+            let last_in = s.code_unit_at(k - 1)
+            if last_in < 128 && ctx.ascii_cls[last_in] == zero {
+              let tail_s = k + rlen
+              if tail_s == seg_end || skip_plain_inline(ctx.table, s, tail_s, seg_end) == seg_end {
+                if db == 126 {
+                  sb.write_string("<del>")
+                  sb.write_substring(s, inner_s, k)
+                  sb.write_string("</del>")
+                } else if rlen == 2 {
+                  sb.write_string("<strong>")
+                  sb.write_substring(s, inner_s, k)
+                  sb.write_string("</strong>")
+                } else {
+                  sb.write_string("<em>")
+                  sb.write_substring(s, inner_s, k)
+                  sb.write_string("</em>")
+                }
+                if tail_s < seg_end {
+                  sb.write_substring(s, tail_s, seg_end)
+                }
+                return false
+              }
+            }
+          }
+        }
+      }
+    }
   }
   scan_inlines_to_ctx(ctx, s, seg_start, seg_end, first_sp, ctx.sc.flag, ref_defs, opts)
 
   let esc_q = !pulldown_compat
   let no_auto = !opts.autolinks
+  let nodes = ctx.nodes
+  let esc_tbl = ctx.esc_tbl
+  let esc_attr_tbl = ctx.esc_attr_tbl
+  let href_tbl = ctx.href_tbl
   let mut cur = ctx.head
   let mut in_link = 0
   let mut end_nl = init_end_nl
 
   while cur >= 0 {
-    let node = ctx.nodes[cur]
+    let node = nodes[cur]
     let tag = node.tag
     // When GFM autolinks are enabled outside links, coalesce adjacent text/unmatched-delim nodes
     // so e.g. `a.b-c_d@a.b_` is seen intact rather than split at `_`.
     if !no_auto && in_link == 0 && (tag == 0 || tag == 20 || tag == 1 || tag == 17) {
       let nxt = node.next
       let next_is_text = nxt >= 0 && {
-        let nt = ctx.nodes[nxt].tag
+        let nt = nodes[nxt].tag
         nt == 0 || nt == 20 || nt == 1 || nt == 17
       }
       if next_is_text {
         ctx.code_sb.reset()
         let mut p = cur
         while p >= 0 {
-          let pn = ctx.nodes[p]
+          let pn = nodes[p]
           let pt = pn.tag
           if pt == 0 || pt == 20 {
             if pn.a < pn.b {
-              write_raw_span(ctx.code_sb, s, pn.a, pn.b)
+              ctx.code_sb.write_substring(s, pn.a, pn.b)
             }
           } else if pt == 1 {
             ctx.code_sb.write_string(ctx.str_pool[pn.a])
@@ -1598,7 +1883,7 @@ fn render_inlines_html(
         }
         let merged = ctx.code_sb.to_string()
         if merged.length() > 0 {
-          end_nl = write_text_html_span(sb, merged, 0, merged.length(), opts, in_link, pulldown_compat)
+          end_nl = write_text_html_span(sb, merged, 0, merged.length(), opts, in_link, esc_tbl, href_tbl)
         }
         cur = p
         continue
@@ -1607,40 +1892,42 @@ fn render_inlines_html(
     if tag == 0 {
       if node.a < node.b {
         if no_auto || in_link > 0 {
-          write_raw_span(sb, s, node.a, node.b)
+          sb.write_substring(s, node.a, node.b)
           end_nl = false
         } else {
-          end_nl = write_text_html_span(sb, s, node.a, node.b, opts, in_link, pulldown_compat)
+          end_nl = write_text_html_span(sb, s, node.a, node.b, opts, in_link, esc_tbl, href_tbl)
         }
       }
     } else if tag == 20 {
       if node.a < node.b {
-        end_nl = write_text_html_span(sb, s, node.a, node.b, opts, in_link, pulldown_compat)
+        end_nl = write_text_html_span(sb, s, node.a, node.b, opts, in_link, esc_tbl, href_tbl)
       }
     } else if tag == 1 {
       let t = ctx.str_pool[node.a]
       if t.length() > 0 {
-        end_nl = write_text_html_span(sb, t, 0, t.length(), opts, in_link, pulldown_compat)
+        end_nl = write_text_html_span(sb, t, 0, t.length(), opts, in_link, esc_tbl, href_tbl)
       }
     } else if tag == 2 {
       sb.write_string("<code>")
-      write_raw_span(sb, s, node.a, node.b)
+      if node.a < node.b {
+        sb.write_substring(s, node.a, node.b)
+      }
       sb.write_string("</code>")
       end_nl = false
     } else if tag == 21 {
       sb.write_string("<code>")
-      write_html_escaped_span(sb, s, node.a, node.b, esc_q)
+      write_html_escaped_span_lut(sb, s, node.a, node.b, esc_tbl)
       sb.write_string("</code>")
       end_nl = false
     } else if tag == 3 {
       let c = ctx.str_pool[node.a]
       sb.write_string("<code>")
-      write_html_escaped_span(sb, c, 0, c.length(), esc_q)
+      write_html_escaped_span_lut(sb, c, 0, c.length(), esc_tbl)
       sb.write_string("</code>")
       end_nl = false
     } else if tag == 4 {
       if node.a < node.b {
-        write_raw_span(sb, s, node.a, node.b)
+        sb.write_substring(s, node.a, node.b)
         end_nl = s.code_unit_at(node.b - 1) == 10
       }
     } else if tag == 5 {
@@ -1673,16 +1960,29 @@ fn render_inlines_html(
       match info.link_type {
         LinkType::Email => {
           sb.write_string("<a href=\"mailto:")
-          escape_href_span_lut(sb, info.dest, 0, info.dest.length(), ctx.href_tbl)
+          if info.dest_start >= 0 {
+            escape_href_span_lut(sb, s, info.dest_start, info.dest_end, href_tbl)
+          } else {
+            escape_href_span_lut(sb, info.dest, 0, info.dest.length(), href_tbl)
+          }
         }
         _ => {
           sb.write_string("<a href=\"")
-          escape_href_span_lut(sb, info.dest, 0, info.dest.length(), ctx.href_tbl)
+          if info.dest_start >= 0 {
+            escape_href_span_lut(sb, s, info.dest_start, info.dest_end, href_tbl)
+          } else {
+            escape_href_span_lut(sb, info.dest, 0, info.dest.length(), href_tbl)
+          }
         }
       }
-      if info.title.length() > 0 {
+      if info.title_start >= 0 {
+        if info.title_start < info.title_end {
+          sb.write_string("\" title=\"")
+          write_html_escaped_span_lut(sb, s, info.title_start, info.title_end, esc_attr_tbl)
+        }
+      } else if info.title.length() > 0 {
         sb.write_string("\" title=\"")
-        escape_html(sb, info.title)
+        write_html_escaped_span_lut(sb, info.title, 0, info.title.length(), esc_attr_tbl)
       }
       sb.write_string("\">")
       end_nl = false
@@ -1695,13 +1995,17 @@ fn render_inlines_html(
     } else if tag == 15 {
       let info = ctx.link_pool[node.a]
       sb.write_string("<img src=\"")
-      escape_href_span_lut(sb, info.dest, 0, info.dest.length(), ctx.href_tbl)
+      if info.dest_start >= 0 {
+        escape_href_span_lut(sb, s, info.dest_start, info.dest_end, href_tbl)
+      } else {
+        escape_href_span_lut(sb, info.dest, 0, info.dest.length(), href_tbl)
+      }
       sb.write_string("\" alt=\"")
       // Walk until matching EndImage (tag == 16), writing alt text escaped (with quote escaping)
       let mut nest = 0
       cur = node.next
       while cur >= 0 {
-        let an = ctx.nodes[cur]
+        let an = nodes[cur]
         let at = an.tag
         if at == 15 || at == 13 || at == 7 || at == 9 || at == 11 {
           nest = nest + 1
@@ -1711,9 +2015,10 @@ fn render_inlines_html(
           }
           nest = nest - 1
         } else if at == 0 || at == 20 || at == 2 || at == 21 || at == 4 {
-          write_html_escaped_span(sb, s, an.a, an.b, true)
+          write_html_escaped_span_lut(sb, s, an.a, an.b, esc_attr_tbl)
         } else if at == 1 || at == 3 {
-          escape_html(sb, ctx.str_pool[an.a])
+          let ts = ctx.str_pool[an.a]
+          write_html_escaped_span_lut(sb, ts, 0, ts.length(), esc_attr_tbl)
         } else if at == 5 || at == 6 {
           sb.write_byte((10).to_byte())
         } else if at == 17 {
@@ -1741,9 +2046,14 @@ fn render_inlines_html(
         }
         cur = an.next
       }
-      if info.title.length() > 0 {
+      if info.title_start >= 0 {
+        if info.title_start < info.title_end {
+          sb.write_string("\" title=\"")
+          write_html_escaped_span_lut(sb, s, info.title_start, info.title_end, esc_attr_tbl)
+        }
+      } else if info.title.length() > 0 {
         sb.write_string("\" title=\"")
-        escape_html(sb, info.title)
+        write_html_escaped_span_lut(sb, info.title, 0, info.title.length(), esc_attr_tbl)
       }
       sb.write_string("\" />")
       end_nl = false
@@ -1883,9 +2193,8 @@ fn write_code_block_lines_html(
   doc : BlockDoc,
   m : BlockMeta,
   sb : StringBuilder,
-  pulldown_compat : Bool,
+  esc_tbl : Array[Byte],
 ) -> Unit {
-  let esc_q = !pulldown_compat
   let n = m.line_len
   if n == 0 {
     return ()
@@ -1906,7 +2215,7 @@ fn write_code_block_lines_html(
       ci = ci + 1
     }
     if contig {
-      write_html_escaped_span(sb, doc.src, sp0.start, prev_end, esc_q)
+      write_html_escaped_span_lut(sb, doc.src, sp0.start, prev_end, esc_tbl)
       sb.write_byte((10).to_byte())
       return ()
     }
@@ -1916,14 +2225,14 @@ fn write_code_block_lines_html(
     let sp = doc.all_lines[m.line_start + i]
     if sp.pad < 0 {
       let ls = doc.extra_strs[sp.start]
-      write_html_escaped_span(sb, ls, 0, ls.length(), esc_q)
+      write_html_escaped_span_lut(sb, ls, 0, ls.length(), esc_tbl)
     } else {
       let mut k = 0
       while k < sp.pad {
         sb.write_byte((32).to_byte())
         k = k + 1
       }
-      write_html_escaped_span(sb, doc.src, sp.start, sp.end, esc_q)
+      write_html_escaped_span_lut(sb, doc.src, sp.start, sp.end, esc_tbl)
     }
     sb.write_byte((10).to_byte())
     i = i + 1
@@ -2059,6 +2368,22 @@ fn render_block_direct(
         } else {
           false
         }
+        // Fast path: render Paragraph leaf directly without RenderFrame push/pop!
+        let cm = doc.meta[c]
+        if (cm.kf & 15) == 4 {
+          if child_tight {
+            end_nl = render_para_lines_html(doc, cm, ctx, opts, sb, pulldown_compat, end_nl)
+          } else {
+            if !end_nl {
+              sb.write_byte((10).to_byte())
+            }
+            sb.write_string("<p>")
+            let _ = render_para_lines_html(doc, cm, ctx, opts, sb, pulldown_compat, false)
+            sb.write_string("</p>\n")
+            end_nl = true
+          }
+          continue
+        }
         stack.push(RenderFrame::{ idx: c, next_child: -1, flags: if child_tight { 1 } else { 0 } })
         continue
       }
@@ -2131,6 +2456,31 @@ fn render_block_direct(
           end_nl = true
         }
       }
+      // Fast path: single-child Paragraph inside Item (avoids 2 RenderFrame loop iterations!)
+      if start_child >= 0 && doc.tree[start_child].next_sibling < 0 {
+        let cm = doc.meta[start_child]
+        if (cm.kf & 15) == 4 {
+          let _ = stack.pop()
+          if in_tight_list {
+            let _ = render_para_lines_html(doc, cm, ctx, opts, sb, pulldown_compat, end_nl)
+          } else {
+            if !end_nl {
+              sb.write_byte((10).to_byte())
+            }
+            sb.write_string("<p>")
+            let _ = render_para_lines_html(doc, cm, ctx, opts, sb, pulldown_compat, false)
+            sb.write_string("</p>\n")
+          }
+          sb.write_string("</li>\n")
+          end_nl = true
+          continue
+        }
+      } else if start_child < 0 {
+        let _ = stack.pop()
+        sb.write_string("</li>\n")
+        end_nl = true
+        continue
+      }
       stack[sp_idx] = RenderFrame::{ idx, next_child: start_child, flags: frame.flags | 2 }
     } else if kind == 5 {
       // Heading
@@ -2196,7 +2546,13 @@ fn render_block_direct(
         let mut hi = 0
         while hi < ncols {
           write_table_cell_open(sb, true, aligns, hi)
-          render_table_cell_span(doc, doc.table_cells[cells_start + hi], ctx, opts, sb, true)
+          let hsp = doc.table_cells[cells_start + hi]
+          if hsp.pad < 0 {
+            let cs = doc.extra_strs[hsp.start]
+            let _ = render_inlines_html(ctx, cs, 0, cs.length(), doc.ref_defs, opts, sb, true, false)
+          } else if hsp.start < hsp.end {
+            let _ = render_inlines_html(ctx, doc.src, hsp.start, hsp.end, doc.ref_defs, opts, sb, true, false)
+          }
           sb.write_string("</th>")
           hi = hi + 1
         }
@@ -2208,7 +2564,13 @@ fn render_block_direct(
           let mut ci = 0
           while ci < ncols {
             write_table_cell_open(sb, false, aligns, ci)
-            render_table_cell_span(doc, doc.table_cells[row_base + ci], ctx, opts, sb, true)
+            let csp = doc.table_cells[row_base + ci]
+            if csp.pad < 0 {
+              let cs = doc.extra_strs[csp.start]
+              let _ = render_inlines_html(ctx, cs, 0, cs.length(), doc.ref_defs, opts, sb, true, false)
+            } else if csp.start < csp.end {
+              let _ = render_inlines_html(ctx, doc.src, csp.start, csp.end, doc.ref_defs, opts, sb, true, false)
+            }
             sb.write_string("</td>")
             ci = ci + 1
           }
@@ -2264,7 +2626,7 @@ fn render_block_direct(
         write_first_info_word_escaped(sb, doc.extra_strs[m.extra])
         sb.write_string("\">")
       }
-      write_code_block_lines_html(doc, m, sb, pulldown_compat)
+      write_code_block_lines_html(doc, m, sb, ctx.esc_tbl)
       sb.write_string("</code></pre>\n")
       end_nl = true
     } else if kind == 1 {
@@ -2282,7 +2644,7 @@ fn render_block_direct(
         sb.write_byte((10).to_byte())
       }
       sb.write_string("<pre><code>")
-      write_code_block_lines_html(doc, m, sb, pulldown_compat)
+      write_code_block_lines_html(doc, m, sb, ctx.esc_tbl)
       sb.write_string("</code></pre>\n")
       end_nl = true
     } else if kind == 8 {
@@ -2314,7 +2676,8 @@ fn render_block_direct(
 ///| Top-level direct streaming Markdown -> HTML renderer (zero Event array materialization).
 pub fn render_markdown_direct(src : String, opts : Options, pulldown_compat : Bool) -> String {
   let doc = parse_blocks(src, opts)
-  let sb = StringBuilder::new()
+  let cap = if opts.tables { src.length() * 2 + 64 } else { src.length() + src.length() / 2 + 64 }
+  let sb = StringBuilder::with_capacity(cap)
   let ctx = new_inline_ctx(opts, !pulldown_compat)
   let _ = render_block_direct(doc, 0, ctx, opts, false, sb, pulldown_compat, true)
   sb.to_string()
@@ -2567,7 +2930,7 @@ fn parse_inlines_with_ctx(
     } else if tag == 13 {
       in_link = in_link + 1
       let info = ctx.link_pool[node.a]
-      events.push(Event::Start(Tag::Link(info.link_type, info.dest, info.title, info.ref_id)))
+      events.push(Event::Start(Tag::Link(info.link_type, link_dest_str(s, info), link_title_str(s, info), info.ref_id)))
     } else if tag == 14 {
       if in_link > 0 {
         in_link = in_link - 1
@@ -2575,7 +2938,7 @@ fn parse_inlines_with_ctx(
       events.push(Event::End(TagEnd::Link))
     } else if tag == 15 {
       let info = ctx.link_pool[node.a]
-      events.push(Event::Start(Tag::Image(info.link_type, info.dest, info.title, info.ref_id)))
+      events.push(Event::Start(Tag::Image(info.link_type, link_dest_str(s, info), link_title_str(s, info), info.ref_id)))
     } else if tag == 16 {
       events.push(Event::End(TagEnd::Image))
     } else if tag == 17 {
@@ -2643,10 +3006,85 @@ fn join_para_spans(doc : BlockDoc, m : BlockMeta, ctx : InlineCtx) -> String {
   ctx.para_sb.to_string()
 }
 
+fn emit_para_lines_events(
+  doc : BlockDoc,
+  m : BlockMeta,
+  ctx : InlineCtx,
+  opts : Options,
+  events : Array[Event],
+) -> Unit {
+  let n = m.line_len
+  if n == 0 {
+    return ()
+  }
+  if n == 1 {
+    let sp = doc.all_lines[m.line_start]
+    if sp.pad == 0 {
+      let mut e = sp.end
+      while e > sp.start && (doc.src.code_unit_at(e - 1) == 32 || doc.src.code_unit_at(e - 1) == 9) {
+        e = e - 1
+      }
+      parse_inlines_with_ctx(ctx, doc.src, sp.start, e, doc.ref_defs, opts, events)
+      return ()
+    } else if sp.pad < 0 {
+      let ls = doc.extra_strs[sp.start]
+      let mut e = ls.length()
+      while e > 0 && (ls.code_unit_at(e - 1) == 32 || ls.code_unit_at(e - 1) == 9) {
+        e = e - 1
+      }
+      parse_inlines_with_ctx(ctx, ls, 0, e, doc.ref_defs, opts, events)
+      return ()
+    }
+  }
+  let sp0 = doc.all_lines[m.line_start]
+  if sp0.pad == 0 {
+    let mut contig = true
+    let mut prev_end = sp0.end
+    let mut ci = 1
+    while ci < n {
+      let spc = doc.all_lines[m.line_start + ci]
+      if spc.pad != 0 || spc.start != prev_end + 1 {
+        contig = false
+        break
+      }
+      prev_end = spc.end
+      ci = ci + 1
+    }
+    if contig {
+      let mut e = prev_end
+      while e > sp0.start && (doc.src.code_unit_at(e - 1) == 32 || doc.src.code_unit_at(e - 1) == 9) {
+        e = e - 1
+      }
+      parse_inlines_with_ctx(ctx, doc.src, sp0.start, e, doc.ref_defs, opts, events)
+      return ()
+    }
+  }
+  let text = join_para_spans(doc, m, ctx)
+  parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+}
+
 fn join_block_spans_nl(doc : BlockDoc, m : BlockMeta, ctx : InlineCtx) -> String {
   let n = m.line_len
   if n == 0 {
     return ""
+  }
+  let sp0 = doc.all_lines[m.line_start]
+  if sp0.pad == 0 {
+    let mut contig = true
+    let mut prev_end = sp0.end
+    let mut ci = 1
+    while ci < n {
+      let spc = doc.all_lines[m.line_start + ci]
+      if spc.pad != 0 || spc.start != prev_end + 1 {
+        contig = false
+        break
+      }
+      prev_end = spc.end
+      ci = ci + 1
+    }
+    if contig && prev_end < doc.src.length() && doc.src.code_unit_at(prev_end) == 10 {
+      return doc.src.slice(sp0.start, prev_end + 1)
+    }
   }
   ctx.para_sb.reset()
   let mut i = 0
@@ -2660,7 +3098,9 @@ fn join_block_spans_nl(doc : BlockDoc, m : BlockMeta, ctx : InlineCtx) -> String
         ctx.para_sb.write_byte((32).to_byte())
         k = k + 1
       }
-      write_raw_span(ctx.para_sb, doc.src, sp.start, sp.end)
+      if sp.start < sp.end {
+        ctx.para_sb.write_substring(doc.src, sp.start, sp.end)
+      }
     }
     ctx.para_sb.write_byte((10).to_byte())
     i = i + 1
@@ -2702,6 +3142,18 @@ fn emit_block_events(
         } else {
           false
         }
+        // Fast path: emit Paragraph leaf directly without RenderFrame push/pop!
+        let cm = doc.meta[c]
+        if (cm.kf & 15) == 4 {
+          if child_tight {
+            emit_para_lines_events(doc, cm, ctx, opts, events)
+          } else {
+            events.push(Event::Start(Tag::Paragraph))
+            emit_para_lines_events(doc, cm, ctx, opts, events)
+            events.push(Event::End(TagEnd::Paragraph))
+          }
+          continue
+        }
         stack.push(RenderFrame::{ idx: c, next_child: -1, flags: if child_tight { 1 } else { 0 } })
         continue
       }
@@ -2737,8 +3189,7 @@ fn emit_block_events(
           if (fm.kf & 15) == 4 {
             events.push(Event::Start(Tag::Paragraph))
             events.push(Event::TaskListMarker(checked))
-            let text = join_para_spans(doc, fm, ctx)
-            parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+            emit_para_lines_events(doc, fm, ctx, opts, events)
             events.push(Event::End(TagEnd::Paragraph))
             start_child = doc.tree[start_child].next_sibling
           } else {
@@ -2751,20 +3202,18 @@ fn emit_block_events(
       stack[sp_idx] = RenderFrame::{ idx, next_child: start_child, flags: frame.flags | 2 }
     } else if kind == 4 {
       let _ = stack.pop()
-      let text = join_para_spans(doc, m, ctx)
       if in_tight_list {
-        parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+        emit_para_lines_events(doc, m, ctx, opts, events)
       } else {
         events.push(Event::Start(Tag::Paragraph))
-        parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+        emit_para_lines_events(doc, m, ctx, opts, events)
         events.push(Event::End(TagEnd::Paragraph))
       }
     } else if kind == 5 {
       let _ = stack.pop()
       let level = (m.kf >> 10) & 255
       events.push(Event::Start(Tag::Heading(level)))
-      let text = join_para_spans(doc, m, ctx)
-      parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+      emit_para_lines_events(doc, m, ctx, opts, events)
       events.push(Event::End(TagEnd::Heading(level)))
     } else if kind == 6 {
       let _ = stack.pop()
@@ -2847,7 +3296,7 @@ fn emit_block_events(
 pub fn parse_events(src : String, opts : Options) -> Array[Event] {
   let doc = parse_blocks(src, opts)
   let ctx = new_inline_ctx(opts, true)
-  let events : Array[Event] = Array::new()
+  let events : Array[Event] = Array::with_capacity(doc.meta.length() * 3 + 16)
   emit_block_events(doc, 0, ctx, opts, false, events)
   events
 }
