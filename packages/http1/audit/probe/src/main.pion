@@ -1,0 +1,675 @@
+///| Red-team probes for packages/http1 (memory, complexity, fragmentation fuzz).
+///|
+///|   probe_pion fuzz <cases> <seed>     mutation fuzz: no panic + whole-vs-split equivalence
+///|   probe_pion queue <n> <ahead>       ChunkedDecoder fed n tiny chunks, producer `ahead` feeds ahead
+///|   probe_pion chunked_drip <kib>      1-byte drip vs bulk of a <kib> KiB chunked body (ns/byte)
+///|   probe_pion sse_drip <kib>          1-byte drip vs bulk of a <kib> KiB SSE stream (ns/byte)
+///|   probe_pion hdr_drip <n_headers>    re-parse-on-every-byte cost of a request (Sans-IO usage)
+
+import "http1"
+
+///|
+struct Rng {
+  mut s : Int64
+}
+
+///|
+fn Rng::next(self : Rng) -> Int {
+  self.s = self.s * 6364136223846793005L + 1442695040888963407L
+  ((self.s >> 33) & 0x7FFFFFFFL).to_int()
+}
+
+///|
+fn Rng::below(self : Rng, n : Int) -> Int {
+  if n <= 0 {
+    0
+  } else {
+    self.next() % n
+  }
+}
+
+///|
+fn framing_str(f : http1::Framing) -> String {
+  match f {
+    http1::Framing::None => "none"
+    http1::Framing::ContentLength(n) => "cl=" + n.to_string()
+    http1::Framing::Chunked => "chunked"
+  }
+}
+
+///|
+fn req_verdict(b : Bytes) -> String {
+  match http1::parse_request(b) {
+    Ok(http1::ParseStatus::Complete(r, c)) =>
+    "ok " + framing_str(r.framing) + " " + c.to_string()
+    Ok(http1::ParseStatus::Partial) => "partial"
+    Err(e) => "err " + http1::http_error_string(e)
+  }
+}
+
+///|
+fn resp_verdict(b : Bytes) -> String {
+  match http1::parse_response(b) {
+    Ok(http1::ParseStatus::Complete(r, c)) =>
+    "ok " + framing_str(r.framing) + " " + c.to_string()
+    Ok(http1::ParseStatus::Partial) => "partial"
+    Err(e) => "err " + http1::http_error_string(e)
+  }
+}
+
+///|
+fn consumed_of(v : String) -> Int {
+  // verdict "ok <framing> <consumed>"
+  let b = v.to_bytes()
+  let mut i = b.length()
+  while i > 0 && b[i - 1].to_int() != 32 {
+    i = i - 1
+  }
+  let mut n = 0
+  while i < b.length() {
+    n = n * 10 + (b[i].to_int() - 48)
+    i = i + 1
+  }
+  n
+}
+
+///| Decode chunked `wire` feeding at the cut points in `cuts` (ascending).
+fn chunked_run(wire : Bytes, cuts : Array[Int]) -> String {
+  let dec = http1::ChunkedDecoder::new()
+  let body = StringBuilder::new()
+  let n = wire.length()
+  let mut prev = 0
+  let mut ci = 0
+  let mut ntr = 0
+  while prev < n {
+    let end = if ci < cuts.length() { cuts[ci] } else { n }
+    ci = ci + 1
+    if end > prev {
+      dec.feed(wire.slice(prev, end))
+      prev = end
+    }
+    let mut looping = true
+    while looping {
+      match dec.next() {
+        Ok(http1::ChunkStep::Data(d)) => body.write_string(d.to_string())
+        Ok(http1::ChunkStep::NeedMore) => looping = false
+        Ok(http1::ChunkStep::Done(tr)) => {
+          ntr = tr.length()
+          return "ok " +
+          body.to_string() +
+          " tr=" +
+          ntr.to_string() +
+          " rem=" +
+          (dec.remaining_bytes() + n - prev).to_string()
+        }
+        Err(e) => return "err " + http1::http_error_string(e)
+      }
+    }
+  }
+  "incomplete " + body.to_string()
+}
+
+///|
+fn sse_run(wire : Bytes, cuts : Array[Int]) -> String {
+  let dec = http1::SseDecoder::new()
+  let sb = StringBuilder::new()
+  let n = wire.length()
+  let mut prev = 0
+  let mut ci = 0
+  while prev < n {
+    let end = if ci < cuts.length() { cuts[ci] } else { n }
+    ci = ci + 1
+    if end > prev {
+      match dec.feed(wire.slice(prev, end)) {
+        Ok(evs) => {
+          let mut i = 0
+          while i < evs.length() {
+            let e = evs[i]
+            sb.write_string(e.event_type + "|" + e.last_event_id + "|" + e.data + ";")
+            i = i + 1
+          }
+        }
+        Err(e) => return "err " + http1::http_error_string(e)
+      }
+      prev = end
+    }
+  }
+  sb.to_string() + " id=" + dec.last_event_id()
+}
+
+///|
+fn random_cuts(rng : Rng, n : Int) -> Array[Int] {
+  let cuts : Array[Int] = []
+  let mut p = 0
+  while p < n {
+    p = p + 1 + rng.below(7)
+    if p < n {
+      cuts.push(p)
+    }
+  }
+  cuts
+}
+
+///|
+fn mutate(rng : Rng, seed : Bytes, alphabet : Bytes) -> Bytes {
+  let arr : Array[Int] = []
+  let mut i = 0
+  while i < seed.length() {
+    arr.push(seed[i].to_int())
+    i = i + 1
+  }
+  let nm = 1 + rng.below(4)
+  let mut k = 0
+  while k < nm {
+    let op = rng.below(4)
+    let pos = rng.below(arr.length() + 1)
+    let ch = if rng.below(4) == 0 {
+      rng.below(256)
+    } else {
+      alphabet[rng.below(alphabet.length())].to_int()
+    }
+    if op == 0 && pos < arr.length() {
+      arr[pos] = ch
+    } else {
+      // rebuild: insert / delete / duplicate a span at pos
+      let len = 1 + rng.below(8)
+      let nb : Array[Int] = []
+      let mut j = 0
+      while j < arr.length() {
+        if j == pos {
+          if op == 1 {
+            nb.push(ch)
+          } else if op == 3 {
+            let mut q = 0
+            while q < len && j + q < arr.length() {
+              nb.push(arr[j + q])
+              q = q + 1
+            }
+          }
+        }
+        if !(op == 2 && j == pos) {
+          nb.push(arr[j])
+        }
+        j = j + 1
+      }
+      if pos == arr.length() && op == 1 {
+        nb.push(ch)
+      }
+      arr.clear()
+      let mut r = 0
+      while r < nb.length() {
+        arr.push(nb[r])
+        r = r + 1
+      }
+    }
+    k = k + 1
+  }
+  let mut out = Bytes::new(arr.length())
+  let mut m = 0
+  while m < arr.length() {
+    out[m] = arr[m].to_byte()
+    m = m + 1
+  }
+  out
+}
+
+///|
+fn hex(b : Bytes) -> String {
+  let digits = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    let v = b[i].to_int()
+    sb.write_string(digits.slice(v / 16, v / 16 + 1))
+    sb.write_string(digits.slice(v % 16, v % 16 + 1))
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn fuzz(world : World, cases : Int, seed : Int64) -> Int {
+  let rng = Rng::{ s: seed }
+  let req_seeds = [
+    "POST /a?b HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\nX: y\r\n\r\n".to_bytes(),
+    "GET / HTTP/1.0\r\nHost: a\r\nContent-Length: 12\r\n\r\n".to_bytes(),
+  ]
+  let resp_seeds = [
+    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX: y\r\n\r\n".to_bytes(),
+    "HTTP/1.1 204 \r\nTransfer-Encoding: chunked\r\n\r\n".to_bytes(),
+  ]
+  let ch_seeds = [
+    "4;a=\"b\\\"c\"\r\nWiki\r\n5\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT".to_bytes(),
+    "000a ; x\r\n0123456789\r\n0\r\n\r\n".to_bytes(),
+  ]
+  let sse_seeds = [
+    "\u{FEFF}id: 1\r\ndata: a\rdata:  b\n\nevent: e\nretry: 10\ndata\n\n".to_bytes(),
+    ": c\nid\ndata: 你好\r\n\r\n".to_bytes(),
+  ]
+  let alpha = "\r\n\r\n :;,=\"\\\t0059aAfFxXgzipchunkedContent-LengthTransfer-Encoding\u{0}\u{b}".to_bytes()
+  let mut fails = 0
+  let mut oks = 0
+  let mut c = 0
+  while c < cases {
+    let which = c % 4
+    if which == 0 {
+      let w = mutate(rng, req_seeds[rng.below(2)], alpha)
+      let full = req_verdict(w)
+      if full.length() >= 2 && full.slice(0, 2) == "ok" {
+        oks = oks + 1
+        // every strict prefix must be Partial
+        let mut i = 0
+        let lim = consumed_of(full)
+        while i < lim {
+          let v = req_verdict(w.slice(0, i))
+          if v != "partial" {
+            io_println(world, "REQ-PREFIX " + hex(w) + " full=" + full + " prefix" + i.to_string() + "=" + v)
+            fails = fails + 1
+            break
+          }
+          i = i + 1
+        }
+      }
+    } else if which == 1 {
+      let w = mutate(rng, resp_seeds[rng.below(2)], alpha)
+      let full = resp_verdict(w)
+      if full.length() >= 2 && full.slice(0, 2) == "ok" {
+        oks = oks + 1
+        let mut i = 0
+        let lim = consumed_of(full)
+        while i < lim {
+          let v = resp_verdict(w.slice(0, i))
+          if v != "partial" {
+            io_println(world, "RESP-PREFIX " + hex(w) + " full=" + full + " prefix" + i.to_string() + "=" + v)
+            fails = fails + 1
+            break
+          }
+          i = i + 1
+        }
+      }
+    } else if which == 2 {
+      let w = mutate(rng, ch_seeds[rng.below(2)], alpha)
+      let a = chunked_run(w, [])
+      if a.slice(0, 2) == "ok" {
+        oks = oks + 1
+      }
+      let b = chunked_run(w, random_cuts(rng, w.length()))
+      // An error may legitimately surface earlier only if both are errors.
+      let both_err = a.slice(0, 3) == "err" && b.slice(0, 3) == "err"
+      if a != b && !both_err {
+        io_println(world, "CHUNKED-SPLIT " + hex(w) + " whole=" + a + " split=" + b)
+        fails = fails + 1
+      }
+    } else {
+      let w = mutate(rng, sse_seeds[rng.below(2)], alpha)
+      let a = sse_run(w, [])
+      if a.length() > 8 {
+        oks = oks + 1
+      }
+      let b = sse_run(w, random_cuts(rng, w.length()))
+      if a != b {
+        io_println(world, "SSE-SPLIT " + hex(w) + " whole=" + a + " split=" + b)
+        fails = fails + 1
+      }
+    }
+    c = c + 1
+  }
+  io_println(world, "fuzz cases=" + cases.to_string() + " accepted=" + oks.to_string() + " divergences=" + fails.to_string())
+  0
+}
+
+///| Producer stays `ahead` feeds in front of the consumer for `n` tiny chunks.
+fn queue_probe(world : World, n : Int, ahead : Int) -> Int {
+  let dec = http1::ChunkedDecoder::new()
+  let piece = "1\r\nx\r\n".to_bytes()
+  let t0 = clock_now_ms(world)
+  let mut fed = 0
+  let mut total = 0
+  while fed < n {
+    let target = if fed + ahead > n { n } else { fed + ahead }
+    while fed < target {
+      dec.feed(piece)
+      fed = fed + 1
+    }
+    // consume exactly one chunk (data + its CRLF are consumed by the next call)
+    match dec.next() {
+      Ok(http1::ChunkStep::Data(d)) => total = total + d.length()
+      Ok(_) => ()
+      Err(_) => {
+        io_println(world, "error")
+        return 1
+      }
+    }
+  }
+  dec.feed("0\r\n\r\n".to_bytes())
+  let mut done = false
+  while !done {
+    match dec.next() {
+      Ok(http1::ChunkStep::Data(d)) => total = total + d.length()
+      Ok(http1::ChunkStep::Done(_)) => done = true
+      Ok(http1::ChunkStep::NeedMore) => done = true
+      Err(_) => done = true
+    }
+  }
+  let t1 = clock_now_ms(world)
+  io_println(
+    world,
+    "queue n=" +
+    n.to_string() +
+    " ahead=" +
+    ahead.to_string() +
+    " decoded=" +
+    total.to_string() +
+    " ms=" +
+    (t1 - t0).to_string(),
+  )
+  0
+}
+
+///|
+fn chunked_body(kib : Int) -> Bytes {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < kib * 4 {
+    sb.write_string("100\r\n")
+    let mut j = 0
+    while j < 16 {
+      sb.write_string("0123456789abcdef")
+      j = j + 1
+    }
+    sb.write_string("\r\n")
+    i = i + 1
+  }
+  sb.write_string("0\r\n\r\n")
+  sb.to_string().to_bytes()
+}
+
+///|
+fn drain_chunked(dec : http1::ChunkedDecoder) -> Int {
+  let mut total = 0
+  while true {
+    match dec.next() {
+      Ok(http1::ChunkStep::Data(d)) => total = total + d.length()
+      Ok(http1::ChunkStep::NeedMore) => break
+      Ok(http1::ChunkStep::Done(_)) => break
+      Err(_) => return -1
+    }
+  }
+  total
+}
+
+///|
+fn chunked_drip(world : World, kib : Int) -> Int {
+  let w = chunked_body(kib)
+  let n = w.length()
+  let t0 = clock_now_ms(world)
+  let d1 = http1::ChunkedDecoder::new()
+  let mut off = 0
+  while off < n {
+    let e = if off + 65536 > n { n } else { off + 65536 }
+    d1.feed(w.slice(off, e))
+    let _ = drain_chunked(d1)
+    off = e
+  }
+  let t1 = clock_now_ms(world)
+  let d2 = http1::ChunkedDecoder::new()
+  let mut i = 0
+  let mut tot = 0
+  while i < n {
+    d2.feed(w.slice(i, i + 1))
+    tot = tot + drain_chunked(d2)
+    i = i + 1
+  }
+  let t2 = clock_now_ms(world)
+  io_println(
+    world,
+    "chunked bytes=" +
+    n.to_string() +
+    " bulk64k_ns_per_byte=" +
+    ((t1 - t0) * 1000000L / n.to_int64()).to_string() +
+    " drip1_ns_per_byte=" +
+    ((t2 - t1) * 1000000L / n.to_int64()).to_string() +
+    " body=" +
+    tot.to_string(),
+  )
+  0
+}
+
+///|
+fn sse_drip(world : World, kib : Int) -> Int {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while sb.to_string().length() < 0 {
+    i = i + 1
+  }
+  let mut k = 0
+  let target = kib * 1024
+  let mut size = 0
+  while size < target {
+    let line = "id: " + k.to_string() + "\ndata: {\"delta\":\"token " + k.to_string() + " 你好\"}\ndata: second line\n\n"
+    sb.write_string(line)
+    size = size + line.to_bytes().length()
+    k = k + 1
+  }
+  let w = sb.to_string().to_bytes()
+  let n = w.length()
+  let t0 = clock_now_ms(world)
+  let d1 = http1::SseDecoder::new()
+  let mut ev1 = 0
+  let mut off = 0
+  while off < n {
+    let e = if off + 4096 > n { n } else { off + 4096 }
+    match d1.feed(w.slice(off, e)) {
+      Ok(evs) => ev1 = ev1 + evs.length()
+      Err(_) => return 1
+    }
+    off = e
+  }
+  let t1 = clock_now_ms(world)
+  let d2 = http1::SseDecoder::new()
+  let mut ev2 = 0
+  let mut j = 0
+  while j < n {
+    match d2.feed(w.slice(j, j + 1)) {
+      Ok(evs) => ev2 = ev2 + evs.length()
+      Err(_) => return 1
+    }
+    j = j + 1
+  }
+  let t2 = clock_now_ms(world)
+  io_println(
+    world,
+    "sse bytes=" +
+    n.to_string() +
+    " events=" +
+    ev1.to_string() +
+    "/" +
+    ev2.to_string() +
+    " bulk4k_ns_per_byte=" +
+    ((t1 - t0) * 1000000L / n.to_int64()).to_string() +
+    " drip1_ns_per_byte=" +
+    ((t2 - t1) * 1000000L / n.to_int64()).to_string(),
+  )
+  0
+}
+
+///| Sans-IO request parsing has no resumable state: a server that calls
+///| `parse_request` after every received byte rescans the whole prefix (O(n^2)).
+fn hdr_drip(world : World, nh : Int) -> Int {
+  let sb = StringBuilder::new()
+  sb.write_string("GET /x HTTP/1.1\r\nHost: a\r\n")
+  let mut i = 0
+  while i < nh {
+    sb.write_string("X-Header-" + i.to_string() + ": value-" + i.to_string() + "\r\n")
+    i = i + 1
+  }
+  sb.write_string("\r\n")
+  let w = sb.to_string().to_bytes()
+  let n = w.length()
+  let lim = http1::Limits::{ ..http1::Limits::default(), max_headers: nh + 8 }
+  let t0 = clock_now_ms(world)
+  let mut parses = 0
+  let mut k = 1
+  while k <= n {
+    match http1::parse_request_with_limits(w.slice(0, k), lim) {
+      Ok(http1::ParseStatus::Complete(_, _)) => parses = parses + 1
+      Ok(http1::ParseStatus::Partial) => ()
+      Err(_) => {
+        io_println(world, "error at " + k.to_string())
+        return 1
+      }
+    }
+    k = k + 1
+  }
+  let t1 = clock_now_ms(world)
+  io_println(
+    world,
+    "hdr_drip headers=" +
+    nh.to_string() +
+    " bytes=" +
+    n.to_string() +
+    " complete=" +
+    parses.to_string() +
+    " ms=" +
+    (t1 - t0).to_string(),
+  )
+  0
+}
+
+///|
+fn unhex(s : Bytes, start : Int, end : Int) -> Bytes {
+  let n = (end - start) / 2
+  let mut out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    let hi = hexd(s[start + 2 * i].to_int())
+    let lo = hexd(s[start + 2 * i + 1].to_int())
+    out[i] = (hi * 16 + lo).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn hexd(c : Int) -> Int {
+  if c >= 97 {
+    c - 87
+  } else if c >= 65 {
+    c - 55
+  } else {
+    c - 48
+  }
+}
+
+///| Differential runner: corpus lines `name<TAB>kind<TAB>hex`; prints
+///| `name<TAB>verdict<TAB>detail` with verdict OK <framing|bodylen> / PARTIAL / ERR.
+fn diff(world : World, path : String) -> Int {
+  let data = match fs_read_bytes(world, path) {
+    Ok(b) => b
+    Err(_) => return 1
+  }
+  let n = data.length()
+  let mut ls = 0
+  while ls < n {
+    let mut le = ls
+    while le < n && data[le].to_int() != 10 {
+      le = le + 1
+    }
+    let mut t1 = ls
+    while data[t1].to_int() != 9 {
+      t1 = t1 + 1
+    }
+    let mut t2 = t1 + 1
+    while data[t2].to_int() != 9 {
+      t2 = t2 + 1
+    }
+    let name = data.slice(ls, t1).to_string()
+    let kind = data.slice(t1 + 1, t2).to_string()
+    let raw = unhex(data, t2 + 1, le)
+    let out = if kind == "req" {
+      norm(req_verdict(raw))
+    } else if kind == "resp" {
+      norm(resp_verdict(raw))
+    } else {
+      let v = chunked_run(raw, [])
+      if v.slice(0, 3) == "ok " {
+        // "ok <body> tr=.. rem=.."
+        let b = v.to_bytes()
+        let mut k = 3
+        while k < b.length() && b[k].to_int() != 32 {
+          k = k + 1
+        }
+        "OK " + (k - 3).to_string() + "\t"
+      } else if v.slice(0, 3) == "err" {
+        "ERR\t" + v.slice(4, v.length())
+      } else {
+        "PARTIAL\t"
+      }
+    }
+    io_println(world, name + "\t" + out)
+    ls = le + 1
+  }
+  0
+}
+
+///|
+fn norm(v : String) -> String {
+  if v == "partial" {
+    "PARTIAL\t"
+  } else if v.slice(0, 3) == "err" {
+    "ERR\t" + v.slice(4, v.length())
+  } else {
+    // "ok <framing> <consumed>"
+    let b = v.to_bytes()
+    let mut k = 3
+    while k < b.length() && b[k].to_int() != 32 {
+      k = k + 1
+    }
+    let f = v.slice(3, k)
+    "OK " + (if f == "cl=0" { "none" } else { f }) + "\t"
+  }
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 2 {
+    io_println(world, "usage: probe <fuzz|queue|chunked_drip|sse_drip|hdr_drip> ...")
+    return 2
+  }
+  let mode = args[1]
+  let a2 = if args.length() > 2 { parse_int(args[2]) } else { 0 }
+  let a3 = if args.length() > 3 { parse_int(args[3]) } else { 0 }
+  if mode == "diff" {
+    return diff(world, args[2])
+  }
+  if mode == "fuzz" {
+    fuzz(world, a2, a3.to_int64() + 1L)
+  } else if mode == "queue" {
+    queue_probe(world, a2, a3)
+  } else if mode == "chunked_drip" {
+    chunked_drip(world, a2)
+  } else if mode == "sse_drip" {
+    sse_drip(world, a2)
+  } else if mode == "hdr_drip" {
+    hdr_drip(world, a2)
+  } else {
+    io_println(world, "unknown mode " + mode)
+    2
+  }
+}
+
+///|
+fn parse_int(s : String) -> Int {
+  let mut v = 0
+  let b = s.to_bytes()
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int()
+    if c >= 48 && c <= 57 {
+      v = v * 10 + (c - 48)
+    }
+    i = i + 1
+  }
+  v
+}
