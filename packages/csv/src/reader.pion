@@ -1,8 +1,287 @@
-///| Streaming RFC 4180 + flexible CSV Reader (stub for Red phase).
+///| High-performance streaming RFC 4180 + flexible CSV Reader.
+///| O(N) deterministic DFA scanner with 256B `FixedArray` LUTs, 4-byte unrolled fast paths,
+///| zero-copy unquoted record slicing, strict RFC 3629 UTF-8 validation, and explicit `Limits`.
+
+// LUT bitmask flags for fast byte classification:
+// 0 = normal data byte
+// 1 = delimiter
+// 2 = quote
+// 4 = LF ('\n')
+// 8 = CR ('\r')
+// 16 = custom terminator (Terminator::Any)
+// 32 = escape
+
+let cls_delim : Int = 1
+
+let cls_quote : Int = 2
+
+let cls_lf : Int = 4
+
+let cls_cr : Int = 8
+
+let cls_term : Int = 16
+
+let cls_escape : Int = 32
+
+///| Top-level read-only 256B LUT for default RFC 4180 config (`,`, `"`, `\n`, `\r`).
+fn build_default_read_lut() -> FixedArray[Int] {
+  let lut : FixedArray[Int] = FixedArray::make(256, 0)
+  lut[44] = cls_delim
+  lut[34] = cls_quote
+  lut[10] = cls_lf
+  lut[13] = cls_cr
+  lut
+}
+
+let default_read_lut : FixedArray[Int] = build_default_read_lut()
+
+///| Top-level read-only 256B LUT for ASCII whitespace (` `, `\t`, `\n`, `\x0C`, `\r`).
+fn build_ascii_ws_lut() -> FixedArray[Int] {
+  let lut : FixedArray[Int] = FixedArray::make(256, 0)
+  lut[32] = 1
+  lut[9] = 1
+  lut[10] = 1
+  lut[12] = 1
+  lut[13] = 1
+  lut
+}
+
+let ascii_ws_lut : FixedArray[Int] = build_ascii_ws_lut()
+
+///| Build a 256B classification LUT for a given `CsvConfig`.
+fn build_read_lut(cfg : CsvConfig) -> FixedArray[Int] {
+  let is_default_term = match cfg.terminator {
+    Terminator::LF => true
+    Terminator::CRLF => true
+    Terminator::Any(_) => false
+  }
+  if cfg.delimiter.to_int() == 44 &&
+  cfg.quote.to_int() == 34 &&
+  cfg.quoting &&
+  is_default_term &&
+  (match cfg.escape {
+    None => true
+    Some(_) => false
+  }) {
+    return default_read_lut
+  }
+  let lut : FixedArray[Int] = FixedArray::make(256, 0)
+  let d = cfg.delimiter.to_int() & 0xFF
+  lut[d] = lut[d] | cls_delim
+  if cfg.quoting {
+    let q = cfg.quote.to_int() & 0xFF
+    lut[q] = lut[q] | cls_quote
+  }
+  match cfg.terminator {
+    Terminator::LF => {
+      lut[10] = lut[10] | cls_lf
+      lut[13] = lut[13] | cls_cr
+    }
+    Terminator::CRLF => {
+      lut[10] = lut[10] | cls_lf
+      lut[13] = lut[13] | cls_cr
+    }
+    Terminator::Any(tb) => {
+      let t = tb.to_int() & 0xFF
+      lut[t] = lut[t] | cls_term
+    }
+  }
+  match cfg.escape {
+    Some(eb) => {
+      let e = eb.to_int() & 0xFF
+      lut[e] = lut[e] | cls_escape
+    }
+    None => ()
+  }
+  lut
+}
+
+///| Validate UTF-8 in `data[start..end]`. Returns `-1` if valid, else `valid_up_to` (relative to `start`).
+fn validate_utf8_bytes(data : Bytes, start : Int, end : Int) -> Int {
+  let mut i = start
+  let end4 = end - 4
+  while i <= end4 {
+    let b0 = data[i].to_int()
+    let b1 = data[i + 1].to_int()
+    let b2 = data[i + 2].to_int()
+    let b3 = data[i + 3].to_int()
+    if ((b0 | b1 | b2 | b3) & 0x80) == 0 {
+      i = i + 4
+      continue
+    }
+    break
+  }
+  while i < end {
+    let b0 = data[i].to_int()
+    if b0 < 0x80 {
+      i = i + 1
+    } else if b0 >= 0xC2 && b0 <= 0xDF {
+      if i + 1 >= end {
+        return i - start
+      }
+      let b1 = data[i + 1].to_int()
+      if (b1 & 0xC0) != 0x80 {
+        return i - start
+      }
+      i = i + 2
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+      if i + 2 >= end {
+        return i - start
+      }
+      let b1 = data[i + 1].to_int()
+      let b2 = data[i + 2].to_int()
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+        return i - start
+      }
+      // Reject overlong (E0 80..9F) and UTF-16 surrogates (ED A0..BF)
+      if (b0 == 0xE0 && b1 < 0xA0) || (b0 == 0xED && b1 >= 0xA0) {
+        return i - start
+      }
+      i = i + 3
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+      if i + 3 >= end {
+        return i - start
+      }
+      let b1 = data[i + 1].to_int()
+      let b2 = data[i + 2].to_int()
+      let b3 = data[i + 3].to_int()
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+        return i - start
+      }
+      // Reject overlong (F0 80..8F) and > U+10FFFF (F4 90..BF)
+      if (b0 == 0xF0 && b1 < 0x90) || (b0 == 0xF4 && b1 >= 0x90) {
+        return i - start
+      }
+      i = i + 4
+    } else {
+      return i - start
+    }
+  }
+  -1
+}
+
+///| Validate UTF-8 in a `String` slice (used when `from_bytes` built an unescaped StringBuilder).
+fn validate_utf8_string(s : String, start : Int, end : Int) -> Int {
+  let mut i = start
+  let end4 = end - 4
+  while i <= end4 {
+    let b0 = s.code_unit_at(i)
+    let b1 = s.code_unit_at(i + 1)
+    let b2 = s.code_unit_at(i + 2)
+    let b3 = s.code_unit_at(i + 3)
+    if ((b0 | b1 | b2 | b3) & 0x80) == 0 {
+      i = i + 4
+      continue
+    }
+    break
+  }
+  while i < end {
+    let b0 = s.code_unit_at(i)
+    if b0 < 0x80 {
+      i = i + 1
+    } else if b0 >= 0xC2 && b0 <= 0xDF {
+      if i + 1 >= end {
+        return i - start
+      }
+      let b1 = s.code_unit_at(i + 1)
+      if (b1 & 0xC0) != 0x80 {
+        return i - start
+      }
+      i = i + 2
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+      if i + 2 >= end {
+        return i - start
+      }
+      let b1 = s.code_unit_at(i + 1)
+      let b2 = s.code_unit_at(i + 2)
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+        return i - start
+      }
+      if (b0 == 0xE0 && b1 < 0xA0) || (b0 == 0xED && b1 >= 0xA0) {
+        return i - start
+      }
+      i = i + 3
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+      if i + 3 >= end {
+        return i - start
+      }
+      let b1 = s.code_unit_at(i + 1)
+      let b2 = s.code_unit_at(i + 2)
+      let b3 = s.code_unit_at(i + 3)
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+        return i - start
+      }
+      if (b0 == 0xF0 && b1 < 0x90) || (b0 == 0xF4 && b1 >= 0x90) {
+        return i - start
+      }
+      i = i + 4
+    } else {
+      return i - start
+    }
+  }
+  -1
+}
+
+///| Trim ASCII whitespace spans in place on `rec`.
+fn trim_record_spans(rec : Record) -> Unit {
+  let ws = ascii_ws_lut
+  let s = rec.buf
+  let spans = rec.spans
+  let n = spans.length()
+  let mut k = 0
+  while k < n {
+    let mut a = spans[k]
+    let mut b = spans[k + 1]
+    while a < b && ws[s.code_unit_at(a)] != 0 {
+      a = a + 1
+    }
+    while b > a && ws[s.code_unit_at(b - 1)] != 0 {
+      b = b - 1
+    }
+    spans[k] = a
+    spans[k + 1] = b
+    k = k + 2
+  }
+}
+
+///| Clone a `Record` (shallow backing string + copied spans).
+fn clone_record(src : Record) -> Record {
+  let n = src.spans.length()
+  let spans : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    spans.push(src.spans[i])
+    i = i + 1
+  }
+  Record::{ buf: src.buf, spans: spans, pos: src.pos }
+}
 
 ///| Streaming CSV reader.
 pub struct Reader {
   config : CsvConfig
+  lut : FixedArray[Int]
+  input : String
+  raw_bytes : Bytes
+  is_bytes : Bool
+  len : Int
+  delim_int : Int
+  quote_int : Int
+  has_escape : Bool
+  escape_int : Int
+  has_comment : Bool
+  comment_int : Int
+  custom_term : Bool
+  term_int : Int
+  mut offset : Int
+  mut line : Int
+  mut record_idx : Int
+  mut records_read : Int
+  mut expected_len : Int
+  mut has_expected_len : Bool
+  mut headers_loaded : Bool
+  mut cached_headers : Record
+  mut headers_err : Option[CsvError]
+  mut pending_first : Option[Record]
   mut pos : Position
 }
 
@@ -13,8 +292,55 @@ pub fn Reader::from_string(input : String) -> Reader {
 
 ///| Create a reader from a UTF-8 `String` with custom configuration.
 pub fn Reader::from_string_with_config(input : String, config : CsvConfig) -> Reader {
-  let _ = input
-  Reader::{ config: config, pos: Position::start() }
+  let n = input.length()
+  let mut start = 0
+  if config.strip_bom &&
+  n >= 3 &&
+  input.code_unit_at(0) == 0xEF &&
+  input.code_unit_at(1) == 0xBB &&
+  input.code_unit_at(2) == 0xBF {
+    start = 3
+  }
+  let (has_esc, esc_int) = match config.escape {
+    Some(b) => (true, b.to_int() & 0xFF)
+    None => (false, -1)
+  }
+  let (has_cmt, cmt_int) = match config.comment {
+    Some(b) => (true, b.to_int() & 0xFF)
+    None => (false, -1)
+  }
+  let (is_custom_term, t_int) = match config.terminator {
+    Terminator::Any(b) => (true, b.to_int() & 0xFF)
+    Terminator::CRLF => (false, 10)
+    Terminator::LF => (false, 10)
+  }
+  Reader::{
+    config: config,
+    lut: build_read_lut(config),
+    input: input,
+    raw_bytes: Bytes::new(0),
+    is_bytes: false,
+    len: n,
+    delim_int: config.delimiter.to_int() & 0xFF,
+    quote_int: config.quote.to_int() & 0xFF,
+    has_escape: has_esc,
+    escape_int: esc_int,
+    has_comment: has_cmt,
+    comment_int: cmt_int,
+    custom_term: is_custom_term,
+    term_int: t_int,
+    offset: start,
+    line: 1,
+    record_idx: 0,
+    records_read: 0,
+    expected_len: 0,
+    has_expected_len: false,
+    headers_loaded: false,
+    cached_headers: Record::new(),
+    headers_err: Option::None,
+    pending_first: Option::None,
+    pos: Position::new(start.to_int64(), 1, 0),
+  }
 }
 
 ///| Create a reader from raw `Bytes` with default configuration (validates UTF-8 per record).
@@ -24,33 +350,751 @@ pub fn Reader::from_bytes(input : Bytes) -> Reader {
 
 ///| Create a reader from raw `Bytes` with custom configuration (validates UTF-8 per record).
 pub fn Reader::from_bytes_with_config(input : Bytes, config : CsvConfig) -> Reader {
-  let _ = input
-  Reader::{ config: config, pos: Position::start() }
+  let n = input.length()
+  let mut start = 0
+  if config.strip_bom &&
+  n >= 3 &&
+  input[0].to_int() == 0xEF &&
+  input[1].to_int() == 0xBB &&
+  input[2].to_int() == 0xBF {
+    start = 3
+  }
+  let (has_esc, esc_int) = match config.escape {
+    Some(b) => (true, b.to_int() & 0xFF)
+    None => (false, -1)
+  }
+  let (has_cmt, cmt_int) = match config.comment {
+    Some(b) => (true, b.to_int() & 0xFF)
+    None => (false, -1)
+  }
+  let (is_custom_term, t_int) = match config.terminator {
+    Terminator::Any(b) => (true, b.to_int() & 0xFF)
+    Terminator::CRLF => (false, 10)
+    Terminator::LF => (false, 10)
+  }
+  Reader::{
+    config: config,
+    lut: build_read_lut(config),
+    input: "",
+    raw_bytes: input,
+    is_bytes: true,
+    len: n,
+    delim_int: config.delimiter.to_int() & 0xFF,
+    quote_int: config.quote.to_int() & 0xFF,
+    has_escape: has_esc,
+    escape_int: esc_int,
+    has_comment: has_cmt,
+    comment_int: cmt_int,
+    custom_term: is_custom_term,
+    term_int: t_int,
+    offset: start,
+    line: 1,
+    record_idx: 0,
+    records_read: 0,
+    expected_len: 0,
+    has_expected_len: false,
+    headers_loaded: false,
+    cached_headers: Record::new(),
+    headers_err: Option::None,
+    pending_first: Option::None,
+    pos: Position::new(start.to_int64(), 1, 0),
+  }
+}
+
+///| Read a single byte at `idx` from either `input` or `raw_bytes`.
+fn Reader::byte_at(self : Reader, idx : Int) -> Int {
+  if self.is_bytes {
+    self.raw_bytes[idx].to_int()
+  } else {
+    self.input.code_unit_at(idx)
+  }
+}
+
+///| Append slice `[start..end)` from reader's input into `sb`.
+fn Reader::write_input_slice(self : Reader, sb : StringBuilder, start : Int, end : Int) -> Unit {
+  if start >= end {
+    return ()
+  }
+  if self.is_bytes {
+    let raw = self.raw_bytes
+    let mut i = start
+    while i < end {
+      sb.write_byte(raw[i])
+      i = i + 1
+    }
+  } else {
+    sb.write_substring(self.input, start, end)
+  }
+}
+
+///| Check whether `b` is a record terminator in this reader's configuration.
+fn Reader::is_terminator_byte(self : Reader, b : Int) -> Bool {
+  if self.custom_term {
+    b == self.term_int
+  } else {
+    b == 10 || b == 13
+  }
+}
+
+///| Skip empty lines and comment lines before a record starts.
+fn Reader::skip_empty_and_comments(self : Reader) -> Unit {
+  let n = self.len
+  let mut i = self.offset
+  let mut line = self.line
+  while i < n {
+    let b = self.byte_at(i)
+    if self.custom_term {
+      if b == self.term_int {
+        if b == 10 || b == 13 {
+          line = line + 1
+        }
+        i = i + 1
+        continue
+      }
+    } else {
+      if b == 10 {
+        line = line + 1
+        i = i + 1
+        continue
+      }
+      if b == 13 {
+        line = line + 1
+        i = i + 1
+        if i < n && self.byte_at(i) == 10 {
+          i = i + 1
+        }
+        continue
+      }
+    }
+    if self.has_comment && b == self.comment_int {
+      i = i + 1
+      if self.custom_term {
+        let t = self.term_int
+        while i < n && self.byte_at(i) != t {
+          i = i + 1
+        }
+        if i < n {
+          if t == 10 || t == 13 {
+            line = line + 1
+          }
+          i = i + 1
+        }
+      } else {
+        while i < n {
+          let cb = self.byte_at(i)
+          if cb == 10 {
+            line = line + 1
+            i = i + 1
+            break
+          }
+          if cb == 13 {
+            line = line + 1
+            i = i + 1
+            if i < n && self.byte_at(i) == 10 {
+              i = i + 1
+            }
+            break
+          }
+          i = i + 1
+        }
+      }
+      continue
+    }
+    break
+  }
+  self.offset = i
+  self.line = line
+}
+
+///| Parse one raw record into `rec` (without header/expected_len/trimming logic).
+///| Returns `Ok(true)` if a record was read, `Ok(false)` on EOF.
+fn Reader::read_raw_record(self : Reader, rec : Record, do_trim : Bool) -> Result[Bool, CsvError] {
+  self.skip_empty_and_comments()
+  let n = self.len
+  if self.offset >= n {
+    self.pos = Position::new(self.offset.to_int64(), self.line, self.record_idx)
+    return Ok(false)
+  }
+
+  let max_recs = self.config.limits.max_records
+  if max_recs > 0 && self.records_read >= max_recs {
+    let p = Position::new(self.offset.to_int64(), self.line, self.record_idx)
+    return Err(
+      CsvError::new(
+        CsvErrorKind::TooManyRecords(max_recs),
+        Option::Some(p),
+        "csv: record count exceeded limit " + max_recs.to_string(),
+      ),
+    )
+  }
+
+  let rec_start = self.offset
+  let rec_line = self.line
+  let rec_pos = Position::new(rec_start.to_int64(), rec_line, self.record_idx)
+  let max_rec_bytes = self.config.limits.max_record_bytes
+  let max_fields = self.config.limits.max_fields_per_record
+  let scan_limit = if max_rec_bytes > 0 && rec_start + max_rec_bytes < n {
+    rec_start + max_rec_bytes
+  } else {
+    n
+  }
+
+  let spans = rec.spans
+  spans.clear()
+
+  let lut = self.lut
+  let delim = self.delim_int
+  let quote = self.quote_int
+  let quoting = self.config.quoting
+  let double_quote = self.config.double_quote
+  let has_escape = self.has_escape
+  let escape_int = self.escape_int
+  let custom_term = self.custom_term
+  let term_int = self.term_int
+
+  let mut i = rec_start
+  let mut line = rec_line
+  let mut using_sb = false
+  let mut sb = StringBuilder::new()
+  let mut sb_len = 0
+  let mut field_count = 0
+
+  // Fast-path loop over fields in the current record.
+  while true {
+    if max_fields > 0 && field_count >= max_fields {
+      return Err(
+        CsvError::new(
+          CsvErrorKind::TooManyFields(max_fields),
+          Option::Some(rec_pos),
+          "csv: field count exceeded limit " + max_fields.to_string(),
+        ),
+      )
+    }
+
+    if i < n && quoting && self.byte_at(i) == quote {
+      // Quoted field: switch to StringBuilder if not already using it.
+      if !using_sb {
+        let est = if n - rec_start < 1024 { n - rec_start } else { 256 }
+        sb = StringBuilder::with_capacity(est)
+        sb_len = 0
+        let existing = spans.length()
+        let mut k = 0
+        while k < existing {
+          let s0 = spans[k]
+          let e0 = spans[k + 1]
+          let fl = e0 - s0
+          self.write_input_slice(sb, s0, e0)
+          spans[k] = sb_len
+          sb_len = sb_len + fl
+          spans[k + 1] = sb_len
+          k = k + 2
+        }
+        using_sb = true
+      }
+
+      let field_sb_start = sb_len
+      i = i + 1 // consume opening quote
+      let mut run_start = i
+      let mut closed = false
+
+      while i < n {
+        if max_rec_bytes > 0 && i - rec_start > max_rec_bytes {
+          return Err(
+            CsvError::new(
+              CsvErrorKind::RecordTooLarge(max_rec_bytes),
+              Option::Some(rec_pos),
+              "csv: record size exceeded limit " + max_rec_bytes.to_string(),
+            ),
+          )
+        }
+        // Fast unrolled scan inside quoted field (for String input)
+        if !self.is_bytes {
+          let s_in = self.input
+          let end4 = scan_limit - 4
+          while i <= end4 {
+            let m = lut[s_in.code_unit_at(i)] |
+            lut[s_in.code_unit_at(i + 1)] |
+            lut[s_in.code_unit_at(i + 2)] |
+            lut[s_in.code_unit_at(i + 3)]
+            // Only stop on quote, escape, LF, CR (not delimiter or custom_term unless also LF/CR)
+            if (m & (cls_quote | cls_escape | cls_lf | cls_cr)) != 0 {
+              break
+            }
+            i = i + 4
+          }
+        }
+        if i >= n {
+          break
+        }
+        if max_rec_bytes > 0 && i - rec_start > max_rec_bytes {
+          return Err(
+            CsvError::new(
+              CsvErrorKind::RecordTooLarge(max_rec_bytes),
+              Option::Some(rec_pos),
+              "csv: record size exceeded limit " + max_rec_bytes.to_string(),
+            ),
+          )
+        }
+        let b = self.byte_at(i)
+        if has_escape && b == escape_int {
+          if i > run_start {
+            self.write_input_slice(sb, run_start, i)
+            sb_len = sb_len + (i - run_start)
+          }
+          i = i + 1
+          if i >= n {
+            run_start = i
+            break
+          }
+          let nb = self.byte_at(i)
+          if nb == 10 {
+            line = line + 1
+          } else if nb == 13 {
+            line = line + 1
+          }
+          sb.write_byte(nb.to_byte())
+          sb_len = sb_len + 1
+          i = i + 1
+          run_start = i
+        } else if b == quote {
+          if double_quote && i + 1 < n && self.byte_at(i + 1) == quote {
+            // Emit slice including the first quote, skip the second quote
+            self.write_input_slice(sb, run_start, i + 1)
+            sb_len = sb_len + (i + 1 - run_start)
+            i = i + 2
+            run_start = i
+          } else {
+            if i > run_start {
+              self.write_input_slice(sb, run_start, i)
+              sb_len = sb_len + (i - run_start)
+            }
+            i = i + 1 // consume closing quote
+            closed = true
+            break
+          }
+        } else if b == 10 {
+          line = line + 1
+          i = i + 1
+        } else if b == 13 {
+          line = line + 1
+          i = i + 1
+          if i < n && self.byte_at(i) == 10 {
+            i = i + 1
+          }
+        } else {
+          i = i + 1
+        }
+      }
+
+      if !closed {
+        if i > run_start {
+          self.write_input_slice(sb, run_start, i)
+          sb_len = sb_len + (i - run_start)
+        }
+        if !self.config.allow_unclosed_quotes {
+          self.offset = i
+          self.line = line
+          return Err(
+            CsvError::new(
+              CsvErrorKind::UnclosedQuote,
+              Option::Some(rec_pos),
+              "csv: unclosed quoted field at line " + rec_line.to_string() + ", byte " + rec_start.to_string(),
+            ),
+          )
+        }
+        spans.push(field_sb_start)
+        spans.push(sb_len)
+        field_count = field_count + 1
+        break
+      }
+
+      // After closing quote: expect delimiter, terminator, EOF, or lenient trailing data
+      if i >= n {
+        spans.push(field_sb_start)
+        spans.push(sb_len)
+        field_count = field_count + 1
+        break
+      }
+      let next_b = self.byte_at(i)
+      if next_b == delim {
+        spans.push(field_sb_start)
+        spans.push(sb_len)
+        field_count = field_count + 1
+        i = i + 1
+        continue
+      }
+      if self.is_terminator_byte(next_b) {
+        spans.push(field_sb_start)
+        spans.push(sb_len)
+        field_count = field_count + 1
+        if custom_term {
+          if term_int == 10 || term_int == 13 {
+            line = line + 1
+          }
+          i = i + 1
+        } else if next_b == 13 {
+          line = line + 1
+          i = i + 1
+          if i < n && self.byte_at(i) == 10 {
+            i = i + 1
+          }
+        } else {
+          line = line + 1
+          i = i + 1
+        }
+        break
+      }
+
+      // Lenient trailing characters after closing quote (matches BurntSushi/rust-csv)
+      let tail_start = i
+      while i < n {
+        if max_rec_bytes > 0 && i - rec_start > max_rec_bytes {
+          return Err(
+            CsvError::new(
+              CsvErrorKind::RecordTooLarge(max_rec_bytes),
+              Option::Some(rec_pos),
+              "csv: record size exceeded limit " + max_rec_bytes.to_string(),
+            ),
+          )
+        }
+        let tb = self.byte_at(i)
+        if tb == delim || self.is_terminator_byte(tb) {
+          break
+        }
+        i = i + 1
+      }
+      if i > tail_start {
+        self.write_input_slice(sb, tail_start, i)
+        sb_len = sb_len + (i - tail_start)
+      }
+      spans.push(field_sb_start)
+      spans.push(sb_len)
+      field_count = field_count + 1
+      if i >= n {
+        break
+      }
+      let end_b = self.byte_at(i)
+      if end_b == delim {
+        i = i + 1
+        continue
+      }
+      if custom_term {
+        if term_int == 10 || term_int == 13 {
+          line = line + 1
+        }
+        i = i + 1
+      } else if end_b == 13 {
+        line = line + 1
+        i = i + 1
+        if i < n && self.byte_at(i) == 10 {
+          i = i + 1
+        }
+      } else {
+        line = line + 1
+        i = i + 1
+      }
+      break
+    } else {
+      // Unquoted field hot path
+      let field_start = i
+      let stop_mask = cls_delim | cls_lf | cls_cr | cls_term
+      if !self.is_bytes {
+        let s_in = self.input
+        let end4 = scan_limit - 4
+        while i <= end4 {
+          let m = lut[s_in.code_unit_at(i)] |
+          lut[s_in.code_unit_at(i + 1)] |
+          lut[s_in.code_unit_at(i + 2)] |
+          lut[s_in.code_unit_at(i + 3)]
+          if (m & stop_mask) != 0 {
+            break
+          }
+          i = i + 4
+        }
+        while i < scan_limit && (lut[s_in.code_unit_at(i)] & stop_mask) == 0 {
+          i = i + 1
+        }
+      } else {
+        let raw = self.raw_bytes
+        let end4 = scan_limit - 4
+        while i <= end4 {
+          let m = lut[raw[i].to_int()] |
+          lut[raw[i + 1].to_int()] |
+          lut[raw[i + 2].to_int()] |
+          lut[raw[i + 3].to_int()]
+          if (m & stop_mask) != 0 {
+            break
+          }
+          i = i + 4
+        }
+        while i < scan_limit && (lut[raw[i].to_int()] & stop_mask) == 0 {
+          i = i + 1
+        }
+      }
+
+      if max_rec_bytes > 0 && i == scan_limit && i < n {
+        let b_check = self.byte_at(i)
+        if b_check != delim && !self.is_terminator_byte(b_check) {
+          return Err(
+            CsvError::new(
+              CsvErrorKind::RecordTooLarge(max_rec_bytes),
+              Option::Some(rec_pos),
+              "csv: record size exceeded limit " + max_rec_bytes.to_string(),
+            ),
+          )
+        }
+      }
+
+      let field_end = i
+      if using_sb {
+        let fl = field_end - field_start
+        self.write_input_slice(sb, field_start, field_end)
+        spans.push(sb_len)
+        sb_len = sb_len + fl
+        spans.push(sb_len)
+      } else {
+        spans.push(field_start)
+        spans.push(field_end)
+      }
+      field_count = field_count + 1
+
+      if i >= n {
+        break
+      }
+      let end_b = self.byte_at(i)
+      if end_b == delim {
+        i = i + 1
+        continue
+      }
+      if custom_term {
+        if term_int == 10 || term_int == 13 {
+          line = line + 1
+        }
+        i = i + 1
+      } else if end_b == 13 {
+        line = line + 1
+        i = i + 1
+        if i < n && self.byte_at(i) == 10 {
+          i = i + 1
+        }
+      } else {
+        line = line + 1
+        i = i + 1
+      }
+      break
+    }
+  }
+
+  // Advance reader state
+  let rec_raw_end = i
+  self.offset = rec_raw_end
+  self.line = line
+  self.record_idx = self.record_idx + 1
+  self.records_read = self.records_read + 1
+  self.pos = Position::new(self.offset.to_int64(), self.line, self.record_idx)
+  rec.pos = rec_pos
+
+  // Finalize backing string & UTF-8 validation (for Bytes input)
+  if self.is_bytes {
+    if using_sb {
+      let s_out = sb.to_string()
+      let nf = spans.length() >> 1
+      let mut f = 0
+      while f < nf {
+        let base = f << 1
+        let bad = validate_utf8_string(s_out, spans[base], spans[base + 1])
+        if bad >= 0 {
+          return Err(
+            CsvError::new(
+              CsvErrorKind::InvalidUtf8(f, bad),
+              Option::Some(rec_pos),
+              "csv: invalid UTF-8 at line " + rec_line.to_string() + ", field " + f.to_string() + ", offset " + bad.to_string(),
+            ),
+          )
+        }
+        f = f + 1
+      }
+      rec.buf = s_out
+    } else {
+      let nf = spans.length() >> 1
+      let mut f = 0
+      while f < nf {
+        let base = f << 1
+        let bad = validate_utf8_bytes(self.raw_bytes, spans[base], spans[base + 1])
+        if bad >= 0 {
+          return Err(
+            CsvError::new(
+              CsvErrorKind::InvalidUtf8(f, bad),
+              Option::Some(rec_pos),
+              "csv: invalid UTF-8 at line " + rec_line.to_string() + ", field " + f.to_string() + ", offset " + bad.to_string(),
+            ),
+          )
+        }
+        f = f + 1
+      }
+      // Slice the validated record bytes into a single String and rebase spans
+      let slice_end = if spans.length() > 0 { spans[spans.length() - 1] } else { rec_start }
+      rec.buf = self.raw_bytes.slice(rec_start, slice_end).to_string()
+      let mut k = 0
+      let slen = spans.length()
+      while k < slen {
+        spans[k] = spans[k] - rec_start
+        k = k + 1
+      }
+    }
+  } else {
+    if using_sb {
+      rec.buf = sb.to_string()
+    } else {
+      rec.buf = self.input
+    }
+  }
+
+  if do_trim {
+    trim_record_spans(rec)
+  }
+
+  Ok(true)
+}
+
+///| Check if headers should be trimmed under this config.
+fn Reader::should_trim_headers(self : Reader) -> Bool {
+  match self.config.trim {
+    Trim::Headers => true
+    Trim::All => true
+    _ => false
+  }
+}
+
+///| Check if data fields should be trimmed under this config.
+fn Reader::should_trim_fields(self : Reader) -> Bool {
+  match self.config.trim {
+    Trim::Fields => true
+    Trim::All => true
+    _ => false
+  }
+}
+
+///| Ensure the header record is loaded (for both `has_headers = true` and `false`).
+fn Reader::ensure_headers(self : Reader) -> Result[Unit, CsvError] {
+  if self.headers_loaded {
+    match self.headers_err {
+      Some(e) => return Err(e)
+      None => return Ok(())
+    }
+  }
+  self.headers_loaded = true
+  let hdr = Record::new()
+  let do_trim = if self.config.has_headers {
+    self.should_trim_headers()
+  } else {
+    self.should_trim_fields()
+  }
+  match self.read_raw_record(hdr, do_trim) {
+    Ok(true) => {
+      self.cached_headers = hdr
+      if !self.config.flexible {
+        self.expected_len = hdr.len()
+        self.has_expected_len = true
+      }
+      if !self.config.has_headers {
+        self.pending_first = Option::Some(clone_record(hdr))
+      }
+      Ok(())
+    }
+    Ok(false) => {
+      self.cached_headers = Record::new()
+      Ok(())
+    }
+    Err(e) => {
+      self.headers_err = Option::Some(e)
+      Err(e)
+    }
+  }
 }
 
 ///| Return the header record (reading and caching the first record if needed).
 pub fn Reader::headers(self : Reader) -> Result[Record, CsvError] {
-  let _ = self
-  Err(CsvError::unimplemented())
-}
-
-///| Read the next record, or `Ok(None)` at EOF.
-pub fn Reader::next_record(self : Reader) -> Result[Option[Record], CsvError] {
-  let _ = self
-  Err(CsvError::unimplemented())
+  match self.ensure_headers() {
+    Ok(_) => Ok(clone_record(self.cached_headers))
+    Err(e) => Err(e)
+  }
 }
 
 ///| Read the next record into a reusable `Record` buffer; returns `Ok(true)` if read, `Ok(false)` at EOF.
 pub fn Reader::read_record(self : Reader, rec : Record) -> Result[Bool, CsvError] {
-  let _ = self
-  let _ = rec
-  Err(CsvError::unimplemented())
+  if self.config.has_headers && !self.headers_loaded {
+    match self.ensure_headers() {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  match self.pending_first {
+    Some(first) => {
+      self.pending_first = Option::None
+      rec.buf = first.buf
+      rec.pos = first.pos
+      rec.spans.clear()
+      let mut i = 0
+      while i < first.spans.length() {
+        rec.spans.push(first.spans[i])
+        i = i + 1
+      }
+      return Ok(true)
+    }
+    None => ()
+  }
+
+  let do_trim = self.should_trim_fields()
+  match self.read_raw_record(rec, do_trim) {
+    Ok(false) => Ok(false)
+    Err(e) => Err(e)
+    Ok(true) => {
+      if !self.config.has_headers && !self.headers_loaded {
+        self.headers_loaded = true
+        self.cached_headers = clone_record(rec)
+      }
+      let flen = rec.len()
+      if !self.config.flexible {
+        if !self.has_expected_len {
+          self.expected_len = flen
+          self.has_expected_len = true
+        } else if flen != self.expected_len {
+          return Err(
+            CsvError::new(
+              CsvErrorKind::UnequalLengths(self.expected_len, flen),
+              Option::Some(rec.pos),
+              "csv: expected " + self.expected_len.to_string() + " fields, found " + flen.to_string() + " at line " + rec.pos.line.to_string(),
+            ),
+          )
+        }
+      }
+      Ok(true)
+    }
+  }
+}
+
+///| Read the next record, or `Ok(None)` at EOF.
+pub fn Reader::next_record(self : Reader) -> Result[Option[Record], CsvError] {
+  let rec = Record::new()
+  match self.read_record(rec) {
+    Ok(true) => Ok(Option::Some(rec))
+    Ok(false) => Ok(Option::None)
+    Err(e) => Err(e)
+  }
 }
 
 ///| Read all remaining records into an `Array[Record]`.
 pub fn Reader::read_all(self : Reader) -> Result[Array[Record], CsvError] {
-  let _ = self
-  Err(CsvError::unimplemented())
+  let out : Array[Record] = []
+  while true {
+    match self.next_record() {
+      Ok(Some(rec)) => out.push(rec)
+      Ok(None) => return Ok(out)
+      Err(e) => return Err(e)
+    }
+  }
+  Ok(out)
 }
 
 ///| Return the current stream position.
