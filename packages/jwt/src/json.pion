@@ -1,0 +1,721 @@
+///| Strict zero-dependency RFC 8259 JSON parser & serializer for JWT/JWK.
+///| Enforces UTF-8 validity, duplicate-key rejection (anti-smuggling),
+///| nesting depth limits, and exact Int64 integer parsing.
+
+///| Hard upper bound on JSON nesting depth to prevent stack overflow during
+///| parsing or dropping on both native and wasm32 (matches serde_json's 128).
+let max_hard_json_depth : Int = 128
+
+///|
+fn clamp_json_depth(max_depth : Int) -> Int {
+  if max_depth <= 0 {
+    0
+  } else if max_depth > max_hard_json_depth {
+    max_hard_json_depth
+  } else {
+    max_depth
+  }
+}
+
+///|
+fn is_finite_double(v : Double) -> Bool {
+  let bits = v.reinterpret_as_uint64()
+  ((bits >> 52UL) & 0x7FFUL) != 0x7FFUL
+}
+
+///|
+fn parse_finite_double(s : String, neg : Bool) -> Result[Double, JwtError] {
+  match s.to_double() {
+    Some(fv) => {
+      if !is_finite_double(fv) {
+        return Err(JwtError::InvalidJson("number out of range"))
+      }
+      if neg && fv == 0.0 {
+        Ok(Double::from_bits(-9223372036854775807L - 1L))
+      } else {
+        Ok(fv)
+      }
+    }
+    None => Err(JwtError::InvalidJson("invalid float number"))
+  }
+}
+
+///|
+struct JsonParser {
+  buf : Bytes
+  len : Int
+  mut pos : Int
+  max_depth : Int
+}
+
+///|
+fn validate_utf8(b : Bytes) -> Bool {
+  let n = b.length()
+  let mut i = 0
+  while i < n {
+    let c = b[i].to_int()
+    if c < 0x80 {
+      i = i + 1
+    } else if c >= 0xC2 && c <= 0xDF {
+      if i + 1 >= n {
+        return false
+      }
+      let c1 = b[i + 1].to_int()
+      if (c1 & 0xC0) != 0x80 {
+        return false
+      }
+      i = i + 2
+    } else if c >= 0xE0 && c <= 0xEF {
+      if i + 2 >= n {
+        return false
+      }
+      let c1 = b[i + 1].to_int()
+      let c2 = b[i + 2].to_int()
+      if (c1 & 0xC0) != 0x80 || (c2 & 0xC0) != 0x80 {
+        return false
+      }
+      if c == 0xE0 && c1 < 0xA0 {
+        return false
+      }
+      if c == 0xED && c1 >= 0xA0 {
+        return false
+      }
+      i = i + 3
+    } else if c >= 0xF0 && c <= 0xF4 {
+      if i + 3 >= n {
+        return false
+      }
+      let c1 = b[i + 1].to_int()
+      let c2 = b[i + 2].to_int()
+      let c3 = b[i + 3].to_int()
+      if (c1 & 0xC0) != 0x80 || (c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80 {
+        return false
+      }
+      if c == 0xF0 && c1 < 0x90 {
+        return false
+      }
+      if c == 0xF4 && c1 > 0x8F {
+        return false
+      }
+      i = i + 4
+    } else {
+      return false
+    }
+  }
+  true
+}
+
+///|
+fn skip_ws(p : JsonParser) -> Unit {
+  while p.pos < p.len {
+    let c = p.buf[p.pos].to_int()
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      p.pos = p.pos + 1
+    } else {
+      return
+    }
+  }
+}
+
+///|
+fn parse_hex4(p : JsonParser) -> Result[Int, JwtError] {
+  if p.pos + 4 > p.len {
+    return Err(JwtError::InvalidJson("truncated unicode escape"))
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < 4 {
+    let c = p.buf[p.pos + i].to_int()
+    let d = if c >= 48 && c <= 57 {
+      c - 48
+    } else if c >= 97 && c <= 102 {
+      c - 97 + 10
+    } else if c >= 65 && c <= 70 {
+      c - 65 + 10
+    } else {
+      return Err(JwtError::InvalidJson("invalid hex in unicode escape"))
+    }
+    acc = (acc << 4) | d
+    i = i + 1
+  }
+  p.pos = p.pos + 4
+  Ok(acc)
+}
+
+///|
+fn append_utf8_cp(out : Array[Byte], cp : Int) -> Unit {
+  if cp < 0x80 {
+    out.push(cp.to_byte())
+  } else if cp < 0x800 {
+    out.push((0xC0 | (cp >> 6)).to_byte())
+    out.push((0x80 | (cp & 0x3F)).to_byte())
+  } else if cp < 0x10000 {
+    out.push((0xE0 | (cp >> 12)).to_byte())
+    out.push((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    out.push((0x80 | (cp & 0x3F)).to_byte())
+  } else {
+    out.push((0xF0 | (cp >> 18)).to_byte())
+    out.push((0x80 | ((cp >> 12) & 0x3F)).to_byte())
+    out.push((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    out.push((0x80 | (cp & 0x3F)).to_byte())
+  }
+}
+
+///|
+fn slice_bytes_to_string(b : Bytes, start : Int, end : Int) -> String {
+  let n = end - start
+  let mut out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = b[start + i]
+    i = i + 1
+  }
+  out.to_string()
+}
+
+///|
+fn parse_string(p : JsonParser) -> Result[String, JwtError] {
+  if p.pos >= p.len || p.buf[p.pos].to_int() != 34 {
+    return Err(JwtError::InvalidJson("expected '\"'"))
+  }
+  p.pos = p.pos + 1
+  let start = p.pos
+  // Fast path: no escapes
+  while p.pos < p.len {
+    let c = p.buf[p.pos].to_int()
+    if c == 34 {
+      let s = slice_bytes_to_string(p.buf, start, p.pos)
+      p.pos = p.pos + 1
+      return Ok(s)
+    }
+    if c == 92 {
+      break
+    }
+    if c < 0x20 {
+      return Err(JwtError::InvalidJson("unescaped control character in string"))
+    }
+    p.pos = p.pos + 1
+  }
+  if p.pos >= p.len {
+    return Err(JwtError::InvalidJson("unterminated string"))
+  }
+
+  // Slow path: string contains escape sequences
+  let out : Array[Byte] = []
+  let mut i = start
+  while i < p.pos {
+    out.push(p.buf[i])
+    i = i + 1
+  }
+  while p.pos < p.len {
+    let c = p.buf[p.pos].to_int()
+    if c == 34 {
+      p.pos = p.pos + 1
+      let n = out.length()
+      let mut res = Bytes::new(n)
+      let mut j = 0
+      while j < n {
+        res[j] = out[j]
+        j = j + 1
+      }
+      return Ok(res.to_string())
+    }
+    if c < 0x20 {
+      return Err(JwtError::InvalidJson("unescaped control character in string"))
+    }
+    if c == 92 {
+      p.pos = p.pos + 1
+      if p.pos >= p.len {
+        return Err(JwtError::InvalidJson("unterminated escape"))
+      }
+      let esc = p.buf[p.pos].to_int()
+      p.pos = p.pos + 1
+      if esc == 34 {
+        out.push((34).to_byte())
+      } else if esc == 92 {
+        out.push((92).to_byte())
+      } else if esc == 47 {
+        out.push((47).to_byte())
+      } else if esc == 98 {
+        out.push((8).to_byte())
+      } else if esc == 102 {
+        out.push((12).to_byte())
+      } else if esc == 110 {
+        out.push((10).to_byte())
+      } else if esc == 114 {
+        out.push((13).to_byte())
+      } else if esc == 116 {
+        out.push((9).to_byte())
+      } else if esc == 117 {
+        let u1 = match parse_hex4(p) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if u1 >= 0xD800 && u1 <= 0xDBFF {
+          if p.pos + 2 > p.len || p.buf[p.pos].to_int() != 92 || p.buf[p.pos + 1].to_int() != 117 {
+            return Err(JwtError::InvalidJson("lone high surrogate"))
+          }
+          p.pos = p.pos + 2
+          let u2 = match parse_hex4(p) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          if u2 < 0xDC00 || u2 > 0xDFFF {
+            return Err(JwtError::InvalidJson("invalid low surrogate"))
+          }
+          let cp = 0x10000 + ((u1 - 0xD800) << 10) + (u2 - 0xDC00)
+          append_utf8_cp(out, cp)
+        } else if u1 >= 0xDC00 && u1 <= 0xDFFF {
+          return Err(JwtError::InvalidJson("lone low surrogate"))
+        } else {
+          append_utf8_cp(out, u1)
+        }
+      } else {
+        return Err(JwtError::InvalidJson("invalid escape sequence"))
+      }
+    } else {
+      out.push(p.buf[p.pos])
+      p.pos = p.pos + 1
+    }
+  }
+  Err(JwtError::InvalidJson("unterminated string"))
+}
+
+///|
+fn parse_number(p : JsonParser) -> Result[JsonValue, JwtError] {
+  let start = p.pos
+  let mut neg = false
+  if p.pos < p.len && p.buf[p.pos].to_int() == 45 {
+    neg = true
+    p.pos = p.pos + 1
+  }
+  if p.pos >= p.len {
+    return Err(JwtError::InvalidJson("unexpected end in number"))
+  }
+  let first = p.buf[p.pos].to_int()
+  if first < 48 || first > 57 {
+    return Err(JwtError::InvalidJson("invalid number"))
+  }
+  let mut acc : UInt64 = 0UL
+  let mut overflow = false
+  if first == 48 {
+    p.pos = p.pos + 1
+    if p.pos < p.len {
+      let next_c = p.buf[p.pos].to_int()
+      if next_c >= 48 && next_c <= 57 {
+        return Err(JwtError::InvalidJson("leading zero in number"))
+      }
+    }
+  } else {
+    while p.pos < p.len {
+      let c = p.buf[p.pos].to_int()
+      if c >= 48 && c <= 57 {
+        let d = (c - 48).to_int64().to_uint64()
+        if acc > 922337203685477580UL || (acc == 922337203685477580UL && d > (if neg { 8UL } else { 7UL })) {
+          overflow = true
+        } else {
+          acc = acc * 10UL + d
+        }
+        p.pos = p.pos + 1
+      } else {
+        break
+      }
+    }
+  }
+
+  let mut is_float = false
+  if p.pos < p.len && p.buf[p.pos].to_int() == 46 {
+    is_float = true
+    p.pos = p.pos + 1
+    if p.pos >= p.len || p.buf[p.pos].to_int() < 48 || p.buf[p.pos].to_int() > 57 {
+      return Err(JwtError::InvalidJson("invalid fraction in number"))
+    }
+    while p.pos < p.len && p.buf[p.pos].to_int() >= 48 && p.buf[p.pos].to_int() <= 57 {
+      p.pos = p.pos + 1
+    }
+  }
+  if p.pos < p.len && (p.buf[p.pos].to_int() == 101 || p.buf[p.pos].to_int() == 69) {
+    is_float = true
+    p.pos = p.pos + 1
+    if p.pos < p.len && (p.buf[p.pos].to_int() == 43 || p.buf[p.pos].to_int() == 45) {
+      p.pos = p.pos + 1
+    }
+    if p.pos >= p.len || p.buf[p.pos].to_int() < 48 || p.buf[p.pos].to_int() > 57 {
+      return Err(JwtError::InvalidJson("invalid exponent in number"))
+    }
+    while p.pos < p.len && p.buf[p.pos].to_int() >= 48 && p.buf[p.pos].to_int() <= 57 {
+      p.pos = p.pos + 1
+    }
+  }
+
+  if is_float || overflow {
+    let s = slice_bytes_to_string(p.buf, start, p.pos)
+    match parse_finite_double(s, neg) {
+      Ok(fv) => return Ok(JsonValue::Float(fv))
+      Err(e) => return Err(e)
+    }
+  }
+  if neg {
+    if acc == 9223372036854775808UL {
+      Ok(JsonValue::Int(-9223372036854775807L - 1L))
+    } else {
+      Ok(JsonValue::Int(0L - acc.to_int64()))
+    }
+  } else {
+    Ok(JsonValue::Int(acc.to_int64()))
+  }
+}
+
+///|
+fn parse_value(p : JsonParser, depth : Int) -> Result[JsonValue, JwtError] {
+  skip_ws(p)
+  if p.pos >= p.len {
+    return Err(JwtError::InvalidJson("unexpected end of input"))
+  }
+  let c = p.buf[p.pos].to_int()
+  if c == 123 {
+    // '{'
+    if depth >= p.max_depth {
+      return Err(JwtError::JsonDepthExceeded(p.max_depth))
+    }
+    p.pos = p.pos + 1
+    let obj : Map[String, JsonValue] = Map::new()
+    skip_ws(p)
+    if p.pos < p.len && p.buf[p.pos].to_int() == 125 {
+      p.pos = p.pos + 1
+      return Ok(JsonValue::Obj(obj))
+    }
+    while true {
+      skip_ws(p)
+      let key = match parse_string(p) {
+        Ok(k) => k
+        Err(e) => return Err(e)
+      }
+      if obj.contains(key) {
+        return Err(JwtError::DuplicateJsonKey(key))
+      }
+      skip_ws(p)
+      if p.pos >= p.len || p.buf[p.pos].to_int() != 58 {
+        return Err(JwtError::InvalidJson("expected ':'"))
+      }
+      p.pos = p.pos + 1
+      let v = match parse_value(p, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      obj.set(key, v)
+      skip_ws(p)
+      if p.pos >= p.len {
+        return Err(JwtError::InvalidJson("unterminated object"))
+      }
+      let sep = p.buf[p.pos].to_int()
+      if sep == 44 {
+        p.pos = p.pos + 1
+      } else if sep == 125 {
+        p.pos = p.pos + 1
+        return Ok(JsonValue::Obj(obj))
+      } else {
+        return Err(JwtError::InvalidJson("expected ',' or '}'"))
+      }
+    }
+    Ok(JsonValue::Obj(obj))
+  } else if c == 91 {
+    // '['
+    if depth >= p.max_depth {
+      return Err(JwtError::JsonDepthExceeded(p.max_depth))
+    }
+    p.pos = p.pos + 1
+    let arr : Array[JsonValue] = []
+    skip_ws(p)
+    if p.pos < p.len && p.buf[p.pos].to_int() == 93 {
+      p.pos = p.pos + 1
+      return Ok(JsonValue::Arr(arr))
+    }
+    while true {
+      let v = match parse_value(p, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      arr.push(v)
+      skip_ws(p)
+      if p.pos >= p.len {
+        return Err(JwtError::InvalidJson("unterminated array"))
+      }
+      let sep = p.buf[p.pos].to_int()
+      if sep == 44 {
+        p.pos = p.pos + 1
+      } else if sep == 93 {
+        p.pos = p.pos + 1
+        return Ok(JsonValue::Arr(arr))
+      } else {
+        return Err(JwtError::InvalidJson("expected ',' or ']'"))
+      }
+    }
+    Ok(JsonValue::Arr(arr))
+  } else if c == 34 {
+    match parse_string(p) {
+      Ok(s) => Ok(JsonValue::Str(s))
+      Err(e) => Err(e)
+    }
+  } else if c == 116 {
+    // true
+    if p.pos + 4 <= p.len && p.buf[p.pos + 1].to_int() == 114 && p.buf[p.pos + 2].to_int() == 117 && p.buf[p.pos + 3].to_int() == 101 {
+      p.pos = p.pos + 4
+      Ok(JsonValue::Bool(true))
+    } else {
+      Err(JwtError::InvalidJson("invalid literal"))
+    }
+  } else if c == 102 {
+    // false
+    if p.pos + 5 <= p.len && p.buf[p.pos + 1].to_int() == 97 && p.buf[p.pos + 2].to_int() == 108 && p.buf[p.pos + 3].to_int() == 115 && p.buf[p.pos + 4].to_int() == 101 {
+      p.pos = p.pos + 5
+      Ok(JsonValue::Bool(false))
+    } else {
+      Err(JwtError::InvalidJson("invalid literal"))
+    }
+  } else if c == 110 {
+    // null
+    if p.pos + 4 <= p.len && p.buf[p.pos + 1].to_int() == 117 && p.buf[p.pos + 2].to_int() == 108 && p.buf[p.pos + 3].to_int() == 108 {
+      p.pos = p.pos + 4
+      Ok(JsonValue::Null)
+    } else {
+      Err(JwtError::InvalidJson("invalid literal"))
+    }
+  } else if c == 45 || (c >= 48 && c <= 57) {
+    parse_number(p)
+  } else {
+    Err(JwtError::InvalidJson("unexpected character"))
+  }
+}
+
+///|
+pub fn json_parse(input : Bytes, max_depth : Int) -> Result[JsonValue, JwtError] {
+  if !validate_utf8(input) {
+    return Err(JwtError::InvalidUtf8("invalid UTF-8 sequence"))
+  }
+  let p = JsonParser::{
+    buf: input,
+    len: input.length(),
+    pos: 0,
+    max_depth: clamp_json_depth(max_depth),
+  }
+  let v = match parse_value(p, 0) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  skip_ws(p)
+  if p.pos != p.len {
+    return Err(JwtError::InvalidJson("trailing data after JSON value"))
+  }
+  Ok(v)
+}
+
+///|
+fn write_json_string(sb : StringBuilder, s : String) -> Unit {
+  sb.write_string("\"")
+  let slen = s.length()
+  let mut needs_escape = false
+  let mut si = 0
+  while si < slen {
+    let cu = s.code_unit_at(si)
+    if cu == 34 || cu == 92 || cu < 0x20 {
+      needs_escape = true
+      break
+    }
+    si = si + 1
+  }
+  if !needs_escape {
+    sb.write_string(s)
+    sb.write_string("\"")
+    return
+  }
+  let b = s.to_bytes()
+  let n = b.length()
+  let mut i = 0
+  let mut seg_start = 0
+  let hex = "0123456789abcdef"
+  while i < n {
+    let c = b[i].to_int()
+    if c == 34 || c == 92 || c < 0x20 {
+      if i > seg_start {
+        sb.write_string(slice_bytes_to_string(b, seg_start, i))
+      }
+      if c == 34 {
+        sb.write_string("\\\"")
+      } else if c == 92 {
+        sb.write_string("\\\\")
+      } else if c == 8 {
+        sb.write_string("\\b")
+      } else if c == 12 {
+        sb.write_string("\\f")
+      } else if c == 10 {
+        sb.write_string("\\n")
+      } else if c == 13 {
+        sb.write_string("\\r")
+      } else if c == 9 {
+        sb.write_string("\\t")
+      } else {
+        sb.write_string("\\u00")
+        let mut h = Bytes::new(2)
+        h[0] = hex.code_unit_at((c >> 4) & 0xF).to_byte()
+        h[1] = hex.code_unit_at(c & 0xF).to_byte()
+        sb.write_string(h.to_string())
+      }
+      seg_start = i + 1
+    }
+    i = i + 1
+  }
+  if seg_start == 0 {
+    sb.write_string(s)
+  } else if seg_start < n {
+    sb.write_string(slice_bytes_to_string(b, seg_start, n))
+  }
+  sb.write_string("\"")
+}
+
+///|
+fn write_json_float(sb : StringBuilder, f : Double) -> Unit {
+  let bits = f.reinterpret_as_uint64()
+  if ((bits >> 52UL) & 0x7FFUL) == 0x7FFUL {
+    sb.write_string("null")
+    return
+  }
+  if bits == 0x8000000000000000UL {
+    sb.write_string("-0.0")
+    return
+  }
+  let s = f.to_string()
+  let n = s.length()
+  let mut has_dot_or_exp = false
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 46 || c == 101 || c == 69 {
+      has_dot_or_exp = true
+      break
+    }
+    i = i + 1
+  }
+  sb.write_string(s)
+  if !has_dot_or_exp {
+    sb.write_string(".0")
+  }
+}
+
+///|
+fn write_json_value_checked(sb : StringBuilder, v : JsonValue) -> Result[Unit, JwtError] {
+  match v {
+    JsonValue::Null => {
+      sb.write_string("null")
+      Ok(())
+    }
+    JsonValue::Bool(b) => {
+      sb.write_string(if b { "true" } else { "false" })
+      Ok(())
+    }
+    JsonValue::Int(n) => {
+      sb.write_string(n.to_string())
+      Ok(())
+    }
+    JsonValue::Float(f) => {
+      if !is_finite_double(f) {
+        return Err(JwtError::InvalidJson("non-finite float cannot be serialized to JSON"))
+      }
+      write_json_float(sb, f)
+      Ok(())
+    }
+    JsonValue::Str(s) => {
+      write_json_string(sb, s)
+      Ok(())
+    }
+    JsonValue::Arr(arr) => {
+      sb.write_string("[")
+      let mut i = 0
+      while i < arr.length() {
+        if i > 0 {
+          sb.write_string(",")
+        }
+        match write_json_value_checked(sb, arr[i]) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      sb.write_string("]")
+      Ok(())
+    }
+    JsonValue::Obj(m) => {
+      sb.write_string("{")
+      let ks = m.keys()
+      let mut i = 0
+      while i < ks.length() {
+        if i > 0 {
+          sb.write_string(",")
+        }
+        let k = ks[i]
+        write_json_string(sb, k)
+        sb.write_string(":")
+        match m.get(k) {
+          Some(mv) =>
+          match write_json_value_checked(sb, mv) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          None => sb.write_string("null")
+        }
+        i = i + 1
+      }
+      sb.write_string("}")
+      Ok(())
+    }
+  }
+}
+
+///|
+fn write_json_value(sb : StringBuilder, v : JsonValue) -> Unit {
+  match v {
+    JsonValue::Null => sb.write_string("null")
+    JsonValue::Bool(b) => sb.write_string(if b { "true" } else { "false" })
+    JsonValue::Int(n) => sb.write_string(n.to_string())
+    JsonValue::Float(f) => write_json_float(sb, f)
+    JsonValue::Str(s) => write_json_string(sb, s)
+    JsonValue::Arr(arr) => {
+      sb.write_string("[")
+      let mut i = 0
+      while i < arr.length() {
+        if i > 0 {
+          sb.write_string(",")
+        }
+        write_json_value(sb, arr[i])
+        i = i + 1
+      }
+      sb.write_string("]")
+    }
+    JsonValue::Obj(m) => {
+      sb.write_string("{")
+      let ks = m.keys()
+      let mut i = 0
+      while i < ks.length() {
+        if i > 0 {
+          sb.write_string(",")
+        }
+        let k = ks[i]
+        write_json_string(sb, k)
+        sb.write_string(":")
+        match m.get(k) {
+          Some(mv) => write_json_value(sb, mv)
+          None => sb.write_string("null")
+        }
+        i = i + 1
+      }
+      sb.write_string("}")
+    }
+  }
+}
+
+///|
+pub fn json_stringify(v : JsonValue) -> String {
+  let sb = StringBuilder::new()
+  write_json_value(sb, v)
+  sb.to_string()
+}
