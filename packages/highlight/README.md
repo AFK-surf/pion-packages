@@ -1,30 +1,37 @@
 # `highlight`
 
-Pure Pion zero-allocation, line-state incremental syntax highlighting engine (16 core languages + Markdown), designed to replace JavaScript `shiki` / `prismjs` across `still.fail`, `board`, and `invar/code_field`.
+Pure Pion zero-allocation, line-state incremental syntax highlighting engine (24 languages including Java, Kotlin, Swift, C#, PHP, Ruby, Dockerfile, and Markdown), designed to replace JavaScript `shiki` / `prismjs` across `still.fail`, `board`, and `invar/code_field`.
 
 Zero regex backtracking, zero JavaScript, zero C glue, zero `World` dependency, `Send`-safe immutable value types, and dual-target verified on **Native (`arm64_apple`)** and **WebAssembly (`wasm32`)**.
 
-## Supported Languages (17 Languages & Aliases)
+## Supported Languages (24 Languages & Aliases)
 
 | Language | Canonical & Aliases | Highlights & Incremental State |
 | --- | --- | --- |
 | `Pion` | `pion`, `mbt`, `moonbit` | Nested `/* /* */ */` comments, `#|` multiline raw strings, `\{expr}` interpolation, `#verify` attributes, `pub val struct` |
-| `Rust` | `rust`, `rs` | Nested `/* /* */ */` comments, `r#"..."#` / `r##"..."##` raw strings, lifetimes `'a` vs chars `'x'`, `#[derive]` / `#![no_std]`, `println!` macros, `std::` namespaces |
+| `Rust` | `rust`, `rs` | Nested `/* /* */ */` comments, `r#"..."#` / `r##"..."##` raw strings, `b'x'` / `c"..."` literals, lifetimes `'a` vs chars `'x'`, `#[derive]` / `#![no_std]`, `println!` macros, `fn parse<T>`, `std::` namespaces |
 | `Go` | `go`, `golang` | Backtick `` `...` `` multiline raw strings, runes, `:=` / `<-` channel ops, `/* */` comments |
-| `TypeScript` | `typescript`, `ts`, `tsx`, `mts`, `cts` | Multiline template literals `` `...${expr}...` `` with nested braces, `@Decorator`, TS type keywords & builtins, BigInt `1_000n` |
-| `JavaScript` | `javascript`, `js`, `jsx`, `mjs`, `cjs` | Multiline template literals with `${...}` interpolation, `/* */` comments, ES operators (`===`, `??`, `?.`, `...`) |
-| `Python` | `python`, `py`, `py3`, `pyi` | Multiline `"""..."""` / `'''...'''` strings, prefixed `f"`/`r"`/`b"` strings, `@decorator`, `#` comments, `:=`/`//`/`**` |
-| `C` | `c`, `h` | Preprocessor `#include`/`#define`/`#ifdef`, `/* */` comments, `42UL`/`0xFFu`/`1.5f` suffixes |
-| `Cpp` | `cpp`, `c++`, `cc`, `cxx`, `hpp`, `hh`, `hxx` | `template`/`constexpr`/`noexcept`/`nullptr`, `std::` namespaces, `[[nodiscard]]` attributes, `1'000'000ULL` digit separators |
+| `TypeScript` | `typescript`, `ts`, `tsx`, `mts`, `cts` | Regex literals `/pat/flags`, multi-level nested template literals `` `a ${`b ${1}`}` ``, JSX/TSX tags & text, `@Decorator`, generic `function comp<T>`, CR line terminators |
+| `JavaScript` | `javascript`, `js`, `jsx`, `mjs`, `cjs` | Regex literals `/pat/flags`, multi-level nested template literals, JSX tags & text, `/* */` comments, ES operators (`===`, `??`, `?.`, `...`) |
+| `Python` | `python`, `py`, `py3`, `pyi` | Multiline `"""..."""` / `'''...'''` strings, prefixed `f"`/`r"`/`b"`/`rb'''` strings, `@decorator`, `#` comments, `:=`/`//`/`**` |
+| `C` | `c`, `h` | Preprocessor `#include <header>`, `#define` `\` continuations, `\` string line splicing, `/* */` comments, numeric suffixes |
+| `Cpp` | `cpp`, `c++`, `cc`, `cxx`, `hpp`, `hh`, `hxx` | Multiline `R"delim(...)delim"` raw strings, `template`/`constexpr`/`noexcept`/`nullptr`, `std::` namespaces, `[[nodiscard]]` attributes, `1'000'000ULL` |
+| `Java` | `java` | `@Override` annotations, classes/records/sealed types, `/* */` comments, strings & numbers |
+| `Kotlin` | `kotlin`, `kt`, `kts` | Nested `/* */` comments, `data class`, `fun`, `suspend`, `@Annotation` |
+| `Swift` | `swift` | Nested `/* */` comments, `struct`/`actor`/`guard`/`async`/`await`, `@MainActor` |
+| `CSharp` | `csharp`, `cs`, `c#` | `namespace`/`using`/`record`/`async`, `#region` directives, primitive types |
+| `Php` | `php` | `<?php`/`?>` tags, `$variable`, `#`/`//`/`/* */` comments, case-insensitive keywords |
+| `Ruby` | `ruby`, `rb` | `def`/`class`/`module`/`end`, `:symbol`, `@ivar`/`@@cvar`/`$gvar`, `#` comments |
+| `Dockerfile` | `dockerfile`, `docker` | `FROM`/`RUN`/`COPY`/`ENV`/`CMD`/`WORKDIR` instructions, `$VAR`/`${VAR}`, strings & `#` comments |
 | `Json` | `json`, `jsonc`, `jsonl` | Property keys `"k":` vs string values `"v"`, JSONC comments, scientific numbers, `true`/`false`/`null` |
-| `Toml` | `toml` | `[table]` & `[[array]]` headers, dotted keys `a.b = 1`, multiline `"""..."""` / `'''...'''`, `#` comments |
+| `Toml` | `toml` | `[table]` & `[[array]]` headers, dotted & inline table keys `{ a = 1 }`, ISO-8601 offset datetimes, multiline `"""..."""` / `'''...'''` |
 | `Yaml` | `yaml`, `yml` | Mapping keys, `|`/`>` multiline block scalars (indentation-tracked), `&anchor`/`*alias`, `---` separators |
-| `Sql` | `sql`, `postgres`, `postgresql`, `mysql`, `sqlite` | Case-insensitive keywords & types, `--` and `/* */` comments, `'O''Brien'` doubled-quote strings |
-| `Shell` | `shell`, `sh`, `bash`, `zsh`, `shellscript` | `#!` shebang & `#` comments, `$VAR`/`${VAR:-default}`/`$?`, quotes, pipes & redirects |
-| `Html` | `html`, `htm`, `xml`, `svg`, `xhtml`, `markup` | Tags, multiline attributes, `<!-- -->` multiline comments, `<!DOCTYPE>`, embedded `<script>` (JS) & `<style>` (CSS) |
-| `Css` | `css`, `scss` | Selectors (`.cls`, `#id`), `@media` at-rules, properties, `#hex` colors, numeric units (`16px`, `1.5rem`, `100%`), `!important` |
+| `Sql` | `sql`, `postgres`, `postgresql`, `mysql`, `sqlite` | Case-insensitive keywords & DDL (`FUNCTION`/`RETURNS`/`LANGUAGE`), `--` and `/* */` comments, `'O''Brien'`, `E'...'`, multiline `$$...$$` / `$tag$...$tag$` |
+| `Shell` | `shell`, `sh`, `bash`, `zsh`, `shellscript` | Heredoc `<<EOF`/`<<-EOF`/`<<'EOF'`, multiline `'...'` & `"..."` with nested `$(...)`, `$((...))` arithmetic, `\'` escapes, `#!` shebang & `#` comments |
+| `Html` | `html`, `htm`, `xml`, `svg`, `xhtml`, `markup` | Tags, unquoted/quoted attributes, `&amp;` entities, `<?xml ?>` prologs, `<!-- -->`, `<!DOCTYPE>`, stateful multiline `<script>` (JS) & `<style>` (CSS) |
+| `Css` | `css`, `scss` | Selectors (`.cls`, `#id`, nested `@media` & SCSS), `//` & `/* */` comments, `$var` variables, negative numbers (`-1.5em`), `#hex` colors, `!important` |
 | `Diff` | `diff`, `patch` | `diff --git`, `---`/`+++`, `@@ ... @@` headers, `+` added lines, `-` deleted lines |
-| `Markdown` | `markdown`, `md` | Headings, fenced code blocks ```` ``` ```` / `~~~`, inline `` `code` ``, blockquotes, links |
+| `Markdown` | `markdown`, `md` | Headings, fenced code blocks ```` ``` ```` / `~~~`, inline `` `code` ``, `**bold**`, `_italic_`, list markers, blockquotes, `[label](url)` links |
 
 ## Architecture
 
@@ -41,17 +48,21 @@ Zero regex backtracking, zero JavaScript, zero C glue, zero `World` dependency, 
 ## Public API
 
 ```pion
-pub enum Language { Pion, Rust, Go, TypeScript, JavaScript, Python, C, Cpp, Json, Toml, Yaml, Sql, Shell, Html, Css, Diff, Markdown }
+pub enum Language { Pion, Rust, Go, TypeScript, JavaScript, Python, C, Cpp, Json, Toml, Yaml, Sql, Shell, Html, Css, Diff, Markdown, Java, Kotlin, Swift, CSharp, Php, Ruby, Dockerfile }
 pub enum TokenKind { Plain, Keyword, Type, Function, String, Number, Comment, Operator, Punctuation, Constant, Attribute, Property, Tag, Variable, Namespace, DiffAdd, DiffDel, DiffHeader }
 pub val struct Span { pub start : Int, pub end : Int, pub kind : TokenKind }
-pub val struct LineState { pub mode : Int, pub depth : Int, pub delim : Int }
+pub val struct LineState { pub mode : Int, pub depth : Int, pub delim : Int, pub sub_mode : Int, pub sub_depth : Int, pub sub_delim : Int, pub tag : String }
 
 pub fn LineState::initial() -> LineState
 pub fn resolve_language(name : String) -> Option[Language]
 pub fn token_kind_class(k : TokenKind) -> String
+pub fn token_kind_ansi(k : TokenKind) -> String
 pub fn highlight(lang : Language, src : String) -> Array[Span]
 pub fn highlight_line(lang : Language, state : LineState, line : String) -> (Array[Span], LineState)
 pub fn highlight_html(lang : Language, src : String) -> String
+pub fn highlight_line_html(lang : Language, state : LineState, line : String) -> (String, LineState)
+pub fn highlight_html_lines(lang : Language, src : String, line_numbers : Bool) -> String
+pub fn highlight_ansi(lang : Language, src : String) -> String
 ```
 
 ## Verification & Head-to-Head Benchmark
