@@ -78,3 +78,18 @@ Run reproducibly via `sh packages/yaml/bench/run_bench.sh` (using `scripts/bench
 | `go_yaml_v3` (`gopkg.in/yaml.v3`) | 117.757 | 115.343 | 118.489 | 25.50 | 20.67 MiB | 0.63x |
 
 _SHA-256 verified identical across all implementations and rounds: `d57e15ae46b8deb701bd42730f7d034287f48e4e7736d1e71249e80df449b633`._
+
+Pion is **2.01x** faster than Go `yaml.v3` on this workload (117.757 / 58.561 ms).
+
+### v0.2.0 Adversarial Benchmarks (`sh packages/yaml/audit/run_audit.sh`, SHA-256 identical)
+
+Measured after red-team remediation (26/26 red-team tests pass; 400/402 `yaml-test-suite` cases on the audit oracle, matching `yaml-rust2`):
+
+| Workload | `pion_yaml` | `rust_yaml_rust2` | Speedup (vs Rust) |
+| --- | ---: | ---: | ---: |
+| `wide_map` (one map, 101k keys) | 73.8 ms | 107.3 ms | **1.45x** |
+| emit round-trip: `block_scalars` | 34.4 ms | 37.2 ms | **1.08x** |
+| `dq_escapes` | 76.4 ms | 53.2 ms | 0.70x |
+
+- Lagging item: `dq_escapes` is 0.70x of `yaml-rust2` (it is 44x faster than Go `yaml.v3` on the same input).
+- DoS: the merge-key amplification probe dropped from 17.8 s to 0.11 s.

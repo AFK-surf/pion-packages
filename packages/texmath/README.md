@@ -36,9 +36,24 @@ pub fn box_metrics(b : LayoutBox) -> Metrics
 
 ## Verification & Benchmark
 
-- **Tests**: 180 tests across `parser_test.pion` (65), `errors_test.pion` (35), `mathml_test.pion` (55 exact KaTeX v0.19.1 vectors), and `layout_test.pion` (25 TeXbook box invariants).
+- **Tests**: 185 tests across `parser_test.pion` (65), `errors_test.pion` (35), `mathml_test.pion` (55 exact KaTeX v0.19.1 vectors), `layout_test.pion` (25 TeXbook box invariants), and `security_test.pion` (5).
+- **Red-Team Audit (`packages/texmath/audit`, v0.2.0)**: 168/168 red-team tests, 60/60 layout formulas with 0 mismatches, 108/127 KaTeX screenshotter formulas (0 valid rejections), 31 DoS probes with 0 SIGSEGV / 0 OOM (`def_arg_growth`: 0.08 s / 5.8 MiB). Reproduce with `sh packages/texmath/audit/run_audit.sh`.
 - **Wasm32**: `pionc build --target wasm32 packages/texmath/wasm_smoke -o /tmp/texmath_smoke.wasm`
-- **Head-to-Head Benchmark (`tokyo-mac-studio-0`, Apple M5 Max, `Darwin arm64`, 500 diverse formulas × 20 = 10,000 ops, `--warmup 1 --rounds 5`)**:
+
+### v0.2.0 Head-to-Head (after red-team remediation)
+
+Measured on `tokyo-mac-studio-0` (Apple M5 Max) with `bench/corpus.txt` × 20, `scripts/bench_compare.py` strictly interleaved, stdout SHA-256 identical across implementations:
+
+| Target | `pion-texmath` Median | `pion-texmath` Peak RSS | `node-katex` Median | `node-katex` Peak RSS | Speedup (vs `node-katex`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Native (`--release`) | 122.69 ms | 3.44 MiB | 282.46 ms | 68.86 MiB | **2.30x** |
+| Wasm32 | 654.94 ms | 837.92 MiB | 282.34 ms | — | 0.43x |
+
+Lagging item: the Wasm32 run is 0.43x of Node.js KaTeX with 837.92 MiB peak RSS; it was measured on the `pionc 0.1.0` Wasm runtime before its idle-pool fix and is pending a re-run on `AFK-surf/pion@a62689d`.
+
+### v0.1.0 Head-to-Head (historical, before red-team remediation)
+
+`tokyo-mac-studio-0`, Apple M5 Max, `Darwin arm64`, 500 diverse formulas × 20 = 10,000 ops, `--warmup 1 --rounds 5`:
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `node-katex`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

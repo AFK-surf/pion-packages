@@ -67,9 +67,17 @@ pub fn highlight_ansi(lang : Language, src : String) -> String
 
 ## Verification & Head-to-Head Benchmark
 
-- **Tests**: **204 tests** across `languages_test.pion` (32), `systems_lang_test.pion` (48), `scripting_lang_test.pion` (40), `data_web_lang_test.pion` (48), and `invariants_test.pion` (36 — including 17-language incremental `highlight_line` == `highlight` exact span equivalence, full byte coverage, UTF-8 CJK/Emoji, unclosed delimiters, and 10 KB adversarial O(n) stress tests).
+- **Tests**: **216 tests** across `languages_test.pion` (32), `systems_lang_test.pion` (48), `scripting_lang_test.pion` (40), `data_web_lang_test.pion` (48), `invariants_test.pion` (36 — including 17-language incremental `highlight_line` == `highlight` exact span equivalence, full byte coverage, UTF-8 CJK/Emoji, unclosed delimiters, and 10 KB adversarial O(n) stress tests), and `redteam_coverage_test.pion` (12).
+- **Red-Team Audit (`packages/highlight/audit`, v0.2.0)**: 35/35 red-team tests pass; tricky-case byte classification accuracy 98.9–100% vs `shiki` / `prismjs`; 19 pathological 1 MiB scans all linear at 9–75 ms (`prismjs` times out on 4). Reproduce with `sh packages/highlight/audit/run_audit.sh`.
 - **Wasm32**: `pionc build --target wasm32 packages/highlight/wasm_smoke -o /tmp/highlight_smoke.wasm` (passes with 0 errors).
-- **Head-to-Head Benchmark** (`Darwin arm64`, 9 languages: Rust, TypeScript, Go, Python, JSON, YAML, C, CSS, HTML; 37,800 B × 220 = **8,316,000 B**, `--warmup 1 --rounds 5`, strictly interleaved, mandatory SHA-256 verification of lossless reconstructed source bytes):
+- **v0.2.0 HTML End-to-End Benchmark** (`run_audit.sh` §5a/§5b, `highlight_html` vs `prismjs` HTML, stdout SHA-256 identical):
+
+| Workload | `pion-highlight` Median | Throughput | Peak RSS | Speedup (vs `prismjs`) |
+| --- | ---: | ---: | ---: | ---: |
+| §5a corpus × 20 (756 KB) | 23.08 ms | 32.76 MB/s | 2.52 MiB | **6.67x** |
+| §5b 1 MiB minified JS | 48.33 ms | 21.69 MB/s | 33.42 MiB | **15.55x** |
+
+- **v0.1.0 Token-Stream Benchmark (historical, before red-team remediation)** (`Darwin arm64`, 9 languages: Rust, TypeScript, Go, Python, JSON, YAML, C, CSS, HTML; 37,800 B × 220 = **8,316,000 B**, `--warmup 1 --rounds 5`, strictly interleaved, mandatory SHA-256 verification of lossless reconstructed source bytes):
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `node-prismjs`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

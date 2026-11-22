@@ -73,14 +73,39 @@ pub fn example() -> Unit {
 ## Verification
 
 ```sh
-# Format, typecheck, and run all 136 tests
+# Format, typecheck, and run all 143 tests
 sh scripts/verify.sh packages/diff
 
 # Wasm32 smoke build
 pionc build --target wasm32 packages/diff/wasm_smoke -o /tmp/diff_wasm_smoke.wasm
 ```
 
-## Head-to-Head Benchmark (Pion Native vs Rust `imara-diff v0.2.0 --release`)
+Red-team audit (`packages/diff/audit`, v0.2.0): 5/5 P0 red-team tests pass and the 5,000-case differential fuzz shows 0 window regressions. Reproduce with `sh packages/diff/audit/run_audit.sh`.
+
+## v0.2.0 Head-to-Head Benchmark (Pion Native vs Rust `imara-diff v0.2.0 --release`)
+
+Measured after red-team remediation on `tokyo-mac-studio-0` (Apple M5 Max) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, stdout SHA-256 byte-for-byte identical).
+
+### Standard workloads (`sh packages/diff/bench/run_bench.sh`)
+
+| Workload | `pion` Median | `rust-imara-diff` Median | Pion Throughput | Speedup (vs `rust-imara-diff`) |
+| --- | ---: | ---: | ---: | ---: |
+| Histogram + indent slider + unified diff (10,029 lines × 50, 32.4 MB) | 40.770 ms | 27.525 ms | 794 MB/s | 0.68x |
+| Myers + indent slider + unified diff (10,029 lines × 30, 19.4 MB) | 95.474 ms | 83.445 ms | 204 MB/s | 0.87x |
+| `helix_syntax.rs` Histogram + unified diff (2,200 lines × 200, 32.2 MB) | 26.469 ms | 23.935 ms | 1215 MB/s | 0.90x |
+
+Peak RSS on `helix_syntax.rs`: 2.31 MiB (Pion) vs 2.39 MiB (`imara-diff`).
+
+### Adversarial workloads (`sh packages/diff/audit/run_audit.sh`)
+
+| Workload | v0.1.0 Pion | v0.2.0 Pion | `rust-imara-diff` | Speedup (vs `rust-imara-diff`) |
+| --- | ---: | ---: | ---: | ---: |
+| `hashflood` (80k colliding lines, 1.44 MB) | 2,458.9 ms | 10.870 ms (**226x faster**) | 10.629 ms | 0.98x |
+| `edge_fallback` (200k lines, first line changed + 1 line added in a `}` block) | 71.9 ms | 37.615 ms (19.11 MiB) | 45.222 ms (21.16 MiB) | **1.20x** |
+| `million` (1M lines, 1 line changed) | — | 44.373 ms | 237.054 ms | **5.34x** |
+| `multi` (reused `BeforeInterner`) | — | 50.924 ms | 42.594 ms | 0.84x |
+
+## v0.1.0 Head-to-Head Benchmark (historical, before red-team remediation)
 
 Run via `sh packages/diff/bench/run_bench.sh` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification). Measured on `Darwin arm64` (Apple Silicon):
 
@@ -113,5 +138,5 @@ _Stdout (`7,131 B`) SHA-256 verified byte-for-byte identical: `586c482f0fd9d4a78
 
 **Notes**:
 - Key optimizations: byte-level 4×/8× unrolled common prefix/suffix trimming (with exact slider-boundary fallback), lockstep predictive line matching in `after` interning, L1-sized packed `Int64` hash table `(hash32 << 32) | (tid + 1)` & packed `tok_span`, packed `Int64` `HistogramState.occ` with cursor-allocated pool and `cur_occ == 1` fast-path LCS extension, hoisted `is_odd` / `right = left` / zero-snake fast-path in `myers_split`, and direct single-`StringBuilder` unified diff emission without temporary hunk buffers.
-- On real-world `helix_syntax.rs`, Pion Native reaches **1,355 MB/s (1.01x of Rust `imara-diff --release`)** with lower peak RSS (`2.31 MiB` vs `2.39 MiB`) and **byte-for-byte identical unified diff output** on the benchmark corpus (note: for empty-side headers and missing trailing newlines, Pion follows standard GNU `diff -u` conventions: `@@ -N,0` and `\ No newline at end of file`).
-- On the 10K-line synthetic refactor (~90% middle window), Pion Native reaches **749 MB/s (0.69x)** on Histogram Diff and **194 MB/s (0.87x)** on Myers Diff, where the remaining gap reflects QBE's scalar bounds-checked `code_unit_at` / `Array[Int]` accesses vs Rust's NEON SIMD `memchr`/`memcmp`, 64-bit `foldhash`, and unchecked `NonNull<i32>` pointers.
+- On real-world `helix_syntax.rs`, Pion Native reaches **1,215 MB/s (0.90x of Rust `imara-diff --release`)** in v0.2.0 (v0.1.0: 1,355 MB/s, 1.01x) with lower peak RSS (`2.31 MiB` vs `2.39 MiB`) and **byte-for-byte identical unified diff output** on the benchmark corpus (note: for empty-side headers and missing trailing newlines, Pion follows standard GNU `diff -u` conventions: `@@ -N,0` and `\ No newline at end of file`).
+- On the 10K-line synthetic refactor (~90% middle window), Pion Native reaches **794 MB/s (0.68x)** on Histogram Diff and **204 MB/s (0.87x)** on Myers Diff in v0.2.0, where the remaining gap reflects QBE's scalar bounds-checked `code_unit_at` / `Array[Int]` accesses vs Rust's NEON SIMD `memchr`/`memcmp`, 64-bit `foldhash`, and unchecked `NonNull<i32>` pointers.

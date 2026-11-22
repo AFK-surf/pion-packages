@@ -62,7 +62,28 @@ Run via:
 sh packages/glob/bench/run_bench.sh
 ```
 
-### Workload: 50,000 Monorepo Paths × 80 `GlobSet` Rules × 20 iters (1,000,000 `matches_into` calls)
+Test coverage (v0.2.0): 188/188 unit tests, 29/29 red-team tests (`packages/glob/audit`), and 124/124 upstream `globset` / `ignore` vectors pass.
+
+### v0.2.0 (after red-team remediation): 50,000 Monorepo Paths × 80 `GlobSet` Rules × 20 iters (1,000,000 `matches_into` calls)
+
+| Implementation | Median (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_globset`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 116.529 | 245.35 | 116.53 | 7.27 MiB | **2.09x** |
+| `rust_globset` | 243.484 | 117.42 | 243.48 | 5.89 MiB | 1.00x (baseline) |
+
+Stdout SHA-256 identical across implementations and rounds. Lagging item: peak RSS is 7.27 vs 5.89 MiB.
+
+### v0.2.0 Adversarial Benchmarks (`sh packages/glob/audit/run_audit.sh`, SHA-256 identical)
+
+| Workload | v0.1.0 Pion | v0.2.0 Pion | `rust_globset` | Speedup (vs `rust_globset`) |
+| --- | ---: | ---: | ---: | ---: |
+| `complex_rules_5000` build | 21.9 s / 1285 MiB | 24.8 ms / 52.5 MiB | 55.0 ms / 58.9 MiB | **2.22x** |
+| `complex_rules_5000` match | — | 3,510.9 ms / 113.3 MiB | OOM at 6.5 GiB | — |
+| `dfa_cap_blowup_x200` match | 4,504.1 ms | 8.6 ms / 4.8 MiB | 9.3 ms / 6.2 MiB | **1.08x** |
+| `all_rules_hit_3000x` | 1,901.7 ms | 44.9 ms | 72.3 ms | **1.61x** |
+| `long_prefix_20000` match | — | 75.5 ms / 100.0 MiB | 159.2 ms / 144.7 MiB | **2.11x** |
+
+### v0.1.0 (historical, before red-team remediation): same 80-rule workload
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_globset`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

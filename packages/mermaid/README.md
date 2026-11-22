@@ -37,9 +37,26 @@ Currently implemented (5 core diagram families):
 - `wasm_smoke/` — Wasm32 compilation verification target
 - `bench/` — Head-to-head benchmarks vs official Node.js `mermaid` + `@dagrejs/dagre`
 
+## Verification (v0.2.0)
+
+- 137/137 unit tests (`pionc test --json packages/mermaid`).
+- Red-team audit (`sh packages/mermaid/audit/run_audit.sh`): 56/63 red-team tests pass with all 5 implemented diagram families green; geometry audit against `@dagrejs/dagre` 3.1.3 on identical boxes: **0/17** layouts with geometry defects (v0.1.0: 14/17 worse than dagre); 12 DoS probes with 0 SIGSEGV.
+- Wasm32: `pionc build --target wasm32 packages/mermaid/wasm_smoke`.
+
 ## Benchmarks (`Darwin arm64`, `scripts/bench_compare.py --warmup 1 --rounds 5`, SHA-256 verified)
 
-### Steady-State Pure Compute (amortizes process startup)
+### v0.2.0 Adversarial Head-to-Head (`run_audit.sh`, full cluster / label / parallel-edge layout, vs official `mermaid` 12.3.0 + `dagre`)
+
+| Workload | Pion speedup |
+| --- | ---: |
+| `subgraphs 300` | **217.2x** |
+| `dense 40` | **110.1x** |
+| `wide 2000` | **87.3x** |
+| `scc 200` | **82.3x** |
+
+### Original `bench/` workloads (as recorded in v0.1.0)
+
+#### Steady-State Pure Compute (amortizes process startup)
 
 1. **Parse + Canonical Topology JSON (`--iters 50`, 6 diagrams incl. 320-node flowchart, 1,120,750 B total input, `sha256:2f819d7bc0dd394d...`)**:
    - `node-mermaid` (official `mermaid` + `linkedom`): **13,376.880 ms** median (~267.5 ms/pass), **252.36 MiB** Peak RSS
@@ -50,7 +67,7 @@ Currently implemented (5 core diagram families):
    - `pion-sugiyama` (Pion Native `--release`): **27.840 ms** median (~1.39 ms/pass), **2.88 MiB** Peak RSS (**288.84x faster**)
    - *Methodology note*: `@dagrejs/dagre` defaults to `ranker: "network-simplex"` (~55% of its runtime), whereas `pion-sugiyama` uses longest-path + source tightening. Even against `ranker: "longest-path"`, Pion remains ~100x+ faster.
 
-### Cold-Start CLI (1x process startup + execution, for reference)
+#### Cold-Start CLI (1x process startup + execution, for reference)
 
 1. **Parse + Canonical Topology JSON (`--iters 1`, `sha256:12ff4e02e48548c4...`)**:
    - `node-mermaid`: **381.285 ms** median, **108.47 MiB** Peak RSS

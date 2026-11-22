@@ -81,6 +81,20 @@ Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte v
 
 - SHA-256 (identical across all implementations and rounds): `eb0ade9169dfd54fc25a08adb046413fa61bfb44182c6fd0a7310bb8aaf7eba3`
 
+### 3. v0.2.0 Re-run After Red-Team Remediation
+
+After the red-team fixes, the Mixed GFM corpus re-measures at **31.9–36.3 ms** median across runs (**0.72x–0.77x** of `pulldown-cmark`, Peak RSS **20.05 MiB** vs Rust **24.36 MiB**, SHA-256 identical); CommonMark `spec.txt` × 12 stays at about **0.78x–0.79x**. The tables above are the pre-audit optimization runs.
+
+### 4. O(N²) DoS Elimination (`sh packages/markdown/audit/run_audit.sh`)
+
+| Pathological input | v0.1.0 | v0.2.0 | Interleaved vs `pulldown-cmark` |
+| --- | ---: | ---: | --- |
+| `nested_strong_emph` (224 KB) | 6,019 ms | **11.3 ms** | 0.98x (56 KB) |
+| `smart_quotes_nested` (64 KB) | 1,039 ms | **6.8 ms** | 1.1x |
+| `unclosed_comments` (64 KB) | 280 ms | **3.9 ms** | 1.06x (128 KB) |
+
+50k nested `>` blockquotes and 32k nested lists run with 0 SIGSEGV.
+
 ### Honest Bottleneck Analysis
 
 After eliminating `Array[Event]` materialization (direct streaming HTML path), flattening Phase 1 (`BlockMeta` / `BlockTree` / `LineSpan` POD arenas) and Phase 2 (`InlineNode` / `DelimEntry` / `BracketEntry` POD arenas + reusable `InlineCtx` + O(1) 256-byte LUT + zero-tuple scanners), `pion_markdown` reaches **78%–79%** of Rust `pulldown-cmark --release` throughput (**107 MB/s** CommonMark, **84 MB/s** Mixed GFM — a **~1.95× speedup** over the initial `0.45×`–`0.48×` port) while cutting Peak RSS by **2.0×–2.8×** (**20.05 MiB vs Rust's 24.36 MiB** on Mixed GFM — 18% lower memory than Rust).

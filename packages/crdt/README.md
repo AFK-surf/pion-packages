@@ -37,20 +37,37 @@ pub fn example() -> String {
 
 ## Verification
 
-- **128 unit, protocol, convergence (SEC), and official Node.js `yjs` golden wire-vector tests**:
+- **132 unit, protocol, convergence (SEC), and official Node.js `yjs` golden wire-vector tests**:
   ```sh
   pionc fmt --check packages/crdt
   pionc check --json packages/crdt
   pionc test --json packages/crdt
   ```
+- **Red-Team Audit (`packages/crdt/audit`, v0.2.0)**: 16/16 red-team tests pass and 660 three-way differential fuzz runs (Pion / Node.js `yjs` / Rust `yrs`) show 0 mismatches. `encodeStateAsUpdate` size on the `automerge-paper` trace is now **223,411 B** (`yjs` 223,414 B, `yrs` 223,411 B; v0.1.0: 990,662 B). Reproduce with `sh packages/crdt/audit/run_audit.sh`.
 - **Wasm32 smoke build**:
   ```sh
   pionc build --target wasm32 -o /tmp/crdt_wasm_smoke.wasm packages/crdt/wasm_smoke
   ```
 
-## Head-to-Head Benchmarks (Pion Native vs Node.js Official `yjs`)
+## v0.2.0 Three-Language Benchmarks (Pion vs Node.js `yjs` vs Rust `yrs --release`)
 
-Measured on `Darwin arm64` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, **mandatory stdout SHA-256 byte-for-byte identical**):
+Measured after red-team remediation via `sh packages/crdt/audit/run_audit.sh` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, stdout SHA-256 identical across all three implementations; one transaction per edit; baseline `rust_yrs`):
+
+| Workload | `pion` | `node_yjs` | `rust_yrs` | Pion vs `yrs` | Pion vs `yjs` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `text_w1` (`text 20000×3`) | 192.7 ms (7.1 MiB) | 1017.7 ms (103.7 MiB) | 1965.6 ms (5.5 MiB) | **10.20x** | **5.28x** |
+| `append_50k` | 26.1 ms (2.4 MiB) | 163.6 ms | 26.0 ms (2.6 MiB) | 1.00x | **6.27x** |
+| `append_200k` | 80.8 ms (3.64 MiB) | 417.0 ms (100.1 MiB) | 68.8 ms (2.8 MiB) | 0.85x | **5.16x** |
+| `trace_automerge` (259,778 edits) | 1312.8 ms (43.6 MiB) | 7023.4 ms | 6010.3 ms (17.3 MiB) | **4.58x** | **5.35x** |
+| `remote_apply` (×20) | 155.5 ms (9.2 MiB) | 464.0 ms | 81.6 ms (6.4 MiB) | 0.52x | **2.98x** |
+
+- `append_200k` was O(n²) in v0.1.0 (1944.3 ms / 66.8 MiB); v0.2.0 runs it in 80.8 ms / 3.64 MiB (**24.1x faster**).
+- Lagging items: `append_200k` is 0.85x and `remote_apply` 0.52x of `yrs`; peak RSS on `trace_automerge` is 43.6 vs 17.3 MiB.
+- `yrs` is driven with one `transact_mut()` per edit and `OffsetKind::Utf16`; batched single-transaction replay was not measured.
+
+## v0.1.0 Head-to-Head Benchmarks (historical, Pion Native vs Node.js Official `yjs`)
+
+Measured before red-team remediation on `Darwin arm64` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, **mandatory stdout SHA-256 byte-for-byte identical**):
 
 ### Workload 1: Sequential + Random Text Edits (20,000 ops × 10 iters) + v1 Encode/Decode
 `sha256:0ed09d229ad8d2ccc4309209b62dce774bbb95cb8322f2e63b42601de4e0423f`
