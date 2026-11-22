@@ -1,4 +1,5 @@
-///| RFC 6455 streaming Sans-IO WebSocket decoder with zero-copy chunk queue fast path.
+///| RFC 6455 streaming Sans-IO WebSocket decoder with bounded zero-copy chunk queue
+///| and direct cross-chunk unmasking.
 
 ///|
 pub struct Decoder {
@@ -13,14 +14,18 @@ pub struct Decoder {
   mut frag_opcode : Option[Opcode]
   mut frag_chunks : Array[Bytes]
   mut frag_total_len : Int
+  mut frag_utf8_state : Int
+  mut closed : Bool
+  empty_bytes : Bytes
 }
 
 ///| Create a new streaming Sans-IO WebSocket `Decoder`.
 pub fn Decoder::new(role : Role, max_message_size : Int) -> Decoder {
+  let empty = Bytes::new(0)
   Decoder::{
     role: role,
     max_message_size: max_message_size,
-    cur: Bytes::new(0),
+    cur: empty,
     cur_pos: 0,
     cur_len: 0,
     queue: [],
@@ -29,6 +34,9 @@ pub fn Decoder::new(role : Role, max_message_size : Int) -> Decoder {
     frag_opcode: None,
     frag_chunks: [],
     frag_total_len: 0,
+    frag_utf8_state: 0,
+    closed: false,
+    empty_bytes: empty,
   }
 }
 
@@ -37,9 +45,9 @@ pub fn Decoder::buffered_len(self : Decoder) -> Int {
   self.pending_total
 }
 
-///| Reset all buffered bytes and in-progress fragmentation state.
+///| Reset all buffered bytes, close state, and in-progress fragmentation state.
 pub fn Decoder::reset(self : Decoder) -> Unit {
-  self.cur = Bytes::new(0)
+  self.cur = self.empty_bytes
   self.cur_pos = 0
   self.cur_len = 0
   self.queue = []
@@ -48,6 +56,8 @@ pub fn Decoder::reset(self : Decoder) -> Unit {
   self.frag_opcode = None
   self.frag_chunks = []
   self.frag_total_len = 0
+  self.frag_utf8_state = 0
+  self.closed = false
 }
 
 ///| Feed raw network bytes into the decoder (O(1) zero-copy queue).
@@ -75,70 +85,103 @@ fn copy_bytes_slice(
   src_off : Int,
   len : Int,
 ) -> Unit {
-  let mut i = 0
-  while i + 8 <= len {
-    dst[dst_off + i] = src[src_off + i]
-    dst[dst_off + i + 1] = src[src_off + i + 1]
-    dst[dst_off + i + 2] = src[src_off + i + 2]
-    dst[dst_off + i + 3] = src[src_off + i + 3]
-    dst[dst_off + i + 4] = src[src_off + i + 4]
-    dst[dst_off + i + 5] = src[src_off + i + 5]
-    dst[dst_off + i + 6] = src[src_off + i + 6]
-    dst[dst_off + i + 7] = src[src_off + i + 7]
-    i = i + 8
+  let mut di = dst_off
+  let mut si = src_off
+  let end = src_off + len
+  while si + 8 <= end {
+    dst[di] = src[si]
+    dst[di + 1] = src[si + 1]
+    dst[di + 2] = src[si + 2]
+    dst[di + 3] = src[si + 3]
+    dst[di + 4] = src[si + 4]
+    dst[di + 5] = src[si + 5]
+    dst[di + 6] = src[si + 6]
+    dst[di + 7] = src[si + 7]
+    di = di + 8
+    si = si + 8
   }
-  while i < len {
-    dst[dst_off + i] = src[src_off + i]
-    i = i + 1
+  while si < end {
+    dst[di] = src[si]
+    di = di + 1
+    si = si + 1
   }
 }
 
-///| Coalesce current unread slice and queued chunks into a single contiguous buffer
-///| when a frame spans across chunk boundaries.
-fn Decoder::coalesce(self : Decoder) -> Unit {
-  let total = self.pending_total
-  let mut merged = Bytes::new(total)
-  let rem = self.cur_len - self.cur_pos
-  if rem > 0 {
-    copy_bytes_slice(merged, 0, self.cur, self.cur_pos, rem)
-  }
-  let mut off = rem
-  let q = self.queue
-  let qlen = q.length()
-  let mut qi = self.queue_head
-  while qi < qlen {
-    let c = q[qi]
-    let clen = c.length()
-    copy_bytes_slice(merged, off, c, 0, clen)
-    off = off + clen
-    qi = qi + 1
-  }
-  self.cur = merged
-  self.cur_pos = 0
-  self.cur_len = total
-  self.queue.clear()
-  self.queue_head = 0
-}
-
-///| Advance `cur` to the next queued chunk once `cur` is fully consumed.
+///| Advance `cur` to the next queued chunk once `cur` is fully consumed,
+///| immediately releasing consumed chunks and compacting the queue to stay O(1) memory.
 fn Decoder::advance_chunk(self : Decoder) -> Unit {
   if self.cur_pos >= self.cur_len {
     let q = self.queue
     let qlen = q.length()
     if self.queue_head < qlen {
       let next = q[self.queue_head]
+      q[self.queue_head] = self.empty_bytes
       self.queue_head = self.queue_head + 1
       if self.queue_head == qlen {
         q.clear()
+        self.queue_head = 0
+      } else if self.queue_head >= 16 && self.queue_head * 2 >= qlen {
+        let rem = qlen - self.queue_head
+        let mut new_q : Array[Bytes] = []
+        let mut i = 0
+        while i < rem {
+          new_q.push(q[self.queue_head + i])
+          i = i + 1
+        }
+        self.queue = new_q
         self.queue_head = 0
       }
       self.cur = next
       self.cur_pos = 0
       self.cur_len = next.length()
     } else {
+      self.cur = self.empty_bytes
       self.cur_pos = 0
       self.cur_len = 0
     }
+  }
+}
+
+///| Peek a single byte at `offset` from the logical read head without coalescing.
+fn Decoder::peek_byte(self : Decoder, offset : Int) -> Int {
+  let avail = self.cur_len - self.cur_pos
+  if offset < avail {
+    return self.cur[self.cur_pos + offset].to_int()
+  }
+  let mut rem = offset - avail
+  let q = self.queue
+  let qlen = q.length()
+  let mut qi = self.queue_head
+  while qi < qlen {
+    let c = q[qi]
+    let clen = c.length()
+    if rem < clen {
+      return c[rem].to_int()
+    }
+    rem = rem - clen
+    qi = qi + 1
+  }
+  0
+}
+
+///| Discard `count` bytes from the logical read head (caller ensures `count <= pending_total`).
+fn Decoder::skip_bytes(self : Decoder, count : Int) -> Unit {
+  self.pending_total = self.pending_total - count
+  let avail = self.cur_len - self.cur_pos
+  if count < avail {
+    self.cur_pos = self.cur_pos + count
+    return ()
+  }
+  let mut rem = count
+  while rem > 0 {
+    let a = self.cur_len - self.cur_pos
+    if rem < a {
+      self.cur_pos = self.cur_pos + rem
+      return ()
+    }
+    rem = rem - a
+    self.cur_pos = self.cur_len
+    self.advance_chunk()
   }
 }
 
@@ -159,73 +202,177 @@ fn extract_payload_into(
     return ()
   }
   if masked {
-    let mut i = 0
-    while i + 8 <= len {
-      dst[dst_off + i] = (buf[start + i].to_int() ^ m0).to_byte()
-      dst[dst_off + i + 1] = (buf[start + i + 1].to_int() ^ m1).to_byte()
-      dst[dst_off + i + 2] = (buf[start + i + 2].to_int() ^ m2).to_byte()
-      dst[dst_off + i + 3] = (buf[start + i + 3].to_int() ^ m3).to_byte()
-      dst[dst_off + i + 4] = (buf[start + i + 4].to_int() ^ m0).to_byte()
-      dst[dst_off + i + 5] = (buf[start + i + 5].to_int() ^ m1).to_byte()
-      dst[dst_off + i + 6] = (buf[start + i + 6].to_int() ^ m2).to_byte()
-      dst[dst_off + i + 7] = (buf[start + i + 7].to_int() ^ m3).to_byte()
-      i = i + 8
+    let mut di = dst_off
+    let mut si = start
+    let end = start + len
+    while si + 16 <= end {
+      dst[di] = (buf[si].to_int() ^ m0).to_byte()
+      dst[di + 1] = (buf[si + 1].to_int() ^ m1).to_byte()
+      dst[di + 2] = (buf[si + 2].to_int() ^ m2).to_byte()
+      dst[di + 3] = (buf[si + 3].to_int() ^ m3).to_byte()
+      dst[di + 4] = (buf[si + 4].to_int() ^ m0).to_byte()
+      dst[di + 5] = (buf[si + 5].to_int() ^ m1).to_byte()
+      dst[di + 6] = (buf[si + 6].to_int() ^ m2).to_byte()
+      dst[di + 7] = (buf[si + 7].to_int() ^ m3).to_byte()
+      dst[di + 8] = (buf[si + 8].to_int() ^ m0).to_byte()
+      dst[di + 9] = (buf[si + 9].to_int() ^ m1).to_byte()
+      dst[di + 10] = (buf[si + 10].to_int() ^ m2).to_byte()
+      dst[di + 11] = (buf[si + 11].to_int() ^ m3).to_byte()
+      dst[di + 12] = (buf[si + 12].to_int() ^ m0).to_byte()
+      dst[di + 13] = (buf[si + 13].to_int() ^ m1).to_byte()
+      dst[di + 14] = (buf[si + 14].to_int() ^ m2).to_byte()
+      dst[di + 15] = (buf[si + 15].to_int() ^ m3).to_byte()
+      di = di + 16
+      si = si + 16
     }
-    if i + 4 <= len {
-      dst[dst_off + i] = (buf[start + i].to_int() ^ m0).to_byte()
-      dst[dst_off + i + 1] = (buf[start + i + 1].to_int() ^ m1).to_byte()
-      dst[dst_off + i + 2] = (buf[start + i + 2].to_int() ^ m2).to_byte()
-      dst[dst_off + i + 3] = (buf[start + i + 3].to_int() ^ m3).to_byte()
-      i = i + 4
+    if si + 8 <= end {
+      dst[di] = (buf[si].to_int() ^ m0).to_byte()
+      dst[di + 1] = (buf[si + 1].to_int() ^ m1).to_byte()
+      dst[di + 2] = (buf[si + 2].to_int() ^ m2).to_byte()
+      dst[di + 3] = (buf[si + 3].to_int() ^ m3).to_byte()
+      dst[di + 4] = (buf[si + 4].to_int() ^ m0).to_byte()
+      dst[di + 5] = (buf[si + 5].to_int() ^ m1).to_byte()
+      dst[di + 6] = (buf[si + 6].to_int() ^ m2).to_byte()
+      dst[di + 7] = (buf[si + 7].to_int() ^ m3).to_byte()
+      di = di + 8
+      si = si + 8
     }
-    if i < len {
-      dst[dst_off + i] = (buf[start + i].to_int() ^ m0).to_byte()
-      i = i + 1
+    if si + 4 <= end {
+      dst[di] = (buf[si].to_int() ^ m0).to_byte()
+      dst[di + 1] = (buf[si + 1].to_int() ^ m1).to_byte()
+      dst[di + 2] = (buf[si + 2].to_int() ^ m2).to_byte()
+      dst[di + 3] = (buf[si + 3].to_int() ^ m3).to_byte()
+      di = di + 4
+      si = si + 4
     }
-    if i < len {
-      dst[dst_off + i] = (buf[start + i].to_int() ^ m1).to_byte()
-      i = i + 1
+    if si < end {
+      dst[di] = (buf[si].to_int() ^ m0).to_byte()
+      di = di + 1
+      si = si + 1
     }
-    if i < len {
-      dst[dst_off + i] = (buf[start + i].to_int() ^ m2).to_byte()
+    if si < end {
+      dst[di] = (buf[si].to_int() ^ m1).to_byte()
+      di = di + 1
+      si = si + 1
+    }
+    if si < end {
+      dst[di] = (buf[si].to_int() ^ m2).to_byte()
     }
   } else {
     copy_bytes_slice(dst, dst_off, buf, start, len)
   }
 }
 
-///|
-fn extract_payload(
-  buf : Bytes,
-  start : Int,
+///| Read and unmask `len` payload bytes directly from the chunk queue into `dst[dst_off..]`,
+///| avoiding any intermediate `coalesce()` allocation or double copy.
+fn Decoder::read_payload_into(
+  self : Decoder,
+  dst : Bytes,
+  dst_off : Int,
   len : Int,
   masked : Bool,
   m0 : Int,
   m1 : Int,
   m2 : Int,
   m3 : Int,
-) -> Bytes {
-  let out = Bytes::new(len)
-  extract_payload_into(out, 0, buf, start, len, masked, m0, m1, m2, m3)
-  out
+) -> Unit {
+  if len == 0 {
+    return ()
+  }
+  let avail = self.cur_len - self.cur_pos
+  if avail >= len {
+    extract_payload_into(
+      dst,
+      dst_off,
+      self.cur,
+      self.cur_pos,
+      len,
+      masked,
+      m0,
+      m1,
+      m2,
+      m3,
+    )
+    self.cur_pos = self.cur_pos + len
+    self.pending_total = self.pending_total - len
+    if self.cur_pos >= self.cur_len {
+      self.advance_chunk()
+    }
+    return ()
+  }
+  self.pending_total = self.pending_total - len
+  let mut remaining = len
+  let mut out_off = dst_off
+  let mut km0 = m0
+  let mut km1 = m1
+  let mut km2 = m2
+  let mut km3 = m3
+  while remaining > 0 {
+    let a = self.cur_len - self.cur_pos
+    let take = if remaining < a { remaining } else { a }
+    extract_payload_into(
+      dst,
+      out_off,
+      self.cur,
+      self.cur_pos,
+      take,
+      masked,
+      km0,
+      km1,
+      km2,
+      km3,
+    )
+    out_off = out_off + take
+    remaining = remaining - take
+    self.cur_pos = self.cur_pos + take
+    if self.cur_pos >= self.cur_len {
+      self.advance_chunk()
+    }
+    if masked && remaining > 0 {
+      let rot = take & 3
+      if rot == 1 {
+        let t = km0
+        km0 = km1
+        km1 = km2
+        km2 = km3
+        km3 = t
+      } else if rot == 2 {
+        let t0 = km0
+        let t1 = km1
+        km0 = km2
+        km1 = km3
+        km2 = t0
+        km3 = t1
+      } else if rot == 3 {
+        let t = km3
+        km3 = km2
+        km2 = km1
+        km1 = km0
+        km0 = t
+      }
+    }
+  }
 }
 
 ///| Attempt to decode the next complete WebSocket `Message` from buffered bytes.
-///| Returns `Ok(None)` when more bytes are needed.
+///| Returns `Ok(None)` when more bytes are needed or after a Close frame has been delivered.
 pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError] {
+  if self.closed {
+    return Ok(None)
+  }
   while true {
     if self.pending_total < 2 {
       return Ok(None)
     }
-    let mut cur_avail = self.cur_len - self.cur_pos
-    if cur_avail < 2 {
-      self.coalesce()
-      cur_avail = self.cur_len - self.cur_pos
-    }
-    let mut buf = self.cur
-    let mut base = self.cur_pos
+    let cur_avail = self.cur_len - self.cur_pos
+    let buf = self.cur
+    let base = self.cur_pos
     let b0 = buf[base].to_int()
-    let b1 = buf[base + 1].to_int()
+    let b1 = if cur_avail >= 2 {
+      buf[base + 1].to_int()
+    } else {
+      self.queue[self.queue_head][0].to_int()
+    }
 
     let fin = (b0 & 0x80) != 0
     let rsv = (b0 >> 4) & 0x07
@@ -272,13 +419,11 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
       if self.pending_total < 4 {
         return Ok(None)
       }
-      if cur_avail < 4 {
-        self.coalesce()
-        buf = self.cur
-        base = self.cur_pos
-        cur_avail = self.cur_len - base
+      if cur_avail >= 4 {
+        payload_len = (buf[base + 2].to_int() << 8) | buf[base + 3].to_int()
+      } else {
+        payload_len = (self.peek_byte(2) << 8) | self.peek_byte(3)
       }
-      payload_len = (buf[base + 2].to_int() << 8) | buf[base + 3].to_int()
       if payload_len < 126 {
         return Err(WsError::NonMinimalLength)
       }
@@ -287,26 +432,31 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
       if self.pending_total < 10 {
         return Ok(None)
       }
-      if cur_avail < 10 {
-        self.coalesce()
-        buf = self.cur
-        base = self.cur_pos
-        cur_avail = self.cur_len - base
-      }
-      let hi_byte = buf[base + 2].to_int()
-      if (hi_byte & 0x80) != 0 {
+      let h2 = if cur_avail >= 10 { buf[base + 2].to_int() } else { self.peek_byte(2) }
+      if (h2 & 0x80) != 0 {
         return Err(
           WsError::InvalidPayloadLength("64-bit payload length MSB must be 0"),
         )
       }
-      let len64 : Int64 = (buf[base + 2].to_int().to_int64() << 56L) |
-      (buf[base + 3].to_int().to_int64() << 48L) |
-      (buf[base + 4].to_int().to_int64() << 40L) |
-      (buf[base + 5].to_int().to_int64() << 32L) |
-      (buf[base + 6].to_int().to_int64() << 24L) |
-      (buf[base + 7].to_int().to_int64() << 16L) |
-      (buf[base + 8].to_int().to_int64() << 8L) |
-      buf[base + 9].to_int().to_int64()
+      let len64 : Int64 = if cur_avail >= 10 {
+        (h2.to_int64() << 56L) |
+        (buf[base + 3].to_int().to_int64() << 48L) |
+        (buf[base + 4].to_int().to_int64() << 40L) |
+        (buf[base + 5].to_int().to_int64() << 32L) |
+        (buf[base + 6].to_int().to_int64() << 24L) |
+        (buf[base + 7].to_int().to_int64() << 16L) |
+        (buf[base + 8].to_int().to_int64() << 8L) |
+        buf[base + 9].to_int().to_int64()
+      } else {
+        (h2.to_int64() << 56L) |
+        (self.peek_byte(3).to_int64() << 48L) |
+        (self.peek_byte(4).to_int64() << 40L) |
+        (self.peek_byte(5).to_int64() << 32L) |
+        (self.peek_byte(6).to_int64() << 24L) |
+        (self.peek_byte(7).to_int64() << 16L) |
+        (self.peek_byte(8).to_int64() << 8L) |
+        self.peek_byte(9).to_int64()
+      }
       if len64 < 65536L {
         return Err(WsError::NonMinimalLength)
       }
@@ -325,24 +475,26 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
     if !is_control && payload_len > self.max_message_size {
       return Err(WsError::MessageTooLarge(payload_len, self.max_message_size))
     }
-    if op_raw == 0 && self.frag_total_len + payload_len > self.max_message_size {
-      return Err(
-        WsError::MessageTooLarge(
-          self.frag_total_len + payload_len,
-          self.max_message_size,
-        ),
-      )
+    if op_raw == 0 {
+      let total_frag64 = self.frag_total_len.to_int64() + payload_len.to_int64()
+      if total_frag64 > self.max_message_size.to_int64() {
+        return Err(
+          WsError::MessageTooLarge(
+            if total_frag64 > 2147483647L {
+              2147483647
+            } else {
+              total_frag64.to_int()
+            },
+            self.max_message_size,
+          ),
+        )
+      }
     }
 
     let mask_end = if masked { hdr_len + 4 } else { hdr_len }
-    let frame_total = mask_end + payload_len
-    if self.pending_total < frame_total {
+    let frame_total64 : Int64 = mask_end.to_int64() + payload_len.to_int64()
+    if self.pending_total.to_int64() < frame_total64 {
       return Ok(None)
-    }
-    if cur_avail < frame_total {
-      self.coalesce()
-      buf = self.cur
-      base = self.cur_pos
     }
 
     let mut m0 = 0
@@ -350,17 +502,20 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
     let mut m2 = 0
     let mut m3 = 0
     if masked {
-      m0 = buf[base + hdr_len].to_int()
-      m1 = buf[base + hdr_len + 1].to_int()
-      m2 = buf[base + hdr_len + 2].to_int()
-      m3 = buf[base + hdr_len + 3].to_int()
-      hdr_len = mask_end
+      if cur_avail >= mask_end {
+        m0 = buf[base + hdr_len].to_int()
+        m1 = buf[base + hdr_len + 1].to_int()
+        m2 = buf[base + hdr_len + 2].to_int()
+        m3 = buf[base + hdr_len + 3].to_int()
+      } else {
+        m0 = self.peek_byte(hdr_len)
+        m1 = self.peek_byte(hdr_len + 1)
+        m2 = self.peek_byte(hdr_len + 2)
+        m3 = self.peek_byte(hdr_len + 3)
+      }
     }
 
-    let payload_start = base + hdr_len
-    self.cur_pos = base + frame_total
-    self.pending_total = self.pending_total - frame_total
-    self.advance_chunk()
+    self.skip_bytes(mask_end)
 
     // Fast path for final Continuation frame: unmask directly into the reassembled buffer
     // without allocating or copying an intermediate Bytes for the final fragment.
@@ -384,11 +539,9 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
             off = off + clen
             ci = ci + 1
           }
-          extract_payload_into(
+          self.read_payload_into(
             full,
             off,
-            buf,
-            payload_start,
             payload_len,
             masked,
             m0,
@@ -396,12 +549,15 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
             m2,
             m3,
           )
+          let utf8_st = self.frag_utf8_state
           self.frag_opcode = None
           self.frag_chunks.clear()
           self.frag_total_len = 0
+          self.frag_utf8_state = 0
           match orig {
             Opcode::Text => {
-              if !validate_utf8(full) {
+              let final_st = validate_utf8_step(utf8_st, full, off, total_len)
+              if final_st != 0 {
                 return Err(
                   WsError::InvalidUtf8("invalid UTF-8 in fragmented text"),
                 )
@@ -411,9 +567,10 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
             _ => return Ok(Some(Message::Binary(full)))
           }
         } else {
-          let payload = extract_payload(
-            buf,
-            payload_start,
+          let payload = Bytes::new(payload_len)
+          self.read_payload_into(
+            payload,
+            0,
             payload_len,
             masked,
             m0,
@@ -421,14 +578,36 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
             m2,
             m3,
           )
+          match orig {
+            Opcode::Text => {
+              let next_st = validate_utf8_step(
+                self.frag_utf8_state,
+                payload,
+                0,
+                payload_len,
+              )
+              if next_st < 0 {
+                self.frag_opcode = None
+                self.frag_chunks.clear()
+                self.frag_total_len = 0
+                self.frag_utf8_state = 0
+                return Err(
+                  WsError::InvalidUtf8("invalid UTF-8 in text fragment"),
+                )
+              }
+              self.frag_utf8_state = next_st
+            }
+            _ => ()
+          }
           self.frag_chunks.push(payload)
           self.frag_total_len = self.frag_total_len + payload_len
         }
       }
       _ => {
-        let payload = extract_payload(
-          buf,
-          payload_start,
+        let payload = Bytes::new(payload_len)
+        self.read_payload_into(
+          payload,
+          0,
           payload_len,
           masked,
           m0,
@@ -442,6 +621,7 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
           Opcode::Close => {
             let plen = payload.length()
             if plen == 0 {
+              self.closed = true
               return Ok(Some(Message::Close(None)))
             }
             if plen == 1 {
@@ -461,6 +641,7 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
             } else {
               payload.slice(2, plen).to_string()
             }
+            self.closed = true
             return Ok(Some(Message::Close(Some(CloseFrame::new(code, reason)))))
           }
           Opcode::Text => {
@@ -474,10 +655,17 @@ pub fn Decoder::next_message(self : Decoder) -> Result[Option[Message], WsError]
               }
               return Ok(Some(Message::Text(payload.to_string())))
             } else {
+              let st = validate_utf8_step(0, payload, 0, payload_len)
+              if st < 0 {
+                return Err(
+                  WsError::InvalidUtf8("invalid UTF-8 in text fragment"),
+                )
+              }
               self.frag_opcode = Some(Opcode::Text)
               self.frag_chunks.clear()
               self.frag_chunks.push(payload)
               self.frag_total_len = payload_len
+              self.frag_utf8_state = st
             }
           }
           Opcode::Binary => {
