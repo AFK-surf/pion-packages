@@ -2,44 +2,42 @@
 ///| (ported from `imara-diff/src/histogram`).
 
 ///| Pool + per-token occurrence lists with O(1) generation-based clear.
+///| `occ[tok]` packs `(gen << 36) | (len << 29) | index`:
+///| - bits 0..28 (29 bits): `index` (inline pos when len == 1, pool offset when len >= 2)
+///| - bits 29..35 (7 bits): `len` (0..=64)
+///| - bits 36..62 (27 bits): `gen` (generation counter)
 struct HistogramState {
-  /// Per-token occurrence list metadata (indexed by token ID).
-  occ_index : Array[Int]
-  occ_gen : Array[Int]
-  occ_len : Array[Int]
-  /// Flat pooled storage for occurrence lists of length >= 2.
-  pool_data : Array[Int]
+  occ : Array[Int64]
+  /// Flat pre-allocated pooled storage for occurrence lists of length >= 2.
+  mut pool_data : Array[Int]
+  mut pool_top : Int
   /// Free list head per size class (0..=4 for sizes 4, 8, 16, 32, 64).
   free_heads : Array[Int]
-  mut generation : Int
+  mut generation : Int64
 }
 
 ///|
-fn HistogramState::new(num_tokens : Int) -> HistogramState {
+fn HistogramState::new(num_tokens : Int, init_pool_cap : Int) -> HistogramState {
+  let cap = if init_pool_cap < 256 { 256 } else { init_pool_cap }
   HistogramState::{
-    occ_index: Array::make(num_tokens, 0),
-    occ_gen: Array::make(num_tokens, 0),
-    occ_len: Array::make(num_tokens, 0),
-    pool_data: Array::new(),
+    occ: Array::make(num_tokens, 0L),
+    pool_data: Array::make(cap, 0),
+    pool_top: 0,
     free_heads: Array::make(5, -1),
-    generation: 1,
+    generation: 1L,
   }
 }
 
 ///|
 fn HistogramState::clear(self : HistogramState) -> Unit {
-  self.pool_data.clear()
-  let mut i = 0
-  while i < 5 {
-    self.free_heads[i] = -1
-    i = i + 1
-  }
-  self.generation = self.generation + 1
-}
-
-///|
-fn sclass_size(sclass : Int) -> Int {
-  4 << sclass
+  self.pool_top = 0
+  let fh = self.free_heads
+  fh[0] = -1
+  fh[1] = -1
+  fh[2] = -1
+  fh[3] = -1
+  fh[4] = -1
+  self.generation = self.generation + 1L
 }
 
 ///| Size class for list length `len` (when `len` is a power of 2 >= 4: 4->1, 8->2, 16->3, 32->4).
@@ -57,18 +55,31 @@ fn sclass_for_power_of_two(len : Int) -> Int {
 
 ///|
 fn HistogramState::pool_alloc(self : HistogramState, sclass : Int) -> Int {
-  let head = self.free_heads[sclass]
+  let fh = self.free_heads
+  let head = fh[sclass]
   if head < 0 {
-    let offset = self.pool_data.length()
-    let sz = sclass_size(sclass)
-    let mut i = 0
-    while i < sz {
-      self.pool_data.push(-1)
-      i = i + 1
+    let offset = self.pool_top
+    let sz = 4 << sclass
+    let need = offset + sz
+    let cur_cap = self.pool_data.length()
+    if need > cur_cap {
+      let mut new_cap = cur_cap * 2
+      while new_cap < need {
+        new_cap = new_cap * 2
+      }
+      let new_pool = Array::make(new_cap, 0)
+      let old_pool = self.pool_data
+      let mut i = 0
+      while i < offset {
+        new_pool[i] = old_pool[i]
+        i = i + 1
+      }
+      self.pool_data = new_pool
     }
+    self.pool_top = need
     offset
   } else {
-    self.free_heads[sclass] = self.pool_data[head]
+    fh[sclass] = self.pool_data[head]
     head
   }
 }
@@ -79,68 +90,77 @@ fn HistogramState::pool_free(
   block : Int,
   sclass : Int,
 ) -> Unit {
-  self.pool_data[block] = self.free_heads[sclass]
-  self.free_heads[sclass] = block
+  let fh = self.free_heads
+  self.pool_data[block] = fh[sclass]
+  fh[sclass] = block
 }
 
-///|
-fn HistogramState::num_occurrences(self : HistogramState, tok : Int) -> Int {
-  if self.occ_gen[tok] == self.generation {
-    self.occ_len[tok]
-  } else {
-    0
-  }
-}
-
-///|
-fn HistogramState::push_occurrence(
+///| Slow path for `populate` when `tok` already has >= 1 occurrence in the current generation.
+fn HistogramState::push_occurrence_slow(
   self : HistogramState,
   tok : Int,
   pos : Int,
+  e : Int64,
+  gen_shifted : Int64,
 ) -> Unit {
-  let len = self.num_occurrences(tok)
-  if len == 0 {
-    self.occ_gen[tok] = self.generation
-    self.occ_index[tok] = pos
-    self.occ_len[tok] = 1
-  } else if len == 1 {
+  let len = ((e >> 29) & 127L).to_int()
+  if len == 1 {
+    let prev_pos = (e & 0x1FFFFFFFL).to_int()
     let block = self.pool_alloc(0)
-    self.pool_data[block] = self.occ_index[tok]
-    self.pool_data[block + 1] = pos
-    self.occ_index[tok] = block
-    self.occ_len[tok] = 2
+    let pool = self.pool_data
+    pool[block] = prev_pos
+    pool[block + 1] = pos
+    self.occ[tok] = gen_shifted | (2L << 29) | block.to_int64()
   } else if len <= 63 {
-    let mut block = self.occ_index[tok]
+    let mut block = (e & 0x1FFFFFFFL).to_int()
     if len == 4 || len == 8 || len == 16 || len == 32 {
       let to_sc = sclass_for_power_of_two(len)
       let from_sc = to_sc - 1
       let new_block = self.pool_alloc(to_sc)
+      let pool = self.pool_data
       let mut i = 0
       while i < len {
-        self.pool_data[new_block + i] = self.pool_data[block + i]
+        pool[new_block + i] = pool[block + i]
         i = i + 1
       }
       self.pool_free(block, from_sc)
       block = new_block
-      self.occ_index[tok] = block
     }
     self.pool_data[block + len] = pos
-    self.occ_len[tok] = len + 1
+    self.occ[tok] = gen_shifted | ((len + 1).to_int64() << 29) | block.to_int64()
   }
-  // If len >= 64 (MAX_CHAIN_LEN + 1), ignore further occurrences;
-  // find_lcs will detect `min_occurrences > MAX_CHAIN_LEN` and fall back to Myers.
 }
 
-///|
+///| Populate occurrence lists for `before[b_off..b_off+b_len]`.
 fn HistogramState::populate(
   self : HistogramState,
   before : Array[Int],
   b_off : Int,
   b_len : Int,
 ) -> Unit {
+  let occ = self.occ
+  let mut pool = self.pool_data
+  let gen = self.generation
+  let gen_shifted = gen << 36
+  let gen_len1 = gen_shifted | (1L << 29)
+  let step_len = 1L << 29
   let mut i = 0
   while i < b_len {
-    self.push_occurrence(before[b_off + i], i)
+    let tok = before[b_off + i]
+    let e = occ[tok]
+    if (e >> 36) != gen {
+      occ[tok] = gen_len1 | i.to_int64()
+    } else {
+      let len = ((e >> 29) & 127L).to_int()
+      if len >= 2 && len <= 63 && (len & (len - 1)) != 0 {
+        let block = (e & 0x1FFFFFFFL).to_int()
+        pool[block + len] = i
+        occ[tok] = e + step_len
+      } else if len <= 63 {
+        self.push_occurrence_slow(tok, i, e, gen_shifted)
+        pool = self.pool_data
+      }
+    }
     i = i + 1
   }
 }
@@ -171,67 +191,105 @@ fn find_histogram_lcs(
   let mut min_occ = max_chain + 1
   let mut found_cs = false
 
+  let occ = state.occ
+  let pool = state.pool_data
+  let gen = state.generation
+
   let mut pos = 0
   while pos < a_len {
     let tok = after[a_off + pos]
-    let tok_occ = state.num_occurrences(tok)
-    if tok_occ != 0 {
+    let e = occ[tok]
+    if (e >> 36) == gen {
+      let tok_occ = ((e >> 29) & 127L).to_int()
       found_cs = true
       if tok_occ <= min_occ {
         // Explore all occurrences of `tok` in `before`
         let mut next_a_pos = pos + 1
-        let mut occ_i = 0
-        let base_idx = state.occ_index[tok]
-        let mut token_idx1 = if tok_occ == 1 {
-          base_idx
-        } else {
-          state.pool_data[base_idx]
-        }
-        occ_i = 1
+        let base_idx = (e & 0x1FFFFFFFL).to_int()
+        let mut token_idx1 = if tok_occ == 1 { base_idx } else { pool[base_idx] }
+        let mut occ_i = 1
 
         while true {
-          let mut occ = tok_occ
-          let mut start1 = token_idx1
-          let mut start2 = pos
-          while start1 > 0 && start2 > 0 {
-            let t1 = before[b_off + start1 - 1]
-            let t2 = after[a_off + start2 - 1]
-            if t1 == t2 {
-              start1 = start1 - 1
-              start2 = start2 - 1
-              let no = state.num_occurrences(t1)
-              if no < occ {
-                occ = no
+          let mut cur_occ = tok_occ
+          let mut p1 = b_off + token_idx1
+          let mut p2 = a_off + pos
+          let max_back = if token_idx1 < pos { token_idx1 } else { pos }
+          let lim_back = p1 - max_back
+          if cur_occ == 1 {
+            // Fast path: cur_occ == 1 cannot decrease, so skip all `occ[t1]` lookups!
+            while p1 > lim_back && before[p1 - 1] == after[p2 - 1] {
+              p1 = p1 - 1
+              p2 = p2 - 1
+            }
+          } else {
+            while p1 > lim_back {
+              let t1 = before[p1 - 1]
+              if t1 == after[p2 - 1] {
+                p1 = p1 - 1
+                p2 = p2 - 1
+                let no = ((occ[t1] >> 29) & 127L).to_int()
+                if no < cur_occ {
+                  cur_occ = no
+                  if cur_occ == 1 {
+                    while p1 > lim_back && before[p1 - 1] == after[p2 - 1] {
+                      p1 = p1 - 1
+                      p2 = p2 - 1
+                    }
+                    break
+                  }
+                }
+              } else {
+                break
               }
-            } else {
-              break
             }
           }
+          let start1 = p1 - b_off
+          let start2 = p2 - a_off
 
-          let mut end1 = token_idx1 + 1
-          let mut end2 = pos + 1
-          while end1 < b_len && end2 < a_len {
-            let t1 = before[b_off + end1]
-            let t2 = after[a_off + end2]
-            if t1 == t2 {
-              let no = state.num_occurrences(t1)
-              if no < occ {
-                occ = no
+          let mut e1 = b_off + token_idx1 + 1
+          let mut e2 = a_off + pos + 1
+          let rem1 = b_len - (token_idx1 + 1)
+          let rem2 = a_len - (pos + 1)
+          let max_fwd = if rem1 < rem2 { rem1 } else { rem2 }
+          let lim_fwd = e1 + max_fwd
+          if cur_occ == 1 {
+            while e1 < lim_fwd && before[e1] == after[e2] {
+              e1 = e1 + 1
+              e2 = e2 + 1
+            }
+          } else {
+            while e1 < lim_fwd {
+              let t1 = before[e1]
+              if t1 == after[e2] {
+                let no = ((occ[t1] >> 29) & 127L).to_int()
+                if no < cur_occ {
+                  cur_occ = no
+                  if cur_occ == 1 {
+                    e1 = e1 + 1
+                    e2 = e2 + 1
+                    while e1 < lim_fwd && before[e1] == after[e2] {
+                      e1 = e1 + 1
+                      e2 = e2 + 1
+                    }
+                    break
+                  }
+                }
+                e1 = e1 + 1
+                e2 = e2 + 1
+              } else {
+                break
               }
-              end1 = end1 + 1
-              end2 = end2 + 1
-            } else {
-              break
             }
           }
+          let end2 = e2 - a_off
 
           if next_a_pos < end2 {
             next_a_pos = end2
           }
 
           let cur_len = end2 - start2
-          if best_len < cur_len || min_occ > occ {
-            min_occ = occ
+          if best_len < cur_len || min_occ > cur_occ {
+            min_occ = cur_occ
             best_b = start1
             best_a = start2
             best_len = cur_len
@@ -240,7 +298,7 @@ fn find_histogram_lcs(
           // Advance to next occurrence > end2 (matching upstream imara-diff/src/histogram/lcs.rs:132)
           let mut found_next = false
           while occ_i < tok_occ {
-            let cand = state.pool_data[base_idx + occ_i]
+            let cand = pool[base_idx + occ_i]
             occ_i = occ_i + 1
             if cand > end2 {
               token_idx1 = cand
@@ -305,6 +363,14 @@ fn histogram_run(
       while i < b_len {
         removed[b_off + i] = true
         i = i + 1
+      }
+      return
+    }
+
+    if b_len == 1 && a_len == 1 {
+      if before[b_off] != after[a_off] {
+        removed[b_off] = true
+        added[a_off] = true
       }
       return
     }
@@ -384,7 +450,7 @@ pub fn histogram_diff_range(
     }
     return
   }
-  let state = HistogramState::new(num_tokens)
+  let state = HistogramState::new(num_tokens, num_tokens * 2 + 256)
   histogram_run(
     state, before, after, num_tokens, removed, added, b_off, b_len, a_off, a_len,
   )
