@@ -47,8 +47,12 @@ pionc add <package-name>
 | [`semver`](packages/semver) | `0.1.0` | SemVer 2.0.0 解析 / 全序 / 优先级比较与 Cargo `VersionReq` 约束匹配（完整 `u64` 值域、32 comparator 上限） | [`dtolnay/semver`](https://github.com/dtolnay/semver) `=1.0.28` (Rust, MIT/Apache-2.0) | 35 / 35 | ✅ `wasm_smoke` | [解析排序 0.38× · matches 0.27× · 复杂 req 1.06× · 脏输入 1.36×](BENCHMARKS.md#semver) | `pionc add semver --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`uuid`](packages/uuid) | `0.1.0` | RFC 9562 UUID（v1/v3/v4/v5/v6/v7/v8/Nil/Max，内置 MD5 / SHA-1）与 Crockford Base32 ULID（含单调生成器），零堆分配 128-bit `val struct` | [`uuid-rs/uuid`](https://github.com/uuid-rs/uuid) `1.29.3` + [`dylanhart/ulid-rs`](https://github.com/dylanhart/ulid-rs) `1.2.1` (Rust) | 20 / 20 | ✅ `wasm_smoke` | [UUID 批量 0.73× · v5+v7 0.66× · ULID 0.70×（raw）](BENCHMARKS.md#uuid) | `pionc add uuid --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`url`](packages/url) | `0.1.0` | WHATWG URL Standard 解析 / 相对解析 / setters、Unicode 16.0.0 UTS #46 IDNA + Punycode、IPv4/IPv6、percent-encoding 与 `QueryParams`（`URLSearchParams`） | [`servo/rust-url`](https://github.com/servo/rust-url) `2.5.9` (Rust, MIT/Apache-2.0) | 43 / 43 | ✅ `wasm_smoke` | [混合解析 1.05× · URLSearchParams 0.97×](BENCHMARKS.md#url) | `pionc add url --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`http1`](packages/http1) | `0.1.0` | Sans-IO RFC 9110 / RFC 9112 HTTP/1.1 请求 / 响应增量解析与编码、chunked 传输编码流式解码、WHATWG HTML §9.2.6 SSE（EventSource）流式解码，Day-1 请求走私 / CRLF 注入防护与显式 `Limits` | Rust [`httparse`](https://github.com/seanmonstar/httparse) `1.10.1` + Go `net/http`（`go1.27.3`） | 49 / 49 | ✅ `wasm_smoke` | [请求解析 1.48× · 流式 chunked 1.26×（vs Go）](BENCHMARKS.md#http1) | `pionc add http1 --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`jwt`](packages/jwt) | `0.1.0` | RFC 7515 JWS / RFC 7519 JWT / RFC 7517 JWK（HS256 / HS384 / HS512），内置 FIPS 180-4 SHA-2、RFC 4231 HMAC、严格 Base64URL 与常量时间比较，默认强制 `exp` / `aud` 校验并拒绝 `alg: none` | Rust [`jsonwebtoken`](https://github.com/Keats/jsonwebtoken) `12.0.0` + Go [`golang-jwt/jwt/v5`](https://github.com/golang-jwt/jwt) `v5.3.1` | 19 / 19 | ✅ `wasm_smoke` | [签发 0.39× · 验签 0.34×（vs Rust，纯软件 SHA-2 vs 硬件 SHA-2）· 签发 RSS 1.95 MiB](BENCHMARKS.md#jwt) | `pionc add jwt --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`xml`](packages/xml) | `0.1.0` | XML 1.0（第五版）+ Namespaces 1.0 流式拉取解析器、扁平数组只读 DOM 与严格原子 `Writer`；默认禁用 DTD，XXE / Billion Laughs 免疫，全程零递归 | Rust [`roxmltree`](https://github.com/RazrFalcon/roxmltree) `0.21.2` + [`quick-xml`](https://github.com/tafia/quick-xml) `0.42.0` | 38 / 38 | ✅ `wasm_smoke` | [DOM indexed 0.81× · 公开 `Node` API 0.58× · 流式 0.67× · 写 0.87× · 对抗最高 129.32×](BENCHMARKS.md#xml) | `pionc add xml --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`csv`](packages/csv) | `0.1.0` | RFC 4180 + 灵活方言流式 CSV 读写（`Trim` / 注释 / 转义 / `QuoteStyle` / `Terminator`），O(N) 确定性扫描、可选 `Limits` 与严格 RFC 3629 UTF-8 校验 | Rust [`BurntSushi/rust-csv`](https://github.com/BurntSushi/rust-csv) `=1.4.0` + Go `encoding/csv` | 27 / 27 | ✅ `wasm_smoke` | [读 0.95× · 写 1.26×（vs Go，写与 Rust 持平）](BENCHMARKS.md#csv) | `pionc add csv --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 16 个包合计 **3,621 / 3,621** 单测通过（`sh scripts/verify.sh`）。
+全仓 20 个包合计 **3,754 / 3,754** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -57,6 +61,10 @@ pionc add <package-name>
 ### Wave 4：`tar` / `semver` / `uuid` / `url` `v0.1.0` 与 `markdown` `v0.2.1`
 
 Wave 4 新增的 4 个包同样按 Red → Green → 红队审计 → 修复流程交付，首发即为红队修复后的版本，各自随附 `packages/<name>/audit/` 套件。`markdown` `v0.2.1` 为 P49 性能优化版（CommonMark 0.84×、Mixed GFM 0.85× 于 Rust `pulldown-cmark`，峰值 RSS 均低于 Rust）。
+
+### Wave 5：`http1` / `jwt` / `xml` / `csv` `v0.1.0`
+
+Wave 5 新增的 4 个包按 Red → Green → 红队审计 → 修复流程交付，首发即为红队修复后的版本，各自随附 `packages/<name>/audit/` 套件（`http1` 33 / 33 + 200,000 例变异 fuzz 0 分歧；`jwt` 270,128 个 SHA-2 / HMAC / Base64URL 差分向量 0 差异；`xml` 44 / 44，W3C XML Conformance 1,458 / 1,662；`csv` 18 / 18 对 Rust `csv =1.4.0` 差分）。各包对比口径与落后项见 [`BENCHMARKS.md`](BENCHMARKS.md)。
 
 ## 贡献与移植流程
 

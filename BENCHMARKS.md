@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 四个包的数据取自各包 README，未记录 pion commit） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4）
+## 基准总榜（v0.2.0 + Wave 4 + Wave 5）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -81,6 +81,22 @@
 | `url` | 混合 URL 批量 parse + join + serialize | 14,278,136 B | 114.091 ms | 120.056 ms (`rust_url`) | **1.05x** | 21.25 MiB | 10.59 MiB |
 | `url` | `URLSearchParams` parse + mutate + sort + serialize | 16,996,736 B | 244.434 ms | 237.788 ms (`rust_url`) | 0.97x | 23.33 MiB | 11.75 MiB |
 | `url` | 对抗：`adv_join`（净库时间） | 200,000 cases | 103.7 ms | 55.5 ms (`rust_url`) | 0.54x | — | — |
+| `http1` | HTTP/1.1 请求解析（200,000 条混合请求） | 67.92 MB | 232.180 ms | 342.642 ms (`go_net_http`) / 86.743 ms (`rust_httparse`) | **1.48x**（vs Go）/ 0.37x（vs Rust） | 34.20 MiB | 47.80 / 18.05 MiB |
+| `http1` | 响应 + chunked 流式解码（100,000 条 chunked 响应） | 40.77 MB | 174.160 ms | 219.393 ms (`go_net_http`) / 92.271 ms (`rust_httparse`) | **1.26x**（vs Go）/ 0.53x（vs Rust） | 21.27 MiB | 40.91 / 11.58 MiB |
+| `http1` | WHATWG SSE 流式解码（400,000 个 LLM token 事件，4 KiB 分块） | 44.21 MB | 250.726 ms | 161.732 ms (`rust_sse`) / 175.662 ms (`go_sse`) | 0.65x（vs Rust）/ 0.70x（vs Go） | 44.52 MiB | 22.95 / 57.92 MiB |
+| `jwt` | 签发 50,000 个 JWT（25,000 HS256 + 25,000 HS512；Pion 纯软件标量 SHA-2 vs 参考实现 ARMv8 硬件 SHA-2 指令） | 50,000 ops | 150.028 ms | 58.353 ms (`rust_jsonwebtoken`) / 101.761 ms (`go_golang_jwt`) | 0.39x（vs Rust） | **1.95 MiB** | 2.28 / 18.19 MiB |
+| `jwt` | 验签 50,000 个 JWT（含 `exp` / `nbf` / `iss` / `aud` 校验，同上纯软件 SHA-2） | 50,000 ops | 182.783 ms | 62.162 ms (`rust_jsonwebtoken`) / 107.808 ms (`go_golang_jwt`) | 0.34x（vs Rust） | 28.16 MiB | 15.42 / 42.44 MiB |
+| `xml` | DOM 解析 + 全树遍历（indexed 访问器） | 6.45 MB | 36.190 ms | 29.203 ms (`rust_roxmltree`) | 0.81x | 7.02 MiB | 4.98 MiB |
+| `xml` | DOM 解析 + 全树遍历（公开 `Node` API） | 6.45 MB | 45.700 ms | 26.553 ms (`rust_roxmltree`) | 0.58x | 7.44 MiB | 5.02 MiB |
+| `xml` | 流式拉取解析（含 Namespaces 1.0） | 6.45 MB | 39.901 ms | 26.698 ms (`rust_quick_xml`) | 0.67x | 3.16 MiB | 2.56 MiB |
+| `xml` | 结构化序列化 | 3.59 MB | 39.435 ms | 34.481 ms (`rust_quick_xml`) | 0.87x | 3.12 MiB | 2.75 MiB |
+| `xml` | 对抗：2,000 层作用域、叶子使用最外层前缀（DOM；对抗 11 项中 Pion 领先 5 项） | — | 12.99 ms | 1,679.98 ms (Rust) | **129.32x** | 3.64 MiB | 8.56 MiB |
+| `xml` | 对抗：16 MiB 密集实体 / 字符引用（Reader，对抗 11 项中最慢项） | 16 MiB | 73.97 ms | 45.82 ms (Rust) | 0.62x | 35.88 MiB | 18.56 MiB |
+| `csv` | 读：200k 行混合 CSV × 2（`from_string`） | 30,910,952 B | 92.004 ms | 87.099 ms (`go_csv`) / 68.669 ms (`rust_csv` `StringRecord`) | 0.95x（vs Go） | 31.27 MiB | 37.59 / 16.66 MiB |
+| `csv` | 写：200k 结构化记录 × 2 | 29,001,498 B | 73.909 ms | 93.478 ms (`go_csv`) / 74.053 ms (`rust_csv`) | **1.26x**（vs Go；Rust 同为 1.26x，持平） | 30.00 MiB | 40.31 / 16.38 MiB |
+| `csv` | `mixed_1m.csv`，`from_string` vs Rust `ByteRecord`（同口径：均不逐记录校验 UTF-8） | 77 MB | 236.8 ms | 139.2 ms (`rust_byte`) | 1.70x slower | 149.2 MiB | 75.6 MiB |
+| `csv` | `mixed_1m.csv`，`from_bytes` vs Rust `StringRecord`（同口径：均严格校验 UTF-8） | 77 MB | 303.5 ms | 160.8 ms (`rust_str`) | 1.89x slower | 149.2 MiB | — |
+| `csv` | `trim_comment.csv`（`Trim::All` + `#`） | 64 MB | 168.0 ms | 202.7 ms (`rust_byte`) / 298.7 ms (`rust_str`) | **1.21x faster**（vs `ByteRecord`）/ **1.78x faster**（vs `StringRecord`） | 124.0 MiB | 63.1 MiB |
 
 ## 各包明细
 
@@ -497,3 +513,165 @@ SHA-256：Workload 1 `fca6fb3c1d9083d88088188f61cf4c5826e7590a91413844c11058010c
 **DoS 线性扩展（§5，`4n` 输入中位数）**：`n×@` 授权泛洪 78 KB 7.8 ms（Rust 4.8 ms）；`u:` + `n×@` 7.7 ms（4.5 ms）；Punycode 编码上限 117 KB 8.6 ms（5.7 ms）；Punycode 解码上限 58 KB 7.1 ms（5.1 ms）；`1000 × set_hash` 104 KB 27.8 ms（5.5 ms，5.1x）；`1000 × set_query` 110 KB 25.2 ms（7.9 ms，3.2x）。全部线性扩展。
 
 红队：43/43 单测；WPT `urltestdata.json` 869/869、`setters_tests.json` 274/274；`IdnaTestV2.txt` 6,346/6,348（99.97%，`rust-url 2.5.9` / `idna 1.1.0` 为 6,339/6,348 = 99.86%）；审计套件 31/31，15,876 个 URL 0 非幂等往返。审计发现的 P0（`.%2e` 点段、非特殊 scheme `join`、IDNA 映射子集、UTS #46 校验缺失）与 P1（`@` / Punycode 二次复杂度、setter 全量重解析）已修复。落后项：`URLSearchParams` 0.97x，对抗语料中 `adv_join` / `adv_pct` / `adv_query_sort` 为 0.54–0.62x，峰值 RSS 约为 Rust 的 2 倍；`set_hash` / `set_query` 在超长 URL 上仍比 Rust 慢 3–5 倍。
+
+### http1
+
+参考实现：Rust [`httparse`](https://github.com/seanmonstar/httparse) `1.10.1`（`--release`，基线）与 Go `net/http`（`go1.27.3`）。`--warmup 1 --rounds 5`，`sh packages/http1/bench/run_bench.sh`。详见 [`packages/http1/README.md`](packages/http1/README.md)。
+
+**1. HTTP/1.1 请求解析（200,000 条混合请求，67.92 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_httparse`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **232.180** | 229.165 | 239.914 | **292.54** | 1160.90 | 34.20 MiB | 0.37x |
+| `rust_httparse` | 86.743 | 84.775 | 96.716 | 783.02 | 433.72 | 18.05 MiB | 1.00x (baseline) |
+| `go_net_http` | 342.642 | 325.165 | 353.424 | 198.23 | 1713.21 | 47.80 MiB | 0.25x |
+
+SHA-256：`ee568111200158fe227d7ab72523087716ac740d973a453d0bf9816024e0dd1f`
+
+**2. HTTP/1.1 响应 + chunked 流式解码（100,000 条 chunked 响应，40.77 MB）**
+
+Pion 走完整的流式 `ChunkedDecoder` 状态机（与 Go `net/http` 的 `ReadResponse` + `Body.Read` 可比），`rust_httparse` 则对连续切片调用无状态的 `parse_chunk_size`。
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_httparse`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **174.160** | 165.298 | 178.951 | **234.08** | 1741.60 | 21.27 MiB | 0.53x |
+| `rust_httparse` | 92.271 | 90.461 | 92.712 | 441.82 | 922.71 | 11.58 MiB | 1.00x (baseline) |
+| `go_net_http` | 219.393 | 217.825 | 228.853 | 185.82 | 2193.93 | 40.91 MiB | 0.42x |
+
+SHA-256：`013527f1383bbe4530655961b0a38850948e52cc635f27671c7c4d65c00da36c`
+
+**3. WHATWG SSE 流式解码（400,000 个 LLM token 事件，44.21 MB，4 KiB 分块）**
+
+公平性说明：`rust_sse` / `go_sse` 是 `bench/` 中手写移植的同一行扫描算法（不含 `retry:` 解析与 WHATWG `U+FFFD` UTF-8 替换），不是第三方 SSE 库；本表对比的是 Pion 完整 WHATWG 合规 `SseDecoder` 与最小化 Rust / Go 实现。
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_sse`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **250.726** | 245.615 | 485.978 | **176.34** | 626.82 | 44.52 MiB | 0.65x |
+| `rust_sse` | 161.732 | 159.276 | 169.487 | 273.36 | 404.33 | 22.95 MiB | 1.00x (baseline) |
+| `go_sse` | 175.662 | 174.674 | 223.049 | 251.69 | 439.16 | 57.92 MiB | 0.92x |
+
+SHA-256：`cfa251a98ea173c40138cf1f424b54fd6b0df67cddf2b41dc9eff50cde928cb0`
+
+红队：49/49 单测；审计 33/33 + 200,000 例变异 fuzz（0 分歧）。领先项：请求解析与响应 + chunked 流式解码分别为 Go `net/http` 的 **1.48×** 与 **1.26×**，峰值 RSS 更低（34.20 vs 47.80 MiB、21.27 vs 40.91 MiB；Go `ReadRequest` 另会构建 `url.URL` 并把头部规范化进 `map[string][]string`）。落后项：对 Rust `httparse` 为 0.37x / 0.53x（`httparse` 使用 SIMD/SWAR（`aarch64` NEON），向调用方栈数组写借用的零拷贝 `&[u8]` 区间，不分配 `String`，也不做分帧 / `Host` / 走私校验；Pion 返回 `Send` 安全的 owned `String` 字段并内联执行完整 RFC 9112 分帧与 `Host` 校验）；SSE 为最小化 Rust 解码器的 0.65×、Go 解码器的 0.70×（176.34 MB/s）。
+
+### jwt
+
+参考实现：Rust [`jsonwebtoken`](https://github.com/Keats/jsonwebtoken) `12.0.0`（`--release`，基线）与 Go [`golang-jwt/jwt/v5`](https://github.com/golang-jwt/jwt) `v5.3.1`。`--warmup 1 --rounds 5`，`sh packages/jwt/bench/run_bench.sh`。详见 [`packages/jwt/README.md`](packages/jwt/README.md)。
+
+**1. 签发 / 编码 50,000 个 JWT（25,000 HS256 + 25,000 HS512）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (ops/s) | ns/op | Peak RSS | Speedup (vs `rust_jsonwebtoken`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 150.028 | 147.757 | 152.324 | 333,271 | 3000.56 | 1.95 MiB | **0.39x** |
+| `rust_jsonwebtoken` (`12.0.0`, `--release`) | 58.353 | 56.970 | 59.274 | 856,854 | 1167.06 | 2.28 MiB | 1.00x (baseline) |
+| `go_golang_jwt` (`v5.3.1`) | 101.761 | 100.608 | 106.362 | 491,347 | 2035.22 | 18.19 MiB | 0.57x |
+
+SHA-256（3 种实现生成的 50,000 个 token 逐位一致）：`9636875f1e3f086e5919fe68afc497b2546c33c7e537888aaa1b3168a01fbf6d`
+
+**2. 验签 / 解码 50,000 个 JWT（25,000 HS256 + 25,000 HS512 + `exp` / `nbf` / `iss` / `aud` 校验）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (ops/s) | ns/op | Peak RSS | Speedup (vs `rust_jsonwebtoken`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 182.783 | 180.810 | 194.363 | 273,548 | 3655.67 | 28.16 MiB | **0.34x** |
+| `rust_jsonwebtoken` (`12.0.0`, `--release`) | 62.162 | 60.077 | 70.407 | 804,350 | 1243.25 | 15.42 MiB | 1.00x (baseline) |
+| `go_golang_jwt` (`v5.3.1`) | 107.808 | 107.122 | 115.416 | 463,787 | 2156.16 | 42.44 MiB | 0.58x |
+
+SHA-256：`8e46e6e648d8b3f24d2ad00ff40c08f537f02000766e0b6df96929f62d23d5c5`
+
+**硬件差异说明**：在 `Darwin arm64` 上，Rust `sha2`（`jsonwebtoken 12.0.0`）与 Go 标准库 `crypto/sha256` / `sha512` 都通过 ARMv8 Cryptography Extensions（`SHA256H` / `SHA512H` 硬件指令）加速 SHA-2，而 `packages/jwt` 是 100% 纯 Pion 标量软件 SHA-2（零 C FFI，可移植到 `wasm32`）。在此前提下 Pion 达到 **333k 次签发/s** 与 **274k 次验签/s**，签发峰值 RSS **1.95 MiB** 为三者最低。
+
+红队：19/19 单测；270,128 个 SHA-2 / HMAC / Base64URL 差分向量与 RustCrypto 0 差异，三方 JWT 差分与互操作套件、wasm32 逐字节一致、递归深度崩溃探针（0 SIGSEGV / 0 `RangeError`）。落后项：签发 0.39x、验签 0.34x（vs Rust），验签峰值 RSS 28.16 MiB 高于 Rust 的 15.42 MiB。
+
+### xml
+
+参考实现：Rust [`roxmltree`](https://github.com/RazrFalcon/roxmltree) `0.21.2` 与 [`quick-xml`](https://github.com/tafia/quick-xml) `0.42.0`（`--release`，thin LTO，`codegen-units = 1`）。`--warmup 1 --rounds 5`。语料为确定性生成的 645 KB 真实混合 XML（含命名空间的 SVG、Maven / Plist 元数据、带实体 / CDATA / 注释 / PI 的 Atom / RSS），Bench 1 / 2 为 10 轮稳态共 **6.45 MB** 输入，Bench 3 为 5 轮 × 3,000 条结构化记录共 **3.59 MB** 输出。详见 [`packages/xml/README.md`](packages/xml/README.md)。
+
+**1. DOM 解析 + 全树遍历（6.45 MB）**
+
+同时报告两种遍历口径：零分配 indexed 访问器（`Document::node_kind_at`、`attrs_range_at`、`attr_value_len_raw`、`text_len_at`，由 `packages/xml/bench/run_bench.sh` 测量，`sha256:70c1e12cbd0a7d36...`）与公开 `Node` API（`descendants()`、`attributes()`、`text()`，会分配 owned `Array` 与 `String`，由 `packages/xml/audit/perf/run_bench.sh` 测量，`sha256:a32405fd1eeb4911...`）。
+
+| Mode & Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_roxmltree 0.21.2`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (indexed accessors) | 36.190 | 32.133 | 39.675 | 178.23 | 7.02 MiB | 0.81x |
+| `rust_roxmltree` (Bench 1) | 29.203 | 26.365 | 32.190 | 220.87 | 4.98 MiB | 1.00x (baseline) |
+| `pion` (**public `Node` API**) | 45.700 | 44.895 | 46.569 | 141.14 | 7.44 MiB | **0.58x** |
+| `rust_roxmltree` (audit) | 26.553 | 24.651 | 27.078 | 242.91 | 5.02 MiB | 1.00x (baseline) |
+
+**2. 流式拉取解析（6.45 MB，stdout `155 B`，`sha256:520e5cb9a1c90edb...`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_quick_xml 0.42.0`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (with Namespaces 1.0) | 39.901 | 36.755 | 42.520 | 161.65 | 3.16 MiB | 0.67x |
+| `rust_quick_xml` (`check_end_names`) | 26.698 | 23.925 | 27.632 | 241.59 | 2.56 MiB | 1.00x (baseline) |
+
+**3. 结构化 XML 序列化（3.59 MB，stdout `211 B`，`sha256:e5290d6c8b4ff356...`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_quick_xml 0.42.0`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (strict atomic + NS checks) | 39.435 | 35.746 | 53.078 | 90.98 | 3.12 MiB | 0.87x |
+| `rust_quick_xml` | 34.481 | 31.013 | 41.056 | 104.05 | 2.75 MiB | 1.00x (baseline) |
+
+**4. 对抗与病态负载（`packages/xml/audit/run_audit.sh`，与 Rust `roxmltree 0.21.2` / `quick-xml 0.42.0` SHA-256 一致）**
+
+| Workload | `pion` Median | `pion` RSS | Rust Median | Rust RSS | `pion` vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Alternating Text/CDATA × 20,000 (DOM) | 10.65 ms | 2.77 MiB | 10.28 ms | 3.42 MiB | **0.96x** |
+| 1,000 prefixes, 200k elements cycling prefixes (DOM) | 31.66 ms | 37.08 MiB | 162.31 ms | 17.47 MiB | **5.13x (pion wins)** |
+| 2,000-deep scopes, leaf uses outermost prefix (DOM) | 12.99 ms | 3.64 MiB | 1,679.98 ms | 8.56 MiB | **129.32x (pion wins)** |
+| 200 elements × 1,000 attributes (DOM) | 23.58 ms | 21.45 MiB | 161.26 ms | 17.86 MiB | **6.84x (pion wins)** |
+| 200 elements × 1,000 attributes (Reader) | 24.83 ms | 5.86 MiB | 20.78 ms | 4.23 MiB | **0.84x** |
+| 20,000 internal entities + 20,000 refs (DOM, `allow_dtd`) | 15.41 ms | 7.72 MiB | 407.33 ms | 4.19 MiB | **26.43x (pion wins)** |
+| 16 MiB single text node (DOM) | 20.08 ms | 33.77 MiB | 28.46 ms | 17.95 MiB | **1.42x (pion wins)** |
+| 16 MiB dense entity/char refs (DOM) | 74.63 ms | 36.00 MiB | 56.91 ms | 38.02 MiB | 0.76x |
+| 16 MiB dense entity/char refs (Reader) | 73.97 ms | 35.88 MiB | 45.82 ms | 18.56 MiB | 0.62x |
+| 100k sibling elements (DOM) | 16.17 ms | 19.12 MiB | 11.29 ms | 9.16 MiB | 0.70x |
+| 50,000-deep nesting (DOM, limits raised) | 15.46 ms | 13.70 MiB | 11.15 ms | 6.75 MiB | 0.72x |
+
+对抗 11 项中 Pion 领先 5 项（1.42x–129.32x），落后 6 项（0.62x–0.96x）。
+
+红队：38/38 单测；审计 44/44；W3C XML Conformance Test Suite（`xmlts20130923`）1,458 / 1,662（87.7%，`roxmltree 0.21.2` 为 81.5%，且不存在 `roxmltree` 通过而 `xml` 失败的用例）；2,748 份差分语料在 4 种解析模式下 Native / wasm32 逐字节一致。落后项：Bench 1 indexed 0.81x、公开 `Node` API 0.58x（`NodeData` 使用 64 位 `Int` 索引而 Rust 为 32 位 `NonZeroU32`，以及整体 `val struct` 更新；公开 API 遍历时还会分配 owned `Array` / `String`）；Bench 2 0.67x（`quick-xml` 返回零拷贝借用 `&[u8]` 并用 `memchr` SIMD 扫描，其基础 `Reader` 不做 Namespaces 1.0 校验）；Bench 3 0.87x（含完整写前校验）。
+
+### csv
+
+参考实现：Rust [`BurntSushi/rust-csv`](https://github.com/BurntSushi/rust-csv) `csv =1.4.0`（`--release`）与 Go `encoding/csv`。`--warmup 1 --rounds 5`。详见 [`packages/csv/README.md`](packages/csv/README.md)。
+
+**同口径对比方法**：`Reader::from_string` 信任 `String` 输入为 UTF-8（不逐记录校验），同口径 Rust 对照为 **`ByteRecord`**（`rust_byte`）；`Reader::from_bytes` 按 RFC 3629 严格校验 UTF-8，同口径 Rust 对照为 **`StringRecord`**（`rust_str`）。
+
+**1. 对抗与大文件矩阵（`SECTIONS="bench" sh packages/csv/audit/run_audit.sh`，各实现各轮 stdout SHA-256 逐字节一致）**
+
+| Corpus (Size) / Mode | Pion (ms / RSS) | Rust `StringRecord` | Rust `ByteRecord` | Go `encoding/csv` | Pion vs Like-for-Like Rust | Stdout SHA-256 (prefix) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `mixed_200k.csv` (15 MB, default `from_string`) | 54.2 / 31.3 MiB | 39.1 | 35.0 / 16.6 MiB | 47.1 | 1.55x slower (vs `ByteRecord`) | `238820ffb412645a` |
+| `mixed_1m.csv` (77 MB, default `from_string`) | 236.8 / 149.2 MiB | 162.9 | 139.2 / 75.6 MiB | 203.8 | 1.70x slower (vs `ByteRecord`) | `97221bca6d1004af` |
+| `mixed_1m.csv` (77 MB, `from_bytes` validated) | 303.5 / 149.2 MiB | 160.8 | 137.0 / 75.6 MiB | 200.3 | 1.89x slower (vs `StringRecord`) | `97221bca6d1004af` |
+| `mixed_1m.csv` (77 MB, `Record::fields()` alloc) | **314.2** / 149.2 MiB | 344.5 | 138.9 / 75.6 MiB | 201.2 | **0.91x (Pion 1.10x faster vs `StringRecord`)** | `97221bca6d1004af` |
+| `heavy_quote.csv` (52 MB, dense `""` escapes) | 181.2 / 100.8 MiB | 100.8 | 100.4 / 51.4 MiB | 173.6 | 1.81x slower (vs `ByteRecord`) | `3c55bcf725b2b4d0` |
+| `wide_1000.csv` (58 MB, 1,000 cols × 20k rows) | 255.6 / 112.4 MiB | 120.1 | 119.2 / 57.3 MiB | 268.7 | 2.15x slower (vs `ByteRecord`; 1.05x faster vs Go) | `073eb90b9624881a` |
+| `semicolon.csv` (55 MB, `;` delimiter) | 193.5 / 107.0 MiB | 124.4 | 105.8 / 54.5 MiB | 163.5 | 1.83x slower (vs `ByteRecord`) | `40345eda2400b10b` |
+| `trim_comment.csv` (64 MB, `Trim::All` + `#`) | **168.0** / 124.0 MiB | 298.7 | 202.7 / 63.1 MiB | 119.3 | **0.83x vs `ByteRecord` (1.21x faster), 0.56x vs `StringRecord` (1.78x faster)** | `66276dcc4331b3f9` |
+| `escape.csv` (22 MB, `\` escape, `double_quote=false`) | 147.1 / 44.1 MiB | 54.4 | 47.1 / 23.0 MiB | n/a | 3.12x slower (vs `ByteRecord`) | `9ae0aabfea6d2ca3` |
+| `narrow.csv` (40 MB, `read_all` 2M × 10 fields) | 429.9 / 668.5 MiB | 289.9 | 280.1 / 517.7 MiB | 403.9 / 521.0 MiB | 1.53x slower, 1.29x memory (vs `ByteRecord`) | `0f6b0ef0092b8c05` |
+
+`mixed_1m.csv`（77 MB）上 `CsvConfig::default()`（`242.2 ms`）与 `max_record_bytes = 0`（`240.1 ms`）一致（`1.01x`），不存在 16 MiB 快路径悬崖。
+
+**2. 读：200k 行混合 CSV × 2 稳态轮（400,000 条记录，`30,910,952 B`，`sh packages/csv/bench/run_bench.sh`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_csv`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`from_string`) | 92.004 | 86.764 | 92.932 | 335.97 | 230.01 | 31.27 MiB | 0.95x |
+| `rust_csv` (`StringRecord`, `=1.4.0 --release`) | **68.669** | 67.640 | 69.604 | **450.14** | **171.67** | 16.66 MiB | **1.27x** |
+| `go_csv` (`encoding/csv`) | 87.099 | 85.064 | 89.837 | 354.90 | 217.75 | 37.59 MiB | 1.00x (baseline) |
+
+SHA-256：`1ead353719fe54e5aea4d0c4818d61134d51f364cef4f4f8bd4beff1b5310c24`
+
+**3. 写：200k 条结构化记录 × 2 稳态轮（400,000 条记录，`29,001,498 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_csv`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **73.909** | 73.064 | 83.390 | **392.39** | **184.77** | 30.00 MiB | **1.26x** |
+| `rust_csv` (`=1.4.0 --release`) | 74.053 | 72.719 | 89.356 | 391.63 | 185.13 | 16.38 MiB | 1.26x |
+| `go_csv` (`encoding/csv`) | 93.478 | 91.407 | 94.448 | 310.25 | 233.69 | 40.31 MiB | 1.00x (baseline) |
+
+SHA-256：`ddc27c6360c7b492919a2ebe9e6421cf6adf7aec87566c2a2794c81592e69db5`
+
+红队：27/27 单测（`reader_test` 12/12、`writer_test` 6/6、`redteam_test` 9/9）；审计 18/18 对 Rust `csv =1.4.0`（`csv-core 0.1.13`）差分，另有 40,000 读 + 10,000 写差分 fuzz、6,400 次无损往返（0 有损）与 133,816 次 wasm32 / native 逐字节一致运行。领先项：写为 Go 的 **1.26x**、与 Rust 持平（73.909 vs 74.053 ms）；`trim_comment.csv` 快于 Rust `ByteRecord` 1.21x、`StringRecord` 1.78x；`Record::fields()` 分配模式快于 `StringRecord` 1.10x。落后项：读 Bench 1 为 Go 的 0.95x；同口径下 `from_string` 慢于 `ByteRecord` 1.53–2.15x（`escape.csv` 3.12x），`from_bytes` 慢于 `StringRecord` 1.89x；峰值 RSS 多数场景约为 Rust 的 1.8–2.0 倍（`narrow.csv` `read_all` 为 1.29 倍）。
