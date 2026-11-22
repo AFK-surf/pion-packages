@@ -1,0 +1,629 @@
+///| High-performance RFC 4180 + flexible CSV Writer.
+///| Uses 256B `FixedArray` LUTs, 4-byte unrolled single-pass `needs_quotes` scanning,
+///| and `StringBuilder::write_substring` / `write_string` zero-allocation hot paths.
+
+///| Top-level read-only 256B LUT for default writer config (`,`, `"`, `\r`, `\n`).
+fn build_default_write_lut() -> FixedArray[Int] {
+  let lut : FixedArray[Int] = FixedArray::make(256, 0)
+  lut[44] = 1
+  lut[34] = 1
+  lut[10] = 1
+  lut[13] = 1
+  lut
+}
+
+let default_write_lut : FixedArray[Int] = build_default_write_lut()
+
+///| Build a 256B `requires_quotes` LUT for a writer configuration.
+fn build_write_lut(cfg : CsvConfig) -> FixedArray[Int] {
+  let is_default_term = match cfg.terminator {
+    Terminator::LF => true
+    Terminator::CRLF => true
+    Terminator::Any(_) => false
+  }
+  let no_comment = match cfg.comment {
+    None => true
+    Some(_) => false
+  }
+  if cfg.delimiter.to_int() == 44 &&
+  cfg.quote.to_int() == 34 &&
+  cfg.double_quote &&
+  is_default_term &&
+  no_comment {
+    return default_write_lut
+  }
+  let lut : FixedArray[Int] = FixedArray::make(256, 0)
+  lut[cfg.delimiter.to_int() & 0xFF] = 1
+  lut[cfg.quote.to_int() & 0xFF] = 1
+  if !cfg.double_quote {
+    let esc = match cfg.escape {
+      Some(b) => b.to_int() & 0xFF
+      None => 92
+    }
+    lut[esc] = 1
+  }
+  match cfg.terminator {
+    Terminator::CRLF => {
+      lut[10] = 1
+      lut[13] = 1
+    }
+    Terminator::LF => {
+      lut[10] = 1
+      lut[13] = 1
+    }
+    Terminator::Any(tb) => {
+      let t = tb.to_int() & 0xFF
+      if t == 10 || t == 13 {
+        lut[10] = 1
+        lut[13] = 1
+      } else {
+        lut[t] = 1
+      }
+    }
+  }
+  match cfg.comment {
+    Some(cb) => lut[cb.to_int() & 0xFF] = 1
+    None => ()
+  }
+  lut
+}
+
+///| Fast check using a pre-loaded 256B `lut` (bind top-level `default_write_lut` once outside loop).
+fn find_first_special(lut : FixedArray[Int], s : String, start : Int, end : Int) -> Int {
+  let mut i = start
+  let end4 = end - 4
+  while i <= end4 {
+    if (lut[s.code_unit_at(i)] |
+      lut[s.code_unit_at(i + 1)] |
+      lut[s.code_unit_at(i + 2)] |
+      lut[s.code_unit_at(i + 3)]) != 0 {
+      if lut[s.code_unit_at(i)] != 0 {
+        return i
+      }
+      if lut[s.code_unit_at(i + 1)] != 0 {
+        return i + 1
+      }
+      if lut[s.code_unit_at(i + 2)] != 0 {
+        return i + 2
+      }
+      return i + 3
+    }
+    i = i + 4
+  }
+  while i < end {
+    if lut[s.code_unit_at(i)] != 0 {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///| Check whether `s[start..end]` is a valid numeric literal (for `QuoteStyle::NonNumeric`).
+///| Matches Rust `f64::from_str` / `i128::from_str`, including `NaN`, `inf`, `Infinity` (case-insensitive, optional sign).
+fn span_is_numeric(s : String, start : Int, end : Int) -> Bool {
+  if start >= end {
+    return false
+  }
+  let mut i = start
+  let first = s.code_unit_at(i)
+  if first == 43 || first == 45 {
+    i = i + 1
+    if i >= end {
+      return false
+    }
+  }
+  let rem = end - i
+  if rem == 3 {
+    let c0 = s.code_unit_at(i) | 0x20
+    let c1 = s.code_unit_at(i + 1) | 0x20
+    let c2 = s.code_unit_at(i + 2) | 0x20
+    if (c0 == 110 && c1 == 97 && c2 == 110) || (c0 == 105 && c1 == 110 && c2 == 102) {
+      return true
+    }
+  } else if rem == 8 {
+    if (s.code_unit_at(i) | 0x20) == 105 &&
+    (s.code_unit_at(i + 1) | 0x20) == 110 &&
+    (s.code_unit_at(i + 2) | 0x20) == 102 &&
+    (s.code_unit_at(i + 3) | 0x20) == 105 &&
+    (s.code_unit_at(i + 4) | 0x20) == 110 &&
+    (s.code_unit_at(i + 5) | 0x20) == 105 &&
+    (s.code_unit_at(i + 6) | 0x20) == 116 &&
+    (s.code_unit_at(i + 7) | 0x20) == 121 {
+      return true
+    }
+  }
+  let mut digits = 0
+  while i < end {
+    let b = s.code_unit_at(i)
+    if b >= 48 && b <= 57 {
+      digits = digits + 1
+      i = i + 1
+    } else {
+      break
+    }
+  }
+  if i < end && s.code_unit_at(i) == 46 {
+    i = i + 1
+    while i < end {
+      let b = s.code_unit_at(i)
+      if b >= 48 && b <= 57 {
+        digits = digits + 1
+        i = i + 1
+      } else {
+        break
+      }
+    }
+  }
+  if digits == 0 {
+    return false
+  }
+  if i < end {
+    let e = s.code_unit_at(i)
+    if e == 101 || e == 69 {
+      i = i + 1
+      if i < end {
+        let sign = s.code_unit_at(i)
+        if sign == 43 || sign == 45 {
+          i = i + 1
+        }
+      }
+      let mut exp_digits = 0
+      while i < end {
+        let b = s.code_unit_at(i)
+        if b >= 48 && b <= 57 {
+          exp_digits = exp_digits + 1
+          i = i + 1
+        } else {
+          break
+        }
+      }
+      if exp_digits == 0 {
+        return false
+      }
+    }
+  }
+  i == end
+}
+
+///| Write a quoted field `s[start..end]` into `sb`, starting quote scan at `scan_from`.
+fn write_quoted_span_from(
+  sb : StringBuilder,
+  s : String,
+  start : Int,
+  scan_from : Int,
+  end : Int,
+  quote_byte : Byte,
+  quote_int : Int,
+  escape_byte : Byte,
+  double_quote : Bool,
+) -> Unit {
+  sb.write_byte(quote_byte)
+  let mut i = scan_from
+  let mut run_start = start
+  while i < end {
+    while i <= end - 4 {
+      if s.code_unit_at(i) == quote_int ||
+      s.code_unit_at(i + 1) == quote_int ||
+      s.code_unit_at(i + 2) == quote_int ||
+      s.code_unit_at(i + 3) == quote_int {
+        break
+      }
+      i = i + 4
+    }
+    while i < end && s.code_unit_at(i) != quote_int {
+      i = i + 1
+    }
+    if i >= end {
+      break
+    }
+    if i > run_start {
+      sb.write_substring(s, run_start, i)
+    }
+    if double_quote {
+      sb.write_byte(quote_byte)
+      sb.write_byte(quote_byte)
+    } else {
+      sb.write_byte(escape_byte)
+      sb.write_byte(quote_byte)
+    }
+    i = i + 1
+    run_start = i
+  }
+  if run_start < end {
+    sb.write_substring(s, run_start, end)
+  }
+  sb.write_byte(quote_byte)
+}
+
+///| Streaming CSV writer.
+pub struct Writer {
+  config : CsvConfig
+  lut : FixedArray[Int]
+  sb : StringBuilder
+  delim_byte : Byte
+  quote_byte : Byte
+  quote_int : Int
+  escape_byte : Byte
+  double_quote : Bool
+  style_tag : Int
+  term_tag : Int
+  term_byte : Byte
+  is_default_lut : Bool
+  mut expected_len : Int
+  mut has_expected_len : Bool
+}
+
+///| Create a writer with default configuration.
+pub fn Writer::new() -> Writer {
+  Writer::with_config(CsvConfig::default())
+}
+
+///| Create a writer with custom configuration.
+pub fn Writer::with_config(config : CsvConfig) -> Writer {
+  Writer::with_capacity(config, 256)
+}
+
+///| Create a writer with custom configuration and initial buffer capacity.
+pub fn Writer::with_capacity(config : CsvConfig, capacity : Int) -> Writer {
+  let esc_byte = match config.escape {
+    Some(b) => b
+    None => (92).to_byte()
+  }
+  let s_tag = match config.quote_style {
+    QuoteStyle::Necessary => 0
+    QuoteStyle::Always => 1
+    QuoteStyle::NonNumeric => 2
+    QuoteStyle::Never => 3
+  }
+  let (t_tag, t_byte) = match config.terminator {
+    Terminator::LF => (0, (10).to_byte())
+    Terminator::CRLF => (1, (10).to_byte())
+    Terminator::Any(b) => (2, b)
+  }
+  let is_def_term = match config.terminator {
+    Terminator::LF => true
+    Terminator::CRLF => true
+    Terminator::Any(_) => false
+  }
+  let no_cmt = match config.comment {
+    None => true
+    Some(_) => false
+  }
+  let is_def_lut = config.delimiter.to_int() == 44 &&
+  config.quote.to_int() == 34 &&
+  config.double_quote &&
+  is_def_term &&
+  no_cmt
+  Writer::{
+    config: config,
+    lut: build_write_lut(config),
+    sb: StringBuilder::with_capacity(capacity),
+    delim_byte: config.delimiter,
+    quote_byte: config.quote,
+    quote_int: config.quote.to_int() & 0xFF,
+    escape_byte: esc_byte,
+    double_quote: config.double_quote,
+    style_tag: s_tag,
+    term_tag: t_tag,
+    term_byte: t_byte,
+    is_default_lut: is_def_lut,
+    expected_len: 0,
+    has_expected_len: false,
+  }
+}
+
+///| Write record terminator into `sb`.
+fn Writer::write_terminator(self : Writer) -> Unit {
+  if self.term_tag == 0 {
+    self.sb.write_byte((10).to_byte())
+  } else if self.term_tag == 1 {
+    self.sb.write_byte((13).to_byte())
+    self.sb.write_byte((10).to_byte())
+  } else {
+    self.sb.write_byte(self.term_byte)
+  }
+}
+
+///| Write a single field span `s[start..end]` according to `quote_style`.
+fn Writer::write_field_span(self : Writer, s : String, start : Int, end : Int) -> Unit {
+  let tag = self.style_tag
+  if tag == 0 {
+    let first = find_first_special(self.lut, s, start, end)
+    if first >= 0 {
+      write_quoted_span_from(
+        self.sb,
+        s,
+        start,
+        first,
+        end,
+        self.quote_byte,
+        self.quote_int,
+        self.escape_byte,
+        self.double_quote,
+      )
+    } else if start < end {
+      self.sb.write_substring(s, start, end)
+    }
+  } else if tag == 1 {
+    write_quoted_span_from(
+      self.sb,
+      s,
+      start,
+      start,
+      end,
+      self.quote_byte,
+      self.quote_int,
+      self.escape_byte,
+      self.double_quote,
+    )
+  } else if tag == 2 {
+    if !span_is_numeric(s, start, end) {
+      write_quoted_span_from(
+        self.sb,
+        s,
+        start,
+        start,
+        end,
+        self.quote_byte,
+        self.quote_int,
+        self.escape_byte,
+        self.double_quote,
+      )
+    } else if start < end {
+      self.sb.write_substring(s, start, end)
+    }
+  } else if start < end {
+    self.sb.write_substring(s, start, end)
+  }
+}
+
+///| Write a single record of string fields.
+pub fn Writer::write_record(self : Writer, fields : Array[String]) -> Result[Unit, CsvError] {
+  let n = fields.length()
+  let effective_n = if n == 0 { 1 } else { n }
+  if !self.config.flexible {
+    if !self.has_expected_len {
+      self.expected_len = effective_n
+      self.has_expected_len = true
+    } else if effective_n != self.expected_len {
+      return Err(
+        CsvError::new(
+          CsvErrorKind::UnequalLengths(self.expected_len, n),
+          Option::None,
+          "csv: expected " + self.expected_len.to_string() + " fields, got " + n.to_string(),
+        ),
+      )
+    }
+  }
+  let sb = self.sb
+  if n == 0 || (n == 1 && fields[0].length() == 0) {
+    sb.write_byte(self.quote_byte)
+    sb.write_byte(self.quote_byte)
+    self.write_terminator()
+    return Ok(())
+  }
+  let delim = self.delim_byte
+  if self.style_tag == 0 && self.is_default_lut {
+    // Ultra-hot path: default RFC 4180 QuoteStyle::Necessary (all specials <= 44: ',', '"', '\n', '\r')
+    let qbyte = self.quote_byte
+    let esc = self.escape_byte
+    if n > 0 {
+      let f0 = fields[0]
+      let fl0 = f0.length()
+      let mut j0 = 0
+      let mut sp0 = -1
+      while j0 <= fl0 - 4 {
+        if f0.code_unit_at(j0) <= 44 ||
+        f0.code_unit_at(j0 + 1) <= 44 ||
+        f0.code_unit_at(j0 + 2) <= 44 ||
+        f0.code_unit_at(j0 + 3) <= 44 {
+          break
+        }
+        j0 = j0 + 4
+      }
+      while j0 < fl0 {
+        let b = f0.code_unit_at(j0)
+        if b <= 44 && (b == 44 || b == 34 || b == 10 || b == 13) {
+          sp0 = j0
+          break
+        }
+        j0 = j0 + 1
+      }
+      if sp0 >= 0 {
+        write_quoted_span_from(sb, f0, 0, sp0, fl0, qbyte, 34, esc, true)
+      } else if fl0 > 0 {
+        sb.write_string(f0)
+      }
+      let mut i = 1
+      while i < n {
+        sb.write_byte(delim)
+        let f = fields[i]
+        let flen = f.length()
+        let mut j = 0
+        let mut special = -1
+        while j <= flen - 4 {
+          if f.code_unit_at(j) <= 44 ||
+          f.code_unit_at(j + 1) <= 44 ||
+          f.code_unit_at(j + 2) <= 44 ||
+          f.code_unit_at(j + 3) <= 44 {
+            break
+          }
+          j = j + 4
+        }
+        while j < flen {
+          let b = f.code_unit_at(j)
+          if b <= 44 && (b == 44 || b == 34 || b == 10 || b == 13) {
+            special = j
+            break
+          }
+          j = j + 1
+        }
+        if special >= 0 {
+          write_quoted_span_from(sb, f, 0, special, flen, qbyte, 34, esc, true)
+        } else if flen > 0 {
+          sb.write_string(f)
+        }
+        i = i + 1
+      }
+    }
+    if self.term_tag == 0 {
+      sb.write_byte((10).to_byte())
+    } else {
+      self.write_terminator()
+    }
+    return Ok(())
+  } else if self.style_tag == 0 {
+    // Ultra-hot path: QuoteStyle::Necessary with inlined 4-byte unrolled scan + zero-slice write_string
+    let lut = self.lut
+    let qbyte = self.quote_byte
+    let qint = self.quote_int
+    let esc = self.escape_byte
+    let dbl = self.double_quote
+    if n > 0 {
+      let f0 = fields[0]
+      let fl0 = f0.length()
+      let mut j0 = 0
+      let mut sp0 = -1
+      while j0 <= fl0 - 4 {
+        if (lut[f0.code_unit_at(j0)] |
+          lut[f0.code_unit_at(j0 + 1)] |
+          lut[f0.code_unit_at(j0 + 2)] |
+          lut[f0.code_unit_at(j0 + 3)]) != 0 {
+          sp0 = j0
+          break
+        }
+        j0 = j0 + 4
+      }
+      if sp0 < 0 {
+        while j0 < fl0 {
+          if lut[f0.code_unit_at(j0)] != 0 {
+            sp0 = j0
+            break
+          }
+          j0 = j0 + 1
+        }
+      }
+      if sp0 >= 0 {
+        write_quoted_span_from(sb, f0, 0, sp0, fl0, qbyte, qint, esc, dbl)
+      } else if fl0 > 0 {
+        sb.write_string(f0)
+      }
+      let mut i = 1
+      while i < n {
+        sb.write_byte(delim)
+        let f = fields[i]
+        let flen = f.length()
+        let mut j = 0
+        let mut special = -1
+        while j <= flen - 4 {
+          if (lut[f.code_unit_at(j)] |
+            lut[f.code_unit_at(j + 1)] |
+            lut[f.code_unit_at(j + 2)] |
+            lut[f.code_unit_at(j + 3)]) != 0 {
+            special = j
+            break
+          }
+          j = j + 4
+        }
+        if special < 0 {
+          while j < flen {
+            if lut[f.code_unit_at(j)] != 0 {
+              special = j
+              break
+            }
+            j = j + 1
+          }
+        }
+        if special >= 0 {
+          write_quoted_span_from(sb, f, 0, special, flen, qbyte, qint, esc, dbl)
+        } else if flen > 0 {
+          sb.write_string(f)
+        }
+        i = i + 1
+      }
+    }
+    if self.term_tag == 0 {
+      sb.write_byte((10).to_byte())
+    } else {
+      self.write_terminator()
+    }
+    return Ok(())
+  } else {
+    let mut i = 0
+    while i < n {
+      if i > 0 {
+        sb.write_byte(delim)
+      }
+      let f = fields[i]
+      self.write_field_span(f, 0, f.length())
+      i = i + 1
+    }
+  }
+  self.write_terminator()
+  Ok(())
+}
+
+///| Write a single `Record` directly from its backing buffer (zero intermediate field allocation).
+pub fn Writer::write_csv_record(self : Writer, rec : Record) -> Result[Unit, CsvError] {
+  let n = rec.len()
+  let effective_n = if n == 0 { 1 } else { n }
+  if !self.config.flexible {
+    if !self.has_expected_len {
+      self.expected_len = effective_n
+      self.has_expected_len = true
+    } else if effective_n != self.expected_len {
+      return Err(
+        CsvError::new(
+          CsvErrorKind::UnequalLengths(self.expected_len, n),
+          Option::None,
+          "csv: expected " + self.expected_len.to_string() + " fields, got " + n.to_string(),
+        ),
+      )
+    }
+  }
+  let s = rec.buf
+  let spans = rec.spans
+  if n == 0 || (n == 1 && spans[0] == spans[1]) {
+    self.sb.write_byte(self.quote_byte)
+    self.sb.write_byte(self.quote_byte)
+    self.write_terminator()
+    return Ok(())
+  }
+  let delim = self.delim_byte
+  let mut i = 0
+  while i < n {
+    if i > 0 {
+      self.sb.write_byte(delim)
+    }
+    let base = i << 1
+    self.write_field_span(s, spans[base], spans[base + 1])
+    i = i + 1
+  }
+  self.write_terminator()
+  Ok(())
+}
+
+///| Write multiple records.
+pub fn Writer::write_all(self : Writer, records : Array[Array[String]]) -> Result[Unit, CsvError] {
+  let mut i = 0
+  let n = records.length()
+  while i < n {
+    match self.write_record(records[i]) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+///| Finalize and return the serialized CSV string.
+pub fn Writer::finish(self : Writer) -> String {
+  self.sb.to_string()
+}
+
+///| Finalize and return the serialized CSV bytes.
+pub fn Writer::finish_bytes(self : Writer) -> Bytes {
+  self.sb.to_string().to_bytes()
+}
