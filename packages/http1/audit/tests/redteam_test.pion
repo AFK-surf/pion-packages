@@ -1,0 +1,1017 @@
+///| Red-team prosecution suite for `packages/http1` (branch audit/redteam-http1).
+///|
+///| Every non-`control_` test asserts the behaviour RFC 9110 / RFC 9112 / WHATWG HTML
+///| §9.2.6 require, which Go `net/http` (go1.27.3) and/or Rust `httparse` 1.10.1
+///| exhibit on the same bytes (see `audit/diff`). A FAILING test is evidence against
+///| the Pion package; it should PASS once the defect is fixed.
+///| Tests prefixed `control_` are negative controls expected to PASS: they document
+///| attack surface that was probed and found sound.
+///|
+///| Raw bytes are written with `%XX` escapes via `hb` (e.g. `%0B` = VT, `%25` = '%').
+
+import "http1"
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+///|
+fn hexv(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else {
+    -1
+  }
+}
+
+///| Bytes of `s` with `%XX` hex escapes decoded.
+fn hb(s : String) -> Bytes {
+  let src = s.to_bytes()
+  let n = src.length()
+  let tmp : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let c = src[i].to_int()
+    if c == 37 && i + 2 < n + 0 && hexv(src[i + 1].to_int()) >= 0 &&
+    hexv(src[i + 2].to_int()) >= 0 {
+      tmp.push(hexv(src[i + 1].to_int()) * 16 + hexv(src[i + 2].to_int()))
+      i = i + 3
+    } else {
+      tmp.push(c)
+      i = i + 1
+    }
+  }
+  let mut out = Bytes::new(tmp.length())
+  let mut j = 0
+  while j < tmp.length() {
+    out[j] = tmp[j].to_byte()
+    j = j + 1
+  }
+  out
+}
+
+///|
+fn cat(parts : Array[Bytes]) -> Bytes {
+  let mut n = 0
+  let mut i = 0
+  while i < parts.length() {
+    n = n + parts[i].length()
+    i = i + 1
+  }
+  let mut out = Bytes::new(n)
+  let mut off = 0
+  i = 0
+  while i < parts.length() {
+    let p = parts[i]
+    let mut j = 0
+    while j < p.length() {
+      out[off + j] = p[j]
+      j = j + 1
+    }
+    off = off + p.length()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn repeat(s : String, n : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    sb.write_string(s)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn framing_str(f : http1::Framing) -> String {
+  match f {
+    http1::Framing::None => "none"
+    http1::Framing::ContentLength(n) => "cl=" + n.to_string()
+    http1::Framing::Chunked => "chunked"
+  }
+}
+
+///| "ok <framing>" | "partial" | "err <message>"
+fn req_verdict(b : Bytes) -> String {
+  match http1::parse_request(b) {
+    Ok(http1::ParseStatus::Complete(r, _)) => "ok " + framing_str(r.framing)
+    Ok(http1::ParseStatus::Partial) => "partial"
+    Err(e) => "err " + http1::http_error_string(e)
+  }
+}
+
+///|
+fn resp_verdict(b : Bytes) -> String {
+  match http1::parse_response(b) {
+    Ok(http1::ParseStatus::Complete(r, _)) => "ok " + framing_str(r.framing)
+    Ok(http1::ParseStatus::Partial) => "partial"
+    Err(e) => "err " + http1::http_error_string(e)
+  }
+}
+
+///|
+fn is_err(v : String) -> Bool {
+  v.length() >= 4 && v.slice(0, 4) == "err "
+}
+
+///| Body framing a client must apply to a response (RFC 9112 §6.3 rule 1):
+///| 1xx / 204 / 304 never carry content regardless of CL/TE.
+fn resp_has_body_framing(b : Bytes) -> String {
+  match http1::parse_response(b) {
+    Ok(http1::ParseStatus::Complete(r, _)) => framing_str(r.framing)
+    _ => "error"
+  }
+}
+
+///| Decode a chunked body feeding `step` bytes at a time (0 = whole).
+///| Returns "ok <body> | <n trailers> | rem=<remaining>" or "err <message>".
+fn chunked_run(wire : Bytes, step : Int, limits : http1::Limits) -> String {
+  let dec = http1::ChunkedDecoder::with_limits(limits)
+  let body = StringBuilder::new()
+  let n = wire.length()
+  let s = if step == 0 { n } else { step }
+  let mut off = 0
+  let mut done = false
+  let mut ntr = 0
+  while off < n && !done {
+    let end = if off + s > n { n } else { off + s }
+    dec.feed(wire.slice(off, end))
+    off = end
+    let mut looping = true
+    while looping {
+      match dec.next() {
+        Ok(http1::ChunkStep::Data(d)) => body.write_string(d.to_string())
+        Ok(http1::ChunkStep::NeedMore) => looping = false
+        Ok(http1::ChunkStep::Done(tr)) => {
+          ntr = tr.length()
+          done = true
+          looping = false
+        }
+        Err(e) => return "err " + http1::http_error_string(e)
+      }
+    }
+  }
+  if !done {
+    return "incomplete"
+  }
+  // Remaining unread input (pipelining) = what's still queued + not yet fed.
+  "ok " +
+  body.length().to_string() +
+  " | " +
+  ntr.to_string() +
+  " | rem=" +
+  (dec.remaining_bytes() + (n - off)).to_string()
+}
+
+///| Feed SSE `wire` `step` bytes at a time (0 = whole). Returns events rendered as
+///| `type|id|data` joined by `;`, or "err ...".
+fn sse_run(wire : Bytes, step : Int) -> String {
+  let dec = http1::SseDecoder::new()
+  let sb = StringBuilder::new()
+  let n = wire.length()
+  let s = if step == 0 { n } else { step }
+  let mut off = 0
+  while off < n {
+    let end = if off + s > n { n } else { off + s }
+    match dec.feed(wire.slice(off, end)) {
+      Ok(evs) => {
+        let mut i = 0
+        while i < evs.length() {
+          let e = evs[i]
+          sb.write_string(e.event_type)
+          sb.write_string("|")
+          sb.write_string(e.last_event_id)
+          sb.write_string("|")
+          sb.write_string(e.data)
+          sb.write_string(";")
+          i = i + 1
+        }
+      }
+      Err(e) => return "err " + http1::http_error_string(e)
+    }
+    off = end
+  }
+  sb.to_string()
+}
+
+///|
+fn bytes_hex(b : Bytes) -> String {
+  let digits = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    let v = b[i].to_int()
+    sb.write_string(digits.slice(v / 16, v / 16 + 1))
+    sb.write_string(digits.slice(v % 16, v % 16 + 1))
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+// ===========================================================================
+// 1. RFC 9112 request parsing & smuggling
+// ===========================================================================
+
+// P1 — RFC 9112 §3.2: "A server MUST respond with a 400 (Bad Request) status code to
+// any HTTP/1.1 request message that lacks a Host header field and to any request
+// message that contains more than one Host header field line or a Host header field
+// with an invalid field value." Go net/http: `missing required Host header` /
+// `too many Host headers`. Pion: Complete(ok). The Sans-IO API gives the caller no
+// error to map to 400, and `Request::header("host")` silently returns the FIRST of
+// two Host lines while a downstream proxy may route on the last (host-confusion /
+// cache-poisoning primitive).
+
+///|
+test "p1_rfc9112_3_2_http11_request_without_host_rejected" {
+  let v = req_verdict("GET / HTTP/1.1\r\nAccept: */*\r\n\r\n".to_bytes())
+  debug_assert(
+    is_err(v),
+    "HTTP/1.1 request with no Host must be rejected (Go: missing required Host header); got: " +
+    v,
+  )
+}
+
+///|
+test "p1_rfc9112_3_2_duplicate_host_rejected" {
+  let v = req_verdict(
+    "GET / HTTP/1.1\r\nHost: public.example\r\nHost: internal.admin\r\n\r\n".to_bytes(),
+  )
+  debug_assert(
+    is_err(v),
+    "two Host lines must be rejected (Go: too many Host headers); got: " + v,
+  )
+}
+
+///|
+test "p1_rfc9112_3_2_duplicate_host_case_variant_rejected" {
+  let v = req_verdict(
+    "GET / HTTP/1.1\r\nHost: a.example\r\nhOsT: b.example\r\n\r\n".to_bytes(),
+  )
+  debug_assert(is_err(v), "Host + hOsT must be rejected; got: " + v)
+}
+
+///|
+test "p1_rfc9112_3_2_invalid_host_value_rejected" {
+  // RFC 9112 §3.2 / RFC 3986 authority: a Host value containing SP, '/', '@'-userinfo
+  // smuggling or a second authority is invalid. Go: `malformed Host header`.
+  let cases = [
+    "GET / HTTP/1.1\r\nHost: a.example b.example\r\n\r\n", "GET / HTTP/1.1\r\nHost: a.example/evil\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a.example\"\r\n\r\n",
+  ]
+  let mut i = 0
+  while i < cases.length() {
+    let v = req_verdict(cases[i].to_bytes())
+    debug_assert(
+      is_err(v),
+      "invalid Host value case #" + i.to_string() + " must be rejected; got: " + v,
+    )
+    i = i + 1
+  }
+}
+
+// P2 — RFC 9110 §2.5 / RFC 9112 §2.3: "A recipient that receives a message with a
+// major version number that it implements and a minor version number higher than
+// what it implements SHOULD process the message as if it were in the highest minor
+// version within that major version". Go net/http accepts HTTP/1.2 as 1.1.
+
+///|
+test "p2_rfc9110_2_5_higher_minor_version_processed_as_1_1" {
+  let v = req_verdict("GET / HTTP/1.2\r\nHost: a\r\n\r\n".to_bytes())
+  debug_assert(
+    v == "ok none",
+    "HTTP/1.2 SHOULD be processed as HTTP/1.1 (Go: accepted); got: " + v,
+  )
+}
+
+// P2 — RFC 9112 §2.2: "a server that is expecting to receive and parse a request-line
+// SHOULD ignore at least one empty line (CRLF) received prior to the request-line."
+// httparse skips leading empty lines; Pion returns InvalidMethod, so a client that
+// sends a stray CRLF after a POST body (common, RFC 9112 §2.2 calls it out) gets its
+// next keep-alive request rejected.
+
+///|
+test "p2_rfc9112_2_2_leading_crlf_before_request_line_ignored" {
+  let v = req_verdict("\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n".to_bytes())
+  debug_assert(
+    !is_err(v),
+    "leading CRLF before request-line SHOULD be ignored (httparse: ok); got: " +
+    v,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// controls: smuggling payloads that ARE correctly handled
+// ---------------------------------------------------------------------------
+
+///|
+test "control_te_cl_obfuscation_matrix" {
+  // (wire, expected verdict prefix)
+  let rej = [
+    // VT / FF "whitespace" smuggling (CL/TE)
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length:%0B5\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5%0C\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding:%0Bchunked\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked%0B\r\n\r\n",
+    // non-ASCII digits / obs-text in CL
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: %EF%BC%95\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5%A0\r\n\r\n",
+    // space before colon, NUL, bare CR, bare LF, obs-fold
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding : chunked\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked%00\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nX: a\rTransfer-Encoding: chunked\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nX: a\nTransfer-Encoding: chunked\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nX: a\r\n Transfer-Encoding: chunked\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding:\r\n chunked\r\n\r\n",
+    // CL + TE in either order / TE identity / TE chunked twice across lines
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nTrAnSfEr-EnCoDiNg: chunked\r\ncontent-length: 5\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: identity\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n",
+    // CL: dup, list, sign, hex
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0x5\r\n\r\n",
+    // request-line abuse
+    "GET  / HTTP/1.1\r\nHost: a\r\n\r\n", "GET /a b HTTP/1.1\r\nHost: a\r\n\r\n", "GET /%01 HTTP/1.1\r\nHost: a\r\n\r\n",
+    " / HTTP/1.1\r\nHost: a\r\n\r\n", "GET / HTTP/0.9\r\nHost: a\r\n\r\n", "GET / HTTP/2.0\r\nHost: a\r\n\r\n",
+    "GET / http/1.1\r\nHost: a\r\n\r\n", "GET / HTTP/1.1 \r\nHost: a\r\n\r\n", "GET\t/ HTTP/1.1\r\nHost: a\r\n\r\n",
+    "G(T / HTTP/1.1\r\nHost: a\r\n\r\n", "GET / HTTP/1.1\nHost: a\r\n\r\n",
+  ]
+  let mut i = 0
+  while i < rej.length() {
+    let v = req_verdict(hb(rej[i]))
+    debug_assert(is_err(v), "reject case #" + i.to_string() + " got: " + v)
+    i = i + 1
+  }
+  let ok = [
+    ("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: %09chunked%09\r\n\r\n", "ok chunked"),
+    ("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n", "ok chunked"),
+    ("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: CHUNKED\r\n\r\n", "ok chunked"),
+    ("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 007\r\n\r\n", "ok cl=7"),
+    ("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5 \r\n\r\n", "ok cl=5"),
+    ("POST / HTTP/1.1\r\nHost: a\r\nTransfer_Encoding: chunked\r\n\r\n", "ok none"),
+  ]
+  let mut k = 0
+  while k < ok.length() {
+    let (w, want) = ok[k]
+    let v = req_verdict(hb(w))
+    debug_assert(v == want, "accept case #" + k.to_string() + " want " + want + " got: " + v)
+    k = k + 1
+  }
+}
+
+///|
+test "control_header_block_limits_enforced_on_partial_input" {
+  // 70 KiB header value with no CRLF yet -> must not wait forever (OOM)
+  let big = "GET / HTTP/1.1\r\nHost: a\r\nX: " + repeat("a", 70000)
+  debug_assert(is_err(req_verdict(big.to_bytes())), "partial huge header value")
+  let bigm = repeat("G", 70000)
+  debug_assert(is_err(req_verdict(bigm.to_bytes())), "partial huge method")
+  let bigu = "GET /" + repeat("a", 9000)
+  debug_assert(is_err(req_verdict(bigu.to_bytes())), "partial huge URI")
+  let many = "GET / HTTP/1.1\r\n" + repeat("X: y\r\n", 101) + "\r\n"
+  debug_assert(is_err(req_verdict(many.to_bytes())), "101 headers")
+}
+
+///|
+test "control_every_prefix_of_valid_request_is_partial" {
+  let w = "POST /p?q=1 HTTP/1.1\r\nHost: a.example\r\nTransfer-Encoding: gzip, chunked\r\nX-E:\r\nX-T: a\tb \r\n\r\n".to_bytes()
+  let mut i = 0
+  while i < w.length() {
+    let v = req_verdict(w.slice(0, i))
+    debug_assert(v == "partial", "prefix " + i.to_string() + " got: " + v)
+    i = i + 1
+  }
+  debug_assert(req_verdict(w) == "ok chunked", "full")
+  let r = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n".to_bytes()
+  let mut j = 0
+  while j < r.length() {
+    let v = resp_verdict(r.slice(0, j))
+    debug_assert(v == "partial", "resp prefix " + j.to_string() + " got: " + v)
+    j = j + 1
+  }
+}
+
+// ===========================================================================
+// 2. Response framing (RFC 9112 §6.3)
+// ===========================================================================
+
+// P1 — RFC 9112 §6.3 rule 1: "Any response to a HEAD request and any response with a
+// 1xx (Informational), 204 (No Content), or 304 (Not Modified) status code is always
+// terminated by the first empty line after the header fields, regardless of the
+// header fields present in the message, and thus cannot contain a message body".
+// Go net/http (`bodyAllowedForStatus`) gives these an empty body. Pion reports
+// `Framing::ContentLength(n)` / `Framing::Chunked`, so a client following the
+// returned framing swallows n bytes of the NEXT pipelined response (response
+// desync / response splitting on keep-alive connections).
+
+///|
+test "p1_rfc9112_6_3_204_with_content_length_has_no_body" {
+  let f = resp_has_body_framing(
+    "HTTP/1.1 204 No Content\r\nContent-Length: 38\r\n\r\n".to_bytes(),
+  )
+  debug_assert(
+    f == "none" || f == "cl=0",
+    "204 must not carry a body (Go: ContentLength 0); got framing: " + f,
+  )
+}
+
+///|
+test "p1_rfc9112_6_3_304_with_content_length_has_no_body" {
+  let f = resp_has_body_framing(
+    "HTTP/1.1 304 Not Modified\r\nContent-Length: 1024\r\n\r\n".to_bytes(),
+  )
+  debug_assert(
+    f == "none" || f == "cl=0",
+    "304 must not carry a body; got framing: " + f,
+  )
+}
+
+///|
+test "p1_rfc9112_6_3_1xx_with_transfer_encoding_has_no_body" {
+  let f = resp_has_body_framing(
+    "HTTP/1.1 100 Continue\r\nTransfer-Encoding: chunked\r\n\r\n".to_bytes(),
+  )
+  debug_assert(
+    f == "none" || f == "cl=0",
+    "1xx must not carry a body; got framing: " + f,
+  )
+  let g = resp_has_body_framing(
+    "HTTP/1.1 101 Switching Protocols\r\nContent-Length: 10\r\n\r\n".to_bytes(),
+  )
+  debug_assert(
+    g == "none" || g == "cl=0",
+    "101 must not carry a body; got framing: " + g,
+  )
+}
+
+///|
+test "p1_rfc9112_6_3_204_with_chunked_has_no_body" {
+  let f = resp_has_body_framing(
+    "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n".to_bytes(),
+  )
+  debug_assert(
+    f == "none" || f == "cl=0",
+    "204 + chunked must not carry a body; got framing: " + f,
+  )
+}
+
+// P2 — RFC 9112 §6.1: "A server or client that receives an HTTP/1.0 message containing
+// a Transfer-Encoding header field MUST treat the message as if the framing is faulty,
+// even if a Content-Length is present, and close the connection after processing the
+// message." Pion rejects such requests, but for an HTTP/1.0 *response* it returns
+// `Framing::Chunked`, so the client keeps the connection and reuses whatever the
+// sender left in the buffer. Go net/http ignores TE on HTTP/1.0 and reads to close.
+
+///|
+test "p2_rfc9112_6_1_http10_response_with_te_is_faulty_framing" {
+  let v = resp_verdict(
+    "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_bytes(),
+  )
+  debug_assert(
+    is_err(v) || v == "ok none",
+    "HTTP/1.0 response with TE must be error or read-to-close (Go: none); got: " +
+    v,
+  )
+}
+
+///|
+test "control_response_framing_basics" {
+  debug_assert(
+    resp_verdict(
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n".to_bytes(),
+    ) ==
+    "ok none",
+    "TE non-chunked final -> read to close",
+  )
+  debug_assert(
+    resp_verdict("HTTP/1.1 200\r\n\r\n".to_bytes()) == "ok none",
+    "missing reason phrase (no SP) tolerated like httparse/Go",
+  )
+  debug_assert(
+    resp_verdict("HTTP/1.1 200 \r\n\r\n".to_bytes()) == "ok none",
+    "empty reason phrase",
+  )
+  debug_assert(
+    is_err(
+      resp_verdict(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n".to_bytes(),
+      ),
+    ),
+    "CL+TE response",
+  )
+  debug_assert(
+    is_err(resp_verdict("HTTP/1.1 2000 OK\r\n\r\n".to_bytes())),
+    "4-digit status",
+  )
+  debug_assert(
+    is_err(resp_verdict("HTTP/1.1 20 OK\r\n\r\n".to_bytes())),
+    "2-digit status",
+  )
+  debug_assert(
+    is_err(resp_verdict(hb("HTTP/1.1 200 O%00K\r\n\r\n"))),
+    "NUL in reason",
+  )
+}
+
+// ===========================================================================
+// 3. Encoder (request/response/trailer generation)
+// ===========================================================================
+
+// P1 — The encoder happily serialises a request carrying BOTH `Content-Length` and
+// `Transfer-Encoding: chunked` (and two different Content-Lengths). This is the
+// textbook CL.TE / TE.CL smuggling payload; RFC 9112 §6.2: "A sender MUST NOT send a
+// Content-Length header field in any message that contains a Transfer-Encoding
+// header field." Pion's own parser rejects the bytes its encoder produces. Go
+// `Request.Write` never emits user-supplied CL/TE (they are excluded and derived from
+// the body), so this cannot be produced with net/http.
+
+///|
+test "p1_encoder_rejects_content_length_plus_transfer_encoding" {
+  let hs = [
+    http1::Header::new("Host", "victim"),
+    http1::Header::new("Content-Length", "4"),
+    http1::Header::new("Transfer-Encoding", "chunked"),
+  ]
+  match http1::encode_request("POST", "/", http1::Version::Http11, hs) {
+    Ok(b) => {
+      let back = req_verdict(b)
+      debug_assert(
+        false,
+        "encoder emitted CL+TE smuggling message; its own parser says: " + back,
+      )
+    }
+    Err(_) => ()
+  }
+  match
+  http1::encode_response(http1::Version::Http11, 200, "OK", [
+    http1::Header::new("Transfer-Encoding", "chunked"),
+    http1::Header::new("Content-Length", "4"),
+  ]) {
+    Ok(_) => debug_assert(false, "encode_response emitted CL+TE")
+    Err(_) => ()
+  }
+}
+
+///|
+test "p1_encoder_rejects_conflicting_or_invalid_content_length" {
+  let cases : Array[Array[http1::Header]] = [
+    [
+      http1::Header::new("Host", "a"),
+      http1::Header::new("Content-Length", "4"),
+      http1::Header::new("Content-Length", "40"),
+    ],
+    [http1::Header::new("Host", "a"), http1::Header::new("Content-Length", "-1")],
+    [
+      http1::Header::new("Host", "a"),
+      http1::Header::new("Transfer-Encoding", "chunked, gzip"),
+    ],
+  ]
+  let mut i = 0
+  while i < cases.length() {
+    match http1::encode_request("POST", "/", http1::Version::Http11, cases[i]) {
+      Ok(b) =>
+      debug_assert(
+        false,
+        "encoder case #" +
+        i.to_string() +
+        " emitted a message its own parser rejects: " +
+        req_verdict(b),
+      )
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+}
+
+// P2 — RFC 9110 §6.5.1: "Many fields cannot be processed outside the header section
+// because their evaluation is necessary prior to receiving the content, such as those
+// that describe message framing, routing, authentication, request modifiers, response
+// controls, or content format. A sender MUST NOT generate a trailer field unless the
+// sender knows the corresponding header field name's definition permits the field to
+// be sent in trailers." Go `net/http` refuses these trailer keys (`badTrailer`:
+// Content-Length, Transfer-Encoding, Host, Trailer, ...). Pion emits them.
+
+///|
+test "p2_encode_final_chunk_rejects_framing_and_routing_trailers" {
+  let names = ["Content-Length", "Transfer-Encoding", "Host", "Trailer"]
+  let mut i = 0
+  while i < names.length() {
+    match http1::encode_final_chunk([http1::Header::new(names[i], "1")]) {
+      Ok(_) =>
+      debug_assert(false, "trailer " + names[i] + " must not be generated")
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+}
+
+// P2 — RFC 9110 §5.5: field values never include leading or trailing whitespace
+// (`field-value = *field-content`, `field-content = field-vchar [...]`). Pion emits
+// `X:  v ` verbatim; a parser strips it, so the encoder output and parsed value
+// disagree (signature / canonicalisation mismatch). Go `Header.Write` trims.
+
+///|
+test "p2_encoder_rejects_or_trims_leading_trailing_whitespace_in_values" {
+  match
+  http1::encode_request("GET", "/", http1::Version::Http11, [
+    http1::Header::new("Host", "a"),
+    http1::Header::new("X-Sig", " v "),
+  ]) {
+    Ok(b) => {
+      let s = b.to_string()
+      debug_assert(
+        s == "GET / HTTP/1.1\r\nHost: a\r\nX-Sig: v\r\n\r\n",
+        "encoded value must not carry leading/trailing SP; got bytes: " +
+        bytes_hex(b),
+      )
+    }
+    Err(_) => ()
+  }
+}
+
+// P2 — RFC 9112 §6.1: "A client MUST NOT send a request containing Transfer-Encoding
+// unless it knows the server will handle HTTP/1.1 requests". Pion's parser rejects
+// HTTP/1.0 + TE requests, yet its encoder produces them.
+
+///|
+test "p2_encoder_rejects_transfer_encoding_on_http10_request" {
+  match
+  http1::encode_request("POST", "/", http1::Version::Http10, [
+    http1::Header::new("Host", "a"),
+    http1::Header::new("Transfer-Encoding", "chunked"),
+  ]) {
+    Ok(b) =>
+    debug_assert(
+      false,
+      "HTTP/1.0 + TE encoded; own parser says: " + req_verdict(b),
+    )
+    Err(_) => ()
+  }
+}
+
+///|
+test "control_encoder_injection_defenses" {
+  let bad_names = ["X:Y", "X Y", "X(Y)", "", "X\r\nY", "X\u{7f}"]
+  let mut i = 0
+  while i < bad_names.length() {
+    match
+    http1::encode_request("GET", "/", http1::Version::Http11, [
+      http1::Header::new(bad_names[i], "v"),
+    ]) {
+      Ok(_) => debug_assert(false, "bad header name #" + i.to_string())
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  let bad_vals = ["a\r\nHost: evil", "a\nb", "a\rb", "a\u{00}b", "a\u{01}b", "a\u{1f}b", "a\u{7f}b", "a\u{0b}b"]
+  let mut j = 0
+  while j < bad_vals.length() {
+    match
+    http1::encode_request("GET", "/", http1::Version::Http11, [
+      http1::Header::new("X", bad_vals[j]),
+    ]) {
+      Ok(_) => debug_assert(false, "bad header value #" + j.to_string())
+      Err(_) => ()
+    }
+    match http1::encode_final_chunk([http1::Header::new("X", bad_vals[j])]) {
+      Ok(_) => debug_assert(false, "bad trailer value #" + j.to_string())
+      Err(_) => ()
+    }
+    j = j + 1
+  }
+  match http1::encode_request("GET", "/a b", http1::Version::Http11, []) {
+    Ok(_) => debug_assert(false, "SP in path")
+    Err(_) => ()
+  }
+  match http1::encode_request("GET", "/a\r\nX: y", http1::Version::Http11, []) {
+    Ok(_) => debug_assert(false, "CRLF in path")
+    Err(_) => ()
+  }
+  match http1::encode_request("G T", "/", http1::Version::Http11, []) {
+    Ok(_) => debug_assert(false, "SP in method")
+    Err(_) => ()
+  }
+  match http1::encode_response(http1::Version::Http11, 200, "OK\r\nX: y", []) {
+    Ok(_) => debug_assert(false, "CRLF in reason")
+    Err(_) => ()
+  }
+  match http1::encode_response(http1::Version::Http11, 99, "X", []) {
+    Ok(_) => debug_assert(false, "status 99")
+    Err(_) => ()
+  }
+}
+
+// ===========================================================================
+// 4. ChunkedDecoder
+// ===========================================================================
+
+// P2 — Whole-buffer vs fragmented feeding disagree. The fast path
+// (`parse_chunk_size_with_limits` on the current slice) accepts an unbounded run of
+// leading zero digits, while the slow path (`read_crlf_line`, bounded by
+// `max_chunk_ext_bytes + 64`) rejects the very same bytes once they arrive in two TCP
+// segments. A front-end and back-end both running Pion therefore disagree on message
+// boundaries depending only on segmentation — the precondition for request
+// smuggling. Go (`parseHexUint`: >16 digits -> "http chunk length too large") and
+// httparse (`InvalidChunkSize` after 16 digits) reject deterministically.
+
+///|
+test "p2_chunk_size_leading_zero_flood_segmentation_independent" {
+  let wire = (repeat("0", 5000) + "5\r\nhello\r\n0\r\n\r\n").to_bytes()
+  let lim = http1::Limits::default()
+  let whole = chunked_run(wire, 0, lim)
+  let split = chunked_run(wire, 4096, lim)
+  debug_assert(
+    whole == split,
+    "verdict depends on segmentation: whole=" + whole + " split@4096=" + split,
+  )
+}
+
+///|
+test "p2_chunk_size_more_than_16_hex_digits_rejected_like_go_and_httparse" {
+  let wire = "00000000000000000005\r\nhello\r\n0\r\n\r\n".to_bytes()
+  let v = chunked_run(wire, 0, http1::Limits::default())
+  debug_assert(
+    v.length() >= 4 && v.slice(0, 4) == "err ",
+    "20-digit chunk-size must be rejected (Go/httparse reject >16 digits); got: " +
+    v,
+  )
+}
+
+// P2 — `max_chunk_size` defaults to 64 MiB and is enforced even though ChunkedDecoder
+// streams `Data` slices and never buffers a whole chunk. A legitimate single 80 MiB
+// chunk (common for file downloads/proxies) is rejected while Go and httparse decode
+// it. The limit buys no memory safety and breaks interoperability.
+
+///|
+test "p2_large_single_chunk_streamed_not_rejected" {
+  let wire = "5000000\r\n".to_bytes()
+  let dec = http1::ChunkedDecoder::new()
+  dec.feed(wire)
+  dec.feed(Bytes::new(4096))
+  match dec.next() {
+    Ok(http1::ChunkStep::Data(d)) =>
+    debug_assert(d.length() == 4096, "streamed first 4 KiB of 80 MiB chunk")
+    Ok(_) => debug_assert(false, "expected data")
+    Err(e) =>
+    debug_assert(
+      false,
+      "80 MiB chunk rejected up front (Go/httparse stream it): " +
+      http1::http_error_string(e),
+    )
+  }
+}
+
+///|
+test "control_chunked_overflow_and_syntax_matrix" {
+  let lim = http1::Limits::default()
+  let rej = [
+    "FFFFFFFFFFFFFFFF\r\n", "10000000000000000\r\n", "7FFFFFFFFFFFFFFF\r\n", "-5\r\nhello\r\n0\r\n\r\n",
+    "+5\r\nhello\r\n0\r\n\r\n", "0x5\r\nhello\r\n0\r\n\r\n", " 5\r\nhello\r\n0\r\n\r\n", "5\nhello\r\n0\r\n\r\n",
+    "5\r\nhello\n0\r\n\r\n", "5\r\nhelloXY0\r\n\r\n", "5;a=\"unterminated\r\nhello\r\n0\r\n\r\n",
+    "5;a=\"x\ry\"\r\nhello\r\n0\r\n\r\n", "5;\r\nhello\r\n0\r\n\r\n", "5;=v\r\nhello\r\n0\r\n\r\n",
+    "5\r\nhello\r\n0\r\nX: a\r\n b\r\n\r\n", "5\r\nhello\r\n0\r\nX: a\n\r\n", "5\r\nhello\r\n0\r\nX : a\r\n\r\n",
+    "5\r\nhello\r\n0\r\nX: a%00\r\n\r\n", "5\r\nhello\r\n0\r\n\n",
+  ]
+  let mut i = 0
+  while i < rej.length() {
+    let w = hb(rej[i])
+    let a = chunked_run(w, 0, lim)
+    let b = chunked_run(w, 1, lim)
+    debug_assert(
+      a.slice(0, 4) == "err " && b.slice(0, 4) == "err ",
+      "reject #" + i.to_string() + " whole=" + a + " drip=" + b,
+    )
+    i = i + 1
+  }
+  let longext = "5;" + "a=" + repeat("b", 5000) + "\r\nhello\r\n0\r\n\r\n"
+  debug_assert(
+    chunked_run(longext.to_bytes(), 0, lim).slice(0, 4) == "err ",
+    "huge ext whole",
+  )
+  debug_assert(
+    chunked_run(longext.to_bytes(), 7, lim).slice(0, 4) == "err ",
+    "huge ext split",
+  )
+}
+
+///|
+test "control_chunked_drip_and_random_split_equivalence" {
+  let lim = http1::Limits::default()
+  let wire = "4;ext=\"q\\\"x\"\r\nWiki\r\n5 ; a = b\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nX-T: 1\r\nX-U: two\r\n\r\nGET /next HTTP/1.1\r\n\r\n".to_bytes()
+  let ref_ = chunked_run(wire, 0, lim)
+  debug_assert(ref_ == "ok 23 | 2 | rem=22", "reference: " + ref_)
+  let mut s = 1
+  while s <= 7 {
+    let v = chunked_run(wire, s, lim)
+    debug_assert(v == ref_, "split " + s.to_string() + ": " + v)
+    s = s + 1
+  }
+}
+
+///|
+test "control_chunked_100k_tiny_chunks_streaming_is_linear" {
+  // 100k "1\r\nx\r\n" chunks, fed as 100k separate feeds BEFORE draining (queue
+  // growth), then drained. Must decode all bytes without error.
+  let dec = http1::ChunkedDecoder::new()
+  let piece = "1\r\nx\r\n".to_bytes()
+  let mut i = 0
+  while i < 100000 {
+    dec.feed(piece)
+    i = i + 1
+  }
+  dec.feed("0\r\n\r\n".to_bytes())
+  let mut total = 0
+  let mut done = false
+  while !done {
+    match dec.next() {
+      Ok(http1::ChunkStep::Data(d)) => total = total + d.length()
+      Ok(http1::ChunkStep::Done(_)) => done = true
+      Ok(http1::ChunkStep::NeedMore) => {
+        debug_assert(false, "need more")
+        done = true
+      }
+      Err(_) => {
+        debug_assert(false, "error")
+        done = true
+      }
+    }
+  }
+  debug_assert(total == 100000, "total " + total.to_string())
+  debug_assert(dec.remaining_bytes() == 0, "remaining")
+}
+
+// ===========================================================================
+// 5. WHATWG SSE
+// ===========================================================================
+
+// P2 — WHATWG HTML §9.2.6: "Streams must be decoded using the UTF-8 decode algorithm",
+// which replaces every invalid sequence with U+FFFD. Pion copies raw bytes into the
+// `String` fields, so `SseEvent.data` / `event_type` / `last_event_id` can hold
+// invalid UTF-8 (e.g. a lone 0xFF or a truncated 4-byte sequence at end of line).
+// Browsers' EventSource yields "\u{FFFD}".
+
+///|
+test "p2_whatwg_sse_invalid_utf8_replaced_with_u_fffd" {
+  let v = sse_run(hb("data: a%FFb\n\n"), 0)
+  debug_assert(
+    v == "message||a\u{FFFD}b;",
+    "invalid UTF-8 must decode to U+FFFD; got hex: " + bytes_hex(v.to_bytes()),
+  )
+  let w = sse_run(hb("data: %F0%9F%8E\n\n"), 0)
+  debug_assert(
+    w == "message||\u{FFFD};",
+    "truncated 4-byte sequence must decode to one U+FFFD; got hex: " +
+    bytes_hex(w.to_bytes()),
+  )
+  let x = sse_run(hb("event: %C0%AF\ndata: x\n\n"), 0)
+  debug_assert(
+    x == "\u{FFFD}\u{FFFD}||x;",
+    "overlong in event type must decode to U+FFFD U+FFFD; got hex: " +
+    bytes_hex(x.to_bytes()),
+  )
+}
+
+// P2 — WHATWG §9.2.6 "dispatch the event" step 1: "Set the last event ID string of the
+// event source to the value of the last event ID buffer." The `id:` field only sets
+// the *buffer*; the source's last event ID (what a reconnect sends as
+// `Last-Event-ID`) changes only when a blank line is processed. Pion's
+// `last_event_id()` exposes the buffer immediately, so a connection dropped between
+// `id: 7` and the blank line resumes AFTER event 7 that was never dispatched
+// (message loss on reconnect).
+
+///|
+test "p2_whatwg_sse_last_event_id_only_committed_on_dispatch" {
+  let dec = http1::SseDecoder::new()
+  let _ = dec.feed("id: 1\ndata: a\n\nid: 2\ndata: b\n".to_bytes())
+  // connection drops here; event 2 was never dispatched
+  let _ = dec.finish()
+  debug_assert(
+    dec.last_event_id() == "1",
+    "Last-Event-ID for reconnect must be 1 (last dispatched); got: " +
+    dec.last_event_id(),
+  )
+}
+
+///|
+test "control_whatwg_sse_field_semantics" {
+  let cases = [
+    ("data:  two spaces\n\n", "message|| two spaces;"),
+    ("data\n\n", "message||;"),
+    ("data:\ndata:\n\n", "message||\n;"),
+    ("event: ping\n\ndata: x\n\n", "message||x;"),
+    ("event: e\nid: 9\nretry: 5\n\n", ""),
+    ("id: 3\n\ndata: x\n\n", "message|3|x;"),
+    ("id: 3\nid\ndata: x\n\n", "message||x;"),
+    ("id: 3\nid: a%00b\ndata: x\n\n", "message|3|x;"),
+    (": comment\ndata: x\n\n", "message||x;"),
+    ("Data: x\n\n", ""),
+    ("data: x\r\rdata: y\r\n\r\n", "message||x;message||y;"),
+    ("%EF%BB%BFdata: bom\n\n", "message||bom;"),
+    ("%EF%BB%BF%EF%BB%BFdata: x\n\n", ""),
+    ("data: 你好🎉\n\n", "message||你好🎉;"),
+    ("data: x\n", ""),
+  ]
+  let mut i = 0
+  while i < cases.length() {
+    let (w, want) = cases[i]
+    let bw = hb(w)
+    let a = sse_run(bw, 0)
+    debug_assert(a == want, "case #" + i.to_string() + " whole: want " + want + " got " + a)
+    let mut s = 1
+    while s <= 7 {
+      let b = sse_run(bw, s)
+      debug_assert(b == want, "case #" + i.to_string() + " split " + s.to_string() + ": " + b)
+      s = s + 1
+    }
+    i = i + 1
+  }
+}
+
+///|
+test "control_whatwg_sse_retry_parsing" {
+  let cases = [
+    ("retry: 0\n", Some(0L)),
+    ("retry: 010\n", Some(10L)),
+    ("retry: +10\n", None),
+    ("retry: 10 \n", None),
+    ("retry: -1\n", None),
+    ("retry:\n", None),
+    ("retry: 1e3\n", None),
+  ]
+  let mut i = 0
+  while i < cases.length() {
+    let (w, want) = cases[i]
+    let d = http1::SseDecoder::new()
+    let _ = d.feed(w.to_bytes())
+    let got = d.retry()
+    let ok = match (got, want) {
+      (None, None) => true
+      (Some(a), Some(b)) => a == b
+      _ => false
+    }
+    debug_assert(ok, "retry case #" + i.to_string())
+    i = i + 1
+  }
+  // retry persists across an event that has no data
+  let d2 = http1::SseDecoder::new()
+  let _ = d2.feed("retry: 42\n\n".to_bytes())
+  match d2.retry() {
+    Some(v) => debug_assert(v == 42L, "retry side effect kept")
+    None => debug_assert(false, "retry side effect dropped")
+  }
+  // overflow is ignored, previous value kept
+  let d3 = http1::SseDecoder::new()
+  let _ = d3.feed("retry: 7\nretry: 99999999999999999999\n".to_bytes())
+  match d3.retry() {
+    Some(v) => debug_assert(v == 7L, "overflow kept previous")
+    None => debug_assert(false, "overflow cleared retry")
+  }
+}
+
+///|
+test "control_whatwg_sse_cross_chunk_bom_and_crlf" {
+  let d = http1::SseDecoder::new()
+  let mut out = 0
+  let parts = [hb("%EF"), hb("%BB"), hb("%BF"), "data: a\r".to_bytes(), "\n".to_bytes(), "\r".to_bytes(), "\n".to_bytes()]
+  let mut i = 0
+  let sb = StringBuilder::new()
+  while i < parts.length() {
+    match d.feed(parts[i]) {
+      Ok(evs) => {
+        out = out + evs.length()
+        let mut k = 0
+        while k < evs.length() {
+          sb.write_string(evs[k].data)
+          k = k + 1
+        }
+      }
+      Err(_) => debug_assert(false, "err")
+    }
+    i = i + 1
+  }
+  debug_assert(out == 1 && sb.to_string() == "a", "one event 'a', got " + out.to_string() + " " + sb.to_string())
+}
+
+///|
+test "control_whatwg_sse_100k_line_event_linear" {
+  // 100k "data: x" lines in one event (~800 KB < 1 MiB limit), fed in 4 KiB pieces.
+  let w = (repeat("data: x\n", 100000) + "\n").to_bytes()
+  let d = http1::SseDecoder::new()
+  let mut n = 0
+  let mut len = 0
+  let mut off = 0
+  while off < w.length() {
+    let e = if off + 4096 > w.length() { w.length() } else { off + 4096 }
+    match d.feed(w.slice(off, e)) {
+      Ok(evs) => {
+        n = n + evs.length()
+        if evs.length() > 0 {
+          len = evs[0].data.length()
+        }
+      }
+      Err(_) => debug_assert(false, "err")
+    }
+    off = e
+  }
+  debug_assert(n == 1 && len == 199999, "n=" + n.to_string() + " len=" + len.to_string())
+}
