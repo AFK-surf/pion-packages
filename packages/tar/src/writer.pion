@@ -1,44 +1,659 @@
-///| Streaming TAR Writer and `write_all` convenience function.
-///| Red-phase stub implementation.
+///| Streaming TAR Writer (USTAR / PAX / GNU) with single-allocation `finish()`,
+///| zero-copy payload staging, and deterministic PAX key ordering.
 
 ///| Streaming TAR archive writer.
 pub struct Writer {
+  chunks : Array[(Int, Bytes)] // (byte offset in final output, chunk bytes)
+  mut total_bytes : Int64
+  mut remaining : Int64
+  mut pad : Int64
   mut closed : Bool
 }
 
 ///| Create a new `Writer`.
 pub fn Writer::new() -> Writer {
-  Writer::{ closed: false }
+  Writer::with_capacity(64)
 }
 
-///| Create a new `Writer` with an initial capacity hint in bytes.
+///| Create a new `Writer` with an initial chunk-list capacity hint.
 pub fn Writer::with_capacity(cap : Int) -> Writer {
-  let _ = cap
-  Writer::{ closed: false }
+  let c = if cap > 0 { cap } else { 16 }
+  Writer::{
+    chunks: Array::with_capacity(c),
+    total_bytes: 0L,
+    remaining: 0L,
+    pad: 0L,
+    closed: false,
+  }
+}
+
+///| Append a non-zero byte chunk at the current output offset.
+fn writer_push_chunk(self : Writer, b : Bytes) -> Unit {
+  let n = b.length()
+  if n > 0 {
+    self.chunks.push((self.total_bytes.to_int(), b))
+    self.total_bytes = self.total_bytes + n.to_int64()
+  }
+}
+
+///| Advance output offset by `n` zero bytes (no allocation/copy needed since `Bytes::new` is zeroed!).
+fn writer_push_zeros(self : Writer, n : Int64) -> Unit {
+  if n > 0L {
+    self.total_bytes = self.total_bytes + n
+  }
+}
+
+///| Flush pending block padding for the previous entry.
+fn writer_flush_pad(self : Writer) -> Result[Unit, TarError] {
+  if self.remaining > 0L {
+    return Err(TarError::IncompleteWrite(self.remaining))
+  }
+  if self.pad > 0L {
+    writer_push_zeros(self, self.pad)
+    self.pad = 0L
+  }
+  Ok(())
+}
+
+///| Returns true if `k` is one of the built-in PAX keys derived from `Header` fields.
+fn is_basic_pax_key(k : String) -> Bool {
+  k == "path" ||
+  k == "linkpath" ||
+  k == "size" ||
+  k == "uid" ||
+  k == "gid" ||
+  k == "uname" ||
+  k == "gname" ||
+  k == "mtime" ||
+  k == "atime" ||
+  k == "ctime"
+}
+
+///| Sort `(key, value)` pairs lexicographically by key (insertion sort; PAX headers have few keys).
+fn sort_kv_pairs(pairs : Array[(String, String)]) -> Unit {
+  let n = pairs.length()
+  let mut i = 1
+  while i < n {
+    let cur = pairs[i]
+    let (ck, _) = cur
+    let mut j = i - 1
+    while j >= 0 {
+      let (jk, _) = pairs[j]
+      if jk > ck {
+        pairs[j + 1] = pairs[j]
+        j = j - 1
+      } else {
+        break
+      }
+    }
+    pairs[j + 1] = cur
+    i = i + 1
+  }
+}
+
+///| Build a PAX pseudo-header filename: `<dir>/PaxHeaders.0/<file>` (matching Go `path.Split`/`path.Join`).
+fn make_pax_header_name(real_name : String) -> String {
+  let b = real_name.to_bytes()
+  let n = b.length()
+  let mut slash = -1
+  let mut i = n - 1
+  while i >= 0 {
+    if b[i].to_int() == 47 {
+      slash = i
+      break
+    }
+    i = i - 1
+  }
+  let dir = if slash >= 0 { b.slice(0, slash).to_string() } else { "" }
+  let file = if slash >= 0 { b.slice(slash + 1, n).to_string() } else { real_name }
+  if dir.length() == 0 {
+    if file.length() == 0 {
+      "PaxHeaders.0"
+    } else {
+      "PaxHeaders.0/" + file
+    }
+  } else if file.length() == 0 {
+    dir + "/PaxHeaders.0"
+  } else {
+    dir + "/PaxHeaders.0/" + file
+  }
+}
+
+///| Stamp magic + version + checksum into a 512-byte header block.
+fn finalize_header_block(blk : Bytes, fmt : TarFormat) -> Unit {
+  match fmt {
+    Gnu => {
+      // "ustar " + " \0"
+      let _ = format_string_into(blk, 257, 6, "ustar ")
+      blk[263] = (32).to_byte()
+      blk[264] = (0).to_byte()
+    }
+    Ustar | Pax => {
+      // "ustar\0" + "00"
+      blk[257] = (117).to_byte()
+      blk[258] = (115).to_byte()
+      blk[259] = (116).to_byte()
+      blk[260] = (97).to_byte()
+      blk[261] = (114).to_byte()
+      blk[262] = (0).to_byte()
+      blk[263] = (48).to_byte()
+      blk[264] = (48).to_byte()
+    }
+    _ => ()
+  }
+  stamp_checksum(blk, 0)
+}
+
+///| Write a raw meta-file (PAX extended header or GNU LongName/LongLink) + padded body.
+fn write_raw_meta_file(
+  self : Writer,
+  raw_name : String,
+  body : Bytes,
+  flag : Byte,
+  fmt : TarFormat,
+) -> Result[Unit, TarError] {
+  let mut name = to_ascii(raw_name)
+  let nb = name.to_bytes()
+  if nb.length() > name_size {
+    name = nb.slice(0, name_size).to_string()
+  }
+  // Trim trailing slashes
+  let nb2 = name.to_bytes()
+  let mut end = nb2.length()
+  while end > 0 && nb2[end - 1].to_int() == 47 {
+    end = end - 1
+  }
+  name = nb2.slice(0, end).to_string()
+
+  let blk = Bytes::new(512)
+  blk[156] = flag
+  let _ = format_string_into(blk, 0, 100, name)
+  let _ = format_octal_into(blk, 100, 8, 0L)
+  let _ = format_octal_into(blk, 108, 8, 0L)
+  let _ = format_octal_into(blk, 116, 8, 0L)
+  if !format_octal_into(blk, 124, 12, body.length().to_int64()) {
+    return Err(TarError::FieldTooLong("meta file too large"))
+  }
+  let _ = format_octal_into(blk, 136, 12, 0L)
+  finalize_header_block(blk, fmt)
+
+  writer_push_chunk(self, blk)
+  writer_push_chunk(self, body)
+  writer_push_zeros(self, block_padding(body.length().to_int64()))
+  Ok(())
+}
+
+///| Populate common V7 + USTAR/PAX/GNU fields into a fresh 512-byte block.
+fn build_template_block(
+  hdr : Header,
+  typeflag : Byte,
+  name : String,
+  ascii_only : Bool,
+  allow_base256 : Bool,
+) -> Bytes {
+  let blk = Bytes::new(512)
+  let mtime_sec = if hdr.mod_time.is_zero() { 0L } else { hdr.mod_time.sec }
+  blk[156] = typeflag
+  let s_name = if ascii_only { to_ascii(name) } else { name }
+  let s_link = if ascii_only { to_ascii(hdr.linkname) } else { hdr.linkname }
+  let s_uname = if ascii_only { to_ascii(hdr.uname) } else { hdr.uname }
+  let s_gname = if ascii_only { to_ascii(hdr.gname) } else { hdr.gname }
+  let _ = format_string_into(blk, 0, 100, s_name)
+  let _ = format_string_into(blk, 157, 100, s_link)
+  let _ = format_string_into(blk, 265, 32, s_uname)
+  let _ = format_string_into(blk, 297, 32, s_gname)
+  if allow_base256 {
+    let _ = format_numeric_into(blk, 100, 8, hdr.mode)
+    let _ = format_numeric_into(blk, 108, 8, hdr.uid)
+    let _ = format_numeric_into(blk, 116, 8, hdr.gid)
+    let _ = format_numeric_into(blk, 124, 12, hdr.size)
+    let _ = format_numeric_into(blk, 136, 12, mtime_sec)
+    let _ = format_numeric_into(blk, 329, 8, hdr.devmajor)
+    let _ = format_numeric_into(blk, 337, 8, hdr.devminor)
+  } else {
+    let _ = format_octal_into(blk, 100, 8, hdr.mode)
+    let _ = format_octal_into(blk, 108, 8, hdr.uid)
+    let _ = format_octal_into(blk, 116, 8, hdr.gid)
+    let _ = format_octal_into(blk, 124, 12, hdr.size)
+    let _ = format_octal_into(blk, 136, 12, mtime_sec)
+    let _ = format_octal_into(blk, 329, 8, hdr.devmajor)
+    let _ = format_octal_into(blk, 337, 8, hdr.devminor)
+  }
+  blk
 }
 
 ///| Write a header and prepare to receive `hdr.size` bytes of payload data.
 pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarError] {
-  let _ = self
-  let _ = hdr
-  Err(TarError::InvalidHeader("unimplemented"))
+  if self.closed {
+    return Err(TarError::WriteAfterClose)
+  }
+  match writer_flush_pad(self) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  // Promote TypeRegA to TypeReg or TypeDir
+  let mut tf = hdr.typeflag
+  if tf == type_reg_a() {
+    if str_ends_with_slash(hdr.name) {
+      tf = type_dir()
+    } else {
+      tf = type_reg()
+    }
+  }
+
+  // Normalize timestamps when format is unspecified (matches Go Writer.WriteHeader)
+  let mod_time = if format_equals(hdr.format, TarFormat::Unknown) {
+    hdr.mod_time.round_sec()
+  } else {
+    hdr.mod_time
+  }
+  let access_time = if format_equals(hdr.format, TarFormat::Unknown) {
+    Timestamp::zero()
+  } else {
+    hdr.access_time
+  }
+  let change_time = if format_equals(hdr.format, TarFormat::Unknown) {
+    Timestamp::zero()
+  } else {
+    hdr.change_time
+  }
+
+  // Validate typeflag rules
+  if tf == type_reg() ||
+  tf == type_char() ||
+  tf == type_block() ||
+  tf == type_fifo() ||
+  tf == type_gnu_sparse() {
+    if str_ends_with_slash(hdr.name) {
+      return Err(TarError::InvalidHeader("filename may not have trailing slash"))
+    }
+  }
+  if tf == type_x_header() || tf == type_gnu_long_name() || tf == type_gnu_long_link() {
+    return Err(TarError::InvalidHeader("cannot manually encode meta header type"))
+  }
+  if !is_header_only_type(tf) && hdr.size < 0L {
+    return Err(TarError::InvalidHeader("negative file size"))
+  }
+
+  // Determine allowed formats (bitmask: 1=USTAR, 2=PAX, 4=GNU)
+  let mut allowed = 7
+  let mut prefer_pax = false
+  let pax_hdrs : Array[(String, String)] = []
+
+  // Helper checks for string fields
+  let str_checks = [
+    (hdr.name, 100, "path", true, true),
+    (hdr.linkname, 100, "linkpath", false, true),
+    (hdr.uname, 32, "uname", false, false),
+    (hdr.gname, 32, "gname", false, false),
+  ]
+  let mut i = 0
+  while i < str_checks.length() {
+    let (s, limit, pax_key, can_split_ustar, allow_long_gnu) = str_checks[i]
+    let slen = s.to_bytes().length()
+    let too_long = slen > limit
+    if has_nul(s) {
+      return Err(TarError::InvalidHeader("NUL byte in header string field"))
+    }
+    if too_long && !allow_long_gnu {
+      allowed = allowed & (7 ^ 4)
+    }
+    if !is_ascii(s) || too_long {
+      let split_ok = if can_split_ustar {
+        match split_ustar_path(s) {
+          Some(_) => true
+          None => false
+        }
+      } else {
+        false
+      }
+      if !split_ok {
+        allowed = allowed & (7 ^ 1)
+      }
+      kv_set(pax_hdrs, pax_key, s)
+    }
+    match kv_get(hdr.pax_records, pax_key) {
+      Some(pv) =>
+      if pv == s {
+        kv_set(pax_hdrs, pax_key, pv)
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+
+  // Helper checks for numeric fields
+  let num_checks = [
+    (hdr.mode, 8, ""),
+    (hdr.uid, 8, "uid"),
+    (hdr.gid, 8, "gid"),
+    (hdr.size, 12, "size"),
+    (hdr.devmajor, 8, ""),
+    (hdr.devminor, 8, ""),
+  ]
+  i = 0
+  while i < num_checks.length() {
+    let (n, width, pax_key) = num_checks[i]
+    if !fits_in_base256(width, n) {
+      allowed = allowed & (7 ^ 4)
+    }
+    if !fits_in_octal(width, n) {
+      allowed = allowed & (7 ^ 1)
+      if pax_key.length() == 0 {
+        allowed = allowed & (7 ^ 2)
+      } else {
+        kv_set(pax_hdrs, pax_key, n.to_string())
+      }
+    }
+    if pax_key.length() > 0 {
+      match kv_get(hdr.pax_records, pax_key) {
+        Some(pv) =>
+        if pv == n.to_string() {
+          kv_set(pax_hdrs, pax_key, pv)
+        }
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+
+  // Helper checks for time fields
+  let time_checks = [
+    (mod_time, "mtime", true),
+    (access_time, "atime", false),
+    (change_time, "ctime", false),
+  ]
+  i = 0
+  while i < time_checks.length() {
+    let (ts, pax_key, is_mtime) = time_checks[i]
+    if !ts.is_zero() {
+      if !fits_in_base256(12, ts.sec) {
+        allowed = allowed & (7 ^ 4)
+      }
+      let fits_oct = fits_in_octal(12, ts.sec)
+      if (is_mtime && !fits_oct) || !is_mtime {
+        allowed = allowed & (7 ^ 1)
+      }
+      let needs_nano = ts.nsec != 0
+      if !is_mtime || !fits_oct || needs_nano {
+        prefer_pax = true
+        kv_set(pax_hdrs, pax_key, format_pax_time(ts))
+      }
+      let formatted = format_pax_time(ts)
+      match kv_get(hdr.pax_records, pax_key) {
+        Some(pv) =>
+        if pv == formatted {
+          kv_set(pax_hdrs, pax_key, pv)
+        }
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+
+  // Global header requires PAX
+  if tf == type_x_global_header() {
+    allowed = allowed & 2
+  }
+
+  // Xattrs & PAXRecords require PAX
+  if hdr.xattrs.length() > 0 {
+    i = 0
+    while i < hdr.xattrs.length() {
+      let (xk, xv) = hdr.xattrs[i]
+      kv_set(pax_hdrs, "SCHILY.xattr." + xk, xv)
+      i = i + 1
+    }
+    allowed = allowed & 2
+  }
+  if hdr.pax_records.length() > 0 {
+    i = 0
+    while i < hdr.pax_records.length() {
+      let (pk, pv) = hdr.pax_records[i]
+      let exists = match kv_get(pax_hdrs, pk) {
+        Some(_) => true
+        None => false
+      }
+      if !exists {
+        if tf == type_x_global_header() {
+          kv_set(pax_hdrs, pk, pv)
+        } else if !is_basic_pax_key(pk) && !str_starts_with(pk, "GNU.sparse.") {
+          kv_set(pax_hdrs, pk, pv)
+        }
+      }
+      i = i + 1
+    }
+    allowed = allowed & 2
+  }
+
+  // Validate all PAX records
+  i = 0
+  while i < pax_hdrs.length() {
+    let (pk, pv) = pax_hdrs[i]
+    if !valid_pax_record(pk, pv) {
+      return Err(TarError::InvalidHeader("invalid PAX record: " + pk))
+    }
+    i = i + 1
+  }
+
+  // Intersect with user-requested format
+  match hdr.format {
+    Ustar => allowed = allowed & 1
+    Pax => {
+      let want = if prefer_pax { 2 } else { 3 }
+      allowed = allowed & want
+    }
+    Gnu => allowed = allowed & 4
+    Unknown => ()
+    _ => return Err(TarError::InvalidHeader("unsupported output format"))
+  }
+
+  if allowed == 0 {
+    return Err(TarError::FieldTooLong("header cannot be encoded in requested format"))
+  }
+
+  let eff_hdr = Header::{
+    ..hdr,
+    typeflag: tf,
+    mod_time: mod_time,
+    access_time: access_time,
+    change_time: change_time,
+  }
+
+  // Choose format: USTAR > PAX > GNU
+  if (allowed & 1) != 0 {
+    // USTAR
+    let mut name_prefix = ""
+    let mut name_suffix = eff_hdr.name
+    match split_ustar_path(eff_hdr.name) {
+      Some((p, s)) => {
+        name_prefix = p
+        name_suffix = s
+      }
+      None => ()
+    }
+    let blk = build_template_block(eff_hdr, tf, name_suffix, false, false)
+    if name_prefix.length() > 0 {
+      let _ = format_string_into(blk, 345, 155, name_prefix)
+    }
+    finalize_header_block(blk, TarFormat::Ustar)
+    writer_push_chunk(self, blk)
+  } else if (allowed & 2) != 0 {
+    // PAX
+    let is_global = tf == type_x_global_header()
+    if pax_hdrs.length() > 0 || is_global {
+      sort_kv_pairs(pax_hdrs)
+      let sb = StringBuilder::new()
+      i = 0
+      while i < pax_hdrs.length() {
+        let (pk, pv) = pax_hdrs[i]
+        let rec = match format_pax_record(pk, pv) {
+          Ok(s) => s
+          Err(e) => return Err(e)
+        }
+        sb.write_string(rec)
+        i = i + 1
+      }
+      let pax_bytes = sb.to_string().to_bytes()
+      if pax_bytes.length() > 1048576 {
+        return Err(TarError::FieldTooLong("PAX header exceeds 1 MiB"))
+      }
+      let meta_name = if is_global {
+        if eff_hdr.name.length() > 0 {
+          eff_hdr.name
+        } else {
+          "GlobalHead.0.0"
+        }
+      } else {
+        make_pax_header_name(eff_hdr.name)
+      }
+      let meta_flag = if is_global { type_x_global_header() } else { type_x_header() }
+      match write_raw_meta_file(self, meta_name, pax_bytes, meta_flag, TarFormat::Pax) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      if is_global {
+        self.remaining = 0L
+        self.pad = 0L
+        return Ok(())
+      }
+    }
+    let blk = build_template_block(eff_hdr, tf, eff_hdr.name, true, false)
+    finalize_header_block(blk, TarFormat::Pax)
+    writer_push_chunk(self, blk)
+  } else {
+    // GNU
+    if eff_hdr.name.to_bytes().length() > name_size {
+      let nb = eff_hdr.name.to_bytes()
+      let with_nul = Bytes::new(nb.length() + 1)
+      let mut j = 0
+      while j < nb.length() {
+        with_nul[j] = nb[j]
+        j = j + 1
+      }
+      match write_raw_meta_file(
+        self,
+        "././@LongLink",
+        with_nul,
+        type_gnu_long_name(),
+        TarFormat::Gnu,
+      ) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    if eff_hdr.linkname.to_bytes().length() > name_size {
+      let lb = eff_hdr.linkname.to_bytes()
+      let with_nul = Bytes::new(lb.length() + 1)
+      let mut j = 0
+      while j < lb.length() {
+        with_nul[j] = lb[j]
+        j = j + 1
+      }
+      match write_raw_meta_file(
+        self,
+        "././@LongLink",
+        with_nul,
+        type_gnu_long_link(),
+        TarFormat::Gnu,
+      ) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    let blk = build_template_block(eff_hdr, tf, eff_hdr.name, false, true)
+    if !eff_hdr.access_time.is_zero() {
+      let _ = format_numeric_into(blk, 345, 12, eff_hdr.access_time.sec)
+    }
+    if !eff_hdr.change_time.is_zero() {
+      let _ = format_numeric_into(blk, 357, 12, eff_hdr.change_time.sec)
+    }
+    finalize_header_block(blk, TarFormat::Gnu)
+    writer_push_chunk(self, blk)
+  }
+
+  let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { eff_hdr.size }
+  self.remaining = data_sz
+  self.pad = block_padding(data_sz)
+  Ok(())
 }
 
-///| Write payload bytes for the current entry.
+///| Write payload bytes for the current entry (zero-copy staged until `finish()`).
 pub fn Writer::write_data(self : Writer, data : Bytes) -> Result[Unit, TarError] {
-  let _ = self
-  let _ = data
-  Err(TarError::InvalidHeader("unimplemented"))
+  if self.closed {
+    return Err(TarError::WriteAfterClose)
+  }
+  let n = data.length().to_int64()
+  if n > self.remaining {
+    return Err(TarError::WriteTooLong)
+  }
+  if n > 0L {
+    writer_push_chunk(self, data)
+    self.remaining = self.remaining - n
+  }
+  Ok(())
 }
 
-///| Finalize the archive (padding + two 512-byte zero EOF blocks) and return the encoded bytes.
+///| Finalize the archive (padding + two 512-byte zero EOF blocks) in a single allocation.
 pub fn Writer::finish(self : Writer) -> Result[Bytes, TarError] {
-  let _ = self
-  Err(TarError::InvalidHeader("unimplemented"))
+  if self.closed {
+    return Err(TarError::WriteAfterClose)
+  }
+  match writer_flush_pad(self) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  // Two 512-byte zero EOF blocks
+  writer_push_zeros(self, 1024L)
+  self.closed = true
+
+  let total = self.total_bytes.to_int()
+  let out = Bytes::new(total)
+  let num_chunks = self.chunks.length()
+  let mut c = 0
+  while c < num_chunks {
+    let (off, chunk) = self.chunks[c]
+    let clen = chunk.length()
+    let mut i = 0
+    while i + 8 <= clen {
+      out[off + i] = chunk[i]
+      out[off + i + 1] = chunk[i + 1]
+      out[off + i + 2] = chunk[i + 2]
+      out[off + i + 3] = chunk[i + 3]
+      out[off + i + 4] = chunk[i + 4]
+      out[off + i + 5] = chunk[i + 5]
+      out[off + i + 6] = chunk[i + 6]
+      out[off + i + 7] = chunk[i + 7]
+      i = i + 8
+    }
+    while i < clen {
+      out[off + i] = chunk[i]
+      i = i + 1
+    }
+    c = c + 1
+  }
+  Ok(out)
 }
 
 ///| Encode an array of `Entry` values into a complete TAR archive.
 pub fn write_all(entries : Array[Entry]) -> Result[Bytes, TarError] {
-  let _ = entries
-  Err(TarError::InvalidHeader("unimplemented"))
+  let w = Writer::with_capacity(entries.length() * 2 + 2)
+  let n = entries.length()
+  let mut i = 0
+  while i < n {
+    let ent = entries[i]
+    match w.write_header(ent.header) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    if ent.data.length() > 0 {
+      match w.write_data(ent.data) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    i = i + 1
+  }
+  w.finish()
 }
