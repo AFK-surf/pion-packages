@@ -50,18 +50,23 @@ pub val struct EncodeOptions {
 // Entrypoints
 pub fn decode(data : Bytes, opts : DecodeOptions) -> Result[CborValue, CborError]
 pub fn decode_default(data : Bytes) -> Result[CborValue, CborError]
+pub fn decode_strict(data : Bytes, mode : SortMode) -> Result[CborValue, CborError]
+pub fn decode_prefix(data : Bytes, opts : DecodeOptions) -> Result[(CborValue, Int), CborError]
+pub fn decode_prefix_at(data : Bytes, offset : Int, opts : DecodeOptions) -> Result[(CborValue, Int), CborError]
+pub fn decode_first(data : Bytes, opts : DecodeOptions) -> Result[(CborValue, Int), CborError]
 pub fn validate(data : Bytes, opts : DecodeOptions) -> Result[Unit, CborError]
 pub fn encode(value : CborValue, opts : EncodeOptions) -> Result[Bytes, CborError]
 pub fn encode_default(value : CborValue) -> Result[Bytes, CborError]
 pub fn to_diagnostic(value : CborValue) -> String
 ```
 
-## Compliance & Security Test Suite (209 tests)
+## Compliance & Security Test Suite (218 tests)
 
 - **`appendix_a_test.pion` (83 tests)**: All RFC 8949 Appendix A official test vectors (`cbor/test-vectors/appendix_a.json`), including integers `0..2^64-1`, `-1..-2^64`, float16 subnormals/normals/±0.0/±Inf/NaN, float32/64, UTF-8 text strings, byte strings, definite & indefinite-length containers, tags (`0, 1, 2, 3, 23, 24, 32`), and simple values.
 - **`canonical_test.pion` (45 tests)**: RFC 8949 §4.2 Core Deterministic Encoding, CTAP2 / RFC 7049 length-first sorting vs Core Deterministic bytewise lexicographic sorting, shortest integer/float encoding, duplicate key rejection, and strict canonical decode validation.
-- **`security_test.pion` (56 tests)**: Ported from `fxamacker/cbor` — truncated inputs, trailing bytes, reserved additional info (28/29/30), unexpected break codes (`0xff`), invalid simple values (`0xf8 0x00..0x1f`), strict UTF-8 validation (including split multi-byte chunks across indefinite text strings), depth limit (`max_depth = 32`), element limit (`max_elements`), duplicate key detection, and OOM defense against crafted huge lengths (`u64::MAX`).
+- **`security_test.pion` (56 tests)**: Ported from `fxamacker/cbor` — truncated inputs, trailing bytes, reserved additional info (28/29/30), unexpected break codes (`0xff`), invalid simple values (`0xf8 0x00..0x1f`), strict UTF-8 validation (including split multi-byte chunks across indefinite text strings), depth limit (`max_depth = 32`, hard safety cap `1024`), element limit (`max_elements`), O(n) hash duplicate key detection, and OOM defense against crafted huge lengths (`u64::MAX`).
 - **`diagnostic_test.pion` (25 tests)**: RFC 8949 §8 Diagnostic Notation and WebAuthn/COSE/CTAP2/Telemetry roundtrip tests.
+- **`regression_test.pion` (9 tests)**: Red-team regression tests covering O(n) duplicate-key detection, worst-case O(n log n) Introsort on Shell-killer key orders, depth safety & iterative encoding, `decode_prefix`/`decode_first`/`decode_prefix_at` (including WebAuthn `attestedCredentialData` `COSE_Key || extensions` and indefinite-length byte strings), RFC 8949 tag 0/1/2/3 validation, NaN payload key equality, bignum preferred serialization, and strict RFC 8949 vs CTAP2 decoding.
 
 ## Benchmarks
 
@@ -94,3 +99,13 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | St
 | `rust_ciborium` | 123.136 | 122.112 | 131.406 | 190.92 | 1539.20 | 6.72 MiB | 1.20x |
 
 _SHA-256 verified identical across all implementations and rounds: `3e1929251b4f124f4f35012b86df7c3b1ad83579b233cee32aacc5fb05a48ece`._
+
+### Fairness Note: Idiomatic Go Typed Structs
+
+The standard benchmark above compares dynamic value trees (`CborValue` vs Go `map[string]any`/`map[any]any` vs Rust `ciborium::Value`). When Go uses idiomatic typed structs with pre-cached field sorting (`audit/go/cmd/bench_{encode,decode}_struct`, producing byte-identical SHA-256 output on the same workloads):
+
+| Workload | Pion (`CborValue`) | Go (`typed struct`, idiomatic) | Go (`map[string]any` / `map[any]any`) |
+| --- | ---: | ---: | ---: |
+| 1. Deterministic Encode (50k records, ns/op) | 1436 ns/op (1.80 MiB RSS, 0.64x vs Go struct) | **926 ns/op** (11.94 MiB RSS, 1.00x) | 2372 ns/op (12.70 MiB RSS, 0.39x) |
+| 2. Decode + Walk (80k records, MB/s) | 254.6 MB/s (9.58 MiB RSS, 0.93x vs Go struct) | **274.0 MB/s** (11.66 MiB RSS, 1.00x) | 155.1 MB/s (18.38 MiB RSS, 0.57x) |
+
