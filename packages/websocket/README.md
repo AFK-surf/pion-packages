@@ -54,19 +54,23 @@ match decoder.next_message() {
 
 ## Head-to-Head Benchmark
 
-Workload: **50,000 masked client frames** (~50.8 MB mixed Text + Binary + cross-fragment UTF-8 Text + interleaved Ping), batch-encoded and stream-decoded with unmasking, fragment reassembly, and strict UTF-8 validation. Verified via `scripts/bench_compare.py --warmup 1 --rounds 5` with **mandatory byte-for-byte stdout SHA-256 verification**.
+Workload: **50,000 masked client frames** (~50.88 MB mixed Text + Binary + cross-fragment UTF-8 Text + interleaved Ping), batch-encoded and stream-decoded with unmasking, fragment reassembly, and strict UTF-8 validation. Verified via `scripts/bench_compare.py --warmup 1 --rounds 5` with **mandatory byte-for-byte stdout SHA-256 verification**.
 
 Platform: `Darwin arm64` | Stdout SHA-256: `7830282bc43598507bfee624e7f55c3bbd01505b2f8e8e4674117ca67e349c92`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_tungstenite`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`packages/websocket`) | 255.914 | 222.350 | 284.604 | 198.82 | 5118.28 | 2.02 MiB | 0.29x |
-| `rust_tungstenite` (`0.26.2 --release`) | 74.330 | 72.295 | 75.673 | 684.52 | 1486.60 | 2.22 MiB | 1.00x (baseline) |
-| `go_coder_ws` (`v1.8.14`) | 129.358 | 115.856 | 134.806 | 393.33 | 2587.16 | 17.23 MiB | 0.57x |
+| `pion` (`packages/websocket`) | **131.212** | 127.738 | 140.728 | **387.77** | 2624.24 | **1.98 MiB** | 0.58x |
+| `go_coder_ws` (`v1.8.14`, NEON asm) | 136.798 | 134.678 | 144.166 | 371.93 | 2735.96 | 16.95 MiB | 0.56x |
+| `rust_tungstenite` (`0.26.2 --release`) | 76.104 | 72.802 | 77.086 | 668.56 | 1522.08 | 2.23 MiB | 1.00x (baseline) |
 
-**Analysis**:
-- Pion Native achieves **~199 MB/s** sustained encode+mask+stream-decode+UTF-8 throughput with the **lowest Peak RSS (2.02 MiB)** — lower than Rust `tungstenite` (2.22 MiB) and **8.5x lower** than Go `coder/websocket` (17.23 MiB).
-- Rust `tungstenite` (685 MB/s) and Go `coder/websocket` (393 MB/s, using ARM64 NEON assembly in `mask_arm64.s`) lead in raw throughput because Pion's current `Bytes` indexing lowers to per-byte runtime calls (`pion_bytes_get` / `pion_bytes_set`) rather than inline word/SIMD loads. Once Pion adds inline `Bytes` load/store or 64-bit word intrinsics, the 8-byte unrolled masking and UTF-8 fast paths will scale directly with hardware memory bandwidth.
+**Optimization & Profiling Summary**:
+- **1.95x speedup over initial baseline** (`255.9 ms` / `198.8 MB/s` → **`131.2 ms` / `387.8 MB/s`**), **surpassing Go `coder/websocket`** (`136.8 ms` / `371.9 MB/s`, even with Go's hand-written `mask_arm64.s` NEON assembly) while using **8.5x less memory** (`1.98 MiB` vs `16.95 MiB`) and less memory than Rust `tungstenite` (`2.23 MiB`).
+- Key optimizations:
+  1. **Zero-copy chunk queue in `Decoder::feed`** (eliminated staging copy and 50M per-byte struct-field RC inc/dec ops: `feed` dropped from `79 ms` → `0 ms`).
+  2. **Direct-unmask into final reassembled fragment** (eliminated intermediate allocation & copy on final continuation frames) + reusable `queue`/`frag_chunks` buffers via `.clear()`.
+  3. **Gated 8-byte ASCII fast path in `validate_utf8_range`** (avoids redundant 8-byte lookaheads on CJK/emoji-heavy UTF-8).
+- **Remaining gap vs Rust `tungstenite` (compiler ceiling)**: ARM64 disassembly of `extract_payload_into` shows `pionc 0.1.0` already inlines `Bytes` indexing (`ldrb`/`strb`), but emits ~13 scalar instructions/byte (per-byte `cmp`/`b.hs` bounds check, redundant `mov`/`sxtw`/`and #0xff` before `strb`, and no 64-bit word or NEON `eor.16b` vectorization). Hoisting loop bounds checks and adding 64-bit/SIMD `Bytes` word operations in `pionc` will directly close the remaining gap to Rust.
 
 Run the benchmark locally:
 
