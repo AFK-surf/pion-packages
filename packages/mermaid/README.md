@@ -33,11 +33,22 @@ Pure Pion, zero-JS, zero-DOM (`linkedom`-free), zero-`World` Mermaid diagram par
 - `wasm_smoke/` — Wasm32 compilation verification target
 - `bench/` — Head-to-head benchmarks vs official Node.js `mermaid` + `@dagrejs/dagre`
 
-## Benchmarks (`Darwin arm64`, `--warmup 1 --rounds 5`, SHA-256 verified)
+## Benchmarks (`Darwin arm64`, `scripts/bench_compare.py --warmup 1 --rounds 5`, SHA-256 verified)
 
-1. **Parse + Canonical Topology JSON** (6 diagrams incl. 320-node flowchart, 44,397 B stdout, `sha256:01503cfb8beab764...`):
-   - `node-mermaid` (official `mermaid` + `linkedom`): **405.351 ms** median, **92.23 MiB** RSS
-   - `pion-mermaid` (Pion Native `--release`): **8.995 ms** median, **2.66 MiB** RSS (**45.07x faster**)
-2. **Layered Graph Layout** (50 / 200 / 500 nodes, 1,088 edges incl. cycles & long edges, `sha256:c84da338384d484d...`):
-   - `node-dagre` (official `@dagrejs/dagre`): **566.553 ms** median, **233.17 MiB** RSS
-   - `pion-sugiyama` (Pion Native `--release`): **10.383 ms** median, **2.88 MiB** RSS (**54.57x faster**)
+### Steady-State Pure Compute (amortizes process startup)
+
+1. **Parse + Canonical Topology JSON (`--iters 50`, 6 diagrams incl. 320-node flowchart, 1,120,750 B total input, `sha256:2f819d7bc0dd394d...`)**:
+   - `node-mermaid` (official `mermaid` + `linkedom`): **13,376.880 ms** median (~267.5 ms/pass), **252.36 MiB** Peak RSS
+   - `pion-mermaid` (Pion Native `--release`): **45.997 ms** median (~0.92 ms/pass), **2.72 MiB** Peak RSS (**290.82x faster**)
+2. **Layered Graph Layout (`--iters 20`, 50 / 200 / 500 nodes, 1,088 edges incl. cycles & long edges, 442,380 B total input, `sha256:477f544c81534122...`)**:
+   - `node-dagre` (official `@dagrejs/dagre`): **8,041.165 ms** median (~402.1 ms/pass), **318.91 MiB** Peak RSS
+   - `pion-sugiyama` (Pion Native `--release`): **27.840 ms** median (~1.39 ms/pass), **2.88 MiB** Peak RSS (**288.84x faster**)
+
+### Cold-Start CLI (1x process startup + execution, for reference)
+
+1. **Parse + Canonical Topology JSON (`--iters 1`, `sha256:12ff4e02e48548c4...`)**:
+   - `node-mermaid`: **381.285 ms** median, **108.47 MiB** Peak RSS
+   - `pion-mermaid`: **8.518 ms** median, **2.64 MiB** Peak RSS (**44.76x faster**)
+2. **Layered Graph Layout (`--iters 1`, `sha256:a61c633038f51153...`)**:
+   - `node-dagre`: **572.356 ms** median, **234.11 MiB** Peak RSS
+   - `pion-sugiyama`: **9.809 ms** median, **2.88 MiB** Peak RSS (**58.35x faster**)
