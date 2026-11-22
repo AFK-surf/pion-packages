@@ -29,10 +29,14 @@ pionc add <package-name>
 
 ## 包清单
 
-| Package | Version | Description | Upstream Reference | Native | Wasm32 | Benchmark |
-| --- | --- | --- | --- | --- | --- | --- |
+| Package | Version | Description | Upstream Reference | Tests (Native) | Wasm32 | Benchmark | Install |
+| --- | --- | --- | --- | ---: | --- | --- | --- |
+| [`markdown`](packages/markdown) | `0.1.0` | CommonMark 0.31.2 + GFM（表格、删除线、任务列表、自动链接）+ CJK 友好强调的 Markdown 解析与 HTML 渲染 | [`pulldown-cmark/pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark) `v0.13.1` (Rust, MIT) | 702 / 702 | ✅ `wasm_smoke` | [CommonMark 2.46 MB · GFM 2.50 MB](BENCHMARKS.md#markdown) | `pionc add markdown --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`texmath`](packages/texmath) | `0.1.0` | TeX 数学公式解析、KaTeX 兼容 MathML 序列化与 TeXbook 盒模型布局 IR | [`KaTeX/KaTeX`](https://github.com/KaTeX/KaTeX) `v0.19.1` (JavaScript, MIT) | 180 / 180 | ✅ `wasm_smoke` | [10,000 ops MathML](BENCHMARKS.md#texmath) | `pionc add texmath --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`mermaid`](packages/mermaid) | `0.1.0` | Mermaid 流程图 / 时序图 / 状态图 / 类图 / ER 图解析、Sugiyama 分层布局与 SVG 渲染 | [`mermaid-js/mermaid`](https://github.com/mermaid-js/mermaid) + [`dagrejs/dagre`](https://github.com/dagrejs/dagre) (JavaScript, MIT) | 137 / 137 | ✅ `wasm_smoke` | [解析 + 布局（稳态 / 冷启动）](BENCHMARKS.md#mermaid) | `pionc add mermaid --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`time`](packages/time) | `0.1.0` | 公历日期 / 时间 / 时间戳 / 有符号时长值类型，RFC 3339、RFC 2822、HTTP-date 与 ISO 8601 时长解析格式化 | [`BurntSushi/jiff`](https://github.com/BurntSushi/jiff) `0.2` (Rust, MIT/Unlicense) | 249 / 249 | ✅ `wasm_smoke` | [RFC 3339 200k · Civil 2M](BENCHMARKS.md#time) | `pionc add time --registry https://github.com/AFK-surf/pion-packages.git` |
 
-*(暂无已发布包，将随 Wave 1+ 陆续合入。)*
+全仓合计 **1,268 / 1,268** 单测通过（`sh scripts/verify.sh`）。
 
 ## 贡献与移植流程
 
