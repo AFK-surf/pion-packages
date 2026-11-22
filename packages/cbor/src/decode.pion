@@ -1,10 +1,40 @@
-///| CBOR decoder (RFC 8949) with OOM protection, strict UTF-8, depth/element limits, and canonical validation.
+///| CBOR decoder (RFC 8949) with OOM protection, strict UTF-8, depth/element limits,
+///  O(n) hash duplicate-key detection, RFC 8949 tag validation, and canonical validation.
+
+///| Hard safety cap on nesting depth to prevent native call-stack overflow during decode or drop.
+let max_safe_depth : Int = 1024
 
 ///|
 struct Decoder {
   data : Bytes
+  mut data_str : String
+  mut has_data_str : Bool
+  len : Int
   mut pos : Int
-  opts : DecodeOptions
+  max_depth : Int
+  max_elements : Int
+  reject_duplicate_keys : Bool
+  require_canonical : Bool
+  canonical_mode : Int // 0 = RFC 8949 or CTAP2, 1 = RFC 8949 only, 2 = CTAP2 only
+  mut has_err : Bool
+  mut err : CborError
+}
+
+///|
+fn set_err(dec : Decoder, err : CborError) -> Unit {
+  if !dec.has_err {
+    dec.has_err = true
+    dec.err = err
+  }
+}
+
+///|
+fn get_data_str(dec : Decoder) -> String {
+  if !dec.has_data_str {
+    dec.data_str = dec.data.to_string()
+    dec.has_data_str = true
+  }
+  dec.data_str
 }
 
 ///|
@@ -15,6 +45,9 @@ fn is_valid_utf8_range(data : Bytes, start : Int, len : Int) -> Bool {
     let b0 = data[i].to_int()
     if b0 < 0x80 {
       i = i + 1
+      while i < end && data[i].to_int() < 0x80 {
+        i = i + 1
+      }
     } else if b0 >= 0xC2 && b0 <= 0xDF {
       if i + 1 >= end {
         return false
@@ -67,6 +100,117 @@ fn is_valid_utf8_range(data : Bytes, start : Int, len : Int) -> Bool {
 }
 
 ///|
+fn parse_2digits(s : String, i : Int) -> Int {
+  let c0 = s.code_unit_at(i)
+  let c1 = s.code_unit_at(i + 1)
+  if c0 < 48 || c0 > 57 || c1 < 48 || c1 > 57 {
+    return -1
+  }
+  (c0 - 48) * 10 + (c1 - 48)
+}
+
+///|
+fn parse_4digits(s : String, i : Int) -> Int {
+  let hi = parse_2digits(s, i)
+  let lo = parse_2digits(s, i + 2)
+  if hi < 0 || lo < 0 {
+    return -1
+  }
+  hi * 100 + lo
+}
+
+///|
+fn days_in_month(year : Int, month : Int) -> Int {
+  match month {
+    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31
+    4 | 6 | 9 | 11 => 30
+    2 =>
+    if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+      29
+    } else {
+      28
+    }
+    _ => 0
+  }
+}
+
+///| Validate RFC 3339 date-time string (RFC 8949 §3.4.1, tag 0).
+fn is_valid_rfc3339(s : String) -> Bool {
+  let n = s.length()
+  // Shortest valid RFC 3339: "YYYY-MM-DDTHH:MM:SSZ" (20 chars)
+  if n < 20 {
+    return false
+  }
+  let year = parse_4digits(s, 0)
+  if year < 0 || s.code_unit_at(4) != 45 {
+    return false
+  }
+  let month = parse_2digits(s, 5)
+  if month < 1 || month > 12 || s.code_unit_at(7) != 45 {
+    return false
+  }
+  let day = parse_2digits(s, 8)
+  if day < 1 || day > days_in_month(year, month) {
+    return false
+  }
+  let sep = s.code_unit_at(10)
+  // 'T' (84) or 't' (116)
+  if sep != 84 && sep != 116 {
+    return false
+  }
+  let hour = parse_2digits(s, 11)
+  if hour < 0 || hour > 23 || s.code_unit_at(13) != 58 {
+    return false
+  }
+  let minute = parse_2digits(s, 14)
+  if minute < 0 || minute > 59 || s.code_unit_at(16) != 58 {
+    return false
+  }
+  let second = parse_2digits(s, 17)
+  if second < 0 || second > 60 {
+    return false
+  }
+  let mut pos = 19
+  // Optional fractional seconds: '.' followed by 1+ digits
+  if pos < n && s.code_unit_at(pos) == 46 {
+    pos = pos + 1
+    let frac_start = pos
+    while pos < n {
+      let c = s.code_unit_at(pos)
+      if c >= 48 && c <= 57 {
+        pos = pos + 1
+      } else {
+        break
+      }
+    }
+    if pos == frac_start {
+      return false
+    }
+  }
+  if pos >= n {
+    return false
+  }
+  let tz = s.code_unit_at(pos)
+  // 'Z' (90) or 'z' (122)
+  if tz == 90 || tz == 122 {
+    return pos + 1 == n
+  }
+  // '+' (43) or '-' (45) followed by HH:MM
+  if tz == 43 || tz == 45 {
+    if pos + 6 != n {
+      return false
+    }
+    let off_h = parse_2digits(s, pos + 1)
+    if off_h < 0 || off_h > 23 || s.code_unit_at(pos + 3) != 58 {
+      return false
+    }
+    let off_m = parse_2digits(s, pos + 4)
+    return off_m >= 0 && off_m <= 59
+  }
+  false
+}
+
+///|
 fn cmp_slice_lex(data : Bytes, s1 : Int, e1 : Int, s2 : Int, e2 : Int) -> Int {
   let l1 = e1 - s1
   let l2 = e2 - s2
@@ -89,85 +233,297 @@ fn cmp_slice_lex(data : Bytes, s1 : Int, e1 : Int, s2 : Int, e2 : Int) -> Int {
   }
 }
 
-///|
-fn read_uint_arg(dec : Decoder, ai : Int, start_pos : Int) -> Result[UInt64, CborError] {
-  if ai <= 23 {
-    return Ok(ai.to_int64().to_uint64())
+///| Exact CBOR data-model key equality for duplicate-key detection.
+///  Unlike cbor_equals (which equates all NaNs for test assertions), this preserves
+///  IEEE-754 bit patterns so NaNs with different payloads or signs are distinct keys,
+///  while equal-value integers/floats (e.g. f16 1.0 vs f64 1.0, 0 vs overlong 0) match.
+fn cbor_key_equals(lhs : CborValue, rhs : CborValue) -> Bool {
+  match (lhs, rhs) {
+    (Unsigned(a), Unsigned(b)) => a == b
+    (Negative(a), Negative(b)) => a == b
+    (Bytes(a), Bytes(b)) => bytes_equal(a, b)
+    (Text(a), Text(b)) => a == b
+    (Bool(a), Bool(b)) => a == b
+    (Null, Null) => true
+    (Undefined, Undefined) => true
+    (Simple(a), Simple(b)) => a == b
+    (Float(a), Float(b)) => a.to_bits() == b.to_bits()
+    (Tag(ta, va), Tag(tb, vb)) => ta == tb && cbor_key_equals(va, vb)
+    (Array(a), Array(b)) => {
+      let n = a.length()
+      if n != b.length() {
+        return false
+      }
+      let mut i = 0
+      while i < n {
+        if !cbor_key_equals(a[i], b[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    (Map(a), Map(b)) => {
+      let n = a.length()
+      if n != b.length() {
+        return false
+      }
+      let mut i = 0
+      while i < n {
+        let (ka, va) = a[i]
+        let (kb, vb) = b[i]
+        if !cbor_key_equals(ka, kb) || !cbor_key_equals(va, vb) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
   }
-  let rem = dec.data.length() - dec.pos
-  if ai == 24 {
-    if rem < 1 {
-      return Err(CborError::UnexpectedEof(dec.pos))
+}
+
+///| SplitMix64 finalizer for fast, low-collision 64-bit hashing.
+fn mix64(x : UInt64) -> UInt64 {
+  let mut z = x + 0x9E3779B97F4A7C15UL
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL
+  z ^ (z >> 31)
+}
+
+///| Fast 64-bit structural hash consistent with cbor_key_equals.
+fn cbor_key_hash(v : CborValue) -> UInt64 {
+  match v {
+    Unsigned(u) => mix64(u ^ 0x1111111111111111UL)
+    Negative(n) => mix64(n ^ 0x2222222222222222UL)
+    Bytes(b) => {
+      let n = b.length()
+      let mut h = 0xCBF29CE484222325UL ^ n.to_int64().to_uint64()
+      let mut i = 0
+      while i < n {
+        h = (h ^ b[i].to_int().to_int64().to_uint64()) * 0x100000001B3UL
+        i = i + 1
+      }
+      mix64(h ^ 0x3333333333333333UL)
     }
-    let v = dec.data[dec.pos].to_int().to_int64().to_uint64()
-    dec.pos = dec.pos + 1
-    if dec.opts.require_canonical && v < 24UL {
-      return Err(CborError::NonCanonicalEncoding(start_pos))
+    Text(s) => {
+      let n = s.length()
+      let mut h = 0xCBF29CE484222325UL ^ n.to_int64().to_uint64()
+      let mut i = 0
+      while i < n {
+        h = (h ^ s.code_unit_at(i).to_int64().to_uint64()) * 0x100000001B3UL
+        i = i + 1
+      }
+      mix64(h ^ 0x4444444444444444UL)
     }
-    return Ok(v)
+    Bool(b) => if b { 0x5555555555555551UL } else { 0x5555555555555550UL }
+    Null => 0x6666666666666660UL
+    Undefined => 0x6666666666666661UL
+    Simple(s) => mix64(s.to_int64().to_uint64() ^ 0x6666666666666662UL)
+    Float(d) => mix64(d.to_bits().to_uint64() ^ 0x7777777777777777UL)
+    Tag(t, inner) => mix64(t ^ (cbor_key_hash(inner) * 0x100000001B3UL) ^ 0x8888888888888888UL)
+    Array(items) => {
+      let n = items.length()
+      let mut h = mix64(n.to_int64().to_uint64() ^ 0x9999999999999999UL)
+      let mut i = 0
+      while i < n {
+        h = mix64(h ^ cbor_key_hash(items[i]))
+        i = i + 1
+      }
+      h
+    }
+    Map(pairs) => {
+      let n = pairs.length()
+      let mut h = mix64(n.to_int64().to_uint64() ^ 0xAAAAAAAAAAAAAAAAUL)
+      let mut i = 0
+      while i < n {
+        let (k, x) = pairs[i]
+        h = mix64(h ^ cbor_key_hash(k) ^ (cbor_key_hash(x) * 0x100000001B3UL))
+        i = i + 1
+      }
+      h
+    }
   }
-  if ai == 25 {
-    if rem < 2 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let b0 = dec.data[dec.pos].to_int().to_int64().to_uint64()
-    let b1 = dec.data[dec.pos + 1].to_int().to_int64().to_uint64()
-    dec.pos = dec.pos + 2
-    let v = (b0 << 8) | b1
-    if dec.opts.require_canonical && v <= 0xFFUL {
-      return Err(CborError::NonCanonicalEncoding(start_pos))
-    }
-    return Ok(v)
-  }
-  if ai == 26 {
-    if rem < 4 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let b0 = dec.data[dec.pos].to_int().to_int64().to_uint64()
-    let b1 = dec.data[dec.pos + 1].to_int().to_int64().to_uint64()
-    let b2 = dec.data[dec.pos + 2].to_int().to_int64().to_uint64()
-    let b3 = dec.data[dec.pos + 3].to_int().to_int64().to_uint64()
-    dec.pos = dec.pos + 4
-    let v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-    if dec.opts.require_canonical && v <= 0xFFFFUL {
-      return Err(CborError::NonCanonicalEncoding(start_pos))
-    }
-    return Ok(v)
-  }
-  if ai == 27 {
-    if rem < 8 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let b0 = dec.data[dec.pos].to_int().to_int64().to_uint64()
-    let b1 = dec.data[dec.pos + 1].to_int().to_int64().to_uint64()
-    let b2 = dec.data[dec.pos + 2].to_int().to_int64().to_uint64()
-    let b3 = dec.data[dec.pos + 3].to_int().to_int64().to_uint64()
-    let b4 = dec.data[dec.pos + 4].to_int().to_int64().to_uint64()
-    let b5 = dec.data[dec.pos + 5].to_int().to_int64().to_uint64()
-    let b6 = dec.data[dec.pos + 6].to_int().to_int64().to_uint64()
-    let b7 = dec.data[dec.pos + 7].to_int().to_int64().to_uint64()
-    dec.pos = dec.pos + 8
-    let v = (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
-    if dec.opts.require_canonical && v <= 0xFFFFFFFFUL {
-      return Err(CborError::NonCanonicalEncoding(start_pos))
-    }
-    return Ok(v)
-  }
-  Err(CborError::InvalidAdditionalInfo(ai, start_pos))
+}
+
+///| Open-addressing hash set referencing indices into `pairs` for O(n) duplicate-key detection.
+struct KeyHashSet {
+  mut table : Array[Int]
+  mut mask : Int
+  mut count : Int
+  hashes : Array[UInt64]
 }
 
 ///|
-fn decode_indef_bytes(dec : Decoder, start_pos : Int) -> Result[CborValue, CborError] {
-  if dec.opts.require_canonical {
-    return Err(CborError::NonCanonicalEncoding(start_pos))
+fn make_key_hash_set(initial_cap : Int) -> KeyHashSet {
+  let mut cap = 32
+  while cap < initial_cap {
+    cap = cap * 2
   }
-  let chunks : Array[Bytes] = []
-  let mut total_len = 0
-  while true {
-    if dec.pos >= dec.data.length() {
-      return Err(CborError::UnexpectedEof(dec.pos))
+  let table : Array[Int] = Array::with_capacity(cap)
+  let mut i = 0
+  while i < cap {
+    table.push(-1)
+    i = i + 1
+  }
+  KeyHashSet::{ table: table, mask: cap - 1, count: 0, hashes: [] }
+}
+
+///|
+fn key_hash_set_grow(set : KeyHashSet) -> Unit {
+  let new_cap = (set.mask + 1) * 2
+  let new_mask = new_cap - 1
+  let new_table : Array[Int] = Array::with_capacity(new_cap)
+  let mut i = 0
+  while i < new_cap {
+    new_table.push(-1)
+    i = i + 1
+  }
+  let old_table = set.table
+  let old_len = old_table.length()
+  let hashes = set.hashes
+  let mut j = 0
+  while j < old_len {
+    let idx = old_table[j]
+    if idx >= 0 {
+      let mut slot = (hashes[idx] & new_mask.to_int64().to_uint64()).to_int()
+      while new_table[slot] >= 0 {
+        slot = (slot + 1) & new_mask
+      }
+      new_table[slot] = idx
     }
-    let b = dec.data[dec.pos].to_int()
+    j = j + 1
+  }
+  set.table = new_table
+  set.mask = new_mask
+}
+
+///| Insert key `k` (which will be stored at `pairs[pair_idx]`).
+///  Returns `false` if a duplicate key already exists in `pairs`.
+fn key_hash_set_insert(
+  set : KeyHashSet,
+  pairs : Array[(CborValue, CborValue)],
+  k : CborValue,
+  pair_idx : Int,
+) -> Bool {
+  if (set.count + 1) * 10 >= (set.mask + 1) * 7 {
+    key_hash_set_grow(set)
+  }
+  let h = cbor_key_hash(k)
+  let mask = set.mask
+  let table = set.table
+  let hashes = set.hashes
+  let mut slot = (h & mask.to_int64().to_uint64()).to_int()
+  while true {
+    let existing = table[slot]
+    if existing < 0 {
+      table[slot] = pair_idx
+      hashes.push(h)
+      set.count = set.count + 1
+      return true
+    }
+    if hashes[existing] == h {
+      let (pk, _) = pairs[existing]
+      if cbor_key_equals(pk, k) {
+        return false
+      }
+    }
+    slot = (slot + 1) & mask
+  }
+  true
+}
+
+///|
+fn read_uint_arg_slow(dec : Decoder, ai : Int, start_pos : Int) -> UInt64 {
+  let pos = dec.pos
+  let rem = dec.len - pos
+  let data = dec.data
+  if ai == 24 {
+    if rem < 1 {
+      set_err(dec, CborError::UnexpectedEof(pos))
+      return 0UL
+    }
+    let v = data[pos].to_int().to_int64().to_uint64()
+    dec.pos = pos + 1
+    if dec.require_canonical && v < 24UL {
+      set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+      return 0UL
+    }
+    return v
+  }
+  if ai == 25 {
+    if rem < 2 {
+      set_err(dec, CborError::UnexpectedEof(pos))
+      return 0UL
+    }
+    let b0 = data[pos].to_int().to_int64().to_uint64()
+    let b1 = data[pos + 1].to_int().to_int64().to_uint64()
+    dec.pos = pos + 2
+    let v = (b0 << 8) | b1
+    if dec.require_canonical && v <= 0xFFUL {
+      set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+      return 0UL
+    }
+    return v
+  }
+  if ai == 26 {
+    if rem < 4 {
+      set_err(dec, CborError::UnexpectedEof(pos))
+      return 0UL
+    }
+    let b0 = data[pos].to_int().to_int64().to_uint64()
+    let b1 = data[pos + 1].to_int().to_int64().to_uint64()
+    let b2 = data[pos + 2].to_int().to_int64().to_uint64()
+    let b3 = data[pos + 3].to_int().to_int64().to_uint64()
+    dec.pos = pos + 4
+    let v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    if dec.require_canonical && v <= 0xFFFFUL {
+      set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+      return 0UL
+    }
+    return v
+  }
+  if ai == 27 {
+    if rem < 8 {
+      set_err(dec, CborError::UnexpectedEof(pos))
+      return 0UL
+    }
+    let b0 = data[pos].to_int().to_int64().to_uint64()
+    let b1 = data[pos + 1].to_int().to_int64().to_uint64()
+    let b2 = data[pos + 2].to_int().to_int64().to_uint64()
+    let b3 = data[pos + 3].to_int().to_int64().to_uint64()
+    let b4 = data[pos + 4].to_int().to_int64().to_uint64()
+    let b5 = data[pos + 5].to_int().to_int64().to_uint64()
+    let b6 = data[pos + 6].to_int().to_int64().to_uint64()
+    let b7 = data[pos + 7].to_int().to_int64().to_uint64()
+    dec.pos = pos + 8
+    let v = (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+    if dec.require_canonical && v <= 0xFFFFFFFFUL {
+      set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+      return 0UL
+    }
+    return v
+  }
+  set_err(dec, CborError::InvalidAdditionalInfo(ai, start_pos))
+  0UL
+}
+
+///|
+fn decode_indef_bytes(dec : Decoder, start_pos : Int) -> CborValue {
+  if dec.require_canonical {
+    set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+    return CborValue::Null
+  }
+  let starts : Array[Int] = []
+  let lens : Array[Int] = []
+  let mut total = 0
+  let data = dec.data
+  while true {
+    if dec.pos >= dec.len {
+      set_err(dec, CborError::UnexpectedEof(dec.pos))
+      return CborValue::Null
+    }
+    let b = data[dec.pos].to_int()
     if b == 0xFF {
       dec.pos = dec.pos + 1
       break
@@ -175,50 +531,70 @@ fn decode_indef_bytes(dec : Decoder, start_pos : Int) -> Result[CborValue, CborE
     let major = (b >> 5) & 7
     let ai = b & 31
     if major != 2 || ai == 31 {
-      return Err(CborError::InvalidIndefiniteChunk(dec.pos))
+      set_err(dec, CborError::InvalidIndefiniteChunk(dec.pos))
+      return CborValue::Null
     }
     let chunk_start = dec.pos
     dec.pos = dec.pos + 1
-    let len_u64 = match read_uint_arg(dec, ai, chunk_start) {
-      Ok(v) => v
-      Err(e) => return Err(e)
+    let len_u64 = if ai < 24 {
+      ai.to_int64().to_uint64()
+    } else {
+      let v = read_uint_arg_slow(dec, ai, chunk_start)
+      if dec.has_err {
+        return CborValue::Null
+      }
+      v
     }
-    let rem_u64 = (dec.data.length() - dec.pos).to_int64().to_uint64()
+    let rem_u64 = (dec.len - dec.pos).to_int64().to_uint64()
     if len_u64 > rem_u64 {
-      return Err(CborError::UnexpectedEof(dec.pos))
+      set_err(dec, CborError::UnexpectedEof(dec.pos))
+      return CborValue::Null
     }
     let len = len_u64.to_int()
-    chunks.push(dec.data.slice(dec.pos, dec.pos + len))
-    dec.pos = dec.pos + len
-    total_len = total_len + len
-  }
-  let out = Bytes::new(total_len)
-  let mut off = 0
-  let mut i = 0
-  while i < chunks.length() {
-    let ch = chunks[i]
-    let mut j = 0
-    while j < ch.length() {
-      out[off] = ch[j]
-      off = off + 1
-      j = j + 1
+    if len > 0 {
+      starts.push(dec.pos)
+      lens.push(len)
+      total = total + len
+      dec.pos = dec.pos + len
     }
-    i = i + 1
   }
-  Ok(CborValue::Bytes(out))
+  if total == 0 {
+    return CborValue::Bytes(Bytes::new(0))
+  }
+  let out = Bytes::new(total)
+  let n_chunks = starts.length()
+  let mut dst = 0
+  let mut c = 0
+  while c < n_chunks {
+    let s = starts[c]
+    let l = lens[c]
+    let mut k = 0
+    while k < l {
+      out[dst + k] = data[s + k]
+      k = k + 1
+    }
+    dst = dst + l
+    c = c + 1
+  }
+  CborValue::Bytes(out)
 }
 
 ///|
-fn decode_indef_text(dec : Decoder, start_pos : Int) -> Result[CborValue, CborError] {
-  if dec.opts.require_canonical {
-    return Err(CborError::NonCanonicalEncoding(start_pos))
+fn decode_indef_text(dec : Decoder, start_pos : Int) -> CborValue {
+  if dec.require_canonical {
+    set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+    return CborValue::Null
   }
-  let sb = StringBuilder::new()
+  let starts : Array[Int] = []
+  let lens : Array[Int] = []
+  let mut total = 0
+  let data = dec.data
   while true {
-    if dec.pos >= dec.data.length() {
-      return Err(CborError::UnexpectedEof(dec.pos))
+    if dec.pos >= dec.len {
+      set_err(dec, CborError::UnexpectedEof(dec.pos))
+      return CborValue::Null
     }
-    let b = dec.data[dec.pos].to_int()
+    let b = data[dec.pos].to_int()
     if b == 0xFF {
       dec.pos = dec.pos + 1
       break
@@ -226,378 +602,709 @@ fn decode_indef_text(dec : Decoder, start_pos : Int) -> Result[CborValue, CborEr
     let major = (b >> 5) & 7
     let ai = b & 31
     if major != 3 || ai == 31 {
-      return Err(CborError::InvalidIndefiniteChunk(dec.pos))
+      set_err(dec, CborError::InvalidIndefiniteChunk(dec.pos))
+      return CborValue::Null
     }
     let chunk_start = dec.pos
     dec.pos = dec.pos + 1
-    let len_u64 = match read_uint_arg(dec, ai, chunk_start) {
-      Ok(v) => v
-      Err(e) => return Err(e)
+    let len_u64 = if ai < 24 {
+      ai.to_int64().to_uint64()
+    } else {
+      let v = read_uint_arg_slow(dec, ai, chunk_start)
+      if dec.has_err {
+        return CborValue::Null
+      }
+      v
     }
-    let rem_u64 = (dec.data.length() - dec.pos).to_int64().to_uint64()
+    let rem_u64 = (dec.len - dec.pos).to_int64().to_uint64()
     if len_u64 > rem_u64 {
-      return Err(CborError::UnexpectedEof(dec.pos))
+      set_err(dec, CborError::UnexpectedEof(dec.pos))
+      return CborValue::Null
     }
     let len = len_u64.to_int()
-    if !is_valid_utf8_range(dec.data, dec.pos, len) {
-      return Err(CborError::InvalidUtf8(dec.pos))
+    if !is_valid_utf8_range(data, dec.pos, len) {
+      set_err(dec, CborError::InvalidUtf8(dec.pos))
+      return CborValue::Null
     }
-    let slice = dec.data.slice(dec.pos, dec.pos + len)
-    sb.write_string(slice.to_string())
-    dec.pos = dec.pos + len
+    if len > 0 {
+      starts.push(dec.pos)
+      lens.push(len)
+      total = total + len
+      dec.pos = dec.pos + len
+    }
   }
-  Ok(CborValue::Text(sb.to_string()))
+  if total == 0 {
+    return CborValue::Text("")
+  }
+  let out = Bytes::new(total)
+  let n_chunks = starts.length()
+  let mut dst = 0
+  let mut c = 0
+  while c < n_chunks {
+    let s = starts[c]
+    let l = lens[c]
+    let mut k = 0
+    while k < l {
+      out[dst + k] = data[s + k]
+      k = k + 1
+    }
+    dst = dst + l
+    c = c + 1
+  }
+  CborValue::Text(out.to_string())
 }
 
 ///|
-fn decode_item(dec : Decoder, depth : Int) -> Result[CborValue, CborError] {
-  if dec.pos >= dec.data.length() {
-    return Err(CborError::UnexpectedEof(dec.pos))
-  }
+fn decode_item(dec : Decoder, depth : Int) -> CborValue {
   let start_pos = dec.pos
-  let initial = dec.data[dec.pos].to_int()
-  dec.pos = dec.pos + 1
+  if start_pos >= dec.len {
+    set_err(dec, CborError::UnexpectedEof(start_pos))
+    return CborValue::Null
+  }
+  let initial = dec.data[start_pos].to_int()
+  dec.pos = start_pos + 1
   let major = (initial >> 5) & 7
   let ai = initial & 31
 
-  if major == 0 {
-    let v = match read_uint_arg(dec, ai, start_pos) {
-      Ok(x) => x
-      Err(e) => return Err(e)
-    }
-    return Ok(CborValue::Unsigned(v))
-  }
-
-  if major == 1 {
-    let v = match read_uint_arg(dec, ai, start_pos) {
-      Ok(x) => x
-      Err(e) => return Err(e)
-    }
-    return Ok(CborValue::Negative(v))
-  }
-
-  if major == 2 {
-    if ai == 31 {
-      return decode_indef_bytes(dec, start_pos)
-    }
-    let len_u64 = match read_uint_arg(dec, ai, start_pos) {
-      Ok(x) => x
-      Err(e) => return Err(e)
-    }
-    let rem_u64 = (dec.data.length() - dec.pos).to_int64().to_uint64()
-    if len_u64 > rem_u64 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let len = len_u64.to_int()
-    let slice = dec.data.slice(dec.pos, dec.pos + len)
-    dec.pos = dec.pos + len
-    return Ok(CborValue::Bytes(slice))
-  }
-
-  if major == 3 {
-    if ai == 31 {
-      return decode_indef_text(dec, start_pos)
-    }
-    let len_u64 = match read_uint_arg(dec, ai, start_pos) {
-      Ok(x) => x
-      Err(e) => return Err(e)
-    }
-    let rem_u64 = (dec.data.length() - dec.pos).to_int64().to_uint64()
-    if len_u64 > rem_u64 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let len = len_u64.to_int()
-    if !is_valid_utf8_range(dec.data, dec.pos, len) {
-      return Err(CborError::InvalidUtf8(dec.pos))
-    }
-    let slice = dec.data.slice(dec.pos, dec.pos + len)
-    dec.pos = dec.pos + len
-    return Ok(CborValue::Text(slice.to_string()))
-  }
-
-  if major == 4 {
-    let next_depth = depth + 1
-    if next_depth > dec.opts.max_depth {
-      return Err(CborError::MaxDepthExceeded(dec.opts.max_depth))
-    }
-    if ai == 31 {
-      if dec.opts.require_canonical {
-        return Err(CborError::NonCanonicalEncoding(start_pos))
+  match major {
+    0 => {
+      let v = if ai < 24 {
+        ai.to_int64().to_uint64()
+      } else {
+        read_uint_arg_slow(dec, ai, start_pos)
       }
-      let items : Array[CborValue] = []
-      while true {
-        if dec.pos >= dec.data.length() {
-          return Err(CborError::UnexpectedEof(dec.pos))
+      CborValue::Unsigned(v)
+    }
+    1 => {
+      let v = if ai < 24 {
+        ai.to_int64().to_uint64()
+      } else {
+        read_uint_arg_slow(dec, ai, start_pos)
+      }
+      CborValue::Negative(v)
+    }
+    2 => {
+      if ai == 31 {
+        return decode_indef_bytes(dec, start_pos)
+      }
+      let len = if ai < 24 {
+        if ai > dec.len - dec.pos {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
         }
-        if dec.data[dec.pos].to_int() == 0xFF {
-          dec.pos = dec.pos + 1
-          break
+        ai
+      } else {
+        let len_u64 = read_uint_arg_slow(dec, ai, start_pos)
+        if dec.has_err {
+          return CborValue::Null
         }
-        if items.length() >= dec.opts.max_elements {
-          return Err(CborError::MaxElementsExceeded(dec.opts.max_elements))
+        let rem_u64 = (dec.len - dec.pos).to_int64().to_uint64()
+        if len_u64 > rem_u64 {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
         }
-        let item = match decode_item(dec, next_depth) {
-          Ok(v) => v
-          Err(e) => return Err(e)
+        len_u64.to_int()
+      }
+      if len == 0 {
+        return CborValue::Bytes(Bytes::new(0))
+      }
+      let p = dec.pos
+      dec.pos = p + len
+      CborValue::Bytes(dec.data.slice(p, p + len))
+    }
+    3 => {
+      if ai == 31 {
+        return decode_indef_text(dec, start_pos)
+      }
+      let len = if ai < 24 {
+        if ai > dec.len - dec.pos {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
+        }
+        ai
+      } else {
+        let len_u64 = read_uint_arg_slow(dec, ai, start_pos)
+        if dec.has_err {
+          return CborValue::Null
+        }
+        let rem_u64 = (dec.len - dec.pos).to_int64().to_uint64()
+        if len_u64 > rem_u64 {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
+        }
+        len_u64.to_int()
+      }
+      if len == 0 {
+        return CborValue::Text("")
+      }
+      let p = dec.pos
+      if !is_valid_utf8_range(dec.data, p, len) {
+        set_err(dec, CborError::InvalidUtf8(p))
+        return CborValue::Null
+      }
+      dec.pos = p + len
+      CborValue::Text(get_data_str(dec).slice(p, p + len))
+    }
+    4 => {
+      let next_depth = depth + 1
+      if next_depth > dec.max_depth {
+        set_err(dec, CborError::MaxDepthExceeded(dec.max_depth))
+        return CborValue::Null
+      }
+      if ai == 31 {
+        if dec.require_canonical {
+          set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+          return CborValue::Null
+        }
+        let items : Array[CborValue] = []
+        while true {
+          if dec.pos >= dec.len {
+            set_err(dec, CborError::UnexpectedEof(dec.pos))
+            return CborValue::Null
+          }
+          if dec.data[dec.pos].to_int() == 0xFF {
+            dec.pos = dec.pos + 1
+            break
+          }
+          if items.length() >= dec.max_elements {
+            set_err(dec, CborError::MaxElementsExceeded(dec.max_elements))
+            return CborValue::Null
+          }
+          let item = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          items.push(item)
+        }
+        return CborValue::Array(items)
+      }
+      let count = if ai < 24 {
+        if ai > dec.max_elements {
+          set_err(dec, CborError::MaxElementsExceeded(dec.max_elements))
+          return CborValue::Null
+        }
+        if ai > dec.len - dec.pos {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
+        }
+        ai
+      } else {
+        let len_u64 = read_uint_arg_slow(dec, ai, start_pos)
+        if dec.has_err {
+          return CborValue::Null
+        }
+        if len_u64 > dec.max_elements.to_int64().to_uint64() {
+          set_err(dec, CborError::MaxElementsExceeded(dec.max_elements))
+          return CborValue::Null
+        }
+        let rem_u64 = (dec.len - dec.pos).to_int64().to_uint64()
+        if len_u64 > rem_u64 {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
+        }
+        len_u64.to_int()
+      }
+      let cap = if count < 4096 { count } else { 4096 }
+      let items : Array[CborValue] = Array::with_capacity(cap)
+      let mut i = 0
+      while i < count {
+        let item = decode_item(dec, next_depth)
+        if dec.has_err {
+          return CborValue::Null
         }
         items.push(item)
+        i = i + 1
       }
-      return Ok(CborValue::Array(items))
+      CborValue::Array(items)
     }
-    let len_u64 = match read_uint_arg(dec, ai, start_pos) {
-      Ok(x) => x
-      Err(e) => return Err(e)
-    }
-    if len_u64 > dec.opts.max_elements.to_int64().to_uint64() {
-      return Err(CborError::MaxElementsExceeded(dec.opts.max_elements))
-    }
-    let rem_u64 = (dec.data.length() - dec.pos).to_int64().to_uint64()
-    if len_u64 > rem_u64 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let count = len_u64.to_int()
-    let items : Array[CborValue] = []
-    let mut i = 0
-    while i < count {
-      let item = match decode_item(dec, next_depth) {
-        Ok(v) => v
-        Err(e) => return Err(e)
+    5 => {
+      let next_depth = depth + 1
+      if next_depth > dec.max_depth {
+        set_err(dec, CborError::MaxDepthExceeded(dec.max_depth))
+        return CborValue::Null
       }
-      items.push(item)
-      i = i + 1
-    }
-    return Ok(CborValue::Array(items))
-  }
-
-  if major == 5 {
-    let next_depth = depth + 1
-    if next_depth > dec.opts.max_depth {
-      return Err(CborError::MaxDepthExceeded(dec.opts.max_depth))
-    }
-    if ai == 31 {
-      if dec.opts.require_canonical {
-        return Err(CborError::NonCanonicalEncoding(start_pos))
+      if ai == 31 {
+        if dec.require_canonical {
+          set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+          return CborValue::Null
+        }
+        let pairs : Array[(CborValue, CborValue)] = []
+        let mut hash_set : Option[KeyHashSet] = Option::None
+        while true {
+          if dec.pos >= dec.len {
+            set_err(dec, CborError::UnexpectedEof(dec.pos))
+            return CborValue::Null
+          }
+          if dec.data[dec.pos].to_int() == 0xFF {
+            dec.pos = dec.pos + 1
+            break
+          }
+          if pairs.length() >= dec.max_elements {
+            set_err(dec, CborError::MaxElementsExceeded(dec.max_elements))
+            return CborValue::Null
+          }
+          let key_pos = dec.pos
+          let k = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          if dec.pos >= dec.len {
+            set_err(dec, CborError::UnexpectedEof(dec.pos))
+            return CborValue::Null
+          }
+          if dec.data[dec.pos].to_int() == 0xFF {
+            set_err(dec, CborError::UnexpectedBreak(dec.pos))
+            return CborValue::Null
+          }
+          let v = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          if dec.reject_duplicate_keys {
+            let cur_len = pairs.length()
+            match hash_set {
+              Some(set) => {
+                if !key_hash_set_insert(set, pairs, k, cur_len) {
+                  set_err(dec, CborError::DuplicateMapKey(key_pos))
+                  return CborValue::Null
+                }
+              }
+              None => {
+                let mut j = 0
+                while j < cur_len {
+                  let (pk, _) = pairs[j]
+                  if cbor_key_equals(pk, k) {
+                    set_err(dec, CborError::DuplicateMapKey(key_pos))
+                    return CborValue::Null
+                  }
+                  j = j + 1
+                }
+                if cur_len >= 8 {
+                  let set = make_key_hash_set(32)
+                  let mut idx = 0
+                  while idx < cur_len {
+                    let (pk, _) = pairs[idx]
+                    let _ = key_hash_set_insert(set, pairs, pk, idx)
+                    idx = idx + 1
+                  }
+                  let _ = key_hash_set_insert(set, pairs, k, cur_len)
+                  hash_set = Option::Some(set)
+                }
+              }
+            }
+          }
+          pairs.push((k, v))
+        }
+        return CborValue::Map(pairs)
       }
-      let pairs : Array[(CborValue, CborValue)] = []
-      while true {
-        if dec.pos >= dec.data.length() {
-          return Err(CborError::UnexpectedEof(dec.pos))
+      let count = if ai < 24 {
+        if ai > dec.max_elements {
+          set_err(dec, CborError::MaxElementsExceeded(dec.max_elements))
+          return CborValue::Null
         }
-        if dec.data[dec.pos].to_int() == 0xFF {
-          dec.pos = dec.pos + 1
-          break
+        if ai * 2 > dec.len - dec.pos {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
         }
-        if pairs.length() >= dec.opts.max_elements {
-          return Err(CborError::MaxElementsExceeded(dec.opts.max_elements))
+        ai
+      } else {
+        let len_u64 = read_uint_arg_slow(dec, ai, start_pos)
+        if dec.has_err {
+          return CborValue::Null
         }
-        let key_pos = dec.pos
-        let k = match decode_item(dec, next_depth) {
-          Ok(v) => v
-          Err(e) => return Err(e)
+        if len_u64 > dec.max_elements.to_int64().to_uint64() {
+          set_err(dec, CborError::MaxElementsExceeded(dec.max_elements))
+          return CborValue::Null
         }
-        if dec.pos >= dec.data.length() {
-          return Err(CborError::UnexpectedEof(dec.pos))
+        let rem_u64 = (dec.len - dec.pos).to_int64().to_uint64()
+        if len_u64 * 2UL > rem_u64 {
+          set_err(dec, CborError::UnexpectedEof(dec.pos))
+          return CborValue::Null
         }
-        if dec.data[dec.pos].to_int() == 0xFF {
-          return Err(CborError::UnexpectedBreak(dec.pos))
+        len_u64.to_int()
+      }
+      let cap = if count < 4096 { count } else { 4096 }
+      let pairs : Array[(CborValue, CborValue)] = Array::with_capacity(cap)
+      if !dec.require_canonical && !dec.reject_duplicate_keys {
+        let mut i = 0
+        while i < count {
+          let k = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          let v = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          pairs.push((k, v))
+          i = i + 1
         }
-        let v = match decode_item(dec, next_depth) {
-          Ok(x) => x
-          Err(e) => return Err(e)
+        return CborValue::Map(pairs)
+      }
+      if dec.require_canonical {
+        let mut prev_k_start = -1
+        let mut prev_k_end = -1
+        let mut rfc_ok = dec.canonical_mode != 2
+        let mut ctap2_ok = dec.canonical_mode != 1
+        let mut i = 0
+        while i < count {
+          let k_start = dec.pos
+          let k = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          let k_end = dec.pos
+          if prev_k_start >= 0 {
+            let ord_lex = cmp_slice_lex(dec.data, prev_k_start, prev_k_end, k_start, k_end)
+            if ord_lex == 0 {
+              set_err(dec, CborError::DuplicateMapKey(k_start))
+              return CborValue::Null
+            }
+            if ord_lex > 0 {
+              rfc_ok = false
+            }
+            if ctap2_ok {
+              let l1 = prev_k_end - prev_k_start
+              let l2 = k_end - k_start
+              let ord_ctap = if l1 != l2 {
+                if l1 < l2 { -1 } else { 1 }
+              } else {
+                ord_lex
+              }
+              if ord_ctap > 0 {
+                ctap2_ok = false
+              }
+            }
+            if !rfc_ok && !ctap2_ok {
+              set_err(dec, CborError::NonCanonicalEncoding(k_start))
+              return CborValue::Null
+            }
+          }
+          prev_k_start = k_start
+          prev_k_end = k_end
+          let v = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          pairs.push((k, v))
+          i = i + 1
         }
-        if dec.opts.reject_duplicate_keys {
+        return CborValue::Map(pairs)
+      }
+      // reject_duplicate_keys && !require_canonical
+      if count <= 8 {
+        let mut i = 0
+        while i < count {
+          let k_start = dec.pos
+          let k = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
           let mut j = 0
           while j < pairs.length() {
             let (pk, _) = pairs[j]
-            if cbor_equals(pk, k) {
-              return Err(CborError::DuplicateMapKey(key_pos))
+            if cbor_key_equals(pk, k) {
+              set_err(dec, CborError::DuplicateMapKey(k_start))
+              return CborValue::Null
             }
             j = j + 1
           }
+          let v = decode_item(dec, next_depth)
+          if dec.has_err {
+            return CborValue::Null
+          }
+          pairs.push((k, v))
+          i = i + 1
+        }
+        return CborValue::Map(pairs)
+      }
+      let init_table = if count < 4096 { count * 2 } else { 8192 }
+      let set = make_key_hash_set(init_table)
+      let mut i = 0
+      while i < count {
+        let k_start = dec.pos
+        let k = decode_item(dec, next_depth)
+        if dec.has_err {
+          return CborValue::Null
+        }
+        if !key_hash_set_insert(set, pairs, k, i) {
+          set_err(dec, CborError::DuplicateMapKey(k_start))
+          return CborValue::Null
+        }
+        let v = decode_item(dec, next_depth)
+        if dec.has_err {
+          return CborValue::Null
         }
         pairs.push((k, v))
+        i = i + 1
       }
-      return Ok(CborValue::Map(pairs))
+      CborValue::Map(pairs)
     }
-    let len_u64 = match read_uint_arg(dec, ai, start_pos) {
-      Ok(x) => x
-      Err(e) => return Err(e)
-    }
-    if len_u64 > dec.opts.max_elements.to_int64().to_uint64() {
-      return Err(CborError::MaxElementsExceeded(dec.opts.max_elements))
-    }
-    let rem_u64 = (dec.data.length() - dec.pos).to_int64().to_uint64()
-    if len_u64 * 2UL > rem_u64 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let count = len_u64.to_int()
-    let pairs : Array[(CborValue, CborValue)] = []
-    let mut prev_k_start = -1
-    let mut prev_k_end = -1
-    let mut i = 0
-    while i < count {
-      let k_start = dec.pos
-      let k = match decode_item(dec, next_depth) {
-        Ok(v) => v
-        Err(e) => return Err(e)
+    6 => {
+      let tag_num = if ai < 24 {
+        ai.to_int64().to_uint64()
+      } else {
+        let v = read_uint_arg_slow(dec, ai, start_pos)
+        if dec.has_err {
+          return CborValue::Null
+        }
+        v
       }
-      let k_end = dec.pos
-      if dec.opts.require_canonical && prev_k_start >= 0 {
-        let ord = cmp_slice_lex(dec.data, prev_k_start, prev_k_end, k_start, k_end)
-        if ord == 0 {
-          return Err(CborError::DuplicateMapKey(k_start))
-        }
-        if ord > 0 {
-          return Err(CborError::NonCanonicalEncoding(k_start))
-        }
-      } else if dec.opts.reject_duplicate_keys {
-        let mut j = 0
-        while j < pairs.length() {
-          let (pk, _) = pairs[j]
-          if cbor_equals(pk, k) {
-            return Err(CborError::DuplicateMapKey(k_start))
+      if dec.pos >= dec.len {
+        set_err(dec, CborError::UnexpectedEof(dec.pos))
+        return CborValue::Null
+      }
+      let next_depth = depth + 1
+      if next_depth > dec.max_depth {
+        set_err(dec, CborError::MaxDepthExceeded(dec.max_depth))
+        return CborValue::Null
+      }
+      let content = decode_item(dec, next_depth)
+      if dec.has_err {
+        return CborValue::Null
+      }
+      // RFC 8949 §3.4.1–§3.4.3 standard tag content validation
+      if tag_num == 0UL {
+        match content {
+          Text(s) =>
+          if !is_valid_rfc3339(s) {
+            set_err(dec, CborError::UnsupportedValue("tag 0 requires valid RFC 3339 date-time string"))
+            return CborValue::Null
           }
-          j = j + 1
+          _ => {
+            set_err(dec, CborError::UnsupportedValue("tag 0 requires text string"))
+            return CborValue::Null
+          }
+        }
+      } else if tag_num == 1UL {
+        match content {
+          Unsigned(_) | Negative(_) => ()
+          Float(d) => {
+            let bits = d.to_bits()
+            let exp = ((bits >> 52) & 0x7FFL).to_int()
+            if exp == 0x7FF {
+              set_err(dec, CborError::UnsupportedValue("tag 1 requires finite numeric epoch"))
+              return CborValue::Null
+            }
+          }
+          _ => {
+            set_err(dec, CborError::UnsupportedValue("tag 1 requires integer or float"))
+            return CborValue::Null
+          }
+        }
+      } else if tag_num == 2UL || tag_num == 3UL {
+        match content {
+          Bytes(b) =>
+          if dec.require_canonical {
+            let blen = b.length()
+            if blen <= 8 || b[0].to_int() == 0 {
+              set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+              return CborValue::Null
+            }
+          }
+          _ => {
+            set_err(dec, CborError::UnsupportedValue("tag 2/3 requires byte string"))
+            return CborValue::Null
+          }
         }
       }
-      prev_k_start = k_start
-      prev_k_end = k_end
-      let v = match decode_item(dec, next_depth) {
-        Ok(x) => x
-        Err(e) => return Err(e)
-      }
-      pairs.push((k, v))
-      i = i + 1
+      CborValue::Tag(tag_num, content)
     }
-    return Ok(CborValue::Map(pairs))
+    _ => {
+      // major == 7: simple values and IEEE-754 floating-point
+      match ai {
+        20 => CborValue::Bool(false)
+        21 => CborValue::Bool(true)
+        22 => CborValue::Null
+        23 => CborValue::Undefined
+        24 => {
+          if dec.pos >= dec.len {
+            set_err(dec, CborError::UnexpectedEof(dec.pos))
+            return CborValue::Null
+          }
+          let sv = dec.data[dec.pos].to_int()
+          dec.pos = dec.pos + 1
+          if sv < 32 {
+            set_err(dec, CborError::InvalidSimpleValue(sv))
+            return CborValue::Null
+          }
+          CborValue::Simple(sv)
+        }
+        25 => {
+          let p = dec.pos
+          if dec.len - p < 2 {
+            set_err(dec, CborError::UnexpectedEof(p))
+            return CborValue::Null
+          }
+          let h = (dec.data[p].to_int() << 8) | dec.data[p + 1].to_int()
+          dec.pos = p + 2
+          if dec.require_canonical {
+            let exp = (h >> 10) & 0x1F
+            let frac = h & 0x3FF
+            if exp == 31 && frac != 0 && h != 0x7E00 {
+              set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+              return CborValue::Null
+            }
+          }
+          CborValue::Float(float16_to_double(h))
+        }
+        26 => {
+          let p = dec.pos
+          if dec.len - p < 4 {
+            set_err(dec, CborError::UnexpectedEof(p))
+            return CborValue::Null
+          }
+          let data = dec.data
+          let b0 = data[p].to_int().to_int64()
+          let b1 = data[p + 1].to_int().to_int64()
+          let b2 = data[p + 2].to_int().to_int64()
+          let b3 = data[p + 3].to_int().to_int64()
+          dec.pos = p + 4
+          let f32bits = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+          let d = float32_to_double(f32bits)
+          if dec.require_canonical {
+            match double_to_float16_exact(d) {
+              Some(_) => {
+                set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+                return CborValue::Null
+              }
+              None => ()
+            }
+          }
+          CborValue::Float(d)
+        }
+        27 => {
+          let p = dec.pos
+          if dec.len - p < 8 {
+            set_err(dec, CborError::UnexpectedEof(p))
+            return CborValue::Null
+          }
+          let data = dec.data
+          let b0 = data[p].to_int().to_int64()
+          let b1 = data[p + 1].to_int().to_int64()
+          let b2 = data[p + 2].to_int().to_int64()
+          let b3 = data[p + 3].to_int().to_int64()
+          let b4 = data[p + 4].to_int().to_int64()
+          let b5 = data[p + 5].to_int().to_int64()
+          let b6 = data[p + 6].to_int().to_int64()
+          let b7 = data[p + 7].to_int().to_int64()
+          dec.pos = p + 8
+          let f64bits = (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+          let d = Double::from_bits(f64bits)
+          if dec.require_canonical {
+            match double_to_float32_exact(d) {
+              Some(_) => {
+                set_err(dec, CborError::NonCanonicalEncoding(start_pos))
+                return CborValue::Null
+              }
+              None => ()
+            }
+          }
+          CborValue::Float(d)
+        }
+        31 => {
+          set_err(dec, CborError::UnexpectedBreak(start_pos))
+          CborValue::Null
+        }
+        _ =>
+        if ai < 20 {
+          CborValue::Simple(ai)
+        } else {
+          set_err(dec, CborError::InvalidAdditionalInfo(ai, start_pos))
+          CborValue::Null
+        }
+      }
+    }
   }
+}
 
-  if major == 6 {
-    let tag_num = match read_uint_arg(dec, ai, start_pos) {
-      Ok(x) => x
-      Err(e) => return Err(e)
-    }
-    if dec.pos >= dec.data.length() {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let next_depth = depth + 1
-    if next_depth > dec.opts.max_depth {
-      return Err(CborError::MaxDepthExceeded(dec.opts.max_depth))
-    }
-    let content = match decode_item(dec, next_depth) {
-      Ok(v) => v
-      Err(e) => return Err(e)
-    }
-    return Ok(CborValue::Tag(tag_num, content))
+///|
+fn clamp_max_depth(d : Int) -> Int {
+  if d < 0 {
+    0
+  } else if d > max_safe_depth {
+    max_safe_depth
+  } else {
+    d
   }
+}
 
-  // major == 7: simple values and IEEE-754 floating-point
-  if ai < 20 {
-    return Ok(CborValue::Simple(ai))
+///|
+fn decode_internal(
+  data : Bytes,
+  offset : Int,
+  opts : DecodeOptions,
+  canonical_mode : Int,
+  allow_trailing : Bool,
+) -> Result[(CborValue, Int), CborError] {
+  let n = data.length()
+  if offset < 0 || offset >= n {
+    return Err(CborError::UnexpectedEof(if offset < 0 { 0 } else { offset }))
   }
-  if ai == 20 {
-    return Ok(CborValue::Bool(false))
+  let dec = Decoder::{
+    data: data,
+    data_str: "",
+    has_data_str: false,
+    len: n,
+    pos: offset,
+    max_depth: clamp_max_depth(opts.max_depth),
+    max_elements: opts.max_elements,
+    reject_duplicate_keys: opts.reject_duplicate_keys,
+    require_canonical: opts.require_canonical,
+    canonical_mode: canonical_mode,
+    has_err: false,
+    err: CborError::UnexpectedEof(offset),
   }
-  if ai == 21 {
-    return Ok(CborValue::Bool(true))
+  let v = decode_item(dec, 0)
+  if dec.has_err {
+    return Err(dec.err)
   }
-  if ai == 22 {
-    return Ok(CborValue::Null)
+  if !allow_trailing && dec.pos != n {
+    return Err(CborError::TrailingBytes(dec.pos))
   }
-  if ai == 23 {
-    return Ok(CborValue::Undefined)
-  }
-  if ai == 24 {
-    if dec.pos >= dec.data.length() {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let sv = dec.data[dec.pos].to_int()
-    dec.pos = dec.pos + 1
-    if sv < 32 {
-      return Err(CborError::InvalidSimpleValue(sv))
-    }
-    return Ok(CborValue::Simple(sv))
-  }
-  if ai == 25 {
-    if dec.data.length() - dec.pos < 2 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let h = (dec.data[dec.pos].to_int() << 8) | dec.data[dec.pos + 1].to_int()
-    dec.pos = dec.pos + 2
-    if dec.opts.require_canonical {
-      // If NaN in float16, canonical form is strictly 0x7E00
-      let exp = (h >> 10) & 0x1F
-      let frac = h & 0x3FF
-      if exp == 31 && frac != 0 && h != 0x7E00 {
-        return Err(CborError::NonCanonicalEncoding(start_pos))
-      }
-    }
-    return Ok(CborValue::Float(float16_to_double(h)))
-  }
-  if ai == 26 {
-    if dec.data.length() - dec.pos < 4 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let b0 = dec.data[dec.pos].to_int().to_int64()
-    let b1 = dec.data[dec.pos + 1].to_int().to_int64()
-    let b2 = dec.data[dec.pos + 2].to_int().to_int64()
-    let b3 = dec.data[dec.pos + 3].to_int().to_int64()
-    dec.pos = dec.pos + 4
-    let f32bits = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-    let d = float32_to_double(f32bits)
-    if dec.opts.require_canonical {
-      match double_to_float16_exact(d) {
-        Some(_) => return Err(CborError::NonCanonicalEncoding(start_pos))
-        None => ()
-      }
-    }
-    return Ok(CborValue::Float(d))
-  }
-  if ai == 27 {
-    if dec.data.length() - dec.pos < 8 {
-      return Err(CborError::UnexpectedEof(dec.pos))
-    }
-    let b0 = dec.data[dec.pos].to_int().to_int64()
-    let b1 = dec.data[dec.pos + 1].to_int().to_int64()
-    let b2 = dec.data[dec.pos + 2].to_int().to_int64()
-    let b3 = dec.data[dec.pos + 3].to_int().to_int64()
-    let b4 = dec.data[dec.pos + 4].to_int().to_int64()
-    let b5 = dec.data[dec.pos + 5].to_int().to_int64()
-    let b6 = dec.data[dec.pos + 6].to_int().to_int64()
-    let b7 = dec.data[dec.pos + 7].to_int().to_int64()
-    dec.pos = dec.pos + 8
-    let f64bits = (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
-    let d = Double::from_bits(f64bits)
-    if dec.opts.require_canonical {
-      match double_to_float32_exact(d) {
-        Some(_) => return Err(CborError::NonCanonicalEncoding(start_pos))
-        None => ()
-      }
-    }
-    return Ok(CborValue::Float(d))
-  }
-  if ai == 31 {
-    return Err(CborError::UnexpectedBreak(start_pos))
-  }
-  Err(CborError::InvalidAdditionalInfo(ai, start_pos))
+  Ok((v, dec.pos - offset))
 }
 
 ///|
 pub fn decode(data : Bytes, opts : DecodeOptions) -> Result[CborValue, CborError] {
-  if data.length() == 0 {
-    return Err(CborError::UnexpectedEof(0))
-  }
-  let dec = Decoder::{ data: data, pos: 0, opts: opts }
-  let val_res = decode_item(dec, 0)
-  match val_res {
+  match decode_internal(data, 0, opts, 0, opts.allow_trailing_bytes) {
+    Ok((v, _)) => Ok(v)
     Err(e) => Err(e)
-    Ok(v) => {
-      if !opts.allow_trailing_bytes && dec.pos != data.length() {
-        return Err(CborError::TrailingBytes(dec.pos))
-      }
-      Ok(v)
-    }
   }
+}
+
+///| Decode strictly enforcing a specific canonical map key ordering (CoreDeterministic or Ctap2).
+pub fn decode_strict(data : Bytes, mode : SortMode) -> Result[CborValue, CborError] {
+  let cm = match mode {
+    SortMode::CoreDeterministic => 1
+    SortMode::Ctap2 => 2
+    SortMode::None => 0
+  }
+  match decode_internal(data, 0, DecodeOptions::strict(), cm, false) {
+    Ok((v, _)) => Ok(v)
+    Err(e) => Err(e)
+  }
+}
+
+///| Decode a single CBOR item from the start of `data`, returning `(value, bytes_consumed)`.
+///  Trailing bytes after the first item are left unconsumed (ideal for CBOR sequences and
+///  WebAuthn `attestedCredentialData` where `COSE_Key` is followed by `extensions`).
+pub fn decode_prefix(data : Bytes, opts : DecodeOptions) -> Result[(CborValue, Int), CborError] {
+  decode_internal(data, 0, opts, 0, true)
+}
+
+///| Decode a single CBOR item starting at `offset` in `data`, returning `(value, bytes_consumed)`.
+pub fn decode_prefix_at(
+  data : Bytes,
+  offset : Int,
+  opts : DecodeOptions,
+) -> Result[(CborValue, Int), CborError] {
+  decode_internal(data, offset, opts, 0, true)
+}
+
+///| Alias for `decode_prefix` (matching Go `fxamacker/cbor` `UnmarshalFirst`).
+pub fn decode_first(data : Bytes, opts : DecodeOptions) -> Result[(CborValue, Int), CborError] {
+  decode_internal(data, 0, opts, 0, true)
 }
 
 ///|

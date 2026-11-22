@@ -1,118 +1,739 @@
-///| CBOR encoder (RFC 8949 + Core Deterministic + CTAP2 Canonical CBOR).
+///| CBOR encoder (RFC 8949 + Core Deterministic + CTAP2 Canonical CBOR) with
+///  worst-case O(n log n) Introsort, zero-copy key sorting, preferred bignum serialization,
+///  and stack-safe iterative fallback for arbitrarily deep trees.
 
 ///|
-fn push_head(out : Array[Byte], major : Int, n : UInt64) -> Unit {
+struct Encoder {
+  out : Bytes
+  mut pos : Int
+  shortest_float : Bool
+  sort_mode : Int // 0 = None, 1 = CoreDeterministic, 2 = Ctap2
+  mut has_err : Bool
+  mut err : CborError
+}
+
+///| Recursion depth threshold before switching to explicit heap stack.
+let encode_rec_limit : Int = 64
+
+///|
+fn head_size_u64(n : UInt64) -> Int {
+  if n < 24UL {
+    1
+  } else if n <= 0xFFUL {
+    2
+  } else if n <= 0xFFFFUL {
+    3
+  } else if n <= 0xFFFFFFFFUL {
+    5
+  } else {
+    9
+  }
+}
+
+///|
+fn head_size_int(n : Int) -> Int {
+  if n < 24 {
+    1
+  } else if n <= 0xFF {
+    2
+  } else if n <= 0xFFFF {
+    3
+  } else {
+    5
+  }
+}
+
+///|
+fn float_size(d : Double, shortest : Bool) -> Int {
+  if shortest {
+    let bits = d.to_bits()
+    let exp = ((bits >> 52) & 0x7FFL).to_int()
+    if !(exp >= 897 && exp <= 1150 && (bits & 0x1FFFFFFFL) != 0L) {
+      match double_to_float16_exact(d) {
+        Some(_) => return 3
+        None => ()
+      }
+      match double_to_float32_exact(d) {
+        Some(_) => return 5
+        None => ()
+      }
+    }
+  }
+  9
+}
+
+///| Index of first non-zero byte in bignum payload.
+fn bignum_first_nonzero(b : Bytes) -> Int {
+  let n = b.length()
+  let mut i = 0
+  while i < n && b[i].to_int() == 0 {
+    i = i + 1
+  }
+  i
+}
+
+///| Decode up to 8 big-endian bytes starting at `start` into UInt64.
+fn bignum_to_u64(b : Bytes, start : Int) -> UInt64 {
+  let n = b.length()
+  let mut v = 0UL
+  let mut i = start
+  while i < n {
+    v = (v << 8) | b[i].to_int().to_int64().to_uint64()
+    i = i + 1
+  }
+  v
+}
+
+///| Iterative size calculation for deep values (stack-safe).
+fn encoded_size_iter(root : CborValue, shortest_float : Bool, det_bignum : Bool) -> Int {
+  let stack : Array[CborValue] = [root]
+  let mut total = 0
+  while stack.length() > 0 {
+    let cur = stack.pop()
+    match cur {
+      Some(value) =>
+      match value {
+        Unsigned(u) => total = total + (if u < 24UL { 1 } else { head_size_u64(u) })
+        Negative(n) => total = total + (if n < 24UL { 1 } else { head_size_u64(n) })
+        Bytes(b) => {
+          let n = b.length()
+          total = total + (if n < 24 { 1 } else { head_size_int(n) }) + n
+        }
+        Text(s) => {
+          let n = s.length()
+          total = total + (if n < 24 { 1 } else { head_size_int(n) }) + n
+        }
+        Array(items) => {
+          let n = items.length()
+          total = total + (if n < 24 { 1 } else { head_size_int(n) })
+          let mut i = n - 1
+          while i >= 0 {
+            stack.push(items[i])
+            i = i - 1
+          }
+        }
+        Map(pairs) => {
+          let n = pairs.length()
+          total = total + (if n < 24 { 1 } else { head_size_int(n) })
+          let mut i = n - 1
+          while i >= 0 {
+            let (k, v) = pairs[i]
+            stack.push(v)
+            stack.push(k)
+            i = i - 1
+          }
+        }
+        Tag(t, inner) => {
+          if det_bignum && (t == 2UL || t == 3UL) {
+            match inner {
+              Bytes(b) => {
+                let start = bignum_first_nonzero(b)
+                let rem = b.length() - start
+                if rem <= 8 {
+                  let u = bignum_to_u64(b, start)
+                  total = total + (if u < 24UL { 1 } else { head_size_u64(u) })
+                } else {
+                  total = total + head_size_u64(t) + head_size_int(rem) + rem
+                }
+                continue
+              }
+              _ => ()
+            }
+          }
+          total = total + head_size_u64(t)
+          stack.push(inner)
+        }
+        Bool(_) => total = total + 1
+        Null => total = total + 1
+        Undefined => total = total + 1
+        Simple(v) =>
+        if v >= 0 && v <= 23 {
+          total = total + 1
+        } else if v >= 32 && v <= 255 {
+          total = total + 2
+        } else {
+          return -1
+        }
+        Float(d) => total = total + float_size(d, shortest_float)
+      }
+      None => break
+    }
+  }
+  total
+}
+
+///|
+fn encoded_size(value : CborValue, shortest_float : Bool, det_bignum : Bool, depth : Int) -> Int {
+  if depth > encode_rec_limit {
+    return encoded_size_iter(value, shortest_float, det_bignum)
+  }
+  match value {
+    Unsigned(u) => if u < 24UL { 1 } else { head_size_u64(u) }
+    Negative(n) => if n < 24UL { 1 } else { head_size_u64(n) }
+    Bytes(b) => {
+      let n = b.length()
+      (if n < 24 { 1 } else { head_size_int(n) }) + n
+    }
+    Text(s) => {
+      let n = s.length()
+      (if n < 24 { 1 } else { head_size_int(n) }) + n
+    }
+    Array(items) => {
+      let n = items.length()
+      let mut total = if n < 24 { 1 } else { head_size_int(n) }
+      let nd = depth + 1
+      let mut i = 0
+      while i < n {
+        let s = encoded_size(items[i], shortest_float, det_bignum, nd)
+        if s < 0 {
+          return -1
+        }
+        total = total + s
+        i = i + 1
+      }
+      total
+    }
+    Map(pairs) => {
+      let n = pairs.length()
+      let mut total = if n < 24 { 1 } else { head_size_int(n) }
+      let nd = depth + 1
+      let mut i = 0
+      while i < n {
+        let (k, v) = pairs[i]
+        let sk = encoded_size(k, shortest_float, det_bignum, nd)
+        if sk < 0 {
+          return -1
+        }
+        let sv = encoded_size(v, shortest_float, det_bignum, nd)
+        if sv < 0 {
+          return -1
+        }
+        total = total + sk + sv
+        i = i + 1
+      }
+      total
+    }
+    Tag(t, inner) => {
+      if det_bignum && (t == 2UL || t == 3UL) {
+        match inner {
+          Bytes(b) => {
+            let start = bignum_first_nonzero(b)
+            let rem = b.length() - start
+            if rem <= 8 {
+              let u = bignum_to_u64(b, start)
+              return if u < 24UL { 1 } else { head_size_u64(u) }
+            }
+            return head_size_u64(t) + head_size_int(rem) + rem
+          }
+          _ => ()
+        }
+      }
+      let s = encoded_size(inner, shortest_float, det_bignum, depth + 1)
+      if s < 0 {
+        -1
+      } else {
+        head_size_u64(t) + s
+      }
+    }
+    Bool(_) => 1
+    Null => 1
+    Undefined => 1
+    Simple(v) =>
+    if v >= 0 && v <= 23 {
+      1
+    } else if v >= 32 && v <= 255 {
+      2
+    } else {
+      -1
+    }
+    Float(d) => float_size(d, shortest_float)
+  }
+}
+
+///|
+fn write_head_u64(enc : Encoder, major : Int, n : UInt64) -> Unit {
+  let out = enc.out
+  let p = enc.pos
   let maj = major << 5
   if n < 24UL {
-    out.push((maj | n.to_int()).to_byte())
+    out[p] = (maj | n.to_int()).to_byte()
+    enc.pos = p + 1
   } else if n <= 0xFFUL {
-    out.push((maj | 24).to_byte())
-    out.push((n & 0xFFUL).to_int().to_byte())
+    out[p] = (maj | 24).to_byte()
+    out[p + 1] = (n & 0xFFUL).to_int().to_byte()
+    enc.pos = p + 2
   } else if n <= 0xFFFFUL {
-    out.push((maj | 25).to_byte())
-    out.push(((n >> 8) & 0xFFUL).to_int().to_byte())
-    out.push((n & 0xFFUL).to_int().to_byte())
+    out[p] = (maj | 25).to_byte()
+    out[p + 1] = ((n >> 8) & 0xFFUL).to_int().to_byte()
+    out[p + 2] = (n & 0xFFUL).to_int().to_byte()
+    enc.pos = p + 3
   } else if n <= 0xFFFFFFFFUL {
-    out.push((maj | 26).to_byte())
-    out.push(((n >> 24) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 16) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 8) & 0xFFUL).to_int().to_byte())
-    out.push((n & 0xFFUL).to_int().to_byte())
+    out[p] = (maj | 26).to_byte()
+    out[p + 1] = ((n >> 24) & 0xFFUL).to_int().to_byte()
+    out[p + 2] = ((n >> 16) & 0xFFUL).to_int().to_byte()
+    out[p + 3] = ((n >> 8) & 0xFFUL).to_int().to_byte()
+    out[p + 4] = (n & 0xFFUL).to_int().to_byte()
+    enc.pos = p + 5
   } else {
-    out.push((maj | 27).to_byte())
-    out.push(((n >> 56) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 48) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 40) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 32) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 24) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 16) & 0xFFUL).to_int().to_byte())
-    out.push(((n >> 8) & 0xFFUL).to_int().to_byte())
-    out.push((n & 0xFFUL).to_int().to_byte())
+    out[p] = (maj | 27).to_byte()
+    out[p + 1] = ((n >> 56) & 0xFFUL).to_int().to_byte()
+    out[p + 2] = ((n >> 48) & 0xFFUL).to_int().to_byte()
+    out[p + 3] = ((n >> 40) & 0xFFUL).to_int().to_byte()
+    out[p + 4] = ((n >> 32) & 0xFFUL).to_int().to_byte()
+    out[p + 5] = ((n >> 24) & 0xFFUL).to_int().to_byte()
+    out[p + 6] = ((n >> 16) & 0xFFUL).to_int().to_byte()
+    out[p + 7] = ((n >> 8) & 0xFFUL).to_int().to_byte()
+    out[p + 8] = (n & 0xFFUL).to_int().to_byte()
+    enc.pos = p + 9
   }
 }
 
 ///|
-fn push_bytes(out : Array[Byte], b : Bytes) -> Unit {
-  let mut i = 0
-  let n = b.length()
-  while i < n {
-    out.push(b[i])
-    i = i + 1
+fn write_head_int(enc : Encoder, major : Int, n : Int) -> Unit {
+  let out = enc.out
+  let p = enc.pos
+  let maj = major << 5
+  if n < 24 {
+    out[p] = (maj | n).to_byte()
+    enc.pos = p + 1
+  } else if n <= 0xFF {
+    out[p] = (maj | 24).to_byte()
+    out[p + 1] = (n & 0xFF).to_byte()
+    enc.pos = p + 2
+  } else if n <= 0xFFFF {
+    out[p] = (maj | 25).to_byte()
+    out[p + 1] = ((n >> 8) & 0xFF).to_byte()
+    out[p + 2] = (n & 0xFF).to_byte()
+    enc.pos = p + 3
+  } else {
+    let u = n.to_int64().to_uint64()
+    out[p] = (maj | 26).to_byte()
+    out[p + 1] = ((u >> 24) & 0xFFUL).to_int().to_byte()
+    out[p + 2] = ((u >> 16) & 0xFFUL).to_int().to_byte()
+    out[p + 3] = ((u >> 8) & 0xFFUL).to_int().to_byte()
+    out[p + 4] = (u & 0xFFUL).to_int().to_byte()
+    enc.pos = p + 5
   }
 }
 
 ///|
-fn push_array_slice(out : Array[Byte], src : Array[Byte], start : Int, end : Int) -> Unit {
-  let mut i = start
-  while i < end {
-    out.push(src[i])
-    i = i + 1
-  }
-}
-
-///|
-fn push_float(out : Array[Byte], d : Double, shortest : Bool) -> Unit {
-  if shortest {
-    match double_to_float16_exact(d) {
-      Some(h) => {
-        out.push((0xF9).to_byte())
-        out.push(((h >> 8) & 0xFF).to_byte())
-        out.push((h & 0xFF).to_byte())
-        return
-      }
-      None => ()
-    }
-    match double_to_float32_exact(d) {
-      Some(f32) => {
-        out.push((0xFA).to_byte())
-        out.push(((f32 >> 24) & 0xFFL).to_int().to_byte())
-        out.push(((f32 >> 16) & 0xFFL).to_int().to_byte())
-        out.push(((f32 >> 8) & 0xFFL).to_int().to_byte())
-        out.push((f32 & 0xFFL).to_int().to_byte())
-        return
-      }
-      None => ()
-    }
-  }
+fn write_float(enc : Encoder, d : Double) -> Unit {
+  let out = enc.out
+  let p = enc.pos
   let bits = d.to_bits()
-  out.push((0xFB).to_byte())
-  out.push(((bits >> 56) & 0xFFL).to_int().to_byte())
-  out.push(((bits >> 48) & 0xFFL).to_int().to_byte())
-  out.push(((bits >> 40) & 0xFFL).to_int().to_byte())
-  out.push(((bits >> 32) & 0xFFL).to_int().to_byte())
-  out.push(((bits >> 24) & 0xFFL).to_int().to_byte())
-  out.push(((bits >> 16) & 0xFFL).to_int().to_byte())
-  out.push(((bits >> 8) & 0xFFL).to_int().to_byte())
-  out.push((bits & 0xFFL).to_int().to_byte())
+  if enc.shortest_float {
+    let exp = ((bits >> 52) & 0x7FFL).to_int()
+    if !(exp >= 897 && exp <= 1150 && (bits & 0x1FFFFFFFL) != 0L) {
+      match double_to_float16_exact(d) {
+        Some(h) => {
+          out[p] = (0xF9).to_byte()
+          out[p + 1] = ((h >> 8) & 0xFF).to_byte()
+          out[p + 2] = (h & 0xFF).to_byte()
+          enc.pos = p + 3
+          return
+        }
+        None => ()
+      }
+      match double_to_float32_exact(d) {
+        Some(f32) => {
+          out[p] = (0xFA).to_byte()
+          out[p + 1] = ((f32 >> 24) & 0xFFL).to_int().to_byte()
+          out[p + 2] = ((f32 >> 16) & 0xFFL).to_int().to_byte()
+          out[p + 3] = ((f32 >> 8) & 0xFFL).to_int().to_byte()
+          out[p + 4] = (f32 & 0xFFL).to_int().to_byte()
+          enc.pos = p + 5
+          return
+        }
+        None => ()
+      }
+    }
+  }
+  out[p] = (0xFB).to_byte()
+  out[p + 1] = ((bits >> 56) & 0xFFL).to_int().to_byte()
+  out[p + 2] = ((bits >> 48) & 0xFFL).to_int().to_byte()
+  out[p + 3] = ((bits >> 40) & 0xFFL).to_int().to_byte()
+  out[p + 4] = ((bits >> 32) & 0xFFL).to_int().to_byte()
+  out[p + 5] = ((bits >> 24) & 0xFFL).to_int().to_byte()
+  out[p + 6] = ((bits >> 16) & 0xFFL).to_int().to_byte()
+  out[p + 7] = ((bits >> 8) & 0xFFL).to_int().to_byte()
+  out[p + 8] = (bits & 0xFFL).to_int().to_byte()
+  enc.pos = p + 9
 }
 
 ///|
-val struct EncodedPairRange {
-  k_start : Int
-  k_end : Int
-  v_end : Int
+fn is_fast_key(v : CborValue) -> Bool {
+  match v {
+    Unsigned(_) => true
+    Negative(_) => true
+    Bytes(_) => true
+    Text(_) => true
+    _ => false
+  }
 }
 
-///|
-fn cmp_key_range(buf : Array[Byte], a : EncodedPairRange, b : EncodedPairRange, length_first : Bool) -> Int {
-  let la = a.k_end - a.k_start
-  let lb = b.k_end - b.k_start
-  if length_first && la != lb {
+///| Encoded byte length for fast keys (Unsigned / Negative / Bytes / Text).
+fn fast_key_encoded_len(v : CborValue) -> Int {
+  match v {
+    Unsigned(u) => if u < 24UL { 1 } else { head_size_u64(u) }
+    Negative(n) => if n < 24UL { 1 } else { head_size_u64(n) }
+    Bytes(b) => {
+      let n = b.length()
+      (if n < 24 { 1 } else { head_size_int(n) }) + n
+    }
+    Text(s) => {
+      let n = s.length()
+      (if n < 24 { 1 } else { head_size_int(n) }) + n
+    }
+    _ => -1
+  }
+}
+
+///| Direct CoreDeterministic comparator for Unsigned / Negative / Bytes / Text keys.
+///  Returns -1, 0, 1 for fast keys, or 2 if either key is not a fast key.
+fn try_fast_key_cmp_lex(a : CborValue, b : CborValue) -> Int {
+  match a {
+    Text(sa) =>
+    match b {
+      Text(sb) => {
+        let la = sa.length()
+        let lb = sb.length()
+        if la != lb {
+          return if la < lb { -1 } else { 1 }
+        }
+        if sa < sb {
+          -1
+        } else if sa > sb {
+          1
+        } else {
+          0
+        }
+      }
+      Unsigned(_) | Negative(_) | Bytes(_) => 1
+      _ => 2
+    }
+    Unsigned(ua) =>
+    match b {
+      Unsigned(ub) =>
+      if ua < ub {
+        -1
+      } else if ua > ub {
+        1
+      } else {
+        0
+      }
+      Negative(_) | Bytes(_) | Text(_) => -1
+      _ => 2
+    }
+    Negative(na) =>
+    match b {
+      Negative(nb) =>
+      if na < nb {
+        -1
+      } else if na > nb {
+        1
+      } else {
+        0
+      }
+      Unsigned(_) => 1
+      Bytes(_) | Text(_) => -1
+      _ => 2
+    }
+    Bytes(ba) =>
+    match b {
+      Bytes(bb) => {
+        let la = ba.length()
+        let lb = bb.length()
+        if la != lb {
+          return if la < lb { -1 } else { 1 }
+        }
+        let mut i = 0
+        while i < la {
+          let ca = ba[i].to_int()
+          let cb = bb[i].to_int()
+          if ca != cb {
+            return if ca < cb { -1 } else { 1 }
+          }
+          i = i + 1
+        }
+        0
+      }
+      Unsigned(_) | Negative(_) => 1
+      Text(_) => -1
+      _ => 2
+    }
+    _ => 2
+  }
+}
+
+///| Direct comparator for fast keys supporting both CoreDeterministic (length_first=false)
+///  and CTAP2 (length_first=true). Returns -1, 0, 1, or 2 if not a fast key.
+fn try_fast_key_cmp(a : CborValue, b : CborValue, length_first : Bool) -> Int {
+  if !length_first {
+    return try_fast_key_cmp_lex(a, b)
+  }
+  let la = fast_key_encoded_len(a)
+  if la < 0 {
+    return 2
+  }
+  let lb = fast_key_encoded_len(b)
+  if lb < 0 {
+    return 2
+  }
+  if la != lb {
     return if la < lb { -1 } else { 1 }
   }
-  let min_len = if la < lb { la } else { lb }
-  let mut i = 0
-  while i < min_len {
-    let ba = buf[a.k_start + i].to_int()
-    let bb = buf[b.k_start + i].to_int()
-    if ba != bb {
-      return if ba < bb { -1 } else { 1 }
+  try_fast_key_cmp_lex(a, b)
+}
+
+///| Floor of log2(n) for Introsort depth limit.
+fn ilog2(n : Int) -> Int {
+  let mut k = 0
+  let mut v = n
+  while v > 1 {
+    v = v >> 1
+    k = k + 1
+  }
+  k
+}
+
+///| Insertion sort on idx_buf[lo..=hi] for fast keys.
+fn insertion_sort_fast(
+  pairs : Array[(CborValue, CborValue)],
+  idx_buf : Array[Int],
+  lo : Int,
+  hi : Int,
+  length_first : Bool,
+) -> Unit {
+  let mut i = lo + 1
+  while i <= hi {
+    let cur_idx = idx_buf[i]
+    let (cur_k, _) = pairs[cur_idx]
+    let mut j = i
+    while j > lo {
+      let prev_idx = idx_buf[j - 1]
+      let (prev_k, _) = pairs[prev_idx]
+      if try_fast_key_cmp(prev_k, cur_k, length_first) > 0 {
+        idx_buf[j] = prev_idx
+        j = j - 1
+      } else {
+        break
+      }
+    }
+    idx_buf[j] = cur_idx
+    i = i + 1
+  }
+}
+
+///| Sift-down helper for heapsort fallback on idx_buf[lo..=hi].
+fn sift_down_fast(
+  pairs : Array[(CborValue, CborValue)],
+  idx_buf : Array[Int],
+  lo : Int,
+  start : Int,
+  end : Int,
+  length_first : Bool,
+) -> Unit {
+  let mut root = start
+  while true {
+    let left = root * 2 + 1
+    if left > end {
+      break
+    }
+    let mut swap_pos = root
+    let (rk, _) = pairs[idx_buf[lo + swap_pos]]
+    let (lk, _) = pairs[idx_buf[lo + left]]
+    if try_fast_key_cmp(rk, lk, length_first) < 0 {
+      swap_pos = left
+    }
+    let right = left + 1
+    if right <= end {
+      let (sk, _) = pairs[idx_buf[lo + swap_pos]]
+      let (rtk, _) = pairs[idx_buf[lo + right]]
+      if try_fast_key_cmp(sk, rtk, length_first) < 0 {
+        swap_pos = right
+      }
+    }
+    if swap_pos == root {
+      break
+    }
+    let tmp = idx_buf[lo + root]
+    idx_buf[lo + root] = idx_buf[lo + swap_pos]
+    idx_buf[lo + swap_pos] = tmp
+    root = swap_pos
+  }
+}
+
+///| Worst-case O(n log n) heapsort fallback on idx_buf[lo..=hi].
+fn heapsort_fast(
+  pairs : Array[(CborValue, CborValue)],
+  idx_buf : Array[Int],
+  lo : Int,
+  hi : Int,
+  length_first : Bool,
+) -> Unit {
+  let count = hi - lo + 1
+  let mut start = (count - 2) / 2
+  while start >= 0 {
+    sift_down_fast(pairs, idx_buf, lo, start, count - 1, length_first)
+    start = start - 1
+  }
+  let mut end = count - 1
+  while end > 0 {
+    let tmp = idx_buf[lo + end]
+    idx_buf[lo + end] = idx_buf[lo]
+    idx_buf[lo] = tmp
+    end = end - 1
+    sift_down_fast(pairs, idx_buf, lo, 0, end, length_first)
+  }
+}
+
+///| Iterative Introsort (median-of-3 quicksort + heapsort fallback + insertion sort)
+///  on fast keys. Guaranteed O(n log n) worst-case, in-place, stack-safe.
+///  Returns index of first duplicate key, or -1 if all keys are distinct.
+fn sort_fast_indices(
+  pairs : Array[(CborValue, CborValue)],
+  idx_buf : Array[Int],
+  n : Int,
+  length_first : Bool,
+) -> Int {
+  if n <= 16 {
+    insertion_sort_fast(pairs, idx_buf, 0, n - 1, length_first)
+  } else {
+    let st_lo : Array[Int] = [0]
+    let st_hi : Array[Int] = [n - 1]
+    let st_dep : Array[Int] = [2 * ilog2(n)]
+    while st_lo.length() > 0 {
+      let mut lo = match st_lo.pop() {
+        Some(v) => v
+        None => break
+      }
+      let mut hi = match st_hi.pop() {
+        Some(v) => v
+        None => break
+      }
+      let mut dep = match st_dep.pop() {
+        Some(v) => v
+        None => break
+      }
+      while hi - lo > 16 {
+        if dep == 0 {
+          heapsort_fast(pairs, idx_buf, lo, hi, length_first)
+          break
+        }
+        dep = dep - 1
+        let mid = lo + ((hi - lo) >> 1)
+        // Median-of-3 sort of lo, mid, hi
+        let (klo, _) = pairs[idx_buf[lo]]
+        let (kmid, _) = pairs[idx_buf[mid]]
+        if try_fast_key_cmp(kmid, klo, length_first) < 0 {
+          let t = idx_buf[lo]
+          idx_buf[lo] = idx_buf[mid]
+          idx_buf[mid] = t
+        }
+        let (klo2, _) = pairs[idx_buf[lo]]
+        let (khi, _) = pairs[idx_buf[hi]]
+        if try_fast_key_cmp(khi, klo2, length_first) < 0 {
+          let t = idx_buf[lo]
+          idx_buf[lo] = idx_buf[hi]
+          idx_buf[hi] = t
+        }
+        let (kmid2, _) = pairs[idx_buf[mid]]
+        let (khi2, _) = pairs[idx_buf[hi]]
+        if try_fast_key_cmp(khi2, kmid2, length_first) < 0 {
+          let t = idx_buf[mid]
+          idx_buf[mid] = idx_buf[hi]
+          idx_buf[hi] = t
+        }
+        let (pivot_k, _) = pairs[idx_buf[mid]]
+        // Hoare partition
+        let mut i = lo
+        let mut j = hi
+        while true {
+          while true {
+            let (ki, _) = pairs[idx_buf[i]]
+            if try_fast_key_cmp(ki, pivot_k, length_first) < 0 {
+              i = i + 1
+            } else {
+              break
+            }
+          }
+          while true {
+            let (kj, _) = pairs[idx_buf[j]]
+            if try_fast_key_cmp(kj, pivot_k, length_first) > 0 {
+              j = j - 1
+            } else {
+              break
+            }
+          }
+          if i >= j {
+            break
+          }
+          let t = idx_buf[i]
+          idx_buf[i] = idx_buf[j]
+          idx_buf[j] = t
+          i = i + 1
+          j = j - 1
+        }
+        // Recurse on smaller half, push larger half
+        if j - lo < hi - j {
+          if j + 1 < hi {
+            st_lo.push(j + 1)
+            st_hi.push(hi)
+            st_dep.push(dep)
+          }
+          hi = j
+        } else {
+          if lo < j {
+            st_lo.push(lo)
+            st_hi.push(j)
+            st_dep.push(dep)
+          }
+          lo = j + 1
+        }
+      }
+      if hi > lo && hi - lo <= 16 {
+        insertion_sort_fast(pairs, idx_buf, lo, hi, length_first)
+      }
+    }
+  }
+  // Single linear pass to detect duplicate keys
+  let mut i = 1
+  while i < n {
+    let (pk, _) = pairs[idx_buf[i - 1]]
+    let (ck, _) = pairs[idx_buf[i]]
+    if try_fast_key_cmp(pk, ck, length_first) == 0 {
+      return i
     }
     i = i + 1
   }
-  if la < lb {
+  -1
+}
+
+///| Compare two encoded key slices in a contiguous `arena : Bytes`.
+fn cmp_arena_key(
+  arena : Bytes,
+  s1 : Int,
+  l1 : Int,
+  s2 : Int,
+  l2 : Int,
+  length_first : Bool,
+) -> Int {
+  if length_first && l1 != l2 {
+    return if l1 < l2 { -1 } else { 1 }
+  }
+  let min_l = if l1 < l2 { l1 } else { l2 }
+  let mut i = 0
+  while i < min_l {
+    let a = arena[s1 + i].to_int()
+    let b = arena[s2 + i].to_int()
+    if a != b {
+      return if a < b { -1 } else { 1 }
+    }
+    i = i + 1
+  }
+  if l1 < l2 {
     -1
-  } else if la > lb {
+  } else if l1 > l2 {
     1
   } else {
     0
@@ -120,169 +741,897 @@ fn cmp_key_range(buf : Array[Byte], a : EncodedPairRange, b : EncodedPairRange, 
 }
 
 ///|
-fn sort_pair_ranges(buf : Array[Byte], ranges : Array[EncodedPairRange], length_first : Bool) -> Unit {
-  // Insertion sort for small maps, shell sort for larger maps (zero extra allocations).
-  let n = ranges.length()
-  let mut gap = n / 2
-  while gap > 0 {
-    let mut i = gap
-    while i < n {
-      let cur = ranges[i]
-      let mut j = i
-      while j >= gap && cmp_key_range(buf, ranges[j - gap], cur, length_first) > 0 {
-        ranges[j] = ranges[j - gap]
-        j = j - gap
+fn insertion_sort_arena(
+  arena : Bytes,
+  starts : Array[Int],
+  lens : Array[Int],
+  order : Array[Int],
+  lo : Int,
+  hi : Int,
+  length_first : Bool,
+) -> Unit {
+  let mut i = lo + 1
+  while i <= hi {
+    let cur = order[i]
+    let cs = starts[cur]
+    let cl = lens[cur]
+    let mut j = i
+    while j > lo {
+      let prev = order[j - 1]
+      if cmp_arena_key(arena, starts[prev], lens[prev], cs, cl, length_first) > 0 {
+        order[j] = prev
+        j = j - 1
+      } else {
+        break
       }
-      ranges[j] = cur
-      i = i + 1
     }
-    gap = gap / 2
+    order[j] = cur
+    i = i + 1
   }
 }
 
 ///|
-fn encode_into(out : Array[Byte], value : CborValue, opts : EncodeOptions) -> Result[Unit, CborError] {
-  match value {
-    Unsigned(u) => {
-      push_head(out, 0, u)
-      Ok(())
+fn sift_down_arena(
+  arena : Bytes,
+  starts : Array[Int],
+  lens : Array[Int],
+  order : Array[Int],
+  lo : Int,
+  start : Int,
+  end : Int,
+  length_first : Bool,
+) -> Unit {
+  let mut root = start
+  while true {
+    let left = root * 2 + 1
+    if left > end {
+      break
     }
-    Negative(n) => {
-      push_head(out, 1, n)
-      Ok(())
+    let mut swap_pos = root
+    let r_id = order[lo + swap_pos]
+    let l_id = order[lo + left]
+    if cmp_arena_key(arena, starts[r_id], lens[r_id], starts[l_id], lens[l_id], length_first) < 0 {
+      swap_pos = left
+    }
+    let right = left + 1
+    if right <= end {
+      let s_id = order[lo + swap_pos]
+      let rt_id = order[lo + right]
+      if cmp_arena_key(arena, starts[s_id], lens[s_id], starts[rt_id], lens[rt_id], length_first) < 0 {
+        swap_pos = right
+      }
+    }
+    if swap_pos == root {
+      break
+    }
+    let tmp = order[lo + root]
+    order[lo + root] = order[lo + swap_pos]
+    order[lo + swap_pos] = tmp
+    root = swap_pos
+  }
+}
+
+///|
+fn heapsort_arena(
+  arena : Bytes,
+  starts : Array[Int],
+  lens : Array[Int],
+  order : Array[Int],
+  lo : Int,
+  hi : Int,
+  length_first : Bool,
+) -> Unit {
+  let count = hi - lo + 1
+  let mut start = (count - 2) / 2
+  while start >= 0 {
+    sift_down_arena(arena, starts, lens, order, lo, start, count - 1, length_first)
+    start = start - 1
+  }
+  let mut end = count - 1
+  while end > 0 {
+    let tmp = order[lo + end]
+    order[lo + end] = order[lo]
+    order[lo] = tmp
+    end = end - 1
+    sift_down_arena(arena, starts, lens, order, lo, 0, end, length_first)
+  }
+}
+
+///| Iterative Introsort on encoded key slices in `arena`. Guaranteed O(n log n) worst-case.
+fn sort_arena_keys(
+  arena : Bytes,
+  starts : Array[Int],
+  lens : Array[Int],
+  order : Array[Int],
+  n : Int,
+  length_first : Bool,
+) -> Unit {
+  if n <= 16 {
+    insertion_sort_arena(arena, starts, lens, order, 0, n - 1, length_first)
+    return
+  }
+  let st_lo : Array[Int] = [0]
+  let st_hi : Array[Int] = [n - 1]
+  let st_dep : Array[Int] = [2 * ilog2(n)]
+  while st_lo.length() > 0 {
+    let mut lo = match st_lo.pop() {
+      Some(v) => v
+      None => break
+    }
+    let mut hi = match st_hi.pop() {
+      Some(v) => v
+      None => break
+    }
+    let mut dep = match st_dep.pop() {
+      Some(v) => v
+      None => break
+    }
+    while hi - lo > 16 {
+      if dep == 0 {
+        heapsort_arena(arena, starts, lens, order, lo, hi, length_first)
+        break
+      }
+      dep = dep - 1
+      let mid = lo + ((hi - lo) >> 1)
+      let a = order[lo]
+      let b = order[mid]
+      if cmp_arena_key(arena, starts[b], lens[b], starts[a], lens[a], length_first) < 0 {
+        order[lo] = b
+        order[mid] = a
+      }
+      let a2 = order[lo]
+      let c = order[hi]
+      if cmp_arena_key(arena, starts[c], lens[c], starts[a2], lens[a2], length_first) < 0 {
+        order[lo] = c
+        order[hi] = a2
+      }
+      let b2 = order[mid]
+      let c2 = order[hi]
+      if cmp_arena_key(arena, starts[c2], lens[c2], starts[b2], lens[b2], length_first) < 0 {
+        order[mid] = c2
+        order[hi] = b2
+      }
+      let piv = order[mid]
+      let ps = starts[piv]
+      let pl = lens[piv]
+      let mut i = lo
+      let mut j = hi
+      while true {
+        while true {
+          let oi = order[i]
+          if cmp_arena_key(arena, starts[oi], lens[oi], ps, pl, length_first) < 0 {
+            i = i + 1
+          } else {
+            break
+          }
+        }
+        while true {
+          let oj = order[j]
+          if cmp_arena_key(arena, starts[oj], lens[oj], ps, pl, length_first) > 0 {
+            j = j - 1
+          } else {
+            break
+          }
+        }
+        if i >= j {
+          break
+        }
+        let t = order[i]
+        order[i] = order[j]
+        order[j] = t
+        i = i + 1
+        j = j - 1
+      }
+      if j - lo < hi - j {
+        if j + 1 < hi {
+          st_lo.push(j + 1)
+          st_hi.push(hi)
+          st_dep.push(dep)
+        }
+        hi = j
+      } else {
+        if lo < j {
+          st_lo.push(lo)
+          st_hi.push(j)
+          st_dep.push(dep)
+        }
+        lo = j + 1
+      }
+    }
+    if hi > lo && hi - lo <= 16 {
+      insertion_sort_arena(arena, starts, lens, order, lo, hi, length_first)
+    }
+  }
+}
+
+///|
+fn encode_map_slow(
+  enc : Encoder,
+  pairs : Array[(CborValue, CborValue)],
+  length_first : Bool,
+  depth : Int,
+) -> Unit {
+  let n = pairs.length()
+  let det_bignum = enc.sort_mode != 0
+  let starts : Array[Int] = Array::with_capacity(n)
+  let lens : Array[Int] = Array::with_capacity(n)
+  let order : Array[Int] = Array::with_capacity(n)
+  let mut total_kbytes = 0
+  let mut i = 0
+  while i < n {
+    let (k, _) = pairs[i]
+    let ksize = encoded_size(k, enc.shortest_float, det_bignum, depth + 1)
+    if ksize < 0 {
+      let kenc = Encoder::{
+        out: Bytes::new(0),
+        pos: 0,
+        shortest_float: enc.shortest_float,
+        sort_mode: enc.sort_mode,
+        has_err: false,
+        err: enc.err,
+      }
+      encode_into(kenc, k, depth + 1)
+      enc.has_err = true
+      enc.err = kenc.err
+      return
+    }
+    starts.push(total_kbytes)
+    lens.push(ksize)
+    order.push(i)
+    total_kbytes = total_kbytes + ksize
+    i = i + 1
+  }
+  let arena = Bytes::new(total_kbytes)
+  let kenc = Encoder::{
+    out: arena,
+    pos: 0,
+    shortest_float: enc.shortest_float,
+    sort_mode: enc.sort_mode,
+    has_err: false,
+    err: enc.err,
+  }
+  let mut ei = 0
+  while ei < n {
+    let (k, _) = pairs[ei]
+    encode_into(kenc, k, depth + 1)
+    if kenc.has_err {
+      enc.has_err = true
+      enc.err = kenc.err
+      return
+    }
+    ei = ei + 1
+  }
+  sort_arena_keys(arena, starts, lens, order, n, length_first)
+  let out = enc.out
+  let mut j = 0
+  while j < n {
+    let cur = order[j]
+    let cs = starts[cur]
+    let cl = lens[cur]
+    if j > 0 {
+      let prev = order[j - 1]
+      if cmp_arena_key(arena, starts[prev], lens[prev], cs, cl, false) == 0 {
+        enc.has_err = true
+        enc.err = CborError::DuplicateMapKey(j)
+        return
+      }
+    }
+    let p = enc.pos
+    let mut b = 0
+    while b < cl {
+      out[p + b] = arena[cs + b]
+      b = b + 1
+    }
+    enc.pos = p + cl
+    let (_, v) = pairs[cur]
+    encode_into(enc, v, depth + 1)
+    if enc.has_err {
+      return
+    }
+    j = j + 1
+  }
+}
+
+///| Stack-safe iterative encoder for deep trees (depth > encode_rec_limit).
+fn encode_into_iter(enc : Encoder, root : CborValue) -> Unit {
+  let out = enc.out
+  let det_bignum = enc.sort_mode != 0
+  let stack : Array[CborValue] = [root]
+  while stack.length() > 0 {
+    if enc.has_err {
+      return
+    }
+    let cur = stack.pop()
+    match cur {
+      Some(value) =>
+      match value {
+        Unsigned(u) =>
+        if u < 24UL {
+          let p = enc.pos
+          out[p] = u.to_int().to_byte()
+          enc.pos = p + 1
+        } else {
+          write_head_u64(enc, 0, u)
+        }
+        Negative(n) =>
+        if n < 24UL {
+          let p = enc.pos
+          out[p] = (0x20 | n.to_int()).to_byte()
+          enc.pos = p + 1
+        } else {
+          write_head_u64(enc, 1, n)
+        }
+        Bytes(b) => {
+          let n = b.length()
+          if n < 24 {
+            let p = enc.pos
+            out[p] = (0x40 | n).to_byte()
+            enc.pos = p + 1
+          } else {
+            write_head_int(enc, 2, n)
+          }
+          let p = enc.pos
+          let mut i = 0
+          while i < n {
+            out[p + i] = b[i]
+            i = i + 1
+          }
+          enc.pos = p + n
+        }
+        Text(s) => {
+          let n = s.length()
+          if n < 24 {
+            let p = enc.pos
+            out[p] = (0x60 | n).to_byte()
+            enc.pos = p + 1
+          } else {
+            write_head_int(enc, 3, n)
+          }
+          let p = enc.pos
+          let mut i = 0
+          while i < n {
+            out[p + i] = s.code_unit_at(i).to_byte()
+            i = i + 1
+          }
+          enc.pos = p + n
+        }
+        Array(items) => {
+          let n = items.length()
+          if n < 24 {
+            let p = enc.pos
+            out[p] = (0x80 | n).to_byte()
+            enc.pos = p + 1
+          } else {
+            write_head_int(enc, 4, n)
+          }
+          let mut i = n - 1
+          while i >= 0 {
+            stack.push(items[i])
+            i = i - 1
+          }
+        }
+        Map(pairs) => {
+          let n = pairs.length()
+          if n < 24 {
+            let p = enc.pos
+            out[p] = (0xA0 | n).to_byte()
+            enc.pos = p + 1
+          } else {
+            write_head_int(enc, 5, n)
+          }
+          if enc.sort_mode == 0 || n <= 1 {
+            let mut i = n - 1
+            while i >= 0 {
+              let (k, v) = pairs[i]
+              stack.push(v)
+              stack.push(k)
+              i = i - 1
+            }
+          } else {
+            // Check if fast keys; otherwise delegate to slow arena path
+            let length_first = enc.sort_mode == 2
+            let mut all_fast = true
+            let mut i = 0
+            while i < n {
+              let (k, _) = pairs[i]
+              if !is_fast_key(k) {
+                all_fast = false
+                break
+              }
+              i = i + 1
+            }
+            if all_fast {
+              let idx_buf : Array[Int] = Array::with_capacity(n)
+              let mut j = 0
+              while j < n {
+                idx_buf.push(j)
+                j = j + 1
+              }
+              let dup = sort_fast_indices(pairs, idx_buf, n, length_first)
+              if dup >= 0 {
+                enc.has_err = true
+                enc.err = CborError::DuplicateMapKey(dup)
+                return
+              }
+              let mut m = n - 1
+              while m >= 0 {
+                let (k, v) = pairs[idx_buf[m]]
+                stack.push(v)
+                stack.push(k)
+                m = m - 1
+              }
+            } else {
+              encode_map_slow(enc, pairs, length_first, encode_rec_limit + 1)
+            }
+          }
+        }
+        Tag(t, inner) => {
+          if det_bignum && (t == 2UL || t == 3UL) {
+            match inner {
+              Bytes(b) => {
+                let start = bignum_first_nonzero(b)
+                let rem = b.length() - start
+                if rem <= 8 {
+                  let u = bignum_to_u64(b, start)
+                  if t == 2UL {
+                    write_head_u64(enc, 0, u)
+                  } else {
+                    write_head_u64(enc, 1, u)
+                  }
+                } else {
+                  write_head_u64(enc, 6, t)
+                  write_head_int(enc, 2, rem)
+                  let p = enc.pos
+                  let mut bi = 0
+                  while bi < rem {
+                    out[p + bi] = b[start + bi]
+                    bi = bi + 1
+                  }
+                  enc.pos = p + rem
+                }
+                continue
+              }
+              _ => ()
+            }
+          }
+          write_head_u64(enc, 6, t)
+          stack.push(inner)
+        }
+        Bool(b) => {
+          let p = enc.pos
+          out[p] = (if b { 0xF5 } else { 0xF4 }).to_byte()
+          enc.pos = p + 1
+        }
+        Null => {
+          let p = enc.pos
+          out[p] = (0xF6).to_byte()
+          enc.pos = p + 1
+        }
+        Undefined => {
+          let p = enc.pos
+          out[p] = (0xF7).to_byte()
+          enc.pos = p + 1
+        }
+        Simple(v) =>
+        if v >= 0 && v <= 23 {
+          let p = enc.pos
+          out[p] = (0xE0 | v).to_byte()
+          enc.pos = p + 1
+        } else if v >= 32 && v <= 255 {
+          let p = enc.pos
+          out[p] = (0xF8).to_byte()
+          out[p + 1] = v.to_byte()
+          enc.pos = p + 2
+        } else {
+          enc.has_err = true
+          enc.err = CborError::InvalidSimpleValue(v)
+        }
+        Float(d) => write_float(enc, d)
+      }
+      None => break
+    }
+  }
+}
+
+///|
+fn encode_into(enc : Encoder, value : CborValue, depth : Int) -> Unit {
+  if depth > encode_rec_limit {
+    encode_into_iter(enc, value)
+    return
+  }
+  let out = enc.out
+  let nd = depth + 1
+  match value {
+    Unsigned(u) =>
+    if u < 24UL {
+      let p = enc.pos
+      out[p] = u.to_int().to_byte()
+      enc.pos = p + 1
+    } else {
+      write_head_u64(enc, 0, u)
+    }
+    Negative(n) =>
+    if n < 24UL {
+      let p = enc.pos
+      out[p] = (0x20 | n.to_int()).to_byte()
+      enc.pos = p + 1
+    } else {
+      write_head_u64(enc, 1, n)
     }
     Bytes(b) => {
-      push_head(out, 2, b.length().to_int64().to_uint64())
-      push_bytes(out, b)
-      Ok(())
+      let n = b.length()
+      if n < 24 {
+        let p = enc.pos
+        out[p] = (0x40 | n).to_byte()
+        enc.pos = p + 1
+      } else {
+        write_head_int(enc, 2, n)
+      }
+      let p = enc.pos
+      let mut i = 0
+      while i < n {
+        out[p + i] = b[i]
+        i = i + 1
+      }
+      enc.pos = p + n
     }
     Text(s) => {
-      let b = s.to_bytes()
-      push_head(out, 3, b.length().to_int64().to_uint64())
-      push_bytes(out, b)
-      Ok(())
+      let n = s.length()
+      if n < 24 {
+        let p = enc.pos
+        out[p] = (0x60 | n).to_byte()
+        enc.pos = p + 1
+      } else {
+        write_head_int(enc, 3, n)
+      }
+      let p = enc.pos
+      let mut i = 0
+      while i < n {
+        out[p + i] = s.code_unit_at(i).to_byte()
+        i = i + 1
+      }
+      enc.pos = p + n
     }
     Array(items) => {
-      push_head(out, 4, items.length().to_int64().to_uint64())
+      let n = items.length()
+      if n < 24 {
+        let p = enc.pos
+        out[p] = (0x80 | n).to_byte()
+        enc.pos = p + 1
+      } else {
+        write_head_int(enc, 4, n)
+      }
       let mut i = 0
-      while i < items.length() {
-        match encode_into(out, items[i], opts) {
-          Ok(_) => ()
-          Err(e) => return Err(e)
+      while i < n {
+        encode_into(enc, items[i], nd)
+        if enc.has_err {
+          return
         }
         i = i + 1
       }
-      Ok(())
     }
     Map(pairs) => {
       let n = pairs.length()
-      push_head(out, 5, n.to_int64().to_uint64())
-      let need_sort = match opts.sort_mode {
-        SortMode::None => false
-        SortMode::CoreDeterministic => true
-        SortMode::Ctap2 => true
+      if n < 24 {
+        let p = enc.pos
+        out[p] = (0xA0 | n).to_byte()
+        enc.pos = p + 1
+      } else {
+        write_head_int(enc, 5, n)
       }
-      if !need_sort || n <= 1 {
+      if enc.sort_mode == 0 || n <= 1 {
         let mut i = 0
         while i < n {
           let (k, v) = pairs[i]
-          match encode_into(out, k, opts) {
-            Ok(_) => ()
-            Err(e) => return Err(e)
+          encode_into(enc, k, nd)
+          if enc.has_err {
+            return
           }
-          match encode_into(out, v, opts) {
-            Ok(_) => ()
-            Err(e) => return Err(e)
+          encode_into(enc, v, nd)
+          if enc.has_err {
+            return
           }
           i = i + 1
         }
-        return Ok(())
+        return
       }
-      let length_first = match opts.sort_mode {
-        SortMode::Ctap2 => true
-        _ => false
+      let length_first = enc.sort_mode == 2
+      if n == 2 {
+        let (k0, v0) = pairs[0]
+        let (k1, v1) = pairs[1]
+        let c = try_fast_key_cmp(k0, k1, length_first)
+        if c != 2 {
+          if c == 0 {
+            enc.has_err = true
+            enc.err = CborError::DuplicateMapKey(1)
+            return
+          }
+          if c < 0 {
+            encode_into(enc, k0, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, v0, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, k1, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, v1, nd)
+          } else {
+            encode_into(enc, k1, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, v1, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, k0, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, v0, nd)
+          }
+          return
+        }
+        encode_map_slow(enc, pairs, length_first, depth)
+        return
       }
-      let scratch : Array[Byte] = []
-      let ranges : Array[EncodedPairRange] = []
-      let mut i = 0
+      let mut all_fast = true
+      let mut sorted = true
+      let mut i = 1
       while i < n {
-        let (k, v) = pairs[i]
-        let k_start = scratch.length()
-        match encode_into(scratch, k, opts) {
-          Ok(_) => ()
-          Err(e) => return Err(e)
+        let (k, _) = pairs[i]
+        if sorted {
+          let (pk, _) = pairs[i - 1]
+          let c = try_fast_key_cmp(pk, k, length_first)
+          if c == 2 {
+            all_fast = false
+            break
+          }
+          if c == 0 {
+            enc.has_err = true
+            enc.err = CborError::DuplicateMapKey(i)
+            return
+          }
+          if c > 0 {
+            sorted = false
+          }
+        } else if !is_fast_key(k) {
+          all_fast = false
+          break
         }
-        let k_end = scratch.length()
-        match encode_into(scratch, v, opts) {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-        let v_end = scratch.length()
-        ranges.push(EncodedPairRange::{ k_start: k_start, k_end: k_end, v_end: v_end })
         i = i + 1
       }
-      sort_pair_ranges(scratch, ranges, length_first)
-      let mut j = 0
-      while j < n {
-        if j > 0 && cmp_key_range(scratch, ranges[j - 1], ranges[j], length_first) == 0 {
-          return Err(CborError::DuplicateMapKey(j))
+      if all_fast {
+        if sorted {
+          let mut j = 0
+          while j < n {
+            let (k, v) = pairs[j]
+            encode_into(enc, k, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, v, nd)
+            if enc.has_err {
+              return
+            }
+            j = j + 1
+          }
+          return
         }
-        let r = ranges[j]
-        push_array_slice(out, scratch, r.k_start, r.v_end)
-        j = j + 1
+        if n <= 8 {
+          let mut used = 0
+          let mut prev_idx = -1
+          let mut emitted = 0
+          while emitted < n {
+            let mut best = -1
+            let mut j = 0
+            while j < n {
+              if (used & (1 << j)) == 0 {
+                if best < 0 {
+                  best = j
+                } else {
+                  let (bk, _) = pairs[best]
+                  let (jk, _) = pairs[j]
+                  let c = try_fast_key_cmp(jk, bk, length_first)
+                  if c < 0 {
+                    best = j
+                  } else if c == 0 {
+                    enc.has_err = true
+                    enc.err = CborError::DuplicateMapKey(j)
+                    return
+                  }
+                }
+              }
+              j = j + 1
+            }
+            if prev_idx >= 0 {
+              let (pk, _) = pairs[prev_idx]
+              let (bk, _) = pairs[best]
+              if try_fast_key_cmp(pk, bk, length_first) == 0 {
+                enc.has_err = true
+                enc.err = CborError::DuplicateMapKey(best)
+                return
+              }
+            }
+            used = used | (1 << best)
+            prev_idx = best
+            let (k, v) = pairs[best]
+            encode_into(enc, k, nd)
+            if enc.has_err {
+              return
+            }
+            encode_into(enc, v, nd)
+            if enc.has_err {
+              return
+            }
+            emitted = emitted + 1
+          }
+          return
+        }
+        let idx_buf : Array[Int] = Array::with_capacity(n)
+        let mut j = 0
+        while j < n {
+          idx_buf.push(j)
+          j = j + 1
+        }
+        let dup = sort_fast_indices(pairs, idx_buf, n, length_first)
+        if dup >= 0 {
+          enc.has_err = true
+          enc.err = CborError::DuplicateMapKey(dup)
+          return
+        }
+        let mut m = 0
+        while m < n {
+          let (k, v) = pairs[idx_buf[m]]
+          encode_into(enc, k, nd)
+          if enc.has_err {
+            return
+          }
+          encode_into(enc, v, nd)
+          if enc.has_err {
+            return
+          }
+          m = m + 1
+        }
+        return
       }
-      Ok(())
+      encode_map_slow(enc, pairs, length_first, depth)
     }
     Tag(t, inner) => {
-      push_head(out, 6, t)
-      encode_into(out, inner, opts)
+      if enc.sort_mode != 0 && (t == 2UL || t == 3UL) {
+        match inner {
+          Bytes(b) => {
+            let start = bignum_first_nonzero(b)
+            let rem = b.length() - start
+            if rem <= 8 {
+              let u = bignum_to_u64(b, start)
+              if t == 2UL {
+                write_head_u64(enc, 0, u)
+              } else {
+                write_head_u64(enc, 1, u)
+              }
+              return
+            }
+            write_head_u64(enc, 6, t)
+            write_head_int(enc, 2, rem)
+            let p = enc.pos
+            let mut bi = 0
+            while bi < rem {
+              out[p + bi] = b[start + bi]
+              bi = bi + 1
+            }
+            enc.pos = p + rem
+            return
+          }
+          _ => ()
+        }
+      }
+      write_head_u64(enc, 6, t)
+      encode_into(enc, inner, nd)
     }
     Bool(b) => {
-      out.push((if b { 0xF5 } else { 0xF4 }).to_byte())
-      Ok(())
+      let p = enc.pos
+      out[p] = (if b { 0xF5 } else { 0xF4 }).to_byte()
+      enc.pos = p + 1
     }
     Null => {
-      out.push((0xF6).to_byte())
-      Ok(())
+      let p = enc.pos
+      out[p] = (0xF6).to_byte()
+      enc.pos = p + 1
     }
     Undefined => {
-      out.push((0xF7).to_byte())
-      Ok(())
+      let p = enc.pos
+      out[p] = (0xF7).to_byte()
+      enc.pos = p + 1
     }
-    Simple(v) => {
-      if v >= 0 && v <= 23 {
-        out.push((0xE0 | v).to_byte())
-        Ok(())
-      } else if v >= 32 && v <= 255 {
-        out.push((0xF8).to_byte())
-        out.push(v.to_byte())
-        Ok(())
-      } else {
-        Err(CborError::InvalidSimpleValue(v))
+    Simple(v) =>
+    if v >= 0 && v <= 23 {
+      let p = enc.pos
+      out[p] = (0xE0 | v).to_byte()
+      enc.pos = p + 1
+    } else if v >= 32 && v <= 255 {
+      let p = enc.pos
+      out[p] = (0xF8).to_byte()
+      out[p + 1] = v.to_byte()
+      enc.pos = p + 2
+    } else {
+      enc.has_err = true
+      enc.err = CborError::InvalidSimpleValue(v)
+    }
+    Float(d) => write_float(enc, d)
+  }
+}
+
+///| Stack-safe iterative scan for invalid simple value.
+fn find_invalid_simple(root : CborValue) -> Option[CborError] {
+  let stack : Array[CborValue] = [root]
+  while stack.length() > 0 {
+    match stack.pop() {
+      Some(value) =>
+      match value {
+        Simple(v) =>
+        if !((v >= 0 && v <= 23) || (v >= 32 && v <= 255)) {
+          return Option::Some(CborError::InvalidSimpleValue(v))
+        }
+        Array(items) => {
+          let mut i = items.length() - 1
+          while i >= 0 {
+            stack.push(items[i])
+            i = i - 1
+          }
+        }
+        Map(pairs) => {
+          let mut i = pairs.length() - 1
+          while i >= 0 {
+            let (k, v) = pairs[i]
+            stack.push(v)
+            stack.push(k)
+            i = i - 1
+          }
+        }
+        Tag(_, inner) => stack.push(inner)
+        _ => ()
       }
-    }
-    Float(d) => {
-      push_float(out, d, opts.shortest_float)
-      Ok(())
+      None => break
     }
   }
+  Option::None
 }
 
 ///|
 pub fn encode(value : CborValue, opts : EncodeOptions) -> Result[Bytes, CborError] {
-  let buf : Array[Byte] = []
-  match encode_into(buf, value, opts) {
-    Err(e) => Err(e)
-    Ok(_) => {
-      let n = buf.length()
-      let out = Bytes::new(n)
-      let mut i = 0
-      while i < n {
-        out[i] = buf[i]
-        i = i + 1
-      }
-      Ok(out)
+  let sort_mode = match opts.sort_mode {
+    SortMode::None => 0
+    SortMode::CoreDeterministic => 1
+    SortMode::Ctap2 => 2
+  }
+  let det_bignum = sort_mode != 0
+  let total_len = encoded_size(value, opts.shortest_float, det_bignum, 0)
+  if total_len < 0 {
+    match find_invalid_simple(value) {
+      Some(e) => return Err(e)
+      None => return Err(CborError::InvalidSimpleValue(-1))
     }
+  }
+  let out = Bytes::new(total_len)
+  let enc = Encoder::{
+    out: out,
+    pos: 0,
+    shortest_float: opts.shortest_float,
+    sort_mode: sort_mode,
+    has_err: false,
+    err: CborError::InvalidSimpleValue(0),
+  }
+  encode_into(enc, value, 0)
+  if enc.has_err {
+    Err(enc.err)
+  } else {
+    Ok(out)
   }
 }
 
