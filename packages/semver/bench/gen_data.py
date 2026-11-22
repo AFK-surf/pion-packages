@@ -113,15 +113,63 @@ def gen_reqs(path: str, count: int) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def gen_req32(path: str, count: int) -> None:
+    rng = XorShift64(0x5E40E22026112303)
+    lines = []
+    for _ in range(count):
+        parts = []
+        for k in range(32):
+            if k % 4 == 0:
+                parts.append(f">={rng.randrange(2)}.{rng.randrange(5)}.{rng.randrange(5)}")
+            elif k % 4 == 1:
+                parts.append(f"<{2 + rng.randrange(3)}.{rng.randrange(5)}.0")
+            elif k % 4 == 2:
+                parts.append(f">={rng.randrange(2)}.{rng.randrange(5)}.{rng.randrange(5)}-alpha.{rng.randrange(5)}")
+            else:
+                parts.append(f"<= {2 + rng.randrange(2)}.{rng.randrange(6)}.{rng.randrange(10)}")
+        lines.append(", ".join(parts))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def gen_dirty(path: str, count: int) -> None:
+    rng = XorShift64(0x5E40E22026112304)
+    samples = [
+        "not-a-version",
+        "01.2.3",
+        "1.02.3",
+        "1.2.3-",
+        "1.2.3-01",
+        "1.2.3+a..b",
+        "18446744073709551616.0.0",
+        "1.2.3 || 2.3.4",
+        ">= >= 1.0.0",
+        "1.2.3-alpha_1",
+        "1.2.3.4",
+        "v1.2.3",
+        "*, 1.0.0",
+        "1.*.2",
+        "1.2.3-α",
+        "   ",
+    ]
+    lines = [samples[rng.randrange(len(samples))] for _ in range(count)]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def main() -> int:
     if len(sys.argv) < 5:
         print(
-            "usage: gen_data.py <versions_out> <reqs_out> <num_versions> <num_reqs>",
+            "usage: gen_data.py <versions_out> <reqs_out> <num_versions> <num_reqs> [req32_out] [dirty_out]",
             file=sys.stderr,
         )
         return 1
     gen_versions(sys.argv[1], int(sys.argv[3]))
     gen_reqs(sys.argv[2], int(sys.argv[4]))
+    if len(sys.argv) >= 6:
+        gen_req32(sys.argv[5], 20000)
+    if len(sys.argv) >= 7:
+        gen_dirty(sys.argv[6], 100000)
     return 0
 
 

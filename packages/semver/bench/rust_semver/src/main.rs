@@ -115,10 +115,60 @@ fn run_req_bench(reqs_file: &str, versions_file: &str, ver_limit: usize, iters: 
     println!("checksum={}", checksum);
 }
 
+fn run_req32_bench(reqs_file: &str, ver_text: &str, iters: usize) {
+    let lines = read_lines(reqs_file);
+    let ver = Version::parse(ver_text).unwrap_or_else(|_| Version::new(1, 5, 5));
+    let mut ok: u64 = 0;
+    let mut matched: u64 = 0;
+    let mut bytes: u64 = 0;
+    for _ in 0..iters {
+        for line in &lines {
+            if let Ok(r) = VersionReq::parse(line) {
+                ok += 1;
+                if r.matches(&ver) {
+                    matched += 1;
+                }
+                bytes += r.to_string().len() as u64;
+            }
+        }
+    }
+    println!("bench=req32");
+    println!("lines={}", lines.len());
+    println!("iters={}", iters);
+    println!("ok={}", ok);
+    println!("matched={}", matched);
+    println!("bytes={}", bytes);
+}
+
+fn run_dirty_bench(dirty_file: &str, iters: usize) {
+    let lines = read_lines(dirty_file);
+    let mut ver_err: u64 = 0;
+    let mut req_err: u64 = 0;
+    let mut err_bytes: u64 = 0;
+    for _ in 0..iters {
+        for line in &lines {
+            if let Err(e) = Version::parse(line) {
+                ver_err += 1;
+                err_bytes += e.to_string().len() as u64;
+            }
+            if let Err(e) = VersionReq::parse(line) {
+                req_err += 1;
+                err_bytes += e.to_string().len() as u64;
+            }
+        }
+    }
+    println!("bench=dirty_reject");
+    println!("lines={}", lines.len());
+    println!("iters={}", iters);
+    println!("ver_err={}", ver_err);
+    println!("req_err={}", req_err);
+    println!("err_bytes={}", err_bytes);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: semver-bench-rust <version|req> ...");
+        eprintln!("usage: semver-bench-rust <version|req|req32|dirty> ...");
         process::exit(1);
     }
     match args[1].as_str() {
@@ -142,6 +192,23 @@ fn main() {
             let ver_limit: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(500);
             let iters: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(5);
             run_req_bench(reqs_file, versions_file, ver_limit, iters);
+        }
+        "req32" => {
+            let reqs_file = args
+                .get(2)
+                .map(|s| s.as_str())
+                .unwrap_or("/tmp/pion-semver-bench/req32_20k.txt");
+            let ver_text = args.get(3).map(|s| s.as_str()).unwrap_or("1.5.5");
+            let iters: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
+            run_req32_bench(reqs_file, ver_text, iters);
+        }
+        "dirty" => {
+            let dirty_file = args
+                .get(2)
+                .map(|s| s.as_str())
+                .unwrap_or("/tmp/pion-semver-bench/dirty_100k.txt");
+            let iters: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5);
+            run_dirty_bench(dirty_file, iters);
         }
         other => {
             eprintln!("unknown mode: {}", other);
