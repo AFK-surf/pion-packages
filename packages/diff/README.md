@@ -81,8 +81,8 @@ Run via `sh packages/diff/bench/run_bench.sh` (`scripts/bench_compare.py`, `--wa
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs rust-imara-diff) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 115.493 | 113.648 | 121.808 | 280.40 | 4.44 MiB | 0.26x |
-| `rust-imara-diff` | 30.316 | 30.020 | 32.131 | 1068.23 | 3.39 MiB | 1.00x (baseline) |
+| `pion` | 43.250 | 40.681 | 44.360 | 748.77 | 3.39 MiB | 0.69x |
+| `rust-imara-diff` | 29.832 | 27.861 | 30.330 | 1085.57 | 3.39 MiB | 1.00x (baseline) |
 
 _Stdout (`67,406 B`) SHA-256 verified byte-for-byte identical: `fe0936eaa06404b6d49c707348a6790ff1234d4d3e27f14cc86d325d45a7b906`._
 
@@ -90,8 +90,8 @@ _Stdout (`67,406 B`) SHA-256 verified byte-for-byte identical: `fe0936eaa06404b6
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs rust-imara-diff) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 174.831 | 164.568 | 203.590 | 111.14 | 5.00 MiB | 0.55x |
-| `rust-imara-diff` | 96.955 | 82.300 | 108.232 | 200.41 | 4.03 MiB | 1.00x (baseline) |
+| `pion` | 100.018 | 94.026 | 119.974 | 194.27 | 4.09 MiB | 0.87x |
+| `rust-imara-diff` | 86.980 | 83.921 | 89.967 | 223.39 | 4.03 MiB | 1.00x (baseline) |
 
 _Stdout (`238,918 B`) SHA-256 verified byte-for-byte identical: `a61a0400fdf2028988aac61e9e10d5ee97136d733d2dcb02bbd6a572c1a2f038`._
 
@@ -99,11 +99,12 @@ _Stdout (`238,918 B`) SHA-256 verified byte-for-byte identical: `a61a0400fdf2028
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs rust-imara-diff) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 83.214 | 83.037 | 87.081 | 386.59 | 2.73 MiB | 0.32x |
-| `rust-imara-diff` | 26.269 | 24.617 | 27.731 | 1224.62 | 2.39 MiB | 1.00x (baseline) |
+| `pion` | 23.744 | 22.126 | 25.425 | 1354.85 | 2.31 MiB | **1.01x** |
+| `rust-imara-diff` | 24.025 | 22.184 | 24.582 | 1338.98 | 2.39 MiB | 1.00x (baseline) |
 
 _Stdout (`7,131 B`) SHA-256 verified byte-for-byte identical: `586c482f0fd9d4a787fbc561f69095e8395a2990128debd8d13230fcc70e33f8`._
 
 **Notes**:
-- Rust `imara-diff` benefits from SIMD `memchr`, `foldhash`, and LLVM `-O3` + LTO; Pion Native reaches **280–387 MB/s** on Histogram Diff (0.26x–0.32x of Rust) and **111 MB/s** on Myers Diff (**0.55x of Rust**) with ~2.7–5.0 MiB peak RSS and **100% byte-for-byte identical unified diff output**.
-- Consistent with `imara-diff`, Histogram Diff in Pion is **~2.5x faster** than Myers on large refactors while producing 3.5x smaller, more readable diffs.
+- Key optimizations: byte-level 4×/8× unrolled common prefix/suffix trimming (with exact slider-boundary fallback), lockstep predictive line matching in `after` interning, L1-sized packed `Int64` hash table `(hash32 << 32) | (tid + 1)` & packed `tok_span`, packed `Int64` `HistogramState.occ` with cursor-allocated pool and `cur_occ == 1` fast-path LCS extension, hoisted `is_odd` / `right = left` / zero-snake fast-path in `myers_split`, and direct single-`StringBuilder` unified diff emission without temporary hunk buffers.
+- On real-world `helix_syntax.rs`, Pion Native reaches **1,355 MB/s (1.01x of Rust `imara-diff --release`)** with lower peak RSS (`2.31 MiB` vs `2.39 MiB`) and **100% byte-for-byte identical unified diff output**.
+- On the 10K-line synthetic refactor (~90% middle window), Pion Native reaches **749 MB/s (0.69x)** on Histogram Diff and **194 MB/s (0.87x)** on Myers Diff, where the remaining gap reflects QBE's scalar bounds-checked `code_unit_at` / `Array[Int]` accesses vs Rust's NEON SIMD `memchr`/`memcmp`, 64-bit `foldhash`, and unchecked `NonNull<i32>` pointers.
