@@ -1,45 +1,52 @@
-///| Linear-time Thompson NFA compiler and simulator for single globs and multi-pattern sets.
-///| Zero backtracking, O(States * PathLen) worst-case time (immune to ReDoS).
-///| Fast 64-bit bit-parallel path for <= 64 states (zero heap allocations per match!).
+///| Pure byte-level Thompson NFA compiler and on-demand Lazy DFA simulator.
+///| - O(N) NFA compilation time and memory (no quadratic epsilon-closure matrix).
+///| - Shared leading `RecursivePrefix` (`**/`) gadget across multi-pattern sets.
+///| - O(N + 256) byte equivalence classes (`ByteClassSet`) for compact transitions.
+///| - Memory-bounded Lazy DFA (all 256 bytes, including UTF-8 / raw bytes, O(1) per byte on hit).
 
-///| NFA state transition kind.
+///| Byte-level NFA state transition kind.
 pub enum NfaKind {
   Epsilon
-  Literal(Int, Bool) // (cp, case_insensitive)
-  Any(Bool) // literal_separator (if true, excludes '/')
-  Class(Bool, Bool, Bool, Array[CharRange]) // (negated, literal_separator, case_insensitive, ranges)
-  Match(Int) // pattern_id (0 for single glob, global_index for multi-NFA)
+  Byte(Int, Bool) // (byte 0..255, ascii_case_insensitive)
+  AnyByte(Bool) // literal_separator (if true, excludes '/')
+  ByteClass(Int64, Int64, Int64, Int64) // 256-bit bitmap for bytes 0..255
+  Match(Int) // pattern_id
 }
 
-///| A single NFA state with up to 2 epsilon transitions and 1 consuming transition (`out1`).
+///| A single NFA state with up to 2 epsilon transitions or 1 consuming transition (`out1`).
 pub struct NfaState {
   pub kind : NfaKind
   pub mut out1 : Int // -1 if none
   pub mut out2 : Int // -1 if none (only used for Epsilon split)
 }
 
-///| Compiled immutable Thompson NFA with optional precompiled ASCII DFA
-///| (supports 1 or many patterns in a single pass, O(1) per byte on ASCII fast path).
+///| Compiled byte-level Thompson NFA with on-demand memory-bounded Lazy DFA cache.
 pub struct Nfa {
   pub states : Array[NfaState]
-  pub start : Int
+  pub start_states : Array[Int]
   pub num_states : Int
-  pub words : Int // (num_states + 63) / 64
-  // Precomputed epsilon closures: flat array of length `num_states * words`.
-  pub eps_flat : Array[Int64]
-  // Precomputed start closure: length `words`.
-  pub start_mask : Array[Int64]
-  // Precomputed match states: state indices that are NfaKind::Match(pat_id).
-  pub match_states : Array[Int]
-  pub match_pat_ids : Array[Int]
-  // Fast 64-bit fields (valid when words == 1)
-  pub start_mask64 : Int64
-  pub match_mask64 : Int64
-  // Precompiled ASCII DFA (if has_dfa == true): flat [state * 128 + byte] -> next_state (-1 = dead)
-  pub has_dfa : Bool
-  pub dfa_trans : Array[Int]
-  pub dfa_has_match : Array[Bool]
-  pub dfa_matches : Array[Array[Int]]
+  pub byte_classes : Array[Int] // length 256: byte -> class_id
+  pub rep_bytes : Array[Int] // length stride: class_id -> representative byte
+  pub stride : Int
+  mut dfa_ready : Bool
+  mut start_dead : Bool
+  // Lazy DFA cache:
+  // row 0 = unused dummy row; row 1 = start state.
+  // dfa_trans[state_id * stride + cls]: 0 = unknown, -1 = dead, > 0 = next_state_id * stride
+  dfa_trans : Array[Int]
+  dfa_sets : Array[Array[Int]]
+  dfa_has_match : Array[Bool]
+  dfa_matches : Array[Array[Int]]
+  mut total_set_ints : Int
+  // Open-addressing hash table mapping sorted NFA state set -> dfa state_id
+  mut tbl_mask : Int
+  mut tbl_buckets : Array[Int]
+  mut tbl_hashes : Array[Int64]
+  mut tbl_count : Int
+  // Reusable epsilon-closure scratch (allocated on first match)
+  eps_gen_arr : Array[Int]
+  mut eps_gen : Int
+  eps_stack : Array[Int]
 }
 
 struct NfaBuilder {
@@ -61,38 +68,115 @@ fn NfaBuilder::add(
   id
 }
 
-///| Compile a token sequence starting at `entry` and transitioning into `exit_state`.
-fn NfaBuilder::compile_tokens(
-  self : NfaBuilder,
-  tokens : Array[Token],
-  opts : GlobOptions,
-  exit_state : Int,
-) -> Int {
-  // Special case: entire glob is just `[RecursivePrefix]` -> `.*`
-  if tokens.length() == 1 {
-    match tokens[0] {
-      Token::RecursivePrefix => {
-        let loop_s = self.add(NfaKind::Any(false), -1, -1)
-        let split = self.add(NfaKind::Epsilon, loop_s, exit_state)
-        self.states[loop_s].out1 = split
-        return split
-      }
-      _ => ()
-    }
+///| Encode a Unicode scalar value into 1..4 UTF-8 bytes.
+fn encode_utf8_bytes(cp : Int) -> Array[Int] {
+  if cp < 0x80 {
+    [cp]
+  } else if cp < 0x800 {
+    [0xC0 | (cp >> 6), 0x80 | (cp & 0x3F)]
+  } else if cp < 0x10000 {
+    [0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+  } else {
+    [
+      0xF0 | (cp >> 18),
+      0x80 | ((cp >> 12) & 0x3F),
+      0x80 | ((cp >> 6) & 0x3F),
+      0x80 | (cp & 0x3F),
+    ]
   }
-  self.compile_seq(tokens, opts, exit_state)
 }
 
-fn NfaBuilder::compile_seq(
+fn set_mask_bit(w : Array[Int64], b : Int) -> Unit {
+  let idx = b >> 6
+  w[idx] = w[idx] | (1L << (b & 63))
+}
+
+fn get_mask_bit(w : Array[Int64], b : Int) -> Bool {
+  (w[b >> 6] & (1L << (b & 63))) != 0L
+}
+
+///| Convert a glob character class into a 256-bit byte bitmap matching `BurntSushi/globset`
+///| (`(?-u)` byte regex semantics). When `class_excludes_separator` is true (`.gitignore`),
+///| byte `'/'` (47) is always excluded.
+fn build_byte_class_mask(
+  negated : Bool,
+  class_excludes_separator : Bool,
+  ci : Bool,
+  ranges : Array[CharRange],
+) -> (Int64, Int64, Int64, Int64) {
+  let w : Array[Int64] = [0L, 0L, 0L, 0L]
+  let mut i = 0
+  let nr = ranges.length()
+  while i < nr {
+    let r = ranges[i]
+    let lo_b = encode_utf8_bytes(r.lo)
+    if r.lo == r.hi {
+      let mut k = 0
+      while k < lo_b.length() {
+        set_mask_bit(w, lo_b[k])
+        k = k + 1
+      }
+    } else {
+      let hi_b = encode_utf8_bytes(r.hi)
+      let mut k = 0
+      while k < lo_b.length() - 1 {
+        set_mask_bit(w, lo_b[k])
+        k = k + 1
+      }
+      let r_lo = lo_b[lo_b.length() - 1]
+      let r_hi = hi_b[0]
+      let mut b = r_lo
+      while b <= r_hi {
+        set_mask_bit(w, b)
+        b = b + 1
+      }
+      k = 1
+      while k < hi_b.length() {
+        set_mask_bit(w, hi_b[k])
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  if ci {
+    let mut b = 65 // 'A'..'Z'
+    while b <= 90 {
+      let lower = b + 32
+      let has_u = get_mask_bit(w, b)
+      let has_l = get_mask_bit(w, lower)
+      if has_u && !has_l {
+        set_mask_bit(w, lower)
+      } else if has_l && !has_u {
+        set_mask_bit(w, b)
+      }
+      b = b + 1
+    }
+  }
+  if negated {
+    w[0] = w[0] ^ -1L
+    w[1] = w[1] ^ -1L
+    w[2] = w[2] ^ -1L
+    w[3] = w[3] ^ -1L
+  }
+  if class_excludes_separator {
+    w[0] = w[0] & ((1L << 47) ^ -1L)
+  }
+  (w[0], w[1], w[2], w[3])
+}
+
+///| Compile a token sequence starting at `start_idx` and transitioning into `exit_state`.
+fn NfaBuilder::compile_seq_from(
   self : NfaBuilder,
   tokens : Array[Token],
+  start_idx : Int,
   opts : GlobOptions,
+  class_excludes_separator : Bool,
   exit_state : Int,
 ) -> Int {
   let mut next = exit_state
   let mut i = tokens.length() - 1
-  while i >= 0 {
-    next = self.compile_tok(tokens[i], opts, next)
+  while i >= start_idx {
+    next = self.compile_tok(tokens[i], opts, class_excludes_separator, next)
     i = i - 1
   }
   next
@@ -102,59 +186,83 @@ fn NfaBuilder::compile_tok(
   self : NfaBuilder,
   tok : Token,
   opts : GlobOptions,
+  class_excludes_separator : Bool,
   next : Int,
 ) -> Int {
   match tok {
     Token::Literal(cp) =>
-    self.add(NfaKind::Literal(cp, opts.case_insensitive), next, -1)
-    Token::Any => self.add(NfaKind::Any(opts.literal_separator), next, -1)
+    if cp < 128 {
+      self.add(NfaKind::Byte(cp, opts.case_insensitive), next, -1)
+    } else {
+      let bs = encode_utf8_bytes(cp)
+      let mut cur = next
+      let mut i = bs.length() - 1
+      while i >= 0 {
+        cur = self.add(NfaKind::Byte(bs[i], false), cur, -1)
+        i = i - 1
+      }
+      cur
+    }
+    Token::Any => self.add(NfaKind::AnyByte(opts.literal_separator), next, -1)
     Token::ZeroOrMore => {
-      let loop_s = self.add(NfaKind::Any(opts.literal_separator), -1, -1)
+      let loop_s = self.add(NfaKind::AnyByte(opts.literal_separator), -1, -1)
+      let split = self.add(NfaKind::Epsilon, loop_s, next)
+      self.states[loop_s].out1 = split
+      split
+    }
+    Token::RecursiveAll => {
+      let loop_s = self.add(NfaKind::AnyByte(false), -1, -1)
       let split = self.add(NfaKind::Epsilon, loop_s, next)
       self.states[loop_s].out1 = split
       split
     }
     Token::RecursivePrefix => {
       // (?:/?|.*/) == (?:|.*/)
-      let slash = self.add(NfaKind::Literal(47, false), next, -1)
-      let any_s = self.add(NfaKind::Any(false), -1, -1)
+      let slash = self.add(NfaKind::Byte(47, false), next, -1)
+      let any_s = self.add(NfaKind::AnyByte(false), -1, -1)
       let star = self.add(NfaKind::Epsilon, any_s, slash)
       self.states[any_s].out1 = star
       self.add(NfaKind::Epsilon, next, star)
     }
     Token::RecursiveSuffix => {
       // /.*
-      let any_s = self.add(NfaKind::Any(false), -1, -1)
+      let any_s = self.add(NfaKind::AnyByte(false), -1, -1)
       let star = self.add(NfaKind::Epsilon, any_s, next)
       self.states[any_s].out1 = star
-      self.add(NfaKind::Literal(47, false), star, -1)
+      self.add(NfaKind::Byte(47, false), star, -1)
     }
     Token::RecursiveZeroOrMore => {
       // (?:/|/.*/) == / (?: | .*/ )
-      let slash2 = self.add(NfaKind::Literal(47, false), next, -1)
-      let any_s = self.add(NfaKind::Any(false), -1, -1)
+      let slash2 = self.add(NfaKind::Byte(47, false), next, -1)
+      let any_s = self.add(NfaKind::AnyByte(false), -1, -1)
       let star = self.add(NfaKind::Epsilon, any_s, slash2)
       self.states[any_s].out1 = star
       let mid = self.add(NfaKind::Epsilon, next, star)
-      self.add(NfaKind::Literal(47, false), mid, -1)
+      self.add(NfaKind::Byte(47, false), mid, -1)
     }
-    Token::Class(negated, ranges) =>
-    self.add(
-      NfaKind::Class(
+    Token::Class(negated, ranges) => {
+      let (w0, w1, w2, w3) = build_byte_class_mask(
         negated,
-        opts.literal_separator,
+        class_excludes_separator,
         opts.case_insensitive,
         ranges,
-      ),
-      next,
-      -1,
-    )
+      )
+      self.add(NfaKind::ByteClass(w0, w1, w2, w3), next, -1)
+    }
     Token::Alternates(alts) => {
       let entries : Array[Int] = Array::new()
       let mut i = 0
       while i < alts.length() {
         if !is_empty_branch(alts[i], opts) || opts.empty_alternates {
-          entries.push(self.compile_seq(alts[i], opts, next))
+          entries.push(
+            self.compile_seq_from(
+              alts[i],
+              0,
+              opts,
+              class_excludes_separator,
+              next,
+            ),
+          )
         }
         i = i + 1
       }
@@ -175,314 +283,105 @@ fn NfaBuilder::compile_tok(
   }
 }
 
-fn finalize_nfa(builder : NfaBuilder, start : Int) -> Nfa {
-  let num_states = builder.states.length()
-  let words = (num_states + 63) / 64
-  let eps_flat : Array[Int64] = Array::new()
-  let total_words = num_states * words
+fn mark_bound(bounds : Array[Int64], b : Int) -> Unit {
+  if b > 0 && b < 256 {
+    let idx = b >> 6
+    bounds[idx] = bounds[idx] | (1L << (b & 63))
+  }
+}
+
+///| Compute byte equivalence classes in O(num_states + 256) time.
+fn compute_byte_classes(states : Array[NfaState]) -> (Array[Int], Array[Int]) {
+  let bounds : Array[Int64] = [0L, 0L, 0L, 0L]
   let mut i = 0
-  while i < total_words {
-    eps_flat.push(0L)
+  let n = states.length()
+  while i < n {
+    match states[i].kind {
+      NfaKind::Byte(b, ci) => {
+        mark_bound(bounds, b)
+        mark_bound(bounds, b + 1)
+        if ci {
+          let sw = ascii_swap_case(b)
+          if sw != b {
+            mark_bound(bounds, sw)
+            mark_bound(bounds, sw + 1)
+          }
+        }
+      }
+      NfaKind::AnyByte(lit_sep) =>
+      if lit_sep {
+        mark_bound(bounds, 47)
+        mark_bound(bounds, 48)
+      }
+      NfaKind::ByteClass(w0, w1, w2, w3) => {
+        bounds[0] = bounds[0] | (w0 ^ (w0 << 1))
+        let c0 = if (w0 & (1L << 63)) != 0L { 1L } else { 0L }
+        bounds[1] = bounds[1] | (w1 ^ ((w1 << 1) | c0))
+        let c1 = if (w1 & (1L << 63)) != 0L { 1L } else { 0L }
+        bounds[2] = bounds[2] | (w2 ^ ((w2 << 1) | c1))
+        let c2 = if (w2 & (1L << 63)) != 0L { 1L } else { 0L }
+        bounds[3] = bounds[3] | (w3 ^ ((w3 << 1) | c2))
+      }
+      _ => ()
+    }
     i = i + 1
   }
 
-  // Compute epsilon closure for every state using iterative DFS.
-  let stack : Array[Int] = Array::new()
-  let mut s = 0
-  while s < num_states {
-    let base = s * words
-    stack.clear()
-    stack.push(s)
-    eps_flat[base + (s / 64)] = eps_flat[base + (s / 64)] | (1L << (s % 64))
-    while stack.length() > 0 {
-      let cur = match stack.pop() {
-        Some(v) => v
-        None => break
-      }
-      match builder.states[cur].kind {
-        NfaKind::Epsilon => {
-          let o1 = builder.states[cur].out1
-          if o1 >= 0 {
-            let bit1 = 1L << (o1 % 64)
-            let w1 = base + (o1 / 64)
-            if (eps_flat[w1] & bit1) == 0L {
-              eps_flat[w1] = eps_flat[w1] | bit1
-              stack.push(o1)
-            }
-          }
-          let o2 = builder.states[cur].out2
-          if o2 >= 0 {
-            let bit2 = 1L << (o2 % 64)
-            let w2 = base + (o2 / 64)
-            if (eps_flat[w2] & bit2) == 0L {
-              eps_flat[w2] = eps_flat[w2] | bit2
-              stack.push(o2)
-            }
-          }
-        }
-        _ => ()
-      }
+  let byte_classes : Array[Int] = Array::new()
+  let rep_bytes : Array[Int] = Array::new()
+  let mut cls = 0
+  byte_classes.push(0)
+  rep_bytes.push(0)
+  let mut b = 1
+  while b < 256 {
+    if (bounds[b >> 6] & (1L << (b & 63))) != 0L {
+      cls = cls + 1
+      rep_bytes.push(b)
     }
-    s = s + 1
-  }
-
-  let start_mask : Array[Int64] = Array::new()
-  let mut w = 0
-  while w < words {
-    start_mask.push(eps_flat[start * words + w])
-    w = w + 1
-  }
-
-  let match_states : Array[Int] = Array::new()
-  let match_pat_ids : Array[Int] = Array::new()
-  let mut match_mask64 = 0L
-  s = 0
-  while s < num_states {
-    match builder.states[s].kind {
-      NfaKind::Match(pid) => {
-        match_states.push(s)
-        match_pat_ids.push(pid)
-        if s < 64 {
-          match_mask64 = match_mask64 | (1L << s)
-        }
-      }
-      _ => ()
-    }
-    s = s + 1
-  }
-
-  let start_mask64 = if words == 1 { start_mask[0] } else { 0L }
-
-  let base_nfa = Nfa::{
-    states: builder.states,
-    start,
-    num_states,
-    words,
-    eps_flat,
-    start_mask,
-    match_states,
-    match_pat_ids,
-    start_mask64,
-    match_mask64,
-    has_dfa: false,
-    dfa_trans: Array::new(),
-    dfa_has_match: Array::new(),
-    dfa_matches: Array::new(),
-  }
-  try_build_ascii_dfa(base_nfa)
-}
-
-///| Try to compile an ASCII DFA (128 transitions/state, capped at 256 states) via subset construction.
-///| Falls back gracefully to Thompson NFA if the state cap is exceeded.
-fn mask_key(mask : Array[Int64], words : Int) -> String {
-  let sb = StringBuilder::new()
-  let mut w = 0
-  while w < words {
-    if w > 0 {
-      sb.write_byte((44).to_byte())
-    }
-    sb.write_string(mask[w].to_string())
-    w = w + 1
-  }
-  sb.to_string()
-}
-
-fn try_build_ascii_dfa(nfa : Nfa) -> Nfa {
-  let max_dfa_states = 256
-  let words = nfa.words
-  let num_states = nfa.num_states
-  if num_states == 0 {
-    return nfa
-  }
-
-  // Precompute per-byte active transition masks for every NFA state on ASCII 0..127.
-  // First collect only consuming NFA states so inner loops skip Epsilon/Match states.
-  let consuming_idx : Array[Int] = Array::new()
-  let mut s = 0
-  while s < num_states {
-    match nfa.states[s].kind {
-      NfaKind::Literal(_, _) | NfaKind::Any(_) | NfaKind::Class(_, _, _, _) =>
-      consuming_idx.push(s)
-      _ => ()
-    }
-    s = s + 1
-  }
-
-  // Compute equivalence classes on ASCII 0..127 so subset construction only steps unique classes!
-  // For each byte b in 0..127, build a signature of which consuming states match b.
-  let class_of_byte : Array[Int] = Array::new()
-  let rep_byte_of_class : Array[Int] = Array::new()
-  let sig_to_class : Map[String, Int] = Map::new()
-  let n_cons = consuming_idx.length()
-  let mut b = 0
-  while b < 128 {
-    let sb = StringBuilder::new()
-    let mut ci = 0
-    while ci < n_cons {
-      let sid = consuming_idx[ci]
-      if state_matches_cp(nfa.states[sid].kind, b) {
-        sb.write_byte((49).to_byte())
-      } else {
-        sb.write_byte((48).to_byte())
-      }
-      ci = ci + 1
-    }
-    let sig = sb.to_string()
-    match sig_to_class.get(sig) {
-      Some(cid) => class_of_byte.push(cid)
-      None => {
-        let cid = rep_byte_of_class.length()
-        sig_to_class.set(sig, cid)
-        rep_byte_of_class.push(b)
-        class_of_byte.push(cid)
-      }
-    }
+    byte_classes.push(cls)
     b = b + 1
   }
-  let num_classes = rep_byte_of_class.length()
+  (byte_classes, rep_bytes)
+}
 
-  // Precompute for each (class, consuming_state_idx): whether it matches.
-  let class_matches : Array[Array[Int]] = Array::new()
-  let mut c = 0
-  while c < num_classes {
-    let rb = rep_byte_of_class[c]
-    let list : Array[Int] = Array::new()
-    let mut ci = 0
-    while ci < n_cons {
-      let sid = consuming_idx[ci]
-      if state_matches_cp(nfa.states[sid].kind, rb) {
-        list.push(sid)
-      }
-      ci = ci + 1
-    }
-    class_matches.push(list)
-    c = c + 1
-  }
-
-  let dfa_masks : Array[Array[Int64]] = Array::new()
-  let mask_to_id : Map[String, Int] = Map::new()
-  let dfa_trans : Array[Int] = Array::new()
-  let dfa_has_match : Array[Bool] = Array::new()
-  let dfa_matches : Array[Array[Int]] = Array::new()
-
-  let start_copy : Array[Int64] = Array::new()
-  let mut w = 0
-  while w < words {
-    start_copy.push(nfa.start_mask[w])
-    w = w + 1
-  }
-  let start_key = mask_key(start_copy, words)
-  mask_to_id.set(start_key, 0)
-  dfa_masks.push(start_copy)
-
-  let mut cur_id = 0
-  while cur_id < dfa_masks.length() {
-    let cur_mask = dfa_masks[cur_id]
-    // Compute match list for cur_id
-    let mlist : Array[Int] = Array::new()
-    let mut mi = 0
-    while mi < nfa.match_states.length() {
-      let ms = nfa.match_states[mi]
-      if (cur_mask[ms / 64] & (1L << (ms % 64))) != 0L {
-        mlist.push(nfa.match_pat_ids[mi])
-      }
-      mi = mi + 1
-    }
-    dfa_has_match.push(mlist.length() > 0)
-    dfa_matches.push(mlist)
-
-    // Compute transitions for each equivalence class
-    let class_next : Array[Int] = Array::new()
-    c = 0
-    while c < num_classes {
-      let nxt : Array[Int64] = Array::new()
-      w = 0
-      while w < words {
-        nxt.push(0L)
-        w = w + 1
-      }
-      let mstates = class_matches[c]
-      let mut k = 0
-      let nm = mstates.length()
-      while k < nm {
-        let sid = mstates[k]
-        if (cur_mask[sid / 64] & (1L << (sid % 64))) != 0L {
-          let dst = nfa.states[sid].out1
-          if dst >= 0 {
-            let dbase = dst * words
-            w = 0
-            while w < words {
-              nxt[w] = nxt[w] | nfa.eps_flat[dbase + w]
-              w = w + 1
-            }
-          }
-        }
-        k = k + 1
-      }
-      let mut is_dead = true
-      w = 0
-      while w < words {
-        if nxt[w] != 0L {
-          is_dead = false
-          break
-        }
-        w = w + 1
-      }
-      if is_dead {
-        class_next.push(-1)
-      } else {
-        let key = mask_key(nxt, words)
-        match mask_to_id.get(key) {
-          Some(existing) => class_next.push(existing)
-          None => {
-            let new_id = dfa_masks.length()
-            if new_id >= max_dfa_states {
-              // State cap exceeded: fall back to Thompson NFA.
-              return nfa
-            }
-            mask_to_id.set(key, new_id)
-            dfa_masks.push(nxt)
-            class_next.push(new_id)
-          }
-        }
-      }
-      c = c + 1
-    }
-
-    // Expand equivalence class transitions into flat 128-entry row (pre-multiplied by 128!)
-    b = 0
-    while b < 128 {
-      let dst = class_next[class_of_byte[b]]
-      dfa_trans.push(if dst < 0 { -1 } else { dst << 7 })
-      b = b + 1
-    }
-    cur_id = cur_id + 1
-  }
-
+fn finalize_nfa(builder : NfaBuilder, start_states : Array[Int]) -> Nfa {
+  let num_states = builder.states.length()
+  let (byte_classes, rep_bytes) = compute_byte_classes(builder.states)
+  let stride = rep_bytes.length()
   Nfa::{
-    states: nfa.states,
-    start: nfa.start,
-    num_states: nfa.num_states,
-    words: nfa.words,
-    eps_flat: nfa.eps_flat,
-    start_mask: nfa.start_mask,
-    match_states: nfa.match_states,
-    match_pat_ids: nfa.match_pat_ids,
-    start_mask64: nfa.start_mask64,
-    match_mask64: nfa.match_mask64,
-    has_dfa: true,
-    dfa_trans,
-    dfa_has_match,
-    dfa_matches,
+    states: builder.states,
+    start_states,
+    num_states,
+    byte_classes,
+    rep_bytes,
+    stride,
+    dfa_ready: false,
+    start_dead: false,
+    dfa_trans: Array::new(),
+    dfa_sets: Array::new(),
+    dfa_has_match: Array::new(),
+    dfa_matches: Array::new(),
+    total_set_ints: 0,
+    tbl_mask: 0,
+    tbl_buckets: Array::new(),
+    tbl_hashes: Array::new(),
+    tbl_count: 0,
+    eps_gen_arr: Array::new(),
+    eps_gen: 0,
+    eps_stack: Array::new(),
   }
 }
 
-///| Compile a single token sequence into an immutable Thompson NFA.
-pub fn compile_single_nfa(tokens : Array[Token], opts : GlobOptions) -> Nfa {
+///| Compile a single token sequence into an immutable byte-level NFA.
+pub fn compile_single_nfa(
+  tokens : Array[Token],
+  opts : GlobOptions,
+  class_excludes_separator : Bool,
+) -> Nfa {
   let b = NfaBuilder::new()
   let m = b.add(NfaKind::Match(0), -1, -1)
-  let start = b.compile_tokens(tokens, opts, m)
-  finalize_nfa(b, start)
+  let start = b.compile_seq_from(tokens, 0, opts, class_excludes_separator, m)
+  finalize_nfa(b, [start])
 }
 
 ///| Entry for compiling a multi-pattern NFA.
@@ -490,190 +389,455 @@ pub struct MultiNfaEntry {
   pub pat_id : Int
   pub tokens : Array[Token]
   pub opts : GlobOptions
+  pub class_excludes_separator : Bool
 }
 
-///| Compile multiple patterns into a single unified Thompson NFA.
+///| Compile multiple patterns into a single unified byte-level NFA in O(N) time and memory.
+///| Patterns starting with `RecursivePrefix` (`**/...`) share a single `**/` loop gadget.
 pub fn compile_multi_nfa(entries : Array[MultiNfaEntry]) -> Nfa {
   let b = NfaBuilder::new()
   if entries.length() == 0 {
-    let dead = b.add(NfaKind::Epsilon, -1, -1)
-    return finalize_nfa(b, dead)
+    return finalize_nfa(b, Array::new())
   }
-  let starts : Array[Int] = Array::new()
+  let start_states : Array[Int] = Array::new()
+  let rec_tails : Array[Int] = Array::new()
   let mut i = 0
-  while i < entries.length() {
+  let ne = entries.length()
+  while i < ne {
     let e = entries[i]
     let m = b.add(NfaKind::Match(e.pat_id), -1, -1)
-    let st = b.compile_tokens(e.tokens, e.opts, m)
-    starts.push(st)
-    i = i + 1
-  }
-  let mut root = starts[starts.length() - 1]
-  let mut j = starts.length() - 2
-  while j >= 0 {
-    root = b.add(NfaKind::Epsilon, starts[j], root)
-    j = j - 1
-  }
-  finalize_nfa(b, root)
-}
-
-fn state_matches_cp(kind : NfaKind, cp : Int) -> Bool {
-  match kind {
-    NfaKind::Literal(lit, ci) =>
-    if cp == lit {
-      true
-    } else if ci {
-      ascii_lower(cp) == ascii_lower(lit)
+    let is_rec_prefix = if e.tokens.length() >= 2 {
+      match e.tokens[0] {
+        Token::RecursivePrefix => true
+        _ => false
+      }
     } else {
       false
     }
-    NfaKind::Any(lit_sep) => !(lit_sep && cp == 47)
-    NfaKind::Class(negated, lit_sep, ci, ranges) => {
-      if lit_sep && cp == 47 {
-        return false
-      }
-      let swapped = if ci { ascii_swap_case(cp) } else { cp }
-      let mut hit = false
-      let mut i = 0
-      let n = ranges.length()
-      while i < n {
-        let r = ranges[i]
-        if (cp >= r.lo && cp <= r.hi) ||
-        (ci && swapped >= r.lo && swapped <= r.hi) {
-          hit = true
-          break
-        }
-        i = i + 1
-      }
-      if negated {
-        !hit
+    if is_rec_prefix {
+      let tail = b.compile_seq_from(
+        e.tokens,
+        1,
+        e.opts,
+        e.class_excludes_separator,
+        m,
+      )
+      rec_tails.push(tail)
+    } else {
+      let st = b.compile_seq_from(
+        e.tokens,
+        0,
+        e.opts,
+        e.class_excludes_separator,
+        m,
+      )
+      start_states.push(st)
+    }
+    i = i + 1
+  }
+  if rec_tails.length() > 0 {
+    // Build one shared epsilon fan-out tree for all `**/` tails,
+    // and attach a single shared `(?:|.*/)` gadget to it!
+    let mut fanout = rec_tails[rec_tails.length() - 1]
+    let mut j = rec_tails.length() - 2
+    while j >= 0 {
+      fanout = b.add(NfaKind::Epsilon, rec_tails[j], fanout)
+      j = j - 1
+    }
+    let slash = b.add(NfaKind::Byte(47, false), fanout, -1)
+    let any_s = b.add(NfaKind::AnyByte(false), -1, -1)
+    let star = b.add(NfaKind::Epsilon, any_s, slash)
+    b.states[any_s].out1 = star
+    start_states.push(fanout)
+    start_states.push(star)
+  }
+  finalize_nfa(b, start_states)
+}
+
+fn state_matches_byte(kind : NfaKind, b : Int) -> Bool {
+  match kind {
+    NfaKind::Byte(lit, ci) =>
+    if b == lit {
+      true
+    } else if ci {
+      ascii_lower(b) == ascii_lower(lit)
+    } else {
+      false
+    }
+    NfaKind::AnyByte(lit_sep) => !(lit_sep && b == 47)
+    NfaKind::ByteClass(w0, w1, w2, w3) => {
+      let word = if b < 64 {
+        w0
+      } else if b < 128 {
+        w1
+      } else if b < 192 {
+        w2
       } else {
-        hit
+        w3
       }
+      (word & (1L << (b & 63))) != 0L
     }
     _ => false
   }
 }
 
-///| Fast 64-bit bit-parallel simulation on `s[start_pos..end_pos]` (ZERO heap allocations!).
-fn Nfa::run64(self : Nfa, s : String, start_pos : Int, end_pos : Int) -> Int64 {
-  let mut cur = self.start_mask64
-  let mut pos = start_pos
-  while pos < end_pos && cur != 0L {
-    let b0 = s.code_unit_at(pos)
-    let mut cp = b0
-    if b0 < 0x80 {
-      pos = pos + 1
-    } else {
-      let (decoded, next_pos) = decode_utf8(s, pos)
-      cp = decoded
-      pos = next_pos
-    }
-    let mut next = 0L
-    let mut s_idx = 0
-    let mut rem = cur
-    while rem != 0L {
-      // Skip 8 zero bits at a time for speed
-      if (rem & 255L) == 0L {
-        rem = rem >> 8
-        // Mask off sign-extended high bits if negative
-        rem = rem & 0x00FFFFFFFFFFFFFFL
-        s_idx = s_idx + 8
-        continue
-      }
-      if (rem & 1L) != 0L {
-        let st = self.states[s_idx]
-        if state_matches_cp(st.kind, cp) {
-          let dst = st.out1
-          if dst >= 0 {
-            next = next | self.eps_flat[dst]
-          }
-        }
-      }
-      rem = (rem >> 1) & 0x7FFFFFFFFFFFFFFFL
-      s_idx = s_idx + 1
-    }
-    cur = next
+///| Sort an `Array[Int]` in-place (insertion sort for small arrays, iterative quicksort for large).
+fn sort_ints_in_place(arr : Array[Int]) -> Unit {
+  let n = arr.length()
+  if n <= 1 {
+    return
   }
-  cur
+  if n <= 24 {
+    let mut i = 1
+    while i < n {
+      let key = arr[i]
+      let mut j = i - 1
+      while j >= 0 && arr[j] > key {
+        arr[j + 1] = arr[j]
+        j = j - 1
+      }
+      arr[j + 1] = key
+      i = i + 1
+    }
+    return
+  }
+  // Iterative quicksort with median-of-three pivot
+  let stack_lo : Array[Int] = [0]
+  let stack_hi : Array[Int] = [n - 1]
+  while stack_lo.length() > 0 {
+    let lo = match stack_lo.pop() {
+      Some(v) => v
+      None => break
+    }
+    let hi = match stack_hi.pop() {
+      Some(v) => v
+      None => break
+    }
+    if hi - lo <= 16 {
+      let mut i = lo + 1
+      while i <= hi {
+        let key = arr[i]
+        let mut j = i - 1
+        while j >= lo && arr[j] > key {
+          arr[j + 1] = arr[j]
+          j = j - 1
+        }
+        arr[j + 1] = key
+        i = i + 1
+      }
+      continue
+    }
+    let mid = lo + ((hi - lo) >> 1)
+    if arr[mid] < arr[lo] {
+      let t = arr[lo]
+      arr[lo] = arr[mid]
+      arr[mid] = t
+    }
+    if arr[hi] < arr[lo] {
+      let t = arr[lo]
+      arr[lo] = arr[hi]
+      arr[hi] = t
+    }
+    if arr[mid] < arr[hi] {
+      let t = arr[mid]
+      arr[mid] = arr[hi]
+      arr[hi] = t
+    }
+    let pivot = arr[hi]
+    let mut i = lo - 1
+    let mut j = lo
+    while j < hi {
+      if arr[j] <= pivot {
+        i = i + 1
+        let t = arr[i]
+        arr[i] = arr[j]
+        arr[j] = t
+      }
+      j = j + 1
+    }
+    let p = i + 1
+    let t = arr[p]
+    arr[p] = arr[hi]
+    arr[hi] = t
+    if p - 1 > lo {
+      stack_lo.push(lo)
+      stack_hi.push(p - 1)
+    }
+    if p + 1 < hi {
+      stack_lo.push(p + 1)
+      stack_hi.push(hi)
+    }
+  }
 }
 
-///| General multi-word bit-parallel simulation on `s[start_pos..end_pos]`.
-fn Nfa::run_wide(
-  self : Nfa,
-  s : String,
-  start_pos : Int,
-  end_pos : Int,
-) -> Array[Int64] {
-  let words = self.words
-  let cur : Array[Int64] = Array::new()
-  let next : Array[Int64] = Array::new()
-  let mut w = 0
-  while w < words {
-    cur.push(self.start_mask[w])
-    next.push(0L)
-    w = w + 1
+fn hash_int_array(arr : Array[Int]) -> Int64 {
+  let mut h : Int64 = -3750763034362895579L
+  let mut i = 0
+  let n = arr.length()
+  while i < n {
+    h = (h ^ arr[i].to_int64()) * 1099511628211L
+    i = i + 1
   }
+  h
+}
 
-  let mut pos = start_pos
-  while pos < end_pos {
-    let b0 = s.code_unit_at(pos)
-    let mut cp = b0
-    if b0 < 0x80 {
-      pos = pos + 1
-    } else {
-      let (decoded, next_pos) = decode_utf8(s, pos)
-      cp = decoded
-      pos = next_pos
+fn eq_int_array(a : Array[Int], b : Array[Int]) -> Bool {
+  let n = a.length()
+  if n != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    if a[i] != b[i] {
+      return false
     }
-    w = 0
-    while w < words {
-      next[w] = 0L
-      w = w + 1
+    i = i + 1
+  }
+  true
+}
+
+///| Run epsilon closure from `self.eps_stack` and return sorted consuming + Match state IDs.
+fn Nfa::eps_closure_from_stack(self : Nfa) -> Array[Int] {
+  self.eps_gen = self.eps_gen + 1
+  let gen = self.eps_gen
+  let gen_arr = self.eps_gen_arr
+  let states = self.states
+  let out : Array[Int] = Array::new()
+  while self.eps_stack.length() > 0 {
+    let cur = match self.eps_stack.pop() {
+      Some(v) => v
+      None => break
     }
-    let mut any_active = false
-    w = 0
-    while w < words {
-      let mut rem = cur[w]
-      if rem != 0L {
-        any_active = true
-        let mut s_idx = w * 64
-        while rem != 0L {
-          if (rem & 255L) == 0L {
-            rem = (rem >> 8) & 0x00FFFFFFFFFFFFFFL
-            s_idx = s_idx + 8
-            continue
-          }
-          if (rem & 1L) != 0L {
-            let st = self.states[s_idx]
-            if state_matches_cp(st.kind, cp) {
-              let dst = st.out1
-              if dst >= 0 {
-                let dbase = dst * words
-                let mut dw = 0
-                while dw < words {
-                  next[dw] = next[dw] | self.eps_flat[dbase + dw]
-                  dw = dw + 1
-                }
-              }
-            }
-          }
-          rem = (rem >> 1) & 0x7FFFFFFFFFFFFFFFL
-          s_idx = s_idx + 1
+    if gen_arr[cur] == gen {
+      continue
+    }
+    gen_arr[cur] = gen
+    let st = states[cur]
+    match st.kind {
+      NfaKind::Epsilon => {
+        let o1 = st.out1
+        if o1 >= 0 && gen_arr[o1] != gen {
+          self.eps_stack.push(o1)
+        }
+        let o2 = st.out2
+        if o2 >= 0 && gen_arr[o2] != gen {
+          self.eps_stack.push(o2)
         }
       }
-      w = w + 1
-    }
-    if !any_active {
-      break
-    }
-    w = 0
-    while w < words {
-      cur[w] = next[w]
-      w = w + 1
+      _ => out.push(cur)
     }
   }
-  cur
+  sort_ints_in_place(out)
+  out
+}
+
+fn Nfa::rehash_set_table(self : Nfa, new_cap : Int) -> Unit {
+  let mask = new_cap - 1
+  let buckets : Array[Int] = Array::new()
+  let hashes : Array[Int64] = Array::new()
+  let mut i = 0
+  while i < new_cap {
+    buckets.push(-1)
+    hashes.push(0L)
+    i = i + 1
+  }
+  let old_buckets = self.tbl_buckets
+  let old_hashes = self.tbl_hashes
+  let mut k = 0
+  while k < old_buckets.length() {
+    let sid = old_buckets[k]
+    if sid >= 0 {
+      let h = old_hashes[k]
+      let mut slot = h.to_int() & mask
+      while buckets[slot] >= 0 {
+        slot = (slot + 1) & mask
+      }
+      buckets[slot] = sid
+      hashes[slot] = h
+    }
+    k = k + 1
+  }
+  self.tbl_mask = mask
+  self.tbl_buckets = buckets
+  self.tbl_hashes = hashes
+}
+
+fn Nfa::lookup_dfa_state(self : Nfa, set : Array[Int], h : Int64) -> Int {
+  let mask = self.tbl_mask
+  let buckets = self.tbl_buckets
+  let hashes = self.tbl_hashes
+  let sets = self.dfa_sets
+  let mut slot = h.to_int() & mask
+  while true {
+    let sid = buckets[slot]
+    if sid < 0 {
+      return -1
+    }
+    if hashes[slot] == h && eq_int_array(sets[sid], set) {
+      return sid
+    }
+    slot = (slot + 1) & mask
+  }
+  -1
+}
+
+fn Nfa::insert_dfa_state(self : Nfa, set : Array[Int], h : Int64) -> Int {
+  if (self.tbl_count + 1) * 2 > self.tbl_buckets.length() {
+    self.rehash_set_table(self.tbl_buckets.length() * 2)
+  }
+  let new_id = self.dfa_sets.length()
+  self.dfa_sets.push(set)
+  self.total_set_ints = self.total_set_ints + set.length()
+
+  let matches : Array[Int] = Array::new()
+  let states = self.states
+  let mut i = 0
+  let ns = set.length()
+  while i < ns {
+    match states[set[i]].kind {
+      NfaKind::Match(pid) => matches.push(pid)
+      _ => ()
+    }
+    i = i + 1
+  }
+  self.dfa_has_match.push(matches.length() > 0)
+  self.dfa_matches.push(matches)
+
+  // Append a zero-initialized transition row (0 = unknown)
+  let stride = self.stride
+  let mut c = 0
+  while c < stride {
+    self.dfa_trans.push(0)
+    c = c + 1
+  }
+
+  let mask = self.tbl_mask
+  let buckets = self.tbl_buckets
+  let hashes = self.tbl_hashes
+  let mut slot = h.to_int() & mask
+  while buckets[slot] >= 0 {
+    slot = (slot + 1) & mask
+  }
+  buckets[slot] = new_id
+  hashes[slot] = h
+  self.tbl_count = self.tbl_count + 1
+  new_id
+}
+
+fn Nfa::reset_dfa_cache(self : Nfa) -> Unit {
+  self.dfa_trans.clear()
+  self.dfa_sets.clear()
+  self.dfa_has_match.clear()
+  self.dfa_matches.clear()
+  self.total_set_ints = 0
+
+  // Row 0: unused dummy dead row
+  let stride = self.stride
+  let mut c = 0
+  while c < stride {
+    self.dfa_trans.push(-1)
+    c = c + 1
+  }
+  self.dfa_sets.push(Array::new())
+  self.dfa_has_match.push(false)
+  self.dfa_matches.push(Array::new())
+
+  // Reset open-addressing hash table
+  let init_cap = 256
+  let buckets : Array[Int] = Array::new()
+  let hashes : Array[Int64] = Array::new()
+  let mut i = 0
+  while i < init_cap {
+    buckets.push(-1)
+    hashes.push(0L)
+    i = i + 1
+  }
+  self.tbl_mask = init_cap - 1
+  self.tbl_buckets = buckets
+  self.tbl_hashes = hashes
+  self.tbl_count = 0
+
+  // Compute start state (row 1)
+  self.eps_stack.clear()
+  i = 0
+  while i < self.start_states.length() {
+    self.eps_stack.push(self.start_states[i])
+    i = i + 1
+  }
+  let start_set = self.eps_closure_from_stack()
+  if start_set.length() == 0 {
+    self.start_dead = true
+  } else {
+    self.start_dead = false
+    let _ = self.insert_dfa_state(start_set, hash_int_array(start_set))
+  }
+}
+
+fn Nfa::init_dfa(self : Nfa) -> Unit {
+  if self.eps_gen_arr.length() < self.num_states {
+    let mut i = self.eps_gen_arr.length()
+    while i < self.num_states {
+      self.eps_gen_arr.push(0)
+      i = i + 1
+    }
+  }
+  self.reset_dfa_cache()
+  self.dfa_ready = true
+}
+
+///| Compute a missing Lazy DFA transition `(cur_off, cls)` on demand.
+///| Returns `next_state_id * stride` (> 0) or `-1` (dead).
+fn Nfa::step_lazy(self : Nfa, cur_off : Int, cls : Int) -> Int {
+  let stride = self.stride
+  let cur_id = cur_off / stride
+  let cur_set = self.dfa_sets[cur_id]
+  let rb = self.rep_bytes[cls]
+  let states = self.states
+
+  self.eps_stack.clear()
+  let mut i = 0
+  let ns = cur_set.length()
+  while i < ns {
+    let st = states[cur_set[i]]
+    if state_matches_byte(st.kind, rb) {
+      let dst = st.out1
+      if dst >= 0 {
+        self.eps_stack.push(dst)
+      }
+    }
+    i = i + 1
+  }
+
+  let next_set = self.eps_closure_from_stack()
+  if next_set.length() == 0 {
+    self.dfa_trans[cur_off + cls] = -1
+    return -1
+  }
+  let h = hash_int_array(next_set)
+  let existing = self.lookup_dfa_state(next_set, h)
+  if existing >= 0 {
+    let next_off = existing * stride
+    self.dfa_trans[cur_off + cls] = next_off
+    return next_off
+  }
+
+  // Memory-bounded cache flush (~24 MiB cap): clear & continue seamlessly without restarting!
+  if self.dfa_sets.length() >= 8192 ||
+  self.total_set_ints + next_set.length() > 3000000 ||
+  self.dfa_trans.length() + stride > 3000000 {
+    self.reset_dfa_cache()
+    let after_reset = self.lookup_dfa_state(next_set, h)
+    if after_reset >= 0 {
+      return after_reset * stride
+    }
+    let fresh_id = self.insert_dfa_state(next_set, h)
+    return fresh_id * stride
+  }
+
+  let new_id = self.insert_dfa_state(next_set, h)
+  let next_off = new_id * stride
+  self.dfa_trans[cur_off + cls] = next_off
+  next_off
 }
 
 ///| Test whether any pattern in this NFA matches `s[start_pos..end_pos]`.
@@ -683,42 +847,34 @@ pub fn Nfa::is_match_slice(
   start_pos : Int,
   end_pos : Int,
 ) -> Bool {
-  if self.has_dfa {
-    let trans = self.dfa_trans
-    let mut st = 0
-    let mut pos = start_pos
-    let mut ascii_ok = true
-    while pos < end_pos {
-      let b = s.code_unit_at(pos)
-      if b >= 128 {
-        ascii_ok = false
-        break
-      }
-      st = trans[st + b]
+  if !self.dfa_ready {
+    self.init_dfa()
+  }
+  if self.start_dead {
+    return false
+  }
+  let stride = self.stride
+  let byte_classes = self.byte_classes
+  let mut trans = self.dfa_trans
+  let mut st = stride // state 1 = start state
+  let mut pos = start_pos
+  while pos < end_pos {
+    let cls = byte_classes[s.code_unit_at(pos)]
+    let nxt = trans[st + cls]
+    if nxt > 0 {
+      st = nxt
+    } else if nxt < 0 {
+      return false
+    } else {
+      st = self.step_lazy(st, cls)
       if st < 0 {
         return false
       }
-      pos = pos + 1
+      trans = self.dfa_trans
     }
-    if ascii_ok {
-      return self.dfa_has_match[st >> 7]
-    }
+    pos = pos + 1
   }
-  if self.words == 1 {
-    let fin = self.run64(s, start_pos, end_pos)
-    return (fin & self.match_mask64) != 0L
-  }
-  let fin = self.run_wide(s, start_pos, end_pos)
-  let mut i = 0
-  let nm = self.match_states.length()
-  while i < nm {
-    let ms = self.match_states[i]
-    if (fin[ms / 64] & (1L << (ms % 64))) != 0L {
-      return true
-    }
-    i = i + 1
-  }
-  false
+  self.dfa_has_match[st / stride]
 }
 
 ///| Append all matching pattern IDs for `s[start_pos..end_pos]` into `into`.
@@ -729,61 +885,41 @@ pub fn Nfa::matches_slice_into(
   end_pos : Int,
   into : Array[Int],
 ) -> Unit {
-  if self.has_dfa {
-    let trans = self.dfa_trans
-    let mut st = 0
-    let mut pos = start_pos
-    let mut ascii_ok = true
-    while pos < end_pos {
-      let b = s.code_unit_at(pos)
-      if b >= 128 {
-        ascii_ok = false
-        break
-      }
-      st = trans[st + b]
+  if !self.dfa_ready {
+    self.init_dfa()
+  }
+  if self.start_dead {
+    return
+  }
+  let stride = self.stride
+  let byte_classes = self.byte_classes
+  let mut trans = self.dfa_trans
+  let mut st = stride // state 1 = start state
+  let mut pos = start_pos
+  while pos < end_pos {
+    let cls = byte_classes[s.code_unit_at(pos)]
+    let nxt = trans[st + cls]
+    if nxt > 0 {
+      st = nxt
+    } else if nxt < 0 {
+      return
+    } else {
+      st = self.step_lazy(st, cls)
       if st < 0 {
         return
       }
-      pos = pos + 1
+      trans = self.dfa_trans
     }
-    if ascii_ok {
-      let sid = st >> 7
-      if self.dfa_has_match[sid] {
-        let hits = self.dfa_matches[sid]
-        let mut i = 0
-        let nh = hits.length()
-        while i < nh {
-          into.push(hits[i])
-          i = i + 1
-        }
-      }
-      return
-    }
+    pos = pos + 1
   }
-  if self.words == 1 {
-    let fin = self.run64(s, start_pos, end_pos)
-    if (fin & self.match_mask64) == 0L {
-      return
-    }
+  let sid = st / stride
+  if self.dfa_has_match[sid] {
+    let hits = self.dfa_matches[sid]
     let mut i = 0
-    let nm = self.match_states.length()
-    while i < nm {
-      let ms = self.match_states[i]
-      if (fin & (1L << ms)) != 0L {
-        into.push(self.match_pat_ids[i])
-      }
+    let nh = hits.length()
+    while i < nh {
+      into.push(hits[i])
       i = i + 1
     }
-    return
-  }
-  let fin = self.run_wide(s, start_pos, end_pos)
-  let mut i = 0
-  let nm = self.match_states.length()
-  while i < nm {
-    let ms = self.match_states[i]
-    if (fin[ms / 64] & (1L << (ms % 64))) != 0L {
-      into.push(self.match_pat_ids[i])
-    }
-    i = i + 1
   }
 }
