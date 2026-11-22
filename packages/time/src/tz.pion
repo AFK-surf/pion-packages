@@ -1,0 +1,931 @@
+///| Time zones (`TimeZone`), POSIX TZ strings, TZif (v1/v2/v3/v4) binary parsing,
+///| DST disambiguation (`Disambiguation`, `AmbiguousZoned`), and zone-aware `Zoned` datetimes.
+///| Pure Pion, zero `World`, `wasm32`-compatible.
+
+///|
+pub enum Disambiguation {
+  Compatible
+  Earlier
+  Later
+  Reject
+}
+
+///|
+pub struct OffsetInfo {
+  pub offset : Offset
+  pub dst : Bool
+  pub abbrev : String
+}
+
+///|
+enum PosixRuleKind {
+  MonthWeekDay(Int, Int, Int)
+  JulianOne(Int)
+  JulianZero(Int)
+}
+
+///|
+struct PosixTransitionRule {
+  kind : PosixRuleKind
+  time_secs : Int
+}
+
+///|
+struct PosixTz {
+  std_abbrev : String
+  std_offset : Int
+  has_dst : Bool
+  dst_abbrev : String
+  dst_offset : Int
+  has_rules : Bool
+  start_rule : PosixTransitionRule
+  end_rule : PosixTransitionRule
+}
+
+///|
+struct TzifType {
+  utoff : Int
+  isdst : Bool
+  abbrev : String
+}
+
+///|
+struct TzifData {
+  transitions : Array[Int64]
+  type_indices : Array[Int]
+  types : Array[TzifType]
+  footer : Option[PosixTz]
+}
+
+///|
+enum TimeZoneKind {
+  Fixed(Offset, String)
+  Posix(PosixTz)
+  Tzif(TzifData)
+}
+
+///|
+pub struct TimeZone {
+  name : String
+  kind : TimeZoneKind
+}
+
+///|
+pub struct Zoned {
+  pub timestamp : Timestamp
+  pub datetime : DateTime
+  pub offset : Offset
+  pub tz : TimeZone
+}
+
+///|
+pub enum AmbiguousKind {
+  Unambiguous(Offset)
+  Fold(Offset, Offset)
+  Gap(Offset, Offset)
+}
+
+///|
+pub struct AmbiguousZoned {
+  pub datetime : DateTime
+  pub tz : TimeZone
+  pub kind : AmbiguousKind
+}
+
+// -----------------------------------------------------------------------------
+// POSIX TZ string parser & evaluator (IEEE 1003.1 / RFC 8536 §3.3.1)
+// -----------------------------------------------------------------------------
+
+///|
+fn parse_posix_abbrev(s : String, start : Int) -> Result[(String, Int), TimeError] {
+  let len = s.length()
+  if start >= len {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "expected tz abbreviation"))
+  }
+  let sb = StringBuilder::new()
+  let mut pos = start
+  if s.code_unit_at(pos) == 60 {
+    // Quoted <...>
+    pos = pos + 1
+    while pos < len && s.code_unit_at(pos) != 62 {
+      let c = s.code_unit_at(pos)
+      if !((c >= 65 && c <= 90) ||
+        (c >= 97 && c <= 122) ||
+        (c >= 48 && c <= 57) ||
+        c == 43 ||
+        c == 45) {
+        return Err(TimeError::new("PARSE_POSIX_TZ", "invalid char in quoted tz abbreviation"))
+      }
+      sb.write_byte(c.to_byte())
+      pos = pos + 1
+    }
+    if pos >= len || s.code_unit_at(pos) != 62 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "unclosed '<' in tz abbreviation"))
+    }
+    pos = pos + 1
+  } else {
+    while pos < len {
+      let c = s.code_unit_at(pos)
+      if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+        sb.write_byte(c.to_byte())
+        pos = pos + 1
+      } else {
+        break
+      }
+    }
+  }
+  let abbrev = sb.to_string()
+  if abbrev.length() < 3 {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "tz abbreviation must be at least 3 chars"))
+  }
+  Ok((abbrev, pos))
+}
+
+///| Parse `[+-]hh[:mm[:ss]]` into seconds. When `invert_sign` is true (POSIX offsets),
+///| `+5` / `5` means `-18000` (west of UTC) and `-1` means `+3600` (east of UTC).
+fn parse_posix_hms(
+  s : String,
+  start : Int,
+  invert_sign : Bool,
+  max_hours : Int,
+) -> Result[(Int, Int), TimeError] {
+  let len = s.length()
+  let mut pos = start
+  if pos >= len {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "expected offset/time"))
+  }
+  let mut neg = false
+  let first = s.code_unit_at(pos)
+  if first == 45 {
+    neg = true
+    pos = pos + 1
+  } else if first == 43 {
+    pos = pos + 1
+  }
+  let mut h = 0
+  let mut h_digits = 0
+  while pos < len && is_digit(s.code_unit_at(pos)) && h_digits < 3 {
+    h = h * 10 + (s.code_unit_at(pos) - 48)
+    h_digits = h_digits + 1
+    pos = pos + 1
+  }
+  if h_digits == 0 || h > max_hours {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "invalid hours in POSIX TZ"))
+  }
+  let mut m = 0
+  let mut sec = 0
+  if pos < len && s.code_unit_at(pos) == 58 {
+    pos = pos + 1
+    if pos + 2 > len {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "truncated minutes in POSIX TZ"))
+    }
+    let mv = parse_2_digits(s, pos)
+    if mv < 0 || mv > 59 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "invalid minutes in POSIX TZ"))
+    }
+    m = mv
+    pos = pos + 2
+    if pos < len && s.code_unit_at(pos) == 58 {
+      pos = pos + 1
+      if pos + 2 > len {
+        return Err(TimeError::new("PARSE_POSIX_TZ", "truncated seconds in POSIX TZ"))
+      }
+      let sv = parse_2_digits(s, pos)
+      if sv < 0 || sv > 59 {
+        return Err(TimeError::new("PARSE_POSIX_TZ", "invalid seconds in POSIX TZ"))
+      }
+      sec = sv
+      pos = pos + 2
+    }
+  }
+  let mag = h * 3600 + m * 60 + sec
+  let signed = if invert_sign {
+    if neg { mag } else { -mag }
+  } else {
+    if neg { -mag } else { mag }
+  }
+  Ok((signed, pos))
+}
+
+///|
+fn parse_posix_uint(s : String, start : Int) -> Result[(Int, Int), TimeError] {
+  let len = s.length()
+  let mut pos = start
+  let mut acc = 0
+  let mut digits = 0
+  while pos < len && is_digit(s.code_unit_at(pos)) {
+    acc = acc * 10 + (s.code_unit_at(pos) - 48)
+    digits = digits + 1
+    pos = pos + 1
+    if digits > 4 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "integer too large in POSIX rule"))
+    }
+  }
+  if digits == 0 {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "expected integer in POSIX rule"))
+  }
+  Ok((acc, pos))
+}
+
+///|
+fn parse_posix_rule(s : String, start : Int) -> Result[(PosixTransitionRule, Int), TimeError] {
+  let len = s.length()
+  if start >= len {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "empty transition rule"))
+  }
+  let mut pos = start
+  let c = s.code_unit_at(pos)
+  let kind : PosixRuleKind = if c == 77 || c == 109 {
+    // Mm.w.d
+    pos = pos + 1
+    let mp = match parse_posix_uint(s, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let month = mp.0
+    pos = mp.1
+    if month < 1 || month > 12 || pos >= len || s.code_unit_at(pos) != 46 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "invalid month in Mm.w.d rule"))
+    }
+    pos = pos + 1
+    let wp = match parse_posix_uint(s, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let week = wp.0
+    pos = wp.1
+    if week < 1 || week > 5 || pos >= len || s.code_unit_at(pos) != 46 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "invalid week in Mm.w.d rule"))
+    }
+    pos = pos + 1
+    let dp = match parse_posix_uint(s, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let day = dp.0
+    pos = dp.1
+    if day < 0 || day > 6 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "invalid weekday in Mm.w.d rule"))
+    }
+    PosixRuleKind::MonthWeekDay(month, week, day)
+  } else if c == 74 {
+    // Jn (1..=365, ignoring Feb 29)
+    pos = pos + 1
+    let jp = match parse_posix_uint(s, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if jp.0 < 1 || jp.0 > 365 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "Jn must be 1..=365"))
+    }
+    pos = jp.1
+    PosixRuleKind::JulianOne(jp.0)
+  } else {
+    // n (0..=365, counting Feb 29)
+    let np = match parse_posix_uint(s, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if np.0 < 0 || np.0 > 365 {
+      return Err(TimeError::new("PARSE_POSIX_TZ", "Julian day must be 0..=365"))
+    }
+    pos = np.1
+    PosixRuleKind::JulianZero(np.0)
+  }
+  let mut time_secs = 7200
+  if pos < len && s.code_unit_at(pos) == 47 {
+    pos = pos + 1
+    match parse_posix_hms(s, pos, false, 167) {
+      Ok(tp) => {
+        time_secs = tp.0
+        pos = tp.1
+      }
+      Err(e) => return Err(e)
+    }
+  }
+  Ok((PosixTransitionRule::{ kind: kind, time_secs: time_secs }, pos))
+}
+
+///|
+fn parse_posix_tz(spec : String) -> Result[PosixTz, TimeError] {
+  let len = spec.length()
+  if len == 0 {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "empty POSIX TZ string"))
+  }
+  let sp = match parse_posix_abbrev(spec, 0) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let std_abbrev = sp.0
+  let mut pos = sp.1
+  let op = match parse_posix_hms(spec, pos, true, 25) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let std_offset = op.0
+  pos = op.1
+  let dummy_rule = PosixTransitionRule::{ kind: PosixRuleKind::JulianZero(0), time_secs: 7200 }
+  if pos == len {
+    return Ok(PosixTz::{
+      std_abbrev: std_abbrev,
+      std_offset: std_offset,
+      has_dst: false,
+      dst_abbrev: "",
+      dst_offset: std_offset,
+      has_rules: false,
+      start_rule: dummy_rule,
+      end_rule: dummy_rule,
+    })
+  }
+  // DST abbreviation
+  let dp = match parse_posix_abbrev(spec, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let dst_abbrev = dp.0
+  pos = dp.1
+  let mut dst_offset = std_offset + 3600
+  if pos < len && spec.code_unit_at(pos) != 44 {
+    let dop = match parse_posix_hms(spec, pos, true, 25) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    dst_offset = dop.0
+    pos = dop.1
+  }
+  if pos == len {
+    return Ok(PosixTz::{
+      std_abbrev: std_abbrev,
+      std_offset: std_offset,
+      has_dst: true,
+      dst_abbrev: dst_abbrev,
+      dst_offset: dst_offset,
+      has_rules: false,
+      start_rule: dummy_rule,
+      end_rule: dummy_rule,
+    })
+  }
+  if spec.code_unit_at(pos) != 44 {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "expected ',' before DST start rule"))
+  }
+  pos = pos + 1
+  let sr = match parse_posix_rule(spec, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = sr.1
+  if pos >= len || spec.code_unit_at(pos) != 44 {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "expected ',' before DST end rule"))
+  }
+  pos = pos + 1
+  let er = match parse_posix_rule(spec, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = er.1
+  if pos != len {
+    return Err(TimeError::new("PARSE_POSIX_TZ", "trailing characters in POSIX TZ"))
+  }
+  Ok(PosixTz::{
+    std_abbrev: std_abbrev,
+    std_offset: std_offset,
+    has_dst: true,
+    dst_abbrev: dst_abbrev,
+    dst_offset: dst_offset,
+    has_rules: true,
+    start_rule: sr.0,
+    end_rule: er.0,
+  })
+}
+
+///| Compute the UTC epoch second of a POSIX transition rule in a given `year`,
+///| given the offset (`active_offset`) in effect immediately before the transition.
+fn posix_rule_utc_secs(year : Int, rule : PosixTransitionRule, active_offset : Int) -> Int64 {
+  let ed : Int = match rule.kind {
+    PosixRuleKind::MonthWeekDay(month, week, target_sun0) => {
+      let first_ed = epoch_days_from_ymd(year, month, 1)
+      // -4371587 is Monday (sun0 = 1). So sun0 = (mod7_nonneg(ed + 4371587) + 1) % 7
+      let first_sun0 = (mod7_nonneg(first_ed + 4371587) + 1) % 7
+      let delta = (target_sun0 - first_sun0 + 7) % 7
+      let mut day = 1 + delta + (week - 1) * 7
+      let dim = days_in_month_of(year, month)
+      while day > dim {
+        day = day - 7
+      }
+      epoch_days_from_ymd(year, month, day)
+    }
+    PosixRuleKind::JulianOne(j) => {
+      let jan1 = epoch_days_from_ymd(year, 1, 1)
+      let extra = if j >= 60 && is_leap_year(year) { 1 } else { 0 }
+      jan1 + (j - 1) + extra
+    }
+    PosixRuleKind::JulianZero(n) => {
+      let jan1 = epoch_days_from_ymd(year, 1, 1)
+      jan1 + n
+    }
+  }
+  ed.to_int64() * 86400L + rule.time_secs.to_int64() - active_offset.to_int64()
+}
+
+///|
+fn posix_tz_offset_info(ptz : PosixTz, ts : Timestamp) -> OffsetInfo {
+  if !ptz.has_dst || !ptz.has_rules {
+    return OffsetInfo::{
+      offset: Offset::{ seconds: ptz.std_offset },
+      dst: false,
+      abbrev: ptz.std_abbrev,
+    }
+  }
+  let utc_dt = Offset::utc().to_datetime(ts)
+  let year = utc_dt.date.year
+  let start_utc = posix_rule_utc_secs(year, ptz.start_rule, ptz.std_offset)
+  let end_utc = posix_rule_utc_secs(year, ptz.end_rule, ptz.dst_offset)
+  let in_dst = if start_utc <= end_utc {
+    ts.secs >= start_utc && ts.secs < end_utc
+  } else {
+    // Southern hemisphere: DST spans New Year
+    ts.secs >= start_utc || ts.secs < end_utc
+  }
+  if in_dst {
+    OffsetInfo::{
+      offset: Offset::{ seconds: ptz.dst_offset },
+      dst: true,
+      abbrev: ptz.dst_abbrev,
+    }
+  } else {
+    OffsetInfo::{
+      offset: Offset::{ seconds: ptz.std_offset },
+      dst: false,
+      abbrev: ptz.std_abbrev,
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// TZif v1 / v2 / v3 / v4 binary parser (RFC 8536)
+// -----------------------------------------------------------------------------
+
+///|
+fn read_be_u32(b : Bytes, pos : Int) -> Int64 {
+  let b0 = b[pos].to_int().to_int64()
+  let b1 = b[pos + 1].to_int().to_int64()
+  let b2 = b[pos + 2].to_int().to_int64()
+  let b3 = b[pos + 3].to_int().to_int64()
+  (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+///|
+fn read_be_i32(b : Bytes, pos : Int) -> Int {
+  let u = read_be_u32(b, pos)
+  if u >= 2147483648L {
+    (u - 4294967296L).to_int()
+  } else {
+    u.to_int()
+  }
+}
+
+///|
+fn read_be_i64(b : Bytes, pos : Int) -> Int64 {
+  let hi = read_be_u32(b, pos)
+  let lo = read_be_u32(b, pos + 4)
+  (hi << 32) | lo
+}
+
+///|
+fn read_cstr(b : Bytes, base : Int, limit : Int, offset : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut p = base + offset
+  while p < limit {
+    let c = b[p].to_int()
+    if c == 0 {
+      break
+    }
+    sb.write_byte(b[p])
+    p = p + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn parse_tzif_block(b : Bytes, start : Int, is_64 : Bool) -> Result[(TzifData, Int), TimeError] {
+  let len = b.length()
+  if start + 44 > len {
+    return Err(TimeError::new("PARSE_TZIF", "truncated TZif header"))
+  }
+  if b[start].to_int() != 84 ||
+  b[start + 1].to_int() != 90 ||
+  b[start + 2].to_int() != 105 ||
+  b[start + 3].to_int() != 102 {
+    return Err(TimeError::new("PARSE_TZIF", "invalid TZif magic"))
+  }
+  let isutcnt = read_be_u32(b, start + 20).to_int()
+  let isstdcnt = read_be_u32(b, start + 24).to_int()
+  let leapcnt = read_be_u32(b, start + 28).to_int()
+  let timecnt = read_be_u32(b, start + 32).to_int()
+  let typecnt = read_be_u32(b, start + 36).to_int()
+  let charcnt = read_be_u32(b, start + 40).to_int()
+  if typecnt <= 0 || timecnt < 0 || charcnt < 0 || leapcnt < 0 || isstdcnt < 0 || isutcnt < 0 {
+    return Err(TimeError::new("PARSE_TZIF", "invalid TZif header counts"))
+  }
+  let time_size = if is_64 { 8 } else { 4 }
+  let leap_size = if is_64 { 12 } else { 8 }
+  let mut pos = start + 44
+  let need = timecnt * time_size + timecnt + typecnt * 6 + charcnt + leapcnt * leap_size + isstdcnt + isutcnt
+  if pos + need > len {
+    return Err(TimeError::new("PARSE_TZIF", "truncated TZif data block"))
+  }
+  let transitions : Array[Int64] = []
+  let mut i = 0
+  while i < timecnt {
+    let t = if is_64 {
+      read_be_i64(b, pos)
+    } else {
+      read_be_i32(b, pos).to_int64()
+    }
+    transitions.push(t)
+    pos = pos + time_size
+    i = i + 1
+  }
+  let type_indices : Array[Int] = []
+  i = 0
+  while i < timecnt {
+    let idx = b[pos].to_int()
+    if idx >= typecnt {
+      return Err(TimeError::new("PARSE_TZIF", "transition type index out of bounds"))
+    }
+    type_indices.push(idx)
+    pos = pos + 1
+    i = i + 1
+  }
+  let ttinfo_base = pos
+  pos = pos + typecnt * 6
+  let char_base = pos
+  let char_end = pos + charcnt
+  pos = char_end
+  let types : Array[TzifType] = []
+  i = 0
+  while i < typecnt {
+    let off = ttinfo_base + i * 6
+    let utoff = read_be_i32(b, off)
+    let isdst = b[off + 4].to_int() != 0
+    let desig = b[off + 5].to_int()
+    let abbrev = read_cstr(b, char_base, char_end, desig)
+    types.push(TzifType::{ utoff: utoff, isdst: isdst, abbrev: abbrev })
+    i = i + 1
+  }
+  // Skip leap seconds, isstd, isut
+  pos = pos + leapcnt * leap_size + isstdcnt + isutcnt
+  Ok((
+    TzifData::{
+      transitions: transitions,
+      type_indices: type_indices,
+      types: types,
+      footer: None,
+    },
+    pos,
+  ))
+}
+
+///|
+fn parse_tzif_bytes(b : Bytes) -> Result[TzifData, TimeError] {
+  let len = b.length()
+  if len < 44 {
+    return Err(TimeError::new("PARSE_TZIF", "TZif input too short"))
+  }
+  if b[0].to_int() != 84 || b[1].to_int() != 90 || b[2].to_int() != 105 || b[3].to_int() != 102 {
+    return Err(TimeError::new("PARSE_TZIF", "missing TZif magic header"))
+  }
+  let version = b[4].to_int()
+  let v1 = match parse_tzif_block(b, 0, false) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if version == 0 {
+    return Ok(v1.0)
+  }
+  // v2 ('2'=50), v3 ('3'=51), v4 ('4'=52): parse 64-bit block immediately following v1
+  let v2 = match parse_tzif_block(b, v1.1, true) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let data = v2.0
+  let mut pos = v2.1
+  let mut footer : Option[PosixTz] = None
+  if pos < len && b[pos].to_int() == 10 {
+    pos = pos + 1
+    let sb = StringBuilder::new()
+    while pos < len && b[pos].to_int() != 10 {
+      sb.write_byte(b[pos])
+      pos = pos + 1
+    }
+    let fstr = sb.to_string()
+    if fstr.length() > 0 {
+      match parse_posix_tz(fstr) {
+        Ok(ptz) => footer = Some(ptz)
+        Err(_) => ()
+      }
+    }
+  }
+  Ok(TzifData::{
+    transitions: data.transitions,
+    type_indices: data.type_indices,
+    types: data.types,
+    footer: footer,
+  })
+}
+
+///|
+fn tzif_offset_info(data : TzifData, ts : Timestamp) -> OffsetInfo {
+  let n = data.transitions.length()
+  if n == 0 {
+    match data.footer {
+      Some(ptz) => return posix_tz_offset_info(ptz, ts)
+      None => {
+        let t0 = data.types[0]
+        return OffsetInfo::{ offset: Offset::{ seconds: t0.utoff }, dst: t0.isdst, abbrev: t0.abbrev }
+      }
+    }
+  }
+  if ts.secs < data.transitions[0] {
+    let t0 = data.types[0]
+    return OffsetInfo::{ offset: Offset::{ seconds: t0.utoff }, dst: t0.isdst, abbrev: t0.abbrev }
+  }
+  if ts.secs >= data.transitions[n - 1] {
+    match data.footer {
+      Some(ptz) => return posix_tz_offset_info(ptz, ts)
+      None => {
+        let idx = data.type_indices[n - 1]
+        let tt = data.types[idx]
+        return OffsetInfo::{ offset: Offset::{ seconds: tt.utoff }, dst: tt.isdst, abbrev: tt.abbrev }
+      }
+    }
+  }
+  // Binary search for largest i with transitions[i] <= ts.secs
+  let mut lo = 0
+  let mut hi = n - 1
+  while lo < hi {
+    let mid = lo + (hi - lo + 1) / 2
+    if data.transitions[mid] <= ts.secs {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  let idx = data.type_indices[lo]
+  let tt = data.types[idx]
+  OffsetInfo::{ offset: Offset::{ seconds: tt.utoff }, dst: tt.isdst, abbrev: tt.abbrev }
+}
+
+// -----------------------------------------------------------------------------
+// TimeZone, AmbiguousZoned, and Zoned public API
+// -----------------------------------------------------------------------------
+
+///|
+pub fn TimeZone::utc() -> TimeZone {
+  TimeZone::{ name: "UTC", kind: TimeZoneKind::Fixed(Offset::utc(), "UTC") }
+}
+
+///|
+pub fn TimeZone::fixed(offset : Offset) -> TimeZone {
+  TimeZone::{ name: "", kind: TimeZoneKind::Fixed(offset, "") }
+}
+
+///|
+pub fn TimeZone::posix(spec : String) -> Result[TimeZone, TimeError] {
+  match parse_posix_tz(spec) {
+    Ok(ptz) => Ok(TimeZone::{ name: "", kind: TimeZoneKind::Posix(ptz) })
+    Err(e) => Err(e)
+  }
+}
+
+///|
+pub fn TimeZone::from_tzif(name : String, data : Bytes) -> Result[TimeZone, TimeError] {
+  match parse_tzif_bytes(data) {
+    Ok(tzif) => Ok(TimeZone::{ name: name, kind: TimeZoneKind::Tzif(tzif) })
+    Err(e) => Err(e)
+  }
+}
+
+///|
+pub fn TimeZone::iana_name(self : TimeZone) -> String {
+  self.name
+}
+
+///|
+pub fn TimeZone::to_offset_info(self : TimeZone, ts : Timestamp) -> OffsetInfo {
+  match self.kind {
+    TimeZoneKind::Fixed(off, abbrev) => OffsetInfo::{ offset: off, dst: false, abbrev: abbrev }
+    TimeZoneKind::Posix(ptz) => posix_tz_offset_info(ptz, ts)
+    TimeZoneKind::Tzif(data) => tzif_offset_info(data, ts)
+  }
+}
+
+///|
+pub fn TimeZone::to_offset(self : TimeZone, ts : Timestamp) -> Offset {
+  self.to_offset_info(ts).offset
+}
+
+///|
+pub fn TimeZone::to_zoned(self : TimeZone, ts : Timestamp) -> Zoned {
+  let off = self.to_offset(ts)
+  Zoned::{
+    timestamp: ts,
+    datetime: off.to_datetime(ts),
+    offset: off,
+    tz: self,
+  }
+}
+
+///| Resolve a civil `DateTime` in this `TimeZone`, detecting DST gaps and folds.
+pub fn TimeZone::to_ambiguous_zoned(self : TimeZone, dt : DateTime) -> AmbiguousZoned {
+  match self.kind {
+    TimeZoneKind::Fixed(off, _) =>
+    AmbiguousZoned::{ datetime: dt, tz: self, kind: AmbiguousKind::Unambiguous(off) }
+    _ => {
+      // Probe around the approximate UTC instant (±26h covers any DST transition)
+      let approx_secs = dt.date.to_epoch_days().to_int64() * 86400L + dt.time.to_second_of_day().to_int64()
+      let ts_before = Timestamp::{ secs: approx_secs - 86400L, nanos: 0 }
+      let ts_after = Timestamp::{ secs: approx_secs + 86400L, nanos: 0 }
+      let off_before = self.to_offset(ts_before)
+      let off_after = self.to_offset(ts_after)
+      if off_before.seconds == off_after.seconds {
+        // Also check at the candidate itself in case there's a transition within 48h
+        let cand_ts = Timestamp::{ secs: approx_secs - off_before.seconds.to_int64(), nanos: dt.time.nanosecond }
+        let off_mid = self.to_offset(cand_ts)
+        return AmbiguousZoned::{ datetime: dt, tz: self, kind: AmbiguousKind::Unambiguous(off_mid) }
+      }
+      // Two distinct offsets exist around this date: test both candidates.
+      let ts1 = Timestamp::{ secs: approx_secs - off_before.seconds.to_int64(), nanos: dt.time.nanosecond }
+      let ts2 = Timestamp::{ secs: approx_secs - off_after.seconds.to_int64(), nanos: dt.time.nanosecond }
+      let ok1 = self.to_offset(ts1).seconds == off_before.seconds
+      let ok2 = self.to_offset(ts2).seconds == off_after.seconds
+      if ok1 && ok2 {
+        // Fold (clock moved backward, wall time occurs twice): off_before is earlier instant, off_after is later instant.
+        AmbiguousZoned::{ datetime: dt, tz: self, kind: AmbiguousKind::Fold(off_before, off_after) }
+      } else if ok1 {
+        AmbiguousZoned::{ datetime: dt, tz: self, kind: AmbiguousKind::Unambiguous(off_before) }
+      } else if ok2 {
+        AmbiguousZoned::{ datetime: dt, tz: self, kind: AmbiguousKind::Unambiguous(off_after) }
+      } else {
+        // Gap (clock sprang forward, wall time does not exist): off_before -> off_after
+        AmbiguousZoned::{ datetime: dt, tz: self, kind: AmbiguousKind::Gap(off_before, off_after) }
+      }
+    }
+  }
+}
+
+///|
+pub fn AmbiguousZoned::is_ambiguous(self : AmbiguousZoned) -> Bool {
+  match self.kind {
+    AmbiguousKind::Unambiguous(_) => false
+    _ => true
+  }
+}
+
+///|
+pub fn AmbiguousZoned::is_gap(self : AmbiguousZoned) -> Bool {
+  match self.kind {
+    AmbiguousKind::Gap(_, _) => true
+    _ => false
+  }
+}
+
+///|
+pub fn AmbiguousZoned::is_fold(self : AmbiguousZoned) -> Bool {
+  match self.kind {
+    AmbiguousKind::Fold(_, _) => true
+    _ => false
+  }
+}
+
+///| Disambiguate a civil `DateTime` according to `Disambiguation` (matching RFC 5545 / Temporal / jiff).
+pub fn AmbiguousZoned::disambiguate(
+  self : AmbiguousZoned,
+  mode : Disambiguation,
+) -> Result[Zoned, TimeError] {
+  match self.kind {
+    AmbiguousKind::Unambiguous(off) =>
+    match off.to_timestamp(self.datetime) {
+      Ok(ts) => Ok(Zoned::{ timestamp: ts, datetime: self.datetime, offset: off, tz: self.tz })
+      Err(e) => Err(e)
+    }
+    AmbiguousKind::Fold(before, after) =>
+    match mode {
+      Disambiguation::Reject =>
+      Err(TimeError::new("AMBIGUOUS_FOLD", "civil datetime is ambiguous (DST fold)"))
+      Disambiguation::Compatible | Disambiguation::Earlier =>
+      match before.to_timestamp(self.datetime) {
+        Ok(ts) => Ok(Zoned::{ timestamp: ts, datetime: self.datetime, offset: before, tz: self.tz })
+        Err(e) => Err(e)
+      }
+      Disambiguation::Later =>
+      match after.to_timestamp(self.datetime) {
+        Ok(ts) => Ok(Zoned::{ timestamp: ts, datetime: self.datetime, offset: after, tz: self.tz })
+        Err(e) => Err(e)
+      }
+    }
+    AmbiguousKind::Gap(before, after) =>
+    match mode {
+      Disambiguation::Reject =>
+      Err(TimeError::new("AMBIGUOUS_GAP", "civil datetime does not exist (DST gap)"))
+      Disambiguation::Compatible | Disambiguation::Later => {
+        // Shift forward by gap length (after - before) using `after` offset (i.e. interpret wall time with `before` offset!)
+        match before.to_timestamp(self.datetime) {
+          Ok(ts) => Ok(self.tz.to_zoned(ts))
+          Err(e) => Err(e)
+        }
+      }
+      Disambiguation::Earlier => {
+        // Shift backward by gap length (after - before) using `before` offset (i.e. interpret wall time with `after` offset!)
+        match after.to_timestamp(self.datetime) {
+          Ok(ts) => Ok(self.tz.to_zoned(ts))
+          Err(e) => Err(e)
+        }
+      }
+    }
+  }
+}
+
+///|
+pub fn Timestamp::to_zoned(self : Timestamp, tz : TimeZone) -> Zoned {
+  tz.to_zoned(self)
+}
+
+///|
+pub fn Zoned::new(ts : Timestamp, tz : TimeZone) -> Zoned {
+  tz.to_zoned(ts)
+}
+
+///|
+pub fn Zoned::from_datetime(
+  dt : DateTime,
+  tz : TimeZone,
+  mode : Disambiguation,
+) -> Result[Zoned, TimeError] {
+  tz.to_ambiguous_zoned(dt).disambiguate(mode)
+}
+
+///|
+pub fn Zoned::with_time_zone(self : Zoned, tz : TimeZone) -> Zoned {
+  tz.to_zoned(self.timestamp)
+}
+
+///|
+pub fn Zoned::add_duration(self : Zoned, dur : SignedDuration) -> Result[Zoned, TimeError] {
+  match self.timestamp.checked_add(dur) {
+    Ok(ts) => Ok(self.tz.to_zoned(ts))
+    Err(e) => Err(e)
+  }
+}
+
+///| Civil day addition preserving wall clock time across DST transitions (`Disambiguation::Compatible`).
+pub fn Zoned::add_days(self : Zoned, days : Int) -> Result[Zoned, TimeError] {
+  match self.datetime.add_days(days) {
+    Ok(dt) => self.tz.to_ambiguous_zoned(dt).disambiguate(Disambiguation::Compatible)
+    Err(e) => Err(e)
+  }
+}
+
+///|
+pub fn Zoned::duration_since(self : Zoned, other : Zoned) -> SignedDuration {
+  self.timestamp.since(other.timestamp)
+}
+
+///|
+pub fn Zoned::to_string(self : Zoned) -> String {
+  let sb = StringBuilder::new()
+  write_date_to(sb, self.datetime.date)
+  sb.write_byte((84).to_byte())
+  write_time_to(sb, self.datetime.time)
+  write_offset_hm_to(sb, self.offset)
+  if self.tz.name.length() > 0 {
+    sb.write_byte((91).to_byte())
+    sb.write_string(self.tz.name)
+    sb.write_byte((93).to_byte())
+  }
+  sb.to_string()
+}
+
+///| Parse an RFC 9557 zoned timestamp string with a supplied `TimeZone`,
+///| rejecting offset conflicts where the string's offset does not match the time zone at that instant.
+pub fn Zoned::parse_with_tz(s : String, tz : TimeZone) -> Result[Zoned, TimeError] {
+  let pair = match parse_rfc3339_general_slice(s, 0, s.length()) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let fdt = pair.0
+  let ts = match fdt.to_timestamp() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let expected_off = tz.to_offset(ts)
+  if expected_off.seconds != fdt.offset.seconds {
+    return Err(TimeError::new("OFFSET_CONFLICT", "offset in RFC 9557 string conflicts with time zone"))
+  }
+  Ok(Zoned::{
+    timestamp: ts,
+    datetime: fdt.datetime,
+    offset: expected_off,
+    tz: tz,
+  })
+}
