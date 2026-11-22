@@ -1,0 +1,1016 @@
+///| Single `Glob` and multi-pattern `GlobSet` compilation and strategic matching.
+///| Directly modeled on `BurntSushi/globset`'s strategy pipeline with zero-alloc
+///| hash tables, prefix/reversed-suffix tries, and bit-parallel Thompson NFAs.
+
+///| Matching strategy for a single glob (or expanded brace branch).
+enum MatchStrategy {
+  Literal(String)
+  BasenameLiteral(String)
+  Extension(String)
+  Prefix(String)
+  Suffix(String, Bool) // (suffix, component)
+  RequiredExtension(String)
+  BasenameNfa(Array[Token])
+  FullNfa
+}
+
+///| Compiled single glob matcher (immutable, Send-safe).
+pub struct Glob {
+  pub pattern : String
+  pub opts : GlobOptions
+  tokens : Array[Token]
+  strategy : MatchStrategy
+  nfa : Option[Nfa]
+}
+
+///| Unified Extension + RequiredExtension hash table:
+///| ONE hash & probe per path handles both pure `*.ext` hits and `RequiredExtension` multi-NFAs!
+struct ExtTable {
+  mask : Int
+  keys : Array[String]
+  hashes : Array[Int64]
+  occupied : Array[Bool]
+  pure_ids : Array[Array[Int]]
+  req_nfas : Array[Option[Nfa]]
+  lengths : Int64
+  min_len : Int
+  max_len : Int
+  entry_count : Int
+}
+
+fn ExtTable::empty() -> ExtTable {
+  ExtTable::{
+    mask: 0,
+    keys: Array::new(),
+    hashes: Array::new(),
+    occupied: Array::new(),
+    pure_ids: Array::new(),
+    req_nfas: Array::new(),
+    lengths: 0L,
+    min_len: 0,
+    max_len: -1,
+    entry_count: 0,
+  }
+}
+
+fn build_ext_table(
+  pure_exts : Array[String],
+  pure_ids_in : Array[Int],
+  req_exts : Array[String],
+  req_entries : Array[MultiNfaEntry],
+) -> ExtTable {
+  let total = pure_exts.length() + req_exts.length()
+  if total == 0 {
+    return ExtTable::empty()
+  }
+  let mut cap = 8
+  while cap < total * 2 {
+    cap = cap * 2
+  }
+  let mask = cap - 1
+  let keys : Array[String] = Array::new()
+  let hashes : Array[Int64] = Array::new()
+  let occupied : Array[Bool] = Array::new()
+  let pure_ids : Array[Array[Int]] = Array::new()
+  let grouped : Array[Array[MultiNfaEntry]] = Array::new()
+  let mut i = 0
+  while i < cap {
+    keys.push("")
+    hashes.push(0L)
+    occupied.push(false)
+    pure_ids.push(Array::new())
+    grouped.push(Array::new())
+    i = i + 1
+  }
+  let mut lengths = 0L
+  let mut min_len = 2147483647
+  let mut max_len = -1
+  let mut entry_count = 0
+
+  i = 0
+  while i < pure_exts.length() {
+    let k = pure_exts[i]
+    let klen = k.length()
+    lengths = lengths | (1L << (klen % 64))
+    if klen < min_len {
+      min_len = klen
+    }
+    if klen > max_len {
+      max_len = klen
+    }
+    let h = fnv1a_slice(k, 0, klen)
+    let mut slot = h.to_int() & mask
+    while true {
+      if !occupied[slot] {
+        occupied[slot] = true
+        keys[slot] = k
+        hashes[slot] = h
+        pure_ids[slot].push(pure_ids_in[i])
+        entry_count = entry_count + 1
+        break
+      } else if hashes[slot] == h && keys[slot] == k {
+        pure_ids[slot].push(pure_ids_in[i])
+        break
+      }
+      slot = (slot + 1) & mask
+    }
+    i = i + 1
+  }
+
+  i = 0
+  while i < req_exts.length() {
+    let k = req_exts[i]
+    let klen = k.length()
+    lengths = lengths | (1L << (klen % 64))
+    if klen < min_len {
+      min_len = klen
+    }
+    if klen > max_len {
+      max_len = klen
+    }
+    let h = fnv1a_slice(k, 0, klen)
+    let mut slot = h.to_int() & mask
+    while true {
+      if !occupied[slot] {
+        occupied[slot] = true
+        keys[slot] = k
+        hashes[slot] = h
+        grouped[slot].push(req_entries[i])
+        entry_count = entry_count + 1
+        break
+      } else if hashes[slot] == h && keys[slot] == k {
+        grouped[slot].push(req_entries[i])
+        break
+      }
+      slot = (slot + 1) & mask
+    }
+    i = i + 1
+  }
+
+  let req_nfas : Array[Option[Nfa]] = Array::new()
+  i = 0
+  while i < cap {
+    if grouped[i].length() > 0 {
+      req_nfas.push(Some(compile_multi_nfa(grouped[i])))
+    } else {
+      req_nfas.push(None)
+    }
+    i = i + 1
+  }
+
+  ExtTable::{
+    mask,
+    keys,
+    hashes,
+    occupied,
+    pure_ids,
+    req_nfas,
+    lengths,
+    min_len,
+    max_len,
+    entry_count,
+  }
+}
+
+fn ExtTable::is_match(
+  self : ExtTable,
+  path : String,
+  ext_start : Int,
+  ext_end : Int,
+) -> Bool {
+  if self.entry_count == 0 || ext_end <= ext_start {
+    return false
+  }
+  let len = ext_end - ext_start
+  if len < self.min_len ||
+  len > self.max_len ||
+  (self.lengths & (1L << (len % 64))) == 0L {
+    return false
+  }
+  let h = fnv1a_slice(path, ext_start, ext_end)
+  let mask = self.mask
+  let occupied = self.occupied
+  let hashes = self.hashes
+  let keys = self.keys
+  let mut slot = h.to_int() & mask
+  while occupied[slot] {
+    if hashes[slot] == h && slice_eq_str(path, ext_start, ext_end, keys[slot]) {
+      if self.pure_ids[slot].length() > 0 {
+        return true
+      }
+      match self.req_nfas[slot] {
+        Some(nfa) => return nfa.is_match_slice(path, 0, path.length())
+        None => return false
+      }
+    }
+    slot = (slot + 1) & mask
+  }
+  false
+}
+
+fn ExtTable::matches_into(
+  self : ExtTable,
+  path : String,
+  ext_start : Int,
+  ext_end : Int,
+  into : Array[Int],
+) -> Unit {
+  if self.entry_count == 0 || ext_end <= ext_start {
+    return
+  }
+  let len = ext_end - ext_start
+  if len < self.min_len ||
+  len > self.max_len ||
+  (self.lengths & (1L << (len % 64))) == 0L {
+    return
+  }
+  let h = fnv1a_slice(path, ext_start, ext_end)
+  let mask = self.mask
+  let occupied = self.occupied
+  let hashes = self.hashes
+  let keys = self.keys
+  let mut slot = h.to_int() & mask
+  while occupied[slot] {
+    if hashes[slot] == h && slice_eq_str(path, ext_start, ext_end, keys[slot]) {
+      let pids = self.pure_ids[slot]
+      let mut i = 0
+      let np = pids.length()
+      while i < np {
+        into.push(pids[i])
+        i = i + 1
+      }
+      match self.req_nfas[slot] {
+        Some(nfa) => nfa.matches_slice_into(path, 0, path.length(), into)
+        None => ()
+      }
+      return
+    }
+    slot = (slot + 1) & mask
+  }
+}
+
+///| Compiled multi-pattern glob set matcher (immutable, Send-safe).
+pub struct GlobSet {
+  pub count : Int
+  exts : ExtTable
+  base_lits : StrTable
+  lits : StrTable
+  prefixes : ByteTrie
+  suffixes : ByteTrie
+  base_nfa : Option[Nfa]
+  full_nfa : Option[Nfa]
+}
+
+// --- Zero-alloc candidate path slicing (mirrors `globset/src/pathutil.rs`) ---
+
+///| Compute `(base_start, base_end, is_parent_dots, ext_start, ext_end)` for `path`.
+///| - If `path` is empty, `base_start = 0, base_end = 0`.
+///| - If final component is `".."`, `is_parent_dots = true` (matches `file_name` returning None,
+///|   while `basename_for_regex` still sees `".."`!).
+///| - `ext_start < ext_end` iff final component (when not `".."`) contains `.`.
+val struct CandidateSlices {
+  plen : Int
+  base_start : Int
+  base_end : Int
+  has_basename : Bool
+  regex_base_start : Int
+  regex_base_end : Int
+  ext_start : Int
+  ext_end : Int
+}
+
+fn make_candidate(path : String) -> CandidateSlices {
+  let plen = path.length()
+  if plen == 0 {
+    return CandidateSlices::{
+      plen: 0,
+      base_start: 0,
+      base_end: 0,
+      has_basename: false,
+      regex_base_start: 0,
+      regex_base_end: 0,
+      ext_start: 0,
+      ext_end: 0,
+    }
+  }
+  // Single backward scan over basename only: simultaneously find last '.' and last '/'.
+  let mut last_slash = -1
+  let mut last_dot = -1
+  let mut i = plen - 1
+  while i >= 0 {
+    let b = path.code_unit_at(i)
+    if b == 47 { // '/'
+      last_slash = i
+      break
+    }
+    if b == 46 && last_dot < 0 { // '.'
+      last_dot = i
+    }
+    i = i - 1
+  }
+  let bstart = last_slash + 1
+  let blen = plen - bstart
+  if blen == 2 &&
+  path.code_unit_at(bstart) == 46 &&
+  path.code_unit_at(bstart + 1) == 46 {
+    return CandidateSlices::{
+      plen,
+      base_start: plen,
+      base_end: plen,
+      has_basename: false,
+      regex_base_start: bstart,
+      regex_base_end: plen,
+      ext_start: plen,
+      ext_end: plen,
+    }
+  }
+  let has_basename = blen > 0
+  let ext_start = if has_basename && last_dot >= 0 { last_dot } else { plen }
+  CandidateSlices::{
+    plen,
+    base_start: bstart,
+    base_end: plen,
+    has_basename,
+    regex_base_start: bstart,
+    regex_base_end: plen,
+    ext_start,
+    ext_end: plen,
+  }
+}
+
+// --- Strategy extraction (exact port of `globset/src/glob.rs`) ---
+
+fn tokens_to_literal_string(
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+) -> Option[String] {
+  let sb = StringBuilder::new()
+  let mut i = start
+  while i < end {
+    match tokens[i] {
+      Token::Literal(cp) => write_codepoint_utf8(sb, cp)
+      _ => return None
+    }
+    i = i + 1
+  }
+  Some(sb.to_string())
+}
+
+fn extract_literal(tokens : Array[Token], opts : GlobOptions) -> Option[String] {
+  if opts.case_insensitive || tokens.length() == 0 {
+    return None
+  }
+  tokens_to_literal_string(tokens, 0, tokens.length())
+}
+
+fn extract_basename_tokens(
+  tokens : Array[Token],
+  opts : GlobOptions,
+) -> Option[Array[Token]] {
+  if tokens.length() < 2 {
+    return None
+  }
+  match tokens[0] {
+    Token::RecursivePrefix => ()
+    _ => return None
+  }
+  let out : Array[Token] = Array::new()
+  let mut i = 1
+  while i < tokens.length() {
+    let t = tokens[i]
+    match t {
+      Token::Literal(cp) =>
+      if cp == 47 {
+        return None
+      }
+      Token::Any | Token::ZeroOrMore =>
+      if !opts.literal_separator {
+        return None
+      }
+      Token::RecursivePrefix
+      | Token::RecursiveSuffix
+      | Token::RecursiveZeroOrMore => return None
+      Token::Class(negated, ranges) => {
+        let mut contains_slash = false
+        let mut r = 0
+        while r < ranges.length() {
+          if ranges[r].lo <= 47 && 47 <= ranges[r].hi {
+            contains_slash = true
+            break
+          }
+          r = r + 1
+        }
+        if contains_slash != negated {
+          return None
+        }
+      }
+      Token::Alternates(_) => return None
+    }
+    out.push(t)
+    i = i + 1
+  }
+  Some(out)
+}
+
+fn extract_basename_literal(
+  tokens : Array[Token],
+  opts : GlobOptions,
+) -> Option[String] {
+  if opts.case_insensitive {
+    return None
+  }
+  let bt = match extract_basename_tokens(tokens, opts) {
+    Some(v) => v
+    None => return None
+  }
+  tokens_to_literal_string(bt, 0, bt.length())
+}
+
+fn extract_ext(tokens : Array[Token], opts : GlobOptions) -> Option[String] {
+  if opts.case_insensitive || tokens.length() < 2 {
+    return None
+  }
+  let start = match tokens[0] {
+    Token::RecursivePrefix => 1
+    _ => 0
+  }
+  if start + 1 >= tokens.length() {
+    return None
+  }
+  match tokens[start] {
+    Token::ZeroOrMore =>
+    if start == 0 && opts.literal_separator {
+      return None
+    }
+    _ => return None
+  }
+  match tokens[start + 1] {
+    Token::Literal(cp) =>
+    if cp != 46 {
+      return None
+    }
+    _ => return None
+  }
+  let sb = StringBuilder::new()
+  sb.write_byte((46).to_byte()) // '.'
+  let mut i = start + 2
+  while i < tokens.length() {
+    match tokens[i] {
+      Token::Literal(cp) => {
+        if cp == 46 || cp == 47 {
+          return None
+        }
+        write_codepoint_utf8(sb, cp)
+      }
+      _ => return None
+    }
+    i = i + 1
+  }
+  let s = sb.to_string()
+  if s.length() == 0 {
+    None
+  } else {
+    Some(s)
+  }
+}
+
+fn extract_required_ext(
+  tokens : Array[Token],
+  opts : GlobOptions,
+) -> Option[String] {
+  if opts.case_insensitive || tokens.length() == 0 {
+    return None
+  }
+  let rev : Array[Int] = Array::new()
+  let mut i = tokens.length() - 1
+  while i >= 0 {
+    match tokens[i] {
+      Token::Literal(cp) => {
+        if cp == 47 {
+          return None
+        }
+        rev.push(cp)
+        if cp == 46 {
+          break
+        }
+      }
+      _ => return None
+    }
+    i = i - 1
+  }
+  if rev.length() == 0 || rev[rev.length() - 1] != 46 {
+    return None
+  }
+  let sb = StringBuilder::new()
+  let mut j = rev.length() - 1
+  while j >= 0 {
+    write_codepoint_utf8(sb, rev[j])
+    j = j - 1
+  }
+  Some(sb.to_string())
+}
+
+fn extract_prefix(tokens : Array[Token], opts : GlobOptions) -> Option[String] {
+  if opts.case_insensitive || tokens.length() == 0 {
+    return None
+  }
+  let n = tokens.length()
+  let mut end = n
+  let mut need_sep = false
+  match tokens[n - 1] {
+    Token::ZeroOrMore => {
+      if opts.literal_separator {
+        return None
+      }
+      end = n - 1
+    }
+    Token::RecursiveSuffix => {
+      end = n - 1
+      need_sep = true
+    }
+    _ => ()
+  }
+  let lit = match tokens_to_literal_string(tokens, 0, end) {
+    Some(s) => s
+    None => return None
+  }
+  let out = if need_sep { lit + "/" } else { lit }
+  if out.length() == 0 {
+    None
+  } else {
+    Some(out)
+  }
+}
+
+fn extract_suffix(
+  tokens : Array[Token],
+  opts : GlobOptions,
+) -> Option[(String, Bool)] {
+  if opts.case_insensitive || tokens.length() == 0 {
+    return None
+  }
+  let mut start = 0
+  let mut entire = false
+  match tokens[0] {
+    Token::RecursivePrefix =>
+    if tokens.length() > 1 {
+      match tokens[1] {
+        Token::Literal(_) => {
+          start = 1
+          entire = true
+        }
+        _ => start = 1
+      }
+    } else {
+      start = 1
+    }
+    _ => ()
+  }
+  if start >= tokens.length() {
+    return None
+  }
+  match tokens[start] {
+    Token::ZeroOrMore => {
+      if opts.literal_separator {
+        return None
+      }
+      start = start + 1
+    }
+    _ => ()
+  }
+  let rest = match tokens_to_literal_string(tokens, start, tokens.length()) {
+    Some(s) => s
+    None => return None
+  }
+  let lit = if entire { "/" + rest } else { rest }
+  if lit.length() == 0 || lit == "/" {
+    None
+  } else {
+    Some((lit, entire))
+  }
+}
+
+fn choose_strategy(tokens : Array[Token], opts : GlobOptions) -> MatchStrategy {
+  match extract_basename_literal(tokens, opts) {
+    Some(lit) => return MatchStrategy::BasenameLiteral(lit)
+    None => ()
+  }
+  match extract_literal(tokens, opts) {
+    Some(lit) => return MatchStrategy::Literal(lit)
+    None => ()
+  }
+  match extract_ext(tokens, opts) {
+    Some(ext) => return MatchStrategy::Extension(ext)
+    None => ()
+  }
+  match extract_prefix(tokens, opts) {
+    Some(pre) => return MatchStrategy::Prefix(pre)
+    None => ()
+  }
+  match extract_suffix(tokens, opts) {
+    Some((suf, comp)) => return MatchStrategy::Suffix(suf, comp)
+    None => ()
+  }
+  match extract_required_ext(tokens, opts) {
+    Some(ext) => return MatchStrategy::RequiredExtension(ext)
+    None => ()
+  }
+  match extract_basename_tokens(tokens, opts) {
+    Some(bt) => return MatchStrategy::BasenameNfa(bt)
+    None => ()
+  }
+  MatchStrategy::FullNfa
+}
+
+fn str_starts_with(haystack : String, needle : String) -> Bool {
+  let nlen = needle.length()
+  if nlen > haystack.length() {
+    return false
+  }
+  let mut i = 0
+  while i < nlen {
+    if haystack.code_unit_at(i) != needle.code_unit_at(i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn str_ends_with(haystack : String, needle : String) -> Bool {
+  let nlen = needle.length()
+  let hlen = haystack.length()
+  if nlen > hlen {
+    return false
+  }
+  let off = hlen - nlen
+  let mut i = 0
+  while i < nlen {
+    if haystack.code_unit_at(off + i) != needle.code_unit_at(i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Compile a single glob pattern with default options.
+pub fn compile(pattern : String) -> Result[Glob, GlobError] {
+  compile_with(pattern, GlobOptions::default())
+}
+
+///| Compile a single glob pattern with custom options.
+pub fn compile_with(
+  pattern : String,
+  opts : GlobOptions,
+) -> Result[Glob, GlobError] {
+  let tokens = match parse_glob_tokens(pattern, opts) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let strategy = choose_strategy(tokens, opts)
+  let nfa = match strategy {
+    MatchStrategy::Literal(_)
+    | MatchStrategy::BasenameLiteral(_)
+    | MatchStrategy::Extension(_)
+    | MatchStrategy::Prefix(_)
+    | MatchStrategy::Suffix(_, _) => None
+    MatchStrategy::RequiredExtension(_) | MatchStrategy::FullNfa =>
+    Some(compile_single_nfa(tokens, opts))
+    MatchStrategy::BasenameNfa(bt) => Some(compile_single_nfa(bt, opts))
+  }
+  Ok(Glob::{ pattern, opts, tokens, strategy, nfa })
+}
+
+///| Test whether `path` matches this single glob.
+pub fn Glob::is_match(self : Glob, path : String) -> Bool {
+  match self.strategy {
+    MatchStrategy::Literal(lit) => path == lit
+    MatchStrategy::BasenameLiteral(lit) => {
+      let c = make_candidate(path)
+      c.has_basename && slice_eq_str(path, c.base_start, c.base_end, lit)
+    }
+    MatchStrategy::Extension(ext) => {
+      let c = make_candidate(path)
+      c.ext_end > c.ext_start && slice_eq_str(path, c.ext_start, c.ext_end, ext)
+    }
+    MatchStrategy::Prefix(pre) => str_starts_with(path, pre)
+    MatchStrategy::Suffix(suf, comp) => {
+      if comp && slice_eq_str(suf, 1, suf.length(), path) {
+        return true
+      }
+      str_ends_with(path, suf)
+    }
+    MatchStrategy::RequiredExtension(ext) => {
+      let c = make_candidate(path)
+      if c.ext_end <= c.ext_start ||
+      !slice_eq_str(path, c.ext_start, c.ext_end, ext) {
+        return false
+      }
+      match self.nfa {
+        Some(nfa) => nfa.is_match_slice(path, 0, path.length())
+        None => false
+      }
+    }
+    MatchStrategy::BasenameNfa(_) => {
+      let c = make_candidate(path)
+      match self.nfa {
+        Some(nfa) => nfa.is_match_slice(path, c.regex_base_start, c.regex_base_end)
+        None => false
+      }
+    }
+    MatchStrategy::FullNfa =>
+    match self.nfa {
+      Some(nfa) => nfa.is_match_slice(path, 0, path.length())
+      None => false
+    }
+  }
+}
+
+///| Return an empty `GlobSet` that matches nothing.
+pub fn GlobSet::empty() -> GlobSet {
+  GlobSet::{
+    count: 0,
+    exts: ExtTable::empty(),
+    base_lits: StrTable::empty(),
+    lits: StrTable::empty(),
+    prefixes: ByteTrie::empty(),
+    suffixes: ByteTrie::empty(),
+    base_nfa: None,
+    full_nfa: None,
+  }
+}
+
+///| Return true if this `GlobSet` contains zero patterns.
+pub fn GlobSet::is_empty(self : GlobSet) -> Bool {
+  self.count == 0
+}
+
+///| Return the number of patterns in this `GlobSet`.
+pub fn GlobSet::len(self : GlobSet) -> Int {
+  self.count
+}
+
+///| Compile multiple glob patterns with default options into a `GlobSet`.
+pub fn compile_set(patterns : Array[String]) -> Result[GlobSet, GlobError] {
+  let globs : Array[Glob] = Array::new()
+  let mut i = 0
+  while i < patterns.length() {
+    let g = match compile(patterns[i]) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    globs.push(g)
+    i = i + 1
+  }
+  compile_set_from_globs(globs)
+}
+
+///| Compile pre-built `Glob` instances (with per-glob options) into a `GlobSet`.
+pub fn compile_set_from_globs(
+  globs : Array[Glob],
+) -> Result[GlobSet, GlobError] {
+  let count = globs.length()
+  if count == 0 {
+    return Ok(GlobSet::empty())
+  }
+  let ext_keys : Array[String] = Array::new()
+  let ext_ids : Array[Int] = Array::new()
+  let base_lit_keys : Array[String] = Array::new()
+  let base_lit_ids : Array[Int] = Array::new()
+  let lit_keys : Array[String] = Array::new()
+  let lit_ids : Array[Int] = Array::new()
+  let pre_pats : Array[String] = Array::new()
+  let pre_ids : Array[Int] = Array::new()
+  let suf_pats : Array[String] = Array::new()
+  let suf_ids : Array[Int] = Array::new()
+  let req_exts : Array[String] = Array::new()
+  let req_entries : Array[MultiNfaEntry] = Array::new()
+  let base_nfa_entries : Array[MultiNfaEntry] = Array::new()
+  let full_nfa_entries : Array[MultiNfaEntry] = Array::new()
+
+  let mut i = 0
+  while i < count {
+    let g = globs[i]
+    // Try controlled brace expansion (<= 16 branches) so `{*.rs,*.pion}` hits O(1) tables!
+    let branches = match try_expand_alternates(g.tokens, g.opts, 16) {
+      Some(b) => b
+      None => [g.tokens]
+    }
+    let mut b = 0
+    while b < branches.length() {
+      let toks = branches[b]
+      let strat = choose_strategy(toks, g.opts)
+      match strat {
+        MatchStrategy::Literal(lit) => {
+          lit_keys.push(lit)
+          lit_ids.push(i)
+        }
+        MatchStrategy::BasenameLiteral(lit) => {
+          base_lit_keys.push(lit)
+          base_lit_ids.push(i)
+        }
+        MatchStrategy::Extension(ext) => {
+          ext_keys.push(ext)
+          ext_ids.push(i)
+        }
+        MatchStrategy::Prefix(pre) => {
+          pre_pats.push(pre)
+          pre_ids.push(i)
+        }
+        MatchStrategy::Suffix(suf, comp) => {
+          if comp {
+            lit_keys.push(suf.slice(1, suf.length()))
+            lit_ids.push(i)
+          }
+          suf_pats.push(suf)
+          suf_ids.push(i)
+        }
+        MatchStrategy::RequiredExtension(ext) => {
+          req_exts.push(ext)
+          req_entries.push(
+            MultiNfaEntry::{ pat_id: i, tokens: toks, opts: g.opts },
+          )
+        }
+        MatchStrategy::BasenameNfa(bt) =>
+        base_nfa_entries.push(
+          MultiNfaEntry::{ pat_id: i, tokens: bt, opts: g.opts },
+        )
+        MatchStrategy::FullNfa =>
+        full_nfa_entries.push(
+          MultiNfaEntry::{ pat_id: i, tokens: toks, opts: g.opts },
+        )
+      }
+      b = b + 1
+    }
+    i = i + 1
+  }
+
+  let base_nfa = if base_nfa_entries.length() > 0 {
+    Some(compile_multi_nfa(base_nfa_entries))
+  } else {
+    None
+  }
+  let full_nfa = if full_nfa_entries.length() > 0 {
+    Some(compile_multi_nfa(full_nfa_entries))
+  } else {
+    None
+  }
+
+  Ok(GlobSet::{
+    count,
+    exts: build_ext_table(ext_keys, ext_ids, req_exts, req_entries),
+    base_lits: build_str_table(base_lit_keys, base_lit_ids),
+    lits: build_str_table(lit_keys, lit_ids),
+    prefixes: build_byte_trie(pre_pats, pre_ids, false),
+    suffixes: build_byte_trie(suf_pats, suf_ids, true),
+    base_nfa,
+    full_nfa,
+  })
+}
+
+///| Return true if any pattern in this set matches `path`.
+pub fn GlobSet::is_match(self : GlobSet, path : String) -> Bool {
+  if self.count == 0 {
+    return false
+  }
+  let c = make_candidate(path)
+  if self.exts.entry_count > 0 && c.ext_end > c.ext_start {
+    if self.exts.is_match(path, c.ext_start, c.ext_end) {
+      return true
+    }
+  }
+  if !self.base_lits.is_empty() && c.has_basename {
+    if self.base_lits.contains_slice(path, c.base_start, c.base_end) {
+      return true
+    }
+  }
+  if !self.lits.is_empty() {
+    if self.lits.contains_slice(path, 0, c.plen) {
+      return true
+    }
+  }
+  if !self.suffixes.is_empty() {
+    if self.suffixes.is_match_suffix(path) {
+      return true
+    }
+  }
+  if !self.prefixes.is_empty() {
+    if self.prefixes.is_match_prefix(path) {
+      return true
+    }
+  }
+  match self.base_nfa {
+    Some(nfa) =>
+    if nfa.is_match_slice(path, c.regex_base_start, c.regex_base_end) {
+      return true
+    }
+    None => ()
+  }
+  match self.full_nfa {
+    Some(nfa) =>
+    if nfa.is_match_slice(path, 0, c.plen) {
+      return true
+    }
+    None => ()
+  }
+  false
+}
+
+///| Sort small integer array in-place and deduplicate (fast paths for 0, 1, 2 elements).
+fn sort_and_dedup(arr : Array[Int]) -> Unit {
+  let n = arr.length()
+  if n <= 1 {
+    return
+  }
+  if n == 2 {
+    let a = arr[0]
+    let b = arr[1]
+    if a == b {
+      let _ = arr.pop()
+    } else if a > b {
+      arr[0] = b
+      arr[1] = a
+    }
+    return
+  }
+  let mut i = 1
+  while i < n {
+    let key = arr[i]
+    let mut j = i - 1
+    while j >= 0 && arr[j] > key {
+      arr[j + 1] = arr[j]
+      j = j - 1
+    }
+    arr[j + 1] = key
+    i = i + 1
+  }
+  let mut write = 1
+  i = 1
+  while i < n {
+    if arr[i] != arr[write - 1] {
+      arr[write] = arr[i]
+      write = write + 1
+    }
+    i = i + 1
+  }
+  while arr.length() > write {
+    let _ = arr.pop()
+  }
+}
+
+///| Clear `into` and fill it with all matching pattern indices in ascending order.
+pub fn GlobSet::matches_into(
+  self : GlobSet,
+  path : String,
+  into : Array[Int],
+) -> Unit {
+  into.clear()
+  if self.count == 0 {
+    return
+  }
+  let c = make_candidate(path)
+  if self.exts.entry_count > 0 && c.ext_end > c.ext_start {
+    self.exts.matches_into(path, c.ext_start, c.ext_end, into)
+  }
+  if !self.base_lits.is_empty() && c.has_basename {
+    self.base_lits.matches_slice_into(path, c.base_start, c.base_end, into)
+  }
+  if !self.lits.is_empty() {
+    self.lits.matches_slice_into(path, 0, c.plen, into)
+  }
+  if !self.suffixes.is_empty() {
+    self.suffixes.matches_suffix_into(path, into)
+  }
+  if !self.prefixes.is_empty() {
+    self.prefixes.matches_prefix_into(path, into)
+  }
+  match self.base_nfa {
+    Some(nfa) =>
+    nfa.matches_slice_into(path, c.regex_base_start, c.regex_base_end, into)
+    None => ()
+  }
+  match self.full_nfa {
+    Some(nfa) => nfa.matches_slice_into(path, 0, c.plen, into)
+    None => ()
+  }
+  sort_and_dedup(into)
+}
+
+///| Return all matching pattern indices in ascending order.
+pub fn GlobSet::matches(self : GlobSet, path : String) -> Array[Int] {
+  let out : Array[Int] = Array::new()
+  self.matches_into(path, out)
+  out
+}
+
+///| Return true if all patterns in this set match `path` (vacuously true when empty).
+pub fn GlobSet::matches_all(self : GlobSet, path : String) -> Bool {
+  if self.count == 0 {
+    return true
+  }
+  let buf : Array[Int] = Array::new()
+  self.matches_into(path, buf)
+  buf.length() == self.count
+}
