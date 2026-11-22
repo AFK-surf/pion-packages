@@ -1,9 +1,9 @@
 ///| Zero-allocation lookup structures for `GlobSet` fast strategies:
 ///| 1. `StrTable`: open-addressing FNV-1a hash table that looks up `s[start..end]`
 ///|    WITHOUT allocating a sliced `String`, with min/max length + 64-bit length bitmask
-///|    + stored hash prefilters!
-///| 2. `ByteTrie`: flat pre-multiplied 128-entry-per-state ASCII trie for O(min(len, max_pat))
-///|    prefix & reversed-suffix matching with zero pointer chasing and zero allocations!
+///|    + stored hash prefilters.
+///| 2. `ByteTrie`: compact CSR Compressed Radix Trie (Patricia Trie) with O(1) root ASCII
+///|    dispatch and flat byte pool — O(total_bytes) memory and zero allocations on lookup.
 
 ///| Compute 64-bit FNV-1a hash of `s[start..end]`.
 pub fn fnv1a_slice(s : String, start : Int, end : Int) -> Int64 {
@@ -206,26 +206,36 @@ pub fn StrTable::matches_slice_into(
   }
 }
 
-///| Flat pre-multiplied 128-entry-per-state ASCII byte trie for prefix & reversed-suffix matching.
-///| Zero pointer chases and zero allocations in the ASCII hot loop.
+///| Compact CSR Compressed Radix Trie for prefix & reversed-suffix matching.
+///| Uses flat byte pool + CSR child edges + O(1) 128-entry root ASCII table.
 pub struct ByteTrie {
-  // Flat transition table: `trans[state * 128 + b]` = `next_state * 128` (or -1 if dead).
-  pub trans : Array[Int]
-  pub has_match : Array[Bool]
-  pub pat_ids : Array[Array[Int]]
-  // Non-ASCII fallback edges per state (empty for all ASCII patterns).
-  pub non_ascii_bytes : Array[Array[Int]]
-  pub non_ascii_next : Array[Array[Int]]
+  pub pool : String
+  pub edge_off : Array[Int]
+  pub edge_len : Array[Int]
+  pub child_start : Array[Int]
+  pub child_count : Array[Int]
+  pub child_byte : Array[Int]
+  pub child_node : Array[Int]
+  pub match_start : Array[Int]
+  pub match_count : Array[Int]
+  pub match_ids : Array[Int]
+  pub root_trans : Array[Int] // length 128 when count > 0: ASCII byte -> child node (-1 if none)
   pub count : Int
 }
 
 pub fn ByteTrie::empty() -> ByteTrie {
   ByteTrie::{
-    trans: Array::new(),
-    has_match: Array::new(),
-    pat_ids: Array::new(),
-    non_ascii_bytes: Array::new(),
-    non_ascii_next: Array::new(),
+    pool: "",
+    edge_off: Array::new(),
+    edge_len: Array::new(),
+    child_start: Array::new(),
+    child_count: Array::new(),
+    child_byte: Array::new(),
+    child_node: Array::new(),
+    match_start: Array::new(),
+    match_count: Array::new(),
+    match_ids: Array::new(),
+    root_trans: Array::new(),
     count: 0,
   }
 }
@@ -234,39 +244,50 @@ pub fn ByteTrie::is_empty(self : ByteTrie) -> Bool {
   self.count == 0
 }
 
-fn push_trie_state(
-  trans : Array[Int],
-  has_match : Array[Bool],
-  pat_ids : Array[Array[Int]],
-  non_ascii_bytes : Array[Array[Int]],
-  non_ascii_next : Array[Array[Int]],
-) -> Int {
-  let id = has_match.length()
-  let mut b = 0
-  while b < 128 {
-    trans.push(-1)
-    b = b + 1
+fn pat_byte_at(p : String, plen : Int, idx : Int, reversed : Bool) -> Int {
+  if reversed {
+    p.code_unit_at(plen - 1 - idx)
+  } else {
+    p.code_unit_at(idx)
   }
-  has_match.push(false)
-  pat_ids.push(Array::new())
-  non_ascii_bytes.push(Array::new())
-  non_ascii_next.push(Array::new())
-  id
 }
 
-fn find_non_ascii_edge(bytes : Array[Int], nexts : Array[Int], b : Int) -> Int {
-  let mut i = 0
-  let n = bytes.length()
-  while i < n {
-    if bytes[i] == b {
-      return nexts[i]
+fn find_sorted_byte(bytes : Array[Int], b : Int) -> Int {
+  let mut lo = 0
+  let mut hi = bytes.length() - 1
+  while lo <= hi {
+    let mid = lo + ((hi - lo) >> 1)
+    let v = bytes[mid]
+    if v == b {
+      return mid
+    } else if v < b {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
     }
-    i = i + 1
   }
   -1
 }
 
-///| Build a flat prefix trie (`reversed == false`) or reversed suffix trie (`reversed == true`).
+fn insert_sorted_child(
+  bytes : Array[Int],
+  nodes : Array[Int],
+  b : Int,
+  node : Int,
+) -> Unit {
+  bytes.push(b)
+  nodes.push(node)
+  let mut i = bytes.length() - 1
+  while i > 0 && bytes[i - 1] > b {
+    bytes[i] = bytes[i - 1]
+    nodes[i] = nodes[i - 1]
+    i = i - 1
+  }
+  bytes[i] = b
+  nodes[i] = node
+}
+
+///| Build a compressed radix prefix trie (`reversed == false`) or reversed suffix trie (`reversed == true`).
 pub fn build_byte_trie(
   pats : Array[String],
   ids : Array[Int],
@@ -276,116 +297,218 @@ pub fn build_byte_trie(
   if n == 0 {
     return ByteTrie::empty()
   }
-  let trans : Array[Int] = Array::new()
-  let has_match : Array[Bool] = Array::new()
-  let pat_ids : Array[Array[Int]] = Array::new()
-  let non_ascii_bytes : Array[Array[Int]] = Array::new()
-  let non_ascii_next : Array[Array[Int]] = Array::new()
-  let _ = push_trie_state(
-    trans,
-    has_match,
-    pat_ids,
-    non_ascii_bytes,
-    non_ascii_next,
-  )
 
-  let mut i = 0
-  while i < n {
-    let p = pats[i]
+  let pool_bytes : Array[Int] = Array::new()
+  let b_eoff : Array[Int] = [0]
+  let b_elen : Array[Int] = [0]
+  let b_ch_bytes : Array[Array[Int]] = [Array::new()]
+  let b_ch_nodes : Array[Array[Int]] = [Array::new()]
+  let b_mids : Array[Array[Int]] = [Array::new()]
+
+  let mut pi = 0
+  while pi < n {
+    let p = pats[pi]
     let plen = p.length()
     let mut cur = 0
-    if !reversed {
-      let mut j = 0
-      while j < plen {
-        let b = p.code_unit_at(j)
-        if b < 128 {
-          let idx = (cur << 7) + b
-          let nxt = trans[idx]
-          if nxt >= 0 {
-            cur = nxt >> 7
-          } else {
-            let new_id = push_trie_state(
-              trans,
-              has_match,
-              pat_ids,
-              non_ascii_bytes,
-              non_ascii_next,
-            )
-            trans[idx] = new_id << 7
-            cur = new_id
-          }
-        } else {
-          let nxt = find_non_ascii_edge(
-            non_ascii_bytes[cur],
-            non_ascii_next[cur],
-            b,
-          )
-          if nxt >= 0 {
-            cur = nxt
-          } else {
-            let new_id = push_trie_state(
-              trans,
-              has_match,
-              pat_ids,
-              non_ascii_bytes,
-              non_ascii_next,
-            )
-            non_ascii_bytes[cur].push(b)
-            non_ascii_next[cur].push(new_id)
-            cur = new_id
-          }
+    let mut pos = 0
+    while pos < plen {
+      let b = pat_byte_at(p, plen, pos, reversed)
+      let cidx = find_sorted_byte(b_ch_bytes[cur], b)
+      if cidx < 0 {
+        // Append remaining suffix of `p` to pool as a single compressed leaf edge.
+        let eoff = pool_bytes.length()
+        let elen = plen - pos
+        let mut k = pos
+        while k < plen {
+          pool_bytes.push(pat_byte_at(p, plen, k, reversed))
+          k = k + 1
         }
-        j = j + 1
+        let leaf = b_eoff.length()
+        b_eoff.push(eoff)
+        b_elen.push(elen)
+        b_ch_bytes.push(Array::new())
+        b_ch_nodes.push(Array::new())
+        b_mids.push(Array::new())
+        insert_sorted_child(b_ch_bytes[cur], b_ch_nodes[cur], b, leaf)
+        cur = leaf
+        break
       }
-    } else {
-      let mut j = plen - 1
-      while j >= 0 {
-        let b = p.code_unit_at(j)
-        if b < 128 {
-          let idx = (cur << 7) + b
-          let nxt = trans[idx]
-          if nxt >= 0 {
-            cur = nxt >> 7
-          } else {
-            let new_id = push_trie_state(
-              trans,
-              has_match,
-              pat_ids,
-              non_ascii_bytes,
-              non_ascii_next,
-            )
-            trans[idx] = new_id << 7
-            cur = new_id
-          }
-        } else {
-          let nxt = find_non_ascii_edge(
-            non_ascii_bytes[cur],
-            non_ascii_next[cur],
-            b,
-          )
-          if nxt >= 0 {
-            cur = nxt
-          } else {
-            let new_id = push_trie_state(
-              trans,
-              has_match,
-              pat_ids,
-              non_ascii_bytes,
-              non_ascii_next,
-            )
-            non_ascii_bytes[cur].push(b)
-            non_ascii_next[cur].push(new_id)
-            cur = new_id
-          }
+      let child = b_ch_nodes[cur][cidx]
+      let eoff = b_eoff[child]
+      let elen = b_elen[child]
+      let rem = plen - pos
+      let max_cmp = if rem < elen { rem } else { elen }
+      let mut lcp = 1
+      while lcp < max_cmp &&
+      pool_bytes[eoff + lcp] == pat_byte_at(p, plen, pos + lcp, reversed) {
+        lcp = lcp + 1
+      }
+      if lcp == elen {
+        cur = child
+        pos = pos + elen
+      } else {
+        // Split `child` at `lcp`: create intermediate `mid` node.
+        let mid = b_eoff.length()
+        b_eoff.push(eoff)
+        b_elen.push(lcp)
+        let mid_cb : Array[Int] = [pool_bytes[eoff + lcp]]
+        let mid_cn : Array[Int] = [child]
+        b_ch_bytes.push(mid_cb)
+        b_ch_nodes.push(mid_cn)
+        b_mids.push(Array::new())
+
+        // Shorten `child`'s edge.
+        b_eoff[child] = eoff + lcp
+        b_elen[child] = elen - lcp
+        b_ch_nodes[cur][cidx] = mid
+
+        pos = pos + lcp
+        if pos == plen {
+          cur = mid
+          break
         }
-        j = j - 1
+        let nb = pat_byte_at(p, plen, pos, reversed)
+        let loff = pool_bytes.length()
+        let llen = plen - pos
+        let mut k = pos
+        while k < plen {
+          pool_bytes.push(pat_byte_at(p, plen, k, reversed))
+          k = k + 1
+        }
+        let leaf = b_eoff.length()
+        b_eoff.push(loff)
+        b_elen.push(llen)
+        b_ch_bytes.push(Array::new())
+        b_ch_nodes.push(Array::new())
+        b_mids.push(Array::new())
+        insert_sorted_child(b_ch_bytes[mid], b_ch_nodes[mid], nb, leaf)
+        cur = leaf
+        break
       }
     }
-    has_match[cur] = true
-    pat_ids[cur].push(ids[i])
-    i = i + 1
+    b_mids[cur].push(ids[pi])
+    pi = pi + 1
   }
-  ByteTrie::{ trans, has_match, pat_ids, non_ascii_bytes, non_ascii_next, count: n }
+
+  // Flatten byte pool into a single compact String (1 byte per entry).
+  let sb = StringBuilder::new()
+  let mut k = 0
+  let np = pool_bytes.length()
+  while k < np {
+    sb.write_byte(pool_bytes[k].to_byte())
+    k = k + 1
+  }
+  let pool = sb.to_string()
+
+  // Flatten children and match IDs into CSR arrays.
+  let num_nodes = b_eoff.length()
+  let child_start : Array[Int] = Array::new()
+  let child_count : Array[Int] = Array::new()
+  let child_byte : Array[Int] = Array::new()
+  let child_node : Array[Int] = Array::new()
+  let match_start : Array[Int] = Array::new()
+  let match_count : Array[Int] = Array::new()
+  let match_ids : Array[Int] = Array::new()
+
+  let mut u = 0
+  while u < num_nodes {
+    let cb = b_ch_bytes[u]
+    let cn = b_ch_nodes[u]
+    child_start.push(child_byte.length())
+    child_count.push(cb.length())
+    let mut j = 0
+    while j < cb.length() {
+      child_byte.push(cb[j])
+      child_node.push(cn[j])
+      j = j + 1
+    }
+    let mids = b_mids[u]
+    match_start.push(match_ids.length())
+    match_count.push(mids.length())
+    j = 0
+    while j < mids.length() {
+      match_ids.push(mids[j])
+      j = j + 1
+    }
+    u = u + 1
+  }
+
+  // Build O(1) root ASCII transition table.
+  let root_trans : Array[Int] = Array::new()
+  let mut b = 0
+  while b < 128 {
+    root_trans.push(-1)
+    b = b + 1
+  }
+  let rcb = b_ch_bytes[0]
+  let rcn = b_ch_nodes[0]
+  let mut rj = 0
+  while rj < rcb.length() {
+    let rb = rcb[rj]
+    if rb < 128 {
+      root_trans[rb] = rcn[rj]
+    }
+    rj = rj + 1
+  }
+
+  ByteTrie::{
+    pool,
+    edge_off: b_eoff,
+    edge_len: b_elen,
+    child_start,
+    child_count,
+    child_byte,
+    child_node,
+    match_start,
+    match_count,
+    match_ids,
+    root_trans,
+    count: n,
+  }
+}
+
+fn ByteTrie::find_child(self : ByteTrie, u : Int, b : Int) -> Int {
+  if u == 0 && b < 128 {
+    return self.root_trans[b]
+  }
+  let cs = self.child_start[u]
+  let cc = self.child_count[u]
+  if cc == 0 {
+    return -1
+  }
+  let cb = self.child_byte
+  if cc == 1 {
+    return if cb[cs] == b { self.child_node[cs] } else { -1 }
+  }
+  if cc <= 8 {
+    let end = cs + cc
+    let mut i = cs
+    while i < end {
+      let v = cb[i]
+      if v == b {
+        return self.child_node[i]
+      }
+      if v > b {
+        return -1
+      }
+      i = i + 1
+    }
+    return -1
+  }
+  let mut lo = cs
+  let mut hi = cs + cc - 1
+  while lo <= hi {
+    let mid = lo + ((hi - lo) >> 1)
+    let v = cb[mid]
+    if v == b {
+      return self.child_node[mid]
+    } else if v < b {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  -1
 }
 
 ///| Check whether any prefix in this trie matches the start of `path`.
@@ -393,37 +516,38 @@ pub fn ByteTrie::is_match_prefix(self : ByteTrie, path : String) -> Bool {
   if self.count == 0 {
     return false
   }
-  let has_match = self.has_match
-  if has_match[0] {
+  if self.match_count[0] > 0 {
     return true
   }
-  let trans = self.trans
+  let pool = self.pool
+  let edge_off = self.edge_off
+  let edge_len = self.edge_len
+  let match_count = self.match_count
   let n = path.length()
-  let mut st = 0 // pre-multiplied by 128
+  let mut cur = 0
   let mut i = 0
   while i < n {
-    let b = path.code_unit_at(i)
-    if b < 128 {
-      st = trans[st + b]
-      if st < 0 {
-        return false
-      }
-    } else {
-      let sid = st >> 7
-      let nxt = find_non_ascii_edge(
-        self.non_ascii_bytes[sid],
-        self.non_ascii_next[sid],
-        b,
-      )
-      if nxt < 0 {
-        return false
-      }
-      st = nxt << 7
+    let nxt = self.find_child(cur, path.code_unit_at(i))
+    if nxt < 0 {
+      return false
     }
-    if has_match[st >> 7] {
+    let elen = edge_len[nxt]
+    if i + elen > n {
+      return false
+    }
+    let eoff = edge_off[nxt]
+    let mut k = 1
+    while k < elen {
+      if path.code_unit_at(i + k) != pool.code_unit_at(eoff + k) {
+        return false
+      }
+      k = k + 1
+    }
+    i = i + elen
+    cur = nxt
+    if match_count[cur] > 0 {
       return true
     }
-    i = i + 1
   }
   false
 }
@@ -437,49 +561,52 @@ pub fn ByteTrie::matches_prefix_into(
   if self.count == 0 {
     return
   }
-  let has_match = self.has_match
-  if has_match[0] {
-    let r_ids = self.pat_ids[0]
+  let match_start = self.match_start
+  let match_count = self.match_count
+  let match_ids = self.match_ids
+  let rmc = match_count[0]
+  if rmc > 0 {
+    let rms = match_start[0]
     let mut k = 0
-    while k < r_ids.length() {
-      into.push(r_ids[k])
+    while k < rmc {
+      into.push(match_ids[rms + k])
       k = k + 1
     }
   }
-  let trans = self.trans
+  let pool = self.pool
+  let edge_off = self.edge_off
+  let edge_len = self.edge_len
   let n = path.length()
-  let mut st = 0
+  let mut cur = 0
   let mut i = 0
   while i < n {
-    let b = path.code_unit_at(i)
-    if b < 128 {
-      st = trans[st + b]
-      if st < 0 {
+    let nxt = self.find_child(cur, path.code_unit_at(i))
+    if nxt < 0 {
+      return
+    }
+    let elen = edge_len[nxt]
+    if i + elen > n {
+      return
+    }
+    let eoff = edge_off[nxt]
+    let mut k = 1
+    while k < elen {
+      if path.code_unit_at(i + k) != pool.code_unit_at(eoff + k) {
         return
       }
-    } else {
-      let sid = st >> 7
-      let nxt = find_non_ascii_edge(
-        self.non_ascii_bytes[sid],
-        self.non_ascii_next[sid],
-        b,
-      )
-      if nxt < 0 {
-        return
-      }
-      st = nxt << 7
+      k = k + 1
     }
-    let sid = st >> 7
-    if has_match[sid] {
-      let ids = self.pat_ids[sid]
-      let mut k = 0
-      let nids = ids.length()
-      while k < nids {
-        into.push(ids[k])
-        k = k + 1
+    i = i + elen
+    cur = nxt
+    let mc = match_count[cur]
+    if mc > 0 {
+      let ms = match_start[cur]
+      let mut m = 0
+      while m < mc {
+        into.push(match_ids[ms + m])
+        m = m + 1
       }
     }
-    i = i + 1
   }
 }
 
@@ -488,36 +615,37 @@ pub fn ByteTrie::is_match_suffix(self : ByteTrie, path : String) -> Bool {
   if self.count == 0 {
     return false
   }
-  let has_match = self.has_match
-  if has_match[0] {
+  if self.match_count[0] > 0 {
     return true
   }
-  let trans = self.trans
-  let mut st = 0
+  let pool = self.pool
+  let edge_off = self.edge_off
+  let edge_len = self.edge_len
+  let match_count = self.match_count
+  let mut cur = 0
   let mut i = path.length() - 1
   while i >= 0 {
-    let b = path.code_unit_at(i)
-    if b < 128 {
-      st = trans[st + b]
-      if st < 0 {
-        return false
-      }
-    } else {
-      let sid = st >> 7
-      let nxt = find_non_ascii_edge(
-        self.non_ascii_bytes[sid],
-        self.non_ascii_next[sid],
-        b,
-      )
-      if nxt < 0 {
-        return false
-      }
-      st = nxt << 7
+    let nxt = self.find_child(cur, path.code_unit_at(i))
+    if nxt < 0 {
+      return false
     }
-    if has_match[st >> 7] {
+    let elen = edge_len[nxt]
+    if i + 1 < elen {
+      return false
+    }
+    let eoff = edge_off[nxt]
+    let mut k = 1
+    while k < elen {
+      if path.code_unit_at(i - k) != pool.code_unit_at(eoff + k) {
+        return false
+      }
+      k = k + 1
+    }
+    i = i - elen
+    cur = nxt
+    if match_count[cur] > 0 {
       return true
     }
-    i = i - 1
   }
   false
 }
@@ -531,47 +659,50 @@ pub fn ByteTrie::matches_suffix_into(
   if self.count == 0 {
     return
   }
-  let has_match = self.has_match
-  if has_match[0] {
-    let r_ids = self.pat_ids[0]
+  let match_start = self.match_start
+  let match_count = self.match_count
+  let match_ids = self.match_ids
+  let rmc = match_count[0]
+  if rmc > 0 {
+    let rms = match_start[0]
     let mut k = 0
-    while k < r_ids.length() {
-      into.push(r_ids[k])
+    while k < rmc {
+      into.push(match_ids[rms + k])
       k = k + 1
     }
   }
-  let trans = self.trans
-  let mut st = 0
+  let pool = self.pool
+  let edge_off = self.edge_off
+  let edge_len = self.edge_len
+  let mut cur = 0
   let mut i = path.length() - 1
   while i >= 0 {
-    let b = path.code_unit_at(i)
-    if b < 128 {
-      st = trans[st + b]
-      if st < 0 {
+    let nxt = self.find_child(cur, path.code_unit_at(i))
+    if nxt < 0 {
+      return
+    }
+    let elen = edge_len[nxt]
+    if i + 1 < elen {
+      return
+    }
+    let eoff = edge_off[nxt]
+    let mut k = 1
+    while k < elen {
+      if path.code_unit_at(i - k) != pool.code_unit_at(eoff + k) {
         return
       }
-    } else {
-      let sid = st >> 7
-      let nxt = find_non_ascii_edge(
-        self.non_ascii_bytes[sid],
-        self.non_ascii_next[sid],
-        b,
-      )
-      if nxt < 0 {
-        return
-      }
-      st = nxt << 7
+      k = k + 1
     }
-    let sid = st >> 7
-    if has_match[sid] {
-      let ids = self.pat_ids[sid]
-      let mut k = 0
-      let nids = ids.length()
-      while k < nids {
-        into.push(ids[k])
-        k = k + 1
+    i = i - elen
+    cur = nxt
+    let mc = match_count[cur]
+    if mc > 0 {
+      let ms = match_start[cur]
+      let mut m = 0
+      while m < mc {
+        into.push(match_ids[ms + m])
+        m = m + 1
       }
     }
-    i = i - 1
   }
 }

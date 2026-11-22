@@ -4,18 +4,21 @@ Pure Pion, zero-`World`, `Send`-safe high-performance glob, multi-pattern `GlobS
 
 ## Features
 
-- **Full `BurntSushi/globset` syntax & options**:
-  - `*`, `?`, recursive `**` (`**/foo`, `foo/**`, `a/**/b`, `**`), character classes `[a-z]` / `[!a-z]` / `[^a-z]`, all 12 ASCII POSIX classes (`[[:digit:]]`, `[[:alpha:]]`, `[[:space:]]`, etc.), backslash escapes (`\*`, `\?`, `\[`), nested brace alternations (`{*.rs,*.pion}`, `{a,{b,c}}`), and `escape()`.
+- **Full `BurntSushi/globset` syntax & options (byte-level `(?-u)` semantics)**:
+  - `*`, `?`, recursive `**` (`**/foo`, `foo/**`, `a/**/b`, `**`), character classes `[a-z]` / `[!a-z]` / `[^a-z]`, backslash escapes (`\*`, `\?`, `\[`), nested brace alternations (`{*.rs,*.pion}`, `{a,{b,c}}`), and `escape()`.
   - Full `GlobOptions`: `case_insensitive`, `literal_separator`, `backslash_escape`, `empty_alternates`, `allow_unclosed_class`.
   - Strict compile-time `Result[T, GlobError]` errors for unclosed `[`, invalid ranges `[z-a]`, unclosed/unopened `{}`/`}`, nesting depth > 100, and dangling `\`.
+  - Reusable `Candidate` (`Candidate::new`, `is_match_candidate`, `matches_candidate`, `matches_candidate_into`, `matches_all_candidate`) and incremental `GlobSetBuilder` (`new`, `add`, `add_pattern`, `build`).
 - **Strategic `GlobSet` multi-pattern acceleration**:
-  - Single-pass backward basename scan (`make_candidate`) computing both `last_slash` and `last_dot` in one pass.
-  - Unified zero-allocation `ExtTable` (single FNV-1a hash & probe per path serving both pure `*.ext` and `RequiredExtension` multi-DFAs) + `StrTable` with `min_len`/`max_len`, 64-bit length bitmask, and stored hash prefilters for `BasenameLiteral` and `Literal`.
-  - Flat pre-multiplied 128-entry-per-state ASCII `ByteTrie` for zero-pointer-chase `Prefix` and reversed `Suffix` matching.
-  - Controlled brace & small character-class expansion (≤ 16 branches, e.g., `**/*.{js,jsx,mjs}`, `**/*.py[cod]`, `{target,dist,build}/**`) routing directly into O(1) tables.
-  - Precompiled ASCII DFA with pre-multiplied state offsets (O(1) array load per byte, dead-state early exit) backed by a linear-time bit-parallel Thompson NFA (O(States × PathLen), zero backtracking, immune to ReDoS).
+  - Single-pass backward basename scan (`Candidate::new`) computing both `last_slash` and `last_dot` in one pass.
+  - Unified zero-allocation `ExtTable` (single FNV-1a hash & probe per path serving both pure `*.ext` and `RequiredExtension` multi-NFAs) + `StrTable` with `min_len`/`max_len`, 64-bit length bitmask, and stored hash prefilters for `BasenameLiteral` and `Literal`.
+  - Compact CSR Compressed Radix Trie (`ByteTrie`) with O(1) root ASCII dispatch for `Prefix` and reversed `Suffix` matching.
+  - Controlled brace & small ASCII character-class expansion (≤ 16 branches, e.g., `**/*.{js,jsx,mjs}`, `**/*.py[cod]`, `{target,dist,build}/**`) routing directly into O(1) tables.
+  - O(N) byte-level Thompson NFA with shared leading `**/` loop, O(N + 256) byte equivalence classes, and on-demand memory-bounded Lazy DFA (O(1) per byte on hit across all 0..255 bytes, zero backtracking, immune to ReDoS).
+  - Adaptive deduplication: O(1) fast paths for ≤ 2 hits, O(k) bitmap dedup for dense multi-hits, and O(k log k) iterative quicksort for sparse large hits.
 - **Complete `.gitignore` semantics**:
-  - Comments (`#`), blank lines, UTF-8 BOM, CRLF/LF, trailing unescaped space trimming (`foo\   ` → `foo `), escaped leading `\#` / `\!`, bare `!` no-op, anchoring (`/foo`, `dir/file`), directory-only rules (`build/`), negation override (`!important.log`), root prefix stripping, and case-insensitive mode.
+  - Comments (`#`), blank lines, UTF-8 BOM, CRLF/LF, trailing unescaped space trimming (`foo\   ` → `foo `), escaped leading `\#` / `\!`, bare `!` no-op, anchoring (`/foo`, `dir/file`), directory-only rules (`build/`), negation override (`!important.log`), root prefix stripping, POSIX character classes (`[[:digit:]]`, `[[:alpha:]]`, etc., matching `git`), separator-excluding character classes (matching `git`), and case-insensitive mode.
+  - Tolerates invalid lines without aborting the whole file (matching `git` and `BurntSushi/ignore`), plus `parse_gitignore_partial` and `GitignoreBuilder` for recording per-line `GitignoreError`s.
   - `matched(path, is_dir) -> MatchResult` (`None` / `Ignore(line)` / `Whitelist(line)`), `is_ignored(path, is_dir)`, `matched_path_or_any_parents`, top-down git parent-directory exclusion (`is_ignored_with_parents`), and multi-level nested `.gitignore` priority (`GitignoreStack`).
 - **Dual target**: Native + `wasm32` (`packages/glob/wasm_smoke`).
 
