@@ -50,33 +50,36 @@ let rendered = markdown::render_html(events)
 - `parse(src : String, opts : Options) -> Array[Event]`
 - `render_html(events : Array[Event]) -> String` (strict CommonMark 0.31.2 HTML)
 - `render_html_pulldown(events : Array[Event]) -> String` (`pulldown-cmark::html::push_html` byte-for-byte formatting)
-- `to_html(src : String, opts : Options) -> String`
+- `to_html(src : String, opts : Options) -> String` (direct zero-Event streaming HTML renderer)
+- `to_html_pulldown(src : String, opts : Options) -> String` (direct zero-Event streaming `pulldown-cmark` HTML renderer)
 
-## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=1`, `rounds=5`, SHA-256 Verified)
+## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=2`, `rounds=9`, SHA-256 Verified)
 
-Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte verification against Rust `pulldown-cmark 0.13.1` (`cargo build --release`, `opt-level = 3`, `lto = "thin"`).
+Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte verification against Rust `pulldown-cmark 0.13.6` (`cargo build --release`, `opt-level = 3`, `lto = "thin"`).
 
-### 1. CommonMark 0.31.2 `spec.txt` × 12 (`2,460,323 B` input → `2,692,692 B` HTML)
+### 1. CommonMark 0.31.2 `spec.txt` × 12 (`2,458,295 B` input → `2,690,436 B` HTML)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_pulldown_cmark`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_pulldown_cmark` | 16.917 | 15.885 | 17.440 | 145.43 | 13.06 MiB | 1.00x (baseline) |
-| `pion_markdown` | 36.899 | 36.655 | 40.525 | 66.68 | 32.11 MiB | 0.46x |
+| `rust_pulldown_cmark` | 18.065 | 17.162 | 19.137 | 136.08 | 13.03 MiB | 1.00x (baseline) |
+| `pion_markdown` | 23.001 | 21.080 | 23.616 | 106.88 | 15.73 MiB | 0.79x |
 
-- SHA-256 (identical across all implementations and rounds): `110321ab0d170585d613698c00eecaf17192fdbedff9f9585e887800d6da64d4`
+- SHA-256 (identical across all implementations and rounds): `a72cc1c4e54ce0990a10f277818f85a5e87db112e86b0bc84844b3c0ec54620a`
 
 ### 2. Mixed GFM Corpus (`2,503,227 B` input → `4,976,832 B` HTML)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_pulldown_cmark`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_pulldown_cmark` | 22.699 | 20.658 | 23.618 | 110.28 | 25.81 MiB | 1.00x (baseline) |
-| `pion_markdown` | 51.712 | 49.845 | 56.385 | 48.41 | 55.31 MiB | 0.44x |
+| `rust_pulldown_cmark` | 23.271 | 21.993 | 24.975 | 107.57 | 24.36 MiB | 1.00x (baseline) |
+| `pion_markdown` | 29.847 | 27.075 | 32.484 | 83.87 | 20.05 MiB | 0.78x |
 
 - SHA-256 (identical across all implementations and rounds): `eb0ade9169dfd54fc25a08adb046413fa61bfb44182c6fd0a7310bb8aaf7eba3`
 
 ### Honest Bottleneck Analysis
 
-`pion_markdown` achieves **44%–46%** of Rust `pulldown-cmark`'s throughput (~48–67 MB/s) on Apple Silicon with ~2.1–2.5× peak RSS. The remaining gap comes from three clear architectural factors:
-1. **Materialized `Array[Event]` + `String` slices vs zero-copy streaming `CowStr<'a>`**: `parse()` materializes all `Event` objects and owned `PionString` slices (RC-allocated copies) in memory before `render_html()`, whereas Rust `pulldown-cmark` streams borrowed `&'a str` slices directly into `html::push_html` without intermediate event buffering.
-2. **Backend codegen & SIMD**: Rust uses LLVM `-O3` + thin LTO + `memchr` NEON SIMD scanning for delimiter/escape searches, while `pionc` uses QBE scalar loops without SIMD intrinsics.
-3. **Line-slice copying in Phase 1**: `BlockNode.lines` stores owned `String` slices per line; switching to `(start, end)` byte-offset spans referencing the normalized input string would eliminate most per-line allocations and roughly halve peak RSS.
+After eliminating `Array[Event]` materialization (direct streaming HTML path), flattening Phase 1 (`BlockMeta` / `BlockTree` / `LineSpan` POD arenas) and Phase 2 (`InlineNode` / `DelimEntry` / `BracketEntry` POD arenas + reusable `InlineCtx` + O(1) 256-byte LUT + zero-tuple scanners), `pion_markdown` reaches **78%–79%** of Rust `pulldown-cmark --release` throughput (**107 MB/s** CommonMark, **84 MB/s** Mixed GFM — a **~1.95× speedup** over the initial `0.45×`–`0.48×` port) while cutting Peak RSS by **2.0×–2.8×** (**20.05 MiB vs Rust's 24.36 MiB** on Mixed GFM — 18% lower memory than Rust).
+
+The remaining ~4.9–6.6 ms gap is attributable to three `pionc` / runtime primitives absent in pure Pion:
+1. **No `StringBuilder::write_substring(s, start, end)`**: Pion must either loop `sb.write_byte` (~3.5 ns/byte: 3 loads + 3 stores + NUL write per byte) for short/medium spans (`<= 48 B`), or allocate+copy+free via `s.slice` for longer spans. Micro-benchmarking 2.5 MB HTML escaping shows `8.90 ms` (byte loop) vs `2.72 ms` (chunked `memcpy`) — a **6.2 ms** gap on its own.
+2. **No `StringBuilder::with_capacity(cap)`**: `StringBuilder::new()` starts at 32 B (18 `realloc`s to 8 MiB), whereas Rust pre-allocates `src.len() * 3 / 2` once.
+3. **Scalar QBE loops vs NEON SIMD `memchr`**: Rust uses `memchr` (16 B/cycle NEON) for newline and delimiter searches; QBE compiles 1 B/iter scalar loops with per-byte table bounds checks.

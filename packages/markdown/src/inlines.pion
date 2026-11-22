@@ -1,130 +1,288 @@
-///| CommonMark 0.31.2 + GFM + Smart Punctuation + CJK-Friendly Phase 2 Inline Parser & Event Emitter.
+///| CommonMark 0.31.2 + GFM + Smart Punctuation + CJK-Friendly Phase 2 Inline Parser & Direct HTML Renderer.
 
-///| Internal inline AST node stored in a flat intrusive doubly-linked list for O(1) wrapping.
-enum InlineKind {
-  Text(String)
-  Code(String)
-  InlineHtml(String)
-  SoftBreak
-  HardBreak
-  StartTag(Tag)
-  EndTag(TagEnd)
-  DelimText(Int, Int) // (byte_char, count)
-  BracketText(Bool) // is_image: true = "![", false = "["
-  Removed
+// InlineNode tags (stored in flat 32-byte POD val struct)
+// 0 = Span(a=start, b=end)
+// 1 = OwnedText(a=str_pool_idx)
+// 2 = CodeSpan(a=start, b=end)
+// 3 = OwnedCode(a=str_pool_idx)
+// 4 = InlineHtmlSpan(a=start, b=end)
+// 5 = SoftBreak
+// 6 = HardBreak
+// 7 = StartEm
+// 8 = EndEm
+// 9 = StartStrong
+// 10 = EndStrong
+// 11 = StartDel
+// 12 = EndDel
+// 13 = StartLink(a=link_pool_idx)
+// 14 = EndLink
+// 15 = StartImage(a=link_pool_idx)
+// 16 = EndImage
+// 17 = DelimText(a=delim_byte, b=count)
+// 18 = BracketText(a=1 for "![", 0 for "[")
+// 19 = Removed
+
+val struct InlineNode {
+  tag : Int
+  a : Int
+  b : Int
+  next : Int
 }
 
-struct InlineNode {
-  mut kind : InlineKind
-  mut prev : Int
-  mut next : Int
-}
-
-struct DelimEntry {
+val struct DelimEntry {
   node_idx : Int
-  delim : Int // 42='*', 95='_', 126='~', 34='"', 39='\''
-  orig_len : Int
-  mut len : Int
-  can_open : Bool
-  can_close : Bool
-  mut active : Bool
+  meta : Int // delim | (orig_len << 8)
+  len : Int
+  flags : Int // bit 0: can_open, bit 1: can_close, bit 2: active
 }
 
-struct BracketEntry {
+val struct BracketEntry {
   node_idx : Int
-  delim_idx : Int // index into delims array at time of '['
-  text_start : Int // byte offset in inline string right after '[' or '!['
-  is_image : Bool
-  mut active : Bool
+  delim_idx : Int
+  text_start : Int
+  flags : Int // bit 0: is_image, bit 1: active
 }
 
-///| Intrusive doubly-linked list of InlineNodes.
-struct InlineList {
+struct LinkInfo {
+  link_type : LinkType
+  dest : String
+  title : String
+  ref_id : String
+}
+
+///| Reusable per-document inline parsing context (avoids per-paragraph allocations).
+struct InlineCtx {
+  table : Array[Byte] // 256-byte O(1) inline trigger LUT
+  ascii_cls : Array[Byte] // 128-byte ASCII LUT: bit 0 = ws, bit 1 = punct
+  href_tbl : Array[Byte] // 128-byte LUT: 1 = safe href byte
   nodes : Array[InlineNode]
+  prevs : Array[Int]
+  delims : Array[DelimEntry]
+  brackets : Array[BracketEntry]
+  str_pool : Array[String]
+  link_pool : Array[LinkInfo]
+  bottoms : Array[Int] // 30 slots
+  bt_failed : Array[Int] // 65 slots
+  para_sb : StringBuilder
+  code_sb : StringBuilder
+  sc : ScanOut
   mut head : Int
   mut tail : Int
+  mut bt_init : Bool
 }
 
-fn new_inline_list() -> InlineList {
-  InlineList::{ nodes: Array::new(), head: -1, tail: -1 }
+fn make_ascii_cls_table() -> Array[Byte] {
+  let tbl : Array[Byte] = Array::with_capacity(128)
+  let mut i = 0
+  while i < 128 {
+    let mut v = 0
+    if is_ascii_ws(i) {
+      v = v | 1
+    }
+    if is_ascii_punct(i) {
+      v = v | 2
+    }
+    tbl.push(v.to_byte())
+    i = i + 1
+  }
+  tbl
 }
 
-fn il_push(il : InlineList, kind : InlineKind) -> Int {
-  let idx = il.nodes.length()
-  let prev = il.tail
-  il.nodes.push(InlineNode::{ kind, prev, next: -1 })
+fn make_inline_table(opts : Options, escape_quote : Bool) -> Array[Byte] {
+  let tbl : Array[Byte] = Array::with_capacity(256)
+  let zero = (0).to_byte()
+  let mut i = 0
+  while i < 256 {
+    tbl.push(zero)
+    i = i + 1
+  }
+  // 2 = HTML-escape-only byte (not an inline trigger, unless overridden to 1 below)
+  let two = (2).to_byte()
+  tbl[62] = two // '>'
+  if escape_quote {
+    tbl[34] = two // '"'
+  }
+  // 1 = inline trigger byte
+  let one = (1).to_byte()
+  tbl[92] = one // '\'
+  tbl[10] = one // '\n'
+  tbl[96] = one // '`'
+  tbl[38] = one // '&'
+  tbl[60] = one // '<'
+  tbl[42] = one // '*'
+  tbl[95] = one // '_'
+  tbl[91] = one // '['
+  tbl[93] = one // ']'
+  tbl[33] = one // '!'
+  if opts.strikethrough {
+    tbl[126] = one // '~'
+  }
+  if opts.smart_punctuation {
+    tbl[34] = one // '"'
+    tbl[39] = one // '\''
+    tbl[45] = one // '-'
+    tbl[46] = one // '.'
+  }
+  tbl
+}
+
+fn new_inline_ctx(opts : Options, escape_quote : Bool) -> InlineCtx {
+  let bottoms : Array[Int] = Array::with_capacity(30)
+  let mut i = 0
+  while i < 30 {
+    bottoms.push(0)
+    i = i + 1
+  }
+  let bt_failed : Array[Int] = Array::with_capacity(65)
+  i = 0
+  while i < 65 {
+    bt_failed.push(-1)
+    i = i + 1
+  }
+  InlineCtx::{
+    table: make_inline_table(opts, escape_quote),
+    ascii_cls: make_ascii_cls_table(),
+    href_tbl: make_href_safe_table(),
+    nodes: Array::with_capacity(64),
+    prevs: Array::with_capacity(64),
+    delims: Array::with_capacity(16),
+    brackets: Array::with_capacity(8),
+    str_pool: Array::new(),
+    link_pool: Array::new(),
+    bottoms,
+    bt_failed,
+    para_sb: StringBuilder::new(),
+    code_sb: StringBuilder::new(),
+    sc: new_scan_out(),
+    head: -1,
+    tail: -1,
+    bt_init: false,
+  }
+}
+
+fn il_push(ctx : InlineCtx, tag : Int, a : Int, b : Int) -> Int {
+  let idx = ctx.nodes.length()
+  let prev = ctx.tail
+  ctx.nodes.push(InlineNode::{ tag, a, b, next: -1 })
+  ctx.prevs.push(prev)
   if prev >= 0 {
-    il.nodes[prev].next = idx
+    let pn = ctx.nodes[prev]
+    ctx.nodes[prev] = InlineNode::{ tag: pn.tag, a: pn.a, b: pn.b, next: idx }
   } else {
-    il.head = idx
+    ctx.head = idx
   }
-  il.tail = idx
+  ctx.tail = idx
   idx
 }
 
-fn il_insert_after(il : InlineList, after_idx : Int, kind : InlineKind) -> Int {
-  let idx = il.nodes.length()
-  let nxt = il.nodes[after_idx].next
-  il.nodes.push(InlineNode::{ kind, prev: after_idx, next: nxt })
-  il.nodes[after_idx].next = idx
+fn il_insert_after(ctx : InlineCtx, after_idx : Int, tag : Int, a : Int, b : Int) -> Int {
+  let idx = ctx.nodes.length()
+  let an = ctx.nodes[after_idx]
+  let nxt = an.next
+  ctx.nodes.push(InlineNode::{ tag, a, b, next: nxt })
+  ctx.prevs.push(after_idx)
+  ctx.nodes[after_idx] = InlineNode::{ tag: an.tag, a: an.a, b: an.b, next: idx }
   if nxt >= 0 {
-    il.nodes[nxt].prev = idx
+    ctx.prevs[nxt] = idx
   } else {
-    il.tail = idx
+    ctx.tail = idx
   }
   idx
 }
 
-fn il_insert_before(il : InlineList, before_idx : Int, kind : InlineKind) -> Int {
-  let idx = il.nodes.length()
-  let prv = il.nodes[before_idx].prev
-  il.nodes.push(InlineNode::{ kind, prev: prv, next: before_idx })
-  il.nodes[before_idx].prev = idx
+fn il_insert_before(ctx : InlineCtx, before_idx : Int, tag : Int, a : Int, b : Int) -> Int {
+  let idx = ctx.nodes.length()
+  let prv = ctx.prevs[before_idx]
+  ctx.nodes.push(InlineNode::{ tag, a, b, next: before_idx })
+  ctx.prevs.push(prv)
+  ctx.prevs[before_idx] = idx
   if prv >= 0 {
-    il.nodes[prv].next = idx
+    let pn = ctx.nodes[prv]
+    ctx.nodes[prv] = InlineNode::{ tag: pn.tag, a: pn.a, b: pn.b, next: idx }
   } else {
-    il.head = idx
+    ctx.head = idx
   }
   idx
 }
 
-///| Compute CommonMark (or CJK-friendly) flanking flags `(can_open, can_close)` for a delimiter run.
-fn compute_flanking(
+fn il_set_node(ctx : InlineCtx, idx : Int, tag : Int, a : Int, b : Int) -> Unit {
+  let cur = ctx.nodes[idx]
+  ctx.nodes[idx] = InlineNode::{ tag, a, b, next: cur.next }
+}
+
+fn il_push_str(ctx : InlineCtx, s : String) -> Int {
+  let idx = ctx.str_pool.length()
+  ctx.str_pool.push(s)
+  idx
+}
+
+fn delim_slot(d : Int) -> Int {
+  if d == 42 {
+    0
+  } else if d == 95 {
+    1
+  } else if d == 126 {
+    2
+  } else if d == 34 {
+    3
+  } else {
+    4
+  }
+}
+
+///| Compute CommonMark (or CJK-friendly) flanking flags as a bitmask (bit 0 = can_open, bit 1 = can_close).
+///| Zero tuple allocations on ASCII fast path!
+fn compute_flanking_mask(
+  ctx : InlineCtx,
   s : String,
+  seg_start : Int,
+  seg_end : Int,
   run_start : Int,
   run_end : Int,
   delim : Int,
   opts : Options,
-) -> (Bool, Bool) {
-  let n = s.length()
-  let (prev_cp, prev_start) = if run_start > 0 {
-    utf8_decode_prev(s, run_start)
-  } else {
-    (10, 0) // beginning of line counts as whitespace
+) -> Int {
+  let mut prev_cp = 10
+  let mut prev_start = seg_start
+  if run_start > seg_start {
+    let pb = s.code_unit_at(run_start - 1)
+    if pb < 128 {
+      prev_cp = pb
+      prev_start = run_start - 1
+    } else {
+      let (cp, ps) = utf8_decode_prev(s, run_start)
+      prev_cp = cp
+      prev_start = ps
+    }
   }
-  let (next_cp, _) = if run_end < n {
-    utf8_decode(s, run_end)
-  } else {
-    (10, 0) // end of line counts as whitespace
+  let mut next_cp = 10
+  if run_end < seg_end {
+    let nb = s.code_unit_at(run_end)
+    if nb < 128 {
+      next_cp = nb
+    } else {
+      let (cp, _) = utf8_decode(s, run_end)
+      next_cp = cp
+    }
   }
 
   let run_len = run_end - run_start
 
   if opts.cjk_friendly && (delim == 42 || delim == 95 || (delim == 126 && run_len == 1)) {
     let prev_is_vs = is_non_emoji_general_vs(prev_cp)
-    let (prev_is_cjk, prev_is_ivs, prev_is_punct) = if prev_is_vs {
-      if prev_start > 0 {
+    let mut prev_is_cjk = false
+    let mut prev_is_ivs = false
+    let mut prev_is_punct = false
+    if prev_is_vs {
+      if prev_start > seg_start {
         let (pp_cp, _) = utf8_decode_prev(s, prev_start)
-        (
-          is_cjk_char(pp_cp) || is_cjk_ambiguous_punct_seq(pp_cp, prev_cp),
-          false,
-          is_unicode_punct(pp_cp),
-        )
-      } else {
-        (false, false, false)
+        prev_is_cjk = is_cjk_char(pp_cp) || is_cjk_ambiguous_punct_seq(pp_cp, prev_cp)
+        prev_is_punct = is_unicode_punct(pp_cp)
       }
     } else {
-      (is_cjk_char(prev_cp), is_ideographic_vs(prev_cp), is_unicode_punct(prev_cp))
+      prev_is_cjk = is_cjk_char(prev_cp)
+      prev_is_ivs = is_ideographic_vs(prev_cp)
+      prev_is_punct = is_unicode_punct(prev_cp)
     }
 
     let before_ws = is_unicode_ws(prev_cp)
@@ -136,153 +294,159 @@ fn compute_flanking(
     if delim == 95 || delim == 126 {
       let open = !after_ws && (!after_punct || before_ws_or_punct || next_cp == 42 || next_cp == 95)
       let close = !before_ws && (!prev_is_punct || after_ws_or_punct || prev_cp == 42 || prev_cp == 95)
-      return (open && (before_ws_or_punct || !close), close && (after_ws_or_punct || !open))
+      let co = open && (before_ws_or_punct || !close)
+      let cc = close && (after_ws_or_punct || !open)
+      return (if co { 1 } else { 0 }) | (if cc { 2 } else { 0 })
     }
 
-    // delim == '*'
     let before_cjk_or_ivs = prev_is_cjk || prev_is_ivs
     let after_cjk = is_cjk_char(next_cp)
-    let can_open = !after_ws &&
+    let co = !after_ws &&
     (!after_punct || before_ws_or_punct || before_cjk_or_ivs || after_cjk || next_cp == 42 || next_cp == 95)
-    let can_close = !before_ws &&
+    let cc = !before_ws &&
     (!prev_is_punct || after_ws_or_punct || prev_is_cjk || after_cjk || prev_cp == 42 || prev_cp == 95)
-    return (can_open, can_close)
+    return (if co { 1 } else { 0 }) | (if cc { 2 } else { 0 })
   }
 
-  let before_ws = is_unicode_ws(prev_cp)
-  let after_ws = is_unicode_ws(next_cp)
-  let before_punct = is_unicode_punct(prev_cp)
-  let after_punct = is_unicode_punct(next_cp)
+  let before_ws = if prev_cp < 128 { (ctx.ascii_cls[prev_cp].to_int() & 1) != 0 } else { is_unicode_ws(prev_cp) }
+  let before_punct = if prev_cp < 128 { (ctx.ascii_cls[prev_cp].to_int() & 2) != 0 } else { is_unicode_punct(prev_cp) }
+  let after_ws = if next_cp < 128 { (ctx.ascii_cls[next_cp].to_int() & 1) != 0 } else { is_unicode_ws(next_cp) }
+  let after_punct = if next_cp < 128 { (ctx.ascii_cls[next_cp].to_int() & 2) != 0 } else { is_unicode_punct(next_cp) }
 
   let left_flanking = !after_ws && (!after_punct || before_ws || before_punct)
   let right_flanking = !before_ws && (!before_punct || after_ws || after_punct)
 
   if delim == 95 {
-    // '_' intraword rule
-    (left_flanking && (!right_flanking || before_punct), right_flanking && (!left_flanking || after_punct))
+    let co = left_flanking && (!right_flanking || before_punct)
+    let cc = right_flanking && (!left_flanking || after_punct)
+    (if co { 1 } else { 0 }) | (if cc { 2 } else { 0 })
   } else if delim == 126 {
-    // GFM strikethrough: 2 tildes always open/close (pulldown-cmark); 1 tilde uses flanking
     if run_len == 2 {
-      (true, true)
+      3
     } else if run_len == 1 {
-      (left_flanking, right_flanking)
+      (if left_flanking { 1 } else { 0 }) | (if right_flanking { 2 } else { 0 })
     } else {
-      (false, false)
+      0
     }
   } else if delim == 34 || delim == 39 {
-    // Smart quotes: `'` after `]` or `)` closes (apostrophe, e.g. `[a]'s`)
     if delim == 39 && (prev_cp == 93 || prev_cp == 41) {
-      (false, true)
+      2
     } else {
-      (left_flanking && !right_flanking, right_flanking)
+      let co = left_flanking && !right_flanking
+      (if co { 1 } else { 0 }) | (if right_flanking { 2 } else { 0 })
     }
   } else {
-    // '*'
-    (left_flanking, right_flanking)
+    (if left_flanking { 1 } else { 0 }) | (if right_flanking { 2 } else { 0 })
   }
 }
 
-///| Process emphasis, strong, strikethrough, and smart quotes in `delims[stack_bottom..]`.
-fn process_emphasis(
-  il : InlineList,
-  delims : Array[DelimEntry],
-  stack_bottom : Int,
-) -> Unit {
-  if delims.length() <= stack_bottom {
+///| Process emphasis, strong, strikethrough, and smart quotes in `ctx.delims[stack_bottom..]`.
+fn process_emphasis(ctx : InlineCtx, stack_bottom : Int) -> Unit {
+  let dlen = ctx.delims.length()
+  if dlen <= stack_bottom {
     return ()
   }
-  // openers_bottom cache: 5 delim types * 3 (len % 3) * 2 (can_open) = 30 slots
-  let bottoms : Array[Int] = Array::new()
-  let mut bi = 0
-  while bi < 30 {
-    bottoms.push(stack_bottom)
-    bi = bi + 1
-  }
-
-  let delim_slot = fn(d : Int) -> Int {
-    if d == 42 {
-      0
-    } else if d == 95 {
-      1
-    } else if d == 126 {
-      2
-    } else if d == 34 {
-      3
-    } else {
-      4
+  let use_bottoms = dlen - stack_bottom > 12
+  if use_bottoms {
+    let mut bi = 0
+    while bi < 30 {
+      ctx.bottoms[bi] = stack_bottom
+      bi = bi + 1
     }
   }
 
   let mut closer_idx = stack_bottom
-  while closer_idx < delims.length() {
-    let closer = delims[closer_idx]
-    if !closer.active || !closer.can_close || closer.len == 0 {
+  while closer_idx < dlen {
+    let closer = ctx.delims[closer_idx]
+    let c_flags = closer.flags
+    if (c_flags & 4) == 0 || (c_flags & 2) == 0 || closer.len == 0 {
       closer_idx = closer_idx + 1
       continue
     }
+    let c_delim = closer.meta & 0xFF
+    let c_orig_len = closer.meta >> 8
 
     // Quotes: match single `'` or `"` opener
-    if closer.delim == 34 || closer.delim == 39 {
+    if c_delim == 34 || c_delim == 39 {
       let mut j = closer_idx - 1
       let mut found = -1
       while j >= stack_bottom {
-        let opener = delims[j]
-        if opener.active && opener.can_open && opener.delim == closer.delim && opener.len > 0 {
+        let op = ctx.delims[j]
+        if (op.flags & 4) != 0 && (op.flags & 1) != 0 && (op.meta & 0xFF) == c_delim && op.len > 0 {
           found = j
           break
         }
         j = j - 1
       }
       if found >= 0 {
-        let opener = delims[found]
-        if closer.delim == 34 {
-          il.nodes[opener.node_idx].kind = InlineKind::Text("“")
-          il.nodes[closer.node_idx].kind = InlineKind::Text("”")
+        let op = ctx.delims[found]
+        if c_delim == 34 {
+          il_set_node(ctx, op.node_idx, 1, il_push_str(ctx, "“"), 0)
+          il_set_node(ctx, closer.node_idx, 1, il_push_str(ctx, "”"), 0)
         } else {
-          il.nodes[opener.node_idx].kind = InlineKind::Text("‘")
-          il.nodes[closer.node_idx].kind = InlineKind::Text("’")
+          il_set_node(ctx, op.node_idx, 1, il_push_str(ctx, "‘"), 0)
+          il_set_node(ctx, closer.node_idx, 1, il_push_str(ctx, "’"), 0)
         }
-        opener.len = 0
-        opener.active = false
-        closer.len = 0
-        closer.active = false
-        // Deactivate delimiters between opener and closer
+        ctx.delims[found] = DelimEntry::{
+          node_idx: op.node_idx,
+          meta: op.meta,
+          len: 0,
+          flags: op.flags & 3,
+        }
+        ctx.delims[closer_idx] = DelimEntry::{
+          node_idx: closer.node_idx,
+          meta: closer.meta,
+          len: 0,
+          flags: c_flags & 3,
+        }
         let mut k = found + 1
         while k < closer_idx {
-          delims[k].active = false
+          let dk = ctx.delims[k]
+          ctx.delims[k] = DelimEntry::{
+            node_idx: dk.node_idx,
+            meta: dk.meta,
+            len: dk.len,
+            flags: dk.flags & 3,
+          }
           k = k + 1
         }
-      } else {
-        // Unmatched closing quote: single quote becomes apostrophe ’
-        if closer.delim == 39 {
-          il.nodes[closer.node_idx].kind = InlineKind::Text("’")
-          closer.len = 0
-          closer.active = false
+      } else if c_delim == 39 {
+        il_set_node(ctx, closer.node_idx, 1, il_push_str(ctx, "’"), 0)
+        ctx.delims[closer_idx] = DelimEntry::{
+          node_idx: closer.node_idx,
+          meta: closer.meta,
+          len: 0,
+          flags: c_flags & 3,
         }
       }
       closer_idx = closer_idx + 1
       continue
     }
 
-    let slot = delim_slot(closer.delim) * 6 + (closer.orig_len % 3) * 2 + (if closer.can_open { 1 } else { 0 })
-    let min_opener = bottoms[slot]
+    let c_can_open = (c_flags & 1) != 0
+    let slot = if use_bottoms {
+      delim_slot(c_delim) * 6 + (c_orig_len % 3) * 2 + (if c_can_open { 1 } else { 0 })
+    } else {
+      0
+    }
+    let min_opener = if use_bottoms { ctx.bottoms[slot] } else { stack_bottom }
 
     let mut opener_idx = closer_idx - 1
     let mut found_opener = -1
     while opener_idx >= min_opener {
-      let opener = delims[opener_idx]
-      if opener.active && opener.can_open && opener.len > 0 && opener.delim == closer.delim {
-        if closer.delim == 126 {
-          // Strikethrough: exact length match (1==1 or 2==2)
-          if opener.orig_len == closer.orig_len {
+      let op = ctx.delims[opener_idx]
+      if (op.flags & 4) != 0 && (op.flags & 1) != 0 && op.len > 0 && (op.meta & 0xFF) == c_delim {
+        let o_orig_len = op.meta >> 8
+        if c_delim == 126 {
+          if o_orig_len == c_orig_len {
             found_opener = opener_idx
             break
           }
         } else {
-          // CommonMark rule of 3
-          let odd_match = (opener.can_close || closer.can_open) &&
-          ((opener.orig_len + closer.orig_len) % 3 == 0) &&
-          !((opener.orig_len % 3 == 0) && (closer.orig_len % 3 == 0))
+          let o_can_close = (op.flags & 2) != 0
+          let odd_match = (o_can_close || c_can_open) &&
+          ((o_orig_len + c_orig_len) % 3 == 0) &&
+          !((o_orig_len % 3 == 0) && (c_orig_len % 3 == 0))
           if !odd_match {
             found_opener = opener_idx
             break
@@ -293,57 +457,92 @@ fn process_emphasis(
     }
 
     if found_opener >= 0 {
-      let opener = delims[found_opener]
-      let use_delims = if closer.delim == 126 {
+      let op = ctx.delims[found_opener]
+      let use_delims = if c_delim == 126 {
         closer.len
-      } else if opener.len >= 2 && closer.len >= 2 {
+      } else if op.len >= 2 && closer.len >= 2 {
         2
       } else {
         1
       }
 
-      opener.len = opener.len - use_delims
-      closer.len = closer.len - use_delims
+      let new_op_len = op.len - use_delims
+      let new_cl_len = closer.len - use_delims
 
-      if opener.len == 0 {
-        il.nodes[opener.node_idx].kind = InlineKind::Removed
-        opener.active = false
-      } else {
-        il.nodes[opener.node_idx].kind = InlineKind::DelimText(opener.delim, opener.len)
-      }
-
-      if closer.len == 0 {
-        il.nodes[closer.node_idx].kind = InlineKind::Removed
-        closer.active = false
-      } else {
-        il.nodes[closer.node_idx].kind = InlineKind::DelimText(closer.delim, closer.len)
-      }
-
-      let (st, et) = if closer.delim == 126 {
-        (Tag::Strikethrough, TagEnd::Strikethrough)
+      let (st_tag, et_tag) = if c_delim == 126 {
+        (11, 12)
       } else if use_delims == 2 {
-        (Tag::Strong, TagEnd::Strong)
+        (9, 10)
       } else {
-        (Tag::Emphasis, TagEnd::Emphasis)
+        (7, 8)
       }
 
-      let _ = il_insert_after(il, opener.node_idx, InlineKind::StartTag(st))
-      let _ = il_insert_before(il, closer.node_idx, InlineKind::EndTag(et))
+      if new_op_len == 0 {
+        // In-place overwrite: zero node insertion, zero linked-list rewiring!
+        il_set_node(ctx, op.node_idx, st_tag, 0, 0)
+        ctx.delims[found_opener] = DelimEntry::{
+          node_idx: op.node_idx,
+          meta: op.meta,
+          len: 0,
+          flags: op.flags & 3,
+        }
+      } else {
+        il_set_node(ctx, op.node_idx, 17, c_delim, new_op_len)
+        ctx.delims[found_opener] = DelimEntry::{
+          node_idx: op.node_idx,
+          meta: op.meta,
+          len: new_op_len,
+          flags: op.flags,
+        }
+        let _ = il_insert_after(ctx, op.node_idx, st_tag, 0, 0)
+      }
 
-      // Deactivate all delimiters strictly between opener and closer
+      if new_cl_len == 0 {
+        // In-place overwrite: zero node insertion, zero linked-list rewiring!
+        il_set_node(ctx, closer.node_idx, et_tag, 0, 0)
+        ctx.delims[closer_idx] = DelimEntry::{
+          node_idx: closer.node_idx,
+          meta: closer.meta,
+          len: 0,
+          flags: c_flags & 3,
+        }
+      } else {
+        il_set_node(ctx, closer.node_idx, 17, c_delim, new_cl_len)
+        ctx.delims[closer_idx] = DelimEntry::{
+          node_idx: closer.node_idx,
+          meta: closer.meta,
+          len: new_cl_len,
+          flags: c_flags,
+        }
+        let _ = il_insert_before(ctx, closer.node_idx, et_tag, 0, 0)
+      }
+
       let mut k = found_opener + 1
       while k < closer_idx {
-        delims[k].active = false
+        let dk = ctx.delims[k]
+        ctx.delims[k] = DelimEntry::{
+          node_idx: dk.node_idx,
+          meta: dk.meta,
+          len: dk.len,
+          flags: dk.flags & 3,
+        }
         k = k + 1
       }
 
-      if closer.len == 0 {
+      if new_cl_len == 0 {
         closer_idx = closer_idx + 1
       }
     } else {
-      bottoms[slot] = closer_idx
-      if !closer.can_open {
-        closer.active = false
+      if use_bottoms {
+        ctx.bottoms[slot] = closer_idx
+      }
+      if !c_can_open {
+        ctx.delims[closer_idx] = DelimEntry::{
+          node_idx: closer.node_idx,
+          meta: closer.meta,
+          len: closer.len,
+          flags: c_flags & 3,
+        }
       }
       closer_idx = closer_idx + 1
     }
@@ -351,17 +550,23 @@ fn process_emphasis(
 
   // Convert any remaining active unmatched quotes
   let mut k = stack_bottom
-  while k < delims.length() {
-    let d = delims[k]
-    if d.active && d.len > 0 {
-      if d.delim == 34 {
-        il.nodes[d.node_idx].kind = InlineKind::Text(if d.can_open { "“" } else { "”" })
-      } else if d.delim == 39 {
-        // Unmatched single quote is always right single quote (apostrophe ’)
-        il.nodes[d.node_idx].kind = InlineKind::Text("’")
+  while k < dlen {
+    let d = ctx.delims[k]
+    if (d.flags & 4) != 0 && d.len > 0 {
+      let dd = d.meta & 0xFF
+      if dd == 34 {
+        let q = if (d.flags & 1) != 0 { "“" } else { "”" }
+        il_set_node(ctx, d.node_idx, 1, il_push_str(ctx, q), 0)
+      } else if dd == 39 {
+        il_set_node(ctx, d.node_idx, 1, il_push_str(ctx, "’"), 0)
       }
     }
-    d.active = false
+    ctx.delims[k] = DelimEntry::{
+      node_idx: d.node_idx,
+      meta: d.meta,
+      len: d.len,
+      flags: d.flags & 3,
+    }
     k = k + 1
   }
 }
@@ -418,6 +623,1483 @@ fn smart_dashes(count : Int) -> String {
   sb.to_string()
 }
 
+///| Tiny leaf function to find the first inline trigger byte in `s[seg_start..seg_end]`.
+///| Returns:
+///|   -1 = plain text, 100% HTML-raw-safe (no inline triggers, no HTML-escape bytes)
+///|   -2 = plain text, needs HTML escaping (`>` or `"`)
+///|   >= 0 = index of first inline trigger byte (sets `ctx.sc.flag = true` if an HTML-escape byte preceded it)
+fn find_first_inline_special(
+  tbl : Array[Byte],
+  s : String,
+  seg_start : Int,
+  seg_end : Int,
+  sc : ScanOut,
+) -> Int {
+  let zero = (0).to_byte()
+  let one = (1).to_byte()
+  let mut saw_esc = false
+  let mut i = seg_start
+  while i < seg_end {
+    let b = s.code_unit_at(i)
+    let v = tbl[b]
+    if v != zero {
+      if v == one {
+        // Fast skip literal '&' that cannot start an entity (e.g. "A & B")
+        if b == 38 {
+          if i + 2 >= seg_end {
+            saw_esc = true
+            i = i + 1
+            continue
+          }
+          let b1 = s.code_unit_at(i + 1)
+          if b1 != 35 && !((b1 >= 65 && b1 <= 90) || (b1 >= 97 && b1 <= 122)) {
+            saw_esc = true
+            i = i + 1
+            continue
+          }
+        }
+        sc.flag = saw_esc
+        return i
+      }
+      saw_esc = true
+    }
+    i = i + 1
+  }
+  if saw_esc { -2 } else { -1 }
+}
+
+///| Scan inline content `s[seg_start..seg_end]` starting at `first_special` into `ctx`.
+///| Emits tag 0 (RawSafeSpan) when a text span needs no HTML escaping, tag 20 (EscSpan) otherwise;
+///| tag 2 (RawSafeCodeSpan) when a code span needs no HTML escaping, tag 21 (EscCodeSpan) otherwise.
+fn scan_inlines_to_ctx(
+  ctx : InlineCtx,
+  s : String,
+  seg_start : Int,
+  seg_end : Int,
+  first_special : Int,
+  had_esc_before : Bool,
+  ref_defs : Map[String, LinkDef],
+  opts : Options,
+) -> Unit {
+  let tbl = ctx.table
+  let zero = (0).to_byte()
+  let two = (2).to_byte()
+  let mut i = first_special
+
+  ctx.nodes.clear()
+  ctx.prevs.clear()
+  if ctx.delims.length() > 0 {
+    ctx.delims.clear()
+  }
+  if ctx.brackets.length() > 0 {
+    ctx.brackets.clear()
+  }
+  if ctx.str_pool.length() > 0 {
+    ctx.str_pool.clear()
+  }
+  if ctx.link_pool.length() > 0 {
+    ctx.link_pool.clear()
+  }
+  ctx.head = -1
+  ctx.tail = -1
+  ctx.bt_init = false
+
+  let has_ref_defs = ref_defs.length() > 0
+  let mut text_start = seg_start
+  let mut span_esc = had_esc_before
+
+  while i < seg_end {
+    let b = s.code_unit_at(i)
+    let tv = tbl[b]
+    if tv == zero {
+      i = i + 1
+      while i < seg_end && tbl[s.code_unit_at(i)] == zero {
+        i = i + 1
+      }
+      continue
+    }
+    if tv == two {
+      span_esc = true
+      i = i + 1
+      continue
+    }
+
+    // 1. Backslash escape or hard line break
+    if b == 92 {
+      if i + 1 < seg_end {
+        let nb = s.code_unit_at(i + 1)
+        if nb == 10 {
+          if text_start < i {
+            let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+          }
+          let _ = il_push(ctx, 6, 0, 0)
+          i = i + 2
+          while i < seg_end && (s.code_unit_at(i) == 32 || s.code_unit_at(i) == 9) {
+            i = i + 1
+          }
+          text_start = i
+          span_esc = false
+          continue
+        } else if is_ascii_punct(nb) {
+          if text_start < i {
+            let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+          }
+          let nb_esc = nb == 38 || nb == 60 || nb == 62 || nb == 34
+          let _ = il_push(ctx, if nb_esc { 20 } else { 0 }, i + 1, i + 2)
+          i = i + 2
+          text_start = i
+          span_esc = false
+          continue
+        }
+      }
+      i = i + 1
+      continue
+    }
+
+    // 2. Newline: SoftBreak or HardBreak (2+ trailing spaces)
+    if b == 10 {
+      let mut sp_start = i
+      while sp_start > text_start && s.code_unit_at(sp_start - 1) == 32 {
+        sp_start = sp_start - 1
+      }
+      let trailing_spaces = i - sp_start
+      if text_start < sp_start {
+        let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, sp_start)
+      }
+      if trailing_spaces >= 2 {
+        let _ = il_push(ctx, 6, 0, 0)
+      } else {
+        let _ = il_push(ctx, 5, 0, 0)
+      }
+      i = i + 1
+      while i < seg_end && (s.code_unit_at(i) == 32 || s.code_unit_at(i) == 9) {
+        i = i + 1
+      }
+      text_start = i
+      span_esc = false
+      continue
+    }
+
+    // 3. Code span (backtick run)
+    if b == 96 {
+      let run_start = i
+      while i < seg_end && s.code_unit_at(i) == 96 {
+        i = i + 1
+      }
+      let ticks = i - run_start
+      let can_search = if ctx.bt_init && ticks < 65 { ctx.bt_failed[ticks] < run_start } else { true }
+      let mut match_pos = -1
+      if can_search {
+        let mut j = i
+        while j < seg_end {
+          if s.code_unit_at(j) == 96 {
+            let cs = j
+            while j < seg_end && s.code_unit_at(j) == 96 {
+              j = j + 1
+            }
+            if j - cs == ticks {
+              match_pos = cs
+              break
+            }
+          } else {
+            j = j + 1
+          }
+        }
+        if match_pos < 0 && ticks < 65 {
+          if !ctx.bt_init {
+            let mut bti = 0
+            while bti < 65 {
+              ctx.bt_failed[bti] = -1
+              bti = bti + 1
+            }
+            ctx.bt_init = true
+          }
+          ctx.bt_failed[ticks] = seg_end
+        }
+      }
+      if match_pos >= 0 {
+        if text_start < run_start {
+          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, run_start)
+        }
+        // Check if code span contains '\n', HTML-escape bytes, or is all spaces
+        let mut has_nl = false
+        let mut all_spaces = true
+        let mut code_esc = false
+        let mut k = i
+        while k < match_pos {
+          let cb = s.code_unit_at(k)
+          if cb <= 62 {
+            if cb == 10 {
+              has_nl = true
+              break
+            }
+            if cb == 38 || cb == 60 || cb == 62 || cb == 34 {
+              code_esc = true
+            }
+            if cb != 32 {
+              all_spaces = false
+            }
+          } else {
+            all_spaces = false
+          }
+          k = k + 1
+        }
+        if !has_nl {
+          let ctag = if code_esc { 21 } else { 2 }
+          let rlen = match_pos - i
+          if rlen >= 2 && !all_spaces && s.code_unit_at(i) == 32 && s.code_unit_at(match_pos - 1) == 32 {
+            let _ = il_push(ctx, ctag, i + 1, match_pos - 1)
+          } else {
+            let _ = il_push(ctx, ctag, i, match_pos)
+          }
+        } else {
+          ctx.code_sb.reset()
+          let mut all_sp2 = true
+          k = i
+          while k < match_pos {
+            let cb = s.code_unit_at(k)
+            if cb == 10 {
+              ctx.code_sb.write_byte((32).to_byte())
+            } else {
+              if cb != 32 {
+                all_sp2 = false
+              }
+              ctx.code_sb.write_byte(cb.to_byte())
+            }
+            k = k + 1
+          }
+          let raw_code = ctx.code_sb.to_string()
+          let rlen = raw_code.length()
+          let final_code = if rlen >= 2 && !all_sp2 && raw_code.code_unit_at(0) == 32 &&
+          raw_code.code_unit_at(rlen - 1) == 32 {
+            raw_code.slice(1, rlen - 1)
+          } else {
+            raw_code
+          }
+          let _ = il_push(ctx, 3, il_push_str(ctx, final_code), 0)
+        }
+        i = match_pos + ticks
+        text_start = i
+        span_esc = false
+        continue
+      }
+      continue
+    }
+
+    // 4. HTML entity / numeric character reference (fast pre-check before call)
+    if b == 38 {
+      if i + 2 < seg_end {
+        let b1 = s.code_unit_at(i + 1)
+        if b1 == 35 || (b1 >= 65 && b1 <= 90) || (b1 >= 97 && b1 <= 122) {
+          match scan_entity(s, i, seg_end) {
+            Some((decoded, next_i)) => {
+              if text_start < i {
+                let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+              }
+              let _ = il_push(ctx, 1, il_push_str(ctx, decoded), 0)
+              i = next_i
+              text_start = i
+              span_esc = false
+              continue
+            }
+            None => ()
+          }
+        }
+      }
+      span_esc = true
+      i = i + 1
+      continue
+    }
+
+    // 5. Autolink `<...>` or Inline HTML `<...>`
+    if b == 60 {
+      match scan_autolink(s, i, seg_end) {
+        Some((is_email, inner, next_i)) => {
+          if text_start < i {
+            let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+          }
+          let lt = if is_email { LinkType::Email } else { LinkType::Autolink }
+          let lidx = ctx.link_pool.length()
+          ctx.link_pool.push(LinkInfo::{ link_type: lt, dest: inner, title: "", ref_id: "" })
+          let _ = il_push(ctx, 13, lidx, 0)
+          let _ = il_push(ctx, 1, il_push_str(ctx, inner), 0)
+          let _ = il_push(ctx, 14, 0, 0)
+          i = next_i
+          text_start = i
+          span_esc = false
+          continue
+        }
+        None => ()
+      }
+      let html_end = scan_inline_html(s, i, seg_end)
+      if html_end > 0 {
+        if text_start < i {
+          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+        }
+        let _ = il_push(ctx, 4, i, html_end)
+        i = html_end
+        text_start = i
+        span_esc = false
+        continue
+      }
+      span_esc = true
+      i = i + 1
+      continue
+    }
+
+    // 6. Emphasis / Strong / Strikethrough delimiters: `*`, `_`, `~`
+    if b == 42 || b == 95 || (b == 126 && opts.strikethrough) {
+      let run_start = i
+      while i < seg_end && s.code_unit_at(i) == b {
+        i = i + 1
+      }
+      let run_len = i - run_start
+      let fmask = compute_flanking_mask(ctx, s, seg_start, seg_end, run_start, i, b, opts)
+      if fmask != 0 {
+        if text_start < run_start {
+          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, run_start)
+        }
+        let nidx = il_push(ctx, 17, b, run_len)
+        ctx.delims.push(DelimEntry::{
+          node_idx: nidx,
+          meta: b | (run_len << 8),
+          len: run_len,
+          flags: fmask | 4,
+        })
+        text_start = i
+        span_esc = false
+      }
+      continue
+    }
+
+    // 7. Smart punctuation: `"`, `'`, `--`, `---`, `...`
+    if opts.smart_punctuation {
+      if b == 34 || b == 39 {
+        let fmask = compute_flanking_mask(ctx, s, seg_start, seg_end, i, i + 1, b, opts)
+        if text_start < i {
+          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+        }
+        if fmask != 0 {
+          let nidx = il_push(ctx, 17, b, 1)
+          ctx.delims.push(DelimEntry::{
+            node_idx: nidx,
+            meta: b | (1 << 8),
+            len: 1,
+            flags: fmask | 4,
+          })
+        } else if b == 39 {
+          let _ = il_push(ctx, 1, il_push_str(ctx, "’"), 0)
+        } else {
+          let _ = il_push(ctx, 1, il_push_str(ctx, "“"), 0)
+        }
+        i = i + 1
+        text_start = i
+        span_esc = false
+        continue
+      }
+      if b == 45 && i + 1 < seg_end && s.code_unit_at(i + 1) == 45 {
+        let run_start = i
+        while i < seg_end && s.code_unit_at(i) == 45 {
+          i = i + 1
+        }
+        if text_start < run_start {
+          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, run_start)
+        }
+        let _ = il_push(ctx, 1, il_push_str(ctx, smart_dashes(i - run_start)), 0)
+        text_start = i
+        span_esc = false
+        continue
+      }
+      if b == 46 && i + 2 < seg_end && s.code_unit_at(i + 1) == 46 && s.code_unit_at(i + 2) == 46 {
+        if text_start < i {
+          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+        }
+        let _ = il_push(ctx, 1, il_push_str(ctx, "…"), 0)
+        i = i + 3
+        text_start = i
+        span_esc = false
+        continue
+      }
+    }
+
+    // 8. Link / Image openers: `[` and `![`
+    if b == 91 || (b == 33 && i + 1 < seg_end && s.code_unit_at(i + 1) == 91) {
+      let is_img = b == 33
+      if text_start < i {
+        let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+      }
+      let nidx = il_push(ctx, 18, if is_img { 1 } else { 0 }, 0)
+      let after = if is_img { i + 2 } else { i + 1 }
+      ctx.brackets.push(BracketEntry::{
+        node_idx: nidx,
+        delim_idx: ctx.delims.length(),
+        text_start: after,
+        flags: (if is_img { 1 } else { 0 }) | 2,
+      })
+      i = after
+      text_start = i
+      span_esc = false
+      continue
+    }
+
+    // 9. Link / Image closer: `]`
+    if b == 93 && ctx.brackets.length() > 0 {
+      let br = ctx.brackets[ctx.brackets.length() - 1]
+      let _ = ctx.brackets.pop()
+      if (br.flags & 2) == 0 {
+        i = i + 1
+        continue
+      }
+
+      let mut matched = false
+      let mut dest = ""
+      let mut title = ""
+      let mut ref_id = ""
+      let mut link_type = LinkType::Inline
+      let mut after_close = i + 1
+
+      // Case A: Inline link `(...)` (zero-tuple scan_link_dest_into / scan_link_title_into!)
+      if i + 1 < seg_end && s.code_unit_at(i + 1) == 40 {
+        let mut p = i + 2
+        while p < seg_end && is_ascii_ws(s.code_unit_at(p)) {
+          p = p + 1
+        }
+        if p < seg_end && s.code_unit_at(p) == 41 {
+          matched = true
+          after_close = p + 1
+        } else if scan_link_dest_into(s, p, seg_end, ctx.sc) {
+          let d = ctx.sc.s1
+          let after_d = ctx.sc.a
+          let mut q = after_d
+          while q < seg_end && is_ascii_ws(s.code_unit_at(q)) {
+            q = q + 1
+          }
+          if q < seg_end && s.code_unit_at(q) == 41 {
+            matched = true
+            dest = d
+            after_close = q + 1
+          } else if q > after_d && scan_link_title_into(s, q, seg_end, ctx.sc) {
+            let t = ctx.sc.s1
+            let after_t = ctx.sc.a
+            let mut r = after_t
+            while r < seg_end && is_ascii_ws(s.code_unit_at(r)) {
+              r = r + 1
+            }
+            if r < seg_end && s.code_unit_at(r) == 41 {
+              matched = true
+              dest = d
+              title = t
+              after_close = r + 1
+            }
+          }
+        }
+      }
+
+      // Case B & C: Reference links (skip entirely if ref_defs is empty!)
+      if !matched && has_ref_defs {
+        // Case B: Full reference `[label]` or Collapsed reference `[]`
+        if i + 1 < seg_end && s.code_unit_at(i + 1) == 91 {
+          if i + 2 < seg_end && s.code_unit_at(i + 2) == 93 {
+            let raw_lbl = s.slice(br.text_start, i)
+            let norm = normalize_link_label(raw_lbl)
+            match ref_defs.get(norm) {
+              Some(def) => {
+                matched = true
+                dest = def.dest
+                title = def.title
+                ref_id = raw_lbl
+                link_type = LinkType::Collapsed
+                after_close = i + 3
+              }
+              None => ()
+            }
+          } else if scan_link_label_into(s, i + 1, seg_end, ctx.sc) {
+            let raw_lbl = s.slice(ctx.sc.a, ctx.sc.b)
+            let after_lbl = ctx.sc.c
+            let norm = normalize_link_label(raw_lbl)
+            match ref_defs.get(norm) {
+              Some(def) => {
+                matched = true
+                dest = def.dest
+                title = def.title
+                ref_id = raw_lbl
+                link_type = LinkType::Reference
+                after_close = after_lbl
+              }
+              None => ()
+            }
+          }
+        }
+
+        // Case C: Shortcut reference (not followed by `[`)
+        if !matched {
+          let has_next_label = if i + 1 < seg_end && s.code_unit_at(i + 1) == 91 {
+            if scan_link_label_into(s, i + 1, seg_end, ctx.sc) {
+              true
+            } else {
+              i + 2 < seg_end && s.code_unit_at(i + 2) == 93
+            }
+          } else {
+            false
+          }
+          if !has_next_label {
+            let lbl_len = i - br.text_start
+            let mut valid_shortcut = lbl_len <= 999
+            let mut k = br.text_start
+            while valid_shortcut && k < i {
+              let c = s.code_unit_at(k)
+              if c == 92 && k + 1 < i {
+                k = k + 2
+              } else if c == 91 || c == 93 {
+                valid_shortcut = false
+              } else {
+                k = k + 1
+              }
+            }
+            if valid_shortcut {
+              let raw_lbl = s.slice(br.text_start, i)
+              let norm = normalize_link_label(raw_lbl)
+              match ref_defs.get(norm) {
+                Some(def) => {
+                  matched = true
+                  dest = def.dest
+                  title = def.title
+                  ref_id = raw_lbl
+                  link_type = LinkType::Shortcut
+                  after_close = i + 1
+                }
+                None => ()
+              }
+            }
+          }
+        }
+      }
+
+      if matched {
+        if text_start < i {
+          let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, i)
+        }
+        process_emphasis(ctx, br.delim_idx)
+        let lidx = ctx.link_pool.length()
+        ctx.link_pool.push(LinkInfo::{ link_type, dest, title, ref_id })
+        if (br.flags & 1) != 0 {
+          il_set_node(ctx, br.node_idx, 15, lidx, 0)
+          let _ = il_push(ctx, 16, 0, 0)
+        } else {
+          il_set_node(ctx, br.node_idx, 13, lidx, 0)
+          let _ = il_push(ctx, 14, 0, 0)
+          let mut bi = 0
+          let blen = ctx.brackets.length()
+          while bi < blen {
+            let b_ent = ctx.brackets[bi]
+            if (b_ent.flags & 1) == 0 {
+              ctx.brackets[bi] = BracketEntry::{
+                node_idx: b_ent.node_idx,
+                delim_idx: b_ent.delim_idx,
+                text_start: b_ent.text_start,
+                flags: b_ent.flags & 1,
+              }
+            }
+            bi = bi + 1
+          }
+        }
+        i = after_close
+        text_start = i
+        span_esc = false
+        continue
+      }
+
+      i = i + 1
+      continue
+    }
+
+    i = i + 1
+  }
+
+  if text_start < seg_end {
+    let _ = il_push(ctx, if span_esc { 20 } else { 0 }, text_start, seg_end)
+  }
+  if ctx.delims.length() > 0 {
+    process_emphasis(ctx, 0)
+  }
+}
+
+///| Write text span `s[start..end]` to HTML `sb` with optional GFM autolink literal detection.
+fn write_text_html_span(
+  sb : StringBuilder,
+  s : String,
+  start : Int,
+  end : Int,
+  opts : Options,
+  in_link : Int,
+  pulldown_compat : Bool,
+) -> Bool {
+  if start >= end {
+    return false
+  }
+  let esc_q = !pulldown_compat
+  if !opts.autolinks || in_link > 0 || end - start < 5 {
+    write_html_escaped_span(sb, s, start, end, esc_q)
+    return s.code_unit_at(end - 1) == 10
+  }
+  let mut mark = start
+  let mut i = start
+  let mut end_nl = false
+  while i < end {
+    let b = s.code_unit_at(i)
+    let boundary_ok = i == start || {
+      let pb = s.code_unit_at(i - 1)
+      is_ascii_ws(pb) || pb == 40 || pb == 42 || pb == 95 || pb == 126 || pb == 91
+    }
+
+    if boundary_ok && (b == 119 || b == 104) {
+      let is_www = starts_with_lit(s, i, end, "www.")
+      let is_http = !is_www && (starts_with_lit(s, i, end, "http://") || starts_with_lit(s, i, end, "https://"))
+      if is_www || is_http {
+        let mut uend = i
+        while uend < end {
+          let c = s.code_unit_at(uend)
+          if c <= 32 || c == 60 {
+            break
+          }
+          uend = uend + 1
+        }
+        let mut trim_end = uend
+        let mut changed = true
+        while changed && trim_end > i {
+          changed = false
+          let last = s.code_unit_at(trim_end - 1)
+          if last == 63 || last == 33 || last == 46 || last == 44 || last == 58 || last == 42 || last == 95 || last == 126 {
+            trim_end = trim_end - 1
+            changed = true
+          } else if last == 41 {
+            let mut opens = 0
+            let mut closes = 0
+            let mut k = i
+            while k < trim_end {
+              let ch = s.code_unit_at(k)
+              if ch == 40 { opens = opens + 1 }
+              if ch == 41 { closes = closes + 1 }
+              k = k + 1
+            }
+            if closes > opens {
+              trim_end = trim_end - 1
+              changed = true
+            }
+          }
+        }
+        let prefix_len = if is_www { 4 } else if starts_with_lit(s, i, end, "https://") { 8 } else { 7 }
+        if trim_end > i + prefix_len {
+          let mut has_dot = false
+          let mut k = i + prefix_len
+          while k < trim_end && s.code_unit_at(k) != 47 {
+            if s.code_unit_at(k) == 46 {
+              has_dot = true
+            }
+            k = k + 1
+          }
+          if has_dot {
+            if mark < i {
+              write_html_escaped_span(sb, s, mark, i, esc_q)
+            }
+            sb.write_string("<a href=\"")
+            if is_www {
+              sb.write_string("http://")
+            }
+            escape_href_span(sb, s, i, trim_end)
+            sb.write_string("\">")
+            write_html_escaped_span(sb, s, i, trim_end, esc_q)
+            sb.write_string("</a>")
+            end_nl = false
+            i = trim_end
+            mark = trim_end
+            continue
+          }
+        }
+      }
+    }
+
+    if b == 64 && i > mark {
+      let mut lstart = i
+      while lstart > mark {
+        let c = s.code_unit_at(lstart - 1)
+        if is_ascii_alnum(c) || c == 46 || c == 95 || c == 43 || c == 45 {
+          lstart = lstart - 1
+        } else {
+          break
+        }
+      }
+      let mut dend = i + 1
+      let mut dots = 0
+      let mut valid_domain = true
+      while dend < end {
+        let c = s.code_unit_at(dend)
+        if is_ascii_alnum(c) || c == 45 || c == 95 {
+          dend = dend + 1
+        } else if c == 46 {
+          dots = dots + 1
+          dend = dend + 1
+        } else {
+          break
+        }
+      }
+      while dend > i + 1 && s.code_unit_at(dend - 1) == 46 {
+        dend = dend - 1
+        dots = dots - 1
+      }
+      if dend <= i + 1 || dots < 1 {
+        valid_domain = false
+      } else {
+        let last_c = s.code_unit_at(dend - 1)
+        if last_c == 45 || last_c == 95 {
+          valid_domain = false
+        }
+        if dend < end && s.code_unit_at(dend) == 43 {
+          valid_domain = false
+        }
+      }
+      if lstart < i && valid_domain {
+        if mark < lstart {
+          write_html_escaped_span(sb, s, mark, lstart, esc_q)
+        }
+        sb.write_string("<a href=\"mailto:")
+        escape_href_span(sb, s, lstart, dend)
+        sb.write_string("\">")
+        write_html_escaped_span(sb, s, lstart, dend, esc_q)
+        sb.write_string("</a>")
+        end_nl = false
+        i = dend
+        mark = dend
+        continue
+      }
+    }
+
+    i = i + 1
+  }
+  if mark < end {
+    write_html_escaped_span(sb, s, mark, end, esc_q)
+    end_nl = s.code_unit_at(end - 1) == 10
+  }
+  end_nl
+}
+
+///| Direct-to-HTML inline parser & renderer for `s[seg_start..seg_end]`.
+///| Returns updated `end_nl`.
+fn render_inlines_html(
+  ctx : InlineCtx,
+  s : String,
+  seg_start : Int,
+  seg_end : Int,
+  ref_defs : Map[String, LinkDef],
+  opts : Options,
+  sb : StringBuilder,
+  pulldown_compat : Bool,
+  init_end_nl : Bool,
+) -> Bool {
+  if seg_start >= seg_end {
+    return init_end_nl
+  }
+  let first_sp = find_first_inline_special(ctx.table, s, seg_start, seg_end, ctx.sc)
+  if first_sp < 0 {
+    if first_sp == -1 && !opts.autolinks {
+      write_raw_span(sb, s, seg_start, seg_end)
+      return false
+    }
+    return write_text_html_span(sb, s, seg_start, seg_end, opts, 0, pulldown_compat)
+  }
+  scan_inlines_to_ctx(ctx, s, seg_start, seg_end, first_sp, ctx.sc.flag, ref_defs, opts)
+
+  let esc_q = !pulldown_compat
+  let no_auto = !opts.autolinks
+  let mut cur = ctx.head
+  let mut in_link = 0
+  let mut end_nl = init_end_nl
+
+  while cur >= 0 {
+    let node = ctx.nodes[cur]
+    let tag = node.tag
+    if tag == 0 {
+      if node.a < node.b {
+        if no_auto || in_link > 0 {
+          write_raw_span(sb, s, node.a, node.b)
+          end_nl = false
+        } else {
+          end_nl = write_text_html_span(sb, s, node.a, node.b, opts, in_link, pulldown_compat)
+        }
+      }
+    } else if tag == 20 {
+      if node.a < node.b {
+        end_nl = write_text_html_span(sb, s, node.a, node.b, opts, in_link, pulldown_compat)
+      }
+    } else if tag == 1 {
+      let t = ctx.str_pool[node.a]
+      if t.length() > 0 {
+        end_nl = write_text_html_span(sb, t, 0, t.length(), opts, in_link, pulldown_compat)
+      }
+    } else if tag == 2 {
+      sb.write_string("<code>")
+      write_raw_span(sb, s, node.a, node.b)
+      sb.write_string("</code>")
+      end_nl = false
+    } else if tag == 21 {
+      sb.write_string("<code>")
+      write_html_escaped_span(sb, s, node.a, node.b, esc_q)
+      sb.write_string("</code>")
+      end_nl = false
+    } else if tag == 3 {
+      let c = ctx.str_pool[node.a]
+      sb.write_string("<code>")
+      write_html_escaped_span(sb, c, 0, c.length(), esc_q)
+      sb.write_string("</code>")
+      end_nl = false
+    } else if tag == 4 {
+      if node.a < node.b {
+        write_raw_span(sb, s, node.a, node.b)
+        end_nl = s.code_unit_at(node.b - 1) == 10
+      }
+    } else if tag == 5 {
+      sb.write_byte((10).to_byte())
+      end_nl = true
+    } else if tag == 6 {
+      sb.write_string("<br />\n")
+      end_nl = true
+    } else if tag == 7 {
+      sb.write_string("<em>")
+      end_nl = false
+    } else if tag == 8 {
+      sb.write_string("</em>")
+      end_nl = false
+    } else if tag == 9 {
+      sb.write_string("<strong>")
+      end_nl = false
+    } else if tag == 10 {
+      sb.write_string("</strong>")
+      end_nl = false
+    } else if tag == 11 {
+      sb.write_string("<del>")
+      end_nl = false
+    } else if tag == 12 {
+      sb.write_string("</del>")
+      end_nl = false
+    } else if tag == 13 {
+      in_link = in_link + 1
+      let info = ctx.link_pool[node.a]
+      match info.link_type {
+        LinkType::Email => {
+          sb.write_string("<a href=\"mailto:")
+          escape_href_span_lut(sb, info.dest, 0, info.dest.length(), ctx.href_tbl)
+        }
+        _ => {
+          sb.write_string("<a href=\"")
+          escape_href_span_lut(sb, info.dest, 0, info.dest.length(), ctx.href_tbl)
+        }
+      }
+      if info.title.length() > 0 {
+        sb.write_string("\" title=\"")
+        escape_html(sb, info.title)
+      }
+      sb.write_string("\">")
+      end_nl = false
+    } else if tag == 14 {
+      if in_link > 0 {
+        in_link = in_link - 1
+      }
+      sb.write_string("</a>")
+      end_nl = false
+    } else if tag == 15 {
+      let info = ctx.link_pool[node.a]
+      sb.write_string("<img src=\"")
+      escape_href_span_lut(sb, info.dest, 0, info.dest.length(), ctx.href_tbl)
+      sb.write_string("\" alt=\"")
+      // Walk until matching EndImage (tag == 16), writing alt text escaped (with quote escaping)
+      let mut nest = 0
+      cur = node.next
+      while cur >= 0 {
+        let an = ctx.nodes[cur]
+        let at = an.tag
+        if at == 15 || at == 13 || at == 7 || at == 9 || at == 11 {
+          nest = nest + 1
+        } else if at == 16 || at == 14 || at == 8 || at == 10 || at == 12 {
+          if nest == 0 {
+            break
+          }
+          nest = nest - 1
+        } else if at == 0 || at == 20 || at == 2 || at == 21 || at == 4 {
+          write_html_escaped_span(sb, s, an.a, an.b, true)
+        } else if at == 1 || at == 3 {
+          escape_html(sb, ctx.str_pool[an.a])
+        } else if at == 5 || at == 6 {
+          sb.write_byte((10).to_byte())
+        } else if at == 17 {
+          let ch = an.a
+          let cnt = an.b
+          if ch == 34 {
+            let mut k = 0
+            while k < cnt {
+              sb.write_string("&quot;")
+              k = k + 1
+            }
+          } else {
+            let mut k = 0
+            while k < cnt {
+              sb.write_byte(ch.to_byte())
+              k = k + 1
+            }
+          }
+        } else if at == 18 {
+          if an.a != 0 {
+            sb.write_string("![")
+          } else {
+            sb.write_byte((91).to_byte())
+          }
+        }
+        cur = an.next
+      }
+      if info.title.length() > 0 {
+        sb.write_string("\" title=\"")
+        escape_html(sb, info.title)
+      }
+      sb.write_string("\" />")
+      end_nl = false
+      if cur < 0 {
+        break
+      }
+      cur = ctx.nodes[cur].next
+      continue
+    } else if tag == 17 {
+      let ch = node.a
+      let cnt = node.b
+      if cnt > 0 {
+        if ch == 34 && esc_q {
+          let mut k = 0
+          while k < cnt {
+            sb.write_string("&quot;")
+            k = k + 1
+          }
+        } else {
+          let mut k = 0
+          while k < cnt {
+            sb.write_byte(ch.to_byte())
+            k = k + 1
+          }
+        }
+        end_nl = false
+      }
+    } else if tag == 18 {
+      if node.a != 0 {
+        sb.write_string("![")
+      } else {
+        sb.write_byte((91).to_byte())
+      }
+      end_nl = false
+    }
+    cur = node.next
+  }
+  end_nl
+}
+
+///| Render paragraph/heading lines of `m` directly into `sb` without intermediate String when 1 line.
+fn render_para_lines_html(
+  doc : BlockDoc,
+  m : BlockMeta,
+  ctx : InlineCtx,
+  opts : Options,
+  sb : StringBuilder,
+  pulldown_compat : Bool,
+  init_end_nl : Bool,
+) -> Bool {
+  let n = m.line_len
+  if n == 0 {
+    return init_end_nl
+  }
+  if n == 1 {
+    let sp = doc.all_lines[m.line_start]
+    if sp.pad == 0 {
+      let mut e = sp.end
+      while e > sp.start && (doc.src.code_unit_at(e - 1) == 32 || doc.src.code_unit_at(e - 1) == 9) {
+        e = e - 1
+      }
+      return render_inlines_html(ctx, doc.src, sp.start, e, doc.ref_defs, opts, sb, pulldown_compat, init_end_nl)
+    } else if sp.pad < 0 {
+      let ls = doc.extra_strs[sp.start]
+      let mut e = ls.length()
+      while e > 0 && (ls.code_unit_at(e - 1) == 32 || ls.code_unit_at(e - 1) == 9) {
+        e = e - 1
+      }
+      return render_inlines_html(ctx, ls, 0, e, doc.ref_defs, opts, sb, pulldown_compat, init_end_nl)
+    }
+  }
+  // Contiguous multi-line paragraph zero-copy fast path!
+  let sp0 = doc.all_lines[m.line_start]
+  if sp0.pad == 0 {
+    let mut contig = true
+    let mut prev_end = sp0.end
+    let mut ci = 1
+    while ci < n {
+      let spc = doc.all_lines[m.line_start + ci]
+      if spc.pad != 0 || spc.start != prev_end + 1 {
+        contig = false
+        break
+      }
+      prev_end = spc.end
+      ci = ci + 1
+    }
+    if contig {
+      let mut e = prev_end
+      while e > sp0.start && (doc.src.code_unit_at(e - 1) == 32 || doc.src.code_unit_at(e - 1) == 9) {
+        e = e - 1
+      }
+      return render_inlines_html(ctx, doc.src, sp0.start, e, doc.ref_defs, opts, sb, pulldown_compat, init_end_nl)
+    }
+  }
+  // Multi-line paragraph: reuse ctx.para_sb
+  ctx.para_sb.reset()
+  let mut i = 0
+  while i < n {
+    let sp = doc.all_lines[m.line_start + i]
+    if i > 0 {
+      ctx.para_sb.write_byte((10).to_byte())
+    }
+    let is_last = i + 1 == n
+    if sp.pad < 0 {
+      let ls = doc.extra_strs[sp.start]
+      if is_last {
+        let mut e = ls.length()
+        while e > 0 && (ls.code_unit_at(e - 1) == 32 || ls.code_unit_at(e - 1) == 9) {
+          e = e - 1
+        }
+        write_raw_span(ctx.para_sb, ls, 0, e)
+      } else {
+        ctx.para_sb.write_string(ls)
+      }
+    } else {
+      let mut k = 0
+      while k < sp.pad {
+        ctx.para_sb.write_byte((32).to_byte())
+        k = k + 1
+      }
+      let mut e = sp.end
+      if is_last {
+        while e > sp.start && (doc.src.code_unit_at(e - 1) == 32 || doc.src.code_unit_at(e - 1) == 9) {
+          e = e - 1
+        }
+      }
+      write_raw_span(ctx.para_sb, doc.src, sp.start, e)
+    }
+    i = i + 1
+  }
+  let pstr = ctx.para_sb.to_string()
+  render_inlines_html(ctx, pstr, 0, pstr.length(), doc.ref_defs, opts, sb, pulldown_compat, init_end_nl)
+}
+
+///| Write a code block's lines directly to `sb` (HTML-escaped) with contiguous bulk fast path.
+fn write_code_block_lines_html(
+  doc : BlockDoc,
+  m : BlockMeta,
+  sb : StringBuilder,
+  pulldown_compat : Bool,
+) -> Unit {
+  let esc_q = !pulldown_compat
+  let n = m.line_len
+  if n == 0 {
+    return ()
+  }
+  // Contiguous multi-line code block fast path!
+  let sp0 = doc.all_lines[m.line_start]
+  if sp0.pad == 0 {
+    let mut contig = true
+    let mut prev_end = sp0.end
+    let mut ci = 1
+    while ci < n {
+      let spc = doc.all_lines[m.line_start + ci]
+      if spc.pad != 0 || spc.start != prev_end + 1 {
+        contig = false
+        break
+      }
+      prev_end = spc.end
+      ci = ci + 1
+    }
+    if contig {
+      write_html_escaped_span(sb, doc.src, sp0.start, prev_end, esc_q)
+      sb.write_byte((10).to_byte())
+      return ()
+    }
+  }
+  let mut i = 0
+  while i < n {
+    let sp = doc.all_lines[m.line_start + i]
+    if sp.pad < 0 {
+      let ls = doc.extra_strs[sp.start]
+      write_html_escaped_span(sb, ls, 0, ls.length(), esc_q)
+    } else {
+      let mut k = 0
+      while k < sp.pad {
+        sb.write_byte((32).to_byte())
+        k = k + 1
+      }
+      write_html_escaped_span(sb, doc.src, sp.start, sp.end, esc_q)
+    }
+    sb.write_byte((10).to_byte())
+    i = i + 1
+  }
+}
+
+///| Write an HTML block's lines directly to `sb` (raw) with contiguous bulk fast path.
+fn write_html_block_lines_raw(doc : BlockDoc, m : BlockMeta, sb : StringBuilder) -> Unit {
+  let n = m.line_len
+  if n == 0 {
+    return ()
+  }
+  let sp0 = doc.all_lines[m.line_start]
+  if sp0.pad == 0 {
+    let mut contig = true
+    let mut prev_end = sp0.end
+    let mut ci = 1
+    while ci < n {
+      let spc = doc.all_lines[m.line_start + ci]
+      if spc.pad != 0 || spc.start != prev_end + 1 {
+        contig = false
+        break
+      }
+      prev_end = spc.end
+      ci = ci + 1
+    }
+    if contig {
+      write_raw_span(sb, doc.src, sp0.start, prev_end)
+      sb.write_byte((10).to_byte())
+      return ()
+    }
+  }
+  let mut i = 0
+  while i < n {
+    let sp = doc.all_lines[m.line_start + i]
+    if sp.pad < 0 {
+      sb.write_string(doc.extra_strs[sp.start])
+    } else {
+      let mut k = 0
+      while k < sp.pad {
+        sb.write_byte((32).to_byte())
+        k = k + 1
+      }
+      write_raw_span(sb, doc.src, sp.start, sp.end)
+    }
+    sb.write_byte((10).to_byte())
+    i = i + 1
+  }
+}
+
+fn write_table_cell_open(sb : StringBuilder, in_head : Bool, aligns : Array[Alignment], col_idx : Int) -> Unit {
+  if col_idx < aligns.length() {
+    if in_head {
+      match aligns[col_idx] {
+        Alignment::Left => sb.write_string("<th style=\"text-align: left\">")
+        Alignment::Center => sb.write_string("<th style=\"text-align: center\">")
+        Alignment::Right => sb.write_string("<th style=\"text-align: right\">")
+        Alignment::None => sb.write_string("<th>")
+      }
+    } else {
+      match aligns[col_idx] {
+        Alignment::Left => sb.write_string("<td style=\"text-align: left\">")
+        Alignment::Center => sb.write_string("<td style=\"text-align: center\">")
+        Alignment::Right => sb.write_string("<td style=\"text-align: right\">")
+        Alignment::None => sb.write_string("<td>")
+      }
+    }
+  } else if in_head {
+    sb.write_string("<th>")
+  } else {
+    sb.write_string("<td>")
+  }
+}
+
+fn render_table_cell_span(
+  doc : BlockDoc,
+  sp : LineSpan,
+  ctx : InlineCtx,
+  opts : Options,
+  sb : StringBuilder,
+  pulldown_compat : Bool,
+) -> Unit {
+  if sp.pad < 0 {
+    let cs = doc.extra_strs[sp.start]
+    let _ = render_inlines_html(ctx, cs, 0, cs.length(), doc.ref_defs, opts, sb, pulldown_compat, false)
+  } else if sp.start < sp.end {
+    let _ = render_inlines_html(ctx, doc.src, sp.start, sp.end, doc.ref_defs, opts, sb, pulldown_compat, false)
+  }
+}
+
+///| Recursively render block node `idx` directly into `sb` (zero Event allocation).
+fn render_block_direct(
+  doc : BlockDoc,
+  idx : Int,
+  ctx : InlineCtx,
+  opts : Options,
+  in_tight_list : Bool,
+  sb : StringBuilder,
+  pulldown_compat : Bool,
+  init_end_nl : Bool,
+) -> Bool {
+  let m = doc.meta[idx]
+  let t = doc.tree[idx]
+  let kind = m.kf & 15
+  let mut end_nl = init_end_nl
+  if kind == 4 {
+    // Paragraph (most frequent!)
+    if in_tight_list {
+      end_nl = render_para_lines_html(doc, m, ctx, opts, sb, pulldown_compat, end_nl)
+    } else {
+      if !end_nl {
+        sb.write_byte((10).to_byte())
+      }
+      sb.write_string("<p>")
+      let _ = render_para_lines_html(doc, m, ctx, opts, sb, pulldown_compat, false)
+      sb.write_string("</p>\n")
+      end_nl = true
+    }
+  } else if kind == 3 {
+    // Item
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    sb.write_string("<li>")
+    end_nl = false
+    let mut start_child = t.first_child
+    let task_state = (m.kf >> 7) & 3
+    if task_state != 0 {
+      let cb_html = if task_state == 2 {
+        "<input disabled=\"\" type=\"checkbox\" checked=\"\"/>\n"
+      } else {
+        "<input disabled=\"\" type=\"checkbox\"/>\n"
+      }
+      if !in_tight_list && start_child >= 0 {
+        let fm = doc.meta[start_child]
+        if (fm.kf & 15) == 4 {
+          sb.write_string("<p>")
+          sb.write_string(cb_html)
+          let _ = render_para_lines_html(doc, fm, ctx, opts, sb, pulldown_compat, true)
+          sb.write_string("</p>\n")
+          end_nl = true
+          start_child = doc.tree[start_child].next_sibling
+        } else {
+          sb.write_string(cb_html)
+          end_nl = true
+        }
+      } else {
+        sb.write_string(cb_html)
+        end_nl = true
+      }
+    }
+    let mut c = start_child
+    while c >= 0 {
+      end_nl = render_block_direct(doc, c, ctx, opts, in_tight_list, sb, pulldown_compat, end_nl)
+      c = doc.tree[c].next_sibling
+    }
+    sb.write_string("</li>\n")
+    end_nl = true
+  } else if kind == 5 {
+    // Heading
+    let level = (m.kf >> 10) & 255
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    if level == 1 {
+      sb.write_string("<h1>")
+    } else if level == 2 {
+      sb.write_string("<h2>")
+    } else if level == 3 {
+      sb.write_string("<h3>")
+    } else if level == 4 {
+      sb.write_string("<h4>")
+    } else if level == 5 {
+      sb.write_string("<h5>")
+    } else {
+      sb.write_string("<h6>")
+    }
+    let _ = render_para_lines_html(doc, m, ctx, opts, sb, pulldown_compat, false)
+    if level == 1 {
+      sb.write_string("</h1>\n")
+    } else if level == 2 {
+      sb.write_string("</h2>\n")
+    } else if level == 3 {
+      sb.write_string("</h3>\n")
+    } else if level == 4 {
+      sb.write_string("</h4>\n")
+    } else if level == 5 {
+      sb.write_string("</h5>\n")
+    } else {
+      sb.write_string("</h6>\n")
+    }
+    end_nl = true
+  } else if kind == 2 {
+    // List
+    let ordered = (m.kf & 512) != 0
+    let tight = (m.kf & 32) != 0
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    if !ordered {
+      sb.write_string("<ul>\n")
+    } else if m.extra == 1 {
+      sb.write_string("<ol>\n")
+    } else {
+      sb.write_string("<ol start=\"")
+      sb.write_string(m.extra.to_string())
+      sb.write_string("\">\n")
+    }
+    end_nl = true
+    let mut c = t.first_child
+    while c >= 0 {
+      end_nl = render_block_direct(doc, c, ctx, opts, tight, sb, pulldown_compat, end_nl)
+      c = doc.tree[c].next_sibling
+    }
+    if ordered {
+      sb.write_string("</ol>\n")
+    } else {
+      sb.write_string("</ul>\n")
+    }
+    end_nl = true
+  } else if kind == 10 {
+    // Table
+    let aligns = doc.table_aligns[t.extra2]
+    let cells_start = m.extra
+    let ncols = m.line_start
+    let num_rows = m.line_len
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    if pulldown_compat {
+      sb.write_string("<table><thead><tr>")
+      let mut hi = 0
+      while hi < ncols {
+        write_table_cell_open(sb, true, aligns, hi)
+        render_table_cell_span(doc, doc.table_cells[cells_start + hi], ctx, opts, sb, true)
+        sb.write_string("</th>")
+        hi = hi + 1
+      }
+      sb.write_string("</tr></thead><tbody>\n")
+      let mut ri = 0
+      while ri < num_rows {
+        sb.write_string("<tr>")
+        let row_base = cells_start + (ri + 1) * ncols
+        let mut ci = 0
+        while ci < ncols {
+          write_table_cell_open(sb, false, aligns, ci)
+          render_table_cell_span(doc, doc.table_cells[row_base + ci], ctx, opts, sb, true)
+          sb.write_string("</td>")
+          ci = ci + 1
+        }
+        sb.write_string("</tr>\n")
+        ri = ri + 1
+      }
+      sb.write_string("</tbody></table>\n")
+    } else {
+      sb.write_string("<table>\n<thead>\n<tr>\n")
+      let mut hi = 0
+      while hi < ncols {
+        write_table_cell_open(sb, true, aligns, hi)
+        render_table_cell_span(doc, doc.table_cells[cells_start + hi], ctx, opts, sb, false)
+        sb.write_string("</th>\n")
+        hi = hi + 1
+      }
+      sb.write_string("</tr>\n</thead>\n")
+      if num_rows > 0 {
+        sb.write_string("<tbody>\n")
+        let mut ri = 0
+        while ri < num_rows {
+          sb.write_string("<tr>\n")
+          let row_base = cells_start + (ri + 1) * ncols
+          let mut ci = 0
+          while ci < ncols {
+            write_table_cell_open(sb, false, aligns, ci)
+            render_table_cell_span(doc, doc.table_cells[row_base + ci], ctx, opts, sb, false)
+            sb.write_string("</td>\n")
+            ci = ci + 1
+          }
+          sb.write_string("</tr>\n")
+          ri = ri + 1
+        }
+        sb.write_string("</tbody>\n</table>\n")
+      } else {
+        sb.write_string("<tbody></tbody>\n</table>\n")
+      }
+    }
+    end_nl = true
+  } else if kind == 7 {
+    // FencedCode
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    if m.extra < 0 {
+      sb.write_string("<pre><code>")
+    } else {
+      sb.write_string("<pre><code class=\"language-")
+      write_first_info_word_escaped(sb, doc.extra_strs[m.extra])
+      sb.write_string("\">")
+    }
+    write_code_block_lines_html(doc, m, sb, pulldown_compat)
+    sb.write_string("</code></pre>\n")
+    end_nl = true
+  } else if kind == 1 {
+    // BlockQuote
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    sb.write_string("<blockquote>\n")
+    end_nl = true
+    let mut c = t.first_child
+    while c >= 0 {
+      end_nl = render_block_direct(doc, c, ctx, opts, false, sb, pulldown_compat, end_nl)
+      c = doc.tree[c].next_sibling
+    }
+    sb.write_string("</blockquote>\n")
+    end_nl = true
+  } else if kind == 6 {
+    // IndentedCode
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    sb.write_string("<pre><code>")
+    write_code_block_lines_html(doc, m, sb, pulldown_compat)
+    sb.write_string("</code></pre>\n")
+    end_nl = true
+  } else if kind == 8 {
+    // HtmlBlock
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    write_html_block_lines_raw(doc, m, sb)
+    end_nl = true
+  } else if kind == 9 {
+    // ThematicBreak
+    if !end_nl {
+      sb.write_byte((10).to_byte())
+    }
+    sb.write_string("<hr />\n")
+    end_nl = true
+  } else if kind == 0 {
+    // Document
+    let mut c = t.first_child
+    while c >= 0 {
+      end_nl = render_block_direct(doc, c, ctx, opts, false, sb, pulldown_compat, end_nl)
+      c = doc.tree[c].next_sibling
+    }
+  }
+  end_nl
+}
+
+///| Top-level direct streaming Markdown -> HTML renderer (zero Event array materialization).
+pub fn render_markdown_direct(src : String, opts : Options, pulldown_compat : Bool) -> String {
+  let doc = parse_blocks(src, opts)
+  let sb = StringBuilder::new()
+  let ctx = new_inline_ctx(opts, !pulldown_compat)
+  let _ = render_block_direct(doc, 0, ctx, opts, false, sb, pulldown_compat, true)
+  sb.to_string()
+}
+
+// ============================================================================
+// Public Event-Stream API (`parse` / `parse_inlines`) — full compatibility
+// ============================================================================
+
 ///| Emit text with optional GFM autolink literal detection (only when `in_link == 0`).
 fn emit_text_with_autolinks(
   events : Array[Event],
@@ -439,7 +2121,6 @@ fn emit_text_with_autolinks(
       is_ascii_ws(pb) || pb == 40 || pb == 42 || pb == 95 || pb == 126 || pb == 91
     }
 
-    // 1. Check `www.` or `http://` or `https://`
     if boundary_ok && (b == 119 || b == 104) {
       let is_www = starts_with_lit(s, i, n, "www.")
       let is_http = !is_www && (starts_with_lit(s, i, n, "http://") || starts_with_lit(s, i, n, "https://"))
@@ -452,7 +2133,6 @@ fn emit_text_with_autolinks(
           }
           end = end + 1
         }
-        // Trim trailing GFM punctuation and unmatched ')'
         let mut trim_end = end
         let mut changed = true
         while changed && trim_end > i {
@@ -462,7 +2142,6 @@ fn emit_text_with_autolinks(
             trim_end = trim_end - 1
             changed = true
           } else if last == 41 {
-            // Count '(' vs ')' in s[i..trim_end]
             let mut opens = 0
             let mut closes = 0
             let mut k = i
@@ -478,7 +2157,6 @@ fn emit_text_with_autolinks(
             }
           }
         }
-        // Validate domain has at least one '.' after prefix
         let prefix_len = if is_www { 4 } else if starts_with_lit(s, i, n, "https://") { 8 } else { 7 }
         if trim_end > i + prefix_len {
           let mut has_dot = false
@@ -506,9 +2184,7 @@ fn emit_text_with_autolinks(
       }
     }
 
-    // 2. Check GFM email autolink literal: look for '@'
     if b == 64 && i > mark {
-      // Scan backwards for local part: [a-zA-Z0-9._+-]
       let mut lstart = i
       while lstart > mark {
         let c = s.code_unit_at(lstart - 1)
@@ -518,7 +2194,6 @@ fn emit_text_with_autolinks(
           break
         }
       }
-      // Scan forwards for domain part: [a-zA-Z0-9._-]
       let mut dend = i + 1
       let mut dots = 0
       let mut valid_domain = true
@@ -533,12 +2208,10 @@ fn emit_text_with_autolinks(
           break
         }
       }
-      // Strip trailing '.' from domain
       while dend > i + 1 && s.code_unit_at(dend - 1) == 46 {
         dend = dend - 1
         dots = dots - 1
       }
-      // Domain cannot end with '-' or '_', and cannot contain '+' or '_' in last segment, and must have >= 1 dot
       if dend <= i + 1 || dots < 1 {
         valid_domain = false
       } else {
@@ -546,7 +2219,6 @@ fn emit_text_with_autolinks(
         if last_c == 45 || last_c == 95 {
           valid_domain = false
         }
-        // Check that domain doesn't immediately precede '+' or invalid email domain char like '+'
         if dend < n && s.code_unit_at(dend) == 43 {
           valid_domain = false
         }
@@ -574,6 +2246,81 @@ fn emit_text_with_autolinks(
   }
 }
 
+fn parse_inlines_with_ctx(
+  ctx : InlineCtx,
+  s : String,
+  seg_start : Int,
+  seg_end : Int,
+  ref_defs : Map[String, LinkDef],
+  opts : Options,
+  events : Array[Event],
+) -> Unit {
+  if seg_start >= seg_end {
+    return ()
+  }
+  let first_sp = find_first_inline_special(ctx.table, s, seg_start, seg_end, ctx.sc)
+  if first_sp < 0 {
+    let txt = if seg_start == 0 && seg_end == s.length() { s } else { s.slice(seg_start, seg_end) }
+    emit_text_with_autolinks(events, txt, opts, 0)
+    return ()
+  }
+  scan_inlines_to_ctx(ctx, s, seg_start, seg_end, first_sp, ctx.sc.flag, ref_defs, opts)
+  let mut cur = ctx.head
+  let mut in_link = 0
+  while cur >= 0 {
+    let node = ctx.nodes[cur]
+    let tag = node.tag
+    if tag == 0 || tag == 20 {
+      emit_text_with_autolinks(events, s.slice(node.a, node.b), opts, in_link)
+    } else if tag == 1 {
+      emit_text_with_autolinks(events, ctx.str_pool[node.a], opts, in_link)
+    } else if tag == 2 || tag == 21 {
+      events.push(Event::Code(s.slice(node.a, node.b)))
+    } else if tag == 3 {
+      events.push(Event::Code(ctx.str_pool[node.a]))
+    } else if tag == 4 {
+      events.push(Event::InlineHtml(s.slice(node.a, node.b)))
+    } else if tag == 5 {
+      events.push(Event::SoftBreak)
+    } else if tag == 6 {
+      events.push(Event::HardBreak)
+    } else if tag == 7 {
+      events.push(Event::Start(Tag::Emphasis))
+    } else if tag == 8 {
+      events.push(Event::End(TagEnd::Emphasis))
+    } else if tag == 9 {
+      events.push(Event::Start(Tag::Strong))
+    } else if tag == 10 {
+      events.push(Event::End(TagEnd::Strong))
+    } else if tag == 11 {
+      events.push(Event::Start(Tag::Strikethrough))
+    } else if tag == 12 {
+      events.push(Event::End(TagEnd::Strikethrough))
+    } else if tag == 13 {
+      in_link = in_link + 1
+      let info = ctx.link_pool[node.a]
+      events.push(Event::Start(Tag::Link(info.link_type, info.dest, info.title, info.ref_id)))
+    } else if tag == 14 {
+      if in_link > 0 {
+        in_link = in_link - 1
+      }
+      events.push(Event::End(TagEnd::Link))
+    } else if tag == 15 {
+      let info = ctx.link_pool[node.a]
+      events.push(Event::Start(Tag::Image(info.link_type, info.dest, info.title, info.ref_id)))
+    } else if tag == 16 {
+      events.push(Event::End(TagEnd::Image))
+    } else if tag == 17 {
+      if node.b > 0 {
+        events.push(Event::Text(repeat_byte(node.a, node.b)))
+      }
+    } else if tag == 18 {
+      events.push(Event::Text(if node.a != 0 { "![" } else { "[" }))
+    }
+    cur = node.next
+  }
+}
+
 ///| Parse inline content `s` and append resulting `Event`s to `events`.
 pub fn parse_inlines(
   s : String,
@@ -581,702 +2328,231 @@ pub fn parse_inlines(
   opts : Options,
   events : Array[Event],
 ) -> Unit {
-  let n = s.length()
-  if n == 0 {
-    return ()
-  }
-  // Fast path: scan for any inline trigger byte; if none, emit plain text with zero allocations
-  let mut has_special = false
-  let mut si = 0
-  while si < n {
-    let sb = s.code_unit_at(si)
-    if sb == 92 || sb == 10 || sb == 96 || sb == 38 || sb == 60 || sb == 42 || sb == 95 || sb == 91 || sb == 93 || sb == 33 ||
-    (opts.strikethrough && sb == 126) ||
-    (opts.smart_punctuation && (sb == 34 || sb == 39 || sb == 45 || sb == 46)) {
-      has_special = true
-      break
-    }
-    si = si + 1
-  }
-  if !has_special {
-    emit_text_with_autolinks(events, s, opts, 0)
-    return ()
-  }
-
-  let il = new_inline_list()
-  let delims : Array[DelimEntry] = Array::new()
-  let brackets : Array[BracketEntry] = Array::new()
-  // Lazily initialized cache of farthest failed backtick closing search per length (1..64)
-  let bt_failed : Array[Int] = Array::new()
-
-  let mut text_start = 0
-  let mut i = 0
-
-  let flush_text = fn(up_to : Int) -> Unit {
-    if text_start < up_to {
-      let _ = il_push(il, InlineKind::Text(s.slice(text_start, up_to)))
-    }
-  }
-
-  while i < n {
-    let b = s.code_unit_at(i)
-
-    // 1. Backslash escape or hard line break
-    if b == 92 {
-      if i + 1 < n {
-        let nb = s.code_unit_at(i + 1)
-        if nb == 10 {
-          flush_text(i)
-          let _ = il_push(il, InlineKind::HardBreak)
-          i = i + 2
-          while i < n && (s.code_unit_at(i) == 32 || s.code_unit_at(i) == 9) {
-            i = i + 1
-          }
-          text_start = i
-          continue
-        } else if is_ascii_punct(nb) {
-          flush_text(i)
-          let _ = il_push(il, InlineKind::Text(s.slice(i + 1, i + 2)))
-          i = i + 2
-          text_start = i
-          continue
-        }
-      }
-      i = i + 1
-      continue
-    }
-
-    // 2. Newline: SoftBreak or HardBreak (2+ trailing spaces)
-    if b == 10 {
-      // Count trailing spaces before '\n'
-      let mut sp_start = i
-      while sp_start > text_start && s.code_unit_at(sp_start - 1) == 32 {
-        sp_start = sp_start - 1
-      }
-      let trailing_spaces = i - sp_start
-      if trailing_spaces >= 2 {
-        flush_text(sp_start)
-        let _ = il_push(il, InlineKind::HardBreak)
-      } else {
-        // Also strip single trailing space (or tabs? CommonMark strips trailing spaces only, not tabs)
-        flush_text(sp_start)
-        let _ = il_push(il, InlineKind::SoftBreak)
-      }
-      i = i + 1
-      while i < n && (s.code_unit_at(i) == 32 || s.code_unit_at(i) == 9) {
-        i = i + 1
-      }
-      text_start = i
-      continue
-    }
-
-    // 3. Code span (backtick run)
-    if b == 96 {
-      let run_start = i
-      while i < n && s.code_unit_at(i) == 96 {
-        i = i + 1
-      }
-      let ticks = i - run_start
-      if bt_failed.length() == 0 && ticks < 65 {
-        let mut bti = 0
-        while bti < 65 {
-          bt_failed.push(-1)
-          bti = bti + 1
-        }
-      }
-      let can_search = if ticks < 65 { bt_failed[ticks] < run_start } else { true }
-      let mut match_pos = -1
-      if can_search {
-        let mut j = i
-        while j < n {
-          if s.code_unit_at(j) == 96 {
-            let cs = j
-            while j < n && s.code_unit_at(j) == 96 {
-              j = j + 1
-            }
-            if j - cs == ticks {
-              match_pos = cs
-              break
-            }
-          } else {
-            j = j + 1
-          }
-        }
-        if match_pos < 0 && ticks < 65 {
-          bt_failed[ticks] = n
-        }
-      }
-      if match_pos >= 0 {
-        flush_text(run_start)
-        // Normalize code span content: newlines -> spaces, strip 1 leading & 1 trailing space if both present and not all spaces
-        let csb = StringBuilder::new()
-        let mut all_spaces = true
-        let mut k = i
-        while k < match_pos {
-          let cb = s.code_unit_at(k)
-          if cb == 10 {
-            csb.write_byte((32).to_byte())
-          } else {
-            if cb != 32 {
-              all_spaces = false
-            }
-            csb.write_byte(cb.to_byte())
-          }
-          k = k + 1
-        }
-        let raw_code = csb.to_string()
-        let rlen = raw_code.length()
-        let final_code = if rlen >= 2 && !all_spaces && raw_code.code_unit_at(0) == 32 && raw_code.code_unit_at(rlen - 1) == 32 {
-          raw_code.slice(1, rlen - 1)
-        } else {
-          raw_code
-        }
-        let _ = il_push(il, InlineKind::Code(final_code))
-        i = match_pos + ticks
-        text_start = i
-        continue
-      }
-      // Unmatched backtick run: keep as literal text
-      continue
-    }
-
-    // 4. HTML entity / numeric character reference
-    if b == 38 {
-      match scan_entity(s, i, n) {
-        Some((decoded, next_i)) => {
-          flush_text(i)
-          let _ = il_push(il, InlineKind::Text(decoded))
-          i = next_i
-          text_start = i
-          continue
-        }
-        None => {
-          i = i + 1
-          continue
-        }
-      }
-    }
-
-    // 5. Autolink `<...>` or Inline HTML `<...>`
-    if b == 60 {
-      match scan_autolink(s, i, n) {
-        Some((is_email, inner, next_i)) => {
-          flush_text(i)
-          let lt = if is_email { LinkType::Email } else { LinkType::Autolink }
-          let _ = il_push(il, InlineKind::StartTag(Tag::Link(lt, inner, "", "")))
-          let _ = il_push(il, InlineKind::Text(inner))
-          let _ = il_push(il, InlineKind::EndTag(TagEnd::Link))
-          i = next_i
-          text_start = i
-          continue
-        }
-        None => ()
-      }
-      let html_end = scan_inline_html(s, i, n)
-      if html_end > 0 {
-        flush_text(i)
-        let _ = il_push(il, InlineKind::InlineHtml(s.slice(i, html_end)))
-        i = html_end
-        text_start = i
-        continue
-      }
-      i = i + 1
-      continue
-    }
-
-    // 6. Emphasis / Strong / Strikethrough delimiters: `*`, `_`, `~`
-    if b == 42 || b == 95 || (b == 126 && opts.strikethrough) {
-      let run_start = i
-      while i < n && s.code_unit_at(i) == b {
-        i = i + 1
-      }
-      let run_len = i - run_start
-      let (can_open, can_close) = compute_flanking(s, run_start, i, b, opts)
-      if can_open || can_close {
-        flush_text(run_start)
-        let nidx = il_push(il, InlineKind::DelimText(b, run_len))
-        delims.push(DelimEntry::{
-          node_idx: nidx,
-          delim: b,
-          orig_len: run_len,
-          len: run_len,
-          can_open,
-          can_close,
-          active: true,
-        })
-        text_start = i
-      }
-      continue
-    }
-
-    // 7. Smart punctuation: `"`, `'`, `--`, `---`, `...`
-    if opts.smart_punctuation {
-      if b == 34 || b == 39 {
-        let (can_open, can_close) = compute_flanking(s, i, i + 1, b, opts)
-        flush_text(i)
-        if can_open || can_close {
-          let nidx = il_push(il, InlineKind::DelimText(b, 1))
-          delims.push(DelimEntry::{
-            node_idx: nidx,
-            delim: b,
-            orig_len: 1,
-            len: 1,
-            can_open,
-            can_close,
-            active: true,
-          })
-        } else if b == 39 {
-          let _ = il_push(il, InlineKind::Text("’"))
-        } else {
-          let _ = il_push(il, InlineKind::Text("“"))
-        }
-        i = i + 1
-        text_start = i
-        continue
-      }
-      if b == 45 && i + 1 < n && s.code_unit_at(i + 1) == 45 {
-        let run_start = i
-        while i < n && s.code_unit_at(i) == 45 {
-          i = i + 1
-        }
-        flush_text(run_start)
-        let _ = il_push(il, InlineKind::Text(smart_dashes(i - run_start)))
-        text_start = i
-        continue
-      }
-      if b == 46 && i + 2 < n && s.code_unit_at(i + 1) == 46 && s.code_unit_at(i + 2) == 46 {
-        flush_text(i)
-        let _ = il_push(il, InlineKind::Text("…"))
-        i = i + 3
-        text_start = i
-        continue
-      }
-    }
-
-    // 8. Link / Image openers: `[` and `![`
-    if b == 91 || (b == 33 && i + 1 < n && s.code_unit_at(i + 1) == 91) {
-      let is_img = b == 33
-      flush_text(i)
-      let nidx = il_push(il, InlineKind::BracketText(is_img))
-      let after = if is_img { i + 2 } else { i + 1 }
-      brackets.push(BracketEntry::{
-        node_idx: nidx,
-        delim_idx: delims.length(),
-        text_start: after,
-        is_image: is_img,
-        active: true,
-      })
-      i = after
-      text_start = i
-      continue
-    }
-
-    // 9. Link / Image closer: `]`
-    if b == 93 && brackets.length() > 0 {
-      let br = brackets[brackets.length() - 1]
-      let _ = brackets.pop()
-      if !br.active {
-        i = i + 1
-        continue
-      }
-
-      // Try to match inline link `(dest "title")`, full ref `[label]`, collapsed ref `[]`, or shortcut ref
-      let mut matched = false
-      let mut dest = ""
-      let mut title = ""
-      let mut ref_id = ""
-      let mut link_type = LinkType::Inline
-      let mut after_close = i + 1
-
-      // Case A: Inline link `(...)`
-      if i + 1 < n && s.code_unit_at(i + 1) == 40 {
-        let mut p = i + 2
-        while p < n && is_ascii_ws(s.code_unit_at(p)) {
-          p = p + 1
-        }
-        if p < n && s.code_unit_at(p) == 41 {
-          matched = true
-          after_close = p + 1
-        } else {
-          match scan_link_dest(s, p, n) {
-            Some((d, after_d)) => {
-              let mut q = after_d
-              while q < n && is_ascii_ws(s.code_unit_at(q)) {
-                q = q + 1
-              }
-              if q < n && s.code_unit_at(q) == 41 {
-                matched = true
-                dest = d
-                after_close = q + 1
-              } else if q > after_d {
-                match scan_link_title(s, q, n) {
-                  Some((t, after_t)) => {
-                    let mut r = after_t
-                    while r < n && is_ascii_ws(s.code_unit_at(r)) {
-                      r = r + 1
-                    }
-                    if r < n && s.code_unit_at(r) == 41 {
-                      matched = true
-                      dest = d
-                      title = t
-                      after_close = r + 1
-                    }
-                  }
-                  None => ()
-                }
-              }
-            }
-            None => ()
-          }
-        }
-      }
-
-      // Case B: Full reference `[label]` or Collapsed reference `[]`
-      if !matched && i + 1 < n && s.code_unit_at(i + 1) == 91 {
-        if i + 2 < n && s.code_unit_at(i + 2) == 93 {
-          // Collapsed reference: look up bracket inner text
-          let raw_lbl = s.slice(br.text_start, i)
-          let norm = normalize_link_label(raw_lbl)
-          match ref_defs.get(norm) {
-            Some(def) => {
-              matched = true
-              dest = def.dest
-              title = def.title
-              ref_id = raw_lbl
-              link_type = LinkType::Collapsed
-              after_close = i + 3
-            }
-            None => ()
-          }
-        } else {
-          match scan_link_label(s, i + 1, n) {
-            Some((raw_lbl, after_lbl)) => {
-              let norm = normalize_link_label(raw_lbl)
-              match ref_defs.get(norm) {
-                Some(def) => {
-                  matched = true
-                  dest = def.dest
-                  title = def.title
-                  ref_id = raw_lbl
-                  link_type = LinkType::Reference
-                  after_close = after_lbl
-                }
-                None => ()
-              }
-            }
-            None => ()
-          }
-        }
-      }
-
-      // Case C: Shortcut reference (not followed by `[`)
-      if !matched {
-        let has_next_label = if i + 1 < n && s.code_unit_at(i + 1) == 91 {
-          match scan_link_label(s, i + 1, n) {
-            Some(_) => true
-            None => i + 2 < n && s.code_unit_at(i + 2) == 93
-          }
-        } else {
-          false
-        }
-        if !has_next_label {
-          let raw_lbl = s.slice(br.text_start, i)
-          // Shortcut label cannot contain unescaped '[' or ']'
-          let mut valid_shortcut = raw_lbl.length() <= 999
-          let mut k = 0
-          while valid_shortcut && k < raw_lbl.length() {
-            let c = raw_lbl.code_unit_at(k)
-            if c == 92 && k + 1 < raw_lbl.length() {
-              k = k + 2
-            } else if c == 91 || c == 93 {
-              valid_shortcut = false
-            } else {
-              k = k + 1
-            }
-          }
-          if valid_shortcut {
-            let norm = normalize_link_label(raw_lbl)
-            match ref_defs.get(norm) {
-              Some(def) => {
-                matched = true
-                dest = def.dest
-                title = def.title
-                ref_id = raw_lbl
-                link_type = LinkType::Shortcut
-                after_close = i + 1
-              }
-              None => ()
-            }
-          }
-        }
-      }
-
-      if matched {
-        flush_text(i)
-        process_emphasis(il, delims, br.delim_idx)
-        if br.is_image {
-          il.nodes[br.node_idx].kind = InlineKind::StartTag(Tag::Image(link_type, dest, title, ref_id))
-          let _ = il_push(il, InlineKind::EndTag(TagEnd::Image))
-        } else {
-          il.nodes[br.node_idx].kind = InlineKind::StartTag(Tag::Link(link_type, dest, title, ref_id))
-          let _ = il_push(il, InlineKind::EndTag(TagEnd::Link))
-          // Deactivate all earlier non-image `[` brackets (links cannot contain links)
-          let mut bi = 0
-          while bi < brackets.length() {
-            if !brackets[bi].is_image {
-              brackets[bi].active = false
-            }
-            bi = bi + 1
-          }
-        }
-        i = after_close
-        text_start = i
-        continue
-      }
-
-      i = i + 1
-      continue
-    }
-
-    i = i + 1
-  }
-
-  flush_text(n)
-  process_emphasis(il, delims, 0)
-
-  // Walk the linked list once and emit flat Events
-  let mut cur = il.head
-  let mut in_link = 0
-  while cur >= 0 {
-    let node = il.nodes[cur]
-    match node.kind {
-      InlineKind::Text(t) => emit_text_with_autolinks(events, t, opts, in_link)
-      InlineKind::Code(c) => events.push(Event::Code(c))
-      InlineKind::InlineHtml(h) => events.push(Event::InlineHtml(h))
-      InlineKind::SoftBreak => events.push(Event::SoftBreak)
-      InlineKind::HardBreak => events.push(Event::HardBreak)
-      InlineKind::StartTag(tag) => {
-        match tag {
-          Tag::Link(_, _, _, _) => in_link = in_link + 1
-          _ => ()
-        }
-        events.push(Event::Start(tag))
-      }
-      InlineKind::EndTag(te) => {
-        match te {
-          TagEnd::Link => if in_link > 0 { in_link = in_link - 1 }
-          _ => ()
-        }
-        events.push(Event::End(te))
-      }
-      InlineKind::DelimText(ch, cnt) => {
-        if cnt > 0 {
-          events.push(Event::Text(repeat_byte(ch, cnt)))
-        }
-      }
-      InlineKind::BracketText(is_img) => {
-        events.push(Event::Text(if is_img { "![" } else { "[" }))
-      }
-      InlineKind::Removed => ()
-    }
-    cur = node.next
-  }
+  let ctx = new_inline_ctx(opts, true)
+  parse_inlines_with_ctx(ctx, s, 0, s.length(), ref_defs, opts, events)
 }
 
-///| Join paragraph/heading lines with `\n`, trimming trailing spaces/tabs on the final line.
-fn join_para_lines(lines : Array[String]) -> String {
-  let n = lines.length()
+fn join_para_spans(doc : BlockDoc, m : BlockMeta, ctx : InlineCtx) -> String {
+  let n = m.line_len
   if n == 0 {
     return ""
   }
-  let sb = StringBuilder::new()
+  ctx.para_sb.reset()
   let mut i = 0
   while i < n {
-    let line = lines[i]
+    let sp = doc.all_lines[m.line_start + i]
     if i > 0 {
-      sb.write_byte((10).to_byte())
+      ctx.para_sb.write_byte((10).to_byte())
     }
-    if i + 1 == n {
-      let mut e = line.length()
-      while e > 0 && (line.code_unit_at(e - 1) == 32 || line.code_unit_at(e - 1) == 9) {
-        e = e - 1
+    let is_last = i + 1 == n
+    if sp.pad < 0 {
+      let ls = doc.extra_strs[sp.start]
+      if is_last {
+        let mut e = ls.length()
+        while e > 0 && (ls.code_unit_at(e - 1) == 32 || ls.code_unit_at(e - 1) == 9) {
+          e = e - 1
+        }
+        write_raw_span(ctx.para_sb, ls, 0, e)
+      } else {
+        ctx.para_sb.write_string(ls)
       }
-      sb.write_string(line.slice(0, e))
     } else {
-      sb.write_string(line)
+      let mut k = 0
+      while k < sp.pad {
+        ctx.para_sb.write_byte((32).to_byte())
+        k = k + 1
+      }
+      let mut e = sp.end
+      if is_last {
+        while e > sp.start && (doc.src.code_unit_at(e - 1) == 32 || doc.src.code_unit_at(e - 1) == 9) {
+          e = e - 1
+        }
+      }
+      write_raw_span(ctx.para_sb, doc.src, sp.start, e)
     }
     i = i + 1
   }
-  sb.to_string()
+  ctx.para_sb.to_string()
 }
 
-///| Join code/HTML lines, each terminated with `\n`.
-fn join_block_lines_nl(lines : Array[String]) -> String {
-  let n = lines.length()
+fn join_block_spans_nl(doc : BlockDoc, m : BlockMeta, ctx : InlineCtx) -> String {
+  let n = m.line_len
   if n == 0 {
     return ""
   }
-  let sb = StringBuilder::new()
+  ctx.para_sb.reset()
   let mut i = 0
   while i < n {
-    sb.write_string(lines[i])
-    sb.write_byte((10).to_byte())
+    let sp = doc.all_lines[m.line_start + i]
+    if sp.pad < 0 {
+      ctx.para_sb.write_string(doc.extra_strs[sp.start])
+    } else {
+      let mut k = 0
+      while k < sp.pad {
+        ctx.para_sb.write_byte((32).to_byte())
+        k = k + 1
+      }
+      write_raw_span(ctx.para_sb, doc.src, sp.start, sp.end)
+    }
+    ctx.para_sb.write_byte((10).to_byte())
     i = i + 1
   }
-  sb.to_string()
+  ctx.para_sb.to_string()
 }
 
-///| Recursively emit `Event`s for block node `idx` into `events`.
 fn emit_block_events(
   doc : BlockDoc,
   idx : Int,
+  ctx : InlineCtx,
   opts : Options,
   in_tight_list : Bool,
   events : Array[Event],
 ) -> Unit {
-  let node = doc.nodes[idx]
-  match node.kind {
-    BlockKind::Document => {
-      let mut i = 0
-      while i < node.children.length() {
-        emit_block_events(doc, node.children[i], opts, false, events)
-        i = i + 1
-      }
+  let m = doc.meta[idx]
+  let t = doc.tree[idx]
+  let kind = m.kf & 15
+  if kind == 0 {
+    let mut c = t.first_child
+    while c >= 0 {
+      emit_block_events(doc, c, ctx, opts, false, events)
+      c = doc.tree[c].next_sibling
     }
-    BlockKind::Empty => ()
-    BlockKind::BlockQuote => {
-      events.push(Event::Start(Tag::BlockQuote))
-      let mut i = 0
-      while i < node.children.length() {
-        emit_block_events(doc, node.children[i], opts, false, events)
-        i = i + 1
-      }
-      events.push(Event::End(TagEnd::BlockQuote))
+  } else if kind == 1 {
+    events.push(Event::Start(Tag::BlockQuote))
+    let mut c = t.first_child
+    while c >= 0 {
+      emit_block_events(doc, c, ctx, opts, false, events)
+      c = doc.tree[c].next_sibling
     }
-    BlockKind::List(ordered, _delim, start_num) => {
-      let list_tag = if ordered { Tag::List(Some(start_num)) } else { Tag::List(None) }
-      events.push(Event::Start(list_tag))
-      let mut i = 0
-      while i < node.children.length() {
-        emit_block_events(doc, node.children[i], opts, node.tight, events)
-        i = i + 1
-      }
-      events.push(Event::End(TagEnd::List(ordered)))
+    events.push(Event::End(TagEnd::BlockQuote))
+  } else if kind == 2 {
+    let ordered = (m.kf & 512) != 0
+    let tight = (m.kf & 32) != 0
+    let list_tag = if ordered { Tag::List(Some(m.extra)) } else { Tag::List(None) }
+    events.push(Event::Start(list_tag))
+    let mut c = t.first_child
+    while c >= 0 {
+      emit_block_events(doc, c, ctx, opts, tight, events)
+      c = doc.tree[c].next_sibling
     }
-    BlockKind::Item(_) => {
-      events.push(Event::Start(Tag::Item))
-      match node.task_checked {
-        Some(checked) => {
-          if !in_tight_list && node.children.length() > 0 {
-            match doc.nodes[node.children[0]].kind {
-              BlockKind::Paragraph => {
-                // In loose list, checkbox goes inside <p>
-                let p = doc.nodes[node.children[0]]
-                events.push(Event::Start(Tag::Paragraph))
-                events.push(Event::TaskListMarker(checked))
-                let text = join_para_lines(p.lines)
-                parse_inlines(text, doc.ref_defs, opts, events)
-                events.push(Event::End(TagEnd::Paragraph))
-                let mut i = 1
-                while i < node.children.length() {
-                  emit_block_events(doc, node.children[i], opts, in_tight_list, events)
-                  i = i + 1
-                }
-                events.push(Event::End(TagEnd::Item))
-                return ()
-              }
-              _ => events.push(Event::TaskListMarker(checked))
-            }
-          } else {
-            events.push(Event::TaskListMarker(checked))
-          }
+    events.push(Event::End(TagEnd::List(ordered)))
+  } else if kind == 3 {
+    events.push(Event::Start(Tag::Item))
+    let mut start_child = t.first_child
+    let task_state = (m.kf >> 7) & 3
+    if task_state != 0 {
+      let checked = task_state == 2
+      if !in_tight_list && start_child >= 0 {
+        let fm = doc.meta[start_child]
+        if (fm.kf & 15) == 4 {
+          events.push(Event::Start(Tag::Paragraph))
+          events.push(Event::TaskListMarker(checked))
+          let text = join_para_spans(doc, fm, ctx)
+          parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+          events.push(Event::End(TagEnd::Paragraph))
+          start_child = doc.tree[start_child].next_sibling
+        } else {
+          events.push(Event::TaskListMarker(checked))
         }
-        None => ()
-      }
-      let mut i = 0
-      while i < node.children.length() {
-        emit_block_events(doc, node.children[i], opts, in_tight_list, events)
-        i = i + 1
-      }
-      events.push(Event::End(TagEnd::Item))
-    }
-    BlockKind::Paragraph => {
-      let text = join_para_lines(node.lines)
-      if in_tight_list {
-        parse_inlines(text, doc.ref_defs, opts, events)
       } else {
-        events.push(Event::Start(Tag::Paragraph))
-        parse_inlines(text, doc.ref_defs, opts, events)
-        events.push(Event::End(TagEnd::Paragraph))
+        events.push(Event::TaskListMarker(checked))
       }
     }
-    BlockKind::Heading(level) => {
-      events.push(Event::Start(Tag::Heading(level)))
-      let text = join_para_lines(node.lines)
-      parse_inlines(text, doc.ref_defs, opts, events)
-      events.push(Event::End(TagEnd::Heading(level)))
+    let mut c = start_child
+    while c >= 0 {
+      emit_block_events(doc, c, ctx, opts, in_tight_list, events)
+      c = doc.tree[c].next_sibling
     }
-    BlockKind::IndentedCode => {
-      events.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)))
-      let code = join_block_lines_nl(node.lines)
-      if code.length() > 0 {
-        events.push(Event::Text(code))
+    events.push(Event::End(TagEnd::Item))
+  } else if kind == 4 {
+    let text = join_para_spans(doc, m, ctx)
+    if in_tight_list {
+      parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+    } else {
+      events.push(Event::Start(Tag::Paragraph))
+      parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+      events.push(Event::End(TagEnd::Paragraph))
+    }
+  } else if kind == 5 {
+    let level = (m.kf >> 10) & 255
+    events.push(Event::Start(Tag::Heading(level)))
+    let text = join_para_spans(doc, m, ctx)
+    parse_inlines_with_ctx(ctx, text, 0, text.length(), doc.ref_defs, opts, events)
+    events.push(Event::End(TagEnd::Heading(level)))
+  } else if kind == 6 {
+    events.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)))
+    let code = join_block_spans_nl(doc, m, ctx)
+    if code.length() > 0 {
+      events.push(Event::Text(code))
+    }
+    events.push(Event::End(TagEnd::CodeBlock))
+  } else if kind == 7 {
+    let info = if m.extra < 0 { "" } else { doc.extra_strs[m.extra] }
+    events.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))))
+    let code = join_block_spans_nl(doc, m, ctx)
+    if code.length() > 0 {
+      events.push(Event::Text(code))
+    }
+    events.push(Event::End(TagEnd::CodeBlock))
+  } else if kind == 8 {
+    events.push(Event::Start(Tag::HtmlBlock))
+    let html = join_block_spans_nl(doc, m, ctx)
+    if html.length() > 0 {
+      events.push(Event::Html(html))
+    }
+    events.push(Event::End(TagEnd::HtmlBlock))
+  } else if kind == 9 {
+    events.push(Event::Rule)
+  } else if kind == 10 {
+    let aligns = doc.table_aligns[t.extra2]
+    let cells_start = m.extra
+    let ncols = m.line_start
+    let num_rows = m.line_len
+    events.push(Event::Start(Tag::Table(aligns)))
+    events.push(Event::Start(Tag::TableHead))
+    let mut hi = 0
+    while hi < ncols {
+      events.push(Event::Start(Tag::TableCell))
+      let sp = doc.table_cells[cells_start + hi]
+      if sp.pad < 0 {
+        let cs = doc.extra_strs[sp.start]
+        parse_inlines_with_ctx(ctx, cs, 0, cs.length(), doc.ref_defs, opts, events)
+      } else if sp.start < sp.end {
+        parse_inlines_with_ctx(ctx, doc.src, sp.start, sp.end, doc.ref_defs, opts, events)
       }
-      events.push(Event::End(TagEnd::CodeBlock))
+      events.push(Event::End(TagEnd::TableCell))
+      hi = hi + 1
     }
-    BlockKind::FencedCode(_, _, _, info) => {
-      events.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))))
-      let code = join_block_lines_nl(node.lines)
-      if code.length() > 0 {
-        events.push(Event::Text(code))
-      }
-      events.push(Event::End(TagEnd::CodeBlock))
-    }
-    BlockKind::HtmlBlock(_) => {
-      events.push(Event::Start(Tag::HtmlBlock))
-      let html = join_block_lines_nl(node.lines)
-      if html.length() > 0 {
-        events.push(Event::Html(html))
-      }
-      events.push(Event::End(TagEnd::HtmlBlock))
-    }
-    BlockKind::ThematicBreak => {
-      events.push(Event::Rule)
-    }
-    BlockKind::Table(aligns, header, rows) => {
-      events.push(Event::Start(Tag::Table(aligns)))
-      events.push(Event::Start(Tag::TableHead))
-      let mut hi = 0
-      while hi < header.length() {
+    events.push(Event::End(TagEnd::TableHead))
+    let mut ri = 0
+    while ri < num_rows {
+      events.push(Event::Start(Tag::TableRow))
+      let row_base = cells_start + (ri + 1) * ncols
+      let mut ci = 0
+      while ci < ncols {
         events.push(Event::Start(Tag::TableCell))
-        parse_inlines(header[hi], doc.ref_defs, opts, events)
-        events.push(Event::End(TagEnd::TableCell))
-        hi = hi + 1
-      }
-      events.push(Event::End(TagEnd::TableHead))
-      let mut ri = 0
-      while ri < rows.length() {
-        let row = rows[ri]
-        events.push(Event::Start(Tag::TableRow))
-        let mut ci = 0
-        while ci < row.length() {
-          events.push(Event::Start(Tag::TableCell))
-          parse_inlines(row[ci], doc.ref_defs, opts, events)
-          events.push(Event::End(TagEnd::TableCell))
-          ci = ci + 1
+        let sp = doc.table_cells[row_base + ci]
+        if sp.pad < 0 {
+          let cs = doc.extra_strs[sp.start]
+          parse_inlines_with_ctx(ctx, cs, 0, cs.length(), doc.ref_defs, opts, events)
+        } else if sp.start < sp.end {
+          parse_inlines_with_ctx(ctx, doc.src, sp.start, sp.end, doc.ref_defs, opts, events)
         }
-        events.push(Event::End(TagEnd::TableRow))
-        ri = ri + 1
+        events.push(Event::End(TagEnd::TableCell))
+        ci = ci + 1
       }
-      events.push(Event::End(TagEnd::Table))
+      events.push(Event::End(TagEnd::TableRow))
+      ri = ri + 1
     }
+    events.push(Event::End(TagEnd::Table))
   }
 }
 
 ///| Top-level entry point: parse Markdown string into flat `Array[Event]`.
 pub fn parse_events(src : String, opts : Options) -> Array[Event] {
   let doc = parse_blocks(src, opts)
+  let ctx = new_inline_ctx(opts, true)
   let events : Array[Event] = Array::new()
-  emit_block_events(doc, 0, opts, false, events)
+  emit_block_events(doc, 0, ctx, opts, false, events)
   events
 }

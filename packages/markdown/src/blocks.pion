@@ -1,4 +1,4 @@
-///| CommonMark 0.31.2 + GFM Phase 1 Block Structure Parser.
+///| CommonMark 0.31.2 + GFM Phase 1 Block Structure Parser (flat POD BlockMeta/BlockTree + LineSpan arena).
 
 ///| Link reference definition (destination URL + optional title).
 pub val struct LinkDef {
@@ -6,77 +6,147 @@ pub val struct LinkDef {
   pub title : String
 }
 
-///| Internal block node kinds for Phase 1 block tree.
-pub enum BlockKind {
-  Document
-  BlockQuote
-  List(Bool, Int, Int) // (ordered, delim, start_num)
-  Item(Int) // content_col
-  Paragraph
-  Heading(Int)
-  IndentedCode
-  FencedCode(Int, Int, Int, String) // (fence_char, fence_len, fence_indent, info)
-  HtmlBlock(Int) // kind 1..7
-  ThematicBreak
-  Table(Array[Alignment], Array[String], Array[Array[String]]) // (aligns, header, rows)
-  Empty // Removed paragraph (e.g. pure link reference definitions)
+///| Flat 24-byte POD line span stored inline in `Array[LineSpan]` (zero heap allocation).
+///| When `pad >= 0`: `pad` leading spaces followed by `doc.src[start..end]`.
+///| When `pad == -1`: owned string at `doc.extra_strs[start]`.
+pub val struct LineSpan {
+  pub start : Int
+  pub end : Int
+  pub pad : Int
 }
 
-///| Mutable block node stored in a flat arena.
-pub struct BlockNode {
-  pub mut kind : BlockKind
-  pub children : Array[Int]
-  pub lines : Array[String]
-  pub mut open : Bool
-  pub mut tight : Bool
-  pub mut last_line_blank : Bool
-  pub mut ends_with_blank : Bool
-  pub mut task_checked : Option[Bool]
+// Block kind tags (stored in low 4 bits of BlockMeta.kf):
+// 0 = Document
+// 1 = BlockQuote
+// 2 = List         (bit 9: ordered, bits 10..17: delim, extra: start_num)
+// 3 = Item         (extra: content_col)
+// 4 = Paragraph
+// 5 = Heading      (bits 10..17: level)
+// 6 = IndentedCode
+// 7 = FencedCode   (bits 10..17: fchar, bits 18..29: flen, extra: info_str_idx (-1 if empty), extra2: fence_indent)
+// 8 = HtmlBlock    (bits 10..17: hkind)
+// 9 = ThematicBreak
+// 10 = Table       (line_start: ncols, line_len: num_body_rows, extra: cells_start, extra2: aligns_idx)
+// 11 = Empty
+//
+// Flags in BlockMeta.kf:
+// bit 4 (16): open
+// bit 5 (32): tight
+// bit 6 (64): ends_with_blank
+// bits 7..8 (128/256): task_state (0 = None, 1 = Some(false), 2 = Some(true))
+
+///| Flat 32-byte POD block metadata stored inline in `Array[BlockMeta]`.
+pub val struct BlockMeta {
+  pub kf : Int
+  pub line_start : Int
+  pub line_len : Int
+  pub extra : Int
 }
 
-fn new_block(kind : BlockKind) -> BlockNode {
-  BlockNode::{
-    kind,
-    children: Array::new(),
-    lines: Array::new(),
-    open: true,
-    tight: true,
-    last_line_blank: false,
-    ends_with_blank: false,
-    task_checked: None,
-  }
+///| Flat 32-byte POD block tree links stored inline in `Array[BlockTree]`.
+pub val struct BlockTree {
+  pub first_child : Int
+  pub last_child : Int
+  pub next_sibling : Int
+  pub extra2 : Int
 }
 
 ///| Result of Phase 1 block parsing.
 pub struct BlockDoc {
-  pub nodes : Array[BlockNode]
+  pub src : String
+  pub meta : Array[BlockMeta]
+  pub tree : Array[BlockTree]
+  pub all_lines : Array[LineSpan]
+  pub table_cells : Array[LineSpan]
+  pub table_aligns : Array[Array[Alignment]]
+  pub extra_strs : Array[String]
   pub ref_defs : Map[String, LinkDef]
 }
 
-///| Normalize `\r\n` / `\r` -> `\n` and `\0` -> U+FFFD (zero-alloc fast path if clean).
+///| Reusable mutable line cursor state (allocated ONCE per parse_blocks call, zero per-line tuple allocs).
+struct LineState {
+  mut pos : Int
+  mut col : Int
+  mut partial : Int
+  mut indent : Int
+  mut non_ws : Int
+  mut non_ws_col : Int
+}
+
+fn make_kf(kind : Int, open : Bool, sub : Int) -> Int {
+  kind | (if open { 16 } else { 0 }) | 32 | sub
+}
+
+fn push_block(
+  meta : Array[BlockMeta],
+  tree : Array[BlockTree],
+  kf : Int,
+  line_start : Int,
+  line_len : Int,
+  extra : Int,
+  extra2 : Int,
+) -> Int {
+  let idx = meta.length()
+  meta.push(BlockMeta::{ kf, line_start, line_len, extra })
+  tree.push(BlockTree::{ first_child: -1, last_child: -1, next_sibling: -1, extra2 })
+  idx
+}
+
+fn add_block_child(tree : Array[BlockTree], parent_idx : Int, cidx : Int) -> Unit {
+  let pt = tree[parent_idx]
+  if pt.first_child < 0 {
+    tree[parent_idx] = BlockTree::{
+      first_child: cidx,
+      last_child: cidx,
+      next_sibling: pt.next_sibling,
+      extra2: pt.extra2,
+    }
+  } else {
+    let lc = pt.last_child
+    let lt = tree[lc]
+    tree[lc] = BlockTree::{
+      first_child: lt.first_child,
+      last_child: lt.last_child,
+      next_sibling: cidx,
+      extra2: lt.extra2,
+    }
+    tree[parent_idx] = BlockTree::{
+      first_child: pt.first_child,
+      last_child: cidx,
+      next_sibling: pt.next_sibling,
+      extra2: pt.extra2,
+    }
+  }
+}
+
+fn push_child_open(
+  meta : Array[BlockMeta],
+  tree : Array[BlockTree],
+  open_stack : Array[Int],
+  parent_idx : Int,
+  kf : Int,
+  line_start : Int,
+  line_len : Int,
+  extra : Int,
+  extra2 : Int,
+) -> Int {
+  let cidx = push_block(meta, tree, kf, line_start, line_len, extra, extra2)
+  add_block_child(tree, parent_idx, cidx)
+  open_stack.push(cidx)
+  cidx
+}
+
+///| Normalize `\r\n` / `\r` -> `\n` and `\0` -> U+FFFD (only called when `\r` or `\0` is encountered).
 fn normalize_input(src : String) -> String {
   let n = src.length()
-  let mut i = 0
-  let mut clean = true
-  while i < n {
-    let b = src.code_unit_at(i)
-    if b == 13 || b == 0 {
-      clean = false
-      break
-    }
-    i = i + 1
-  }
-  if clean {
-    return src
-  }
   let sb = StringBuilder::new()
   let mut mark = 0
-  i = 0
+  let mut i = 0
   while i < n {
     let b = src.code_unit_at(i)
     if b == 13 {
       if mark < i {
-        sb.write_string(src.slice(mark, i))
+        write_raw_span(sb, src, mark, i)
       }
       sb.write_byte((10).to_byte())
       if i + 1 < n && src.code_unit_at(i + 1) == 10 {
@@ -87,7 +157,7 @@ fn normalize_input(src : String) -> String {
       mark = i
     } else if b == 0 {
       if mark < i {
-        sb.write_string(src.slice(mark, i))
+        write_raw_span(sb, src, mark, i)
       }
       write_utf8(sb, 0xFFFD)
       i = i + 1
@@ -97,24 +167,15 @@ fn normalize_input(src : String) -> String {
     }
   }
   if mark < n {
-    sb.write_string(src.slice(mark, n))
+    write_raw_span(sb, src, mark, n)
   }
   sb.to_string()
 }
 
-///| Cursor over a single line with 4-space tab-stop tracking.
-struct LineCursor {
-  src : String
-  end : Int
-  mut pos : Int
-  mut col : Int
-  mut partial : Int // remaining spaces from a partially consumed tab
-}
-
-fn cursor_is_blank(cur : LineCursor) -> Bool {
-  let mut i = cur.pos
-  while i < cur.end {
-    let b = cur.src.code_unit_at(i)
+fn line_is_blank(src : String, pos : Int, end : Int) -> Bool {
+  let mut i = pos
+  while i < end {
+    let b = src.code_unit_at(i)
     if b != 32 && b != 9 {
       return false
     }
@@ -123,13 +184,18 @@ fn cursor_is_blank(cur : LineCursor) -> Bool {
   true
 }
 
-///| Peek visual indentation (in columns) to the next non-space/tab byte.
-///| Returns `(indent_cols, non_ws_pos, non_ws_col)`.
-fn cursor_peek_indent(cur : LineCursor) -> (Int, Int, Int) {
-  let mut c = cur.col + cur.partial
-  let mut i = cur.pos
-  while i < cur.end {
-    let b = cur.src.code_unit_at(i)
+///| Compute visual indentation to next non-space/tab byte into `ls.indent`, `ls.non_ws`, `ls.non_ws_col`.
+fn peek_indent_ls(ls : LineState, src : String, end : Int) -> Unit {
+  let mut i = ls.pos
+  if ls.partial == 0 && i < end && src.code_unit_at(i) > 32 {
+    ls.indent = 0
+    ls.non_ws = i
+    ls.non_ws_col = ls.col
+    return ()
+  }
+  let mut c = ls.col + ls.partial
+  while i < end {
+    let b = src.code_unit_at(i)
     if b == 32 {
       c = c + 1
       i = i + 1
@@ -140,110 +206,139 @@ fn cursor_peek_indent(cur : LineCursor) -> (Int, Int, Int) {
       break
     }
   }
-  (c - cur.col, i, c)
+  ls.indent = c - ls.col
+  ls.non_ws = i
+  ls.non_ws_col = c
 }
 
-///| Advance cursor to the next non-space/tab byte.
-fn cursor_skip_ws(cur : LineCursor) -> Unit {
-  let (_, next_pos, next_col) = cursor_peek_indent(cur)
-  cur.pos = next_pos
-  cur.col = next_col
-  cur.partial = 0
-}
-
-///| Advance cursor by up to `count` visual columns (consuming spaces and tabs partially if needed).
-fn cursor_advance_cols(cur : LineCursor, count : Int) -> Unit {
+///| Advance `ls` by up to `count` visual columns in-place (zero tuple allocation).
+fn advance_cols_ls(ls : LineState, src : String, end : Int, count : Int) -> Unit {
+  let mut p = ls.pos
+  let mut c = ls.col
+  let mut part = ls.partial
   let mut rem = count
-  if cur.partial > 0 {
-    if cur.partial >= rem {
-      cur.partial = cur.partial - rem
-      cur.col = cur.col + rem
+  if part > 0 {
+    if part >= rem {
+      ls.col = c + rem
+      ls.partial = part - rem
       return ()
     } else {
-      cur.col = cur.col + cur.partial
-      rem = rem - cur.partial
-      cur.partial = 0
+      c = c + part
+      rem = rem - part
+      part = 0
     }
   }
-  while rem > 0 && cur.pos < cur.end {
-    let b = cur.src.code_unit_at(cur.pos)
+  while rem > 0 && p < end {
+    let b = src.code_unit_at(p)
     if b == 32 {
-      cur.pos = cur.pos + 1
-      cur.col = cur.col + 1
+      p = p + 1
+      c = c + 1
       rem = rem - 1
     } else if b == 9 {
-      let tab_w = 4 - (cur.col % 4)
-      cur.pos = cur.pos + 1
+      let tab_w = 4 - (c % 4)
+      p = p + 1
       if tab_w > rem {
-        cur.col = cur.col + rem
-        cur.partial = tab_w - rem
+        c = c + rem
+        part = tab_w - rem
         rem = 0
       } else {
-        cur.col = cur.col + tab_w
+        c = c + tab_w
         rem = rem - tab_w
       }
     } else {
       break
     }
   }
+  ls.pos = p
+  ls.col = c
+  ls.partial = part
 }
 
-///| Advance cursor past a single non-tab ASCII byte (e.g. `>`).
-fn cursor_advance_byte(cur : LineCursor) -> Unit {
-  cur.pos = cur.pos + 1
-  cur.col = cur.col + 1
-  cur.partial = 0
-}
-
-///| Extract the remaining text of the line, prepending `cur.partial` spaces if any.
-fn cursor_rest(cur : LineCursor) -> String {
-  if cur.partial == 0 {
-    cur.src.slice(cur.pos, cur.end)
+fn span_is_blank(src : String, extra_strs : Array[String], sp : LineSpan) -> Bool {
+  if sp.pad < 0 {
+    let s = extra_strs[sp.start]
+    line_is_blank(s, 0, s.length())
   } else {
-    let sb = StringBuilder::new()
-    let mut k = 0
-    while k < cur.partial {
-      sb.write_byte((32).to_byte())
-      k = k + 1
-    }
-    sb.write_string(cur.src.slice(cur.pos, cur.end))
-    sb.to_string()
+    line_is_blank(src, sp.start, sp.end)
   }
 }
 
-fn is_container_kind(k : BlockKind) -> Bool {
-  match k {
-    BlockKind::Document | BlockKind::BlockQuote | BlockKind::List(_, _, _) | BlockKind::Item(_) => true
-    _ => false
-  }
-}
-
-///| Join paragraph lines with `\n` and extract leading link reference definitions.
+///| Extract leading link reference definitions from paragraph node `idx`.
 ///| Returns `true` if any paragraph text remains.
 fn extract_ref_defs_from_para(
-  node : BlockNode,
+  src : String,
+  meta : Array[BlockMeta],
+  idx : Int,
+  all_lines : Array[LineSpan],
+  extra_strs : Array[String],
   ref_defs : Map[String, LinkDef],
 ) -> Bool {
-  if node.lines.length() == 0 {
+  let m = meta[idx]
+  if m.line_len == 0 {
     return false
   }
-  // Quick check: first non-space char of first line must be '['
-  let first = node.lines[0]
-  let mut f = 0
-  while f < first.length() && first.code_unit_at(f) == 32 {
-    f = f + 1
+  let sp0 = all_lines[m.line_start]
+  let first_is_bracket = if sp0.pad < 0 {
+    let first = extra_strs[sp0.start]
+    let mut f = 0
+    while f < first.length() && first.code_unit_at(f) == 32 {
+      f = f + 1
+    }
+    f < first.length() && first.code_unit_at(f) == 91
+  } else {
+    let mut f = sp0.start
+    while f < sp0.end && src.code_unit_at(f) == 32 {
+      f = f + 1
+    }
+    f < sp0.end && src.code_unit_at(f) == 91
   }
-  if f >= first.length() || first.code_unit_at(f) != 91 {
+  if !first_is_bracket {
     return true
   }
-  // Join lines with '\n'
+  // Single-line zero-copy fast path (avoids StringBuilder allocation for 99% of link ref defs!)
+  if m.line_len == 1 && sp0.pad == 0 {
+    let mut pos = sp0.start
+    let mut extracted = false
+    while pos < sp0.end {
+      match scan_link_ref_def(src, pos, sp0.end) {
+        Some((norm_label, dest, title, next_pos)) => {
+          if !ref_defs.contains(norm_label) {
+            ref_defs.set(norm_label, LinkDef::{ dest, title })
+          }
+          pos = next_pos
+          extracted = true
+        }
+        None => break
+      }
+    }
+    if !extracted {
+      return true
+    }
+    if pos >= sp0.end {
+      let new_kf = (m.kf - (m.kf & 15)) | 11
+      meta[idx] = BlockMeta::{ kf: new_kf, line_start: m.line_start, line_len: 0, extra: m.extra }
+      return false
+    }
+    all_lines[m.line_start] = LineSpan::{ start: pos, end: sp0.end, pad: 0 }
+    return true
+  }
   let sb = StringBuilder::new()
   let mut li = 0
-  while li < node.lines.length() {
+  while li < m.line_len {
     if li > 0 {
       sb.write_byte((10).to_byte())
     }
-    sb.write_string(node.lines[li])
+    let sp = all_lines[m.line_start + li]
+    if sp.pad < 0 {
+      sb.write_string(extra_strs[sp.start])
+    } else {
+      let mut k = 0
+      while k < sp.pad {
+        sb.write_byte((32).to_byte())
+        k = k + 1
+      }
+      write_raw_span(sb, src, sp.start, sp.end)
+    }
     li = li + 1
   }
   let full = sb.to_string()
@@ -265,301 +360,463 @@ fn extract_ref_defs_from_para(
   if !extracted {
     return true
   }
-  node.lines.clear()
   if pos >= n {
-    node.kind = BlockKind::Empty
+    // Convert to Empty (kind = 11)
+    let new_kf = (m.kf - (m.kf & 15)) | 11
+    meta[idx] = BlockMeta::{ kf: new_kf, line_start: m.line_start, line_len: 0, extra: m.extra }
     return false
   }
-  // Split remaining text back into lines
-  let mut ls = pos
+  let new_start = all_lines.length()
+  let mut lstart = pos
   let mut i = pos
+  let mut cnt = 0
   while i <= n {
     if i == n || full.code_unit_at(i) == 10 {
-      node.lines.push(full.slice(ls, i))
-      ls = i + 1
+      let sidx = extra_strs.length()
+      extra_strs.push(full.slice(lstart, i))
+      all_lines.push(LineSpan::{ start: sidx, end: 0, pad: -1 })
+      cnt = cnt + 1
+      lstart = i + 1
     }
     i = i + 1
   }
+  meta[idx] = BlockMeta::{ kf: m.kf, line_start: new_start, line_len: cnt, extra: m.extra }
   true
 }
 
-///| Close a block node (finalizing paragraphs, indented code trailing blanks, list tightness).
+///| Close a block node (finalizing paragraphs, indented code trailing blanks, list tightness, tasklists).
 fn close_block(
-  nodes : Array[BlockNode],
+  src : String,
+  meta : Array[BlockMeta],
+  tree : Array[BlockTree],
+  all_lines : Array[LineSpan],
+  extra_strs : Array[String],
   idx : Int,
   ref_defs : Map[String, LinkDef],
   opts : Options,
 ) -> Unit {
-  let node = nodes[idx]
-  if !node.open {
+  let m = meta[idx]
+  if (m.kf & 16) == 0 {
     return ()
   }
-  node.open = false
-  match node.kind {
-    BlockKind::Paragraph => {
-      let _ = extract_ref_defs_from_para(node, ref_defs)
-    }
-    BlockKind::IndentedCode => {
-      // Strip trailing blank lines
-      while node.lines.length() > 0 {
-        let last = node.lines[node.lines.length() - 1]
-        let mut blank = true
-        let mut i = 0
-        while i < last.length() {
-          let b = last.code_unit_at(i)
-          if b != 32 && b != 9 {
-            blank = false
-            break
-          }
-          i = i + 1
-        }
-        if blank {
-          let _ = node.lines.pop()
-        } else {
-          break
-        }
+  let closed_kf = m.kf ^ 16
+  meta[idx] = BlockMeta::{ kf: closed_kf, line_start: m.line_start, line_len: m.line_len, extra: m.extra }
+  let kind = closed_kf & 15
+  if kind == 4 {
+    let _ = extract_ref_defs_from_para(src, meta, idx, all_lines, extra_strs, ref_defs)
+  } else if kind == 6 {
+    let mut llen = m.line_len
+    while llen > 0 {
+      let last = all_lines[m.line_start + llen - 1]
+      if span_is_blank(src, extra_strs, last) {
+        llen = llen - 1
+      } else {
+        break
       }
     }
-    BlockKind::List(_, _, _) => {
-      // Compute list tightness: loose if any non-last item ends with blank,
-      // or any item has a direct child (not last) that ends with blank.
-      let mut tight = true
-      let mut ci = 0
-      let nc = node.children.length()
-      while ci < nc && tight {
-        let item_idx = node.children[ci]
-        let item = nodes[item_idx]
-        if ci + 1 < nc && item.ends_with_blank {
+    if llen != m.line_len {
+      meta[idx] = BlockMeta::{ kf: closed_kf, line_start: m.line_start, line_len: llen, extra: m.extra }
+    }
+  } else if kind == 2 {
+    // List tightness
+    let mut tight = true
+    let mut ci = tree[idx].first_child
+    while ci >= 0 && tight {
+      let item_t = tree[ci]
+      let next_ci = item_t.next_sibling
+      if next_ci >= 0 && (meta[ci].kf & 64) != 0 {
+        tight = false
+        break
+      }
+      let mut sub = item_t.first_child
+      while sub >= 0 {
+        let sub_m = meta[sub]
+        let next_sub = tree[sub].next_sibling
+        if (sub_m.kf & 15) != 11 && next_sub >= 0 && (sub_m.kf & 64) != 0 {
           tight = false
           break
         }
-        let mut sub = 0
-        let nsub = item.children.length()
-        while sub < nsub {
-          let sub_node = nodes[item.children[sub]]
-          match sub_node.kind {
-            BlockKind::Empty => ()
-            _ => {
-              if sub + 1 < nsub && sub_node.ends_with_blank {
-                tight = false
-                break
+        sub = next_sub
+      }
+      ci = next_ci
+    }
+    if !tight {
+      meta[idx] = BlockMeta::{ kf: closed_kf ^ 32, line_start: m.line_start, line_len: m.line_len, extra: m.extra }
+    }
+  } else if kind == 3 {
+    // Item: check GFM task list marker on first Paragraph child
+    if opts.tasklists {
+      let fc = tree[idx].first_child
+      if fc >= 0 {
+        let fm = meta[fc]
+        if (fm.kf & 15) == 4 && fm.line_len > 0 {
+          let sp0 = all_lines[fm.line_start]
+          if sp0.pad == 0 {
+            let tm = scan_tasklist_marker_fast(src, sp0.start, sp0.end)
+            if tm >= 0 {
+              let tbits = if tm == 1 { 256 } else { 128 }
+              meta[idx] = BlockMeta::{
+                kf: closed_kf | tbits,
+                line_start: m.line_start,
+                line_len: m.line_len,
+                extra: m.extra,
+              }
+              all_lines[fm.line_start] = LineSpan::{
+                start: sp0.start + 4,
+                end: sp0.end,
+                pad: 0,
               }
             }
-          }
-          sub = sub + 1
-        }
-        ci = ci + 1
-      }
-      node.tight = tight
-    }
-    BlockKind::Item(_) => {
-      // Check GFM task list marker on first Paragraph child
-      if opts.tasklists && node.children.length() > 0 {
-        let first_child = nodes[node.children[0]]
-        match first_child.kind {
-          BlockKind::Paragraph => {
-            if first_child.lines.length() > 0 {
-              let l0 = first_child.lines[0]
-              match scan_tasklist_marker(l0, 0, l0.length()) {
-                Some((checked, next_pos)) => {
-                  node.task_checked = Some(checked)
-                  first_child.lines[0] = l0.slice(next_pos, l0.length())
-                }
-                None => ()
+          } else if sp0.pad < 0 {
+            let l0 = extra_strs[sp0.start]
+            let tm = scan_tasklist_marker_fast(l0, 0, l0.length())
+            if tm >= 0 {
+              let tbits = if tm == 1 { 256 } else { 128 }
+              meta[idx] = BlockMeta::{
+                kf: closed_kf | tbits,
+                line_start: m.line_start,
+                line_len: m.line_len,
+                extra: m.extra,
               }
+              extra_strs[sp0.start] = l0.slice(4, l0.length())
             }
           }
-          _ => ()
-        }
-      }
-    }
-    _ => ()
-  }
-}
-
-///| Check if a block node (or its last non-empty descendant) ended with a blank line.
-fn mark_ends_with_blank(nodes : Array[BlockNode], idx : Int) -> Unit {
-  let node = nodes[idx]
-  node.ends_with_blank = true
-  let nc = node.children.length()
-  if nc > 0 {
-    let mut k = nc - 1
-    while k >= 0 {
-      let c = nodes[node.children[k]]
-      match c.kind {
-        BlockKind::Empty => k = k - 1
-        _ => {
-          c.ends_with_blank = true
-          break
         }
       }
     }
   }
 }
 
-///| Parse `src` into a Phase 1 `BlockDoc` (arena of `BlockNode` + `ref_defs`).
+fn mark_ends_with_blank(meta : Array[BlockMeta], tree : Array[BlockTree], idx : Int) -> Unit {
+  let m = meta[idx]
+  meta[idx] = BlockMeta::{ kf: m.kf | 64, line_start: m.line_start, line_len: m.line_len, extra: m.extra }
+  let last = tree[idx].last_child
+  if last >= 0 {
+    let lm = meta[last]
+    if (lm.kf & 15) != 11 {
+      meta[last] = BlockMeta::{ kf: lm.kf | 64, line_start: lm.line_start, line_len: lm.line_len, extra: lm.extra }
+    } else {
+      let mut last_ne = -1
+      let mut c = tree[idx].first_child
+      while c >= 0 {
+        if (meta[c].kf & 15) != 11 {
+          last_ne = c
+        }
+        c = tree[c].next_sibling
+      }
+      if last_ne >= 0 {
+        let nem = meta[last_ne]
+        meta[last_ne] = BlockMeta::{
+          kf: nem.kf | 64,
+          line_start: nem.line_start,
+          line_len: nem.line_len,
+          extra: nem.extra,
+        }
+      }
+    }
+  }
+}
+
+fn close_unmatched_blocks(
+  src : String,
+  meta : Array[BlockMeta],
+  tree : Array[BlockTree],
+  all_lines : Array[LineSpan],
+  extra_strs : Array[String],
+  open_stack : Array[Int],
+  matched : Int,
+  ref_defs : Map[String, LinkDef],
+  opts : Options,
+) -> Unit {
+  while open_stack.length() > matched {
+    let pop_idx = open_stack[open_stack.length() - 1]
+    close_block(src, meta, tree, all_lines, extra_strs, pop_idx, ref_defs, opts)
+    let _ = open_stack.pop()
+  }
+}
+
+fn close_list_and_para(
+  src : String,
+  meta : Array[BlockMeta],
+  tree : Array[BlockTree],
+  all_lines : Array[LineSpan],
+  extra_strs : Array[String],
+  open_stack : Array[Int],
+  ref_defs : Map[String, LinkDef],
+  opts : Options,
+) -> Int {
+  while open_stack.length() > 1 {
+    let top_idx = open_stack[open_stack.length() - 1]
+    let k = meta[top_idx].kf & 15
+    if k == 2 || k == 4 {
+      close_block(src, meta, tree, all_lines, extra_strs, top_idx, ref_defs, opts)
+      let _ = open_stack.pop()
+    } else {
+      break
+    }
+  }
+  open_stack[open_stack.length() - 1]
+}
+
+fn clear_open_blanks(meta : Array[BlockMeta], open_stack : Array[Int]) -> Unit {
+  let mut si = 1
+  let slen = open_stack.length()
+  while si < slen {
+    let bidx = open_stack[si]
+    let m = meta[bidx]
+    if (m.kf & 64) != 0 {
+      meta[bidx] = BlockMeta::{ kf: m.kf ^ 64, line_start: m.line_start, line_len: m.line_len, extra: m.extra }
+    }
+    si = si + 1
+  }
+}
+
+fn append_block_line(
+  meta : Array[BlockMeta],
+  all_lines : Array[LineSpan],
+  bidx : Int,
+  span : LineSpan,
+) -> Unit {
+  let m = meta[bidx]
+  let ls = if m.line_len == 0 { all_lines.length() } else { m.line_start }
+  all_lines.push(span)
+  meta[bidx] = BlockMeta::{ kf: m.kf, line_start: ls, line_len: m.line_len + 1, extra: m.extra }
+}
+
+fn make_block_start_table() -> Array[Byte] {
+  let tbl : Array[Byte] = Array::with_capacity(256)
+  let zero = (0).to_byte()
+  let mut i = 0
+  while i < 256 {
+    tbl.push(zero)
+    i = i + 1
+  }
+  let one = (1).to_byte()
+  tbl[62] = one // '>'
+  tbl[35] = one // '#'
+  tbl[96] = one // '`'
+  tbl[126] = one // '~'
+  tbl[60] = one // '<'
+  tbl[61] = one // '='
+  tbl[45] = one // '-'
+  tbl[124] = one // '|'
+  tbl[58] = one // ':'
+  tbl[42] = one // '*'
+  tbl[95] = one // '_'
+  tbl[43] = one // '+'
+  i = 48
+  while i <= 57 {
+    tbl[i] = one // '0'..'9'
+    i = i + 1
+  }
+  tbl
+}
+
+///| Parse `src` into a Phase 1 `BlockDoc`.
 pub fn parse_blocks(src : String, opts : Options) -> BlockDoc {
-  let text = normalize_input(src)
+  parse_blocks_inner(src, opts, false)
+}
+
+fn parse_blocks_inner(text : String, opts : Options, normalized : Bool) -> BlockDoc {
   let n = text.length()
-  let nodes : Array[BlockNode] = Array::new()
+  let est_nodes = n / 64 + 16
+  let est_lines = n / 32 + 16
+  let meta : Array[BlockMeta] = Array::with_capacity(est_nodes)
+  let tree : Array[BlockTree] = Array::with_capacity(est_nodes)
+  let all_lines : Array[LineSpan] = Array::with_capacity(est_lines)
+  let table_cells : Array[LineSpan] = Array::new()
+  let table_aligns : Array[Array[Alignment]] = Array::new()
+  let extra_strs : Array[String] = Array::new()
   let ref_defs : Map[String, LinkDef] = Map::new()
-  nodes.push(new_block(BlockKind::Document))
-  let open_stack : Array[Int] = Array::new()
+  let _ = push_block(meta, tree, make_kf(0, true, 0), 0, 0, 0, 0)
+  let open_stack : Array[Int] = Array::with_capacity(16)
   open_stack.push(0)
+  let ls = LineState::{ pos: 0, col: 0, partial: 0, indent: 0, non_ws: 0, non_ws_col: 0 }
+  let sc = new_scan_out()
+  let bstart_tbl = make_block_start_table()
+  let zero_b = (0).to_byte()
 
   let mut line_start = 0
   while line_start < n {
     let mut line_end = line_start
-    while line_end < n && text.code_unit_at(line_end) != 10 {
-      line_end = line_end + 1
+    if !normalized {
+      while line_end < n {
+        let b = text.code_unit_at(line_end)
+        if b <= 13 {
+          if b == 10 {
+            break
+          }
+          if b == 13 || b == 0 {
+            return parse_blocks_inner(normalize_input(text), opts, true)
+          }
+        }
+        line_end = line_end + 1
+      }
+    } else {
+      while line_end < n && text.code_unit_at(line_end) != 10 {
+        line_end = line_end + 1
+      }
     }
     let next_line_start = if line_end < n { line_end + 1 } else { n }
 
-    let cur = LineCursor::{
-      src: text,
-      end: line_end,
-      pos: line_start,
-      col: 0,
-      partial: 0,
-    }
+    ls.pos = line_start
+    ls.col = 0
+    ls.partial = 0
+    let mut indent_valid = false
 
     // Step 1: Match existing open blocks from root downward
-    let mut matched = 1 // root (index 0) always matches
+    let mut matched = 1
     let mut consumed = false
     let stack_len = open_stack.length()
 
     while matched < stack_len {
       let bidx = open_stack[matched]
-      let b = nodes[bidx]
-      let (indent, non_ws, _) = cursor_peek_indent(cur)
-      let blank = non_ws == cur.end
+      let bm = meta[bidx]
+      let kind = bm.kf & 15
 
-      match b.kind {
-        BlockKind::BlockQuote => {
-          if !blank && indent <= 3 && cur.src.code_unit_at(non_ws) == 62 {
-            cursor_skip_ws(cur)
-            cursor_advance_byte(cur) // consume '>'
-            // Consume optional single space or 1 column of a tab
-            if cur.pos < cur.end {
-              let nb = cur.src.code_unit_at(cur.pos)
-              if nb == 32 || nb == 9 {
-                cursor_advance_cols(cur, 1)
+      // List always matches without peeking indent!
+      if kind == 2 {
+        matched = matched + 1
+        continue
+      }
+
+      if !indent_valid {
+        peek_indent_ls(ls, text, line_end)
+        indent_valid = true
+      }
+      let indent = ls.indent
+      let non_ws = ls.non_ws
+      let blank = non_ws == line_end
+
+      if kind == 4 {
+        // Paragraph
+        if blank {
+          break
+        }
+        matched = matched + 1
+      } else if kind == 3 {
+        // Item(content_col = bm.extra)
+        let indent_width = bm.extra
+        if blank {
+          if tree[bidx].first_child < 0 {
+            break
+          }
+          advance_cols_ls(ls, text, line_end, indent_width)
+          indent_valid = false
+          matched = matched + 1
+        } else if indent >= indent_width {
+          advance_cols_ls(ls, text, line_end, indent_width)
+          indent_valid = false
+          matched = matched + 1
+        } else {
+          break
+        }
+      } else if kind == 1 {
+        // BlockQuote
+        if !blank && indent <= 3 && text.code_unit_at(non_ws) == 62 {
+          ls.pos = non_ws + 1
+          ls.col = ls.non_ws_col + 1
+          ls.partial = 0
+          if ls.pos < line_end {
+            let nb = text.code_unit_at(ls.pos)
+            if nb == 32 || nb == 9 {
+              advance_cols_ls(ls, text, line_end, 1)
+            }
+          }
+          indent_valid = false
+          matched = matched + 1
+        } else {
+          break
+        }
+      } else if kind == 7 {
+        // FencedCode
+        let fchar = (bm.kf >> 10) & 255
+        let flen = (bm.kf >> 18) & 4095
+        if !blank && indent <= 3 && text.code_unit_at(non_ws) == fchar &&
+        scan_code_fence_close(text, non_ws, line_end, fchar, flen) {
+          close_block(text, meta, tree, all_lines, extra_strs, bidx, ref_defs, opts)
+          let _ = open_stack.pop()
+          consumed = true
+          break
+        }
+        let findent = tree[bidx].extra2
+        if findent > 0 {
+          advance_cols_ls(ls, text, line_end, findent)
+        }
+        append_block_line(meta, all_lines, bidx, LineSpan::{ start: ls.pos, end: line_end, pad: ls.partial })
+        consumed = true
+        break
+      } else if kind == 10 {
+        // Table
+        if blank {
+          break
+        }
+        if indent <= 3 {
+          let first_b = text.code_unit_at(non_ws)
+          if bstart_tbl[first_b] != zero_b {
+            let mut interrupts = false
+            if first_b == 62 {
+              interrupts = true
+            } else if first_b == 35 {
+              if scan_atx_heading_into(text, non_ws, line_end, sc) {
+                interrupts = true
+              }
+            } else if first_b == 96 || first_b == 126 {
+              match scan_code_fence_open(text, non_ws, line_end) {
+                Some(_) => interrupts = true
+                None => ()
+              }
+            } else if first_b == 60 {
+              if scan_html_block_start(text, non_ws, line_end, true) != 0 {
+                interrupts = true
+              }
+            } else if first_b == 42 || first_b == 45 || first_b == 95 || first_b == 43 ||
+            (first_b >= 48 && first_b <= 57) {
+              if (first_b == 42 || first_b == 45 || first_b == 95) &&
+              scan_thematic_break(text, non_ws, line_end) {
+                interrupts = true
+              } else if scan_list_marker_into(text, non_ws, line_end, ls.col + indent, true, sc) {
+                interrupts = true
               }
             }
-            matched = matched + 1
-          } else {
-            break
-          }
-        }
-        BlockKind::List(_, _, _) => {
-          matched = matched + 1
-        }
-        BlockKind::Item(indent_width) => {
-          if blank {
-            // An empty list item cannot contain more than one blank line
-            if b.children.length() == 0 {
-              break
-            }
-            cursor_advance_cols(cur, indent_width)
-            matched = matched + 1
-          } else if indent >= indent_width {
-            cursor_advance_cols(cur, indent_width)
-            matched = matched + 1
-          } else {
-            break
-          }
-        }
-        BlockKind::IndentedCode => {
-          if indent >= 4 {
-            cursor_advance_cols(cur, 4)
-            matched = matched + 1
-          } else if blank {
-            cursor_advance_cols(cur, indent)
-            matched = matched + 1
-          } else {
-            break
-          }
-        }
-        BlockKind::FencedCode(fchar, flen, findent, _) => {
-          if !blank && indent <= 3 && scan_code_fence_close(cur.src, non_ws, cur.end, fchar, flen) {
-            close_block(nodes, bidx, ref_defs, opts)
-            let _ = open_stack.pop()
-            consumed = true
-            break
-          }
-          // Strip up to `findent` columns
-          if findent > 0 {
-            cursor_advance_cols(cur, findent)
-          }
-          b.lines.push(cursor_rest(cur))
-          consumed = true
-          break
-        }
-        BlockKind::HtmlBlock(hkind) => {
-          if blank && (hkind == 6 || hkind == 7) {
-            break
-          }
-          b.lines.push(cursor_rest(cur))
-          if hkind <= 5 && scan_html_block_end(cur.src, cur.pos, cur.end, hkind) {
-            close_block(nodes, bidx, ref_defs, opts)
-            let _ = open_stack.pop()
-          }
-          consumed = true
-          break
-        }
-        BlockKind::Table(aligns, _header, rows) => {
-          if blank {
-            break
-          }
-          // Check if a block-level interrupt terminates the table
-          if indent <= 3 {
-            let first_b = cur.src.code_unit_at(non_ws)
-            let is_atx = match scan_atx_heading(cur.src, non_ws, cur.end) {
-              Some(_) => true
-              None => false
-            }
-            let is_fence = match scan_code_fence_open(cur.src, non_ws, cur.end) {
-              Some(_) => true
-              None => false
-            }
-            let is_list = match scan_list_marker(cur.src, non_ws, cur.end, cur.col + indent, true) {
-              Some(_) => true
-              None => false
-            }
-            let interrupts = first_b == 62 ||
-            is_atx ||
-            is_fence ||
-            scan_thematic_break(cur.src, non_ws, cur.end) ||
-            scan_html_block_start(cur.src, non_ws, cur.end, true) != 0 ||
-            is_list
             if interrupts {
               break
             }
           }
-          let row_cells = split_table_row(cur.src, cur.pos, cur.end)
-          // Normalize cell count to match aligns.length()
-          let ncols = aligns.length()
-          let norm_row : Array[String] = Array::new()
-          let mut ci = 0
-          while ci < ncols {
-            if ci < row_cells.length() {
-              norm_row.push(row_cells[ci])
-            } else {
-              norm_row.push("")
-            }
-            ci = ci + 1
-          }
-          rows.push(norm_row)
-          consumed = true
+        }
+        let ncols = bm.line_start
+        let _ = split_table_row_spans(text, ls.pos, line_end, table_cells, extra_strs, ncols)
+        meta[bidx] = BlockMeta::{ kf: bm.kf, line_start: ncols, line_len: bm.line_len + 1, extra: bm.extra }
+        consumed = true
+        break
+      } else if kind == 6 {
+        // IndentedCode
+        if indent >= 4 {
+          advance_cols_ls(ls, text, line_end, 4)
+          indent_valid = false
+          matched = matched + 1
+        } else if blank {
+          advance_cols_ls(ls, text, line_end, indent)
+          indent_valid = false
+          matched = matched + 1
+        } else {
           break
         }
-        BlockKind::Paragraph => {
-          if blank {
-            break
-          }
-          matched = matched + 1
+      } else if kind == 8 {
+        // HtmlBlock
+        let hkind = (bm.kf >> 10) & 255
+        if blank && (hkind == 6 || hkind == 7) {
+          break
         }
-        _ => break
+        append_block_line(meta, all_lines, bidx, LineSpan::{ start: ls.pos, end: line_end, pad: ls.partial })
+        if hkind <= 5 && scan_html_block_end(text, ls.pos, line_end, hkind) {
+          close_block(text, meta, tree, all_lines, extra_strs, bidx, ref_defs, opts)
+          let _ = open_stack.pop()
+        }
+        consumed = true
+        break
+      } else {
+        break
       }
     }
 
@@ -568,132 +825,112 @@ pub fn parse_blocks(src : String, opts : Options) -> BlockDoc {
       continue
     }
 
-    // Helper: close all unmatched blocks above `matched`
     let all_matched = matched == open_stack.length()
     let tip_idx = open_stack[open_stack.length() - 1]
-    let tip_is_para = match nodes[tip_idx].kind {
-      BlockKind::Paragraph => true
-      _ => false
-    }
+    let tip_is_para = (meta[tip_idx].kf & 15) == 4
     let last_matched_idx = open_stack[matched - 1]
 
     // Step 2: Check for new block starts (unless last matched is IndentedCode)
     let mut container_idx = last_matched_idx
     let mut unmatched_closed = all_matched
-
-    let close_unmatched = fn() -> Unit {
-      if !unmatched_closed {
-        while open_stack.length() > matched {
-          let pop_idx = open_stack[open_stack.length() - 1]
-          close_block(nodes, pop_idx, ref_defs, opts)
-          let _ = open_stack.pop()
-        }
-        unmatched_closed = true
-      }
-    }
-
-    let close_list_if_needed = fn() -> Unit {
-      while open_stack.length() > 1 {
-        let top_idx = open_stack[open_stack.length() - 1]
-        match nodes[top_idx].kind {
-          BlockKind::List(_, _, _) | BlockKind::Paragraph => {
-            close_block(nodes, top_idx, ref_defs, opts)
-            let _ = open_stack.pop()
-          }
-          _ => break
-        }
-      }
-      container_idx = open_stack[open_stack.length() - 1]
-    }
-
-    let add_child = fn(parent_idx : Int, child : BlockNode) -> Int {
-      let cidx = nodes.length()
-      nodes.push(child)
-      nodes[parent_idx].children.push(cidx)
-      open_stack.push(cidx)
-      cidx
-    }
-
-    // Can we start new blocks here?
-    let mut try_starts = true
-    match nodes[container_idx].kind {
-      BlockKind::IndentedCode => try_starts = false
-      _ => ()
-    }
+    let try_starts = (meta[container_idx].kf & 15) != 6
 
     while try_starts {
-      let (indent, non_ws, non_ws_col) = cursor_peek_indent(cur)
-      let blank = non_ws == cur.end
-      if blank {
+      if !indent_valid {
+        peek_indent_ls(ls, text, line_end)
+        indent_valid = true
+      }
+      let indent = ls.indent
+      let non_ws = ls.non_ws
+      let non_ws_col = ls.non_ws_col
+      if non_ws == line_end {
         break
       }
 
       let cur_tip = open_stack[open_stack.length() - 1]
-      let in_para = match nodes[cur_tip].kind {
-        BlockKind::Paragraph => true
-        _ => false
-      }
+      let in_para = (meta[cur_tip].kf & 15) == 4
 
       // 1. Indented code block (only if not in paragraph)
-      if indent >= 4 && !in_para && !cursor_is_blank(cur) {
-        close_unmatched()
-        close_list_if_needed()
-        cursor_advance_cols(cur, 4)
-        let cb = new_block(BlockKind::IndentedCode)
-        cb.lines.push(cursor_rest(cur))
-        let _ = add_child(container_idx, cb)
+      if indent >= 4 && !in_para {
+        if !unmatched_closed {
+          close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+          unmatched_closed = true
+        }
+        container_idx = close_list_and_para(text, meta, tree, all_lines, extra_strs, open_stack, ref_defs, opts)
+        advance_cols_ls(ls, text, line_end, 4)
+        let lstart = all_lines.length()
+        all_lines.push(LineSpan::{ start: ls.pos, end: line_end, pad: ls.partial })
+        let _ = push_child_open(meta, tree, open_stack, container_idx, make_kf(6, true, 0), lstart, 1, 0, 0)
         consumed = true
         break
       }
 
       if indent <= 3 {
-        let fb = cur.src.code_unit_at(non_ws)
+        let fb = text.code_unit_at(non_ws)
+        if bstart_tbl[fb] == zero_b {
+          break
+        }
 
         // 2. BlockQuote `>`
         if fb == 62 {
-          close_unmatched()
-          close_list_if_needed()
-          cursor_skip_ws(cur)
-          cursor_advance_byte(cur)
-          if cur.pos < cur.end {
-            let nb = cur.src.code_unit_at(cur.pos)
+          if !unmatched_closed {
+            close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+            unmatched_closed = true
+          }
+          container_idx = close_list_and_para(text, meta, tree, all_lines, extra_strs, open_stack, ref_defs, opts)
+          ls.pos = non_ws + 1
+          ls.col = non_ws_col + 1
+          ls.partial = 0
+          if ls.pos < line_end {
+            let nb = text.code_unit_at(ls.pos)
             if nb == 32 || nb == 9 {
-              cursor_advance_cols(cur, 1)
+              advance_cols_ls(ls, text, line_end, 1)
             }
           }
-          container_idx = add_child(container_idx, new_block(BlockKind::BlockQuote))
+          indent_valid = false
+          container_idx = push_child_open(meta, tree, open_stack, container_idx, make_kf(1, true, 0), 0, 0, 0, 0)
           continue
         }
 
         // 3. ATX Heading `#`
-        if fb == 35 {
-          match scan_atx_heading(cur.src, non_ws, cur.end) {
-            Some((level, cs, ce)) => {
-              close_unmatched()
-              close_list_if_needed()
-              let h = new_block(BlockKind::Heading(level))
-              h.open = false
-              if cs < ce {
-                h.lines.push(cur.src.slice(cs, ce))
-              }
-              let cidx = nodes.length()
-              nodes.push(h)
-              nodes[container_idx].children.push(cidx)
-              consumed = true
-              break
-            }
-            None => ()
+        if fb == 35 && scan_atx_heading_into(text, non_ws, line_end, sc) {
+          if !unmatched_closed {
+            close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+            unmatched_closed = true
           }
+          container_idx = close_list_and_para(text, meta, tree, all_lines, extra_strs, open_stack, ref_defs, opts)
+          let lstart = all_lines.length()
+          let llen = if sc.b < sc.c {
+            all_lines.push(LineSpan::{ start: sc.b, end: sc.c, pad: 0 })
+            1
+          } else {
+            0
+          }
+          let cidx = push_block(meta, tree, make_kf(5, false, sc.a << 10), lstart, llen, 0, 0)
+          add_block_child(tree, container_idx, cidx)
+          consumed = true
+          break
         }
 
         // 4. Fenced Code Block
         if fb == 96 || fb == 126 {
-          match scan_code_fence_open(cur.src, non_ws, cur.end) {
+          match scan_code_fence_open(text, non_ws, line_end) {
             Some((fchar, flen, info)) => {
-              close_unmatched()
-              close_list_if_needed()
-              let fc = new_block(BlockKind::FencedCode(fchar, flen, indent, info))
-              let _ = add_child(container_idx, fc)
+              if !unmatched_closed {
+                close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+                unmatched_closed = true
+              }
+              container_idx = close_list_and_para(text, meta, tree, all_lines, extra_strs, open_stack, ref_defs, opts)
+              let info_idx = if info.length() > 0 {
+                let idx = extra_strs.length()
+                extra_strs.push(info)
+                idx
+              } else {
+                -1
+              }
+              let clen = if flen > 4095 { 4095 } else { flen }
+              let kf = make_kf(7, true, (fchar << 10) | (clen << 18))
+              let _ = push_child_open(meta, tree, open_stack, container_idx, kf, all_lines.length(), 0, info_idx, indent)
               consumed = true
               break
             }
@@ -703,15 +940,18 @@ pub fn parse_blocks(src : String, opts : Options) -> BlockDoc {
 
         // 5. HTML Block
         if fb == 60 {
-          let hkind = scan_html_block_start(cur.src, non_ws, cur.end, in_para)
+          let hkind = scan_html_block_start(text, non_ws, line_end, in_para)
           if hkind > 0 {
-            close_unmatched()
-            close_list_if_needed()
-            let hb = new_block(BlockKind::HtmlBlock(hkind))
-            hb.lines.push(cursor_rest(cur))
-            let hidx = add_child(container_idx, hb)
-            if hkind <= 5 && scan_html_block_end(cur.src, cur.pos, cur.end, hkind) {
-              close_block(nodes, hidx, ref_defs, opts)
+            if !unmatched_closed {
+              close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+              unmatched_closed = true
+            }
+            container_idx = close_list_and_para(text, meta, tree, all_lines, extra_strs, open_stack, ref_defs, opts)
+            let lstart = all_lines.length()
+            all_lines.push(LineSpan::{ start: ls.pos, end: line_end, pad: ls.partial })
+            let hidx = push_child_open(meta, tree, open_stack, container_idx, make_kf(8, true, hkind << 10), lstart, 1, 0, 0)
+            if hkind <= 5 && scan_html_block_end(text, ls.pos, line_end, hkind) {
+              close_block(text, meta, tree, all_lines, extra_strs, hidx, ref_defs, opts)
               let _ = open_stack.pop()
             }
             consumed = true
@@ -719,20 +959,29 @@ pub fn parse_blocks(src : String, opts : Options) -> BlockDoc {
           }
         }
 
-        // 6. Setext Heading underline (only if tip is Paragraph & all containers matched)
+        // 6. Setext Heading underline
         if in_para && unmatched_closed && (fb == 61 || fb == 45) {
-          match scan_setext_underline(cur.src, non_ws, cur.end) {
+          match scan_setext_underline(text, non_ws, line_end) {
             Some(level) => {
-              let para = nodes[cur_tip]
-              if extract_ref_defs_from_para(para, ref_defs) {
-                para.kind = BlockKind::Heading(level)
-                para.open = false
+              if extract_ref_defs_from_para(text, meta, cur_tip, all_lines, extra_strs, ref_defs) {
+                let pm = meta[cur_tip]
+                meta[cur_tip] = BlockMeta::{
+                  kf: make_kf(5, false, level << 10),
+                  line_start: pm.line_start,
+                  line_len: pm.line_len,
+                  extra: 0,
+                }
                 let _ = open_stack.pop()
                 consumed = true
                 break
               } else {
-                // Entire paragraph was link reference definitions; close & pop it so `===` becomes a new paragraph
-                para.open = false
+                let pm = meta[cur_tip]
+                meta[cur_tip] = BlockMeta::{
+                  kf: pm.kf - (pm.kf & 16),
+                  line_start: pm.line_start,
+                  line_len: pm.line_len,
+                  extra: pm.extra,
+                }
                 let _ = open_stack.pop()
                 container_idx = open_stack[open_stack.length() - 1]
               }
@@ -741,26 +990,79 @@ pub fn parse_blocks(src : String, opts : Options) -> BlockDoc {
           }
         }
 
-        // 7. GFM Table delimiter row (only if opts.tables & tip is Paragraph & all containers matched)
+        // 7. GFM Table delimiter row
         if opts.tables && in_para && unmatched_closed && (fb == 124 || fb == 45 || fb == 58) {
-          match scan_table_delimiter_row(cur.src, non_ws, cur.end) {
+          match scan_table_delimiter_row(text, non_ws, line_end) {
             Some(aligns) => {
-              let para = nodes[cur_tip]
-              if para.lines.length() >= 1 {
-                let last_line = para.lines[para.lines.length() - 1]
-                let header_cells = split_table_row(last_line, 0, last_line.length())
-                if header_cells.length() == aligns.length() {
-                  if para.lines.length() == 1 {
-                    para.kind = BlockKind::Table(aligns, header_cells, Array::new())
-                    para.lines.clear()
+              let pm = meta[cur_tip]
+              if pm.line_len >= 1 {
+                let last_sp = all_lines[pm.line_start + pm.line_len - 1]
+                let ncols = aligns.length()
+                let header_cnt = if last_sp.pad < 0 {
+                  let s = extra_strs[last_sp.start]
+                  count_table_row_cells(s, 0, s.length())
+                } else {
+                  count_table_row_cells(text, last_sp.start, last_sp.end)
+                }
+                if header_cnt == ncols {
+                  let cells_start = table_cells.length()
+                  if last_sp.pad < 0 {
+                    let s = extra_strs[last_sp.start]
+                    let hdr_cells = split_table_row(s, 0, s.length())
+                    let mut hi = 0
+                    while hi < ncols {
+                      let sidx = extra_strs.length()
+                      extra_strs.push(if hi < hdr_cells.length() { hdr_cells[hi] } else { "" })
+                      table_cells.push(LineSpan::{ start: sidx, end: 0, pad: -1 })
+                      hi = hi + 1
+                    }
                   } else {
-                    // Pop last line as table header, keep earlier lines in Paragraph
-                    let _ = para.lines.pop()
-                    close_block(nodes, cur_tip, ref_defs, opts)
+                    let _ = split_table_row_spans(
+                      text,
+                      last_sp.start,
+                      last_sp.end,
+                      table_cells,
+                      extra_strs,
+                      ncols,
+                    )
+                  }
+                  let aligns_idx = table_aligns.length()
+                  table_aligns.push(aligns)
+                  if pm.line_len == 1 {
+                    meta[cur_tip] = BlockMeta::{
+                      kf: make_kf(10, true, 0),
+                      line_start: ncols,
+                      line_len: 0,
+                      extra: cells_start,
+                    }
+                    let pt = tree[cur_tip]
+                    tree[cur_tip] = BlockTree::{
+                      first_child: pt.first_child,
+                      last_child: pt.last_child,
+                      next_sibling: pt.next_sibling,
+                      extra2: aligns_idx,
+                    }
+                  } else {
+                    meta[cur_tip] = BlockMeta::{
+                      kf: pm.kf,
+                      line_start: pm.line_start,
+                      line_len: pm.line_len - 1,
+                      extra: pm.extra,
+                    }
+                    close_block(text, meta, tree, all_lines, extra_strs, cur_tip, ref_defs, opts)
                     let _ = open_stack.pop()
                     let parent_idx = open_stack[open_stack.length() - 1]
-                    let tbl = new_block(BlockKind::Table(aligns, header_cells, Array::new()))
-                    let _ = add_child(parent_idx, tbl)
+                    let _ = push_child_open(
+                      meta,
+                      tree,
+                      open_stack,
+                      parent_idx,
+                      make_kf(10, true, 0),
+                      ncols,
+                      0,
+                      cells_start,
+                      aligns_idx,
+                    )
                   }
                   consumed = true
                   break
@@ -771,82 +1073,100 @@ pub fn parse_blocks(src : String, opts : Options) -> BlockDoc {
           }
         }
 
-        // 8. Thematic Break (must be checked BEFORE list marker so `- - -` is HR!)
-        if (fb == 42 || fb == 45 || fb == 95) && scan_thematic_break(cur.src, non_ws, cur.end) {
-          close_unmatched()
-          close_list_if_needed()
-          let hr = new_block(BlockKind::ThematicBreak)
-          hr.open = false
-          let cidx = nodes.length()
-          nodes.push(hr)
-          nodes[container_idx].children.push(cidx)
+        // 8. Thematic Break (checked BEFORE list marker so `- - -` is HR!)
+        if (fb == 42 || fb == 45 || fb == 95) && scan_thematic_break(text, non_ws, line_end) {
+          if !unmatched_closed {
+            close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+            unmatched_closed = true
+          }
+          container_idx = close_list_and_para(text, meta, tree, all_lines, extra_strs, open_stack, ref_defs, opts)
+          let cidx = push_block(meta, tree, make_kf(9, false, 0), 0, 0, 0, 0)
+          add_block_child(tree, container_idx, cidx)
           consumed = true
           break
         }
 
-        // 9. List Item
-        let list_in_para = match nodes[container_idx].kind {
-          BlockKind::List(_, _, _) => false
-          _ => in_para
-        }
-        match scan_list_marker(cur.src, non_ws, cur.end, non_ws_col, list_in_para) {
-          Some(lm) => {
-            close_unmatched()
+        // 9. List Item (zero-alloc scan_list_marker_into!)
+        if fb == 45 || fb == 43 || fb == 42 || (fb >= 48 && fb <= 57) {
+          let list_in_para = if (meta[container_idx].kf & 15) == 2 { false } else { in_para }
+          if scan_list_marker_into(text, non_ws, line_end, non_ws_col, list_in_para, sc) {
+            if !unmatched_closed {
+              close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+              unmatched_closed = true
+            }
             let t = open_stack[open_stack.length() - 1]
-            match nodes[t].kind {
-              BlockKind::Paragraph => {
-                close_block(nodes, t, ref_defs, opts)
+            if (meta[t].kf & 15) == 4 {
+              close_block(text, meta, tree, all_lines, extra_strs, t, ref_defs, opts)
+              let _ = open_stack.pop()
+              container_idx = open_stack[open_stack.length() - 1]
+            }
+            let lm_ordered = sc.a != 0
+            let lm_delim = sc.b
+            let lm_start_num = sc.c
+            let lm_marker_end = sc.d
+            let lm_content_col = sc.e
+            let lm_is_empty = sc.flag
+            let cm = meta[container_idx]
+            let needs_new_list = if (cm.kf & 15) == 2 {
+              let o = (cm.kf & 512) != 0
+              let d = (cm.kf >> 10) & 255
+              !(o == lm_ordered && d == lm_delim)
+            } else {
+              true
+            }
+            if needs_new_list {
+              if (meta[container_idx].kf & 15) == 2 {
+                close_block(text, meta, tree, all_lines, extra_strs, container_idx, ref_defs, opts)
                 let _ = open_stack.pop()
                 container_idx = open_stack[open_stack.length() - 1]
               }
-              _ => ()
+              let lkf = make_kf(2, true, (if lm_ordered { 512 } else { 0 }) | (lm_delim << 10))
+              container_idx = push_child_open(meta, tree, open_stack, container_idx, lkf, 0, 0, lm_start_num, 0)
             }
-            // Check if container_idx is a matching List
-            let needs_new_list = match nodes[container_idx].kind {
-              BlockKind::List(o, d, _) => !(o == lm.ordered && d == lm.delim)
-              _ => true
-            }
-            if needs_new_list {
-              match nodes[container_idx].kind {
-                BlockKind::List(_, _, _) => {
-                  close_block(nodes, container_idx, ref_defs, opts)
-                  let _ = open_stack.pop()
-                  container_idx = open_stack[open_stack.length() - 1]
-                }
-                _ => ()
-              }
-              container_idx = add_child(
-                container_idx,
-                new_block(BlockKind::List(lm.ordered, lm.delim, lm.start_num)),
-              )
-            }
-            let base_col = cur.col
-            let item_indent_width = lm.content_col - base_col
-            // Advance cursor to item content column
-            cursor_skip_ws(cur)
-            let marker_len = lm.marker_end - cur.pos
-            cur.pos = lm.marker_end
-            cur.col = cur.col + marker_len
-            cur.partial = 0
-            if !lm.is_empty_line {
-              let delta = lm.content_col - cur.col
+            let base_col = ls.col
+            let item_indent_width = lm_content_col - base_col
+            let marker_len = lm_marker_end - non_ws
+            ls.pos = lm_marker_end
+            ls.col = non_ws_col + marker_len
+            ls.partial = 0
+            if !lm_is_empty {
+              let delta = lm_content_col - ls.col
               if delta > 0 {
-                cursor_advance_cols(cur, delta)
+                advance_cols_ls(ls, text, line_end, delta)
               }
-              container_idx = add_child(container_idx, new_block(BlockKind::Item(item_indent_width)))
+              indent_valid = false
+              container_idx = push_child_open(
+                meta,
+                tree,
+                open_stack,
+                container_idx,
+                make_kf(3, true, 0),
+                0,
+                0,
+                item_indent_width,
+                0,
+              )
               continue
             } else {
-              cur.pos = cur.end
-              container_idx = add_child(container_idx, new_block(BlockKind::Item(item_indent_width)))
+              ls.pos = line_end
+              container_idx = push_child_open(
+                meta,
+                tree,
+                open_stack,
+                container_idx,
+                make_kf(3, true, 0),
+                0,
+                0,
+                item_indent_width,
+                0,
+              )
               consumed = true
               break
             }
           }
-          None => ()
         }
       }
 
-      // No new block matched
       break
     }
 
@@ -855,90 +1175,68 @@ pub fn parse_blocks(src : String, opts : Options) -> BlockDoc {
       continue
     }
 
-    // Helper: clear ends_with_blank on all open containers when non-blank content is added
-    let clear_open_blanks = fn() -> Unit {
-      let mut si = 1
-      while si < open_stack.length() {
-        nodes[open_stack[si]].ends_with_blank = false
-        si = si + 1
-      }
+    // Step 3: Remaining line content (reuse indent_valid!)
+    if !indent_valid {
+      peek_indent_ls(ls, text, line_end)
+      indent_valid = true
     }
-
-    // Step 3: Remaining line content
-    let blank_rem = cursor_is_blank(cur)
+    let blank_rem = ls.non_ws == line_end
     if blank_rem {
-      close_unmatched()
+      if !unmatched_closed {
+        close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+        unmatched_closed = true
+      }
       let t = open_stack[open_stack.length() - 1]
-      match nodes[t].kind {
-        BlockKind::IndentedCode => {
-          nodes[t].lines.push(cursor_rest(cur))
-        }
-        BlockKind::Paragraph => {
-          close_block(nodes, t, ref_defs, opts)
+      let tk = meta[t].kf & 15
+      if tk == 6 {
+        append_block_line(meta, all_lines, t, LineSpan::{ start: ls.pos, end: line_end, pad: ls.partial })
+      } else {
+        if tk == 4 {
+          close_block(text, meta, tree, all_lines, extra_strs, t, ref_defs, opts)
           let _ = open_stack.pop()
-          // Mark open containers up to nearest BlockQuote as ending with blank
-          let mut si = open_stack.length() - 1
-          while si >= 1 {
-            match nodes[open_stack[si]].kind {
-              BlockKind::BlockQuote => break
-              _ => {
-                mark_ends_with_blank(nodes, open_stack[si])
-                si = si - 1
-              }
-            }
-          }
         }
-        _ => {
-          let mut si = open_stack.length() - 1
-          while si >= 1 {
-            match nodes[open_stack[si]].kind {
-              BlockKind::BlockQuote => break
-              _ => {
-                mark_ends_with_blank(nodes, open_stack[si])
-                si = si - 1
-              }
-            }
+        let mut si = open_stack.length() - 1
+        while si >= 1 {
+          if (meta[open_stack[si]].kf & 15) == 1 {
+            break
           }
+          mark_ends_with_blank(meta, tree, open_stack[si])
+          si = si - 1
         }
       }
     } else if !unmatched_closed && tip_is_para {
-      // Lazy paragraph continuation!
-      clear_open_blanks()
-      cursor_skip_ws(cur)
-      nodes[tip_idx].lines.push(cursor_rest(cur))
+      clear_open_blanks(meta, open_stack)
+      append_block_line(meta, all_lines, tip_idx, LineSpan::{ start: ls.non_ws, end: line_end, pad: 0 })
     } else {
-      close_unmatched()
+      if !unmatched_closed {
+        close_unmatched_blocks(text, meta, tree, all_lines, extra_strs, open_stack, matched, ref_defs, opts)
+        unmatched_closed = true
+      }
       let t = open_stack[open_stack.length() - 1]
-      match nodes[t].kind {
-        BlockKind::IndentedCode => {
-          clear_open_blanks()
-          nodes[t].lines.push(cursor_rest(cur))
-        }
-        BlockKind::Paragraph => {
-          clear_open_blanks()
-          cursor_skip_ws(cur)
-          nodes[t].lines.push(cursor_rest(cur))
-        }
-        _ => {
-          close_list_if_needed()
-          clear_open_blanks()
-          cursor_skip_ws(cur)
-          let p = new_block(BlockKind::Paragraph)
-          p.lines.push(cursor_rest(cur))
-          let _ = add_child(container_idx, p)
-        }
+      let tk = meta[t].kf & 15
+      if tk == 6 {
+        clear_open_blanks(meta, open_stack)
+        append_block_line(meta, all_lines, t, LineSpan::{ start: ls.pos, end: line_end, pad: ls.partial })
+      } else if tk == 4 {
+        clear_open_blanks(meta, open_stack)
+        append_block_line(meta, all_lines, t, LineSpan::{ start: ls.non_ws, end: line_end, pad: 0 })
+      } else {
+        container_idx = close_list_and_para(text, meta, tree, all_lines, extra_strs, open_stack, ref_defs, opts)
+        clear_open_blanks(meta, open_stack)
+        let lstart = all_lines.length()
+        all_lines.push(LineSpan::{ start: ls.non_ws, end: line_end, pad: 0 })
+        let _ = push_child_open(meta, tree, open_stack, container_idx, make_kf(4, true, 0), lstart, 1, 0, 0)
       }
     }
 
     line_start = next_line_start
   }
 
-  // Close all remaining open blocks bottom-up
   while open_stack.length() > 0 {
     let idx = open_stack[open_stack.length() - 1]
-    close_block(nodes, idx, ref_defs, opts)
+    close_block(text, meta, tree, all_lines, extra_strs, idx, ref_defs, opts)
     let _ = open_stack.pop()
   }
 
-  BlockDoc::{ nodes, ref_defs }
+  BlockDoc::{ src: text, meta, tree, all_lines, table_cells, table_aligns, extra_strs, ref_defs }
 }
