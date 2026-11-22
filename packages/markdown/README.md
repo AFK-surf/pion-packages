@@ -7,19 +7,21 @@ Idiomatic pure Pion port of Rust [`pulldown-cmark`](https://github.com/pulldown-
 - **Upstream**: [`pulldown-cmark/pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark) `v0.13.1` (MIT)
 - **Specification**: [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/) + GitHub Flavored Markdown (GFM) Tables, Strikethrough, Task Lists, Autolink Literals + CommonMark CJK-friendly emphasis amendments (Unicode 17)
 
-## Compliance & Test Coverage (`702 / 702` PASS)
+## Compliance & Test Coverage (`708 / 708` PASS)
 
 | Suite | Passed | Notes |
 | --- | ---: | --- |
 | CommonMark 0.31.2 official `spec.txt` | **652 / 652** | 100% byte-for-byte HTML parity |
 | GFM Tables (`gfm_table.rs`) | **9 / 9** | Column alignment, escaped pipes, paragraph interruption |
-| GFM Strikethrough (`gfm_strikethrough.rs`) | **3 / 3** | Single `~` and double `~~` delimiters |
-| GFM Task Lists (`gfm_tasklist.rs`) | **2 / 2** | Checked/unchecked checkboxes, nested lists |
-| GFM Autolink Literals | **8 / 8** | `www.*`, `http(s)://*`, emails, trailing punctuation & parens |
-| Smart Punctuation (`smart_punct.rs`) | **16 / 16** | Curly quotes, em/en dashes, ellipses |
+| GFM Strikethrough (`gfm_strikethrough.rs`) | **3 / 3** | Single `~` and double `~~` delimiters with strict flanking rules |
+| GFM Task Lists (`gfm_tasklist.rs`) | **2 / 2** | Checked/unchecked checkboxes, empty markers, nested lists |
+| GFM Autolink Literals | **8 / 8** | `www.*`, `http(s)://*`, `ftp://*`, `mailto:*`, `xmpp:*`, emails, entity & punct trimming |
+| Smart Punctuation (`smart_punct.rs`) | **16 / 16** | O(N) single-pass curly quotes, em/en dashes, ellipses |
 | CJK-Friendly Emphasis (`cjk_friendly_emphasis.rs` + toggle) | **11 / 11** | Full Unicode 17 CJK ranges, IVS & variation selectors |
-| Pathological 10k linear-time stress test | **1 / 1** | 10,000 `[` / `*a ` / `_a ` without quadratic blowup |
-| Wasm32 Smoke (`wasm_smoke`) | **PASS** | `pionc build --target wasm32` + Node.js execution verified |
+| Pathological & Extended Tests (`extensions_test.pion` + 10k stress) | **7 / 7** | Iterative block rendering (50k+ nesting, 0 SIGSEGV), O(N) inline parsing, `parse_with_offsets`, footnotes, YAML/Pluses frontmatter |
+| Red-Team P0 / P1 Audit (`audit/tests/redteam_test.pion`) | **P0 6/6, P1 41/41, OK 8/8** | 0 SIGSEGV, 0 direct-vs-parse divergences across 63,864 differential cases |
+| Upstream `pulldown-cmark 0.13.1` `table` / `strikethrough` / `regression` | **27/28, 14/15, 192/210** | 954 / 1,148 total across all upstream suites |
+| Wasm32 Smoke (`wasm_smoke`) | **PASS** | `pionc build --target wasm32` verified |
 
 ## Public API
 
@@ -46,12 +48,16 @@ let rendered = markdown::render_html(events)
 ```
 
 - `Options` (`val struct`): `tables`, `strikethrough`, `tasklists`, `autolinks`, `smart_punctuation`, `cjk_friendly`, with `Options::commonmark()` and `Options::gfm()`.
-- `Event`, `Tag`, `TagEnd`, `Alignment`, `CodeBlockKind`, `LinkType`
+- `ExtendedOptions` (`val struct`): wraps `base : Options` plus optional `footnotes`, `yaml_frontmatter`, `pluses_frontmatter`.
+- `Event`, `OffsetEvent`, `Tag`, `TagEnd`, `Alignment`, `CodeBlockKind`, `LinkType`, `MetadataBlockKind`
 - `parse(src : String, opts : Options) -> Array[Event]`
+- `parse_with_offsets(src : String, opts : Options) -> Array[OffsetEvent]` (source byte ranges `[start, end)` per event)
+- `parse_extended(src : String, opts : ExtendedOptions) -> Array[Event]`
 - `render_html(events : Array[Event]) -> String` (strict CommonMark 0.31.2 HTML)
 - `render_html_pulldown(events : Array[Event]) -> String` (`pulldown-cmark::html::push_html` byte-for-byte formatting)
 - `to_html(src : String, opts : Options) -> String` (direct zero-Event streaming HTML renderer)
 - `to_html_pulldown(src : String, opts : Options) -> String` (direct zero-Event streaming `pulldown-cmark` HTML renderer)
+- `to_html_extended(src : String, opts : ExtendedOptions) -> String` / `to_html_pulldown_extended(src : String, opts : ExtendedOptions) -> String`
 
 ## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=2`, `rounds=9`, SHA-256 Verified)
 
