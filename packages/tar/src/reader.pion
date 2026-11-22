@@ -1,11 +1,10 @@
 ///| Streaming TAR Reader (USTAR / PAX / GNU / V7 / STAR + GNU sparse 0.0 / 0.1 / 1.0 / oldgnu)
-///| with zero-copy `Bytes` payload slicing, cached `String` view for zero-alloc header strings,
-///| full 64-bit size/offset arithmetic, and explicit `Limits`.
+///| with zero-copy `Bytes` payload slicing, direct in-place header parsing (no whole-archive
+///| `String` copy), full 64-bit overflow-safe size/offset arithmetic, O(n) PAX parsing, and explicit `Limits`.
 
 ///| Streaming TAR archive reader operating over a zero-copy `Bytes` buffer.
 pub struct Reader {
   data : Bytes
-  data_str : String
   total_len : Int64
   limits : Limits
   mut pos : Int64
@@ -16,6 +15,9 @@ pub struct Reader {
   mut cur_is_sparse : Bool
   mut cur_sparse_datas : Array[SparseEntry]
   mut cur_data_read : Bool
+  mut cur_logical_pos : Int64
+  mut cur_sparse_idx : Int
+  mut cur_sparse_phys : Int64
   mut entries_read : Int
   mut eof : Bool
   mut sticky_err : Option[TarError]
@@ -30,7 +32,6 @@ pub fn Reader::new(data : Bytes) -> Reader {
 pub fn Reader::with_limits(data : Bytes, limits : Limits) -> Reader {
   Reader::{
     data: data,
-    data_str: data.to_string(),
     total_len: data.length().to_int64(),
     limits: limits,
     pos: 0L,
@@ -41,6 +42,9 @@ pub fn Reader::with_limits(data : Bytes, limits : Limits) -> Reader {
     cur_is_sparse: false,
     cur_sparse_datas: [],
     cur_data_read: true,
+    cur_logical_pos: 0L,
+    cur_sparse_idx: 0,
+    cur_sparse_phys: 0L,
     entries_read: 0,
     eof: false,
     sticky_err: Option::None,
@@ -51,6 +55,16 @@ pub fn Reader::with_limits(data : Bytes, limits : Limits) -> Reader {
 fn reader_fail(self : Reader, err : TarError) -> TarError {
   self.sticky_err = Option::Some(err)
   err
+}
+
+///| Returns true if the current entry is a sparse file.
+pub fn Reader::is_sparse(self : Reader) -> Bool {
+  self.cur_is_sparse
+}
+
+///| Returns the sparse data fragments of the current entry (empty for non-sparse entries).
+pub fn Reader::sparse_entries(self : Reader) -> Array[SparseEntry] {
+  self.cur_sparse_datas
 }
 
 ///| Check if string `s` starts with ASCII prefix `pfx` (zero allocation).
@@ -88,24 +102,25 @@ fn str_contains_comma(s : String) -> Bool {
   false
 }
 
-///| Set or overwrite key in an association list.
-fn kv_set(pairs : Array[(String, String)], key : String, value : String) -> Unit {
-  let n = pairs.length()
-  let mut i = 0
-  while i < n {
-    let (k, _) = pairs[i]
-    if k == key {
-      pairs[i] = (key, value)
-      return
+///| Set or overwrite key in an association list with O(1) index map lookup.
+fn kv_set_indexed(
+  pairs : Array[(String, String)],
+  index : Map[String, Int],
+  key : String,
+  value : String,
+) -> Unit {
+  match index.get(key) {
+    Some(idx) => pairs[idx] = (key, value)
+    None => {
+      index.set(key, pairs.length())
+      pairs.push((key, value))
     }
-    i = i + 1
   }
-  pairs.push((key, value))
 }
 
-///| Parse a PAX extended header payload from `data_str[start..end]` with O(n) cursor (no O(k²) slicing).
-fn parse_pax_payload_range(
-  data_str : String,
+///| Parse a PAX extended header payload from `data[start..end]` in O(n) time.
+fn parse_pax_payload(
+  data : Bytes,
   start : Int,
   end : Int,
   limits : Limits,
@@ -114,16 +129,18 @@ fn parse_pax_payload_range(
   if raw_len > limits.max_pax_bytes {
     return Err(TarError::LimitExceeded("PAX header exceeds max_pax_bytes"))
   }
+  let pax_str = data.slice(start, end).to_string()
   let records : Array[(String, String)] = []
+  let idx_map : Map[String, Int] = Map::new()
   let sparse_tokens : Array[String] = []
-  let mut pos = start
+  let mut pos = 0
   let mut rec_count = 0
-  while pos < end {
+  while pos < raw_len {
     rec_count = rec_count + 1
     if rec_count > limits.max_pax_records {
       return Err(TarError::LimitExceeded("PAX record count exceeds max_pax_records"))
     }
-    let (k, v, next_pos) = match parse_pax_record_at(data_str, pos, end) {
+    let (k, v, next_pos) = match parse_pax_record_at(pax_str, pos, raw_len) {
       Ok(t) => t
       Err(e) => return Err(e)
     }
@@ -140,7 +157,7 @@ fn parse_pax_payload_range(
       }
       sparse_tokens.push(v)
     } else {
-      kv_set(records, k, v)
+      kv_set_indexed(records, idx_map, k, v)
     }
   }
   if sparse_tokens.length() > 0 {
@@ -153,7 +170,7 @@ fn parse_pax_payload_range(
       sb.write_string(sparse_tokens[i])
       i = i + 1
     }
-    kv_set(records, "GNU.sparse.map", sb.to_string())
+    kv_set_indexed(records, idx_map, "GNU.sparse.map", sb.to_string())
   }
   Ok(records)
 }
@@ -222,17 +239,13 @@ fn parse_gnu_sparse_map_0x1(
 ///| Parse GNU PAX sparse 1.0 map from the beginning of the physical data section.
 fn parse_gnu_sparse_map_1x0(
   data : Bytes,
-  data_str : String,
   start_pos : Int64,
   phys_len : Int64,
   total_len : Int64,
   limits : Limits,
 ) -> Result[(Array[SparseEntry], Int64), TarError] {
-  let avail = if start_pos + phys_len <= total_len {
-    phys_len
-  } else {
-    total_len - start_pos
-  }
+  let rem = total_len - start_pos
+  let avail = if phys_len <= rem { phys_len } else { rem }
   let mut consumed : Int64 = 0L
   let mut cursor : Int64 = start_pos
   let mut nl_count : Int64 = 0L
@@ -267,7 +280,7 @@ fn parse_gnu_sparse_map_1x0(
       while p < limit_pos && data[p.to_int()].to_int() != 10 {
         p = p + 1L
       }
-      tokens.push(data_str.slice(tok_start.to_int(), p.to_int()))
+      tokens.push(data.slice(tok_start.to_int(), p.to_int()).to_string())
       p = p + 1L
       cursor = p
       tok_start = p
@@ -350,7 +363,7 @@ fn parse_old_gnu_sparse_map(
     if ext_consumed + 512L > limits.max_pax_bytes.to_int64() {
       return Err(TarError::LimitExceeded("old GNU sparse extension exceeds max_pax_bytes"))
     }
-    if next_off + 512L > total_len {
+    if 512L > total_len - next_off {
       return Err(TarError::UnexpectedEof)
     }
     let boff = next_off.to_int()
@@ -415,8 +428,8 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
   }
 
   let typeflag = self.data[off + 156]
-  let mut name = parse_c_string_from_str(self.data, self.data_str, off + 0, 100)
-  let linkname = parse_c_string_from_str(self.data, self.data_str, off + 157, 100)
+  let mut name = parse_c_string(self.data, off + 0, 100)
+  let linkname = parse_c_string(self.data, off + 157, 100)
   let mode = match parse_numeric_slice(self.data, off + 100, off + 108) {
     Ok(v) => v
     Err(e) => return Err(e)
@@ -450,8 +463,8 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
   match raw_fmt {
     V7 => ()
     _ => {
-      uname = parse_c_string_from_str(self.data, self.data_str, off + 265, 32)
-      gname = parse_c_string_from_str(self.data, self.data_str, off + 297, 32)
+      uname = parse_c_string(self.data, off + 265, 32)
+      gname = parse_c_string(self.data, off + 297, 32)
       devmajor = match parse_numeric_slice(self.data, off + 329, off + 337) {
         Ok(v) => v
         Err(e) => return Err(e)
@@ -463,7 +476,7 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
       let mut prefix = ""
       match raw_fmt {
         Ustar => {
-          prefix = parse_c_string_from_str(self.data, self.data_str, off + 345, 155)
+          prefix = parse_c_string(self.data, off + 345, 155)
           let strict_ok = !has_non_ascii &&
           self.data[off + 107].to_int() == 0 &&
           self.data[off + 115].to_int() == 0 &&
@@ -477,7 +490,7 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
           }
         }
         Star => {
-          prefix = parse_c_string_from_str(self.data, self.data_str, off + 345, 131)
+          prefix = parse_c_string(self.data, off + 345, 131)
           let at = match parse_numeric_slice(self.data, off + 476, off + 488) {
             Ok(v) => v
             Err(e) => return Err(e)
@@ -506,7 +519,7 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
           if !gnu_time_ok {
             access_time = Timestamp::zero()
             change_time = Timestamp::zero()
-            let pfx_cand = parse_c_string_from_str(self.data, self.data_str, off + 345, 155)
+            let pfx_cand = parse_c_string(self.data, off + 345, 155)
             if is_ascii(pfx_cand) {
               prefix = pfx_cand
             }
@@ -543,6 +556,23 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
   Ok(Option::Some((hdr, off)))
 }
 
+///| Convert a `TarFormat` bitmask (`1=USTAR`, `2=PAX`, `4=GNU`) back to `TarFormat`.
+fn format_from_mask(mask : Int) -> TarFormat {
+  let mut m = mask
+  if (m & 1) != 0 && (m & 2) != 0 {
+    m = 1
+  }
+  if m == 1 {
+    TarFormat::Ustar
+  } else if m == 2 {
+    TarFormat::Pax
+  } else if m == 4 {
+    TarFormat::Gnu
+  } else {
+    TarFormat::Unknown
+  }
+}
+
 ///| Advance to the next entry header in the archive. Returns `Ok(None)` at normal EOF.
 pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
   match self.sticky_err {
@@ -553,13 +583,12 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     return Ok(Option::None)
   }
 
-  // Skip any unread data + padding from previous entry
+  // Skip any unread data + padding from previous entry (overflow-safe)
   if !self.cur_data_read {
-    let data_end = self.cur_data_start + self.cur_data_len
-    if data_end > self.total_len {
+    if self.cur_data_len < 0L || self.cur_data_len > self.total_len - self.cur_data_start {
       return Err(reader_fail(self, TarError::UnexpectedEof))
     }
-    self.pos = data_end
+    self.pos = self.cur_data_start + self.cur_data_len
     self.cur_data_read = true
   }
   if self.cur_pad > 0L {
@@ -574,6 +603,7 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     self.cur_pad = 0L
   }
 
+  let mut meta_fmt_mask = 7 // 1=USTAR, 2=PAX, 4=GNU
   let mut has_pax = false
   let mut pax_records : Array[(String, String)] = []
   let mut has_gnu_long_name = false
@@ -591,16 +621,17 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     let tf = raw_hdr.typeflag
     // Handle PAX 'x' / 'g' meta headers
     if tf == type_x_header() || tf == type_x_global_header() {
+      meta_fmt_mask = meta_fmt_mask & 2
       if raw_hdr.size < 0L {
         return Err(reader_fail(self, TarError::InvalidHeader("negative PAX header size")))
       }
       if raw_hdr.size > self.limits.max_pax_bytes.to_int64() {
         return Err(reader_fail(self, TarError::LimitExceeded("PAX header exceeds max_pax_bytes")))
       }
-      let data_end = self.pos + raw_hdr.size
-      if data_end > self.total_len {
+      if raw_hdr.size > self.total_len - self.pos {
         return Err(reader_fail(self, TarError::UnexpectedEof))
       }
+      let data_end = self.pos + raw_hdr.size
       let pax_start = self.pos.to_int()
       let pax_end = data_end.to_int()
       self.pos = data_end
@@ -610,7 +641,7 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
       } else {
         self.pos = self.pos + pad
       }
-      let parsed = match parse_pax_payload_range(self.data_str, pax_start, pax_end, self.limits) {
+      let parsed = match parse_pax_payload(self.data, pax_start, pax_end, self.limits) {
         Ok(r) => r
         Err(e) => return Err(reader_fail(self, e))
       }
@@ -627,7 +658,8 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
           if pk == "path" && pv.length() > 0 {
             g_name = pv
           } else if str_starts_with(pk, "SCHILY.xattr.") {
-            kv_set(g_xattrs, pk.slice(13, pk.length()), pv)
+            // Keys in `parsed` are already deduplicated by `parse_pax_payload`.
+            g_xattrs.push((pk.slice(13, pk.length()), pv))
           }
           pi = pi + 1
         }
@@ -638,6 +670,9 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
         self.cur_is_sparse = false
         self.cur_sparse_datas = []
         self.cur_data_read = true
+        self.cur_logical_pos = 0L
+        self.cur_sparse_idx = 0
+        self.cur_sparse_phys = self.pos
         return Ok(
           Option::Some(
             Header::{
@@ -646,7 +681,7 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
               mode: 0L,
               xattrs: g_xattrs,
               pax_records: parsed,
-              format: TarFormat::Pax,
+              format: format_from_mask(meta_fmt_mask),
             },
           ),
         )
@@ -658,22 +693,18 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
 
     // Handle GNU 'L' / 'K' meta headers
     if tf == type_gnu_long_name() || tf == type_gnu_long_link() {
+      meta_fmt_mask = meta_fmt_mask & 4
       if raw_hdr.size < 0L {
         return Err(reader_fail(self, TarError::InvalidHeader("negative GNU long header size")))
       }
       if raw_hdr.size > self.limits.max_pax_bytes.to_int64() {
         return Err(reader_fail(self, TarError::LimitExceeded("GNU long header exceeds max_pax_bytes")))
       }
-      let data_end = self.pos + raw_hdr.size
-      if data_end > self.total_len {
+      if raw_hdr.size > self.total_len - self.pos {
         return Err(reader_fail(self, TarError::UnexpectedEof))
       }
-      let s = parse_c_string_from_str(
-        self.data,
-        self.data_str,
-        self.pos.to_int(),
-        raw_hdr.size.to_int(),
-      )
+      let data_end = self.pos + raw_hdr.size
+      let s = parse_c_string(self.data, self.pos.to_int(), raw_hdr.size.to_int())
       self.pos = data_end
       let pad = block_padding(raw_hdr.size)
       if self.total_len - self.pos < pad {
@@ -719,7 +750,11 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
       self.cur_logical_size = raw_hdr.size
       self.cur_pad = block_padding(phys_size)
       self.cur_is_sparse = false
+      self.cur_sparse_datas = []
       self.cur_data_read = false
+      self.cur_logical_pos = 0L
+      self.cur_sparse_idx = 0
+      self.cur_sparse_phys = self.pos
       if final_tf == raw_hdr.typeflag {
         return Ok(Option::Some(raw_hdr))
       }
@@ -737,11 +772,24 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     let mut access_time = raw_hdr.access_time
     let mut change_time = raw_hdr.change_time
     let xattrs : Array[(String, String)] = []
-    let mut fmt = raw_hdr.format
 
-    // Merge PAX records
+    let block_mask = match raw_hdr.format {
+      Ustar => 3 // USTAR | PAX
+      Pax => 2
+      Gnu => 4
+      _ => 0
+    }
+    let mut fmt_mask = meta_fmt_mask & block_mask
+
+    let mut sp_major = ""
+    let mut sp_minor = ""
+    let mut sp_map = ""
+    let mut sp_name = ""
+    let mut sp_size = ""
+    let mut sp_realsize = ""
+
+    // Merge PAX records in a single O(n) pass
     if has_pax {
-      fmt = TarFormat::Pax
       let mut pi = 0
       while pi < pax_records.length() {
         let (pk, pv) = pax_records[pi]
@@ -785,20 +833,32 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
               Err(e) => return Err(reader_fail(self, e))
             }
           } else if str_starts_with(pk, "SCHILY.xattr.") {
-            kv_set(xattrs, pk.slice(13, pk.length()), pv)
+            // Keys in `pax_records` are already unique.
+            xattrs.push((pk.slice(13, pk.length()), pv))
+          } else if pk == "GNU.sparse.major" {
+            sp_major = pv
+          } else if pk == "GNU.sparse.minor" {
+            sp_minor = pv
+          } else if pk == "GNU.sparse.map" {
+            sp_map = pv
+          } else if pk == "GNU.sparse.name" {
+            sp_name = pv
+          } else if pk == "GNU.sparse.size" {
+            sp_size = pv
+          } else if pk == "GNU.sparse.realsize" {
+            sp_realsize = pv
           }
         }
         pi = pi + 1
       }
     }
 
-    if has_gnu_long_name {
+    // Apply GNU LongName/LongLink only when non-empty (matches Go `if gnuLongName != ""`)
+    if has_gnu_long_name && gnu_long_name.length() > 0 {
       name = gnu_long_name
-      fmt = TarFormat::Gnu
     }
-    if has_gnu_long_link {
+    if has_gnu_long_link && gnu_long_link.length() > 0 {
       linkname = gnu_long_link
-      fmt = TarFormat::Gnu
     }
 
     let mut final_tf = tf
@@ -824,10 +884,11 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
 
     // Handle sparse files
     if final_tf == type_gnu_sparse() {
-      if !format_equals(raw_hdr.format, TarFormat::Gnu) {
+      // Check raw block magic directly (survives pre-Go1.8 atime prefix fallback)
+      if !is_raw_gnu_magic(self.data, hdr_off) {
         return Err(reader_fail(self, TarError::InvalidHeader("TypeGNUSparse requires GNU format")))
       }
-      fmt = TarFormat::Gnu
+      fmt_mask = fmt_mask & 4
       let (real_sz, spd, ext_bytes) = match parse_old_gnu_sparse_map(
         self.data,
         hdr_off,
@@ -846,40 +907,18 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
       is_sparse = true
       sparse_datas = spd
     } else if has_pax {
-      let sp_major = match kv_get(pax_records, "GNU.sparse.major") {
-        Some(s) => s
-        None => ""
-      }
-      let sp_minor = match kv_get(pax_records, "GNU.sparse.minor") {
-        Some(s) => s
-        None => ""
-      }
-      let has_sp_map = match kv_get(pax_records, "GNU.sparse.map") {
-        Some(_) => true
-        None => false
-      }
       let is_0x = (sp_major == "0" && (sp_minor == "0" || sp_minor == "1")) ||
-      (sp_major.length() == 0 && sp_minor.length() == 0 && has_sp_map)
+      (sp_major.length() == 0 && sp_minor.length() == 0 && sp_map.length() > 0)
       let is_1x0 = sp_major == "1" && sp_minor == "0"
       if is_0x || is_1x0 {
+        fmt_mask = fmt_mask & 2
         if is_header_only_type(final_tf) {
           return Err(reader_fail(self, TarError::InvalidSparse("header-only type cannot be sparse")))
         }
-        match kv_get(pax_records, "GNU.sparse.name") {
-          Some(sn) =>
-          if sn.length() > 0 {
-            name = sn
-          }
-          None => ()
+        if sp_name.length() > 0 {
+          name = sp_name
         }
-        let sp_size_str = match kv_get(pax_records, "GNU.sparse.size") {
-          Some(s) => s
-          None =>
-          match kv_get(pax_records, "GNU.sparse.realsize") {
-            Some(s) => s
-            None => ""
-          }
-        }
+        let sp_size_str = if sp_size.length() > 0 { sp_size } else { sp_realsize }
         if sp_size_str.length() > 0 {
           logical_size = match parse_int64_dec(sp_size_str) {
             Ok(v) => v
@@ -889,7 +928,6 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
         if is_1x0 {
           let (spd, map_bytes) = match parse_gnu_sparse_map_1x0(
             self.data,
-            self.data_str,
             data_start,
             data_len,
             self.total_len,
@@ -933,6 +971,9 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     self.cur_is_sparse = is_sparse
     self.cur_sparse_datas = sparse_datas
     self.cur_data_read = false
+    self.cur_logical_pos = 0L
+    self.cur_sparse_idx = 0
+    self.cur_sparse_phys = data_start
 
     let final_hdr = Header::{
       typeflag: final_tf,
@@ -951,11 +992,96 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
       devminor: raw_hdr.devminor,
       xattrs: xattrs,
       pax_records: if has_pax { pax_records } else { [] },
-      format: fmt,
+      format: format_from_mask(fmt_mask),
     }
     return Ok(Option::Some(final_hdr))
   }
   Ok(Option::None)
+}
+
+///| Stream up to `max_bytes` logical bytes from the current entry (returns empty `Bytes` at entry EOF).
+///| Allows reading large or sparse entries in bounded memory without materializing the entire file.
+pub fn Reader::read_chunk(self : Reader, max_bytes : Int) -> Result[Bytes, TarError] {
+  match self.sticky_err {
+    Some(e) => return Err(e)
+    None => ()
+  }
+  if max_bytes <= 0 || self.cur_data_read {
+    return Ok(Bytes::new(0))
+  }
+  if self.cur_data_len < 0L || self.cur_data_len > self.total_len - self.cur_data_start {
+    return Err(reader_fail(self, TarError::UnexpectedEof))
+  }
+  let data_end = self.cur_data_start + self.cur_data_len
+  let rem = self.cur_logical_size - self.cur_logical_pos
+  if rem <= 0L {
+    self.pos = data_end
+    self.cur_data_read = true
+    return Ok(Bytes::new(0))
+  }
+  let want64 = if rem < max_bytes.to_int64() { rem } else { max_bytes.to_int64() }
+  let want = want64.to_int()
+  if !self.cur_is_sparse {
+    let start = (self.cur_data_start + self.cur_logical_pos).to_int()
+    self.cur_logical_pos = self.cur_logical_pos + want64
+    if self.cur_logical_pos >= self.cur_logical_size {
+      self.pos = data_end
+      self.cur_data_read = true
+    }
+    return Ok(self.data.slice(start, start + want))
+  }
+  let out = Bytes::new(want)
+  let win_start = self.cur_logical_pos
+  let win_end = win_start + want64
+  while self.cur_sparse_idx < self.cur_sparse_datas.length() {
+    let seg = self.cur_sparse_datas[self.cur_sparse_idx]
+    if seg.length == 0L {
+      self.cur_sparse_idx = self.cur_sparse_idx + 1
+      continue
+    }
+    let seg_end = seg.offset + seg.length
+    if seg.offset >= win_end {
+      break
+    }
+    if seg_end <= win_start {
+      if seg.length > data_end - self.cur_sparse_phys {
+        return Err(reader_fail(self, TarError::InvalidSparse("sparse file references non-existent data")))
+      }
+      self.cur_sparse_phys = self.cur_sparse_phys + seg.length
+      self.cur_sparse_idx = self.cur_sparse_idx + 1
+      continue
+    }
+    let ov_start = if win_start > seg.offset { win_start } else { seg.offset }
+    let ov_end = if win_end < seg_end { win_end } else { seg_end }
+    let ov_len = ov_end - ov_start
+    let seg_off_in = ov_start - seg.offset
+    if seg_off_in + ov_len > data_end - self.cur_sparse_phys {
+      return Err(reader_fail(self, TarError::InvalidSparse("sparse file references non-existent data")))
+    }
+    let dst_off = (ov_start - win_start).to_int()
+    let src_off = (self.cur_sparse_phys + seg_off_in).to_int()
+    let n = ov_len.to_int()
+    let mut j = 0
+    while j < n {
+      out[dst_off + j] = self.data[src_off + j]
+      j = j + 1
+    }
+    if seg_end <= win_end {
+      self.cur_sparse_phys = self.cur_sparse_phys + seg.length
+      self.cur_sparse_idx = self.cur_sparse_idx + 1
+    } else {
+      break
+    }
+  }
+  self.cur_logical_pos = win_end
+  if self.cur_logical_pos >= self.cur_logical_size {
+    if self.cur_sparse_phys < data_end {
+      return Err(reader_fail(self, TarError::InvalidSparse("sparse file contains unreferenced data")))
+    }
+    self.pos = data_end
+    self.cur_data_read = true
+  }
+  Ok(out)
 }
 
 ///| Read the full logical data of the current entry.
@@ -968,10 +1094,10 @@ pub fn Reader::read_data(self : Reader) -> Result[Bytes, TarError] {
   if self.cur_data_read {
     return Ok(Bytes::new(0))
   }
-  let data_end = self.cur_data_start + self.cur_data_len
-  if data_end > self.total_len {
+  if self.cur_data_len < 0L || self.cur_data_len > self.total_len - self.cur_data_start {
     return Err(reader_fail(self, TarError::UnexpectedEof))
   }
+  let data_end = self.cur_data_start + self.cur_data_len
   self.pos = data_end
   self.cur_data_read = true
 
@@ -991,13 +1117,24 @@ pub fn Reader::read_data(self : Reader) -> Result[Bytes, TarError] {
   while i < self.cur_sparse_datas.length() {
     let seg = self.cur_sparse_datas[i]
     if seg.length > 0L {
-      if src_pos + seg.length > data_end {
+      if seg.length > data_end - src_pos {
         return Err(reader_fail(self, TarError::InvalidSparse("sparse file references non-existent data")))
       }
       let dst_off = seg.offset.to_int()
       let src_off = src_pos.to_int()
       let n = seg.length.to_int()
       let mut j = 0
+      while j + 8 <= n {
+        out[dst_off + j] = self.data[src_off + j]
+        out[dst_off + j + 1] = self.data[src_off + j + 1]
+        out[dst_off + j + 2] = self.data[src_off + j + 2]
+        out[dst_off + j + 3] = self.data[src_off + j + 3]
+        out[dst_off + j + 4] = self.data[src_off + j + 4]
+        out[dst_off + j + 5] = self.data[src_off + j + 5]
+        out[dst_off + j + 6] = self.data[src_off + j + 6]
+        out[dst_off + j + 7] = self.data[src_off + j + 7]
+        j = j + 8
+      }
       while j < n {
         out[dst_off + j] = self.data[src_off + j]
         j = j + 1
@@ -1013,21 +1150,40 @@ pub fn Reader::read_data(self : Reader) -> Result[Bytes, TarError] {
 }
 
 ///| Read all entries from a TAR archive using default limits.
+///| Cumulative materialized payload bytes are capped at `Limits::default().max_entry_size`.
 pub fn read_all(data : Bytes) -> Result[Array[Entry], TarError] {
   read_all_with_limits(data, Limits::default())
 }
 
 ///| Read all entries from a TAR archive using custom limits.
+///| Cumulative materialized payload bytes are capped at `limits.max_entry_size` to prevent sparse OOM bombs.
 pub fn read_all_with_limits(data : Bytes, limits : Limits) -> Result[Array[Entry], TarError] {
   let r = Reader::with_limits(data, limits)
   let out : Array[Entry] = []
+  let mut total_bytes : Int64 = 0L
   while true {
     match r.next() {
       Ok(Some(hdr)) => {
+        let entry_sz = if is_header_only_type(hdr.typeflag) ||
+        hdr.typeflag == type_x_global_header() {
+          0L
+        } else {
+          hdr.size
+        }
+        if entry_sz < 0L ||
+        entry_sz > limits.max_entry_size ||
+        total_bytes > limits.max_entry_size - entry_sz {
+          return Err(
+            TarError::LimitExceeded(
+              "total materialized archive size exceeds max_entry_size",
+            ),
+          )
+        }
         let body = match r.read_data() {
           Ok(b) => b
           Err(e) => return Err(e)
         }
+        total_bytes = total_bytes + body.length().to_int64()
         out.push(Entry::new(hdr, body))
       }
       Ok(None) => return Ok(out)

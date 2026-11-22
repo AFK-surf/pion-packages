@@ -1,10 +1,21 @@
-///| Streaming TAR Writer (USTAR / PAX / GNU) backed by a single `StringBuilder` buffer
-///| for native `memcpy` throughput, reusable 512B header block, zero per-header temp arrays,
-///| and deterministic PAX key ordering.
+///| Streaming TAR Writer (USTAR / PAX / GNU) backed by a chunked `Bytes` slab buffer
+///| with explicit `Int64` 2 GiB archive-size guard (preventing 32-bit length wrap / heap overflow),
+///| zero-copy staging for large payloads, reusable 512B header block, O(n log n) PAX sorting,
+///| and Go `archive/tar` byte-level parity.
+
+///| Maximum safe TAR archive size in bytes (including the 1024-byte EOF trailer):
+///| `INT32_MAX - 1023 = 2_147_482_624` (a 512-byte multiple strictly below `2^31`).
+let max_archive_bytes : Int64 = 2147482624L
+
+///| Payloads at or above this threshold bypass `StringBuilder` and are staged as zero-copy `Bytes` chunks.
+let large_chunk_threshold : Int = 65536
 
 ///| Streaming TAR archive writer.
 pub struct Writer {
-  sb : StringBuilder
+  chunks : Array[Bytes]
+  mut sb : StringBuilder
+  mut sb_len : Int
+  mut total_bytes : Int64
   blk : Bytes
   zeros : String // 1024 zero bytes for fast padding & EOF trailer writes
   mut dirty_end : Int
@@ -22,7 +33,10 @@ pub fn Writer::new() -> Writer {
 pub fn Writer::with_capacity(cap : Int) -> Writer {
   let c = if cap > 1024 { cap } else { 1024 }
   Writer::{
+    chunks: [],
     sb: StringBuilder::with_capacity(c),
+    sb_len: 0,
+    total_bytes: 0L,
     blk: Bytes::new(512),
     zeros: Bytes::new(1024).to_string(),
     dirty_end: 0,
@@ -30,6 +44,101 @@ pub fn Writer::with_capacity(cap : Int) -> Writer {
     pad: 0L,
     closed: false,
   }
+}
+
+///| Check that adding `add` bytes (plus the 1024-byte EOF trailer) stays within `max_archive_bytes`.
+fn writer_check_size(self : Writer, add : Int64) -> Result[Unit, TarError] {
+  if add < 0L || add > max_archive_bytes - 1024L - self.total_bytes {
+    return Err(TarError::LimitExceeded("archive size exceeds 2 GiB Bytes limit"))
+  }
+  Ok(())
+}
+
+///| Flush buffered `StringBuilder` bytes into `self.chunks`.
+fn writer_flush_sb(self : Writer) -> Unit {
+  if self.sb_len > 0 {
+    self.chunks.push(self.sb.to_string().to_bytes())
+    self.sb = StringBuilder::with_capacity(4096)
+    self.sb_len = 0
+  }
+}
+
+///| Concatenate an array of `Bytes` chunks via native `Bytes::concat` (`memcpy`) in balanced order.
+fn concat_chunks(chunks : Array[Bytes]) -> Bytes {
+  let n = chunks.length()
+  if n == 0 {
+    return Bytes::new(0)
+  }
+  if n == 1 {
+    return chunks[0]
+  }
+  let mut cur = chunks
+  while cur.length() > 1 {
+    let next : Array[Bytes] = Array::with_capacity((cur.length() + 1) / 2)
+    let mut i = 0
+    while i + 1 < cur.length() {
+      next.push(cur[i].concat(cur[i + 1]))
+      i = i + 2
+    }
+    if i < cur.length() {
+      next.push(cur[i])
+    }
+    cur = next
+  }
+  cur[0]
+}
+
+///| Append `len` bytes from `src[0..len]` to the writer buffer (guarding total archive size).
+fn writer_append_bytes(self : Writer, src : Bytes, len : Int) -> Result[Unit, TarError] {
+  if len <= 0 {
+    return Ok(())
+  }
+  match writer_check_size(self, len.to_int64()) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  if len >= large_chunk_threshold && len == src.length() {
+    writer_flush_sb(self)
+    self.chunks.push(src)
+    self.total_bytes = self.total_bytes + len.to_int64()
+    return Ok(())
+  }
+  let s = if len == src.length() { src.to_string() } else { src.slice(0, len).to_string() }
+  self.sb.write_string(s)
+  self.sb_len = self.sb_len + len
+  self.total_bytes = self.total_bytes + len.to_int64()
+  Ok(())
+}
+
+///| Append a `String`'s raw bytes to the writer buffer (guarding total archive size).
+fn writer_append_str(self : Writer, s : String) -> Result[Unit, TarError] {
+  let len = s.length()
+  if len <= 0 {
+    return Ok(())
+  }
+  match writer_check_size(self, len.to_int64()) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  self.sb.write_string(s)
+  self.sb_len = self.sb_len + len
+  self.total_bytes = self.total_bytes + len.to_int64()
+  Ok(())
+}
+
+///| Append `len` zero bytes (`len <= 1024`).
+fn writer_append_zeros(self : Writer, len : Int) -> Result[Unit, TarError] {
+  if len <= 0 {
+    return Ok(())
+  }
+  match writer_check_size(self, len.to_int64()) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  self.sb.write_substring(self.zeros, 0, len)
+  self.sb_len = self.sb_len + len
+  self.total_bytes = self.total_bytes + len.to_int64()
+  Ok(())
 }
 
 ///| Reset the dirty prefix of the reusable 512-byte header block to all zeros.
@@ -65,7 +174,10 @@ fn writer_flush_pad(self : Writer) -> Result[Unit, TarError] {
     return Err(TarError::IncompleteWrite(self.remaining))
   }
   if self.pad > 0L {
-    self.sb.write_substring(self.zeros, 0, self.pad.to_int())
+    match writer_append_zeros(self, self.pad.to_int()) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
     self.pad = 0L
   }
   Ok(())
@@ -85,29 +197,129 @@ fn is_basic_pax_key(k : String) -> Bool {
   k == "ctime"
 }
 
-///| Sort `(key, value)` pairs lexicographically by key.
+///| Sort `(key, value)` pairs lexicographically by key in O(n log n) via bottom-up merge sort.
 fn sort_kv_pairs(pairs : Array[(String, String)]) -> Unit {
   let n = pairs.length()
-  let mut i = 1
-  while i < n {
-    let cur = pairs[i]
-    let (ck, _) = cur
-    let mut j = i - 1
-    while j >= 0 {
-      let (jk, _) = pairs[j]
-      if jk > ck {
-        pairs[j + 1] = pairs[j]
-        j = j - 1
-      } else {
-        break
+  if n <= 16 {
+    let mut i = 1
+    while i < n {
+      let cur = pairs[i]
+      let (ck, _) = cur
+      let mut j = i - 1
+      while j >= 0 {
+        let (jk, _) = pairs[j]
+        if jk > ck {
+          pairs[j + 1] = pairs[j]
+          j = j - 1
+        } else {
+          break
+        }
       }
+      pairs[j + 1] = cur
+      i = i + 1
     }
-    pairs[j + 1] = cur
-    i = i + 1
+    return
+  }
+  let aux : Array[(String, String)] = Array::with_capacity(n)
+  let mut k = 0
+  while k < n {
+    aux.push(pairs[k])
+    k = k + 1
+  }
+  let mut width = 1
+  while width < n {
+    let mut left = 0
+    while left < n {
+      let mid = if left + width < n { left + width } else { n }
+      let right = if left + 2 * width < n { left + 2 * width } else { n }
+      let mut i = left
+      let mut j = mid
+      let mut out = left
+      while i < mid && j < right {
+        let (ik, _) = pairs[i]
+        let (jk, _) = pairs[j]
+        if ik <= jk {
+          aux[out] = pairs[i]
+          i = i + 1
+        } else {
+          aux[out] = pairs[j]
+          j = j + 1
+        }
+        out = out + 1
+      }
+      while i < mid {
+        aux[out] = pairs[i]
+        i = i + 1
+        out = out + 1
+      }
+      while j < right {
+        aux[out] = pairs[j]
+        j = j + 1
+        out = out + 1
+      }
+      let mut c = left
+      while c < right {
+        pairs[c] = aux[c]
+        c = c + 1
+      }
+      left = left + 2 * width
+    }
+    width = width * 2
   }
 }
 
-///| Build a PAX pseudo-header filename: `<dir>/PaxHeaders.0/<file>`.
+///| Clean a POSIX slash-separated path matching Go's `path.Clean`.
+fn posix_path_clean(p : String) -> String {
+  let n = p.length()
+  if n == 0 {
+    return "."
+  }
+  let rooted = p.code_unit_at(0) == 47
+  let segs : Array[String] = []
+  let mut i = 0
+  while i < n {
+    while i < n && p.code_unit_at(i) == 47 {
+      i = i + 1
+    }
+    if i >= n {
+      break
+    }
+    let start = i
+    while i < n && p.code_unit_at(i) != 47 {
+      i = i + 1
+    }
+    let seg = p.slice(start, i)
+    if seg == "." {
+      continue
+    } else if seg == ".." {
+      if segs.length() > 0 && segs[segs.length() - 1] != ".." {
+        let _ = segs.pop()
+      } else if !rooted {
+        segs.push("..")
+      }
+    } else {
+      segs.push(seg)
+    }
+  }
+  if segs.length() == 0 {
+    return if rooted { "/" } else { "." }
+  }
+  let sb = StringBuilder::with_capacity(n)
+  if rooted {
+    sb.write_string("/")
+  }
+  let mut j = 0
+  while j < segs.length() {
+    if j > 0 {
+      sb.write_string("/")
+    }
+    sb.write_string(segs[j])
+    j = j + 1
+  }
+  sb.to_string()
+}
+
+///| Build a PAX pseudo-header filename matching Go's `path.Join(dir, "PaxHeaders.0", file)`.
 fn make_pax_header_name(real_name : String) -> String {
   let n = real_name.length()
   let mut slash = -1
@@ -119,9 +331,9 @@ fn make_pax_header_name(real_name : String) -> String {
     }
     i = i - 1
   }
-  let dir = if slash >= 0 { real_name.slice(0, slash) } else { "" }
+  let dir = if slash >= 0 { real_name.slice(0, slash + 1) } else { "" }
   let file = if slash >= 0 { real_name.slice(slash + 1, n) } else { real_name }
-  if dir.length() == 0 {
+  let joined = if dir.length() == 0 {
     if file.length() == 0 {
       "PaxHeaders.0"
     } else {
@@ -132,6 +344,7 @@ fn make_pax_header_name(real_name : String) -> String {
   } else {
     dir + "/PaxHeaders.0/" + file
   }
+  posix_path_clean(joined)
 }
 
 ///| Stamp magic + version + checksum into a 512-byte header block.
@@ -162,12 +375,7 @@ fn finalize_header_block_bounded(blk : Bytes, fmt : TarFormat, scan_end : Int) -
   stamp_checksum_bounded(blk, 0, scan_end)
 }
 
-///| Stamp magic + version + checksum into a 512-byte header block.
-fn finalize_header_block(blk : Bytes, fmt : TarFormat) -> Unit {
-  finalize_header_block_bounded(blk, fmt, 512)
-}
-
-///| Write a raw meta-file (PAX extended header or GNU LongName/LongLink) + padded body directly to `self.sb`.
+///| Write a raw meta-file (PAX extended header or GNU LongName/LongLink) + padded body directly to the buffer.
 fn write_raw_meta_str(
   self : Writer,
   raw_name : String,
@@ -202,14 +410,23 @@ fn write_raw_meta_str(
   finalize_header_block_bounded(self.blk, fmt, 265)
   self.dirty_end = 265
 
-  self.sb.write_string(self.blk.to_string())
-  self.sb.write_string(body)
+  match writer_append_bytes(self, self.blk, 512) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match writer_append_str(self, body) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
   let mut pad = block_padding(body_len.to_int64()).to_int()
   if append_nul {
     pad = pad + 1
   }
   if pad > 0 {
-    self.sb.write_substring(self.zeros, 0, pad)
+    match writer_append_zeros(self, pad) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
   }
   Ok(())
 }
@@ -325,6 +542,23 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
   if tf == type_x_header() || tf == type_gnu_long_name() || tf == type_gnu_long_link() {
     return Err(TarError::InvalidHeader("cannot manually encode meta header type"))
   }
+  let is_global = tf == type_x_global_header()
+  if is_global {
+    if hdr.linkname.length() > 0 ||
+    hdr.size != 0L ||
+    hdr.mode != 0L ||
+    hdr.uid != 0L ||
+    hdr.gid != 0L ||
+    hdr.uname.length() > 0 ||
+    hdr.gname.length() > 0 ||
+    !mod_time.is_zero() ||
+    !access_time.is_zero() ||
+    !change_time.is_zero() ||
+    hdr.devmajor != 0L ||
+    hdr.devminor != 0L {
+      return Err(TarError::InvalidHeader("only PAXRecords should be set for TypeXGlobalHeader"))
+    }
+  }
   if !is_header_only_type(tf) && hdr.size < 0L {
     return Err(TarError::InvalidHeader("negative file size"))
   }
@@ -348,7 +582,6 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
   }
 
   let has_user_pax = hdr.xattrs.length() > 0 || hdr.pax_records.length() > 0
-  let is_global = tf == type_x_global_header()
 
   // Fast path: pure USTAR when format is Unknown/Ustar/Pax and all fields fit USTAR directly
   let ustar_candidate = !has_user_pax &&
@@ -389,7 +622,10 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     )
     finalize_header_block_bounded(self.blk, TarFormat::Ustar, 345)
     self.dirty_end = 345
-    self.sb.write_string(self.blk.to_string())
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
     let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
     self.remaining = data_sz
     self.pad = block_padding(data_sz)
@@ -460,7 +696,10 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     }
     finalize_header_block_bounded(self.blk, TarFormat::Gnu, scan_end)
     self.dirty_end = scan_end
-    self.sb.write_string(self.blk.to_string())
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
     let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
     self.remaining = data_sz
     self.pad = block_padding(data_sz)
@@ -492,7 +731,6 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     need_size ||
     need_uid ||
     need_uname {
-      // Emit PAX records directly in sorted alphabetical key order (gid, gname, linkpath, mtime, path, size, uid, uname)
       let pax_sb = StringBuilder::with_capacity(256)
       if need_gid {
         write_pax_record_unchecked(pax_sb, "gid", hdr.gid.to_string())
@@ -542,7 +780,10 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     )
     finalize_header_block_bounded(self.blk, TarFormat::Pax, 345)
     self.dirty_end = 345
-    self.sb.write_string(self.blk.to_string())
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
     let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
     self.remaining = data_sz
     self.pad = block_padding(data_sz)
@@ -553,6 +794,18 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
   let mut allowed = 7
   let mut prefer_pax = false
   let pax_hdrs : Array[(String, String)] = []
+  let pax_idx : Map[String, Int] = Map::new()
+
+  // Index user pax_records once in O(n) for O(1) matching-field lookup
+  let user_pax_map : Map[String, String] = Map::new()
+  if hdr.pax_records.length() > 0 {
+    let mut ui = 0
+    while ui < hdr.pax_records.length() {
+      let (pk, pv) = hdr.pax_records[ui]
+      user_pax_map.set(pk, pv)
+      ui = ui + 1
+    }
+  }
 
   // Name
   let name_too_long = hdr.name.length() > 100
@@ -564,25 +817,21 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     if !split_ok {
       allowed = allowed & 6
     }
-    kv_set(pax_hdrs, "path", hdr.name)
+    kv_set_indexed(pax_hdrs, pax_idx, "path", hdr.name)
   }
-  if hdr.pax_records.length() > 0 {
-    match kv_get(hdr.pax_records, "path") {
-      Some(pv) => if pv == hdr.name { kv_set(pax_hdrs, "path", pv) }
-      None => ()
-    }
+  match user_pax_map.get("path") {
+    Some(pv) => if pv == hdr.name { kv_set_indexed(pax_hdrs, pax_idx, "path", pv) }
+    None => ()
   }
 
   // Linkname
   if !link_ascii || hdr.linkname.length() > 100 {
     allowed = allowed & 6
-    kv_set(pax_hdrs, "linkpath", hdr.linkname)
+    kv_set_indexed(pax_hdrs, pax_idx, "linkpath", hdr.linkname)
   }
-  if hdr.pax_records.length() > 0 {
-    match kv_get(hdr.pax_records, "linkpath") {
-      Some(pv) => if pv == hdr.linkname { kv_set(pax_hdrs, "linkpath", pv) }
-      None => ()
-    }
+  match user_pax_map.get("linkpath") {
+    Some(pv) => if pv == hdr.linkname { kv_set_indexed(pax_hdrs, pax_idx, "linkpath", pv) }
+    None => ()
   }
 
   // Uname
@@ -591,13 +840,11 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
   }
   if !uname_ascii || hdr.uname.length() > 32 {
     allowed = allowed & 6
-    kv_set(pax_hdrs, "uname", hdr.uname)
+    kv_set_indexed(pax_hdrs, pax_idx, "uname", hdr.uname)
   }
-  if hdr.pax_records.length() > 0 {
-    match kv_get(hdr.pax_records, "uname") {
-      Some(pv) => if pv == hdr.uname { kv_set(pax_hdrs, "uname", pv) }
-      None => ()
-    }
+  match user_pax_map.get("uname") {
+    Some(pv) => if pv == hdr.uname { kv_set_indexed(pax_hdrs, pax_idx, "uname", pv) }
+    None => ()
   }
 
   // Gname
@@ -606,13 +853,11 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
   }
   if !gname_ascii || hdr.gname.length() > 32 {
     allowed = allowed & 6
-    kv_set(pax_hdrs, "gname", hdr.gname)
+    kv_set_indexed(pax_hdrs, pax_idx, "gname", hdr.gname)
   }
-  if hdr.pax_records.length() > 0 {
-    match kv_get(hdr.pax_records, "gname") {
-      Some(pv) => if pv == hdr.gname { kv_set(pax_hdrs, "gname", pv) }
-      None => ()
-    }
+  match user_pax_map.get("gname") {
+    Some(pv) => if pv == hdr.gname { kv_set_indexed(pax_hdrs, pax_idx, "gname", pv) }
+    None => ()
   }
 
   // Numeric fields
@@ -627,21 +872,33 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
   }
   if !fits_in_octal(8, hdr.uid) {
     allowed = allowed & 6
-    kv_set(pax_hdrs, "uid", hdr.uid.to_string())
+    kv_set_indexed(pax_hdrs, pax_idx, "uid", hdr.uid.to_string())
+  }
+  match user_pax_map.get("uid") {
+    Some(pv) => if pv == hdr.uid.to_string() { kv_set_indexed(pax_hdrs, pax_idx, "uid", pv) }
+    None => ()
   }
   if !fits_in_base256(8, hdr.gid) {
     allowed = allowed & 3
   }
   if !fits_in_octal(8, hdr.gid) {
     allowed = allowed & 6
-    kv_set(pax_hdrs, "gid", hdr.gid.to_string())
+    kv_set_indexed(pax_hdrs, pax_idx, "gid", hdr.gid.to_string())
+  }
+  match user_pax_map.get("gid") {
+    Some(pv) => if pv == hdr.gid.to_string() { kv_set_indexed(pax_hdrs, pax_idx, "gid", pv) }
+    None => ()
   }
   if !fits_in_base256(12, hdr.size) {
     allowed = allowed & 3
   }
   if !fits_in_octal(12, hdr.size) {
     allowed = allowed & 6
-    kv_set(pax_hdrs, "size", hdr.size.to_string())
+    kv_set_indexed(pax_hdrs, pax_idx, "size", hdr.size.to_string())
+  }
+  match user_pax_map.get("size") {
+    Some(pv) => if pv == hdr.size.to_string() { kv_set_indexed(pax_hdrs, pax_idx, "size", pv) }
+    None => ()
   }
   if !fits_in_base256(8, hdr.devmajor) {
     allowed = allowed & 3
@@ -667,14 +924,14 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     }
     if !fits_oct || mod_time.nsec != 0 {
       prefer_pax = true
-      kv_set(pax_hdrs, "mtime", format_pax_time(mod_time))
+      kv_set_indexed(pax_hdrs, pax_idx, "mtime", format_pax_time(mod_time))
     }
-    if hdr.pax_records.length() > 0 {
-      let formatted = format_pax_time(mod_time)
-      match kv_get(hdr.pax_records, "mtime") {
-        Some(pv) => if pv == formatted { kv_set(pax_hdrs, "mtime", pv) }
-        None => ()
+    match user_pax_map.get("mtime") {
+      Some(pv) =>
+      if pv == format_pax_time(mod_time) {
+        kv_set_indexed(pax_hdrs, pax_idx, "mtime", pv)
       }
+      None => ()
     }
   }
   if !access_time.is_zero() {
@@ -683,7 +940,7 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     }
     allowed = allowed & 6
     prefer_pax = true
-    kv_set(pax_hdrs, "atime", format_pax_time(access_time))
+    kv_set_indexed(pax_hdrs, pax_idx, "atime", format_pax_time(access_time))
   }
   if !change_time.is_zero() {
     if !fits_in_base256(12, change_time.sec) {
@@ -691,7 +948,7 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     }
     allowed = allowed & 6
     prefer_pax = true
-    kv_set(pax_hdrs, "ctime", format_pax_time(change_time))
+    kv_set_indexed(pax_hdrs, pax_idx, "ctime", format_pax_time(change_time))
   }
 
   if is_global {
@@ -701,7 +958,7 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     let mut i = 0
     while i < hdr.xattrs.length() {
       let (xk, xv) = hdr.xattrs[i]
-      kv_set(pax_hdrs, "SCHILY.xattr." + xk, xv)
+      kv_set_indexed(pax_hdrs, pax_idx, "SCHILY.xattr." + xk, xv)
       i = i + 1
     }
     allowed = allowed & 2
@@ -710,15 +967,15 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     let mut i = 0
     while i < hdr.pax_records.length() {
       let (pk, pv) = hdr.pax_records[i]
-      let exists = match kv_get(pax_hdrs, pk) {
+      let exists = match pax_idx.get(pk) {
         Some(_) => true
         None => false
       }
       if !exists {
         if is_global {
-          kv_set(pax_hdrs, pk, pv)
+          kv_set_indexed(pax_hdrs, pax_idx, pk, pv)
         } else if !is_basic_pax_key(pk) && !str_starts_with(pk, "GNU.sparse.") {
-          kv_set(pax_hdrs, pk, pv)
+          kv_set_indexed(pax_hdrs, pax_idx, pk, pv)
         }
       }
       i = i + 1
@@ -780,13 +1037,17 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     }
     finalize_header_block_bounded(self.blk, TarFormat::Ustar, scan_end)
     self.dirty_end = scan_end
-    self.sb.write_string(self.blk.to_string())
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
   } else if (allowed & 2) != 0 {
     if pax_hdrs.length() > 0 || is_global {
       if pax_hdrs.length() > 1 {
         sort_kv_pairs(pax_hdrs)
       }
-      let pax_sb = StringBuilder::with_capacity(256)
+      let cap_hint = if pax_hdrs.length() > 8 { pax_hdrs.length() * 32 } else { 256 }
+      let pax_sb = StringBuilder::with_capacity(cap_hint)
       i = 0
       while i < pax_hdrs.length() {
         let (pk, pv) = pax_hdrs[i]
@@ -831,7 +1092,10 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     )
     finalize_header_block_bounded(self.blk, TarFormat::Pax, 345)
     self.dirty_end = 345
-    self.sb.write_string(self.blk.to_string())
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
   } else {
     if hdr.name.length() > name_size {
       match write_raw_meta_str(
@@ -882,7 +1146,10 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
     }
     finalize_header_block_bounded(self.blk, TarFormat::Gnu, scan_end)
     self.dirty_end = scan_end
-    self.sb.write_string(self.blk.to_string())
+    match writer_append_bytes(self, self.blk, 512) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
   }
 
   let data_sz : Int64 = if is_header_only_type(tf) { 0L } else { hdr.size }
@@ -891,7 +1158,7 @@ pub fn Writer::write_header(self : Writer, hdr : Header) -> Result[Unit, TarErro
   Ok(())
 }
 
-///| Write payload bytes for the current entry directly into the output buffer via native `memcpy`.
+///| Write payload bytes for the current entry (zero-copy staged for large payloads).
 pub fn Writer::write_data(self : Writer, data : Bytes) -> Result[Unit, TarError] {
   if self.closed {
     return Err(TarError::WriteAfterClose)
@@ -901,7 +1168,10 @@ pub fn Writer::write_data(self : Writer, data : Bytes) -> Result[Unit, TarError]
     return Err(TarError::WriteTooLong)
   }
   if n > 0L {
-    self.sb.write_string(data.to_string())
+    match writer_append_bytes(self, data, data.length()) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
     self.remaining = self.remaining - n
   }
   Ok(())
@@ -916,9 +1186,17 @@ pub fn Writer::finish(self : Writer) -> Result[Bytes, TarError] {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
+  if self.total_bytes > max_archive_bytes - 1024L {
+    return Err(TarError::LimitExceeded("archive size exceeds 2 GiB Bytes limit"))
+  }
   self.sb.write_string(self.zeros)
+  self.sb_len = self.sb_len + 1024
   self.closed = true
-  Ok(self.sb.to_string().to_bytes())
+  if self.chunks.length() == 0 {
+    return Ok(self.sb.to_string().to_bytes())
+  }
+  self.chunks.push(self.sb.to_string().to_bytes())
+  Ok(concat_chunks(self.chunks))
 }
 
 ///| Encode an array of `Entry` values into a complete TAR archive with pre-sized buffer.

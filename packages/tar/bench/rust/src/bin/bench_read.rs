@@ -43,8 +43,7 @@ fn main() {
             if sz > 0 {
                 entry.read_to_end(&mut buf).expect("read body");
                 total_payload_bytes += buf.len() as i64;
-                checksum = (checksum ^ (buf[0] as u64)).wrapping_mul(1099511628211);
-                checksum = (checksum ^ (buf[buf.len() - 1] as u64)).wrapping_mul(1099511628211);
+                checksum = fnv1a_bytes(checksum, &buf);
             }
         }
     }

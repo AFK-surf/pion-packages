@@ -63,8 +63,7 @@ func main() {
 					os.Exit(3)
 				}
 				totalPayloadBytes += int64(len(buf))
-				checksum = (checksum ^ uint64(buf[0])) * 1099511628211
-				checksum = (checksum ^ uint64(buf[len(buf)-1])) * 1099511628211
+				checksum = fnv1aBytes(checksum, buf)
 			}
 		}
 	}
