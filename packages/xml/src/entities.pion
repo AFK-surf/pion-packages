@@ -3,6 +3,50 @@
 struct EntityDef {
   name : String
   value : String
+  is_external : Bool
+}
+
+struct EntityTable {
+  defs : Array[EntityDef]
+  by_name : Map[String, Int]
+}
+
+fn EntityTable::new() -> EntityTable {
+  EntityTable::{ defs: [], by_name: Map::new() }
+}
+
+fn EntityTable::is_empty(self : EntityTable) -> Bool {
+  self.defs.length() == 0
+}
+
+///| Insert an entity definition following XML 1.0 §4.2 first-definition-wins in O(1).
+fn EntityTable::insert_if_absent(
+  self : EntityTable,
+  name : String,
+  value : String,
+  is_external : Bool,
+) -> Unit {
+  match self.by_name.get(name) {
+    Some(_) => ()
+    None => {
+      let idx = self.defs.length()
+      self.defs.push(EntityDef::{ name: name, value: value, is_external: is_external })
+      self.by_name.set(name, idx)
+    }
+  }
+}
+
+///| Look up a custom DTD entity by slice `src[start..end]` in O(1).
+fn EntityTable::lookup(
+  self : EntityTable,
+  src : String,
+  start : Int,
+  end : Int,
+) -> Option[Int] {
+  if self.defs.length() == 0 {
+    return None
+  }
+  self.by_name.get(src.slice(start, end))
 }
 
 struct EntityBudget {
@@ -19,6 +63,15 @@ fn EntityBudget::new(limits : Limits) -> EntityBudget {
     max_expansions: limits.max_entity_expansions,
     max_bytes: limits.max_entity_bytes,
   }
+}
+
+///| Input source frame for iterative entity content parsing (XML 1.0 §4.4.2 / §4.3.2).
+struct InputFrame {
+  src : String
+  pos : Int
+  len : Int
+  entity_idx : Int
+  base_depth : Int
 }
 
 ///| Parse a character reference starting after `&#` (at `pos`).
@@ -132,25 +185,88 @@ fn lookup_predefined_entity(src : String, start : Int, end : Int) -> Int {
   -1
 }
 
-///| Look up a custom DTD internal entity by slice `src[start..end]`.
-fn lookup_custom_entity(
-  entities : Array[EntityDef],
+///| Expand an EntityValue literal at declaration time per XML 1.0 §4.5:
+///| - Validates all characters are legal XML 1.0 Chars (§2.2).
+///| - Normalizes raw source EOLs (`\r\n`, `\r` -> `\n`) (§2.11).
+///| - Expands character references (`&#...;`, `&#x...;`) immediately (§4.5).
+///| - Rejects parameter entity references (`%...;`) in internal subset (§2.8 WFC).
+///| - Validates syntax of general entity references (`&Name;`) while bypassing them.
+fn process_entity_value(
   src : String,
   start : Int,
   end : Int,
-) -> Option[Int] {
-  let n = entities.length()
-  let mut i = 0
-  while i < n {
-    if raw_slice_eq_str(src, start, end, entities[i].name) {
-      return Some(i)
+) -> Result[String, XmlError] {
+  let sb = StringBuilder::with_capacity(end - start)
+  let mut i = start
+  let mut mark = start
+  while i < end {
+    let b = src.code_unit_at(i)
+    if b == 0x26 {
+      // '&'
+      if i + 1 >= end {
+        return Err(make_err(src, i, XmlErrorKind::InvalidSyntax, "unterminated reference in entity value"))
+      }
+      if src.code_unit_at(i + 1) == 0x23 {
+        // Character reference: expand immediately (§4.5)
+        if i > mark {
+          sb.write_substring(src, mark, i)
+        }
+        match parse_char_ref(src, i + 2, end, i) {
+          Ok((cp, next_i)) => {
+            encode_utf8(sb, cp)
+            i = next_i
+            mark = i
+          }
+          Err(e) => return Err(e)
+        }
+      } else {
+        // General entity reference: bypass (keep literal) but validate syntax `&Name;`
+        let name_start = i + 1
+        let name_end = scan_ncname(src, name_start, end)
+        if name_end < 0 || name_end >= end || src.code_unit_at(name_end) != 0x3B {
+          return Err(
+            make_err(src, i, XmlErrorKind::InvalidSyntax, "invalid entity reference in entity value"),
+          )
+        }
+        i = name_end + 1
+      }
+    } else if b == 0x25 {
+      // '%' — Parameter entity reference forbidden inside internal subset markup declarations
+      return Err(
+        make_err(src, i, XmlErrorKind::InvalidSyntax, "parameter entity reference not allowed in internal subset entity value"),
+      )
+    } else if b == 0x0D {
+      // Normalize raw source CR / CRLF -> LF (§2.11)
+      if i > mark {
+        sb.write_substring(src, mark, i)
+      }
+      sb.write_byte((0x0A).to_byte())
+      if i + 1 < end && src.code_unit_at(i + 1) == 0x0A {
+        i = i + 2
+      } else {
+        i = i + 1
+      }
+      mark = i
+    } else if b < 0x80 {
+      if (xml_lut[b] & mask_valid_ascii) == 0 {
+        return Err(make_err(src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in entity value"))
+      }
+      i = i + 1
+    } else {
+      let (cp, blen) = decode_utf8(src, i, end)
+      if cp < 0 || !is_xml_char(cp) {
+        return Err(make_err(src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in entity value"))
+      }
+      i = i + blen
     }
-    i = i + 1
   }
-  None
+  if end > mark {
+    sb.write_substring(src, mark, end)
+  }
+  Ok(sb.to_string())
 }
 
-///| Frame for iterative entity expansion (zero recursion, cycle detection).
+///| Frame for iterative entity expansion in attribute values (zero recursion, cycle detection).
 struct ExpandFrame {
   text : String
   mut pos : Int
@@ -164,6 +280,7 @@ fn unescape_span_no_dtd(
   start : Int,
   end : Int,
   is_attr : Bool,
+  in_entity : Bool,
 ) -> Result[String, XmlError] {
   let lut = xml_lut
   let sb = StringBuilder::with_capacity(end - start)
@@ -229,20 +346,30 @@ fn unescape_span_no_dtd(
         }
       }
     } else if b == 0x0D {
-      if i > mark {
-        sb.write_substring(src, mark, i)
-      }
-      if is_attr {
-        sb.write_byte((0x20).to_byte())
-      } else {
-        sb.write_byte((0x0A).to_byte())
-      }
-      if i + 1 < end && src.code_unit_at(i + 1) == 0x0A {
-        i = i + 2
-      } else {
+      if in_entity && !is_attr {
+        // CR inside entity replacement text came from &#13;; preserve in text content!
         i = i + 1
+      } else {
+        if i > mark {
+          sb.write_substring(src, mark, i)
+        }
+        if is_attr {
+          sb.write_byte((0x20).to_byte())
+          if !in_entity && i + 1 < end && src.code_unit_at(i + 1) == 0x0A {
+            i = i + 2
+          } else {
+            i = i + 1
+          }
+        } else {
+          sb.write_byte((0x0A).to_byte())
+          if i + 1 < end && src.code_unit_at(i + 1) == 0x0A {
+            i = i + 2
+          } else {
+            i = i + 1
+          }
+        }
+        mark = i
       }
-      mark = i
     } else if is_attr && (b == 0x09 || b == 0x0A) {
       if i > mark {
         sb.write_substring(src, mark, i)
@@ -265,21 +392,25 @@ fn unescape_span_no_dtd(
 }
 
 ///| Normalize & unescape `src[start..end]` into a `String`.
-///| `is_attr`: when true, literal `\t`, `\n`, `\r`, `\r\n` become `0x20` (while char refs keep exact codepoints).
+///| `is_attr`: when true, literal `\t`, `\n`, `\r`, `\r\n` become `0x20` (while direct char refs keep exact codepoints).
+///| Inside entity frames (`entity_idx >= 0`), `\r` and `\n` each normalize to `0x20` individually in attributes,
+///| and `\r` is preserved in text content.
 fn unescape_span(
   src : String,
   start : Int,
   end : Int,
   is_attr : Bool,
-  entities : Array[EntityDef],
+  entities : EntityTable,
   budget : EntityBudget,
+  cur_entity_idx : Int,
+  active_entity_frames : Array[InputFrame],
 ) -> Result[String, XmlError] {
-  if entities.length() == 0 {
-    return unescape_span_no_dtd(src, start, end, is_attr)
+  if entities.is_empty() {
+    return unescape_span_no_dtd(src, start, end, is_attr, cur_entity_idx >= 0)
   }
   let sb = StringBuilder::with_capacity(end - start)
   let stack : Array[ExpandFrame] = [
-    ExpandFrame::{ text: src, pos: start, end: end, entity_idx: -1 },
+    ExpandFrame::{ text: src, pos: start, end: end, entity_idx: cur_entity_idx },
   ]
   while stack.length() > 0 {
     let top_idx = stack.length() - 1
@@ -287,6 +418,7 @@ fn unescape_span(
     let s = frame.text
     let mut i = frame.pos
     let flen = frame.end
+    let in_ent = frame.entity_idx >= 0
     let mut mark = i
     let mut pushed_child = false
     while i < flen {
@@ -331,9 +463,15 @@ fn unescape_span(
             i = semi + 1
             mark = i
           } else {
-            match lookup_custom_entity(entities, s, name_start, semi) {
+            match entities.lookup(s, name_start, semi) {
               Some(eidx) => {
-                // Check cycle
+                let ent = entities.defs[eidx]
+                if ent.is_external {
+                  return Err(
+                    make_err(src, start, XmlErrorKind::ExternalEntityNotAllowed, "external entity reference is not allowed"),
+                  )
+                }
+                // Check cycle against both local expand stack and outer InputFrame stack
                 let mut k = 0
                 while k < stack.length() {
                   if stack[k].entity_idx == eidx {
@@ -343,8 +481,17 @@ fn unescape_span(
                   }
                   k = k + 1
                 }
+                k = 0
+                while k < active_entity_frames.length() {
+                  if active_entity_frames[k].entity_idx == eidx {
+                    return Err(
+                      make_err(src, start, XmlErrorKind::EntityLoop, "circular entity reference"),
+                    )
+                  }
+                  k = k + 1
+                }
                 budget.expansions = budget.expansions + 1
-                let eval = entities[eidx].value
+                let eval = ent.value
                 budget.bytes = budget.bytes + eval.length()
                 if budget.expansions > budget.max_expansions ||
                 budget.bytes > budget.max_bytes {
@@ -373,20 +520,31 @@ fn unescape_span(
         }
       } else if b == 0x0D {
         // '\r' or '\r\n'
-        if i > mark {
-          sb.write_substring(s, mark, i)
-        }
-        if is_attr {
-          sb.write_byte((0x20).to_byte())
-        } else {
-          sb.write_byte((0x0A).to_byte())
-        }
-        if i + 1 < flen && s.code_unit_at(i + 1) == 0x0A {
-          i = i + 2
-        } else {
+        if in_ent && !is_attr {
+          // CR inside entity replacement text (from &#13;): preserve in text content!
           i = i + 1
+        } else {
+          if i > mark {
+            sb.write_substring(s, mark, i)
+          }
+          if is_attr {
+            sb.write_byte((0x20).to_byte())
+            // Only collapse raw source \r\n; entity replacement \r\n (from &#13;&#10;) becomes two spaces (§3.3.3)
+            if !in_ent && i + 1 < flen && s.code_unit_at(i + 1) == 0x0A {
+              i = i + 2
+            } else {
+              i = i + 1
+            }
+          } else {
+            sb.write_byte((0x0A).to_byte())
+            if i + 1 < flen && s.code_unit_at(i + 1) == 0x0A {
+              i = i + 2
+            } else {
+              i = i + 1
+            }
+          }
+          mark = i
         }
-        mark = i
       } else if is_attr && (b == 0x09 || b == 0x0A) {
         if i > mark {
           sb.write_substring(s, mark, i)
