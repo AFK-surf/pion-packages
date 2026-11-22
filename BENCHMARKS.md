@@ -52,6 +52,12 @@
 | `diff` | `helix_syntax.rs` Histogram + unified diff（2,200 行 × 200） | 32.2 MB | 83.214 ms | 26.269 ms (`rust-imara-diff`) | 0.32x | 2.73 MiB | 2.39 MiB | `586c482f…c70e33f8` |
 | `cbor` | Deterministic batch encode（WebAuthn/COSE + Telemetry） | 50,000 ops | 138.962 ms | 120.254 ms (`go_fxamacker`) | 0.87x | 1.78 MiB | 12.33 MiB | `b14fb8d5…a7b61e0b` |
 | `cbor` | Batch decode + tree walk（WebAuthn/COSE + Telemetry） | 23,508,920 B (80,000 ops) | 149.661 ms | 169.493 ms (`go_fxamacker`) | **1.13x** | 9.19 MiB | 24.97 MiB | `3e192925…05a48ece` |
+| `crdt` | 顺序 + 随机文本编辑 + Yjs v1 编解码（20,000 ops × 10） | 200,000 ops | 1,926.438 ms | 6,750.219 ms (`node_yjs`) | **3.50x** | 15.48 MiB | 246.91 MiB | `0ed09d22…e4e0423f` |
+| `crdt` | 双端并发 Text+Array+Map 混合编辑 + 增量 v1 同步（2 × 5,000 ops × 10） | 100,000 ops | 255.262 ms | 1,254.732 ms (`node_yjs`) | **4.92x** | 8.05 MiB | 226.08 MiB | `32c9ec44…1889b8b1` |
+| `highlight` | 9 语言源码高亮 + 无损重建（37,800 B × 220） | 8,316,000 B | 112.973 ms | 1,354.656 ms (`node-prismjs`) | **11.99x** | 2.31 MiB | 87.48 MiB | `1fec95f5…5eceeb80` |
+| `glob` | 50,000 monorepo 路径 × 80 条 `GlobSet` 规则 × 20（`matches_into`） | 1,000,000 calls | 123.861 ms | 307.405 ms (`rust_globset`) | **2.48x** | 8.23 MiB | 5.86 MiB | `2d9a2ef2…496fe91f` |
+| `websocket` | 50,000 掩码客户端帧批量编码 + 流式解码（解掩码、分片重组、严格 UTF-8） | ~50.88 MB | 131.212 ms | 76.104 ms (`rust_tungstenite`) | 0.58x | 1.98 MiB | 2.23 MiB | `7830282b…7e349c92` |
+| `websocket` | 同上（对照 Go） | ~50.88 MB | 131.212 ms | 136.798 ms (`go_coder_ws`) | **1.04x** | 1.98 MiB | 16.95 MiB | `7830282b…7e349c92` |
 
 ## 各包明细
 
@@ -234,3 +240,73 @@ SHA-256：`b14fb8d50078493f9c8c4349e6dd969f3289721f95fe1cc96f1cda48a7b61e0b`
 SHA-256：`3e1929251b4f124f4f35012b86df7c3b1ad83579b233cee32aacc5fb05a48ece`
 
 落后项：编码 Pion 为 Go 的 0.87x，落后 Rust `ciborium`（1.40x）约 38%；解码 Pion 快于 Go（1.13x）但仍慢于 `ciborium`（1.21x，约 7%）。峰值 RSS 编码最低（1.78 MiB），解码高于 `ciborium`（9.19 vs 6.72 MiB）。
+
+### crdt
+
+参考实现：Node.js 官方 [`yjs`](https://github.com/yjs/yjs)（Node.js `v24.22.2`，`npm install yjs` 未锁版本）。正确性另有官方 Node.js `yjs` 生成的黄金线协议向量测试。详见 [`packages/crdt/README.md`](packages/crdt/README.md)。
+
+**1. 顺序 + 随机文本编辑（20,000 ops × 10 iters）+ Yjs Update v1 编解码**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `node_yjs` | 6750.219 | 6070.897 | 7636.549 | 33751.10 | 246.91 MiB | 1.00x (baseline) |
+| `pion` | 1926.438 | 1466.458 | 2320.333 | 9632.19 | 15.48 MiB | **3.50x** |
+
+SHA-256：`0ed09d229ad8d2ccc4309209b62dce774bbb95cb8322f2e63b42601de4e0423f`
+
+**2. 双客户端并发 Text + Array + Map 混合编辑（2 × 5,000 ops × 10 iters）+ 增量 v1 同步**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `node_yjs` | 1254.732 | 1205.617 | 1594.238 | 12547.32 | 226.08 MiB | 1.00x (baseline) |
+| `pion` | 255.262 | 236.044 | 289.484 | 2552.61 | 8.05 MiB | **4.92x** |
+
+SHA-256：`32c9ec4460bf7bb803c77429623574041f23f879e9f4c2ce3d3729801889b8b1`
+
+说明：Pion 两项负载 P95/Min 波动较大（文本编辑 1466–2320 ms）；本组仅对照 JavaScript 参考实现，未与 Rust `yrs` 对比。
+
+### highlight
+
+参考实现：Node.js [`prismjs`](https://github.com/PrismJS/prism)（Node.js `v24.22.2`）。详见 [`packages/highlight/README.md`](packages/highlight/README.md)。
+
+**9 种语言（Rust、TypeScript、Go、Python、JSON、YAML、C、CSS、HTML）37,800 B × 220 = `8,316,000 B`，校验无损重建源码字节（stdout `428 B`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `node-prismjs` | 1354.656 | 1230.325 | 1715.957 | 6.14 | 87.48 MiB | 1.00x (baseline) |
+| `pion-highlight` | 112.973 | 110.089 | 125.756 | 73.61 | 2.31 MiB | **11.99x** |
+
+SHA-256：`1fec95f5f26869f0e95b351d3f462b36a883947e103e513529b074855eceeb80`
+
+说明：SHA-256 校验的是由 token 重建的源码字节（无损性），不是两边的 token 切分；单次迭代 Pion 产出 10,832 个 span（5,876 非 Plain），Prism 产出 10,008 个叶子（6,424 个带类型），粒度并不完全相同，逐语言对照见包 README。本组仅对照 JavaScript 参考实现。
+
+### glob
+
+参考实现：Rust [`globset`](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset) `0.4`（`--release`）。详见 [`packages/glob/README.md`](packages/glob/README.md)。
+
+**50,000 条 monorepo 路径 × 80 条 `GlobSet` 规则 × 20 iters（1,000,000 次 `matches_into`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rust_globset` | 307.405 | 290.437 | 438.753 | 93.01 | 307.40 | 5.86 MiB | 1.00x (baseline) |
+| `pion` | 123.861 | 119.863 | 136.977 | 230.83 | 123.86 | 8.23 MiB | **2.48x** |
+
+SHA-256：`2d9a2ef2bb80d5efd6926bf1bd5024be7f929dd793d5d4ce76a90316496fe91f`
+
+落后项：峰值 RSS 高于 `globset`（8.23 vs 5.86 MiB，约 1.4×）。
+
+### websocket
+
+参考实现：Rust [`tungstenite`](https://github.com/snapview/tungstenite-rs) `0.26.2`（`--release`，基线）与 Go [`coder/websocket`](https://github.com/coder/websocket) `v1.8.14`（含 `mask_arm64.s` NEON 汇编）。详见 [`packages/websocket/README.md`](packages/websocket/README.md)。
+
+**50,000 个掩码客户端帧（~50.88 MB，Text + Binary + 跨分片 UTF-8 Text + 穿插 Ping）批量编码 + 流式解码（解掩码、分片重组、严格 UTF-8 校验）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `rust_tungstenite` | 76.104 | 72.802 | 77.086 | 668.56 | 1522.08 | 2.23 MiB | 1.00x (baseline) |
+| `go_coder_ws` | 136.798 | 134.678 | 144.166 | 371.93 | 2735.96 | 16.95 MiB | 0.56x |
+| `pion` | 131.212 | 127.738 | 140.728 | 387.77 | 2624.24 | 1.98 MiB | 0.58x |
+
+SHA-256：`7830282bc43598507bfee624e7f55c3bbd01505b2f8e8e4674117ca67e349c92`
+
+落后项：Pion 为 Rust `tungstenite` 的 0.58x（吞吐 387.8 vs 668.6 MB/s）；略快于 Go `coder/websocket`（按两者中位数折算 1.04x），峰值 RSS 三者最低。包 README 归因于 `pionc 0.1.0` 在逐字节解掩码循环中每字节约 13 条标量指令（逐字节边界检查、无 64 位字 / NEON 向量化）。总榜「对照 Go」一行的 1.04x 由包 README 两侧中位数折算（136.798 / 131.212），非框架直接输出。
