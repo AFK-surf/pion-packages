@@ -4,16 +4,19 @@ A pure Pion, zero-`World`, zero-C-glue high-performance diff, unified patch, and
 
 ## Features
 
-- **Two Core Algorithms** operating on dense integer token IDs (`Array[Int]`):
+- **Three Core Algorithms** operating on dense integer token IDs (`Array[Int]`):
   - **`Algorithm::Histogram`**: Git's recommended high-readability diff algorithm with pooled occurrence lists (`ListPool`), O(1) generation-based clearing, and automatic Myers fallback on highly repetitive sequences (>63 occurrences).
   - **`Algorithm::Myers`**: Linear-space `O((N+M)D)` divide-and-conquer Myers with unmatched/common-line preprocessing and middle-snake heuristics.
-- **Indentation Slider Postprocessing (`IndentHeuristic`)**: Ported from `imara-diff` / Git `xdiff` to align ambiguous insertion/deletion hunks cleanly on blank-line and indentation/brace boundaries.
-- **Single-Pass Zero-Substring Line Interning**: `intern_lines` splits and hashes lines in a single pass over the input without allocating per-line `String` objects on the hot path.
-- **Standard Unified Diff & Patch**:
-  - `unified_diff(before, after, before_name, after_name, context, algo)` with configurable context lines and `\ No newline at end of file` markers.
+  - **`Algorithm::MyersMinimal`**: Guaranteed minimal edit-script Myers (disables heuristic early-exit and common-line pruning).
+- **Indentation Slider Postprocessing (`IndentHeuristic`)**: Ported from `imara-diff` / Git `xdiff` to align ambiguous insertion/deletion hunks cleanly on blank-line and indentation/brace boundaries, with exact cross-window boundary blank/indent propagation.
+- **Single-Pass Zero-Substring Line Interning & Reuse**:
+  - `intern_lines` splits and hashes lines in a single pass with per-input SplitMix64-seeded 64-bit keyed hashing (HashDoS-resistant) without allocating per-line `String` objects on the hot path.
+  - `BeforeInterner` (`intern_before` / `diff_against_interned` / `unified_diff_against_interned`) pre-interns `before` once and reuses its token table, hash table, and cached indentation levels across repeated diffs against multiple `after` strings.
+- **Standard GNU Unified Diff & Patch**:
+  - `unified_diff(before, after, before_name, after_name, context, algo)` emits standard GNU unified diff format (including `@@ -N,0` empty-range headers and lossless `\ No newline at end of file` markers).
   - `parse_unified_patch`, `apply_unified_patch`, and `apply_unified_patch_reverse` with strict hunk/context validation and structured `Result[T, DiffError]` errors.
 - **Three-Way Merge (`merge3`)**:
-  - Cleanly merges disjoint edits and convergent identical edits.
+  - Cleanly merges disjoint edits and convergent identical edits; reports conflicts on both overlapping and adjacent edits (matching `git merge-file` / diff3 semantics).
   - Emits both structured `MergeChunk::Clean` / `MergeChunk::Conflict(base, ours, theirs)` chunks and standard `<<<<<<<` / `=======` / `>>>>>>>` conflict markers.
 - **Native + Wasm32 Verified**: Zero `World` dependencies; compiles cleanly to both native targets and `wasm32`.
 
@@ -48,14 +51,18 @@ pub fn example() -> Unit {
 
 ## Public API
 
-- `pub enum Algorithm { Myers, Histogram }`
+- `pub enum Algorithm { Myers, MyersMinimal, Histogram }`
 - `pub val struct Hunk { pub before_start : Int, pub before_end : Int, pub after_start : Int, pub after_end : Int }`
 - `pub struct DiffResult { pub hunks : Array[Hunk], pub before_len : Int, pub after_len : Int }`
+- `pub struct BeforeInterner` (`intern_before`, `BeforeInterner::new`, `.diff`, `.diff_raw`, `.unified_diff`)
 - `pub fn diff_lines(before : String, after : String, algo : Algorithm) -> DiffResult`
 - `pub fn diff_lines_raw(before : String, after : String, algo : Algorithm) -> DiffResult`
+- `pub fn diff_against_interned(interned : BeforeInterner, after : String, algo : Algorithm) -> DiffResult`
+- `pub fn diff_raw_against_interned(interned : BeforeInterner, after : String, algo : Algorithm) -> DiffResult`
 - `pub fn diff_slices(before : Array[String], after : Array[String], algo : Algorithm) -> DiffResult`
 - `pub fn diff_tokens(before : Array[Int], after : Array[Int], num_tokens : Int, algo : Algorithm) -> DiffResult`
 - `pub fn unified_diff(before : String, after : String, before_name : String, after_name : String, context : Int, algo : Algorithm) -> String`
+- `pub fn unified_diff_against_interned(interned : BeforeInterner, after : String, before_name : String, after_name : String, context : Int, algo : Algorithm) -> String`
 - `pub fn parse_unified_patch(patch : String) -> Result[UnifiedPatch, DiffError]`
 - `pub fn apply_unified_patch(original : String, patch : String) -> Result[String, DiffError]`
 - `pub fn apply_unified_patch_reverse(modified : String, patch : String) -> Result[String, DiffError]`
@@ -106,5 +113,5 @@ _Stdout (`7,131 B`) SHA-256 verified byte-for-byte identical: `586c482f0fd9d4a78
 
 **Notes**:
 - Key optimizations: byte-level 4×/8× unrolled common prefix/suffix trimming (with exact slider-boundary fallback), lockstep predictive line matching in `after` interning, L1-sized packed `Int64` hash table `(hash32 << 32) | (tid + 1)` & packed `tok_span`, packed `Int64` `HistogramState.occ` with cursor-allocated pool and `cur_occ == 1` fast-path LCS extension, hoisted `is_odd` / `right = left` / zero-snake fast-path in `myers_split`, and direct single-`StringBuilder` unified diff emission without temporary hunk buffers.
-- On real-world `helix_syntax.rs`, Pion Native reaches **1,355 MB/s (1.01x of Rust `imara-diff --release`)** with lower peak RSS (`2.31 MiB` vs `2.39 MiB`) and **100% byte-for-byte identical unified diff output**.
+- On real-world `helix_syntax.rs`, Pion Native reaches **1,355 MB/s (1.01x of Rust `imara-diff --release`)** with lower peak RSS (`2.31 MiB` vs `2.39 MiB`) and **byte-for-byte identical unified diff output** on the benchmark corpus (note: for empty-side headers and missing trailing newlines, Pion follows standard GNU `diff -u` conventions: `@@ -N,0` and `\ No newline at end of file`).
 - On the 10K-line synthetic refactor (~90% middle window), Pion Native reaches **749 MB/s (0.69x)** on Histogram Diff and **194 MB/s (0.87x)** on Myers Diff, where the remaining gap reflects QBE's scalar bounds-checked `code_unit_at` / `Array[Int]` accesses vs Rust's NEON SIMD `memchr`/`memcmp`, 64-bit `foldhash`, and unchecked `NonNull<i32>` pointers.
