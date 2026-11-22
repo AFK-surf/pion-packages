@@ -23,9 +23,12 @@ echo "==> Building Pion Native benchmarks (--release)"
 pionc build --release -o "$BIN_DIR/pion_url" "$BENCH_DIR/pion_url"
 pionc build --release -o "$BIN_DIR/pion_query" "$BENCH_DIR/pion_query"
 
-echo "==> Building Rust url benchmarks (--release, target in /tmp)"
+echo "==> Building Rust url benchmarks (--release, project & lockfile in /tmp)"
+rm -rf "$OUT_DIR/rust-proj"
+mkdir -p "$OUT_DIR/rust-proj"
+cp -R "$BENCH_DIR/rust/Cargo.toml" "$BENCH_DIR/rust/src" "$OUT_DIR/rust-proj/"
 CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release \
-  --manifest-path "$BENCH_DIR/rust/Cargo.toml"
+  --manifest-path "$OUT_DIR/rust-proj/Cargo.toml"
 cp "$OUT_DIR/rust-target/release/bench_url" "$BIN_DIR/rust_url"
 cp "$OUT_DIR/rust-target/release/bench_query" "$BIN_DIR/rust_query"
 
