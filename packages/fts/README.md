@@ -8,7 +8,7 @@ Zero-dependency, `World`-free full-text search engine for **Native** and **Wasm3
 
 - `tokenize(text : String) -> Array[String]`
   - **CJK** (Han, Hiragana, Katakana, Hangul): adjacent bigrams plus `u_<char>` unigrams for single-character search.
-  - **Unicode case folding**: ASCII, Latin-1 Supplement, Latin Extended-A, Greek, and Cyrillic.
+  - **Unicode case folding**: ASCII, Latin-1 Supplement, Latin Extended-A, Greek, and Cyrillic, folded exactly as SQLite FTS5 `unicode61` does with its default `remove_diacritics 1` (`Café` → `cafe`, `Ÿ` → `y`, `ς` → `σ`). Kana voicing marks, `゠` and `・` are separators.
   - **Code identifiers**: whole lowercased identifier plus `CamelCase` (`GroupSurface` → `group`, `surface`; `HTTPServer` → `http`, `server`) and `snake_case` (`nc_follow` → `nc`, `follow`) parts; all-underscore words are skipped.
   - **References & hashes**: `#1234` → `pr1234`, `1234`; lowercase hex SHAs (length ≥ 7 with at least one digit) emit 6/7/8/10-char prefix tokens.
 - `tokenize_query(query : String) -> Array[QueryTerm]`
@@ -21,7 +21,7 @@ Zero-dependency, `World`-free full-text search engine for **Native** and **Wasm3
 ### Inverted Index (`src/index.pion`)
 
 - `Index::new() -> Index` — Okapi BM25 with SQLite FTS5 defaults (`k1 = 1.2`, `b = 0.75`).
-- `Index::with_bm25(k1 : Double, b : Double) -> Index` — custom BM25 parameters (sanitized to valid ranges).
+- `Index::with_bm25(k1 : Double, b : Double) -> Index` — custom BM25 parameters, clamped to `k1 ∈ [0, 100]`, `b ∈ [0, 1]` (`NaN` falls back to `1.2` / `0.75`; `bm25_score` applies the same clamp).
 - `Index::upsert(self, doc_id : Int64, text : String, order_key~ : Int64 = 0L, tags~ : Array[(String, String)] = []) -> Unit`
 - `Index::remove(self, doc_id : Int64) -> Bool`
 - `Index::len(self) -> Int`
