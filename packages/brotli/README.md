@@ -6,7 +6,15 @@ Pure Pion implementation of the **Brotli (RFC 7932)** decompressor with zero ext
 
 - Complete RFC 7932 decoding: empty streams, uncompressed meta-blocks, metadata meta-blocks, multi-meta-block streams, canonical simple & complex prefix codes, context modeling with RLE + MTF, distance ring buffer, and the full 122,784-byte static dictionary with all 121 transforms.
 - High-performance pure Pion hot path: 64-bit bit buffer, 2-level canonical prefix-code LUT (8-bit primary + dynamic subtables), module-level cached static dictionary & context LUT, in-place dictionary transforms, and 8-byte unrolled RLE/LZ77 copies.
-- Strict security & compliance checks: `DecodeLimits` (`max_output_bytes`, `max_window_bits`) enforced before allocation and writes to defeat decompression bombs; strict rejection of non-zero padding bits, trailing garbage bytes, duplicate simple prefix symbols, and non-canonical `MLEN`/`MSKIPLEN`.
+- Strict security & compliance checks: `DecodeLimits` (`max_output_bytes`, `max_window_bits`) enforced before allocation and writes to defeat decompression bombs; strict rejection of non-zero padding bits, trailing garbage bytes, duplicate simple prefix symbols, `insert`/`copy`/dictionary overruns, and non-canonical `MLEN`/`MSKIPLEN`.
+
+### `DecodeLimits` Semantics & Platform Notes
+
+- `max_output_bytes < 0`: rejected immediately with `Err(BrotliError::OutputLimitExceeded(limit))`.
+- `max_output_bytes == 0`: allows only zero-byte output (empty streams return `Ok(empty)`; any non-empty output returns `Err(BrotliError::OutputLimitExceeded(0))`).
+- `max_output_bytes > 2_147_483_631` (`2^31 - 17`, Pion container max): safely clamped to `2_147_483_631` so `Int` max cannot trigger a container-length abort.
+- **Wasm32**: because WebAssembly32 linear memory is bounded at 4 GiB and buffer growth temporarily holds old + new buffers, Wasm32 callers should keep `max_output_bytes <= 536870912` (512 MiB; default is 256 MiB).
+- `max_window_bits`: must be in `10..=24` (`InvalidWindowBits` otherwise); streams declaring a larger `WBITS` return `WindowLimitExceeded`.
 
 ## Public API
 
@@ -57,6 +65,6 @@ Run via `sh packages/brotli/bench/run_bench.sh` (all outputs verified byte-for-b
 
 | Workload | `pion` Median (Throughput) | `rust_brotli` Median (Throughput) | `c_brotlidec` Median (Throughput) | `pion` vs `rust_brotli` |
 | --- | ---: | ---: | ---: | ---: |
-| Web HTML/CSS/JS/JSON (2 MiB q6 × 10 = 20 MiB) | 37.003 ms (566.75 MB/s) | 19.867 ms (1055.59 MB/s) | 17.887 ms (1172.47 MB/s) | **0.54x** |
-| WOFF2 Binary Font Payload (1 MiB q11 × 10 = 10 MiB) | 44.062 ms (237.98 MB/s) | 20.187 ms (519.42 MB/s) | 18.271 ms (573.91 MB/s) | **0.46x** |
-| Small Packet Batch (512 pkts q5 × 10 = 5,120 pkts) | 63.249 ms (43.04 MB/s) | 75.967 ms (35.84 MB/s) | 38.175 ms (71.32 MB/s) | **1.20x** |
+| Web HTML/CSS/JS/JSON (2 MiB q6 × 10 = 20 MiB) | 34.820 ms (602.28 MB/s) | 25.524 ms (821.63 MB/s) | 24.281 ms (863.71 MB/s) | **0.73x** |
+| WOFF2 Binary Font Payload (1 MiB q11 × 10 = 10 MiB) | 33.678 ms (311.35 MB/s) | 24.419 ms (429.41 MB/s) | 25.004 ms (419.36 MB/s) | **0.73x** |
+| Small Packet Batch (512 pkts q5 × 10 = 5,120 pkts) | 43.355 ms (62.80 MB/s) | 69.620 ms (39.11 MB/s) | 35.054 ms (77.67 MB/s) | **1.61x** |
