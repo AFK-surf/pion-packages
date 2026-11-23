@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"math"
 	"os"
 	"sort"
 	"strconv"
+	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/util/teststorage"
 )
 
 func fnv1aStr(h int64, s string) int64 {
@@ -95,162 +99,104 @@ func runW2(totalOps int) int {
 	return 0
 }
 
-type sample struct {
-	ts  int64
-	val float64
-}
-
-type bucketSeries struct {
-	job     string
-	le      float64
-	samples []sample
-}
-
-type counterSeries struct {
-	job     string
-	inst    string
-	samples []sample
-}
-
-func extrapolatedRate(samples []sample, rangeStartMs, rangeEndMs int64) float64 {
-	n := len(samples)
-	first := samples[0]
-	last := samples[n-1]
-	resultVal := last.val - first.val
-	var corr float64
-	prev := first.val
-	for i := 1; i < n; i++ {
-		if samples[i].val < prev {
-			corr += prev
-		}
-		prev = samples[i].val
-	}
-	resultVal += corr
-	durStart := float64(first.ts-rangeStartMs) / 1000.0
-	durEnd := float64(rangeEndMs-last.ts) / 1000.0
-	sampledInt := float64(last.ts-first.ts) / 1000.0
-	avgInt := sampledInt / float64(n-1)
-	if resultVal > 0 && first.val >= 0 {
-		durZero := sampledInt * (first.val / resultVal)
-		if durZero < durStart {
-			durStart = durZero
-		}
-	}
-	thresh := avgInt * 1.1
-	extrap := sampledInt
-	if durStart < thresh {
-		extrap += durStart
-	} else {
-		extrap += avgInt / 2.0
-	}
-	if durEnd < thresh {
-		extrap += durEnd
-	} else {
-		extrap += avgInt / 2.0
-	}
-	rangeSec := float64(rangeEndMs-rangeStartMs) / 1000.0
-	return (resultVal * (extrap / sampledInt)) / rangeSec
-}
-
-func histogramQuantile(phi float64, buckets [][2]float64) float64 {
-	sort.Slice(buckets, func(i, j int) bool { return buckets[i][0] < buckets[j][0] })
-	nb := len(buckets)
-	for i := 1; i < nb; i++ {
-		if buckets[i][1] < buckets[i-1][1] {
-			buckets[i][1] = buckets[i-1][1]
-		}
-	}
-	total := buckets[nb-1][1]
-	rank := phi * total
-	b := 0
-	for b < nb-1 && buckets[b][1] < rank {
-		b++
-	}
-	if b == nb-1 {
-		return buckets[nb-2][0]
-	}
-	bucketStart := 0.0
-	prevCnt := 0.0
-	if b > 0 {
-		bucketStart = buckets[b-1][0]
-		prevCnt = buckets[b-1][1]
-	}
-	bucketEnd := buckets[b][0]
-	count := buckets[b][1] - prevCnt
-	return bucketStart + (bucketEnd-bucketStart)*((rank-prevCnt)/count)
-}
-
 func runW3(iters int) int {
+	stor, err := teststorage.NewWithError()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "w3 storage error: %v\n", err)
+		return 1
+	}
+	defer stor.Close()
+
+	ctx := context.Background()
+	app := stor.Appender(ctx)
 	jobs := []string{"api", "web", "worker", "billing"}
-	leVals := []float64{0.1, 0.25, 0.5, 1.0, 2.5, math.Inf(1)}
+	leVals := []string{"0.1", "0.25", "0.5", "1.0", "2.5", "+Inf"}
 	leWeights := []float64{15.0, 40.0, 70.0, 88.0, 96.0, 100.0}
 
-	var counters []counterSeries
-	var hbuckets []bucketSeries
 	for j, job := range jobs {
 		for inst := 0; inst < 4; inst++ {
-			smps := make([]sample, 11)
+			ls := labels.FromStrings("__name__", "http_requests_total", "instance", fmt.Sprintf("inst-%d", inst), "job", job)
 			rpm := float64((j+1)*60 + inst*15)
 			for t := 0; t <= 10; t++ {
-				smps[t] = sample{ts: int64(t * 60000), val: rpm * float64(t)}
+				if _, err := app.Append(0, ls, int64(t*60000), rpm*float64(t)); err != nil {
+					fmt.Fprintf(os.Stderr, "w3 append error: %v\n", err)
+					return 1
+				}
 			}
-			counters = append(counters, counterSeries{job: job, inst: fmt.Sprintf("inst-%d", inst), samples: smps})
 		}
 		for b, le := range leVals {
-			smps := make([]sample, 11)
+			ls := labels.FromStrings("__name__", "http_request_duration_seconds_bucket", "job", job, "le", le)
 			scale := float64(j + 1)
 			for t := 0; t <= 10; t++ {
-				smps[t] = sample{ts: int64(t * 60000), val: leWeights[b] * scale * float64(t)}
+				if _, err := app.Append(0, ls, int64(t*60000), leWeights[b]*scale*float64(t)); err != nil {
+					fmt.Fprintf(os.Stderr, "w3 append error: %v\n", err)
+					return 1
+				}
 			}
-			hbuckets = append(hbuckets, bucketSeries{job: job, le: le, samples: smps})
 		}
 	}
+	if err := app.Commit(); err != nil {
+		fmt.Fprintf(os.Stderr, "w3 commit error: %v\n", err)
+		return 1
+	}
+
+	engine := promql.NewEngine(promql.EngineOpts{
+		MaxSamples:    50000000,
+		Timeout:       time.Minute,
+		LookbackDelta: 5 * time.Minute,
+	})
+
+	const qHQ = `histogram_quantile(0.95, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m])))`
+	const qRate = `sum by (job) (rate(http_requests_total[5m]))`
 
 	var checksum int64 = 2166136261
 	var totalPoints int64
 	for it := 0; it < iters; it++ {
-		// 1. histogram_quantile(0.95, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m]))) at t=600s
-		for _, job := range jobs {
-			var bs [][2]float64
-			for _, hb := range hbuckets {
-				if hb.job != job {
-					continue
-				}
-				var win []sample
-				for _, s := range hb.samples {
-					if s.ts > 300000 && s.ts <= 600000 {
-						win = append(win, s)
-					}
-				}
-				r := extrapolatedRate(win, 300000, 600000)
-				bs = append(bs, [2]float64{hb.le, r})
-			}
-			hq := histogramQuantile(0.95, bs)
-			q := int64(hq*1000000.0 + 0.5)
+		q1, err := engine.NewInstantQuery(ctx, stor, nil, qHQ, time.UnixMilli(600000))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "w3 q1 error: %v\n", err)
+			return 2
+		}
+		r1 := q1.Exec(ctx)
+		if r1.Err != nil {
+			q1.Close()
+			fmt.Fprintf(os.Stderr, "w3 q1 exec error: %v\n", r1.Err)
+			return 2
+		}
+		vec := r1.Value.(promql.Vector)
+		sort.Slice(vec, func(i, j int) bool {
+			return vec[i].Metric.Get("job") < vec[j].Metric.Get("job")
+		})
+		for _, s := range vec {
+			q := int64(s.F*1000000.0 + 0.5)
 			checksum = fnv1aI64(checksum, q)
 			totalPoints++
 		}
-		// 2. eval_range sum by (job) rate over [300s, 600s] step 60s
-		for _, job := range jobs {
-			for ts := int64(300000); ts <= 600000; ts += 60000 {
-				var sum float64
-				for _, cs := range counters {
-					if cs.job != job {
-						continue
-					}
-					var win []sample
-					for _, s := range cs.samples {
-						if s.ts > ts-300000 && s.ts <= ts {
-							win = append(win, s)
-						}
-					}
-					sum += extrapolatedRate(win, ts-300000, ts)
-				}
-				q := int64(sum*1000000.0 + 0.5)
+		q1.Close()
+
+		q2, err := engine.NewRangeQuery(ctx, stor, nil, qRate, time.UnixMilli(300000), time.UnixMilli(600000), time.Minute)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "w3 q2 error: %v\n", err)
+			return 3
+		}
+		r2 := q2.Exec(ctx)
+		if r2.Err != nil {
+			q2.Close()
+			fmt.Fprintf(os.Stderr, "w3 q2 exec error: %v\n", r2.Err)
+			return 3
+		}
+		mat := r2.Value.(promql.Matrix)
+		sort.Slice(mat, func(i, j int) bool {
+			return mat[i].Metric.Get("job") < mat[j].Metric.Get("job")
+		})
+		for _, s := range mat {
+			for _, p := range s.Floats {
+				q := int64(p.F*1000000.0 + 0.5)
 				checksum = fnv1aI64(checksum, q)
 				totalPoints++
 			}
 		}
+		q2.Close()
 	}
 	fmt.Printf("w3 iters=%d points=%d fnv1a=%d\n", iters, totalPoints, checksum)
 	return 0

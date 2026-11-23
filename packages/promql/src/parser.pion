@@ -215,9 +215,163 @@ fn str_list_contains(xs : Array[String], target : String) -> Bool {
   false
 }
 
-///| Compile a PromQL anchored regex `^(?:pattern)$` to validate syntax and check empty-match.
+///| Preprocess a PromQL/RE2 regex pattern for compatibility with `packages/regex`:
+///| - Enforce RE2 max repeat count of 1000 (`{m,n}` where m > 1000 or n > 1000 or n < m).
+///| - Reject nested repetitions (`a**`, `a++`, `a+*`, etc.) while allowing non-greedy (`*?`, `+?`, `??`, `{m,n}?`).
+///| - Escape `{` that does not form a valid `{m}`, `{m,}`, or `{m,n}` quantifier (RE2 treats them as literals).
+fn preprocess_re2_pattern(pat : String) -> Result[String, String] {
+  let n = pat.length()
+  let sb = StringBuilder::new()
+  let mut i = 0
+  let mut in_class = false
+  let mut class_start = false
+  // prev_quant: 0 = none, 1 = greedy quantifier (*, +, ?, {m,n}), 2 = non-greedy quantifier (*?, etc.)
+  let mut prev_quant = 0
+  while i < n {
+    let b = pat.code_unit_at(i)
+    if b == 92 {
+      // Backslash escape
+      if i + 1 < n && pat.code_unit_at(i + 1) == 81 && !in_class {
+        // \Q ... \E literal quote
+        sb.write_byte(92.to_byte())
+        sb.write_byte(81.to_byte())
+        i = i + 2
+        while i < n {
+          if pat.code_unit_at(i) == 92 && i + 1 < n && pat.code_unit_at(i + 1) == 69 {
+            sb.write_byte(92.to_byte())
+            sb.write_byte(69.to_byte())
+            i = i + 2
+            break
+          }
+          sb.write_byte(pat.code_unit_at(i).to_byte())
+          i = i + 1
+        }
+        prev_quant = 0
+        continue
+      }
+      sb.write_byte(92.to_byte())
+      if i + 1 < n {
+        sb.write_byte(pat.code_unit_at(i + 1).to_byte())
+        i = i + 2
+      } else {
+        i = i + 1
+      }
+      prev_quant = 0
+      class_start = false
+      continue
+    }
+    if in_class {
+      if b == 93 && !class_start {
+        in_class = false
+      } else if b == 94 && class_start {
+        // Leading ^ in [^...] keeps class_start true so `[^]]` works
+        sb.write_byte(b.to_byte())
+        i = i + 1
+        continue
+      }
+      class_start = false
+      sb.write_byte(b.to_byte())
+      i = i + 1
+      prev_quant = 0
+      continue
+    }
+    if b == 91 {
+      // '[' enters character class
+      in_class = true
+      class_start = true
+      sb.write_byte(b.to_byte())
+      i = i + 1
+      prev_quant = 0
+      continue
+    }
+    if b == 123 {
+      // '{': check if valid RE2 quantifier `{m}`, `{m,}`, `{m,n}`
+      let mut j = i + 1
+      let mut m_val = 0
+      let mut m_digits = 0
+      while j < n && is_ascii_digit(pat.code_unit_at(j)) {
+        if m_val <= 10000 {
+          m_val = m_val * 10 + (pat.code_unit_at(j) - 48)
+        }
+        m_digits = m_digits + 1
+        j = j + 1
+      }
+      let mut is_quant = false
+      let mut has_comma = false
+      let mut has_n = false
+      let mut n_val = 0
+      if m_digits > 0 && j < n {
+        if pat.code_unit_at(j) == 125 {
+          // {m}
+          is_quant = true
+          j = j + 1
+        } else if pat.code_unit_at(j) == 44 {
+          has_comma = true
+          j = j + 1
+          let mut n_digits = 0
+          while j < n && is_ascii_digit(pat.code_unit_at(j)) {
+            if n_val <= 10000 {
+              n_val = n_val * 10 + (pat.code_unit_at(j) - 48)
+            }
+            n_digits = n_digits + 1
+            j = j + 1
+          }
+          if j < n && pat.code_unit_at(j) == 125 {
+            is_quant = true
+            has_n = n_digits > 0
+            j = j + 1
+          }
+        }
+      }
+      if is_quant {
+        if prev_quant != 0 {
+          return Err("invalid nested repetition operator")
+        }
+        if m_val > 1000 || (has_n && (n_val > 1000 || n_val < m_val)) {
+          return Err("invalid repeat count")
+        }
+        let _ = has_comma
+        sb.write_string(pat.slice(i, j))
+        i = j
+        prev_quant = 1
+      } else {
+        // Literal '{' in RE2
+        sb.write_string("\\{")
+        i = i + 1
+        prev_quant = 0
+      }
+      continue
+    }
+    if b == 42 || b == 43 || b == 63 {
+      // '*', '+', '?'
+      if prev_quant == 1 && b == 63 {
+        // Non-greedy modifier (*?, +?, ??, {m,n}?)
+        sb.write_byte(b.to_byte())
+        i = i + 1
+        prev_quant = 2
+      } else if prev_quant != 0 {
+        return Err("invalid nested repetition operator")
+      } else {
+        sb.write_byte(b.to_byte())
+        i = i + 1
+        prev_quant = 1
+      }
+      continue
+    }
+    sb.write_byte(b.to_byte())
+    i = i + 1
+    prev_quant = 0
+  }
+  Ok(sb.to_string())
+}
+
+///| Compile a PromQL anchored regex `^(?s:pattern)$` (with RE2 compatibility) to validate syntax and match.
 pub fn compile_promql_regex(pattern : String) -> Result[regex::Regex, String] {
-  match regex::compile("^(?:" + pattern + ")$") {
+  let pre = match preprocess_re2_pattern(pattern) {
+    Ok(p) => p
+    Err(msg) => return Err(msg)
+  }
+  match regex::compile("^(?s:" + pre + ")$") {
     Ok(re) => Ok(re)
     Err(_) => Err("invalid regular expression: " + pattern)
   }
@@ -282,9 +436,6 @@ fn Parser::parse_label_list(self : Parser) -> Result[Array[String], PromqlError]
       }
       _ => return Err(PromqlError::new(PromqlErrorKind::SyntaxError, t.pos, "expected label name in label list"))
     }
-    if str_list_contains(labels, name) {
-      return Err(PromqlError::new(PromqlErrorKind::SemanticError, t.pos, "duplicate label name in grouping/matching clause: " + name))
-    }
     labels.push(name)
     if tok_is_comma(self.peek()) {
       let _ = self.advance()
@@ -306,39 +457,35 @@ fn Parser::parse_matchers_brace(
   let brace_pos = self.peek().pos
   let _ = self.advance() // consume '{'
   let matchers : Array[LabelMatcher] = []
-  let mut resolved_name = metric_name
-  let mut first = true
   while !tok_is_rbrace(self.peek()) && !tok_is_eof(self.peek()) {
     let t = self.peek()
-    // UTF-8 quoted metric name as first item: `{"http.requests", env="prod"}`
-    if first && metric_name.length() == 0 {
-      match t.kind {
-        TokenKind::StringLit => {
-          let next = self.peek_at(1)
-          let is_matcher_op = match next.kind {
-            TokenKind::Assign => true
-            TokenKind::Neq => true
-            TokenKind::EqlRegex => true
-            TokenKind::NeqRegex => true
-            _ => false
-          }
-          if !is_matcher_op {
-            let _ = self.advance()
-            resolved_name = t.text
-            matchers.push(LabelMatcher::new(MatchOp::Equal, "__name__", t.text))
-            first = false
-            if tok_is_comma(self.peek()) {
-              let _ = self.advance()
-            } else {
-              break
-            }
-            continue
-          }
+    // UTF-8 quoted metric name at any position inside `{...}` when not followed by a matcher op
+    match t.kind {
+      TokenKind::StringLit => {
+        let next = self.peek_at(1)
+        let is_matcher_op = match next.kind {
+          TokenKind::Assign => true
+          TokenKind::Neq => true
+          TokenKind::EqlRegex => true
+          TokenKind::NeqRegex => true
+          _ => false
         }
-        _ => ()
+        if !is_matcher_op {
+          if metric_name.length() > 0 {
+            return Err(PromqlError::new(PromqlErrorKind::SyntaxError, t.pos, "metric name must not be set twice"))
+          }
+          let _ = self.advance()
+          matchers.push(LabelMatcher::new(MatchOp::Equal, "__name__", t.text))
+          if tok_is_comma(self.peek()) {
+            let _ = self.advance()
+          } else {
+            break
+          }
+          continue
+        }
       }
+      _ => ()
     }
-    first = false
     let label_name = match t.kind {
       TokenKind::Ident => {
         let _ = self.advance()
@@ -378,8 +525,8 @@ fn Parser::parse_matchers_brace(
       }
       _ => return Err(PromqlError::new(PromqlErrorKind::SyntaxError, val_tok.pos, "expected string literal in label matcher"))
     }
-    if label_name == "__name__" && match_op_eq(op, MatchOp::Equal) && resolved_name.length() == 0 {
-      resolved_name = val_str
+    if metric_name.length() > 0 && label_name == "__name__" {
+      return Err(PromqlError::new(PromqlErrorKind::SyntaxError, t.pos, "metric name must not be set twice"))
     }
     matchers.push(LabelMatcher::new(op, label_name, val_str))
     if tok_is_comma(self.peek()) {
@@ -396,9 +543,48 @@ fn Parser::parse_matchers_brace(
     matchers.push(LabelMatcher::new(MatchOp::Equal, "__name__", metric_name))
   }
   match validate_matchers(matchers, brace_pos) {
-    Ok(_) => Ok((resolved_name, matchers))
+    Ok(_) => Ok((metric_name, matchers))
     Err(e) => Err(e)
   }
+}
+
+fn round_secs_to_ms(secs : Double, pos : Int, err_msg : String) -> Result[Int64, PromqlError] {
+  if secs != secs || secs == 1.0 / 0.0 || secs == -1.0 / 0.0 {
+    return Err(PromqlError::new(PromqlErrorKind::SemanticError, pos, err_msg))
+  }
+  let abs_s = if secs < 0.0 { -secs } else { secs }
+  if abs_s > 9223372036.854 {
+    return Err(PromqlError::new(PromqlErrorKind::SemanticError, pos, err_msg))
+  }
+  let ms_f = secs * 1000.0
+  let rounded = if ms_f >= 0.0 {
+    let t = ms_f.to_int64()
+    if ms_f - t.to_double() >= 0.5 { t + 1L } else { t }
+  } else {
+    let t = ms_f.to_int64()
+    if t.to_double() - ms_f >= 0.5 { t - 1L } else { t }
+  }
+  Ok(rounded)
+}
+
+fn round_at_secs_to_ms(secs : Double, pos : Int) -> Result[Int64, PromqlError] {
+  if secs != secs || secs == 1.0 / 0.0 || secs == -1.0 / 0.0 {
+    return Err(PromqlError::new(PromqlErrorKind::SemanticError, pos, "timestamp out of bounds for @ modifier"))
+  }
+  let abs_s = if secs < 0.0 { -secs } else { secs }
+  // Go promql/parser bounds: math.MinInt64/1000 .. math.MaxInt64/1000
+  if abs_s > 9223372036854775.0 {
+    return Err(PromqlError::new(PromqlErrorKind::SemanticError, pos, "timestamp out of bounds for @ modifier"))
+  }
+  let ms_f = secs * 1000.0
+  let rounded = if ms_f >= 0.0 {
+    let t = ms_f.to_int64()
+    if ms_f - t.to_double() >= 0.5 { t + 1L } else { t }
+  } else {
+    let t = ms_f.to_int64()
+    if t.to_double() - ms_f >= 0.5 { t - 1L } else { t }
+  }
+  Ok(rounded)
 }
 
 fn Parser::parse_offset_value(self : Parser) -> Result[Int64, PromqlError] {
@@ -417,7 +603,15 @@ fn Parser::parse_offset_value(self : Parser) -> Result[Int64, PromqlError] {
   match t.kind {
     TokenKind::Duration => {
       let _ = self.advance()
+      if t.dur_ms <= 0L {
+        return Err(PromqlError::new(PromqlErrorKind::SemanticError, t.pos, "duration must be greater than 0"))
+      }
       Ok(if neg { -t.dur_ms } else { t.dur_ms })
+    }
+    TokenKind::Number => {
+      let _ = self.advance()
+      let secs = if neg { -t.num_val } else { t.num_val }
+      round_secs_to_ms(secs, t.pos, "offset duration out of range")
     }
     _ => Err(PromqlError::new(PromqlErrorKind::SyntaxError, t.pos, "expected duration after 'offset'"))
   }
@@ -428,8 +622,10 @@ fn Parser::parse_at_value(self : Parser) -> Result[AtModifier, PromqlError] {
   match t.kind {
     TokenKind::Number => {
       let _ = self.advance()
-      let ms = (t.num_val * 1000.0).to_int64()
-      Ok(AtModifier::Timestamp(ms))
+      match round_at_secs_to_ms(t.num_val, t.pos) {
+        Ok(ms) => Ok(AtModifier::Timestamp(ms))
+        Err(e) => Err(e)
+      }
     }
     TokenKind::Minus => {
       let _ = self.advance()
@@ -437,8 +633,10 @@ fn Parser::parse_at_value(self : Parser) -> Result[AtModifier, PromqlError] {
       match nt.kind {
         TokenKind::Number => {
           let _ = self.advance()
-          let ms = (-nt.num_val * 1000.0).to_int64()
-          Ok(AtModifier::Timestamp(ms))
+          match round_at_secs_to_ms(-nt.num_val, nt.pos) {
+            Ok(ms) => Ok(AtModifier::Timestamp(ms))
+            Err(e) => Err(e)
+          }
         }
         _ => Err(PromqlError::new(PromqlErrorKind::SyntaxError, nt.pos, "expected timestamp after '@ -'"))
       }
@@ -449,8 +647,10 @@ fn Parser::parse_at_value(self : Parser) -> Result[AtModifier, PromqlError] {
       match nt.kind {
         TokenKind::Number => {
           let _ = self.advance()
-          let ms = (nt.num_val * 1000.0).to_int64()
-          Ok(AtModifier::Timestamp(ms))
+          match round_at_secs_to_ms(nt.num_val, nt.pos) {
+            Ok(ms) => Ok(AtModifier::Timestamp(ms))
+            Err(e) => Err(e)
+          }
         }
         _ => Err(PromqlError::new(PromqlErrorKind::SyntaxError, nt.pos, "expected timestamp after '@ +'"))
       }
@@ -547,7 +747,7 @@ fn lookup_func_sig(name : String) -> Option[FuncSig] {
   if name == "predict_linear" {
     return Some(FuncSig::{ min_args: 2, max_args: 2, arg_types: [ValueType::Matrix, ValueType::Scalar], ret_type: ValueType::Vector })
   }
-  if name == "holt_winters" || name == "double_exponential_smoothing" {
+  if name == "double_exponential_smoothing" {
     return Some(FuncSig::{ min_args: 3, max_args: 3, arg_types: [ValueType::Matrix, ValueType::Scalar, ValueType::Scalar], ret_type: ValueType::Vector })
   }
   // Instant vector -> Instant vector (1 arg: Vector)
@@ -555,10 +755,17 @@ fn lookup_func_sig(name : String) -> Option[FuncSig] {
   name == "ln" || name == "log2" || name == "log10" || name == "sgn" ||
   name == "absent" || name == "sort" || name == "sort_desc" || name == "timestamp" ||
   name == "histogram_count" || name == "histogram_sum" || name == "histogram_avg" ||
+  name == "histogram_stddev" || name == "histogram_stdvar" ||
   name == "sin" || name == "cos" || name == "tan" || name == "asin" || name == "acos" || name == "atan" ||
   name == "sinh" || name == "cosh" || name == "tanh" || name == "asinh" || name == "acosh" || name == "atanh" ||
   name == "deg" || name == "rad" {
     return Some(FuncSig::{ min_args: 1, max_args: 1, arg_types: [ValueType::Vector], ret_type: ValueType::Vector })
+  }
+  if name == "sort_by_label" || name == "sort_by_label_desc" {
+    return Some(FuncSig::{ min_args: 2, max_args: -1, arg_types: [ValueType::Vector, ValueType::String], ret_type: ValueType::Vector })
+  }
+  if name == "info" {
+    return Some(FuncSig::{ min_args: 1, max_args: 2, arg_types: [ValueType::Vector, ValueType::Vector], ret_type: ValueType::Vector })
   }
   // Optional 0 or 1 vector arg date/time functions
   if name == "day_of_month" || name == "day_of_week" || name == "day_of_year" || name == "days_in_month" ||
@@ -590,7 +797,7 @@ fn lookup_func_sig(name : String) -> Option[FuncSig] {
   }
   if name == "label_join" {
     return Some(FuncSig::{
-      min_args: 4,
+      min_args: 3,
       max_args: -1,
       arg_types: [ValueType::Vector, ValueType::String, ValueType::String, ValueType::String],
       ret_type: ValueType::Vector,
@@ -785,20 +992,6 @@ fn Parser::parse_call(self : Parser, name : String, start_pos : Int) -> Result[I
     }
     i = i + 1
   }
-  // Extra static validation for label_replace & label_join
-  if name == "label_replace" {
-    match self.nodes[args[4]] {
-      ExprNode::StringLiteral(pat) =>
-      match compile_promql_regex(pat) {
-        Ok(_) => ()
-        Err(msg) => {
-          self.leave_depth()
-          return Err(PromqlError::new(PromqlErrorKind::SemanticError, start_pos, "invalid regex in label_replace: " + msg))
-        }
-      }
-      _ => ()
-    }
-  }
   self.leave_depth()
   self.push_node(ExprNode::Call(name, args, sig.ret_type), sig.ret_type, start_pos)
 }
@@ -858,11 +1051,16 @@ fn Parser::parse_primary(self : Parser) -> Result[Int, PromqlError] {
     }
     TokenKind::Ident => {
       let low = ascii_lower(t.text)
-      // Special float literals Inf / NaN
-      if (low == "inf" || low == "nan") && !tok_is_lbrace(self.peek_at(1)) && !tok_is_lparen(self.peek_at(1)) {
+      // Special float literals Inf / NaN (never valid as bare metric names)
+      if low == "inf" || low == "nan" {
         let _ = self.advance()
         let v = if low == "inf" { 1.0 / 0.0 } else { 0.0 / 0.0 }
         return self.push_node(ExprNode::NumberLiteral(v), ValueType::Scalar, t.pos)
+      }
+      // Reserved binary/modifier keywords cannot be bare metric names
+      if low == "on" || low == "ignoring" || low == "bool" || low == "group_left" || low == "group_right" ||
+      low == "atan2" {
+        return Err(PromqlError::new(PromqlErrorKind::SyntaxError, t.pos, "unexpected keyword: " + t.text))
       }
       // Aggregation expression if followed by `(`, `by`, or `without`
       match match_agg_op(low) {
@@ -910,6 +1108,13 @@ fn Parser::parse_postfix(self : Parser, initial_id : Int) -> Result[Int, PromqlE
           let _ = self.advance()
           dur_tok.dur_ms
         }
+        TokenKind::Number => {
+          let _ = self.advance()
+          match round_secs_to_ms(dur_tok.num_val, dur_tok.pos, "range duration out of range") {
+            Ok(ms) => ms
+            Err(e) => return Err(e)
+          }
+        }
         _ => return Err(PromqlError::new(PromqlErrorKind::SyntaxError, dur_tok.pos, "expected duration inside '[...]'"))
       }
       if range_ms <= 0L {
@@ -927,6 +1132,18 @@ fn Parser::parse_postfix(self : Parser, initial_id : Int) -> Result[Int, PromqlE
               step_ms = st.dur_ms
               if step_ms <= 0L {
                 return Err(PromqlError::new(PromqlErrorKind::SemanticError, st.pos, "subquery step duration must be positive"))
+              }
+            }
+            TokenKind::Number => {
+              let _ = self.advance()
+              match round_secs_to_ms(st.num_val, st.pos, "subquery step duration out of range") {
+                Ok(ms) => {
+                  step_ms = ms
+                  if step_ms <= 0L {
+                    return Err(PromqlError::new(PromqlErrorKind::SemanticError, st.pos, "subquery step duration must be positive"))
+                  }
+                }
+                Err(e) => return Err(e)
               }
             }
             _ => return Err(PromqlError::new(PromqlErrorKind::SyntaxError, st.pos, "expected step duration or ']' in subquery"))
@@ -949,12 +1166,13 @@ fn Parser::parse_postfix(self : Parser, initial_id : Int) -> Result[Int, PromqlE
           return Err(PromqlError::new(PromqlErrorKind::SyntaxError, self.peek().pos, "expected ']' to close matrix selector"))
         }
         let _ = self.advance()
-        let is_vs = match self.nodes[id] {
-          ExprNode::VectorSelector(_, _, _, _) => true
-          _ => false
-        }
-        if !is_vs {
-          return Err(PromqlError::new(PromqlErrorKind::SemanticError, bpos, "matrix selector requires a vector selector"))
+        match self.nodes[id] {
+          ExprNode::VectorSelector(_, _, off, at_m) => {
+            if off != 0L || !at_mod_is_none(at_m) {
+              return Err(PromqlError::new(PromqlErrorKind::SyntaxError, bpos, "no offset modifiers allowed before range"))
+            }
+          }
+          _ => return Err(PromqlError::new(PromqlErrorKind::SemanticError, bpos, "matrix selector requires a vector selector"))
         }
         match self.push_node(ExprNode::MatrixSelector(id, range_ms), ValueType::Matrix, bpos) {
           Ok(new_id) => id = new_id
@@ -1024,7 +1242,11 @@ fn Parser::parse_unary(self : Parser) -> Result[Int, PromqlError] {
       if !value_type_eq(vt, ValueType::Scalar) && !value_type_eq(vt, ValueType::Vector) {
         return Err(PromqlError::new(PromqlErrorKind::SemanticError, t.pos, "unary '+' only valid on scalar or instant vector"))
       }
-      self.push_node(ExprNode::UnaryExpr(UnaryOp::Plus, operand), vt, t.pos)
+      // Go promql/parser folds unary `+` directly into a NumberLiteral.
+      match self.nodes[operand] {
+        ExprNode::NumberLiteral(_) => Ok(operand)
+        _ => self.push_node(ExprNode::UnaryExpr(UnaryOp::Plus, operand), vt, t.pos)
+      }
     }
     TokenKind::Minus => {
       match self.enter_depth(t.pos) {
@@ -1045,7 +1267,14 @@ fn Parser::parse_unary(self : Parser) -> Result[Int, PromqlError] {
       if !value_type_eq(vt, ValueType::Scalar) && !value_type_eq(vt, ValueType::Vector) {
         return Err(PromqlError::new(PromqlErrorKind::SemanticError, t.pos, "unary '-' only valid on scalar or instant vector"))
       }
-      self.push_node(ExprNode::UnaryExpr(UnaryOp::Minus, operand), vt, t.pos)
+      // Go promql/parser folds unary `-` directly into a NumberLiteral.
+      match self.nodes[operand] {
+        ExprNode::NumberLiteral(v) => {
+          self.nodes[operand] = ExprNode::NumberLiteral(-v)
+          Ok(operand)
+        }
+        _ => self.push_node(ExprNode::UnaryExpr(UnaryOp::Minus, operand), vt, t.pos)
+      }
     }
     _ => {
       let p = match self.parse_primary() {
