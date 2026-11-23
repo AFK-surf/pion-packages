@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–4 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–5 + `fts`）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -242,6 +242,9 @@
 | `asn1` | 真实 PEM 证书链完整解析（10,000 张多算法 X.509 v3） | 11,010,800 B | 68.050 ms (161.80 MB/s) | 60.654 ms (`go_x509`) | 0.89x | **3.08 MiB** | 16.55 MiB |
 | `asn1` | 纯 DER X.509 v3 解析 + 3× SAN 主机名校验（50,000 张） | 38,604,000 B | 215.075 ms (179.49 MB/s) | 182.652 ms (`go_x509`) | 0.85x | **2.56 MiB** | 18.91 MiB |
 | `asn1` | 通用 ASN.1 DER TLV 编码 + 解码往返（100,000 结构） | 7,635,000 B | **120.671 ms** (63.27 MB/s) | 178.035 ms (`go_asn1`) | **1.48x** | **1.94 MiB** | 16.34 MiB |
+| `sdp` | Google Meet Offer 解析（11,142 B × 2,000） | 22.28 MB | **54.080 ms** (412.06 MB/s) | 105.431 ms (`rust_sdp 0.9.0`) | **1.95x** | **2.08 MiB** | 2.53 MiB |
+| `sdp` | Google Meet Offer 解析 + CRLF 往返（11,142 B × 2,000） | 22.28 MB | **87.608 ms** (254.36 MB/s) | 127.865 ms (`rust_sdp 0.9.0`) | **1.46x** | **2.30 MiB** | 2.67 MiB |
+| `sdp` | Google Meet SFU Answer 解析 + CRLF 往返（9,370 B × 2,000） | 18.74 MB | **85.317 ms** (219.65 MB/s) | 141.306 ms (`rust_sdp 0.9.0`) | **1.66x** | **2.31 MiB** | 2.55 MiB |
 
 ## 各包明细
 
@@ -1985,3 +1988,15 @@ Single-certificate extension cliff (`N = 64,000` distinct extensions, `1.2 MB` D
 - **Remaining Gaps**:
   - **Pure DER X.509 Parse (`0.85×` Go, `0.44×` Rust `x509-parser`)**: `Bytes::slice` copies into owned buffers for returned fields (`tbs_bytes`, `raw`, keys, signatures, DN/SAN strings), and `x509-parser` borrows `&[u8]` slices directly and lazily parses extensions without DER canonicality or duplicate-extension checks.
   - **Generic DER vs Rust `der` (`0.34×` Rust)**: Rust `der` reuses pre-allocated `Vec<u8>` buffers and pre-parsed `ObjectIdentifier` constants across iterations, whereas `DerWriter` in Workload 3 allocates per-record sequence buffers and re-encodes the OID string per iteration.
+
+### sdp
+
+参考实现：纯 Rust [`webrtc-rs/sdp`](https://github.com/webrtc-rs/sdp) `0.9.0`（`--release`）。`sh packages/sdp/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替）运行于真实 Chrome / Google Meet Offer（11,142 B：音频 + 双视频 + DataChannel、BUNDLE、VP8/VP9/H.264/AV1/Opus、12 条 `extmap`、Simulcast `rid`/`simulcast`、`ssrc-group:SIM`/`FID`、14 条 ICE candidate）与 Google Meet SFU Answer（9,370 B：`ice-lite`、10 条 bundled m-line），双方在规范结构摘要与完整 CRLF 序列化输出上均经 SHA-256 逐字节一致校验。详见 [`packages/sdp/README.md`](packages/sdp/README.md)。
+
+| Workload | `pion` Median (Throughput) | `rust_sdp` Median (Throughput) | `pion` Peak RSS | `rust_sdp` Peak RSS | `pion` vs `rust_sdp` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SDP Parse: Google Meet Offer (`11,142 B × 2000`) | **54.080 ms (412.06 MB/s)** | 105.431 ms (211.36 MB/s) | **2.08 MiB** | 2.53 MiB | **1.95x** |
+| SDP Roundtrip: Google Meet Offer (`11,142 B × 2000`) | **87.608 ms (254.36 MB/s)** | 127.865 ms (174.28 MB/s) | **2.30 MiB** | 2.67 MiB | **1.46x** |
+| SDP Roundtrip: Google Meet SFU Answer (`9,370 B × 2000`) | **85.317 ms (219.65 MB/s)** | 141.306 ms (132.62 MB/s) | **2.31 MiB** | 2.55 MiB | **1.66x** |
+
+红队：10 / 10 单测，`audit` 31 / 31 全绿（1 P0 + 4 P1 + 18 P2 全部修复：P0-1 放大炸弹 RSS 从 4.95 GB 降至 3.72 MiB、Wasm32 零 OOM、18k × 2 Native/Wasm32 fuzz 0 崩溃 / 0 分歧）。3 项真实 WebRTC SDP 负载全面领先 Rust `webrtc-rs/sdp 0.9.0`（**1.46×–1.95×**）且峰值 RSS 均更低（2.08–2.31 vs 2.53–2.67 MiB）。
