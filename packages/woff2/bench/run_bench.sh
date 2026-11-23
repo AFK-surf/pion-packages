@@ -56,15 +56,30 @@ def csum(b):
     b += b"\x00" * pad
     return sum(w for (w,) in struct.iter_unpack(">I", b)) & 0xFFFFFFFF
 
+def parse_tables(b):
+    nt = struct.unpack_from(">H", b, 4)[0]
+    out = {}
+    for i in range(nt):
+        tag, ck, off, ln = struct.unpack_from(">4sIII", b, 12 + i * 16)
+        payload = b[off:off + ln]
+        if tag == b"head" and ln >= 12:
+            payload = payload[:8] + b"\x00\x00\x00\x00" + payload[12:]
+        out[tag] = payload
+    return out
+
 out_dir = sys.argv[1]
 for name in ["arial_w2", "monaco_w2", "arial_w1"]:
     pt = open(os.path.join(out_dir, f"pion_{name}.txt"), "rb").read()
     rt = open(os.path.join(out_dir, f"rust_{name}.txt"), "rb").read()
     assert pt == rt, f"Summary mismatch on {name}:\n  pion: {pt}\n  rust: {rt}"
     p = open(os.path.join(out_dir, f"pion_{name}.ttf"), "rb").read()
+    r = open(os.path.join(out_dir, f"rust_{name}.ttf"), "rb").read()
+    ptabs = parse_tables(p)
+    rtabs = parse_tables(r)
+    assert ptabs == rtabs, f"Table payload mismatch on {name}: {[k for k in ptabs if ptabs.get(k) != rtabs.get(k)]}"
     cs = csum(p)
     assert cs == 0xB1B0AFBA, f"Pion SFNT checksum mismatch on {name}: 0x{cs:08x}"
-    print(f"  {name:10s}: OK (sfnt_csum=0xb1b0afba) | {pt.decode().strip()}")
+    print(f"  {name:10s}: OK (all {len(ptabs)} tables incl. glyf/loca byte-identical, sfnt_csum=0xb1b0afba) | {pt.decode().strip()}")
 PYEOF
 
 ARIAL_W2_OUT=$(wc -c < "$OUT_DIR/pion_arial_w2.ttf" | tr -d ' ')
