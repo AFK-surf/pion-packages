@@ -1,0 +1,865 @@
+///| Internal jq value representation with exact 64-bit / arbitrary-precision integers,
+///| indexed objects, iterative Json5Value bridge, and pure-Pion math helpers.
+
+import "json5"
+
+///| Private sentinel key used only when lossless >2^53 integers cross the
+///| `json5::Json5Value` public API boundary (`parse_json` / `run` / `to_json`).
+let jq_bigint_sentinel : String = "\u{0000}\u{001f}__pion_jq_int__"
+
+fn is_jq_num(v : JqVal) -> Bool {
+  match v {
+    JqVal::Int(_) | JqVal::BigInt(_) | JqVal::Float(_) => true
+    _ => false
+  }
+}
+
+struct JqObj {
+  entries : Array[(String, JqVal)]
+  mut index : Option[ObjHashIndex]
+}
+
+enum JqVal {
+  Null
+  Bool(Bool)
+  Int(Int64)
+  BigInt(String)
+  Float(Double)
+  Str(String)
+  Array(Array[JqVal])
+  Object(JqObj)
+}
+
+fn jq_obj_from_entries(entries : Array[(String, JqVal)]) -> JqObj {
+  JqObj::{ entries: entries, index: None }
+}
+
+fn jq_obj_ensure_index(obj : JqObj) -> ObjHashIndex {
+  match obj.index {
+    Some(hi) => hi
+    None => {
+      let n = obj.entries.length()
+      let hi = ObjHashIndex::new(if n * 2 < 16 { 16 } else { n * 2 })
+      let mut i = 0
+      while i < n {
+        let (k, _) = obj.entries[i]
+        let _ = hi.upsert(k, i)
+        i = i + 1
+      }
+      obj.index = Some(hi)
+      hi
+    }
+  }
+}
+
+fn jq_obj_get(obj : JqObj, key : String) -> Option[JqVal] {
+  let n = obj.entries.length()
+  if n == 0 {
+    return None
+  }
+  if n < 16 {
+    let mut i = n - 1
+    while i >= 0 {
+      let (k, v) = obj.entries[i]
+      if k == key {
+        return Some(v)
+      }
+      i = i - 1
+    }
+    return None
+  }
+  let hi = jq_obj_ensure_index(obj)
+  let idx = hi.get(key)
+  if idx >= 0 {
+    let (_, v) = obj.entries[idx]
+    Some(v)
+  } else {
+    None
+  }
+}
+
+fn jq_obj_has(obj : JqObj, key : String) -> Bool {
+  match jq_obj_get(obj, key) {
+    Some(_) => true
+    None => false
+  }
+}
+
+fn jq_obj_dedup_entries(entries : Array[(String, JqVal)]) -> JqObj {
+  let n = entries.length()
+  if n <= 1 {
+    return jq_obj_from_entries(entries)
+  }
+  let out : Array[(String, JqVal)] = []
+  let hi = ObjHashIndex::new(if n * 2 < 16 { 16 } else { n * 2 })
+  let mut i = 0
+  while i < n {
+    let (k, v) = entries[i]
+    let existing = hi.get(k)
+    if existing >= 0 {
+      out[existing] = (k, v)
+    } else {
+      let idx = out.length()
+      let _ = hi.upsert(k, idx)
+      out.push((k, v))
+    }
+    i = i + 1
+  }
+  JqObj::{ entries: out, index: Some(hi) }
+}
+
+// ---------------------------------------------------------------------------
+// Exact integer / BigInt helpers (canonical decimal strings)
+// ---------------------------------------------------------------------------
+
+fn parse_i64_exact(s : String) -> Option[Int64] {
+  let n = s.length()
+  if n == 0 {
+    return None
+  }
+  let mut neg = false
+  let mut i = 0
+  if s.code_unit_at(0) == 45 {
+    neg = true
+    i = 1
+  } else if s.code_unit_at(0) == 43 {
+    i = 1
+  }
+  if i >= n {
+    return None
+  }
+  // Accumulate as negative Int64 so Int64::MIN (-9223372036854775808) fits cleanly
+  let min_div10 : Int64 = -922337203685477580L
+  let mut acc : Int64 = 0L
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    let d = (c - 48).to_int64()
+    if acc < min_div10 {
+      return None
+    }
+    acc = acc * 10L
+    if acc < -9223372036854775807L - 1L + d {
+      return None
+    }
+    acc = acc - d
+    i = i + 1
+  }
+  if neg {
+    Some(acc)
+  } else {
+    if acc == -9223372036854775807L - 1L {
+      None
+    } else {
+      Some(-acc)
+    }
+  }
+}
+
+///| Normalize a canonical signed decimal integer string (no leading zeros, no "-0").
+fn bigint_norm(s : String) -> String {
+  let n = s.length()
+  if n == 0 {
+    return "0"
+  }
+  let mut neg = false
+  let mut i = 0
+  if s.code_unit_at(0) == 45 {
+    neg = true
+    i = 1
+  } else if s.code_unit_at(0) == 43 {
+    i = 1
+  }
+  while i < n && s.code_unit_at(i) == 48 {
+    i = i + 1
+  }
+  if i >= n {
+    return "0"
+  }
+  let body = s.slice(i, n)
+  if neg { "-" + body } else { body }
+}
+
+///| Convert a canonical decimal string to `JqVal::Int` if it fits in `Int64`, else `JqVal::BigInt`.
+fn jq_int_from_decimal(s : String) -> JqVal {
+  let norm = bigint_norm(s)
+  match parse_i64_exact(norm) {
+    Some(v) => JqVal::Int(v)
+    None => JqVal::BigInt(norm)
+  }
+}
+
+fn bigint_is_neg(s : String) -> Bool {
+  s.length() > 0 && s.code_unit_at(0) == 45
+}
+
+fn bigint_abs(s : String) -> String {
+  if bigint_is_neg(s) {
+    s.slice(1, s.length())
+  } else {
+    s
+  }
+}
+
+fn bigint_neg_str(s : String) -> String {
+  if s == "0" {
+    "0"
+  } else if bigint_is_neg(s) {
+    s.slice(1, s.length())
+  } else {
+    "-" + s
+  }
+}
+
+fn bigint_cmp_mag(a : String, b : String) -> Int {
+  let na = a.length()
+  let nb = b.length()
+  if na != nb {
+    return if na < nb { -1 } else { 1 }
+  }
+  let mut i = 0
+  while i < na {
+    let ca = a.code_unit_at(i)
+    let cb = b.code_unit_at(i)
+    if ca != cb {
+      return if ca < cb { -1 } else { 1 }
+    }
+    i = i + 1
+  }
+  0
+}
+
+fn bigint_cmp(a : String, b : String) -> Int {
+  let na = bigint_is_neg(a)
+  let nb = bigint_is_neg(b)
+  if na && !nb {
+    return -1
+  }
+  if !na && nb {
+    return 1
+  }
+  let c = bigint_cmp_mag(bigint_abs(a), bigint_abs(b))
+  if na { -c } else { c }
+}
+
+fn bigint_add_mag(a : String, b : String) -> String {
+  let mut i = a.length() - 1
+  let mut j = b.length() - 1
+  let digits : Array[Int] = []
+  let mut carry = 0
+  while i >= 0 || j >= 0 || carry > 0 {
+    let da = if i >= 0 { a.code_unit_at(i) - 48 } else { 0 }
+    let db = if j >= 0 { b.code_unit_at(j) - 48 } else { 0 }
+    let sum = da + db + carry
+    digits.push(sum % 10)
+    carry = sum / 10
+    i = i - 1
+    j = j - 1
+  }
+  let sb = StringBuilder::new()
+  let mut k = digits.length() - 1
+  while k >= 0 {
+    sb.write_byte((48 + digits[k]).to_byte())
+    k = k - 1
+  }
+  bigint_norm(sb.to_string())
+}
+
+///| Assumes mag(a) >= mag(b).
+fn bigint_sub_mag(a : String, b : String) -> String {
+  let mut i = a.length() - 1
+  let mut j = b.length() - 1
+  let digits : Array[Int] = []
+  let mut borrow = 0
+  while i >= 0 {
+    let da = a.code_unit_at(i) - 48 - borrow
+    let db = if j >= 0 { b.code_unit_at(j) - 48 } else { 0 }
+    if da < db {
+      digits.push(da + 10 - db)
+      borrow = 1
+    } else {
+      digits.push(da - db)
+      borrow = 0
+    }
+    i = i - 1
+    j = j - 1
+  }
+  let sb = StringBuilder::new()
+  let mut k = digits.length() - 1
+  while k >= 0 {
+    sb.write_byte((48 + digits[k]).to_byte())
+    k = k - 1
+  }
+  bigint_norm(sb.to_string())
+}
+
+fn bigint_add(a : String, b : String) -> String {
+  let na = bigint_is_neg(a)
+  let nb = bigint_is_neg(b)
+  let ma = bigint_abs(a)
+  let mb = bigint_abs(b)
+  if na == nb {
+    let r = bigint_add_mag(ma, mb)
+    if na && r != "0" { "-" + r } else { r }
+  } else {
+    let c = bigint_cmp_mag(ma, mb)
+    if c == 0 {
+      "0"
+    } else if c > 0 {
+      let r = bigint_sub_mag(ma, mb)
+      if na { "-" + r } else { r }
+    } else {
+      let r = bigint_sub_mag(mb, ma)
+      if nb { "-" + r } else { r }
+    }
+  }
+}
+
+fn bigint_sub(a : String, b : String) -> String {
+  bigint_add(a, bigint_neg_str(b))
+}
+
+fn bigint_mul(a : String, b : String) -> String {
+  let na = bigint_is_neg(a)
+  let nb = bigint_is_neg(b)
+  let ma = bigint_abs(a)
+  let mb = bigint_abs(b)
+  if ma == "0" || mb == "0" {
+    return "0"
+  }
+  let la = ma.length()
+  let lb = mb.length()
+  let prod = FixedArray::make(la + lb, 0)
+  let mut i = la - 1
+  while i >= 0 {
+    let da = ma.code_unit_at(i) - 48
+    let mut j = lb - 1
+    while j >= 0 {
+      let db = mb.code_unit_at(j) - 48
+      let idx = i + j + 1
+      let sum = prod[idx] + da * db
+      prod[idx] = sum % 10
+      prod[idx - 1] = prod[idx - 1] + sum / 10
+      j = j - 1
+    }
+    i = i - 1
+  }
+  let sb = StringBuilder::new()
+  let mut k = 0
+  while k < la + lb && prod[k] == 0 {
+    k = k + 1
+  }
+  if k >= la + lb {
+    return "0"
+  }
+  if na != nb {
+    sb.write_byte(45.to_byte())
+  }
+  while k < la + lb {
+    sb.write_byte((48 + prod[k]).to_byte())
+    k = k + 1
+  }
+  sb.to_string()
+}
+
+///| Signed remainder `a % b` (truncating toward zero, matching jq/gojq/C).
+///| Assumes `b != "0"`.
+fn bigint_rem(a : String, b : String) -> String {
+  let na = bigint_is_neg(a)
+  let ma = bigint_abs(a)
+  let mb = bigint_abs(b)
+  if bigint_cmp_mag(ma, mb) < 0 {
+    return a
+  }
+  // Long division by digit
+  let mut rem = "0"
+  let mut i = 0
+  while i < ma.length() {
+    let ch = ma.slice(i, i + 1)
+    rem = if rem == "0" { ch } else { rem + ch }
+    while bigint_cmp_mag(rem, mb) >= 0 {
+      rem = bigint_sub_mag(rem, mb)
+    }
+    i = i + 1
+  }
+  if rem == "0" {
+    "0"
+  } else if na {
+    "-" + rem
+  } else {
+    rem
+  }
+}
+
+fn bigint_to_double(s : String) -> Double {
+  match json5::parse_with_options(s, json5::ParseOptions::default()) {
+    Ok(json5::Json5Value::Number(x)) => x
+    _ => if bigint_is_neg(s) { -1.0 / 0.0 } else { 1.0 / 0.0 }
+  }
+}
+
+fn jq_val_to_double(v : JqVal) -> Option[Double] {
+  match v {
+    JqVal::Int(i) => Some(i.to_double())
+    JqVal::BigInt(s) => Some(bigint_to_double(s))
+    JqVal::Float(x) => Some(x)
+    _ => None
+  }
+}
+
+fn jq_val_to_decimal_int(v : JqVal) -> Option[String] {
+  match v {
+    JqVal::Int(i) => Some(i.to_string())
+    JqVal::BigInt(s) => Some(s)
+    _ => None
+  }
+}
+
+fn is_pure_decimal_int_str(s : String) -> Bool {
+  let n = s.length()
+  if n == 0 {
+    return false
+  }
+  let mut i = 0
+  if s.code_unit_at(0) == 45 || s.code_unit_at(0) == 43 {
+    i = 1
+  }
+  if i >= n {
+    return false
+  }
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Parse a jq/JSON number string into `JqVal::Int`, `JqVal::BigInt`, or `JqVal::Float`.
+fn parse_jq_number_str(s : String, allow_overflow_inf : Bool) -> Option[JqVal] {
+  if is_pure_decimal_int_str(s) {
+    // Preserve -0 as Float(-0.0) or Int(0): jq/gojq treat -0 as 0 in arithmetic,
+    // and gojq stringifies -0 as "0".
+    return Some(jq_int_from_decimal(s))
+  }
+  let mut norm = s
+  // Normalize leading '+' or leading '.' or trailing '.'
+  if norm.length() > 0 && norm.code_unit_at(0) == 43 {
+    norm = norm.slice(1, norm.length())
+  }
+  let neg = norm.length() > 0 && norm.code_unit_at(0) == 45
+  let body = if neg { norm.slice(1, norm.length()) } else { norm }
+  if body.length() == 0 {
+    return None
+  }
+  // Strip leading zeros before digits (e.g., "05.2" -> "5.2", "01000" already handled above)
+  let mut zi = 0
+  while zi + 1 < body.length() && body.code_unit_at(zi) == 48 && body.code_unit_at(zi + 1) >= 48 && body.code_unit_at(zi + 1) <= 57 {
+    zi = zi + 1
+  }
+  let mut b2 = if zi > 0 { body.slice(zi, body.length()) } else { body }
+  if b2.length() > 0 && b2.code_unit_at(0) == 46 {
+    b2 = "0" + b2
+  }
+  // Handle trailing dot before end or 'e'/'E' (e.g. "5." or "5.e2")
+  let mut dot_pos = -1
+  let mut exp_pos = -1
+  let mut k = 0
+  while k < b2.length() {
+    let c = b2.code_unit_at(k)
+    if c == 46 && dot_pos < 0 {
+      dot_pos = k
+    } else if (c == 101 || c == 69) && exp_pos < 0 {
+      exp_pos = k
+    }
+    k = k + 1
+  }
+  if dot_pos >= 0 {
+    let after_dot = dot_pos + 1
+    if after_dot == b2.length() || after_dot == exp_pos {
+      b2 = b2.slice(0, after_dot) + "0" + b2.slice(after_dot, b2.length())
+    }
+  }
+  let final_s = if neg { "-" + b2 } else { b2 }
+  let opts = if allow_overflow_inf {
+    json5::ParseOptions::default()
+  } else {
+    json5::ParseOptions::strict_json()
+  }
+  match json5::parse_with_options(final_s, opts) {
+    Ok(json5::Json5Value::Number(x)) => Some(JqVal::Float(x))
+    _ => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pure-Pion IEEE 754 math helpers (`sqrt`, `ln`, `exp`, `pow`, `round`)
+// ---------------------------------------------------------------------------
+
+fn f64_sqrt(x : Double) -> Double {
+  if x != x || x < 0.0 {
+    return 0.0 / 0.0
+  }
+  if x == 0.0 || x == 1.0 / 0.0 {
+    return x
+  }
+  // Scale x into [0.5, 2.0) using powers of 4
+  let mut m = x
+  let mut scale = 1.0
+  while m >= 2.0 {
+    m = m * 0.25
+    scale = scale * 2.0
+  }
+  while m < 0.5 {
+    m = m * 4.0
+    scale = scale * 0.5
+  }
+  let mut g = 0.5 * (m + 1.0)
+  let mut i = 0
+  while i < 8 {
+    g = 0.5 * (g + m / g)
+    i = i + 1
+  }
+  g * scale
+}
+
+fn f64_ln(x : Double) -> Double {
+  if x != x || x < 0.0 {
+    return 0.0 / 0.0
+  }
+  if x == 0.0 {
+    return -1.0 / 0.0
+  }
+  if x == 1.0 / 0.0 {
+    return 1.0 / 0.0
+  }
+  let ln2 = 0.693147180559945309417232121458176568
+  let mut m = x
+  let mut k = 0
+  while m >= 1.4142135623730951 {
+    m = m * 0.5
+    k = k + 1
+  }
+  while m < 0.7071067811865476 {
+    m = m * 2.0
+    k = k - 1
+  }
+  let t = (m - 1.0) / (m + 1.0)
+  let t2 = t * t
+  let mut term = t
+  let mut sum = t
+  let mut n = 3
+  while n <= 31 {
+    term = term * t2
+    sum = sum + term / n.to_double()
+    n = n + 2
+  }
+  2.0 * sum + k.to_double() * ln2
+}
+
+fn f64_exp(x : Double) -> Double {
+  if x != x {
+    return x
+  }
+  if x > 709.782712893384 {
+    return 1.0 / 0.0
+  }
+  if x < -745.1332191019412 {
+    return 0.0
+  }
+  let ln2 = 0.693147180559945309417232121458176568
+  let kf = f64_floor(x / ln2 + 0.5)
+  let k = kf.to_int64().to_int()
+  let r = x - kf * ln2
+  let mut term = 1.0
+  let mut sum = 1.0
+  let mut i = 1
+  while i <= 25 {
+    term = term * r / i.to_double()
+    sum = sum + term
+    i = i + 1
+  }
+  // Multiply by 2^k
+  let mut res = sum
+  if k > 0 {
+    let mut rem = k
+    while rem > 0 {
+      res = res * 2.0
+      rem = rem - 1
+    }
+  } else if k < 0 {
+    let mut rem = -k
+    while rem > 0 {
+      res = res * 0.5
+      rem = rem - 1
+    }
+  }
+  res
+}
+
+fn f64_pow(x : Double, y : Double) -> Double {
+  if y == 0.0 {
+    return 1.0
+  }
+  if x == 1.0 {
+    return 1.0
+  }
+  if x != x || y != y {
+    return 0.0 / 0.0
+  }
+  // Exact integer exponent fast path
+  if is_finite_f64(y) && y == f64_trunc(y) && y >= -1074.0 && y <= 1074.0 {
+    let mut exp_i = y.to_int64().to_int()
+    let neg_exp = exp_i < 0
+    if neg_exp {
+      exp_i = -exp_i
+    }
+    let mut base = x
+    let mut acc = 1.0
+    while exp_i > 0 {
+      if (exp_i & 1) != 0 {
+        acc = acc * base
+      }
+      exp_i = exp_i >> 1
+      if exp_i > 0 {
+        base = base * base
+      }
+    }
+    return if neg_exp { 1.0 / acc } else { acc }
+  }
+  if x < 0.0 {
+    return 0.0 / 0.0
+  }
+  if x == 0.0 {
+    return if y > 0.0 { 0.0 } else { 1.0 / 0.0 }
+  }
+  f64_exp(y * f64_ln(x))
+}
+
+fn f64_round(x : Double) -> Double {
+  if !is_finite_f64(x) {
+    return x
+  }
+  if x >= 4503599627370496.0 || x <= -4503599627370496.0 {
+    return x
+  }
+  if x >= 0.0 {
+    f64_floor(x + 0.5)
+  } else {
+    f64_ceil(x - 0.5)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Iterative bridge between `json5::Json5Value` and `JqVal` (O(1) call stack)
+// ---------------------------------------------------------------------------
+
+enum FromJ5Frame {
+  Arr(Array[json5::Json5Value], Int, Array[JqVal])
+  Obj(Array[(String, json5::Json5Value)], Int, Array[(String, JqVal)])
+}
+
+fn from_json5(root : json5::Json5Value) -> JqVal {
+  let stack : Array[FromJ5Frame] = []
+  let mut cur = root
+  while true {
+    let converted = match cur {
+      json5::Json5Value::Null => Some(JqVal::Null)
+      json5::Json5Value::Bool(b) => Some(JqVal::Bool(b))
+      json5::Json5Value::Number(x) => {
+        if is_finite_f64(x) && x >= -9007199254740992.0 && x <= 9007199254740992.0 {
+          let i = x.to_int64()
+          if i.to_double() == x {
+            Some(JqVal::Int(i))
+          } else {
+            Some(JqVal::Float(x))
+          }
+        } else {
+          Some(JqVal::Float(x))
+        }
+      }
+      json5::Json5Value::Str(s) => Some(JqVal::Str(s))
+      json5::Json5Value::Array(xs) => {
+        if xs.length() == 0 {
+          Some(JqVal::Array([]))
+        } else {
+          stack.push(FromJ5Frame::Arr(xs, 1, []))
+          cur = xs[0]
+          None
+        }
+      }
+      json5::Json5Value::Object(es) => {
+        // Check for lossless >2^53 integer sentinel
+        if es.length() == 1 {
+          let (k0, v0) = es[0]
+          if k0 == jq_bigint_sentinel {
+            match v0 {
+              json5::Json5Value::Str(ds) => Some(jq_int_from_decimal(ds))
+              _ => Some(JqVal::Null)
+            }
+          } else {
+            stack.push(FromJ5Frame::Obj(es, 1, []))
+            cur = v0
+            None
+          }
+        } else if es.length() == 0 {
+          Some(JqVal::Object(jq_obj_from_entries([])))
+        } else {
+          let (_, v0) = es[0]
+          stack.push(FromJ5Frame::Obj(es, 1, []))
+          cur = v0
+          None
+        }
+      }
+    }
+    match converted {
+      None => continue
+      Some(v0) => {
+        let mut v_acc = v0
+        let mut need_descend = false
+        while stack.length() > 0 {
+          let top = match stack.pop() {
+            Some(f) => f
+            None => break
+          }
+          match top {
+            FromJ5Frame::Arr(src, idx, out) => {
+              out.push(v_acc)
+              if idx < src.length() {
+                stack.push(FromJ5Frame::Arr(src, idx + 1, out))
+                cur = src[idx]
+                need_descend = true
+                break
+              } else {
+                v_acc = JqVal::Array(out)
+              }
+            }
+            FromJ5Frame::Obj(src, idx, out) => {
+              let (prev_k, _) = src[idx - 1]
+              out.push((prev_k, v_acc))
+              if idx < src.length() {
+                let (_, next_v) = src[idx]
+                stack.push(FromJ5Frame::Obj(src, idx + 1, out))
+                cur = next_v
+                need_descend = true
+                break
+              } else {
+                v_acc = JqVal::Object(jq_obj_from_entries(out))
+              }
+            }
+          }
+        }
+        if !need_descend {
+          return v_acc
+        }
+      }
+    }
+  }
+  JqVal::Null
+}
+
+enum ToJ5Frame {
+  Arr(Array[JqVal], Int, Array[json5::Json5Value])
+  Obj(Array[(String, JqVal)], Int, Array[(String, json5::Json5Value)])
+}
+
+fn to_json5_bounded(root : JqVal, max_nodes : Int) -> Result[json5::Json5Value, JqError] {
+  let stack : Array[ToJ5Frame] = []
+  let mut cur = root
+  let mut visited = 0
+  while true {
+    visited = visited + 1
+    if visited > max_nodes {
+      return Err(JqError::LimitExceeded("output value exceeds max_output_bytes"))
+    }
+    let converted = match cur {
+      JqVal::Null => Some(json5::Json5Value::Null)
+      JqVal::Bool(b) => Some(json5::Json5Value::Bool(b))
+      JqVal::Int(i) => {
+        if i >= -9007199254740992L && i <= 9007199254740992L {
+          Some(json5::Json5Value::Number(i.to_double()))
+        } else {
+          Some(json5::Json5Value::Object([(jq_bigint_sentinel, json5::Json5Value::Str(i.to_string()))]))
+        }
+      }
+      JqVal::BigInt(s) =>
+      Some(json5::Json5Value::Object([(jq_bigint_sentinel, json5::Json5Value::Str(s))]))
+      JqVal::Float(x) => Some(json5::Json5Value::Number(x))
+      JqVal::Str(s) => Some(json5::Json5Value::Str(s))
+      JqVal::Array(xs) => {
+        if xs.length() == 0 {
+          Some(json5::Json5Value::Array([]))
+        } else {
+          stack.push(ToJ5Frame::Arr(xs, 1, []))
+          cur = xs[0]
+          None
+        }
+      }
+      JqVal::Object(obj) => {
+        let es = obj.entries
+        if es.length() == 0 {
+          Some(json5::Json5Value::Object([]))
+        } else {
+          let (_, v0) = es[0]
+          stack.push(ToJ5Frame::Obj(es, 1, []))
+          cur = v0
+          None
+        }
+      }
+    }
+    match converted {
+      None => continue
+      Some(v0) => {
+        let mut v_acc = v0
+        let mut need_descend = false
+        while stack.length() > 0 {
+          let top = match stack.pop() {
+            Some(f) => f
+            None => break
+          }
+          match top {
+            ToJ5Frame::Arr(src, idx, out) => {
+              out.push(v_acc)
+              if idx < src.length() {
+                stack.push(ToJ5Frame::Arr(src, idx + 1, out))
+                cur = src[idx]
+                need_descend = true
+                break
+              } else {
+                v_acc = json5::Json5Value::Array(out)
+              }
+            }
+            ToJ5Frame::Obj(src, idx, out) => {
+              let (prev_k, _) = src[idx - 1]
+              out.push((prev_k, v_acc))
+              if idx < src.length() {
+                let (_, next_v) = src[idx]
+                stack.push(ToJ5Frame::Obj(src, idx + 1, out))
+                cur = next_v
+                need_descend = true
+                break
+              } else {
+                v_acc = json5::Json5Value::Object(out)
+              }
+            }
+          }
+        }
+        if !need_descend {
+          return Ok(v_acc)
+        }
+      }
+    }
+  }
+  Ok(json5::Json5Value::Null)
+}
+
+fn to_json5(root : JqVal) -> json5::Json5Value {
+  match to_json5_bounded(root, 16777216) {
+    Ok(v) => v
+    Err(_) => json5::Json5Value::Null
+  }
+}
