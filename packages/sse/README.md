@@ -16,20 +16,23 @@ Pure-Pion, zero-dependency, `World`-free, `Send`-clean (no module-level mutable 
     - Joins multiple `data:` lines with `\n`; suppresses dispatch when no `data` field appeared in the block; resets `event_type` to `"message"` after every blank line.
     - Commits `id:` to `last_event_id` on blank-line dispatch (even for data-less blocks per §9.2.6 Step 1), persists across subsequent events, clears on bare `id`, and ignores any `id:` value containing NUL (`U+0000`).
     - Parses `retry:` strictly as non-empty ASCII decimal digits (`0..=Int64::MAX`), ignoring non-digits, signs, spaces, and overflow; retains latest valid value in `parser.retry_ms()` while carrying per-block `retry` on `SseEvent.retry`.
-    - Discards incomplete trailing lines/events on `finish()` without overwriting committed `last_event_id`.
+    - Discards incomplete trailing lines/events (including any partial leading BOM bytes or uncommitted `id:`) on `finish()` while preserving committed `last_event_id` and `retry_ms` and re-arming BOM stripping so the parser can be cleanly reused across reconnects.
+    - **Sticky error & committed-event preservation**: once `feed_bytes` hits any `SseError`, the parser enters a poisoned state until `finish()` or `reset()` (preventing mid-line resynchronization or truncated dispatch). If one or more events were already dispatched in the same chunk before the error, `feed_bytes` returns `Ok(events)` first and surfaces the `Err(err)` on the next `feed_bytes` / `finish` call so `last_event_id()` never advances past an undelivered event.
   - **Configurable UTF-8 policy (`Utf8Mode`)**:
     - `Utf8Mode::Replace` (default): WHATWG Encoding Standard maximal-subpart `U+FFFD` replacement, with a zero-copy fast path when the slice is already valid UTF-8.
     - `Utf8Mode::Strict`: rejects any ill-formed UTF-8 sequence with `SseError::InvalidUtf8(offset)`.
 - **Injection-Safe Encoder (`src/encoder.pion`)**:
   - `format_event(event)`, `format_event_bytes(event)`, and `format_comment(comment)`.
-  - Automatically splits multiline `data` (and comments) on `\r\n`, `\n`, and `\r` into separate `data: ` / `: ` lines for lossless round-tripping.
+  - Automatically splits multiline `data` (and comments) on `\r\n`, `\n`, and `\r` into separate `data: ` / `: ` lines. Per the WHATWG SSE wire format, parsed `data:` lines are joined with `\n`, so CR-free payloads round-trip byte-for-byte losslessly while embedded `\r` / `\r\n` normalize to `\n`.
+  - `format_event` omits `id:` when `event.id == ""` (so re-encoding a sequence where a server explicitly cleared a prior non-empty `id` does not emit a bare `id` reset line).
   - Strictly rejects (`Err(SseError::InvalidFieldValue)`) CR (`\r`), LF (`\n`), or NUL (`\0`) in `event_type` or `id`, as well as negative `retry` values, preventing SSE field injection.
 - **Sans-IO Reconnect & Deterministic Backoff State Machine (`src/reconnect.pion`)**:
-  - `SseReconnectState` tracks `last_event_id`, server-supplied `retry_ms`, consecutive failure `attempt`, and capped exponential backoff with injectable deterministic `seed` / `jitter_ratio_bps` (pure `Int64` arithmetic, `World`-free, bit-identical across Native and `wasm32`).
+  - `SseReconnectState` tracks `last_event_id`, server-supplied `retry_ms`, consecutive failure `attempt`, and capped exponential backoff with injectable deterministic `seed` / `jitter_ratio_bps` (pure `Int64` arithmetic, `World`-free, bit-identical across Native and `wasm32`). Because the package is `World`-free, callers deploying multiple clients should pass a per-instance `seed` in `SseReconnectConfig`.
+  - Honors a server `retry: 0` on attempt 1, then falls back to `base_backoff_ms` (or `1 ms`) exponential backoff on consecutive failures to prevent reconnect storms; applies downward jitter within `[cap - span, cap]` once `delay + span > cap` so steady-state retries at the cap remain spread out.
   - Automatically resets `attempt` to `0` on `on_event` / `on_connect_success`.
-  - Provides `last_event_id_header()` (`Last-Event-ID`) and RFC 3986 percent-encoded query cursor helpers (`append_cursor_query` / `append_cursor_query_with`, e.g. `?since=<id>` preserving existing query parameters and `#fragment`).
+  - Provides `last_event_id_header()` (`Last-Event-ID`, returning `None` if `last_event_id` is empty or contains CR/LF/NUL) and RFC 3986 percent-encoded query cursor helpers (`append_cursor_query` / `append_cursor_query_with`, percent-encoding both parameter name and value, replacing any existing same-named query parameter in place, and preserving `#fragment`).
 - **DoS Protection (`SseLimits`)**:
-  - `max_line_bytes` (default `1 MiB`), `max_event_bytes` (default `4 MiB`), `max_data_lines` (default `65,536`).
+  - `max_line_bytes` (default `1 MiB`), `max_event_bytes` (default `4 MiB`, accounted on decoded UTF-8 bytes after `U+FFFD` replacement), `max_data_lines` (default `65,536`).
   - Negative limits are rejected with `SseError::InvalidLimits`; oversized lines, events, or blank-line floods remain bounded with zero OOM/trap on Native and `wasm32`.
 
 ## Quick Start
@@ -93,8 +96,8 @@ SHA-256: `f012a70d17b87fc9419cdff2f9a80896744d291c83960346fd087d7026e9225c`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_eventsource_stream`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 161.073 | 158.366 | 162.216 | 133.06 | 644.29 | 5.83 MiB | **1.37x** |
-| `rust_eventsource_stream` | 221.381 | 217.030 | 248.828 | 96.82 | 885.53 | 4.64 MiB | 1.00x (baseline) |
+| `pion` | 154.053 | 151.055 | 169.562 | 139.13 | 616.21 | 5.84 MiB | **1.23x** |
+| `rust_eventsource_stream` | 188.726 | 184.337 | 219.239 | 113.57 | 754.90 | 4.59 MiB | 1.00x (baseline) |
 
 ### W2: Fragmented 64-Byte Chunked Streaming Parse (`10x 844,017 B = 8,440,170 B`, `100,000` events)
 
@@ -103,8 +106,8 @@ SHA-256: `cb0286ac1072ff267779123b7769801325cb8bc4872bf4d5caeb5e5e1ceab586`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_eventsource_stream`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 81.413 | 80.987 | 86.055 | 103.67 | 814.13 | 3.50 MiB | **1.03x** |
-| `rust_eventsource_stream` | 83.498 | 80.317 | 85.819 | 101.08 | 834.98 | 3.22 MiB | 1.00x (baseline) |
+| `pion` | 79.450 | 78.482 | 82.667 | 106.23 | 794.50 | 3.52 MiB | 1.01x (parity) |
+| `rust_eventsource_stream` | 80.230 | 76.443 | 83.251 | 105.20 | 802.30 | 3.22 MiB | 1.00x (baseline) |
 
 ### W3: Encode + Parse Roundtrip (`8x 844,017 B = 6,752,136 B`, `80,000` events)
 
@@ -113,11 +116,12 @@ SHA-256: `b88c0954b2a2e7b26a57e07e2a700e15fa40ea1984bdb2d1d1300a97e1e51196`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_eventsource_stream`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 85.480 | 83.484 | 94.380 | 78.99 | 1068.50 | 6.53 MiB | **1.03x** |
-| `rust_eventsource_stream` | 87.755 | 86.556 | 99.287 | 76.94 | 1096.94 | 6.20 MiB | 1.00x (baseline) |
+| `pion` | 80.989 | 79.007 | 86.535 | 83.37 | 1012.36 | 6.52 MiB | 0.96x (parity) |
+| `rust_eventsource_stream` | 77.786 | 73.118 | 81.073 | 86.80 | 972.33 | 6.19 MiB | 1.00x (baseline) |
 
 ### Objective Performance & Fairness Notes
 
-- **Zero-copy line scanning vs `String::drain`**: On 4 KiB chunks (W1), `packages/sse` scans complete lines directly on the incoming `Bytes` slice with a 4-byte unrolled newline loop and avoids shifting an internal buffer, achieving **1.37x** throughput over `eventsource-stream` 0.2.3 (`nom` + `String::drain`). Note that W3 feeds re-encoded bytes in 4 KiB chunks to both implementations so `eventsource-stream` does not trigger its O(N²) `String::drain` pathology on single large buffers (while `packages/sse` stays strictly O(N) on whole buffers as well).
-- **Peak RSS**: `pion` uses slightly more peak RSS than Rust (+0.28 to +1.19 MiB across W1–W3) due to per-chunk `Array[SseEvent]` return buffers and Pion's runtime heap sizing.
+- **Zero-copy line scanning vs `String::split_off` / `drain`**: On 4 KiB chunks (W1), `packages/sse` scans complete lines directly on the incoming `Bytes` slice with a 4-byte unrolled newline loop and avoids shifting an internal buffer, achieving **1.23x–1.37x** throughput over `eventsource-stream` 0.2.3 (whose `parse_event` calls `buffer.split_off` per line). On 64-byte fragments (W2) and encode+parse roundtrip (W3), both implementations perform at **parity** (within run-to-run noise). Note that W3 feeds re-encoded bytes in 4 KiB chunks to both implementations so `eventsource-stream` does not trigger its O(N²) buffer-shift pathology on single large buffers.
+- **Corpus constraints**: The benchmark corpora avoid a leading UTF-8 BOM and ill-formed UTF-8 bytes because upstream `eventsource-stream 0.2.3` panics on a leading BOM (`&string[1..]` slices inside the 3-byte `U+FEFF`) and stalls on ill-formed UTF-8.
+- **Peak RSS**: `pion` uses slightly more peak RSS than Rust (+0.30 to +1.25 MiB across W1–W3) due to per-chunk `Array[SseEvent]` return buffers and Pion's runtime heap sizing.
 - **No async runtime overhead in Rust baseline**: The Rust benchmark polls `eventsource_stream::EventStream` directly with `std::task::Waker::noop()` (no Tokio/async-std executor overhead) to keep the comparison strictly on SSE parsing/encoding work.

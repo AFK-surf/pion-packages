@@ -89,20 +89,40 @@ fn SseReconnectState::next_rand_nonneg(self : SseReconnectState) -> Int64 {
 
 ///| Record a disconnect/failure and compute the next deterministic jittered backoff delay in ms.
 pub fn SseReconnectState::next_backoff_ms(self : SseReconnectState) -> Int64 {
-  self.fail_attempt = self.fail_attempt + 1
-  let base = match self.retry_ms {
+  if self.fail_attempt < 1000000000 {
+    self.fail_attempt = self.fail_attempt + 1
+  }
+  let cap = self.config.max_backoff_ms
+  let has_server_retry = match self.retry_ms {
+    Some(_) => true
+    None => false
+  }
+  let raw_base = match self.retry_ms {
     Some(r) => r
     None => self.config.base_backoff_ms
   }
-  let cap = self.config.max_backoff_ms
-  let mut delay = if base >= cap { cap } else { base }
-  let shifts = if self.fail_attempt <= 1 {
+  let mut base = raw_base
+  let mut shifts = if self.fail_attempt <= 1 {
     0
   } else if self.fail_attempt - 1 > 30 {
     30
   } else {
     self.fail_attempt - 1
   }
+  // Prevent reconnect storm when server sends `retry: 0` (or base_backoff_ms == 0)
+  if base == 0L && self.fail_attempt > 1 && cap > 0L {
+    base = if self.config.base_backoff_ms > 0L {
+      self.config.base_backoff_ms
+    } else {
+      1L
+    }
+    shifts = if self.fail_attempt - 2 > 30 {
+      30
+    } else {
+      self.fail_attempt - 2
+    }
+  }
+  let mut delay = if base >= cap { cap } else { base }
   let mut i = 0
   while i < shifts && delay < cap {
     if delay >= cap / 2L {
@@ -112,14 +132,30 @@ pub fn SseReconnectState::next_backoff_ms(self : SseReconnectState) -> Int64 {
     delay = delay * 2L
     i = i + 1
   }
-  if self.config.jitter_ratio_bps > 0L && delay > 0L {
+  // Respect an explicit server `retry:` on attempt 1 (`min(r, cap)`).
+  // On subsequent attempts (or without server `retry:`), apply deterministic jitter,
+  // keeping jitter active in `[cap - span, cap]` once `delay + span > cap`.
+  let skip_first_server_jitter = self.fail_attempt == 1 && has_server_retry
+  if !skip_first_server_jitter && self.config.jitter_ratio_bps > 0L && delay > 0L {
     let bps = self.config.jitter_ratio_bps
     let span = (delay / 10000L) * bps + ((delay % 10000L) * bps) / 10000L
     if span > 0L {
-      let delta = self.next_rand_nonneg() % (span + 1L)
-      if delta >= cap - delay {
-        delay = cap
+      let max_i64 = 9223372036854775807L
+      if span > cap - delay {
+        let lo = if span >= cap { 0L } else { cap - span }
+        let width = cap - lo
+        let delta = if width == max_i64 {
+          self.next_rand_nonneg()
+        } else {
+          self.next_rand_nonneg() % (width + 1L)
+        }
+        delay = lo + delta
       } else {
+        let delta = if span == max_i64 {
+          self.next_rand_nonneg()
+        } else {
+          self.next_rand_nonneg() % (span + 1L)
+        }
         delay = delay + delta
       }
     }
@@ -158,11 +194,12 @@ pub fn SseReconnectState::server_retry_ms(
   self.retry_ms
 }
 
-///| Build the standard `Last-Event-ID` HTTP request header if a non-empty cursor is tracked.
+///| Build the standard `Last-Event-ID` HTTP request header if a non-empty, header-safe cursor is tracked.
+///| Returns `None` if `last_event_id` is empty or contains CR (`\r`), LF (`\n`), or NUL (`\0`).
 pub fn SseReconnectState::last_event_id_header(
   self : SseReconnectState,
 ) -> Option[SseHeader] {
-  if self.last_id.length() == 0 {
+  if self.last_id.length() == 0 || has_forbidden_field_byte(self.last_id) {
     None
   } else {
     Some(SseHeader::{ name: "Last-Event-ID", value: self.last_id })
@@ -233,7 +270,8 @@ fn percent_encode_query_value(s : String) -> String {
   sb.to_string()
 }
 
-///| Append an explicit query parameter `param=<encoded_cursor>` to `base_url` if cursor is non-empty.
+///| Set or replace an explicit query parameter `<encoded_param>=<encoded_cursor>` on `base_url`
+///| if cursor is non-empty, percent-encoding both parameter name and value and preserving `#fragment`.
 pub fn SseReconnectState::append_cursor_query_with(
   self : SseReconnectState,
   base_url : String,
@@ -245,7 +283,7 @@ pub fn SseReconnectState::append_cursor_query_with(
   let ub = base_url.to_bytes()
   let ulen = ub.length()
   let mut hash_pos = ulen
-  let mut has_q = false
+  let mut q_pos = -1
   let mut i = 0
   while i < ulen {
     let c = ub[i].to_int()
@@ -254,20 +292,68 @@ pub fn SseReconnectState::append_cursor_query_with(
       hash_pos = i
       break
     }
-    if c == 63 {
-      // '?'
-      has_q = true
+    if c == 63 && q_pos < 0 {
+      // first '?'
+      q_pos = i
     }
     i = i + 1
   }
-  let sep = if has_q { "&" } else { "?" }
-  let encoded = percent_encode_query_value(self.last_id)
+  let enc_param = percent_encode_query_value(param)
+  let enc_val = percent_encode_query_value(self.last_id)
+  let pair = enc_param + "=" + enc_val
   let sb = StringBuilder::new()
-  sb.write_string(ub.slice(0, hash_pos).to_string())
-  sb.write_string(sep)
-  sb.write_string(param)
-  sb.write_string("=")
-  sb.write_string(encoded)
+  if q_pos < 0 {
+    sb.write_string(ub.slice(0, hash_pos).to_string())
+    sb.write_string("?")
+    sb.write_string(pair)
+  } else {
+    sb.write_string(ub.slice(0, q_pos).to_string())
+    sb.write_string("?")
+    let mut first_out = true
+    let mut replaced = false
+    let mut seg_start = q_pos + 1
+    let mut p = q_pos + 1
+    while p <= hash_pos {
+      if p == hash_pos || ub[p].to_int() == 38 {
+        if p > seg_start {
+          let mut eq_pos = p
+          let mut k = seg_start
+          while k < p {
+            if ub[k].to_int() == 61 {
+              eq_pos = k
+              break
+            }
+            k = k + 1
+          }
+          let key = ub.slice(seg_start, eq_pos).to_string()
+          if key == enc_param || key == param {
+            if !replaced {
+              if !first_out {
+                sb.write_string("&")
+              }
+              sb.write_string(pair)
+              first_out = false
+              replaced = true
+            }
+          } else {
+            if !first_out {
+              sb.write_string("&")
+            }
+            sb.write_string(ub.slice(seg_start, p).to_string())
+            first_out = false
+          }
+        }
+        seg_start = p + 1
+      }
+      p = p + 1
+    }
+    if !replaced {
+      if !first_out {
+        sb.write_string("&")
+      }
+      sb.write_string(pair)
+    }
+  }
   if hash_pos < ulen {
     sb.write_string(ub.slice(hash_pos, ulen).to_string())
   }

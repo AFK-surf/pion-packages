@@ -21,7 +21,8 @@ pub struct SseParser {
   mut last_id : String
   mut event_retry_ms : Option[Int64]
   mut stream_retry_ms : Option[Int64]
-  mut total_bytes_seen : Int
+  mut sticky_err : Option[SseError]
+  mut total_bytes_seen : Int64
 }
 
 ///| Create a new `SseParser` with default limits and WHATWG U+FFFD replacement UTF-8 mode.
@@ -57,7 +58,8 @@ pub fn SseParser::with_options(
     last_id: "",
     event_retry_ms: None,
     stream_retry_ms: None,
-    total_bytes_seen: 0,
+    sticky_err: None,
+    total_bytes_seen: 0L,
   }
 }
 
@@ -71,8 +73,9 @@ pub fn SseParser::retry_ms(self : SseParser) -> Option[Int64] {
   self.stream_retry_ms
 }
 
-///| Reset parser state to initial stream start.
-pub fn SseParser::reset(self : SseParser) -> Unit {
+///| Clear per-stream transient state (BOM, partial line/event, sticky error) while preserving
+///| committed `last_id` and `stream_retry_ms` for clean parser reuse across reconnects.
+fn SseParser::clear_stream_state(self : SseParser) -> Unit {
   self.bom_state = 0
   self.skip_next_lf = false
   self.line_len = 0
@@ -85,11 +88,17 @@ pub fn SseParser::reset(self : SseParser) -> Unit {
   self.has_data = false
   self.data_lines = 0
   self.data_bytes = 0L
-  self.id_buf = ""
-  self.last_id = ""
+  self.id_buf = self.last_id
   self.event_retry_ms = None
+  self.sticky_err = None
+}
+
+///| Reset parser state to initial stream start.
+pub fn SseParser::reset(self : SseParser) -> Unit {
+  self.last_id = ""
   self.stream_retry_ms = None
-  self.total_bytes_seen = 0
+  self.total_bytes_seen = 0L
+  self.clear_stream_state()
 }
 
 ///| Check whether `buf[start..end]` contains any NUL (`0x00`) byte.
@@ -205,14 +214,15 @@ fn find_invalid_utf8(buf : Bytes, start : Int, end : Int) -> Int {
   -1
 }
 
-///| WHATWG Encoding Standard UTF-8 decode with U+FFFD maximal-subpart replacement.
+///| WHATWG Encoding Standard UTF-8 decode with U+FFFD maximal-subpart replacement,
+///| returning both the decoded `String` and its exact UTF-8 byte length.
 ///| Zero-copy fast path when the slice is already valid UTF-8 (ASCII or valid multi-byte).
-fn decode_utf8_lossy(buf : Bytes, start : Int, end : Int) -> String {
+fn decode_utf8_lossy_with_len(buf : Bytes, start : Int, end : Int) -> (String, Int) {
   if start >= end {
-    return ""
+    return ("", 0)
   }
   if find_invalid_utf8(buf, start, end) < 0 {
-    return buf.slice(start, end).to_string()
+    return (buf.slice(start, end).to_string(), end - start)
   }
   // Slow path: replace ill-formed maximal subparts with U+FFFD (EF BF BD)
   let mut out = Bytes::new((end - start) * 3)
@@ -320,7 +330,13 @@ fn decode_utf8_lossy(buf : Bytes, start : Int, end : Int) -> String {
       p = p + 1
     }
   }
-  out.slice(0, o).to_string()
+  (out.slice(0, o).to_string(), o)
+}
+
+///| WHATWG Encoding Standard UTF-8 decode with U+FFFD maximal-subpart replacement.
+fn decode_utf8_lossy(buf : Bytes, start : Int, end : Int) -> String {
+  let (s, _) = decode_utf8_lossy_with_len(buf, start, end)
+  s
 }
 
 ///| Push a single byte into `self.line_buf` with strict `max_line_bytes` enforcement.
@@ -494,17 +510,24 @@ fn SseParser::process_line(
       )
     }
     let vlen = end - val_start
-    let add_bytes = vlen.to_int64() + (if self.has_data { 1L } else { 0L })
-    let next_bytes = self.data_bytes + add_bytes
+    let sep_bytes = if self.has_data { 1L } else { 0L }
+    // Lower-bound check on raw bytes before decoding (decoded UTF-8 length is always >= raw vlen)
+    let raw_next = self.data_bytes + vlen.to_int64() + sep_bytes
+    if raw_next > self.limits.max_event_bytes {
+      return Err(
+        SseError::EventTooLarge(raw_next, self.limits.max_event_bytes),
+      )
+    }
+    let (piece, decoded_len) = if vlen > 0 {
+      decode_utf8_lossy_with_len(buf, val_start, end)
+    } else {
+      ("", 0)
+    }
+    let next_bytes = self.data_bytes + decoded_len.to_int64() + sep_bytes
     if next_bytes > self.limits.max_event_bytes {
       return Err(
         SseError::EventTooLarge(next_bytes, self.limits.max_event_bytes),
       )
-    }
-    let piece = if vlen > 0 {
-      decode_utf8_lossy(buf, val_start, end)
-    } else {
-      ""
     }
     if !self.has_data {
       self.first_data = piece
@@ -516,7 +539,7 @@ fn SseParser::process_line(
         self.multi_data = true
       }
       self.data_sb.write_string("\n")
-      if vlen > 0 {
+      if decoded_len > 0 {
         self.data_sb.write_string(piece)
       }
     }
@@ -563,14 +586,37 @@ fn SseParser::process_line(
   Ok(())
 }
 
+///| Record a sticky parser error; if events were already dispatched in this chunk,
+///| return `Ok(out)` so committed events are never dropped, and surface `Err(err)`
+///| on the next `feed_bytes` / `finish` call.
+fn SseParser::fail_with(
+  self : SseParser,
+  err : SseError,
+  out : Array[SseEvent],
+) -> Result[Array[SseEvent], SseError] {
+  self.sticky_err = Some(err)
+  if out.length() > 0 {
+    Ok(out)
+  } else {
+    Err(err)
+  }
+}
+
 ///| Feed a chunk of raw bytes into the streaming parser.
 pub fn SseParser::feed_bytes(
   self : SseParser,
   chunk : Bytes,
 ) -> Result[Array[SseEvent], SseError] {
+  match self.sticky_err {
+    Some(e) => return Err(e)
+    None => ()
+  }
   match self.limits.validate() {
     Ok(_) => ()
-    Err(e) => return Err(e)
+    Err(e) => {
+      self.sticky_err = Some(e)
+      return Err(e)
+    }
   }
   let out : Array[SseEvent] = []
   let clen = chunk.length()
@@ -596,7 +642,7 @@ pub fn SseParser::feed_bytes(
         self.bom_state = 3
         match self.push_line_byte((0xEF).to_byte()) {
           Ok(_) => ()
-          Err(e) => return Err(e)
+          Err(e) => return self.fail_with(e, out)
         }
       }
     } else if self.bom_state == 2 {
@@ -607,11 +653,11 @@ pub fn SseParser::feed_bytes(
         self.bom_state = 3
         match self.push_line_byte((0xEF).to_byte()) {
           Ok(_) => ()
-          Err(e) => return Err(e)
+          Err(e) => return self.fail_with(e, out)
         }
         match self.push_line_byte((0xBB).to_byte()) {
           Ok(_) => ()
-          Err(e) => return Err(e)
+          Err(e) => return self.fail_with(e, out)
         }
       }
     }
@@ -657,18 +703,18 @@ pub fn SseParser::feed_bytes(
         // Zero-copy fast path directly on `chunk[seg_start..pos]`
         match self.process_line(chunk, seg_start, pos, out) {
           Ok(_) => ()
-          Err(e) => return Err(e)
+          Err(e) => return self.fail_with(e, out)
         }
       } else {
         match self.append_line_slice(chunk, seg_start, pos) {
           Ok(_) => ()
-          Err(e) => return Err(e)
+          Err(e) => return self.fail_with(e, out)
         }
         let llen = self.line_len
         self.line_len = 0
         match self.process_line(self.line_buf, 0, llen, out) {
           Ok(_) => ()
-          Err(e) => return Err(e)
+          Err(e) => return self.fail_with(e, out)
         }
       }
       if nl == 13 {
@@ -686,11 +732,11 @@ pub fn SseParser::feed_bytes(
     } else {
       match self.append_line_slice(chunk, seg_start, clen) {
         Ok(_) => ()
-        Err(e) => return Err(e)
+        Err(e) => return self.fail_with(e, out)
       }
     }
   }
-  self.total_bytes_seen = self.total_bytes_seen + clen
+  self.total_bytes_seen = self.total_bytes_seen + clen.to_int64()
   Ok(out)
 }
 
@@ -703,36 +749,40 @@ pub fn SseParser::feed_str(
 }
 
 ///| Signal end-of-stream and discard any incomplete trailing event per WHATWG §9.2.6.
+///| Preserves committed `last_event_id` and `retry_ms` while re-arming BOM stripping and
+///| clearing stream-level state so the parser can be reused for the next HTTP response.
 pub fn SseParser::finish(self : SseParser) -> Result[Array[SseEvent], SseError] {
+  match self.sticky_err {
+    Some(e) => {
+      self.clear_stream_state()
+      return Err(e)
+    }
+    None => ()
+  }
   match self.limits.validate() {
     Ok(_) => ()
-    Err(e) => return Err(e)
+    Err(e) => {
+      self.clear_stream_state()
+      return Err(e)
+    }
   }
+  let mut strict_err : Option[SseError] = None
   match self.utf8_mode {
     Utf8Mode::Strict => {
       if self.line_len > 0 {
         let bad = find_invalid_utf8(self.line_buf, 0, self.line_len)
         if bad >= 0 {
-          self.line_len = 0
-          return Err(SseError::InvalidUtf8(bad))
+          strict_err = Some(SseError::InvalidUtf8(bad))
         }
       }
     }
     Utf8Mode::Replace => ()
   }
-  self.line_len = 0
-  self.event_type = ""
-  self.first_data = ""
-  if self.multi_data {
-    self.data_sb = StringBuilder::new()
-    self.multi_data = false
+  self.clear_stream_state()
+  match strict_err {
+    Some(e) => Err(e)
+    None => Ok([])
   }
-  self.has_data = false
-  self.data_lines = 0
-  self.data_bytes = 0L
-  self.event_retry_ms = None
-  self.skip_next_lf = false
-  Ok([])
 }
 
 ///| Convenience one-shot parser for a complete byte buffer.

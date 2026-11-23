@@ -674,3 +674,182 @@ test "dos_limits_enforced_and_negative_rejected" {
     Err(e) => debug_assert(false, "blank lines failed: " + e.message())
   }
 }
+
+// ============================================================================
+// 6. Red-Team Regression Tests (F-01 .. F-08)
+// ============================================================================
+
+///|
+test "rt_f01_f02_sticky_error_preserves_prefix_events_and_blocks_resync" {
+  // F-01: prefix event committed before line-limit error is returned first, error surfaces next
+  let lim = SseLimits::{ max_line_bytes: 16L, max_event_bytes: 4194304L, max_data_lines: 65536 }
+  let p = SseParser::with_limits(lim)
+  match p.feed_str("id: 1\ndata: a\n\ndata: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n") {
+    Ok(evts) => {
+      debug_assert(evts.length() == 1 && evts[0].id == "1" && evts[0].data == "a", "prefix event delivered")
+    }
+    Err(e) => debug_assert(false, "prefix event must not be dropped: " + e.message())
+  }
+  match p.feed_str("data: after\n\n") {
+    Err(SseError::LineTooLarge(_, _)) => ()
+    _ => debug_assert(false, "sticky LineTooLarge must surface on next feed")
+  }
+  match p.finish() {
+    Err(SseError::LineTooLarge(_, _)) => ()
+    _ => debug_assert(false, "sticky LineTooLarge must surface on finish")
+  }
+  // After finish(), parser is clean again and retains last_event_id == "1"
+  match p.feed_str("data: resumed\n\n") {
+    Ok(evts) => {
+      debug_assert(evts.length() == 1 && evts[0].id == "1" && evts[0].data == "resumed", "clean reuse after finish")
+    }
+    Err(e) => debug_assert(false, "reuse after finish failed: " + e.message())
+  }
+
+  // F-01 Strict UTF-8: prefix event delivered, then InvalidUtf8 surfaces
+  let sp = SseParser::with_options(SseLimits::default(), Utf8Mode::Strict)
+  let bad = concat_bytes("id: 7\ndata: ok\n\ndata: ".to_bytes(), bytes_from_ints([0xFF, 10, 10]))
+  match sp.feed_bytes(bad) {
+    Ok(evts) => debug_assert(evts.length() == 1 && evts[0].id == "7", "strict prefix event delivered")
+    Err(_) => debug_assert(false, "strict prefix event must not be dropped")
+  }
+  match sp.finish() {
+    Err(SseError::InvalidUtf8(_)) => ()
+    _ => debug_assert(false, "strict InvalidUtf8 must surface on finish")
+  }
+
+  // F-02: sticky error prevents mid-line resync / field injection / truncated event dispatch
+  let p2 = SseParser::with_limits(SseLimits::{ max_line_bytes: 32L, max_event_bytes: 4194304L, max_data_lines: 65536 })
+  match p2.feed_str("data: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") {
+    Err(SseError::LineTooLarge(_, _)) => ()
+    _ => debug_assert(false, "over-long line rejected")
+  }
+  match p2.feed_str("id: evil\ndata: next\n\n") {
+    Err(SseError::LineTooLarge(_, _)) => ()
+    _ => debug_assert(false, "subsequent chunk must stay poisoned")
+  }
+  debug_assert(p2.last_event_id() == "", "cursor must not be poisoned to evil")
+
+  // F-02: max_data_lines error stays sticky and never dispatches truncated event
+  let p3 = SseParser::with_limits(SseLimits::{ max_line_bytes: 1024L, max_event_bytes: 4194304L, max_data_lines: 2 })
+  match p3.feed_str("data: a\ndata: b\ndata: c\n") {
+    Err(SseError::TooManyDataLines(_, _)) => ()
+    _ => debug_assert(false, "3rd data line rejected")
+  }
+  match p3.feed_str("\n") {
+    Err(SseError::TooManyDataLines(_, _)) => ()
+    _ => debug_assert(false, "blank line after TooManyDataLines must stay poisoned")
+  }
+}
+
+///|
+test "rt_f03_f04_reconnect_retry_zero_and_cap_jitter" {
+  // F-03: server retry: 0 must still back off on repeated consecutive failures
+  let st0 = SseReconnectState::new()
+  st0.on_retry(0L)
+  let first = st0.next_backoff_ms()
+  debug_assert(first == 0L, "attempt 1 honors server retry: 0")
+  let mut last = 0L
+  let mut i = 1
+  while i < 10 {
+    last = st0.next_backoff_ms()
+    i = i + 1
+  }
+  debug_assert(last > 0L && last <= 30000L, "consecutive failures after retry: 0 must back off > 0")
+
+  // F-04: explicit huge server retry on attempt 1 respects cap == 30000L
+  let st_huge = SseReconnectState::new()
+  st_huge.on_retry(9223372036854775807L)
+  debug_assert(st_huge.next_backoff_ms() == 30000L, "attempt 1 huge server retry capped at 30000ms")
+
+  // F-04: jitter stays active at the cap across steady-state attempts 11..30
+  let st_cap = SseReconnectState::new()
+  let mut prev = -1L
+  let mut distinct = false
+  let mut k = 0
+  while k < 30 {
+    let d = st_cap.next_backoff_ms()
+    debug_assert(d >= 0L && d <= 30000L, "delay within [0, cap]")
+    if k == 10 {
+      prev = d
+    } else if k > 10 && d != prev {
+      distinct = true
+    }
+    k = k + 1
+  }
+  debug_assert(distinct, "jitter must produce distinct delays at the cap")
+}
+
+///|
+test "rt_f05_finish_rearms_bom_and_discards_partial_bom" {
+  let p = SseParser::new()
+  let _ = p.feed_str("id: 5\ndata: a\n\nid: uncommitted\ndata: partial")
+  match p.finish() {
+    Ok(evts) => debug_assert(evts.length() == 0, "finish emits no events")
+    Err(e) => debug_assert(false, "finish error: " + e.message())
+  }
+  let bom_next = concat_bytes(bytes_from_ints([0xEF, 0xBB, 0xBF]), "data: b\n\n".to_bytes())
+  match p.feed_bytes(bom_next) {
+    Ok(evts) => {
+      debug_assert(
+        evts.length() == 1 && evts[0].data == "b" && evts[0].id == "5",
+        "BOM stripped after finish and committed id preserved (uncommitted discarded)",
+      )
+    }
+    Err(e) => debug_assert(false, "feed after finish failed: " + e.message())
+  }
+
+  let p2 = SseParser::new()
+  let _ = p2.feed_bytes(bytes_from_ints([0xEF, 0xBB]))
+  let _ = p2.finish()
+  match p2.feed_str("data: x\n\n") {
+    Ok(evts) => debug_assert(evts.length() == 1 && evts[0].data == "x", "partial BOM discarded on finish")
+    Err(e) => debug_assert(false, "feed after partial BOM finish failed: " + e.message())
+  }
+}
+
+///|
+test "rt_f06_f07_cursor_replace_param_encode_and_header_crlf" {
+  // F-06: replace existing param (and deduplicate) while preserving other params and fragment
+  let st = SseReconnectState::new()
+  st.set_last_event_id("42")
+  debug_assert(
+    st.append_cursor_query_with("https://h/e?since=0&x=1", "since") ==
+    "https://h/e?since=42&x=1",
+    "existing since= replaced in place",
+  )
+  debug_assert(
+    st.append_cursor_query_with("https://h/e?x=1&since=0&since=9#top", "since") ==
+    "https://h/e?x=1&since=42#top",
+    "duplicate since= deduplicated and fragment preserved",
+  )
+  debug_assert(
+    st.append_cursor_query_with("https://h/e", "since&admin=1") ==
+    "https://h/e?since%26admin%3D1=42",
+    "param name percent-encoded",
+  )
+
+  // F-07: header helper rejects CR, LF, NUL
+  st.set_last_event_id("1\r\nX-Injected: yes")
+  debug_assert(st.last_event_id_header() is None, "CRLF rejected from Last-Event-ID header")
+  st.set_last_event_id("1\u{0000}2")
+  debug_assert(st.last_event_id_header() is None, "NUL rejected from Last-Event-ID header")
+}
+
+///|
+test "rt_f08_max_event_bytes_counts_decoded_utf8" {
+  let p = SseParser::with_limits(SseLimits::{ max_line_bytes: 1048576L, max_event_bytes: 1024L, max_data_lines: 65536 })
+  let mut ff = Bytes::new(1000)
+  let mut i = 0
+  while i < 1000 {
+    ff[i] = (0xFF).to_byte()
+    i = i + 1
+  }
+  let payload = concat_bytes(concat_bytes("data: ".to_bytes(), ff), "\n\n".to_bytes())
+  match p.feed_bytes(payload) {
+    Err(SseError::EventTooLarge(actual, limit)) => {
+      debug_assert(actual == 3000L && limit == 1024L, "decoded 3000 UTF-8 bytes > 1024 limit")
+    }
+    _ => debug_assert(false, "1000 x 0xFF expands to 3000 UTF-8 bytes and must fail EventTooLarge")
+  }
+}
