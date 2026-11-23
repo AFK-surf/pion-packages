@@ -45,9 +45,13 @@ pub fn decode_loose_object(
     Err(e) => return Err(e)
   }
   let max_decompressed = limits.max_object_bytes + 64
-  let raw = match flate::zlib_decompress_with_limit(compressed, max_decompressed) {
-    Ok(b) => b
-    Err(e) => return Err(GitError::DecompressError(e.to_string()))
+  let scratch = PackInflateScratch::new()
+  let (raw, end_pos) = match zlib_inflate_at(compressed, 0, 256, max_decompressed, scratch) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  if end_pos != compressed.length() {
+    return Err(GitError::InvalidObject("trailing garbage after loose object zlib stream"))
   }
   let n = raw.length()
   let mut sp = -1
@@ -203,21 +207,17 @@ pub struct TreeEntry {
   pub oid : Oid
 }
 
-///| Exact Git tree sorting comparator (directories compare as `name + "/"`).
-pub fn tree_entry_compare(a : TreeEntry, b : TreeEntry) -> Int {
-  let ab = a.name.to_bytes()
-  let bb = b.name.to_bytes()
-  let al = ab.length()
-  let bl = bb.length()
-  let a_is_dir = a.mode.equals(FileMode::Tree)
-  let b_is_dir = b.mode.equals(FileMode::Tree)
+///| Zero-allocation Git tree name comparator (directories compare as `name + "/"`).
+fn tree_name_compare(an : String, a_is_dir : Bool, bn : String, b_is_dir : Bool) -> Int {
+  let al = an.length()
+  let bl = bn.length()
   let a_eff = if a_is_dir { al + 1 } else { al }
   let b_eff = if b_is_dir { bl + 1 } else { bl }
   let min_len = if a_eff < b_eff { a_eff } else { b_eff }
   let mut i = 0
   while i < min_len {
-    let ac = if i < al { ab[i].to_int() } else { 47 }
-    let bc = if i < bl { bb[i].to_int() } else { 47 }
+    let ac = if i < al { an.code_unit_at(i) } else { 47 }
+    let bc = if i < bl { bn.code_unit_at(i) } else { 47 }
     if ac != bc {
       return if ac < bc { -1 } else { 1 }
     }
@@ -230,6 +230,30 @@ pub fn tree_entry_compare(a : TreeEntry, b : TreeEntry) -> Int {
   } else {
     0
   }
+}
+
+///| Exact Git tree sorting comparator (directories compare as `name + "/"`), zero allocations.
+pub fn tree_entry_compare(a : TreeEntry, b : TreeEntry) -> Int {
+  tree_name_compare(a.name, a.mode.equals(FileMode::Tree), b.name, b.mode.equals(FileMode::Tree))
+}
+
+///| Binary search sorted `entries[0..hi)` for a non-directory entry with `name`.
+fn tree_has_nondir_name(entries : Array[TreeEntry], hi : Int, name : String) -> Bool {
+  let mut lo = 0
+  let mut r = hi
+  while lo < r {
+    let mid = lo + ((r - lo) >> 1)
+    let em = entries[mid]
+    let cmp = tree_name_compare(name, false, em.name, em.mode.equals(FileMode::Tree))
+    if cmp == 0 {
+      return true
+    } else if cmp < 0 {
+      r = mid
+    } else {
+      lo = mid + 1
+    }
+  }
+  false
 }
 
 ///|
@@ -323,6 +347,9 @@ pub fn Tree::parse(
       Ok(_) => ()
       Err(e) => return Err(e)
     }
+    if mode.equals(FileMode::Link) && is_dotgit_special_file(name) {
+      return Err(GitError::InsecurePath("symlinked git config file: " + name))
+    }
     let oid_start = nul + 1
     if oid_start + oid_len > n {
       return Err(GitError::Truncated("truncated OID in tree entry"))
@@ -331,7 +358,21 @@ pub fn Tree::parse(
       kind: hash_kind,
       bytes: payload.slice(oid_start, oid_start + oid_len),
     }
-    entries.push(TreeEntry::{ mode: mode, name: name, oid: oid })
+    let cur = TreeEntry::{ mode: mode, name: name, oid: oid }
+    let cur_len = entries.length()
+    if cur_len > 0 {
+      let prev = entries[cur_len - 1]
+      if prev.name == name {
+        return Err(GitError::InvalidTree("duplicate tree entry: " + name))
+      }
+      if tree_entry_compare(prev, cur) >= 0 {
+        return Err(GitError::InvalidTree("unsorted tree entries"))
+      }
+      if mode.equals(FileMode::Tree) && tree_has_nondir_name(entries, cur_len, name) {
+        return Err(GitError::InvalidTree("duplicate tree entry: " + name))
+      }
+    }
+    entries.push(cur)
     pos = oid_start + oid_len
   }
   Ok(Tree::{ entries: entries })
@@ -340,8 +381,8 @@ pub fn Tree::parse(
 ///|
 pub fn Tree::encode(self : Tree) -> Result[Bytes, GitError] {
   let count = self.entries.length()
-  let sorted : Array[TreeEntry] = Array::new()
-  let tmp : Array[TreeEntry] = Array::new()
+  let mut is_sorted = true
+  let mut total_bytes = 0
   let mut i = 0
   while i < count {
     let e = self.entries[i]
@@ -349,28 +390,79 @@ pub fn Tree::encode(self : Tree) -> Result[Bytes, GitError] {
       Ok(_) => ()
       Err(err) => return Err(err)
     }
-    sorted.push(e)
-    tmp.push(e)
+    if e.mode.equals(FileMode::Link) && is_dotgit_special_file(e.name) {
+      return Err(GitError::InsecurePath("symlinked git config file: " + e.name))
+    }
+    if i > 0 && is_sorted {
+      if tree_entry_compare(self.entries[i - 1], e) >= 0 {
+        is_sorted = false
+      }
+    }
+    let mode_len = if e.mode.equals(FileMode::Tree) { 5 } else { 6 }
+    total_bytes = total_bytes + mode_len + 1 + e.name.length() + 1 + e.oid.byte_len()
     i = i + 1
   }
-  if count > 1 {
+
+  let ordered = if is_sorted || count <= 1 {
+    self.entries
+  } else {
+    let sorted : Array[TreeEntry] = Array::new()
+    let tmp : Array[TreeEntry] = Array::new()
+    let mut s = 0
+    while s < count {
+      let e = self.entries[s]
+      sorted.push(e)
+      tmp.push(e)
+      s = s + 1
+    }
     merge_sort_tree_entries(sorted, tmp, 0, count)
+    sorted
   }
-  let bb = ByteBuf::new(count * 36)
+
+  let out = Bytes::new(total_bytes)
+  let mut p = 0
   let mut j = 0
   while j < count {
-    let e = sorted[j]
-    if j > 0 && sorted[j - 1].name == e.name {
-      return Err(GitError::InvalidTree("duplicate tree entry: " + e.name))
+    let e = ordered[j]
+    if j > 0 {
+      if ordered[j - 1].name == e.name {
+        return Err(GitError::InvalidTree("duplicate tree entry: " + e.name))
+      }
+      if e.mode.equals(FileMode::Tree) && tree_has_nondir_name(ordered, j, e.name) {
+        return Err(GitError::InvalidTree("duplicate tree entry: " + e.name))
+      }
     }
-    bb.push_str(e.mode.to_octal_str())
-    bb.push_byte(32)
-    bb.push_str(e.name)
-    bb.push_byte(0)
-    bb.push_bytes(e.oid.raw_bytes())
+    let mstr = e.mode.to_octal_str()
+    let mlen = mstr.length()
+    let mut k = 0
+    while k < mlen {
+      out[p] = mstr.code_unit_at(k).to_byte()
+      p = p + 1
+      k = k + 1
+    }
+    out[p] = 32.to_byte()
+    p = p + 1
+    let nm = e.name
+    let nlen = nm.length()
+    k = 0
+    while k < nlen {
+      out[p] = nm.code_unit_at(k).to_byte()
+      p = p + 1
+      k = k + 1
+    }
+    out[p] = 0.to_byte()
+    p = p + 1
+    let ob = e.oid.raw_bytes()
+    let olen = ob.length()
+    k = 0
+    while k < olen {
+      out[p] = ob[k]
+      p = p + 1
+      k = k + 1
+    }
     j = j + 1
   }
-  Ok(bb.to_bytes())
+  Ok(out)
 }
 
 // ============================================================================
@@ -408,9 +500,6 @@ fn parse_tz_offset(tz : String) -> Result[Int, GitError] {
   }
   let hh = d1 * 10 + d2
   let mm = d3 * 10 + d4
-  if mm >= 60 {
-    return Err(GitError::InvalidCommit("timezone minutes >= 60: " + tz))
-  }
   Ok(sign * (hh * 60 + mm))
 }
 
@@ -439,10 +528,13 @@ pub fn Signature::parse(s : String) -> Result[Signature, GitError] {
     s.slice(0, lt)
   }
   let email = s.slice(lt + 1, gt)
-  let rest_start = if gt + 1 < n && s.code_unit_at(gt + 1) == 32 {
+  let mut rest_start = if gt + 1 < n && s.code_unit_at(gt + 1) == 32 {
     gt + 2
   } else {
     return Err(GitError::InvalidCommit("signature missing space after email"))
+  }
+  while rest_start < n && s.code_unit_at(rest_start) == 32 {
+    rest_start = rest_start + 1
   }
   let mut sp = rest_start
   while sp < n && s.code_unit_at(sp) != 32 {
@@ -452,7 +544,7 @@ pub fn Signature::parse(s : String) -> Result[Signature, GitError] {
     return Err(GitError::InvalidCommit("signature missing timestamp or timezone"))
   }
   let ts_str = s.slice(rest_start, sp)
-  let ts = match parse_int64_str(ts_str) {
+  let ts = match parse_timestamp_str(ts_str) {
     Ok(v) => v
     Err(e) => return Err(e)
   }
@@ -521,6 +613,8 @@ pub fn Commit::parse(
   let extra_headers : Array[ExtraHeader] = Array::new()
   let mut pos = 0
   let mut msg_start = n
+  // Strict Git commit header phase: 0=tree, 1=parent*/author, 2=committer, 3=extra
+  let mut phase = 0
 
   while pos < n {
     let mut nl = pos
@@ -535,7 +629,7 @@ pub fn Commit::parse(
     let line = payload.slice(pos, nl).to_string()
     if line.length() > 0 && line.code_unit_at(0) == 32 {
       // Multiline header continuation (e.g. gpgsig, mergetag)
-      if extra_headers.length() == 0 {
+      if phase < 3 || extra_headers.length() == 0 {
         return Err(GitError::InvalidCommit("orphan continuation line"))
       }
       let last_idx = extra_headers.length() - 1
@@ -555,29 +649,49 @@ pub fn Commit::parse(
       }
       let key = line.slice(0, sp)
       let val_str = line.slice(sp + 1, llen)
-      if key == "tree" {
+      if phase == 0 {
+        if key != "tree" {
+          return Err(GitError::InvalidCommit("commit must start with tree header"))
+        }
         match Oid::from_hex(val_str) {
-          Ok(o) => tree_opt = Some(o)
+          Ok(o) => {
+            tree_opt = Some(o)
+            phase = 1
+          }
           Err(e) => return Err(e)
         }
-      } else if key == "parent" {
-        match Oid::from_hex(val_str) {
-          Ok(o) => parents.push(o)
-          Err(e) => return Err(e)
+      } else if phase == 1 {
+        if key == "parent" {
+          match Oid::from_hex(val_str) {
+            Ok(o) => parents.push(o)
+            Err(e) => return Err(e)
+          }
+        } else if key == "author" {
+          match Signature::parse(val_str) {
+            Ok(sig) => {
+              author_opt = Some(sig)
+              phase = 2
+            }
+            Err(e) => return Err(e)
+          }
+        } else {
+          return Err(GitError::InvalidCommit("unexpected header before author: " + key))
         }
-      } else if key == "author" {
+      } else if phase == 2 {
+        if key != "committer" {
+          return Err(GitError::InvalidCommit("expected committer header after author, got: " + key))
+        }
         match Signature::parse(val_str) {
-          Ok(sig) => author_opt = Some(sig)
+          Ok(sig) => {
+            committer_opt = Some(sig)
+            phase = 3
+          }
           Err(e) => return Err(e)
         }
-      } else if key == "committer" {
-        match Signature::parse(val_str) {
-          Ok(sig) => committer_opt = Some(sig)
-          Err(e) => return Err(e)
-        }
-      } else if key == "encoding" {
-        encoding = Some(val_str)
       } else {
+        if key == "encoding" {
+          encoding = Some(val_str)
+        }
         extra_headers.push(ExtraHeader::{ key: key, value: val_str })
       }
     }
@@ -649,13 +763,24 @@ pub fn Commit::encode(self : Commit) -> Bytes {
   sb.write_string("committer ")
   sb.write_string(self.committer.format())
   sb.write_string("\n")
-  match self.encoding {
-    Some(enc) => {
-      sb.write_string("encoding ")
-      sb.write_string(enc)
-      sb.write_string("\n")
+  let mut has_encoding_in_extra = false
+  let mut k = 0
+  while k < self.extra_headers.length() {
+    if self.extra_headers[k].key == "encoding" {
+      has_encoding_in_extra = true
+      break
     }
-    None => ()
+    k = k + 1
+  }
+  if !has_encoding_in_extra {
+    match self.encoding {
+      Some(enc) => {
+        sb.write_string("encoding ")
+        sb.write_string(enc)
+        sb.write_string("\n")
+      }
+      None => ()
+    }
   }
   let mut j = 0
   while j < self.extra_headers.length() {
@@ -685,6 +810,7 @@ pub struct Tag {
   pub target_kind : ObjectKind
   pub name : String
   pub tagger : Option[Signature]
+  pub extra_headers : Array[ExtraHeader]
   pub message : String
 }
 
@@ -705,8 +831,11 @@ pub fn Tag::parse(
   let mut kind_opt : Option[ObjectKind] = None
   let mut name_opt : Option[String] = None
   let mut tagger : Option[Signature] = None
+  let extra_headers : Array[ExtraHeader] = Array::new()
   let mut pos = 0
   let mut msg_start = n
+  // Strict Git tag header phase: 0=object, 1=type, 2=tag, 3=tagger?/extra, 4=extra
+  let mut phase = 0
 
   while pos < n {
     let mut nl = pos
@@ -718,32 +847,70 @@ pub fn Tag::parse(
       break
     }
     let line = payload.slice(pos, nl).to_string()
-    let mut sp = 0
-    let llen = line.length()
-    while sp < llen && line.code_unit_at(sp) != 32 {
-      sp = sp + 1
-    }
-    if sp == 0 || sp >= llen {
-      return Err(GitError::InvalidTag("malformed tag header"))
-    }
-    let key = line.slice(0, sp)
-    let val_str = line.slice(sp + 1, llen)
-    if key == "object" {
-      match Oid::from_hex(val_str) {
-        Ok(o) => target_opt = Some(o)
-        Err(e) => return Err(e)
+    if line.length() > 0 && line.code_unit_at(0) == 32 {
+      if phase < 3 || extra_headers.length() == 0 {
+        return Err(GitError::InvalidTag("orphan continuation line in tag"))
       }
-    } else if key == "type" {
-      match ObjectKind::from_str(val_str) {
-        Ok(k) => kind_opt = Some(k)
-        Err(e) => return Err(e)
+      let last_idx = extra_headers.length() - 1
+      let prev = extra_headers[last_idx]
+      extra_headers[last_idx] = ExtraHeader::{
+        key: prev.key,
+        value: prev.value + "\n" + line.slice(1, line.length()),
       }
-    } else if key == "tag" {
-      name_opt = Some(val_str)
-    } else if key == "tagger" {
-      match Signature::parse(val_str) {
-        Ok(s) => tagger = Some(s)
-        Err(e) => return Err(e)
+    } else {
+      let mut sp = 0
+      let llen = line.length()
+      while sp < llen && line.code_unit_at(sp) != 32 {
+        sp = sp + 1
+      }
+      if sp == 0 || sp >= llen {
+        return Err(GitError::InvalidTag("malformed tag header"))
+      }
+      let key = line.slice(0, sp)
+      let val_str = line.slice(sp + 1, llen)
+      if phase == 0 {
+        if key != "object" {
+          return Err(GitError::InvalidTag("tag must start with object header"))
+        }
+        match Oid::from_hex(val_str) {
+          Ok(o) => {
+            target_opt = Some(o)
+            phase = 1
+          }
+          Err(e) => return Err(e)
+        }
+      } else if phase == 1 {
+        if key != "type" {
+          return Err(GitError::InvalidTag("expected type header after object"))
+        }
+        match ObjectKind::from_str(val_str) {
+          Ok(k) => {
+            kind_opt = Some(k)
+            phase = 2
+          }
+          Err(e) => return Err(e)
+        }
+      } else if phase == 2 {
+        if key != "tag" {
+          return Err(GitError::InvalidTag("expected tag header after type"))
+        }
+        match check_ref_format("refs/tags/" + val_str, false) {
+          Ok(_) => ()
+          Err(_) => return Err(GitError::InvalidTag("invalid tag name: " + val_str))
+        }
+        name_opt = Some(val_str)
+        phase = 3
+      } else if phase == 3 && key == "tagger" {
+        match Signature::parse(val_str) {
+          Ok(s) => {
+            tagger = Some(s)
+            phase = 4
+          }
+          Err(e) => return Err(e)
+        }
+      } else {
+        phase = 4
+        extra_headers.push(ExtraHeader::{ key: key, value: val_str })
       }
     }
     pos = if nl < n { nl + 1 } else { n }
@@ -768,6 +935,7 @@ pub fn Tag::parse(
       target_kind: target_kind,
       name: name,
       tagger: tagger,
+      extra_headers: extra_headers,
       message: message,
     },
   )
@@ -792,6 +960,11 @@ pub fn Tag::encode(self : Tag) -> Bytes {
       sb.write_string("\n")
     }
     None => ()
+  }
+  let mut j = 0
+  while j < self.extra_headers.length() {
+    write_extra_header(sb, self.extra_headers[j])
+    j = j + 1
   }
   sb.write_string("\n")
   sb.write_string(self.message)

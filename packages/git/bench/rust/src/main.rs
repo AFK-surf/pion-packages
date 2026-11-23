@@ -52,10 +52,11 @@ fn run_w1(path: &str, iters: usize) {
         let mut out = Vec::with_capacity(65536);
         let mut cache = gix_pack::cache::lru::MemoryCappedHashmap::new(32 * 1024 * 1024);
 
-        let iter = pack.streaming_iter().expect("streaming_iter");
-        for entry_res in iter {
-            let entry = entry_res.expect("entry");
-            let pack_entry = pack.entry(entry.pack_offset).expect("pack.entry");
+        let num_objects = pack.num_objects();
+        let mut offset: u64 = 12;
+        for _ in 0..num_objects {
+            let pack_entry = pack.entry(offset).expect("pack.entry");
+            let data_offset = pack_entry.data_offset;
             out.clear();
             let outcome = pack
                 .decode_entry(
@@ -66,6 +67,7 @@ fn run_w1(path: &str, iters: usize) {
                     &mut cache,
                 )
                 .expect("decode_entry");
+            offset = data_offset + outcome.compressed_size as u64;
             let oid = hash_git_object(outcome.kind, &out);
             total_objs += 1;
             total_uncomp += out.len() as i64;

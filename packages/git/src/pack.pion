@@ -60,6 +60,9 @@ fn read_ofs_varint(data : Bytes, start : Int, end : Int) -> Result[(Int64, Int),
     if pos >= end {
       return Err(GitError::Truncated("truncated OFS_DELTA offset continuation"))
     }
+    if acc >= 0x00FFFFFFFFFFFFFFL {
+      return Err(GitError::InvalidPack("OFS_DELTA offset overflow"))
+    }
     b = data[pos].to_int()
     pos = pos + 1
     acc = ((acc + 1L) << 7) | (b & 0x7F).to_int64()
@@ -127,7 +130,7 @@ pub fn PackReader::open(
     return Err(GitError::InvalidPack("invalid PACK magic"))
   }
   let version = read_u32_be(data, 4).to_int()
-  if version != 2 {
+  if version != 2 && version != 3 {
     return Err(GitError::UnsupportedVersion(version))
   }
   let count_u = read_u32_be(data, 8)
@@ -150,6 +153,18 @@ pub fn PackReader::open(
   }
   let checksum = Oid::{ kind: HashKind::Sha1, bytes: expected_csum }
 
+  // Effective aggregate byte budget: caps amplification bombs while allowing real large packs
+  let mut total_budget = limits.max_pack_total_bytes
+  if total_budget >= 268435456L {
+    let scaled = n.to_int64() * 16L
+    let cap = 1073741824L
+    let scaled_capped = if scaled > cap { cap } else { scaled }
+    if scaled_capped > total_budget {
+      total_budget = scaled_capped
+    }
+  }
+  let mut total_bytes : Int64 = 0L
+
   // Pass 1: sequential scan & inflate
   let entries : Array[PackEntryMeta] = Array::new()
   let raw_payloads : Array[Bytes] = Array::new()
@@ -164,19 +179,19 @@ pub fn PackReader::open(
     let b0 = data[pos].to_int()
     pos = pos + 1
     let ptype = (b0 >> 4) & 7
-    let mut size = b0 & 0x0F
+    let mut size64 : Int64 = (b0 & 0x0F).to_int64()
     let mut shift = 4
     let mut cur_b = b0
     while (cur_b & 0x80) != 0 {
       if pos >= body_end {
         return Err(GitError::Truncated("truncated pack entry size varint"))
       }
-      if shift >= 31 {
+      if shift >= 60 {
         return Err(GitError::LimitExceeded("pack entry size overflow"))
       }
       cur_b = data[pos].to_int()
       pos = pos + 1
-      size = size | ((cur_b & 0x7F) << shift)
+      size64 = size64 | ((cur_b & 0x7F).to_int64() << shift)
       shift = shift + 7
     }
     let max_bytes = if ptype == 6 || ptype == 7 {
@@ -184,8 +199,12 @@ pub fn PackReader::open(
     } else {
       limits.max_object_bytes
     }
-    if size > max_bytes {
+    if size64 < 0L || size64 > max_bytes.to_int64() {
       return Err(GitError::LimitExceeded("pack entry exceeds size limit"))
+    }
+    let size = size64.to_int()
+    if total_bytes + size64 > total_budget {
+      return Err(GitError::LimitExceeded("packfile exceeds max_pack_total_bytes"))
     }
 
     let kind = if ptype == 1 {
@@ -218,7 +237,13 @@ pub fn PackReader::open(
       return Err(GitError::InvalidPack("invalid pack entry type: " + ptype.to_string()))
     }
 
-    let (inflated, next_pos) = match zlib_inflate_at(data, pos, size, max_bytes, scratch) {
+    let rem_budget64 = total_budget - total_bytes
+    let inflate_cap = if rem_budget64 < max_bytes.to_int64() {
+      rem_budget64.to_int()
+    } else {
+      max_bytes
+    }
+    let (inflated, next_pos) = match zlib_inflate_at(data, pos, size, inflate_cap, scratch) {
       Ok(p) => p
       Err(e) => return Err(e)
     }
@@ -235,6 +260,7 @@ pub fn PackReader::open(
     if next_pos > body_end {
       return Err(GitError::Truncated("pack entry extends into checksum trailer"))
     }
+    total_bytes = total_bytes + size64
     let crc = flate::crc32_update_slice(0U, data, entry_off, next_pos)
     entries.push(
       PackEntryMeta::{
@@ -280,6 +306,7 @@ pub fn PackReader::open(
     match obj_kind_opt {
       Some(k) => {
         let payload = raw_payloads[i]
+        raw_payloads[i] = Bytes::new(0)
         let oid = hash_object_sha1(k, payload)
         resolved[i] = RawObject::{ kind: k, payload: payload, oid: oid }
         done[i] = true
@@ -313,10 +340,23 @@ pub fn PackReader::open(
             return Err(GitError::LimitExceeded("delta chain depth exceeds max_delta_depth"))
           }
           let base_obj = resolved[base_idx]
-          let target_payload = match apply_delta(base_obj.payload, raw_payloads[j], limits) {
+          let delta_bytes = raw_payloads[j]
+          let (_, target_sz, _) = match decode_delta_header(delta_bytes) {
+            Ok(h) => h
+            Err(e) => return Err(e)
+          }
+          if target_sz < 0 {
+            return Err(GitError::InvalidDelta("negative delta target size"))
+          }
+          if total_bytes + target_sz.to_int64() > total_budget {
+            return Err(GitError::LimitExceeded("packfile resolved objects exceed max_pack_total_bytes"))
+          }
+          let target_payload = match apply_delta(base_obj.payload, delta_bytes, limits) {
             Ok(p) => p
             Err(e) => return Err(e)
           }
+          total_bytes = total_bytes - delta_bytes.length().to_int64() + target_payload.length().to_int64()
+          raw_payloads[j] = Bytes::new(0)
           let oid = hash_object_sha1(base_obj.kind, target_payload)
           resolved[j] = RawObject::{
             kind: base_obj.kind,
