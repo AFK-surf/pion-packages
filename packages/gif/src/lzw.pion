@@ -1,0 +1,477 @@
+///| High-performance variable-length GIF LZW decoder (LSB-first, 3..12 bit, 4096-entry flat table).
+///| Zero per-frame scratch allocation, compact Byte suffix/first_char tables (L1-resident),
+///| stackless direct backward-write via `code_len`, 64-bit bit buffer with 48-bit batch refill,
+///| Deferred Clear Code support, and DoS/malformed-code guards.
+
+///| Reusable 4096-entry LZW dictionary scratch tables (allocated once per decode session).
+struct LzwScratch {
+  prefix : FixedArray[Int]
+  code_len : FixedArray[Int]
+  suffix : Bytes
+  first_char : Bytes
+}
+
+///| Allocate a fresh `LzwScratch` with 4096-entry flat arrays.
+fn LzwScratch::new() -> LzwScratch {
+  LzwScratch::{
+    prefix: FixedArray::make(4096, 0),
+    code_len: FixedArray::make(4096, 1),
+    suffix: Bytes::new(4096),
+    first_char: Bytes::new(4096),
+  }
+}
+
+///| Initialize literal entries `0..clear_code` in `scratch`.
+fn init_lzw_literals(scratch : LzwScratch, clear_code : Int) -> Unit {
+  let code_len = scratch.code_len
+  let mut first_char = scratch.first_char
+  let mut i = 0
+  while i < clear_code {
+    code_len[i] = 1
+    first_char[i] = i.to_byte()
+    i = i + 1
+  }
+}
+
+///| Skip remaining GIF sub-blocks starting at `pos` (where `data[pos]` is the next block length).
+///| Returns the byte offset immediately after the `0x00` block terminator.
+fn skip_sub_blocks(data : Bytes, start : Int) -> Result[Int, GifError] {
+  let n = data.length()
+  let mut pos = start
+  while true {
+    if pos >= n {
+      return Err(GifError::UnexpectedEof("missing sub-block terminator"))
+    }
+    let blk_len = data[pos].to_int()
+    pos = pos + 1
+    if blk_len == 0 {
+      return Ok(pos)
+    }
+    if pos + blk_len > n {
+      return Err(GifError::UnexpectedEof("truncated sub-block payload"))
+    }
+    pos = pos + blk_len
+  }
+  Ok(pos)
+}
+
+///| Decode a GIF sub-block-framed LZW stream starting at `data[start..]` directly into `out[0..expected_pixels]`.
+///| Uses 64-bit bit buffer + 48-bit straight-line refill + zero-copy sub-block streaming + stackless backward-write.
+///| Returns `(written_pixels, next_offset_after_0x00_terminator)`.
+fn lzw_decode_subblocks_into(
+  data : Bytes,
+  start : Int,
+  min_code_size : Int,
+  expected_pixels : Int,
+  out : Bytes,
+  scratch : LzwScratch,
+) -> Result[(Int, Int), GifError] {
+  if min_code_size < 2 || min_code_size > 8 {
+    return Err(GifError::InvalidLzwCodeSize(min_code_size))
+  }
+  let in_len = data.length()
+  let clear_code = 1 << min_code_size
+  let eoi_code = clear_code + 1
+  let mut code_size = min_code_size + 1
+  let mut next_code = eoi_code + 1
+  let mut max_code = (1 << code_size) - 1
+  let mut mask : UInt64 = max_code.to_int64().to_uint64()
+  let mut prev_code = -1
+
+  init_lzw_literals(scratch, clear_code)
+  let prefix = scratch.prefix
+  let code_len = scratch.code_len
+  let mut suffix = scratch.suffix
+  let mut first_char = scratch.first_char
+
+  let mut out_mut = out
+  let mut out_pos = 0
+  let mut pos = start
+  let mut sub_pos = start
+  let mut sub_end = start
+  let mut hit_terminator = false
+
+  let mut bitbuf : UInt64 = 0UL
+  let mut bitcnt = 0
+
+  while true {
+    // Fast-path bit refill: when `bitcnt < code_size` (so `bitcnt <= 11`),
+    // load 6 bytes (48 bits) in one straight-line block if available in current sub-block.
+    if bitcnt < code_size {
+      if sub_pos + 6 <= sub_end {
+        let b0 = data[sub_pos].to_int().to_int64().to_uint64()
+        let b1 = data[sub_pos + 1].to_int().to_int64().to_uint64()
+        let b2 = data[sub_pos + 2].to_int().to_int64().to_uint64()
+        let b3 = data[sub_pos + 3].to_int().to_int64().to_uint64()
+        let b4 = data[sub_pos + 4].to_int().to_int64().to_uint64()
+        let b5 = data[sub_pos + 5].to_int().to_int64().to_uint64()
+        let word = b0 |
+        (b1 << 8) |
+        (b2 << 16) |
+        (b3 << 24) |
+        (b4 << 32) |
+        (b5 << 40)
+        bitbuf = bitbuf | (word << bitcnt)
+        bitcnt = bitcnt + 48
+        sub_pos = sub_pos + 6
+      } else {
+        while bitcnt <= 56 {
+          if sub_pos < sub_end {
+            bitbuf = bitbuf | (data[sub_pos].to_int().to_int64().to_uint64() << bitcnt)
+            bitcnt = bitcnt + 8
+            sub_pos = sub_pos + 1
+          } else {
+            if hit_terminator {
+              break
+            }
+            if pos >= in_len {
+              return Err(GifError::UnexpectedEof("truncated LZW sub-block stream"))
+            }
+            let blk_len = data[pos].to_int()
+            pos = pos + 1
+            if blk_len == 0 {
+              hit_terminator = true
+              break
+            }
+            if pos + blk_len > in_len {
+              return Err(GifError::UnexpectedEof("truncated LZW sub-block payload"))
+            }
+            sub_pos = pos
+            sub_end = pos + blk_len
+            pos = sub_end
+          }
+        }
+        if bitcnt < code_size {
+          if out_pos >= expected_pixels {
+            break
+          }
+          return Err(GifError::UnexpectedEof("unexpected EOF inside LZW bitstream"))
+        }
+      }
+    }
+
+    let code = (bitbuf & mask).to_int()
+    bitbuf = bitbuf >> code_size
+    bitcnt = bitcnt - code_size
+
+    if code > eoi_code {
+      if code < next_code {
+        // Hottest path: existing dictionary entry (prev_code is guaranteed != -1 here)
+        let k = code_len[code]
+        let first = first_char[code]
+        if out_pos + k <= expected_pixels {
+          if k == 2 {
+            out_mut[out_pos] = first
+            out_mut[out_pos + 1] = suffix[code]
+          } else {
+            let mut c = code
+            let mut p = out_pos + k - 1
+            while c >= clear_code {
+              out_mut[p] = suffix[c]
+              c = prefix[c]
+              p = p - 1
+            }
+            out_mut[p] = c.to_byte()
+          }
+          out_pos = out_pos + k
+        } else if out_pos < expected_pixels {
+          let mut c = code
+          let mut p = out_pos + k - 1
+          while c >= clear_code {
+            if p < expected_pixels {
+              out_mut[p] = suffix[c]
+            }
+            c = prefix[c]
+            p = p - 1
+          }
+          if p < expected_pixels {
+            out_mut[p] = c.to_byte()
+          }
+          out_pos = expected_pixels
+        }
+        if next_code < 4096 {
+          prefix[next_code] = prev_code
+          suffix[next_code] = first
+          code_len[next_code] = code_len[prev_code] + 1
+          first_char[next_code] = first_char[prev_code]
+          next_code = next_code + 1
+          if next_code > max_code && code_size < 12 {
+            code_size = code_size + 1
+            max_code = (1 << code_size) - 1
+            mask = max_code.to_int64().to_uint64()
+          }
+        }
+        prev_code = code
+      } else if code == next_code && prev_code != -1 {
+        // KwKwK special case: string(prev_code) + first_char(prev_code)
+        let first = first_char[prev_code]
+        let k = code_len[prev_code] + 1
+        if out_pos + k <= expected_pixels {
+          out_mut[out_pos + k - 1] = first
+          let mut c = prev_code
+          let mut p = out_pos + k - 2
+          while c >= clear_code {
+            out_mut[p] = suffix[c]
+            c = prefix[c]
+            p = p - 1
+          }
+          out_mut[p] = c.to_byte()
+          out_pos = out_pos + k
+        } else if out_pos < expected_pixels {
+          let last_p = out_pos + k - 1
+          if last_p < expected_pixels {
+            out_mut[last_p] = first
+          }
+          let mut c = prev_code
+          let mut p = last_p - 1
+          while c >= clear_code {
+            if p < expected_pixels {
+              out_mut[p] = suffix[c]
+            }
+            c = prefix[c]
+            p = p - 1
+          }
+          if p < expected_pixels {
+            out_mut[p] = c.to_byte()
+          }
+          out_pos = expected_pixels
+        }
+        if next_code < 4096 {
+          prefix[next_code] = prev_code
+          suffix[next_code] = first
+          code_len[next_code] = k
+          first_char[next_code] = first
+          next_code = next_code + 1
+          if next_code > max_code && code_size < 12 {
+            code_size = code_size + 1
+            max_code = (1 << code_size) - 1
+            mask = max_code.to_int64().to_uint64()
+          }
+        }
+        prev_code = code
+      } else {
+        return Err(GifError::InvalidLzwCode(code))
+      }
+    } else if code < clear_code {
+      // Single literal byte
+      let b = code.to_byte()
+      if out_pos < expected_pixels {
+        out_mut[out_pos] = b
+        out_pos = out_pos + 1
+      }
+      if prev_code != -1 && next_code < 4096 {
+        prefix[next_code] = prev_code
+        suffix[next_code] = b
+        code_len[next_code] = code_len[prev_code] + 1
+        first_char[next_code] = first_char[prev_code]
+        next_code = next_code + 1
+        if next_code > max_code && code_size < 12 {
+          code_size = code_size + 1
+          max_code = (1 << code_size) - 1
+          mask = max_code.to_int64().to_uint64()
+        }
+      }
+      prev_code = code
+    } else if code == clear_code {
+      code_size = min_code_size + 1
+      next_code = eoi_code + 1
+      max_code = (1 << code_size) - 1
+      mask = max_code.to_int64().to_uint64()
+      prev_code = -1
+    } else {
+      // code == eoi_code
+      break
+    }
+  }
+
+  let end_pos = if hit_terminator {
+    pos
+  } else {
+    match skip_sub_blocks(data, pos) {
+      Ok(p) => p
+      Err(e) => return Err(e)
+    }
+  }
+  Ok((out_pos, end_pos))
+}
+
+///| Decode a standalone raw GIF LZW byte stream (LSB-first, variable 3..12-bit codes).
+pub fn lzw_decode(data : Bytes, min_code_size : Int, max_output : Int) -> Result[Bytes, GifError] {
+  if min_code_size < 2 || min_code_size > 8 {
+    return Err(GifError::InvalidLzwCodeSize(min_code_size))
+  }
+  if max_output < 0 {
+    return Err(GifError::LimitExceeded("max_output must be non-negative"))
+  }
+  let scratch = LzwScratch::new()
+  let clear_code = 1 << min_code_size
+  let eoi_code = clear_code + 1
+  let mut code_size = min_code_size + 1
+  let mut next_code = eoi_code + 1
+  let mut max_code = (1 << code_size) - 1
+  let mut mask : UInt64 = max_code.to_int64().to_uint64()
+  let mut prev_code = -1
+
+  init_lzw_literals(scratch, clear_code)
+  let prefix = scratch.prefix
+  let code_len = scratch.code_len
+  let mut suffix = scratch.suffix
+  let mut first_char = scratch.first_char
+
+  let in_len = data.length()
+  let mut in_pos = 0
+  let mut bitbuf : UInt64 = 0UL
+  let mut bitcnt = 0
+
+  let max_out64 = max_output.to_int64()
+  let mut init_cap64 = in_len.to_int64() * 2L
+  if init_cap64 < 64L {
+    init_cap64 = 64L
+  }
+  if init_cap64 > max_out64 {
+    init_cap64 = max_out64
+  }
+  let init_cap = init_cap64.to_int()
+  let mut out = Bytes::new(init_cap)
+  let mut out_cap = init_cap
+  let mut out_pos = 0
+
+  while true {
+    if bitcnt < code_size {
+      if in_pos + 6 <= in_len {
+        let b0 = data[in_pos].to_int().to_int64().to_uint64()
+        let b1 = data[in_pos + 1].to_int().to_int64().to_uint64()
+        let b2 = data[in_pos + 2].to_int().to_int64().to_uint64()
+        let b3 = data[in_pos + 3].to_int().to_int64().to_uint64()
+        let b4 = data[in_pos + 4].to_int().to_int64().to_uint64()
+        let b5 = data[in_pos + 5].to_int().to_int64().to_uint64()
+        let word = b0 |
+        (b1 << 8) |
+        (b2 << 16) |
+        (b3 << 24) |
+        (b4 << 32) |
+        (b5 << 40)
+        bitbuf = bitbuf | (word << bitcnt)
+        bitcnt = bitcnt + 48
+        in_pos = in_pos + 6
+      } else {
+        while bitcnt <= 56 && in_pos < in_len {
+          bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+          bitcnt = bitcnt + 8
+          in_pos = in_pos + 1
+        }
+        if bitcnt < code_size {
+          return Err(GifError::UnexpectedEof("unexpected EOF in standalone LZW stream"))
+        }
+      }
+    }
+
+    let code = (bitbuf & mask).to_int()
+    bitbuf = bitbuf >> code_size
+    bitcnt = bitcnt - code_size
+
+    if code == clear_code {
+      code_size = min_code_size + 1
+      next_code = eoi_code + 1
+      max_code = (1 << code_size) - 1
+      mask = max_code.to_int64().to_uint64()
+      prev_code = -1
+      continue
+    }
+    if code == eoi_code {
+      break
+    }
+
+    let k = if prev_code == -1 {
+      if code >= clear_code {
+        return Err(GifError::InvalidLzwCode(code))
+      }
+      1
+    } else if code < next_code {
+      code_len[code]
+    } else if code == next_code {
+      code_len[prev_code] + 1
+    } else {
+      return Err(GifError::InvalidLzwCode(code))
+    }
+
+    if k > max_output - out_pos {
+      return Err(GifError::LimitExceeded("LZW output exceeded max_output"))
+    }
+    if out_pos + k > out_cap {
+      let cur64 = out_cap.to_int64()
+      let mut new_cap64 = if cur64 >= 67108864L {
+        cur64 + (cur64 >> 1)
+      } else {
+        cur64 * 2L
+      }
+      let needed64 = (out_pos + k).to_int64()
+      if new_cap64 < needed64 {
+        new_cap64 = needed64
+      }
+      if new_cap64 > max_out64 {
+        new_cap64 = max_out64
+      }
+      let new_cap = new_cap64.to_int()
+      let pad = Bytes::new(new_cap - out_pos)
+      out = if out_pos == out_cap {
+        out.concat(pad)
+      } else {
+        out.slice(0, out_pos).concat(pad)
+      }
+      out_cap = new_cap
+    }
+
+    if prev_code == -1 {
+      out[out_pos] = code.to_byte()
+      out_pos = out_pos + 1
+      prev_code = code
+      continue
+    }
+
+    let first = if code < next_code {
+      let mut c = code
+      let mut p = out_pos + k - 1
+      while c >= clear_code {
+        out[p] = suffix[c]
+        c = prefix[c]
+        p = p - 1
+      }
+      out[p] = c.to_byte()
+      first_char[code]
+    } else {
+      let f = first_char[prev_code]
+      out[out_pos + k - 1] = f
+      let mut c = prev_code
+      let mut p = out_pos + k - 2
+      while c >= clear_code {
+        out[p] = suffix[c]
+        c = prefix[c]
+        p = p - 1
+      }
+      out[p] = c.to_byte()
+      f
+    }
+    out_pos = out_pos + k
+
+    if next_code < 4096 {
+      prefix[next_code] = prev_code
+      suffix[next_code] = first
+      code_len[next_code] = code_len[prev_code] + 1
+      first_char[next_code] = first_char[prev_code]
+      next_code = next_code + 1
+      if next_code > max_code && code_size < 12 {
+        code_size = code_size + 1
+        max_code = (1 << code_size) - 1
+        mask = max_code.to_int64().to_uint64()
+      }
+    }
+    prev_code = code
+  }
+
+  if out_pos == out_cap {
+    Ok(out)
+  } else {
+    Ok(out.slice(0, out_pos))
+  }
+}

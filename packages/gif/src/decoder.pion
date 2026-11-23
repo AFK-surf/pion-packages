@@ -1,0 +1,1005 @@
+///| GIF87a / GIF89a container parser, interlace de-interleaver, and RGBA8888 frame compositor.
+
+///| Read little-endian unsigned 16-bit integer at `data[pos..pos+2]`.
+fn read_u16_le(data : Bytes, pos : Int) -> Int {
+  data[pos].to_int() | (data[pos + 1].to_int() << 8)
+}
+
+///| Check if `data[pos..pos+11]` equals ASCII string `target` (length 11).
+fn match_ascii11(data : Bytes, pos : Int, target : Bytes) -> Bool {
+  let mut i = 0
+  while i < 11 {
+    if data[pos + i] != target[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Parse GIF header + Logical Screen Descriptor + optional Global Color Table.
+///| Returns `(header, next_byte_offset)`.
+fn parse_header_internal(data : Bytes) -> Result[(GifHeader, Int), GifError] {
+  let n = data.length()
+  if n < 13 {
+    return Err(GifError::UnexpectedEof("GIF header requires at least 13 bytes"))
+  }
+  if data[0].to_int() != 0x47 ||
+  data[1].to_int() != 0x49 ||
+  data[2].to_int() != 0x46 ||
+  data[3].to_int() != 0x38 ||
+  data[5].to_int() != 0x61 {
+    return Err(GifError::InvalidHeader("invalid GIF signature"))
+  }
+  let v4 = data[4].to_int()
+  let version = if v4 == 0x37 {
+    GifVersion::Gif87a
+  } else if v4 == 0x39 {
+    GifVersion::Gif89a
+  } else {
+    return Err(GifError::InvalidHeader("unsupported GIF version"))
+  }
+
+  let width = read_u16_le(data, 6)
+  let height = read_u16_le(data, 8)
+  if width <= 0 || height <= 0 {
+    return Err(GifError::InvalidHeader("GIF logical screen dimensions must be positive"))
+  }
+
+  let packed = data[10].to_int()
+  let has_gct = (packed & 0x80) != 0
+  let color_res = ((packed >> 4) & 0x07) + 1
+  let gct_sorted = (packed & 0x08) != 0
+  let gct_size = if has_gct { 1 << ((packed & 0x07) + 1) } else { 0 }
+  let bg_index = data[11].to_int()
+  let aspect = data[12].to_int()
+
+  let mut pos = 13
+  let gct = if has_gct {
+    let gct_bytes = gct_size * 3
+    if pos + gct_bytes > n {
+      return Err(GifError::UnexpectedEof("truncated Global Color Table"))
+    }
+    let tbl = data.slice(pos, pos + gct_bytes)
+    pos = pos + gct_bytes
+    tbl
+  } else {
+    Bytes::new(0)
+  }
+
+  let header = GifHeader::{
+    version: version,
+    width: width,
+    height: height,
+    has_global_color_table: has_gct,
+    color_resolution: color_res,
+    global_color_table_sorted: gct_sorted,
+    global_color_table_size: gct_size,
+    background_color_index: bg_index,
+    pixel_aspect_ratio: aspect,
+    global_color_table: gct,
+  }
+  Ok((header, pos))
+}
+
+///| Probe and parse the GIF header, Logical Screen Descriptor, and optional Global Color Table.
+pub fn probe_header(data : Bytes) -> Result[GifHeader, GifError] {
+  match parse_header_internal(data) {
+    Ok((hdr, _)) => Ok(hdr)
+    Err(e) => Err(e)
+  }
+}
+
+///| Pending Graphic Control Extension state for the next image descriptor.
+struct PendingGce {
+  mut disposal : DisposalMethod
+  mut user_input : Bool
+  mut has_trans : Bool
+  mut delay_cs : Int
+  mut trans_index : Int
+}
+
+///|
+fn PendingGce::default() -> PendingGce {
+  PendingGce::{
+    disposal: DisposalMethod::Unspecified,
+    user_input: false,
+    has_trans: false,
+    delay_cs: 0,
+    trans_index: 0,
+  }
+}
+
+///|
+fn reset_gce(g : PendingGce) -> Unit {
+  g.disposal = DisposalMethod::Unspecified
+  g.user_input = false
+  g.has_trans = false
+  g.delay_cs = 0
+  g.trans_index = 0
+}
+
+///| Fill a 256-entry 4-byte-aligned RGBA palette (1024 bytes) directly from `src[src_off..src_off+ct_bytes]`.
+///| Uses shift-by-2 indexing (`idx << 2`) in compositing hot loops; out-of-range indices map to opaque black.
+fn fill_palette_1024(pal : Bytes, src : Bytes, src_off : Int, ct_count : Int) -> Unit {
+  let mut p = pal
+  let count = if ct_count < 256 { ct_count } else { 256 }
+  let opaque = (255).to_byte()
+  let mut i = 0
+  let mut si = src_off
+  let mut di = 0
+  while i < count {
+    p[di] = src[si]
+    p[di + 1] = src[si + 1]
+    p[di + 2] = src[si + 2]
+    p[di + 3] = opaque
+    i = i + 1
+    si = si + 3
+    di = di + 4
+  }
+  let zero = (0).to_byte()
+  while i < 256 {
+    p[di] = zero
+    p[di + 1] = zero
+    p[di + 2] = zero
+    p[di + 3] = opaque
+    i = i + 1
+    di = di + 4
+  }
+}
+
+///| De-interlace a 4-pass interlaced index buffer of size `w * h` into a fresh linear `Bytes`.
+fn deinterlace_indices(src : Bytes, w : Int, h : Int) -> Bytes {
+  let mut dst = Bytes::new(w * h)
+  let mut src_row = 0
+  let starts = [0, 4, 2, 1]
+  let steps = [8, 8, 4, 2]
+  let mut pass = 0
+  while pass < 4 {
+    let mut y = starts[pass]
+    let step = steps[pass]
+    while y < h {
+      let s_off = src_row * w
+      let d_off = y * w
+      let mut x = 0
+      while x < w {
+        dst[d_off + x] = src[s_off + x]
+        x = x + 1
+      }
+      src_row = src_row + 1
+      y = y + step
+    }
+    pass = pass + 1
+  }
+  dst
+}
+
+///| Composite a single non-interlaced or interlaced frame onto `canvas` (RGBA8888, size `cw * ch * 4`).
+///| `pal` is a 1024-byte 4-byte-aligned RGBA palette (`idx << 2`).
+fn composite_frame(
+  canvas : Bytes,
+  cw : Int,
+  ch : Int,
+  idx_buf : Bytes,
+  left : Int,
+  top : Int,
+  fw : Int,
+  fh : Int,
+  interlaced : Bool,
+  pal : Bytes,
+  has_trans : Bool,
+  trans_idx : Int,
+) -> Unit {
+  let mut dst = canvas
+  let x1_raw = left + fw
+  let y1_raw = top + fh
+  let x_end = if x1_raw < cw { x1_raw } else { cw }
+  let y_end = if y1_raw < ch { y1_raw } else { ch }
+  if left >= cw || top >= ch || x_end <= left || y_end <= top {
+    return
+  }
+  let vis_w = x_end - left
+  let opaque = (255).to_byte()
+
+  if !interlaced {
+    // Fast path: full-canvas opaque frame (4x unrolled, shift-by-2 palette lookup)
+    if !has_trans && left == 0 && top == 0 && fw == cw && fh == ch {
+      let total = cw * ch
+      let lim4 = total - 4
+      let mut i = 0
+      let mut di = 0
+      while i <= lim4 {
+        let p0 = idx_buf[i].to_int() << 2
+        let p1 = idx_buf[i + 1].to_int() << 2
+        let p2 = idx_buf[i + 2].to_int() << 2
+        let p3 = idx_buf[i + 3].to_int() << 2
+        dst[di] = pal[p0]
+        dst[di + 1] = pal[p0 + 1]
+        dst[di + 2] = pal[p0 + 2]
+        dst[di + 3] = opaque
+        dst[di + 4] = pal[p1]
+        dst[di + 5] = pal[p1 + 1]
+        dst[di + 6] = pal[p1 + 2]
+        dst[di + 7] = opaque
+        dst[di + 8] = pal[p2]
+        dst[di + 9] = pal[p2 + 1]
+        dst[di + 10] = pal[p2 + 2]
+        dst[di + 11] = opaque
+        dst[di + 12] = pal[p3]
+        dst[di + 13] = pal[p3 + 1]
+        dst[di + 14] = pal[p3 + 2]
+        dst[di + 15] = opaque
+        i = i + 4
+        di = di + 16
+      }
+      while i < total {
+        let p = idx_buf[i].to_int() << 2
+        dst[di] = pal[p]
+        dst[di + 1] = pal[p + 1]
+        dst[di + 2] = pal[p + 2]
+        dst[di + 3] = opaque
+        i = i + 1
+        di = di + 4
+      }
+      return
+    }
+    let vis_h = y_end - top
+    if !has_trans {
+      let mut fy = 0
+      while fy < vis_h {
+        let s_row = fy * fw
+        let mut di = ((top + fy) * cw + left) * 4
+        let lim4 = vis_w - 4
+        let mut fx = 0
+        while fx <= lim4 {
+          let p0 = idx_buf[s_row + fx].to_int() << 2
+          let p1 = idx_buf[s_row + fx + 1].to_int() << 2
+          let p2 = idx_buf[s_row + fx + 2].to_int() << 2
+          let p3 = idx_buf[s_row + fx + 3].to_int() << 2
+          dst[di] = pal[p0]
+          dst[di + 1] = pal[p0 + 1]
+          dst[di + 2] = pal[p0 + 2]
+          dst[di + 3] = opaque
+          dst[di + 4] = pal[p1]
+          dst[di + 5] = pal[p1 + 1]
+          dst[di + 6] = pal[p1 + 2]
+          dst[di + 7] = opaque
+          dst[di + 8] = pal[p2]
+          dst[di + 9] = pal[p2 + 1]
+          dst[di + 10] = pal[p2 + 2]
+          dst[di + 11] = opaque
+          dst[di + 12] = pal[p3]
+          dst[di + 13] = pal[p3 + 1]
+          dst[di + 14] = pal[p3 + 2]
+          dst[di + 15] = opaque
+          fx = fx + 4
+          di = di + 16
+        }
+        while fx < vis_w {
+          let p = idx_buf[s_row + fx].to_int() << 2
+          dst[di] = pal[p]
+          dst[di + 1] = pal[p + 1]
+          dst[di + 2] = pal[p + 2]
+          dst[di + 3] = opaque
+          fx = fx + 1
+          di = di + 4
+        }
+        fy = fy + 1
+      }
+    } else {
+      let trans_b = trans_idx.to_byte()
+      let lim4 = vis_w - 4
+      let mut fy = 0
+      while fy < vis_h {
+        let s_row = fy * fw
+        let mut di = ((top + fy) * cw + left) * 4
+        let mut fx = 0
+        while fx <= lim4 {
+          let c0 = idx_buf[s_row + fx]
+          if c0 != trans_b {
+            let p = c0.to_int() << 2
+            dst[di] = pal[p]
+            dst[di + 1] = pal[p + 1]
+            dst[di + 2] = pal[p + 2]
+            dst[di + 3] = opaque
+          }
+          let c1 = idx_buf[s_row + fx + 1]
+          if c1 != trans_b {
+            let p = c1.to_int() << 2
+            dst[di + 4] = pal[p]
+            dst[di + 5] = pal[p + 1]
+            dst[di + 6] = pal[p + 2]
+            dst[di + 7] = opaque
+          }
+          let c2 = idx_buf[s_row + fx + 2]
+          if c2 != trans_b {
+            let p = c2.to_int() << 2
+            dst[di + 8] = pal[p]
+            dst[di + 9] = pal[p + 1]
+            dst[di + 10] = pal[p + 2]
+            dst[di + 11] = opaque
+          }
+          let c3 = idx_buf[s_row + fx + 3]
+          if c3 != trans_b {
+            let p = c3.to_int() << 2
+            dst[di + 12] = pal[p]
+            dst[di + 13] = pal[p + 1]
+            dst[di + 14] = pal[p + 2]
+            dst[di + 15] = opaque
+          }
+          fx = fx + 4
+          di = di + 16
+        }
+        while fx < vis_w {
+          let cb = idx_buf[s_row + fx]
+          if cb != trans_b {
+            let p = cb.to_int() << 2
+            dst[di] = pal[p]
+            dst[di + 1] = pal[p + 1]
+            dst[di + 2] = pal[p + 2]
+            dst[di + 3] = opaque
+          }
+          fx = fx + 1
+          di = di + 4
+        }
+        fy = fy + 1
+      }
+    }
+    return
+  }
+
+  // Interlaced 4-pass compositing directly onto canvas
+  let starts = [0, 4, 2, 1]
+  let steps = [8, 8, 4, 2]
+  let trans_b = trans_idx.to_byte()
+  let mut src_row = 0
+  let mut pass = 0
+  while pass < 4 {
+    let mut fy = starts[pass]
+    let step = steps[pass]
+    while fy < fh {
+      let cy = top + fy
+      if cy < y_end {
+        let s_row = src_row * fw
+        let mut di = (cy * cw + left) * 4
+        if !has_trans {
+          let mut fx = 0
+          while fx < vis_w {
+            let p = idx_buf[s_row + fx].to_int() << 2
+            dst[di] = pal[p]
+            dst[di + 1] = pal[p + 1]
+            dst[di + 2] = pal[p + 2]
+            dst[di + 3] = opaque
+            fx = fx + 1
+            di = di + 4
+          }
+        } else {
+          let mut fx = 0
+          while fx < vis_w {
+            let cb = idx_buf[s_row + fx]
+            if cb != trans_b {
+              let p = cb.to_int() << 2
+              dst[di] = pal[p]
+              dst[di + 1] = pal[p + 1]
+              dst[di + 2] = pal[p + 2]
+              dst[di + 3] = opaque
+            }
+            fx = fx + 1
+            di = di + 4
+          }
+        }
+      }
+      src_row = src_row + 1
+      fy = fy + step
+    }
+    pass = pass + 1
+  }
+}
+
+///| Clear a clipped sub-rectangle on `canvas` to transparent black `(0, 0, 0, 0)` (16x unrolled).
+fn clear_rect_rgba(canvas : Bytes, cw : Int, ch : Int, left : Int, top : Int, fw : Int, fh : Int) -> Unit {
+  let mut dst = canvas
+  let x1 = if left + fw < cw { left + fw } else { cw }
+  let y1 = if top + fh < ch { top + fh } else { ch }
+  if left >= cw || top >= ch || x1 <= left || y1 <= top {
+    return
+  }
+  let row_bytes = (x1 - left) * 4
+  let zero = (0).to_byte()
+  let mut y = top
+  while y < y1 {
+    let mut di = (y * cw + left) * 4
+    let end = di + row_bytes
+    let lim16 = end - 16
+    while di <= lim16 {
+      dst[di] = zero
+      dst[di + 1] = zero
+      dst[di + 2] = zero
+      dst[di + 3] = zero
+      dst[di + 4] = zero
+      dst[di + 5] = zero
+      dst[di + 6] = zero
+      dst[di + 7] = zero
+      dst[di + 8] = zero
+      dst[di + 9] = zero
+      dst[di + 10] = zero
+      dst[di + 11] = zero
+      dst[di + 12] = zero
+      dst[di + 13] = zero
+      dst[di + 14] = zero
+      dst[di + 15] = zero
+      di = di + 16
+    }
+    while di < end {
+      dst[di] = zero
+      di = di + 1
+    }
+    y = y + 1
+  }
+}
+
+///| Parse an Extension block starting at the extension label byte `data[pos]`.
+///| Updates `gce` or `loop_count` as appropriate and returns `(new_loop_count, next_pos)`.
+fn parse_extension(
+  data : Bytes,
+  pos : Int,
+  gce : PendingGce,
+  cur_loop : LoopCount,
+  netscape_tag : Bytes,
+  animexts_tag : Bytes,
+) -> Result[(LoopCount, Int), GifError] {
+  let n = data.length()
+  if pos >= n {
+    return Err(GifError::UnexpectedEof("truncated extension label"))
+  }
+  let label = data[pos].to_int()
+  let mut p = pos + 1
+
+  if label == 0xF9 {
+    if p >= n {
+      return Err(GifError::UnexpectedEof("truncated GCE block size"))
+    }
+    let blk_size = data[p].to_int()
+    p = p + 1
+    if blk_size != 4 {
+      return Err(GifError::InvalidExtension("GCE block size must be 4"))
+    }
+    if p + 4 > n {
+      return Err(GifError::UnexpectedEof("truncated GCE payload"))
+    }
+    let packed = data[p].to_int()
+    gce.disposal = disposal_method_from_int((packed >> 2) & 0x07)
+    gce.user_input = (packed & 0x02) != 0
+    gce.has_trans = (packed & 0x01) != 0
+    gce.delay_cs = read_u16_le(data, p + 1)
+    gce.trans_index = data[p + 3].to_int()
+    p = p + 4
+    match skip_sub_blocks(data, p) {
+      Ok(next_p) => return Ok((cur_loop, next_p))
+      Err(e) => return Err(e)
+    }
+  }
+
+  if label == 0xFF {
+    if p >= n {
+      return Err(GifError::UnexpectedEof("truncated Application Extension block size"))
+    }
+    let blk_size = data[p].to_int()
+    p = p + 1
+    if p + blk_size > n {
+      return Err(GifError::UnexpectedEof("truncated Application Extension header"))
+    }
+    let mut next_loop = cur_loop
+    if blk_size == 11 &&
+    (match_ascii11(data, p, netscape_tag) || match_ascii11(data, p, animexts_tag)) {
+      p = p + 11
+      if p < n {
+        let sub_len = data[p].to_int()
+        if sub_len >= 3 && p + 1 + sub_len <= n && data[p + 1].to_int() == 1 {
+          let loops = read_u16_le(data, p + 2)
+          next_loop = if loops == 0 { LoopCount::Infinite } else { LoopCount::Finite(loops) }
+        }
+      }
+      match skip_sub_blocks(data, p) {
+        Ok(next_p) => return Ok((next_loop, next_p))
+        Err(e) => return Err(e)
+      }
+    }
+    p = p + blk_size
+    match skip_sub_blocks(data, p) {
+      Ok(next_p) => return Ok((next_loop, next_p))
+      Err(e) => return Err(e)
+    }
+  }
+
+  if label == 0x01 {
+    reset_gce(gce)
+    if p >= n {
+      return Err(GifError::UnexpectedEof("truncated Plain Text Extension"))
+    }
+    let blk_size = data[p].to_int()
+    p = p + 1
+    if p + blk_size > n {
+      return Err(GifError::UnexpectedEof("truncated Plain Text header"))
+    }
+    p = p + blk_size
+    match skip_sub_blocks(data, p) {
+      Ok(next_p) => return Ok((cur_loop, next_p))
+      Err(e) => return Err(e)
+    }
+  }
+
+  match skip_sub_blocks(data, p) {
+    Ok(next_p) => Ok((cur_loop, next_p))
+    Err(e) => Err(e)
+  }
+}
+
+///| Validate logical screen dimensions against `limits`.
+fn check_canvas_limits(w : Int, h : Int, limits : DecodeLimits) -> Result[Int, GifError] {
+  if limits.max_width < 0 ||
+  limits.max_height < 0 ||
+  limits.max_pixels < 0 ||
+  limits.max_frames < 0 ||
+  limits.max_total_bytes < 0 {
+    return Err(GifError::LimitExceeded("negative decode limit"))
+  }
+  if w > limits.max_width || h > limits.max_height {
+    return Err(
+      GifError::LimitExceeded(
+        "canvas dimensions " + w.to_string() + "x" + h.to_string() + " exceed limit",
+      ),
+    )
+  }
+  let pixels64 = w.to_int64() * h.to_int64()
+  if pixels64 > limits.max_pixels.to_int64() {
+    return Err(
+      GifError::LimitExceeded(
+        "canvas pixel count " + pixels64.to_string() + " exceeds max_pixels",
+      ),
+    )
+  }
+  let rgba_bytes64 = pixels64 * 4L
+  if rgba_bytes64 > limits.max_total_bytes.to_int64() {
+    return Err(GifError::LimitExceeded("single frame RGBA size exceeds max_total_bytes"))
+  }
+  Ok(pixels64.to_int())
+}
+
+///| Internal RGBA decoder supporting both full multi-frame and fast first-frame-only modes.
+fn decode_rgba_internal(
+  data : Bytes,
+  limits : DecodeLimits,
+  first_only : Bool,
+) -> Result[GifImage, GifError] {
+  let (header, start_pos) = match parse_header_internal(data) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let cw = header.width
+  let ch = header.height
+  let canvas_pixels = match check_canvas_limits(cw, ch, limits) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  let canvas_bytes = canvas_pixels * 4
+  let mut canvas = Bytes::new(0)
+
+  let gct_pal = Bytes::new(1024)
+  if header.has_global_color_table {
+    fill_palette_1024(gct_pal, header.global_color_table, 0, header.global_color_table_size)
+  }
+  let lct_pal = Bytes::new(1024)
+
+  let scratch = LzwScratch::new()
+  let mut idx_buf = Bytes::new(0)
+  let gce = PendingGce::default()
+  let mut loop_count = LoopCount::None
+  let netscape_tag = "NETSCAPE2.0".to_bytes()
+  let animexts_tag = "ANIMEXTS1.0".to_bytes()
+
+  let frames : Array[GifFrame] = []
+  let mut total_bytes : Int64 = 0L
+  let n = data.length()
+  let mut pos = start_pos
+
+  while pos < n {
+    let intro = data[pos].to_int()
+    pos = pos + 1
+    if intro == 0x3B {
+      break
+    }
+    if intro == 0x00 {
+      continue
+    }
+    if intro == 0x21 {
+      match parse_extension(data, pos, gce, loop_count, netscape_tag, animexts_tag) {
+        Ok((nl, next_p)) => {
+          loop_count = nl
+          pos = next_p
+        }
+        Err(e) => return Err(e)
+      }
+      continue
+    }
+    if intro == 0x2C {
+      if frames.length() >= limits.max_frames {
+        return Err(GifError::LimitExceeded("frame count exceeds max_frames"))
+      }
+      if pos + 9 > n {
+        return Err(GifError::UnexpectedEof("truncated Image Descriptor"))
+      }
+      let left = read_u16_le(data, pos)
+      let top = read_u16_le(data, pos + 2)
+      let fw = read_u16_le(data, pos + 4)
+      let fh = read_u16_le(data, pos + 6)
+      let packed = data[pos + 8].to_int()
+      pos = pos + 9
+
+      let frame_pixels64 = fw.to_int64() * fh.to_int64()
+      if fw > limits.max_width ||
+      fh > limits.max_height ||
+      frame_pixels64 > limits.max_pixels.to_int64() {
+        return Err(GifError::LimitExceeded("frame dimensions exceed limits"))
+      }
+      let frame_work_bytes = frame_pixels64 * 4L
+      let charge_bytes = if frame_work_bytes > canvas_bytes.to_int64() {
+        frame_work_bytes
+      } else {
+        canvas_bytes.to_int64()
+      }
+      total_bytes = total_bytes + charge_bytes
+      if total_bytes > limits.max_total_bytes.to_int64() {
+        return Err(GifError::LimitExceeded("total decoded bytes exceed max_total_bytes"))
+      }
+      let frame_pixels = frame_pixels64.to_int()
+
+      let has_lct = (packed & 0x80) != 0
+      let interlaced = (packed & 0x40) != 0
+      let pal = if has_lct {
+        let lct_size = 1 << ((packed & 0x07) + 1)
+        let lct_bytes = lct_size * 3
+        if pos + lct_bytes > n {
+          return Err(GifError::UnexpectedEof("truncated Local Color Table"))
+        }
+        fill_palette_1024(lct_pal, data, pos, lct_size)
+        pos = pos + lct_bytes
+        lct_pal
+      } else if header.has_global_color_table {
+        gct_pal
+      } else {
+        return Err(GifError::MissingColorTable("frame has neither local nor global color table"))
+      }
+
+      if pos >= n {
+        return Err(GifError::UnexpectedEof("missing LZW minimum code size"))
+      }
+      let min_code_size = data[pos].to_int()
+      pos = pos + 1
+
+      if frame_pixels > idx_buf.length() {
+        idx_buf = Bytes::new(frame_pixels)
+      }
+      let (written, next_p) = match lzw_decode_subblocks_into(
+        data,
+        pos,
+        min_code_size,
+        frame_pixels,
+        idx_buf,
+        scratch,
+      ) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if written < frame_pixels {
+        return Err(GifError::UnexpectedEof("LZW stream ended before filling frame"))
+      }
+      pos = next_p
+
+      if canvas.length() == 0 {
+        canvas = Bytes::new(canvas_bytes)
+      }
+
+      let disposal = gce.disposal
+      let delay_cs = gce.delay_cs
+      let has_trans = gce.has_trans
+      let trans_idx = gce.trans_index
+      reset_gce(gce)
+
+      let is_last = first_only || pos >= n || data[pos].to_int() == 0x3B
+      if is_last {
+        if fw > 0 && fh > 0 {
+          composite_frame(
+            canvas,
+            cw,
+            ch,
+            idx_buf,
+            left,
+            top,
+            fw,
+            fh,
+            interlaced,
+            pal,
+            has_trans,
+            trans_idx,
+          )
+        }
+        frames.push(
+          GifFrame::{
+            width: cw,
+            height: ch,
+            left: left,
+            top: top,
+            frame_width: fw,
+            frame_height: fh,
+            delay_cs: delay_cs,
+            disposal: disposal,
+            rgba: canvas,
+          },
+        )
+        return Ok(GifImage::{ header: header, loop_count: loop_count, frames: frames })
+      }
+
+      let is_restore_prev = match disposal {
+        DisposalMethod::RestoreToPrevious => true
+        _ => false
+      }
+      if is_restore_prev {
+        // Zero-copy RestoreToPrevious: snapshot canvas first, composite directly onto frame_rgba,
+        // leaving `canvas` completely untouched!
+        let frame_rgba = canvas.slice(0, canvas_bytes)
+        if fw > 0 && fh > 0 {
+          composite_frame(
+            frame_rgba,
+            cw,
+            ch,
+            idx_buf,
+            left,
+            top,
+            fw,
+            fh,
+            interlaced,
+            pal,
+            has_trans,
+            trans_idx,
+          )
+        }
+        frames.push(
+          GifFrame::{
+            width: cw,
+            height: ch,
+            left: left,
+            top: top,
+            frame_width: fw,
+            frame_height: fh,
+            delay_cs: delay_cs,
+            disposal: disposal,
+            rgba: frame_rgba,
+          },
+        )
+        continue
+      }
+
+      if fw > 0 && fh > 0 {
+        composite_frame(
+          canvas,
+          cw,
+          ch,
+          idx_buf,
+          left,
+          top,
+          fw,
+          fh,
+          interlaced,
+          pal,
+          has_trans,
+          trans_idx,
+        )
+      }
+
+      let frame_rgba = canvas.slice(0, canvas_bytes)
+      frames.push(
+        GifFrame::{
+          width: cw,
+          height: ch,
+          left: left,
+          top: top,
+          frame_width: fw,
+          frame_height: fh,
+          delay_cs: delay_cs,
+          disposal: disposal,
+          rgba: frame_rgba,
+        },
+      )
+
+      match disposal {
+        DisposalMethod::RestoreToBackground =>
+        clear_rect_rgba(canvas, cw, ch, left, top, fw, fh)
+        _ => ()
+      }
+      continue
+    }
+
+    return Err(GifError::InvalidBlock("unknown GIF block introducer: " + intro.to_string()))
+  }
+
+  Ok(GifImage::{ header: header, loop_count: loop_count, frames: frames })
+}
+
+///| Decode all frames of a GIF stream into composited RGBA8888 canvases with default limits.
+pub fn decode(data : Bytes) -> Result[GifImage, GifError] {
+  decode_with_limits(data, DecodeLimits::default())
+}
+
+///| Decode all frames of a GIF stream into composited RGBA8888 canvases with custom limits.
+pub fn decode_with_limits(data : Bytes, limits : DecodeLimits) -> Result[GifImage, GifError] {
+  decode_rgba_internal(data, limits, false)
+}
+
+///| Decode only the first frame of a GIF stream into a full-canvas RGBA8888 frame with default limits.
+pub fn decode_first_frame(data : Bytes) -> Result[GifFrame, GifError] {
+  decode_first_frame_with_limits(data, DecodeLimits::default())
+}
+
+///| Decode only the first frame of a GIF stream into a full-canvas RGBA8888 frame with custom limits.
+pub fn decode_first_frame_with_limits(
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[GifFrame, GifError] {
+  match decode_rgba_internal(data, limits, true) {
+    Ok(img) =>
+    if img.frames.length() == 0 {
+      Err(GifError::UnexpectedEof("GIF stream contains no image frames"))
+    } else {
+      Ok(img.frames[0])
+    }
+    Err(e) => Err(e)
+  }
+}
+
+///| Decode all frames of a GIF stream into raw de-interlaced palette-indexed frames with default limits.
+pub fn decode_indexed(data : Bytes) -> Result[GifIndexedImage, GifError] {
+  decode_indexed_with_limits(data, DecodeLimits::default())
+}
+
+///| Decode all frames of a GIF stream into raw de-interlaced palette-indexed frames with custom limits.
+pub fn decode_indexed_with_limits(
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[GifIndexedImage, GifError] {
+  let (header, start_pos) = match parse_header_internal(data) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let _ = match check_canvas_limits(header.width, header.height, limits) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+
+  let scratch = LzwScratch::new()
+  let gce = PendingGce::default()
+  let mut loop_count = LoopCount::None
+  let netscape_tag = "NETSCAPE2.0".to_bytes()
+  let animexts_tag = "ANIMEXTS1.0".to_bytes()
+
+  let frames : Array[GifIndexedFrame] = []
+  let mut total_bytes : Int64 = 0L
+  let n = data.length()
+  let mut pos = start_pos
+
+  while pos < n {
+    let intro = data[pos].to_int()
+    pos = pos + 1
+    if intro == 0x3B {
+      break
+    }
+    if intro == 0x00 {
+      continue
+    }
+    if intro == 0x21 {
+      match parse_extension(data, pos, gce, loop_count, netscape_tag, animexts_tag) {
+        Ok((nl, next_p)) => {
+          loop_count = nl
+          pos = next_p
+        }
+        Err(e) => return Err(e)
+      }
+      continue
+    }
+    if intro == 0x2C {
+      if frames.length() >= limits.max_frames {
+        return Err(GifError::LimitExceeded("frame count exceeds max_frames"))
+      }
+      if pos + 9 > n {
+        return Err(GifError::UnexpectedEof("truncated Image Descriptor"))
+      }
+      let left = read_u16_le(data, pos)
+      let top = read_u16_le(data, pos + 2)
+      let fw = read_u16_le(data, pos + 4)
+      let fh = read_u16_le(data, pos + 6)
+      let packed = data[pos + 8].to_int()
+      pos = pos + 9
+
+      let frame_pixels64 = fw.to_int64() * fh.to_int64()
+      if fw > limits.max_width ||
+      fh > limits.max_height ||
+      frame_pixels64 > limits.max_pixels.to_int64() {
+        return Err(GifError::LimitExceeded("frame dimensions exceed limits"))
+      }
+      total_bytes = total_bytes + frame_pixels64
+      if total_bytes > limits.max_total_bytes.to_int64() {
+        return Err(GifError::LimitExceeded("total indexed bytes exceed max_total_bytes"))
+      }
+      let frame_pixels = frame_pixels64.to_int()
+
+      let has_lct = (packed & 0x80) != 0
+      let interlaced = (packed & 0x40) != 0
+      let lct = if has_lct {
+        let lct_size = 1 << ((packed & 0x07) + 1)
+        let lct_bytes = lct_size * 3
+        if pos + lct_bytes > n {
+          return Err(GifError::UnexpectedEof("truncated Local Color Table"))
+        }
+        let tbl = data.slice(pos, pos + lct_bytes)
+        pos = pos + lct_bytes
+        tbl
+      } else if header.has_global_color_table {
+        Bytes::new(0)
+      } else {
+        return Err(GifError::MissingColorTable("frame has neither local nor global color table"))
+      }
+
+      if pos >= n {
+        return Err(GifError::UnexpectedEof("missing LZW minimum code size"))
+      }
+      let min_code_size = data[pos].to_int()
+      pos = pos + 1
+
+      let raw_idx = Bytes::new(frame_pixels)
+      let (written, next_p) = match lzw_decode_subblocks_into(
+        data,
+        pos,
+        min_code_size,
+        frame_pixels,
+        raw_idx,
+        scratch,
+      ) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if written < frame_pixels {
+        return Err(GifError::UnexpectedEof("LZW stream ended before filling frame"))
+      }
+      pos = next_p
+
+      let indices = if interlaced && fw > 0 && fh > 0 {
+        deinterlace_indices(raw_idx, fw, fh)
+      } else {
+        raw_idx
+      }
+
+      let trans_opt : Option[Int] = if gce.has_trans { Some(gce.trans_index) } else { None }
+      frames.push(
+        GifIndexedFrame::{
+          left: left,
+          top: top,
+          width: fw,
+          height: fh,
+          interlaced: interlaced,
+          delay_cs: gce.delay_cs,
+          disposal: gce.disposal,
+          user_input: gce.user_input,
+          transparent_index: trans_opt,
+          local_color_table: lct,
+          indices: indices,
+        },
+      )
+      reset_gce(gce)
+      continue
+    }
+
+    return Err(GifError::InvalidBlock("unknown GIF block introducer: " + intro.to_string()))
+  }
+
+  Ok(GifIndexedImage::{ header: header, loop_count: loop_count, frames: frames })
+}
