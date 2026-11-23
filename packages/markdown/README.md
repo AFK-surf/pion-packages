@@ -7,7 +7,7 @@ Idiomatic pure Pion port of Rust [`pulldown-cmark`](https://github.com/pulldown-
 - **Upstream**: [`pulldown-cmark/pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark) `v0.13.1` (MIT)
 - **Specification**: [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/) + GitHub Flavored Markdown (GFM) Tables, Strikethrough, Task Lists, Autolink Literals + CommonMark CJK-friendly emphasis amendments (Unicode 17)
 
-## Compliance & Test Coverage (`708 / 708` PASS)
+## Compliance & Test Coverage (`719 / 719` PASS)
 
 | Suite | Passed | Notes |
 | --- | ---: | --- |
@@ -19,9 +19,10 @@ Idiomatic pure Pion port of Rust [`pulldown-cmark`](https://github.com/pulldown-
 | Smart Punctuation (`smart_punct.rs`) | **16 / 16** | O(N) single-pass curly quotes, em/en dashes, ellipses |
 | CJK-Friendly Emphasis (`cjk_friendly_emphasis.rs` + toggle) | **11 / 11** | Full Unicode 17 CJK ranges, IVS & variation selectors |
 | Pathological & Extended Tests (`extensions_test.pion` + 10k stress) | **7 / 7** | Iterative block rendering (50k+ nesting, 0 SIGSEGV), O(N) inline parsing, `parse_with_offsets`, footnotes, YAML/Pluses frontmatter |
+| Tree AST & Plain-Text Extraction (`ast_plain_text_test.pion`) | **11 / 11** | Full `Document`/`Block`/`Inline` AST, GFM tables/tasklists/footnotes/frontmatter, UTF-8 code-point safe `max_chars` (CJK & Emoji), 50k `>` & 32k `- ` stack safety, AST vs Event consistency |
 | Red-Team P0 / P1 Audit (`audit/tests/redteam_test.pion`) | **P0 6/6, P1 41/41, OK 8/8** | 0 SIGSEGV, 0 direct-vs-parse divergences across 85,152 differential cases |
 | Upstream `pulldown-cmark 0.13.1` `table` / `strikethrough` / `regression` | **27/28, 14/15, 192/210** | 954 / 1,148 total across all upstream suites |
-| Wasm32 Smoke (`wasm_smoke`) | **PASS** | `pionc build --release --target wasm32` verified |
+| Wasm32 & Native 4-Mode Smoke (`wasm_smoke`) | **PASS** | `native_dbg` / `native_rel` / `wasm_dbg` / `wasm_rel` all exit 0 with identical SHA-256 (incl. 50k `>` & 32k `- ` nesting, 0 Wasm32 `RangeError`) |
 
 ## Public API
 
@@ -45,11 +46,37 @@ let gfm_html = markdown::to_html(
 // Flat event stream API
 let events = markdown::parse(src, markdown::Options::gfm())
 let rendered = markdown::render_html(events)
+
+// v0.3.0 Structured Tree AST API (fully iterative, zero recursion)
+let doc = markdown::parse_document(src, markdown::Options::gfm())
+let ext_doc = markdown::parse_document_extended(src, markdown::ExtendedOptions::full())
+
+// v0.3.0 Configurable Plain-Text Preview API (UTF-8 code-point safe truncation)
+let preview = markdown::to_plain_text(
+  src,
+  markdown::Options::gfm(),
+  markdown::PlainTextOptions::{
+    image_placeholder: "[图片]",
+    link_placeholder: "[链接]",
+    code_block_placeholder: "[代码块]",
+    math_placeholder: "[公式]",
+    collapse_whitespace: true,
+    max_chars: 120,
+  },
+)
+let from_ast = doc.plain_text(markdown::PlainTextOptions::default())
 ```
 
 - `Options` (`val struct`): `tables`, `strikethrough`, `tasklists`, `autolinks`, `smart_punctuation`, `cjk_friendly`, with `Options::commonmark()` and `Options::gfm()`.
 - `ExtendedOptions` (`val struct`): wraps `base : Options` plus optional `footnotes`, `yaml_frontmatter`, `pluses_frontmatter`.
 - `Event`, `OffsetEvent`, `Tag`, `TagEnd`, `Alignment`, `CodeBlockKind`, `LinkType`, `MetadataBlockKind`
+- **Tree AST (`v0.3.0`)**: `Document`, `FrontMatter`, `Block`, `Inline`, `ListItem`, `TableCell`
+  - `parse_document(src : String, opts : Options) -> Document`
+  - `parse_document_extended(src : String, opts : ExtendedOptions) -> Document`
+- **Plain-Text Extraction (`v0.3.0`)**: `PlainTextOptions` (`PlainTextOptions::default()`)
+  - `Document::plain_text(self : Document, pt_opts : PlainTextOptions) -> String`
+  - `to_plain_text(src : String, opts : Options, pt_opts : PlainTextOptions) -> String`
+  - `to_plain_text_extended(src : String, opts : ExtendedOptions, pt_opts : PlainTextOptions) -> String`
 - `parse(src : String, opts : Options) -> Array[Event]`
 - `parse_with_offsets(src : String, opts : Options) -> Array[OffsetEvent]` (source byte ranges `[start, end)` per event)
 - `parse_extended(src : String, opts : ExtendedOptions) -> Array[Event]`
@@ -83,7 +110,16 @@ Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte v
 
 - SHA-256 (identical across all implementations and rounds): `eb0ade9169dfd54fc25a08adb046413fa61bfb44182c6fd0a7310bb8aaf7eba3`
 
-### 3. O(N²) DoS Elimination (`sh packages/markdown/audit/run_audit.sh`)
+### 3. `v0.3.0` Tree AST & Plain-Text Throughput (Mixed GFM Corpus, `2,503,227 B`, `Darwin arm64`, `warmup=1`, `rounds=5`)
+
+| Operation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `to_html_pulldown` (regression check vs Rust `0.91x`, `24.453 ms`) | 26.912 | 23.446 | 27.450 | 93.01 | 18.45 MiB |
+| `parse_document` (full tree `Document` AST) | 32.574 | 31.550 | 33.754 | 76.85 | 33.84 MiB |
+| `to_plain_text` (full document, `collapse_whitespace: true`) | 40.340 | 38.409 | 41.680 | 62.05 | 34.89 MiB |
+| `to_plain_text` (`max_chars: 120` preview with placeholders) | 31.395 | 30.919 | 34.199 | 79.73 | 33.84 MiB |
+
+### 4. O(N²) DoS Elimination (`sh packages/markdown/audit/run_audit.sh`)
 
 | Pathological input | v0.1.0 | P49 (current) | Interleaved vs `pulldown-cmark` |
 | --- | ---: | ---: | ---: |
