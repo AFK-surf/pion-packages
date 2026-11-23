@@ -10,17 +10,19 @@ Directly reuses `packages/crypto` (`v0.2.0`) for `Sha1` / `sha1`, `sha256`, `Hma
   - Strict 20-byte header validation (top 2 bits `00`, Magic Cookie `0x2112A442`, 4-byte-aligned message length matching packet size, 12-byte `transaction_id`).
   - Full `MessageClass` (`Request`, `Indication`, `SuccessResponse`, `ErrorResponse`) and 12-bit `MessageMethod` (`Binding`, TURN `Allocate`/`Refresh`/`Send`/`Data`/`CreatePermission`/`ChannelBind`, and arbitrary `Other(Int)`).
   - Full attribute support with 4-byte padding alignment: `MAPPED-ADDRESS` (`0x0001`), `XOR-MAPPED-ADDRESS` (`0x0020`, IPv4 & IPv6), `USERNAME` (`0x0006`), `REALM` (`0x0014`), `NONCE` (`0x0015`), `SOFTWARE` (`0x8022`), `ERROR-CODE` (`0x0009`), `UNKNOWN-ATTRIBUTES` (`0x000A`), `PRIORITY` (`0x0024`), `USE-CANDIDATE` (`0x0025`), `ICE-CONTROLLED` (`0x8029`), `ICE-CONTROLLING` (`0x802A`), `MESSAGE-INTEGRITY` (`0x0008`), `MESSAGE-INTEGRITY-SHA256` (`0x001C`), `FINGERPRINT` (`0x8028`), and `Unknown(Int, Bytes)`.
-  - RFC 8489 §14.5 / §14.6 `MESSAGE-INTEGRITY` (HMAC-SHA1) and `MESSAGE-INTEGRITY-SHA256` (HMAC-SHA256) with exact header-length adjustment and constant-time comparison (`crypto::constant_time_eq`).
+  - RFC 8489 §14.5 / §14.6 `MESSAGE-INTEGRITY` (HMAC-SHA1) and `MESSAGE-INTEGRITY-SHA256` (HMAC-SHA256, including truncated 16/20/24/28-byte variants) with exact header-length adjustment, post-MI attribute stripping/ignoring (except `MESSAGE-INTEGRITY-SHA256` and `FINGERPRINT`), full TLV framing validation, and constant-time comparison (`crypto::constant_time_eq`).
+  - Strict RFC 3629 UTF-8 validation on text attributes (`USERNAME`, `REALM`, `NONCE`, `SOFTWARE`, `ERROR-CODE` reason) and RFC 8489 §14.8 length bounds (`ERROR-CODE` reason `<= 509 B` encode / `<= 763 B` decode). Note: `long_term_key_md5` and `long_term_key_sha256` expect passwords already normalized via RFC 8265 OpaqueString / SASLprep.
   - RFC 8489 §14.7 `FINGERPRINT` (`CRC-32 XOR 0x5354554E`) verification and signing.
   - Passes all four **RFC 5769 official test vectors** (§2.1 Sample Request, §2.2 IPv4 Response, §2.3 IPv6 Response, §2.4 Long-Term Credentials including byte-for-byte re-encoding).
 - **Defensive `DecodeLimits`**:
+  - Default `max_message_bytes = 65552` (RFC 8489 §5 maximum legal 20B header + 65532B body), `max_attributes = 64`, `max_attribute_bytes = 4096`.
   - Any negative limit (`max_message_bytes < 0`, `max_attributes < 0`, `max_attribute_bytes < 0`) is immediately rejected with `StunError::InvalidLimits`.
   - `0` strictly means 0 allowed (e.g., `max_attributes == 0` accepts 0-attribute packets and rejects any packet with `>= 1` attribute).
 - **RFC 7983 Demux**:
   - `is_stun_packet(data)` quickly distinguishes STUN (`0..3` + Magic Cookie + length) from DTLS (`20..63`) and RTP/RTCP (`128..191`) on multiplexed WebRTC UDP sockets.
 - **RFC 8445 Sans-IO ICE State Machine (`IceAgent`)**:
-  - `compute_candidate_priority(type_pref, local_pref, component_id)` (§5.1.2.1) and `compute_pair_priority(controlling_prio, controlled_prio)` (§6.1.2.3).
-  - Local/remote candidate management, pair formation, deduplication, descending priority sorting, `Waiting -> InProgress -> Succeeded / Failed` transitions, regular and aggressive nomination (`USE-CANDIDATE`), inbound Binding Request authentication & Binding Success Response generation with `XOR-MAPPED-ADDRESS`.
+  - `compute_candidate_priority(type_pref, local_pref, component_id)` (§5.1.2.1) and `compute_pair_priority(controlling_prio, controlled_prio)` (§6.1.2.3, computed in `UInt64` with overflow saturation and remote priority range validation `1..2^31-1`).
+  - Bounded checklist (`max_candidates = 100`, `max_pairs = 100` by default, configurable via `set_limits`), append-only stable `pair_idx` across trickle-ICE and role switches, RFC 8445 §7.3.1.1 role-conflict `487 Role Conflict` handling, `400 Bad Request` for missing `PRIORITY`/`ICE-CONTROL*`, `420 Unknown Attribute` for unknown comprehension-required attributes (`< 0x8000`), required `FINGERPRINT`, RFC 8445 §7.2.5.2.1 symmetric response source verification, multi-homed `handle_inbound_on(packet, local_addr, from_addr)` with RFC 8445 §7.3.1.5 triggered-check nomination and peer-reflexive candidate discovery, and SHA-256-mixed / caller-injectable 96-bit transaction IDs.
 
 ## Public API Summary
 
@@ -71,7 +73,7 @@ sh scripts/verify.sh --allow-dirty packages/stun
 
 ### 4-Mode `wasm_smoke` Verification
 
-All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`) exit `0` with identical stdout SHA-256 (`d027b13e7d5347a88e54e515425364eb398397b135b8571dbb4fa3fd2d5d40eb`):
+All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`) exit `0` with identical stdout SHA-256 (`b2aac32bb626aff1becd2bc9d0348d0a04de7bc2f88a9f5ed1c05dbb3f2cd523`):
 
 ```sh
 pionc run packages/stun/wasm_smoke
@@ -88,5 +90,5 @@ All 100,000 encoded wire packets and all decoded/verified checksums are verified
 
 | Workload | `pion` Median (`ns/op`) | `rust_webrtc_stun` Median (`ns/op`) | `pion` Peak RSS | `rust_webrtc_stun` Peak RSS | `pion` vs `rust_webrtc_stun` | Stdout SHA-256 (Identical) |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Encode + Sign (`MI` + `FP`, 100k pkts) | 239.998 ms (`2399.98 ns/op`) | 156.428 ms (`1564.28 ns/op`) | 1.84 MiB | 2.06 MiB | **0.65x** | `eb1d673bb93fca8f...` |
-| Decode + Verify `FP` + Verify `MI` (100k pkts) | 199.714 ms (`1997.14 ns/op`) | 122.517 ms (`1225.17 ns/op`) | 1.88 MiB | 2.11 MiB | **0.61x** | `2739a0786b801d32...` |
+| Encode + Sign (`MI` + `FP`, 100k pkts) | 331.526 ms (`3315.26 ns/op`) | 198.978 ms (`1989.78 ns/op`) | 1.86 MiB | 2.08 MiB | **0.60x** | `eb1d673bb93fca8f...` |
+| Decode + Verify `FP` + Verify `MI` (100k pkts) | 368.555 ms (`3685.55 ns/op`) | 142.332 ms (`1423.31 ns/op`) | 1.89 MiB | 2.11 MiB | **0.39x** | `2739a0786b801d32...` |

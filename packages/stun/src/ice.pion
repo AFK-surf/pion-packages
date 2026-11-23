@@ -1,5 +1,16 @@
 ///| RFC 8445 ICE candidate priority, pair priority, and Sans-IO IceAgent state machine.
 
+import "crypto"
+
+///|
+pub let ice_default_max_candidates : Int = 100
+
+///|
+pub let ice_default_max_pairs : Int = 100
+
+///| RFC 8445 §5.3 minimum ice-pwd length (128 bits = 22 base64/ice-char characters)
+pub let ice_min_pwd_len : Int = 22
+
 ///| RFC 8445 §5.1.2.1:
 ///| priority = (2^24)*(type_pref) + (2^8)*(local_pref) + (256 - component_id)
 pub fn compute_candidate_priority(
@@ -24,13 +35,24 @@ pub fn compute_candidate_priority(
 
 ///| RFC 8445 §6.1.2.3:
 ///| pair priority = 2^32 * MIN(G, D) + 2 * MAX(G, D) + (G > D ? 1 : 0)
+///| Computed in UInt64 to prevent Int64 overflow; saturates to Int64::MAX for
+///| out-of-spec inputs >= 2^31 while remaining exact for all RFC-legal 1..2^31-1 priorities.
 pub fn compute_pair_priority(controlling_prio : UInt, controlled_prio : UInt) -> Int64 {
-  let g = controlling_prio.to_int64()
-  let d = controlled_prio.to_int64()
+  let g : UInt64 = controlling_prio.to_int64().to_uint64()
+  let d : UInt64 = controlled_prio.to_int64().to_uint64()
   let mn = if g < d { g } else { d }
   let mx = if g > d { g } else { d }
-  let tie = if g > d { 1L } else { 0L }
-  (mn << 32) + (mx << 1) + tie
+  let tie = if g > d { 1UL } else { 0UL }
+  if mn >= 0x80000000UL {
+    return 0x7FFFFFFFFFFFFFFFL
+  }
+  let base = mn << 32
+  let add = (mx << 1) + tie
+  if base > 0x7FFFFFFFFFFFFFFFUL - add {
+    0x7FFFFFFFFFFFFFFFL
+  } else {
+    (base + add).to_int64()
+  }
 }
 
 ///|
@@ -50,6 +72,21 @@ fn ice_bytes_eq(a : Bytes, b : Bytes) -> Bool {
   let mut i = 0
   while i < a.length() {
     if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn ice_starts_with(s : String, p : String) -> Bool {
+  if s.length() < p.length() {
+    return false
+  }
+  let mut i = 0
+  while i < p.length() {
+    if s.code_unit_at(i) != p.code_unit_at(i) {
       return false
     }
     i = i + 1
@@ -78,7 +115,29 @@ pub fn IceAgent::new(
     pairs: [],
     tx_counter: 1UL,
     nominated_pair_idx: None,
+    max_candidates: ice_default_max_candidates,
+    max_pairs: ice_default_max_pairs,
+    tx_seed: Bytes::new(0),
   }
+}
+
+///| Configure checklist and candidate caps (RFC 8445 §6.1.2.5 / §14).
+pub fn IceAgent::set_limits(
+  self : IceAgent,
+  max_candidates : Int,
+  max_pairs : Int,
+) -> Result[Unit, StunError] {
+  if max_candidates < 0 || max_pairs < 0 {
+    return Err(StunError::InvalidLimits("ICE limits must be >= 0"))
+  }
+  self.max_candidates = max_candidates
+  self.max_pairs = max_pairs
+  Ok(())
+}
+
+///| Inject caller-provided CSPRNG entropy seed for 96-bit transaction ID derivation (RFC 8489 §6).
+pub fn IceAgent::set_tx_seed(self : IceAgent, seed : Bytes) -> Unit {
+  self.tx_seed = seed
 }
 
 ///|
@@ -92,19 +151,36 @@ pub fn IceAgent::set_remote_credentials(
 }
 
 ///|
-fn ice_sort_pairs_desc(pairs : Array[CandidatePair]) -> Unit {
-  let n = pairs.length()
-  let mut i = 1
-  while i < n {
-    let cur = pairs[i]
-    let mut j = i - 1
-    while j >= 0 && pairs[j].priority < cur.priority {
-      pairs[j + 1] = pairs[j]
-      j = j - 1
+fn ice_recompute_pair_priorities(self : IceAgent) -> Unit {
+  let mut i = 0
+  while i < self.pairs.length() {
+    let p = self.pairs[i]
+    let lc = self.local_candidates[p.local_idx]
+    let rc = self.remote_candidates[p.remote_idx]
+    let new_prio = match self.role {
+      IceRole::Controlling => compute_pair_priority(lc.priority, rc.priority)
+      IceRole::Controlled => compute_pair_priority(rc.priority, lc.priority)
     }
-    pairs[j + 1] = cur
+    self.pairs[i] = CandidatePair::{
+      local_idx: p.local_idx,
+      remote_idx: p.remote_idx,
+      priority: new_prio,
+      state: p.state,
+      nominated: p.nominated,
+      last_tx_id: p.last_tx_id,
+      mapped_addr: p.mapped_addr,
+    }
     i = i + 1
   }
+}
+
+///|
+fn ice_switch_role(self : IceAgent) -> Unit {
+  self.role = match self.role {
+    IceRole::Controlling => IceRole::Controlled
+    IceRole::Controlled => IceRole::Controlling
+  }
+  ice_recompute_pair_priorities(self)
 }
 
 ///|
@@ -119,8 +195,12 @@ fn ice_has_pair(pairs : Array[CandidatePair], local_idx : Int, remote_idx : Int)
   false
 }
 
-///|
+///| Append-only pair formation: never reorders `self.pairs` so pair indices stay permanently stable
+///| across trickle-ICE additions and role switches (P1-4), and strictly enforces `max_pairs` (P1-5).
 fn ice_form_pairs_for(self : IceAgent, local_idx : Int, remote_idx : Int) -> Unit {
+  if self.pairs.length() >= self.max_pairs {
+    return
+  }
   let lc = self.local_candidates[local_idx]
   let rc = self.remote_candidates[remote_idx]
   if lc.component_id != rc.component_id || !same_addr_family(lc.addr, rc.addr) {
@@ -142,7 +222,6 @@ fn ice_form_pairs_for(self : IceAgent, local_idx : Int, remote_idx : Int) -> Uni
     last_tx_id: Bytes::new(0),
     mapped_addr: None,
   })
-  ice_sort_pairs_desc(self.pairs)
 }
 
 ///|
@@ -154,6 +233,9 @@ pub fn IceAgent::add_local_candidate(
   cand_type : CandidateType,
   local_pref : Int,
 ) -> Result[Int, StunError] {
+  if self.local_candidates.length() >= self.max_candidates {
+    return Err(StunError::LimitExceeded("local candidate limit exceeded"))
+  }
   let prio = match compute_candidate_priority(candidate_type_pref(cand_type), local_pref, component_id) {
     Ok(p) => p
     Err(e) => return Err(e)
@@ -167,7 +249,7 @@ pub fn IceAgent::add_local_candidate(
     priority: prio,
   })
   let mut r = 0
-  while r < self.remote_candidates.length() {
+  while r < self.remote_candidates.length() && self.pairs.length() < self.max_pairs {
     ice_form_pairs_for(self, idx, r)
     r = r + 1
   }
@@ -186,6 +268,13 @@ pub fn IceAgent::add_remote_candidate(
   if component_id < 1 || component_id > 256 {
     return Err(StunError::IceError("component_id must be in 1..256"))
   }
+  // RFC 8445 §5.1.2: candidate priority MUST be in 1..2^31-1 (P2-6)
+  if priority == 0U || priority > 0x7FFFFFFFU {
+    return Err(StunError::IceError("remote candidate priority must be in 1..2^31-1"))
+  }
+  if self.remote_candidates.length() >= self.max_candidates {
+    return Err(StunError::LimitExceeded("remote candidate limit exceeded"))
+  }
   let idx = self.remote_candidates.length()
   self.remote_candidates.push(IceCandidate::{
     foundation: foundation,
@@ -195,25 +284,32 @@ pub fn IceAgent::add_remote_candidate(
     priority: priority,
   })
   let mut l = 0
-  while l < self.local_candidates.length() {
+  while l < self.local_candidates.length() && self.pairs.length() < self.max_pairs {
     ice_form_pairs_for(self, l, idx)
     l = l + 1
   }
   Ok(idx)
 }
 
-///|
+///| Derive a non-predictable 96-bit transaction ID by SHA-256 hashing secret local credentials,
+///| optional caller CSPRNG seed, tie-breaker, and monotonic 64-bit counter (P2-5).
 fn ice_next_tx_id(self : IceAgent) -> Bytes {
   let seq = self.tx_counter
   self.tx_counter = seq + 1UL
-  let mut tx = Bytes::new(12)
-  let tb_hi = ((self.tie_breaker >> 32) & 0xFFFFFFFFUL).to_int().to_uint()
-  let tb_lo = (self.tie_breaker & 0xFFFFFFFFUL).to_int().to_uint()
-  let s_lo = (seq & 0xFFFFFFFFUL).to_int().to_uint()
-  write_u32_be(tx, 0, tb_hi)
-  write_u32_be(tx, 4, tb_lo)
-  write_u32_be(tx, 8, s_lo)
-  tx
+  let h = crypto::Sha256::new()
+  h.update(string_to_utf8_bytes("pion-stun-txid-v1:"))
+  h.update(string_to_utf8_bytes(self.local_ufrag))
+  h.update(string_to_utf8_bytes(":"))
+  h.update(string_to_utf8_bytes(self.local_pwd))
+  if self.tx_seed.length() > 0 {
+    h.update(self.tx_seed)
+  }
+  let ctr = Bytes::new(16)
+  write_u64_be(ctr, 0, self.tie_breaker)
+  write_u64_be(ctr, 8, seq)
+  h.update(ctr)
+  let digest = h.finalize()
+  slice_bytes(digest, 0, 12)
 }
 
 ///|
@@ -221,17 +317,29 @@ fn ice_build_check_request(
   self : IceAgent,
   pair_idx : Int,
   use_candidate : Bool,
+  tx_id_override : Option[Bytes],
 ) -> Result[IceCheckPacket, StunError] {
-  if self.remote_ufrag.length() == 0 || self.remote_pwd.length() == 0 {
-    return Err(StunError::IceError("remote credentials not set"))
+  if self.local_ufrag.length() == 0 || self.local_pwd.length() < ice_min_pwd_len {
+    return Err(StunError::IceError("invalid local ICE credentials (ice-pwd must be >= 22 chars)"))
+  }
+  if self.remote_ufrag.length() == 0 || self.remote_pwd.length() < ice_min_pwd_len {
+    return Err(StunError::IceError("invalid remote ICE credentials (ice-pwd must be >= 22 chars)"))
   }
   if pair_idx < 0 || pair_idx >= self.pairs.length() {
     return Err(StunError::IceError("pair_idx out of range"))
   }
+  let tx_id = match tx_id_override {
+    Some(t) => {
+      if t.length() != 12 {
+        return Err(StunError::InvalidInput("transaction_id must be 12 bytes"))
+      }
+      t
+    }
+    None => ice_next_tx_id(self)
+  }
   let pair = self.pairs[pair_idx]
   let lc = self.local_candidates[pair.local_idx]
   let rc = self.remote_candidates[pair.remote_idx]
-  let tx_id = ice_next_tx_id(self)
 
   let msg = Message::new(MessageClass::Request, MessageMethod::Binding, tx_id)
   msg.add(Attribute::Username(self.remote_ufrag + ":" + self.local_ufrag))
@@ -265,20 +373,55 @@ fn ice_build_check_request(
   })
 }
 
-///| Pop the highest-priority Waiting candidate pair and emit its signed STUN Binding Request.
+///| Select the highest-priority Waiting candidate pair and emit its signed STUN Binding Request.
 pub fn IceAgent::next_check(self : IceAgent) -> Result[Option[IceCheckPacket], StunError] {
+  let mut best_idx = -1
+  let mut best_prio = -1L
   let mut i = 0
   while i < self.pairs.length() {
     if pair_state_eq(self.pairs[i].state, PairState::Waiting) {
-      let use_cand = ice_role_eq(self.role, IceRole::Controlling) && self.aggressive_nomination
-      match ice_build_check_request(self, i, use_cand) {
-        Ok(pkt) => return Ok(Some(pkt))
-        Err(e) => return Err(e)
+      if best_idx < 0 || self.pairs[i].priority > best_prio {
+        best_idx = i
+        best_prio = self.pairs[i].priority
       }
     }
     i = i + 1
   }
-  Ok(None)
+  if best_idx < 0 {
+    return Ok(None)
+  }
+  let use_cand = ice_role_eq(self.role, IceRole::Controlling) && self.aggressive_nomination
+  match ice_build_check_request(self, best_idx, use_cand, None) {
+    Ok(pkt) => Ok(Some(pkt))
+    Err(e) => Err(e)
+  }
+}
+
+///| Same as `next_check` but uses caller-supplied 96-bit CSPRNG `tx_id` (RFC 8489 §6).
+pub fn IceAgent::next_check_with_tx_id(
+  self : IceAgent,
+  tx_id : Bytes,
+) -> Result[Option[IceCheckPacket], StunError] {
+  let mut best_idx = -1
+  let mut best_prio = -1L
+  let mut i = 0
+  while i < self.pairs.length() {
+    if pair_state_eq(self.pairs[i].state, PairState::Waiting) {
+      if best_idx < 0 || self.pairs[i].priority > best_prio {
+        best_idx = i
+        best_prio = self.pairs[i].priority
+      }
+    }
+    i = i + 1
+  }
+  if best_idx < 0 {
+    return Ok(None)
+  }
+  let use_cand = ice_role_eq(self.role, IceRole::Controlling) && self.aggressive_nomination
+  match ice_build_check_request(self, best_idx, use_cand, Some(tx_id)) {
+    Ok(pkt) => Ok(Some(pkt))
+    Err(e) => Err(e)
+  }
 }
 
 ///| Regular nomination (Controlling role): send Binding Request with USE-CANDIDATE for `pair_idx`.
@@ -289,7 +432,7 @@ pub fn IceAgent::nominate_pair(
   if !ice_role_eq(self.role, IceRole::Controlling) {
     return Err(StunError::IceError("only Controlling agent may nominate a pair"))
   }
-  ice_build_check_request(self, pair_idx, true)
+  ice_build_check_request(self, pair_idx, true, None)
 }
 
 ///|
@@ -302,12 +445,87 @@ pub fn IceAgent::mark_pair_failed(self : IceAgent, pair_idx : Int) -> Result[Uni
 }
 
 ///|
+fn ice_send_error_response(
+  tx_id : Bytes,
+  code : Int,
+  reason : String,
+  unknown_attrs : Option[Array[Int]],
+  local_key : Bytes,
+  from_addr : SocketAddr,
+) -> Result[IceInboundResult, StunError] {
+  let resp = Message::new(MessageClass::ErrorResponse, MessageMethod::Binding, tx_id)
+  resp.add(Attribute::ErrorCode(ErrorCode::new(code, reason)))
+  match unknown_attrs {
+    Some(list) => resp.add(Attribute::UnknownAttributes(list))
+    None => ()
+  }
+  match encode_message_signed(resp, Some(local_key), false, true) {
+    Ok(w) => Ok(IceInboundResult::SendResponse(w, from_addr))
+    Err(e) => Err(e)
+  }
+}
+
+///|
+fn ice_find_or_add_pair_for_inbound(
+  self : IceAgent,
+  local_addr : Option[SocketAddr],
+  from_addr : SocketAddr,
+  peer_priority : UInt,
+) -> Option[Int] {
+  match local_addr {
+    None => None
+    Some(laddr) => {
+      let mut p = 0
+      while p < self.pairs.length() {
+        let lc = self.local_candidates[self.pairs[p].local_idx]
+        let rc = self.remote_candidates[self.pairs[p].remote_idx]
+        if socket_addr_eq(lc.addr, laddr) && socket_addr_eq(rc.addr, from_addr) {
+          return Some(p)
+        }
+        p = p + 1
+      }
+      // RFC 8445 §7.3.1.3: discover Peer-Reflexive remote candidate if unknown
+      let mut lidx = -1
+      let mut l = 0
+      while l < self.local_candidates.length() {
+        if socket_addr_eq(self.local_candidates[l].addr, laddr) {
+          lidx = l
+          break
+        }
+        l = l + 1
+      }
+      if lidx < 0 {
+        return None
+      }
+      let comp = self.local_candidates[lidx].component_id
+      let ridx = match self.add_remote_candidate("prflx", comp, from_addr, CandidateType::PeerReflexive, peer_priority) {
+        Ok(i) => i
+        Err(_) => return None
+      }
+      let mut q = 0
+      while q < self.pairs.length() {
+        if self.pairs[q].local_idx == lidx && self.pairs[q].remote_idx == ridx {
+          return Some(q)
+        }
+        q = q + 1
+      }
+      None
+    }
+  }
+}
+
+///|
 fn ice_handle_binding_request(
   self : IceAgent,
   packet : Bytes,
   msg : Message,
+  local_addr : Option[SocketAddr],
   from_addr : SocketAddr,
 ) -> Result[IceInboundResult, StunError] {
+  // P2-7: reject empty or short local ice-pwd (RFC 8445 §5.3)
+  if self.local_ufrag.length() == 0 || self.local_pwd.length() < ice_min_pwd_len {
+    return Err(StunError::IceError("invalid local ICE credentials (ice-pwd must be >= 22 chars)"))
+  }
   let local_key = string_to_utf8_bytes(self.local_pwd)
   match verify_message_integrity(packet, local_key) {
     Ok(true) => ()
@@ -315,19 +533,41 @@ fn ice_handle_binding_request(
     Err(e) => return Err(e)
   }
 
-  let expected_user = self.local_ufrag + ":" + self.remote_ufrag
+  let prefix = self.local_ufrag + ":"
+  let expected_user = prefix + self.remote_ufrag
   let mut saw_user = false
   let mut has_use_candidate = false
+  let mut peer_priority : Option[UInt] = None
+  let mut peer_controlling : Option[UInt64] = None
+  let mut peer_controlled : Option[UInt64] = None
+  let unknown_req : Array[Int] = []
+
   let mut i = 0
   while i < msg.attributes.length() {
     match msg.attributes[i] {
       Attribute::Username(u) => {
-        if self.remote_ufrag.length() > 0 && u != expected_user {
-          return Err(StunError::IceError("unexpected ICE USERNAME: " + u))
+        // P2-8: always verify local_ufrag + ":" prefix even before remote_ufrag is known
+        if self.remote_ufrag.length() > 0 {
+          if u != expected_user {
+            return Err(StunError::IceError("unexpected ICE USERNAME: " + u))
+          }
+        } else {
+          if !ice_starts_with(u, prefix) || u.length() <= prefix.length() {
+            return Err(StunError::IceError("ICE USERNAME missing local_ufrag prefix: " + u))
+          }
         }
         saw_user = true
       }
+      Attribute::Priority(p) => peer_priority = Some(p)
+      Attribute::IceControlling(tb) => peer_controlling = Some(tb)
+      Attribute::IceControlled(tb) => peer_controlled = Some(tb)
       Attribute::UseCandidate => has_use_candidate = true
+      Attribute::Unknown(t, _) => {
+        // P2-2: comprehension-required unknown attributes (< 0x8000)
+        if t < 0x8000 {
+          unknown_req.push(t)
+        }
+      }
       _ => ()
     }
     i = i + 1
@@ -336,17 +576,97 @@ fn ice_handle_binding_request(
     return Err(StunError::IceError("inbound ICE Binding Request missing USERNAME"))
   }
 
-  if has_use_candidate && ice_role_eq(self.role, IceRole::Controlled) {
-    let mut p = 0
-    while p < self.pairs.length() {
-      let rc = self.remote_candidates[self.pairs[p].remote_idx]
-      if socket_addr_eq(rc.addr, from_addr) {
-        self.pairs[p].nominated = true
-        self.pairs[p].state = PairState::Succeeded
-        self.nominated_pair_idx = Some(p)
-        break
+  // P2-2: RFC 8489 §6.3.1 -> 420 Unknown Attribute + UNKNOWN-ATTRIBUTES
+  if unknown_req.length() > 0 {
+    return ice_send_error_response(
+      msg.transaction_id,
+      420,
+      "Unknown Attribute",
+      Some(unknown_req),
+      local_key,
+      from_addr,
+    )
+  }
+
+  // P2-1: RFC 8445 §7.1.1-7.1.3 / §7.3 -> PRIORITY and exactly one role attr required -> 400
+  let prio_val = match peer_priority {
+    Some(p) => p
+    None => {
+      return ice_send_error_response(
+        msg.transaction_id,
+        400,
+        "Bad Request",
+        None,
+        local_key,
+        from_addr,
+      )
+    }
+  }
+  let has_ctl = match peer_controlling {
+    Some(_) => true
+    None => false
+  }
+  let has_ced = match peer_controlled {
+    Some(_) => true
+    None => false
+  }
+  if (has_ctl && has_ced) || (!has_ctl && !has_ced) {
+    return ice_send_error_response(
+      msg.transaction_id,
+      400,
+      "Bad Request",
+      None,
+      local_key,
+      from_addr,
+    )
+  }
+
+  // P1-2: RFC 8445 §7.3.1.1 Role Conflict resolution (64-bit unsigned tie-breaker)
+  match (self.role, peer_controlling, peer_controlled) {
+    (IceRole::Controlling, Some(peer_tb), _) => {
+      if self.tie_breaker >= peer_tb {
+        return ice_send_error_response(
+          msg.transaction_id,
+          487,
+          "Role Conflict",
+          None,
+          local_key,
+          from_addr,
+        )
+      } else {
+        ice_switch_role(self)
       }
-      p = p + 1
+    }
+    (IceRole::Controlled, _, Some(peer_tb)) => {
+      if self.tie_breaker >= peer_tb {
+        ice_switch_role(self)
+      } else {
+        return ice_send_error_response(
+          msg.transaction_id,
+          487,
+          "Role Conflict",
+          None,
+          local_key,
+          from_addr,
+        )
+      }
+    }
+    _ => ()
+  }
+
+  // P1-3: RFC 8445 §7.3.1.4 / §7.3.1.5 Controlled nomination & triggered check:
+  // Match by (local_addr, remote_addr); NEVER mark Succeeded without our own check!
+  if has_use_candidate && ice_role_eq(self.role, IceRole::Controlled) {
+    match ice_find_or_add_pair_for_inbound(self, local_addr, from_addr, prio_val) {
+      Some(pidx) => {
+        self.pairs[pidx].nominated = true
+        if pair_state_eq(self.pairs[pidx].state, PairState::Succeeded) {
+          self.nominated_pair_idx = Some(pidx)
+        } else if pair_state_eq(self.pairs[pidx].state, PairState::Frozen) {
+          self.pairs[pidx].state = PairState::Waiting
+        }
+      }
+      None => ()
     }
   }
 
@@ -364,8 +684,12 @@ fn ice_handle_binding_response(
   self : IceAgent,
   packet : Bytes,
   msg : Message,
+  from_addr : SocketAddr,
   is_error : Bool,
 ) -> Result[IceInboundResult, StunError] {
+  if self.remote_pwd.length() < ice_min_pwd_len {
+    return Err(StunError::IceError("invalid remote ICE credentials"))
+  }
   let remote_key = string_to_utf8_bytes(self.remote_pwd)
   match verify_message_integrity(packet, remote_key) {
     Ok(true) => ()
@@ -376,7 +700,8 @@ fn ice_handle_binding_response(
   let mut pair_idx = -1
   let mut p = 0
   while p < self.pairs.length() {
-    if ice_bytes_eq(self.pairs[p].last_tx_id, msg.transaction_id) {
+    if self.pairs[p].last_tx_id.length() == 12 &&
+    ice_bytes_eq(self.pairs[p].last_tx_id, msg.transaction_id) {
       pair_idx = p
       break
     }
@@ -384,6 +709,28 @@ fn ice_handle_binding_response(
   }
   if pair_idx < 0 {
     return Ok(IceInboundResult::Ignored("unknown transaction_id"))
+  }
+
+  // P2-3: RFC 8445 §7.2.5.2.1 symmetric source address check
+  let expected_remote = self.remote_candidates[self.pairs[pair_idx].remote_idx].addr
+  if !socket_addr_eq(from_addr, expected_remote) {
+    self.pairs[pair_idx].state = PairState::Failed
+    return Ok(IceInboundResult::PairFailed(pair_idx, 0))
+  }
+
+  // P2-2: fail transaction if response carries unknown comprehension-required attribute
+  let mut u = 0
+  while u < msg.attributes.length() {
+    match msg.attributes[u] {
+      Attribute::Unknown(t, _) => {
+        if t < 0x8000 {
+          self.pairs[pair_idx].state = PairState::Failed
+          return Ok(IceInboundResult::PairFailed(pair_idx, 420))
+        }
+      }
+      _ => ()
+    }
+    u = u + 1
   }
 
   if is_error {
@@ -398,6 +745,13 @@ fn ice_handle_binding_response(
         _ => ()
       }
       i = i + 1
+    }
+    // P1-2: RFC 8445 §7.2.5.1 on 487 Role Conflict, switch role and re-queue pair
+    if err_code == 487 {
+      ice_switch_role(self)
+      self.pairs[pair_idx].state = PairState::Waiting
+      self.pairs[pair_idx].last_tx_id = Bytes::new(0)
+      return Ok(IceInboundResult::Ignored("role conflict 487: switched role and requeued"))
     }
     self.pairs[pair_idx].state = PairState::Failed
     return Ok(IceInboundResult::PairFailed(pair_idx, err_code))
@@ -424,16 +778,17 @@ fn ice_handle_binding_response(
   Ok(IceInboundResult::PairSucceeded(pair_idx, mapped))
 }
 
-///| Process an inbound STUN packet in Sans-IO fashion.
-pub fn IceAgent::handle_inbound(
+///|
+fn ice_process_inbound(
   self : IceAgent,
   packet : Bytes,
+  local_addr : Option[SocketAddr],
   from_addr : SocketAddr,
 ) -> Result[IceInboundResult, StunError] {
   if !is_stun_packet(packet) {
     return Ok(IceInboundResult::Ignored("not a STUN packet"))
   }
-  // If FINGERPRINT is present, it must be valid
+  // P2-4: RFC 8445 §7.2.2 ICE checks & responses MUST carry a valid FINGERPRINT
   match find_attr_offset(packet, attr_fingerprint) {
     Ok(Some(_)) => {
       match verify_fingerprint(packet) {
@@ -442,7 +797,7 @@ pub fn IceAgent::handle_inbound(
         Err(e) => return Err(e)
       }
     }
-    Ok(None) => ()
+    Ok(None) => return Err(StunError::FingerprintMismatch("missing required STUN FINGERPRINT"))
     Err(e) => return Err(e)
   }
 
@@ -455,11 +810,37 @@ pub fn IceAgent::handle_inbound(
   }
 
   match msg.msg_class {
-    MessageClass::Request => ice_handle_binding_request(self, packet, msg, from_addr)
-    MessageClass::SuccessResponse => ice_handle_binding_response(self, packet, msg, false)
-    MessageClass::ErrorResponse => ice_handle_binding_response(self, packet, msg, true)
+    MessageClass::Request => ice_handle_binding_request(self, packet, msg, local_addr, from_addr)
+    MessageClass::SuccessResponse => ice_handle_binding_response(self, packet, msg, from_addr, false)
+    MessageClass::ErrorResponse => ice_handle_binding_response(self, packet, msg, from_addr, true)
     MessageClass::Indication => Ok(IceInboundResult::Ignored("Binding Indication"))
   }
+}
+
+///| Process an inbound STUN packet received on a specific `local_addr` socket (RFC 8445 §7.3.1.4).
+pub fn IceAgent::handle_inbound_on(
+  self : IceAgent,
+  packet : Bytes,
+  local_addr : SocketAddr,
+  from_addr : SocketAddr,
+) -> Result[IceInboundResult, StunError] {
+  ice_process_inbound(self, packet, Some(local_addr), from_addr)
+}
+
+///| Process an inbound STUN packet in Sans-IO fashion.
+///| When the agent has a single local candidate, it is used as the receiving local address;
+///| multi-homed agents should call `handle_inbound_on(packet, local_addr, from_addr)`.
+pub fn IceAgent::handle_inbound(
+  self : IceAgent,
+  packet : Bytes,
+  from_addr : SocketAddr,
+) -> Result[IceInboundResult, StunError] {
+  let laddr = if self.local_candidates.length() == 1 {
+    Some(self.local_candidates[0].addr)
+  } else {
+    None
+  }
+  ice_process_inbound(self, packet, laddr, from_addr)
 }
 
 ///| Return the currently nominated & succeeded candidate pair (if any).
