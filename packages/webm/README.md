@@ -55,6 +55,8 @@ pub fn parse_init_segment(data : Bytes, limits : DecodeLimits) -> Result[WebmIni
 pub fn parse_media_segment(init : WebmInitSegment, data : Bytes, limits : DecodeLimits) -> Result[WebmMediaSegment, WebmError]
 pub fn probe_codec_string(track : TrackEntry) -> String
 pub fn find_keyframe_at(frames : Array[Frame], track_number : Int64, target_pts_ms : Int64) -> Option[Int]
+pub fn build_keyframe_index(frames : Array[Frame], track_number : Int64) -> KeyframeIndex
+pub fn KeyframeIndex::find_at(self : KeyframeIndex, target_pts_ms : Int64) -> Option[Int]
 ```
 
 ## Verification
@@ -80,7 +82,7 @@ Run via `sh packages/webm/bench/run_bench.sh` against pure-Rust **`matroska-demu
 
 | Workload | `pion` Median (Throughput) | `rust_matroska` Median (Throughput) | `pion` Peak RSS | `rust_matroska` Peak RSS | `pion` vs `rust_matroska` | Stdout SHA-256 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| VP9 + Opus 12s WebM (563 KB × 200) | 24.451 ms (4605.45 MB/s) | 24.594 ms (4578.76 MB/s) | 3.33 MiB | 2.84 MiB | **1.01x** | `63ce66873b5cadea...` |
-| Pure Opus 60s Audio WebM (959 KB × 200) | 54.309 ms (3529.84 MB/s) | 36.656 ms (5229.74 MB/s) | 4.20 MiB | 3.30 MiB | **0.68x** | `265c035f8bbcce75...` |
-| AV1 + Opus 10s WebM (360 KB × 200) | 21.613 ms (3331.08 MB/s) | 19.398 ms (3711.39 MB/s) | 2.91 MiB | 2.59 MiB | **0.90x** | `5b30808c7978885e...` |
-| YouTube MSE Init + Clusters (562 KB × 200) | 22.859 ms (4920.87 MB/s) | 22.103 ms (5089.19 MB/s) | 3.33 MiB | 3.30 MiB | **0.97x** | `90ce627eec08617d...` |
+| VP9 + Opus 12s WebM (563 KB × 200) | 12.852 ms (8761.93 MB/s) | 21.545 ms (5226.74 MB/s) | 3.39 MiB | 2.86 MiB | **1.68x** | `63ce66873b5cadea...` |
+| Pure Opus 60s Audio WebM (959 KB × 200) | 17.994 ms (10653.33 MB/s) | 31.679 ms (6051.33 MB/s) | 4.25 MiB | 3.31 MiB | **1.76x** | `265c035f8bbcce75...` |
+| AV1 + Opus 10s WebM (360 KB × 200) | 13.200 ms (5454.25 MB/s) | 19.635 ms (3666.69 MB/s) | 2.97 MiB | 2.59 MiB | **1.49x** | `5b30808c7978885e...` |
+| YouTube MSE Init + Clusters (562 KB × 200) | 13.249 ms (8490.17 MB/s) | 20.020 ms (5618.56 MB/s) | 3.39 MiB | 3.30 MiB | **1.51x** | `90ce627eec08617d...` |
