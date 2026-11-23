@@ -189,6 +189,703 @@ fn is_proper_prefix(from : Array[String], path : Array[String]) -> Bool {
   true
 }
 
+fn check_ptr_depth(
+  ptr : JsonPointer,
+  limits : JsonPathLimits,
+) -> Result[Unit, JsonPathError] {
+  if ptr.tokens.length() > limits.max_depth {
+    return Err(
+      JsonPathError::new(
+        JsonPathErrorKind::LimitExceeded,
+        0,
+        "pointer depth exceeds max_depth",
+      ),
+    )
+  }
+  Ok(())
+}
+
+///| Count logical JSON nodes iteratively, stopping early once count > `limit`.
+///| Uses a zero-allocation tail-loop for single-child chains.
+fn count_nodes_bounded(root : JsonValue, limit : Int) -> Int {
+  let stack : Array[JsonValue] = []
+  let mut cur = root
+  let mut count = 0
+  while true {
+    count = count + 1
+    if count > limit {
+      return count
+    }
+    match cur {
+      JsonValue::Array(items) => {
+        let n = items.length()
+        if n == 1 {
+          cur = items[0]
+          continue
+        }
+        if n > 1 {
+          let mut i = n - 1
+          while i >= 1 {
+            stack.push(items[i])
+            i = i - 1
+          }
+          cur = items[0]
+          continue
+        }
+      }
+      JsonValue::Object(entries) => {
+        let n = entries.length()
+        if n == 1 {
+          let (_, v) = entries[0]
+          cur = v
+          continue
+        }
+        if n > 1 {
+          let mut i = n - 1
+          while i >= 1 {
+            let (_, v) = entries[i]
+            stack.push(v)
+            i = i - 1
+          }
+          let (_, v0) = entries[0]
+          cur = v0
+          continue
+        }
+      }
+      _ => ()
+    }
+    match stack.pop() {
+      Some(next) => cur = next
+      None => break
+    }
+  }
+  count
+}
+
+///| Resolve the existing value that an RFC 6902 `add` at `ptr` would overwrite (only for existing Object keys).
+fn resolve_overwritten_object_val(
+  ptr : JsonPointer,
+  doc : JsonValue,
+) -> Option[JsonValue] {
+  let total = ptr.tokens.length()
+  if total == 0 {
+    return Some(doc)
+  }
+  let mut cur = doc
+  let mut i = 0
+  while i + 1 < total {
+    let tok = ptr.tokens[i]
+    match cur {
+      JsonValue::Object(entries) => {
+        match json_object_get(entries, tok) {
+          Some(v) => cur = v
+          None => return Option::None
+        }
+      }
+      JsonValue::Array(items) => {
+        let idx = parse_pointer_array_index(tok)
+        if idx < 0 || idx >= items.length() {
+          return Option::None
+        }
+        cur = items[idx]
+      }
+      _ => return Option::None
+    }
+    i = i + 1
+  }
+  match cur {
+    JsonValue::Object(entries) => json_object_get(entries, ptr.tokens[total - 1])
+    _ => Option::None
+  }
+}
+
+// ============================================================================
+// Clone-on-Touch Mutable Working Tree for O(N) Atomic `apply_patch`
+// ============================================================================
+
+struct MutObjData {
+  entries : Array[(String, Option[WorkVal])]
+  mut idx_map : Option[Map[String, Int]]
+}
+
+enum WorkVal {
+  Frozen(JsonValue)
+  MutArr(Array[WorkVal])
+  MutObj(MutObjData)
+}
+
+fn mut_obj_find(data : MutObjData, key : String) -> Int {
+  match data.idx_map {
+    Some(m) => {
+      match m.get(key) {
+        Some(idx) => idx
+        None => -1
+      }
+    }
+    None => {
+      let mut i = data.entries.length() - 1
+      while i >= 0 {
+        let (k, v_opt) = data.entries[i]
+        if k == key {
+          match v_opt {
+            Some(_) => return i
+            None => return -1
+          }
+        }
+        i = i - 1
+      }
+      -1
+    }
+  }
+}
+
+fn mut_obj_ensure_map(data : MutObjData) -> Map[String, Int] {
+  match data.idx_map {
+    Some(m) => m
+    None => {
+      let m : Map[String, Int] = Map::new()
+      let mut i = 0
+      while i < data.entries.length() {
+        let (k, v_opt) = data.entries[i]
+        match v_opt {
+          Some(_) => m.set(k, i)
+          None => ()
+        }
+        i = i + 1
+      }
+      data.idx_map = Some(m)
+      m
+    }
+  }
+}
+
+fn mut_obj_set(data : MutObjData, key : String, v : WorkVal) -> Unit {
+  let idx = mut_obj_find(data, key)
+  if idx >= 0 {
+    data.entries[idx] = (key, Some(v))
+    return
+  }
+  let pos = data.entries.length()
+  data.entries.push((key, Some(v)))
+  match data.idx_map {
+    Some(m) => m.set(key, pos)
+    None => {
+      if data.entries.length() >= 16 {
+        let _ = mut_obj_ensure_map(data)
+      }
+    }
+  }
+}
+
+fn mut_obj_remove(data : MutObjData, key : String) -> Option[WorkVal] {
+  let idx = mut_obj_find(data, key)
+  if idx < 0 {
+    return Option::None
+  }
+  let (_, v_opt) = data.entries[idx]
+  data.entries[idx] = (key, Option::None)
+  match data.idx_map {
+    Some(m) => m.set(key, -1)
+    None => ()
+  }
+  v_opt
+}
+
+fn work_unfreeze_container(wv : WorkVal) -> WorkVal {
+  match wv {
+    WorkVal::Frozen(JsonValue::Array(items)) => {
+      let arr : Array[WorkVal] = []
+      let mut i = 0
+      while i < items.length() {
+        arr.push(WorkVal::Frozen(items[i]))
+        i = i + 1
+      }
+      WorkVal::MutArr(arr)
+    }
+    WorkVal::Frozen(JsonValue::Object(entries)) => {
+      let data = MutObjData::{ entries: [], idx_map: Option::None }
+      let mut i = 0
+      while i < entries.length() {
+        let (k, v) = entries[i]
+        mut_obj_set(data, k, WorkVal::Frozen(v))
+        i = i + 1
+      }
+      WorkVal::MutObj(data)
+    }
+    _ => wv
+  }
+}
+
+enum FreezeFrame {
+  Arr(Array[WorkVal], Array[JsonValue], Int)
+  Obj(Array[(String, Option[WorkVal])], Array[(String, JsonValue)], Int, String)
+}
+
+fn work_freeze(root : WorkVal) -> JsonValue {
+  let frames : Array[FreezeFrame] = []
+  let mut cur = root
+  let mut completed : Option[JsonValue] = Option::None
+  while true {
+    match completed {
+      None => {
+        match cur {
+          WorkVal::Frozen(v) => completed = Some(v)
+          WorkVal::MutArr(items) => {
+            if items.length() == 0 {
+              completed = Some(JsonValue::Array([]))
+            } else {
+              frames.push(FreezeFrame::Arr(items, [], 1))
+              cur = items[0]
+            }
+          }
+          WorkVal::MutObj(data) => {
+            let mut idx = 0
+            let n = data.entries.length()
+            let mut found = false
+            while idx < n {
+              let (k, v_opt) = data.entries[idx]
+              match v_opt {
+                Some(v) => {
+                  frames.push(FreezeFrame::Obj(data.entries, [], idx + 1, k))
+                  cur = v
+                  found = true
+                  break
+                }
+                None => idx = idx + 1
+              }
+            }
+            if !found {
+              completed = Some(JsonValue::Object([]))
+            }
+          }
+        }
+      }
+      Some(done_v) => {
+        if frames.length() == 0 {
+          return done_v
+        }
+        let top = match frames.pop() {
+          Some(f) => f
+          None => return done_v
+        }
+        match top {
+          FreezeFrame::Arr(src, dst, next_i) => {
+            dst.push(done_v)
+            if next_i < src.length() {
+              frames.push(FreezeFrame::Arr(src, dst, next_i + 1))
+              cur = src[next_i]
+              completed = Option::None
+            } else {
+              completed = Some(JsonValue::Array(dst))
+            }
+          }
+          FreezeFrame::Obj(src, dst, next_i, cur_key) => {
+            dst.push((cur_key, done_v))
+            let mut ni = next_i
+            let n = src.length()
+            let mut found = false
+            while ni < n {
+              let (nk, nv_opt) = src[ni]
+              match nv_opt {
+                Some(nv) => {
+                  frames.push(FreezeFrame::Obj(src, dst, ni + 1, nk))
+                  cur = nv
+                  completed = Option::None
+                  found = true
+                  break
+                }
+                None => ni = ni + 1
+              }
+            }
+            if !found {
+              completed = Some(JsonValue::Object(dst))
+            }
+          }
+        }
+      }
+    }
+  }
+  JsonValue::Null
+}
+
+fn work_resolve(root : WorkVal, tokens : Array[String]) -> Option[WorkVal] {
+  let mut cur = root
+  let mut i = 0
+  while i < tokens.length() {
+    let tok = tokens[i]
+    match cur {
+      WorkVal::Frozen(v) => {
+        let rem : Array[String] = []
+        let mut k = i
+        while k < tokens.length() {
+          rem.push(tokens[k])
+          k = k + 1
+        }
+        return match pointer_resolve_impl(JsonPointer::{ tokens: rem }, v) {
+          Some(found) => Some(WorkVal::Frozen(found))
+          None => Option::None
+        }
+      }
+      WorkVal::MutObj(data) => {
+        let idx = mut_obj_find(data, tok)
+        if idx < 0 {
+          return Option::None
+        }
+        let (_, v_opt) = data.entries[idx]
+        match v_opt {
+          Some(v) => cur = v
+          None => return Option::None
+        }
+      }
+      WorkVal::MutArr(items) => {
+        let idx = parse_pointer_array_index(tok)
+        if idx < 0 || idx >= items.length() {
+          return Option::None
+        }
+        cur = items[idx]
+      }
+    }
+    i = i + 1
+  }
+  Some(cur)
+}
+
+fn work_add(
+  root_in : WorkVal,
+  tokens : Array[String],
+  new_v : WorkVal,
+) -> Result[WorkVal, JsonPathError] {
+  let total = tokens.length()
+  if total == 0 {
+    return Ok(new_v)
+  }
+  let root = work_unfreeze_container(root_in)
+  let mut cur = root
+  let mut depth = 0
+  while depth + 1 < total {
+    let tok = tokens[depth]
+    match cur {
+      WorkVal::MutObj(data) => {
+        let idx = mut_obj_find(data, tok)
+        if idx < 0 {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PatchError,
+              0,
+              "parent object key not found: " + tok,
+            ),
+          )
+        }
+        let (k, v_opt) = data.entries[idx]
+        let child = match v_opt {
+          Some(v) => work_unfreeze_container(v)
+          None =>
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PatchError,
+              0,
+              "parent object key not found: " + tok,
+            ),
+          )
+        }
+        data.entries[idx] = (k, Some(child))
+        cur = child
+      }
+      WorkVal::MutArr(items) => {
+        let idx = parse_pointer_array_index(tok)
+        if idx < 0 || idx >= items.length() {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PatchError,
+              0,
+              "invalid parent array index: " + tok,
+            ),
+          )
+        }
+        let child = work_unfreeze_container(items[idx])
+        items[idx] = child
+        cur = child
+      }
+      _ =>
+      return Err(
+        JsonPathError::new(
+          JsonPathErrorKind::PatchError,
+          0,
+          "cannot add inside non-container at token: " + tok,
+        ),
+      )
+    }
+    depth = depth + 1
+  }
+  let tok = tokens[total - 1]
+  match cur {
+    WorkVal::MutObj(data) => {
+      mut_obj_set(data, tok, new_v)
+      Ok(root)
+    }
+    WorkVal::MutArr(items) => {
+      let n = items.length()
+      let insert_idx = if tok == "-" {
+        n
+      } else {
+        let idx = parse_pointer_array_index(tok)
+        if idx < 0 || idx > n {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PatchError,
+              0,
+              "invalid array add index: " + tok,
+            ),
+          )
+        }
+        idx
+      }
+      items.push(new_v)
+      let mut j = n
+      while j > insert_idx {
+        items[j] = items[j - 1]
+        j = j - 1
+      }
+      items[insert_idx] = new_v
+      Ok(root)
+    }
+    _ =>
+    Err(
+      JsonPathError::new(
+        JsonPathErrorKind::PatchError,
+        0,
+        "cannot add inside non-container at token: " + tok,
+      ),
+    )
+  }
+}
+
+fn work_replace(
+  root_in : WorkVal,
+  tokens : Array[String],
+  new_v : WorkVal,
+) -> Result[WorkVal, JsonPathError] {
+  let total = tokens.length()
+  if total == 0 {
+    return Ok(new_v)
+  }
+  let root = work_unfreeze_container(root_in)
+  let mut cur = root
+  let mut depth = 0
+  while depth + 1 < total {
+    let tok = tokens[depth]
+    match cur {
+      WorkVal::MutObj(data) => {
+        let idx = mut_obj_find(data, tok)
+        if idx < 0 {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PointerError,
+              0,
+              "target key not found: " + tok,
+            ),
+          )
+        }
+        let (k, v_opt) = data.entries[idx]
+        let child = match v_opt {
+          Some(v) => work_unfreeze_container(v)
+          None =>
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PointerError,
+              0,
+              "target key not found: " + tok,
+            ),
+          )
+        }
+        data.entries[idx] = (k, Some(child))
+        cur = child
+      }
+      WorkVal::MutArr(items) => {
+        let idx = parse_pointer_array_index(tok)
+        if idx < 0 || idx >= items.length() {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PointerError,
+              0,
+              "invalid or out-of-bounds array index: " + tok,
+            ),
+          )
+        }
+        let child = work_unfreeze_container(items[idx])
+        items[idx] = child
+        cur = child
+      }
+      _ =>
+      return Err(
+        JsonPathError::new(
+          JsonPathErrorKind::PointerError,
+          0,
+          "cannot traverse non-container at token: " + tok,
+        ),
+      )
+    }
+    depth = depth + 1
+  }
+  let tok = tokens[total - 1]
+  match cur {
+    WorkVal::MutObj(data) => {
+      let idx = mut_obj_find(data, tok)
+      if idx < 0 {
+        return Err(
+          JsonPathError::new(
+            JsonPathErrorKind::PointerError,
+            0,
+            "target key not found: " + tok,
+          ),
+        )
+      }
+      data.entries[idx] = (tok, Some(new_v))
+      Ok(root)
+    }
+    WorkVal::MutArr(items) => {
+      let idx = parse_pointer_array_index(tok)
+      if idx < 0 || idx >= items.length() {
+        return Err(
+          JsonPathError::new(
+            JsonPathErrorKind::PointerError,
+            0,
+            "invalid or out-of-bounds array index: " + tok,
+          ),
+        )
+      }
+      items[idx] = new_v
+      Ok(root)
+    }
+    _ =>
+    Err(
+      JsonPathError::new(
+        JsonPathErrorKind::PointerError,
+        0,
+        "cannot traverse non-container at token: " + tok,
+      ),
+    )
+  }
+}
+
+fn work_remove(
+  root_in : WorkVal,
+  tokens : Array[String],
+) -> Result[(WorkVal, WorkVal), JsonPathError] {
+  let total = tokens.length()
+  if total == 0 {
+    return Err(
+      JsonPathError::new(
+        JsonPathErrorKind::PatchError,
+        0,
+        "cannot remove root document",
+      ),
+    )
+  }
+  let root = work_unfreeze_container(root_in)
+  let mut cur = root
+  let mut depth = 0
+  while depth + 1 < total {
+    let tok = tokens[depth]
+    match cur {
+      WorkVal::MutObj(data) => {
+        let idx = mut_obj_find(data, tok)
+        if idx < 0 {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PatchError,
+              0,
+              "remove target key not found: " + tok,
+            ),
+          )
+        }
+        let (k, v_opt) = data.entries[idx]
+        let child = match v_opt {
+          Some(v) => work_unfreeze_container(v)
+          None =>
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PatchError,
+              0,
+              "remove target key not found: " + tok,
+            ),
+          )
+        }
+        data.entries[idx] = (k, Some(child))
+        cur = child
+      }
+      WorkVal::MutArr(items) => {
+        let idx = parse_pointer_array_index(tok)
+        if idx < 0 || idx >= items.length() {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::PatchError,
+              0,
+              "remove target array index out of bounds: " + tok,
+            ),
+          )
+        }
+        let child = work_unfreeze_container(items[idx])
+        items[idx] = child
+        cur = child
+      }
+      _ =>
+      return Err(
+        JsonPathError::new(
+          JsonPathErrorKind::PatchError,
+          0,
+          "cannot remove inside non-container at token: " + tok,
+        ),
+      )
+    }
+    depth = depth + 1
+  }
+  let tok = tokens[total - 1]
+  match cur {
+    WorkVal::MutObj(data) => {
+      match mut_obj_remove(data, tok) {
+        Some(removed) => Ok((root, removed))
+        None =>
+        Err(
+          JsonPathError::new(
+            JsonPathErrorKind::PatchError,
+            0,
+            "remove target key not found: " + tok,
+          ),
+        )
+      }
+    }
+    WorkVal::MutArr(items) => {
+      let idx = parse_pointer_array_index(tok)
+      if idx < 0 || idx >= items.length() {
+        return Err(
+          JsonPathError::new(
+            JsonPathErrorKind::PatchError,
+            0,
+            "remove target array index out of bounds: " + tok,
+          ),
+        )
+      }
+      let removed = items[idx]
+      let mut j = idx
+      while j + 1 < items.length() {
+        items[j] = items[j + 1]
+        j = j + 1
+      }
+      let _ = items.pop()
+      Ok((root, removed))
+    }
+    _ =>
+    Err(
+      JsonPathError::new(
+        JsonPathErrorKind::PatchError,
+        0,
+        "cannot remove inside non-container at token: " + tok,
+      ),
+    )
+  }
+}
+
 ///| Apply an RFC 6902 `JsonPatch` atomically with explicit resource limits.
 pub fn apply_patch_impl(
   doc : JsonValue,
@@ -204,7 +901,11 @@ pub fn apply_patch_impl(
       ),
     )
   }
-  let mut cur = doc
+  if patch.ops.length() == 0 {
+    return Ok(doc)
+  }
+  let mut cur = WorkVal::Frozen(doc)
+  let mut total_nodes = -1
   let mut i = 0
   while i < patch.ops.length() {
     match patch.ops[i] {
@@ -213,40 +914,46 @@ pub fn apply_patch_impl(
           Ok(p) => p
           Err(e) => return Err(e)
         }
-        if ptr.tokens.length() > limits.max_depth {
-          return Err(
-            JsonPathError::new(
-              JsonPathErrorKind::LimitExceeded,
-              0,
-              "pointer depth exceeds max_depth",
-            ),
-          )
+        match check_ptr_depth(ptr, limits) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
         }
-        cur = match cow_add(cur, ptr.tokens, 0, v) {
+        cur = match work_add(cur, ptr.tokens, WorkVal::Frozen(v)) {
           Ok(next) => next
           Err(e) => return Err(e)
         }
+        total_nodes = -1
       }
       PatchOp::Remove(path) => {
         let ptr = match pointer_parse_impl(path) {
           Ok(p) => p
           Err(e) => return Err(e)
         }
-        let (next, _) = match cow_remove(cur, ptr.tokens, 0) {
+        match check_ptr_depth(ptr, limits) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let (next, _) = match work_remove(cur, ptr.tokens) {
           Ok(p) => p
           Err(e) => return Err(e)
         }
         cur = next
+        total_nodes = -1
       }
       PatchOp::Replace(path, v) => {
         let ptr = match pointer_parse_impl(path) {
           Ok(p) => p
           Err(e) => return Err(e)
         }
-        cur = match cow_replace(cur, ptr.tokens, 0, v) {
+        match check_ptr_depth(ptr, limits) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        cur = match work_replace(cur, ptr.tokens, WorkVal::Frozen(v)) {
           Ok(next) => next
           Err(e) => return Err(e)
         }
+        total_nodes = -1
       }
       PatchOp::Move(from, path) => {
         let from_ptr = match pointer_parse_impl(from) {
@@ -255,6 +962,14 @@ pub fn apply_patch_impl(
         }
         let path_ptr = match pointer_parse_impl(path) {
           Ok(p) => p
+          Err(e) => return Err(e)
+        }
+        match check_ptr_depth(from_ptr, limits) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        match check_ptr_depth(path_ptr, limits) {
+          Ok(_) => ()
           Err(e) => return Err(e)
         }
         if is_proper_prefix(from_ptr.tokens, path_ptr.tokens) {
@@ -266,14 +981,15 @@ pub fn apply_patch_impl(
             ),
           )
         }
-        let (after_rm, moved_val) = match cow_remove(cur, from_ptr.tokens, 0) {
+        let (after_rm, moved_val) = match work_remove(cur, from_ptr.tokens) {
           Ok(p) => p
           Err(e) => return Err(e)
         }
-        cur = match cow_add(after_rm, path_ptr.tokens, 0, moved_val) {
+        cur = match work_add(after_rm, path_ptr.tokens, moved_val) {
           Ok(next) => next
           Err(e) => return Err(e)
         }
+        total_nodes = -1
       }
       PatchOp::Copy(from, path) => {
         let from_ptr = match pointer_parse_impl(from) {
@@ -284,7 +1000,17 @@ pub fn apply_patch_impl(
           Ok(p) => p
           Err(e) => return Err(e)
         }
-        let copied_val = match pointer_resolve_impl(from_ptr, cur) {
+        match check_ptr_depth(from_ptr, limits) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        match check_ptr_depth(path_ptr, limits) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        // Freeze working tree before copy so the copied subtree is immutable & isolated
+        let snap = work_freeze(cur)
+        let copied_val = match pointer_resolve_impl(from_ptr, snap) {
           Some(v) => v
           None =>
           return Err(
@@ -295,17 +1021,63 @@ pub fn apply_patch_impl(
             ),
           )
         }
-        cur = match cow_add(cur, path_ptr.tokens, 0, copied_val) {
+        let budget = limits.max_nodes_visited
+        if total_nodes < 0 {
+          total_nodes = count_nodes_bounded(snap, budget)
+          if total_nodes > budget {
+            return Err(
+              JsonPathError::new(
+                JsonPathErrorKind::LimitExceeded,
+                0,
+                "patch document exceeds max_nodes_visited",
+              ),
+            )
+          }
+        }
+        let added = if from_ptr.tokens.length() == 0 {
+          total_nodes
+        } else {
+          count_nodes_bounded(copied_val, budget)
+        }
+        if added > budget {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::LimitExceeded,
+              0,
+              "copy amplification exceeds max_nodes_visited",
+            ),
+          )
+        }
+        let replaced = match resolve_overwritten_object_val(path_ptr, snap) {
+          Some(old_v) => count_nodes_bounded(old_v, total_nodes)
+          None => 0
+        }
+        let next_total = total_nodes - replaced + added
+        if next_total > budget {
+          return Err(
+            JsonPathError::new(
+              JsonPathErrorKind::LimitExceeded,
+              0,
+              "copy amplification exceeds max_nodes_visited",
+            ),
+          )
+        }
+        cur = match work_add(WorkVal::Frozen(snap), path_ptr.tokens, WorkVal::Frozen(copied_val)) {
           Ok(next) => next
           Err(e) => return Err(e)
         }
+        total_nodes = next_total
       }
       PatchOp::Test(path, expected) => {
         let ptr = match pointer_parse_impl(path) {
           Ok(p) => p
           Err(e) => return Err(e)
         }
-        let actual = match pointer_resolve_impl(ptr, cur) {
+        match check_ptr_depth(ptr, limits) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let actual_w = match work_resolve(cur, ptr.tokens) {
           Some(v) => v
           None =>
           return Err(
@@ -316,6 +1088,7 @@ pub fn apply_patch_impl(
             ),
           )
         }
+        let actual = work_freeze(actual_w)
         if !json_value_eq_impl(actual, expected) {
           return Err(
             JsonPathError::new(
@@ -329,7 +1102,7 @@ pub fn apply_patch_impl(
     }
     i = i + 1
   }
-  Ok(cur)
+  Ok(work_freeze(cur))
 }
 
 // ============================================================================
@@ -352,29 +1125,85 @@ fn diff_recurse(
   }
   match (before, after) {
     (JsonValue::Object(ea), JsonValue::Object(eb)) => {
-      // Remove keys in before that are absent in after
-      let mut i = 0
-      while i < ea.length() {
-        let (k, va) = ea[i]
-        let child_path = prefix + "/" + escape_token_impl(k)
-        match json_object_get(eb, k) {
-          Some(vb) => diff_recurse(child_path, va, vb, ops, depth + 1)
-          None => ops.push(PatchOp::Remove(child_path))
-        }
-        i = i + 1
-      }
-      // Add keys in after that are absent in before
-      let mut j = 0
-      while j < eb.length() {
-        let (k, vb) = eb[j]
-        match json_object_get(ea, k) {
-          Some(_) => ()
-          None => {
-            let child_path = prefix + "/" + escape_token_impl(k)
-            ops.push(PatchOp::Add(child_path, vb))
+      let na = ea.length()
+      let nb = eb.length()
+      if na <= 12 && nb <= 12 {
+        // Small object fast path (zero Map allocation)
+        let mut i = 0
+        while i < na {
+          let (k, va) = ea[i]
+          let child_path = prefix + "/" + escape_token_impl(k)
+          match json_object_get(eb, k) {
+            Some(vb) => diff_recurse(child_path, va, vb, ops, depth + 1)
+            None => ops.push(PatchOp::Remove(child_path))
           }
+          i = i + 1
         }
-        j = j + 1
+        let mut j = 0
+        while j < nb {
+          let (k, vb) = eb[j]
+          match json_object_get(ea, k) {
+            Some(_) => ()
+            None => {
+              let child_path = prefix + "/" + escape_token_impl(k)
+              ops.push(PatchOp::Add(child_path, vb))
+            }
+          }
+          j = j + 1
+        }
+      } else {
+        // O(na + nb) Map-indexed object diff with LastWins duplicate handling
+        let map_a : Map[String, Int] = Map::new()
+        let mut i = 0
+        while i < na {
+          let (k, _) = ea[i]
+          map_a.set(k, i)
+          i = i + 1
+        }
+        let map_b : Map[String, Int] = Map::new()
+        let mut j = 0
+        while j < nb {
+          let (k, _) = eb[j]
+          map_b.set(k, j)
+          j = j + 1
+        }
+        i = 0
+        while i < na {
+          let (k, va) = ea[i]
+          let is_last = match map_a.get(k) {
+            Some(idx) => idx == i
+            None => false
+          }
+          if is_last {
+            let child_path = prefix + "/" + escape_token_impl(k)
+            match map_b.get(k) {
+              Some(jb) => {
+                let (_, vb) = eb[jb]
+                diff_recurse(child_path, va, vb, ops, depth + 1)
+              }
+              None => ops.push(PatchOp::Remove(child_path))
+            }
+          }
+          i = i + 1
+        }
+        j = 0
+        while j < nb {
+          let (k, vb) = eb[j]
+          let is_last = match map_b.get(k) {
+            Some(idx) => idx == j
+            None => false
+          }
+          if is_last {
+            match map_a.get(k) {
+              Some(_) => ()
+              None => {
+                let child_path = prefix + "/" + escape_token_impl(k)
+                ops.push(PatchOp::Add(child_path, vb))
+              }
+            }
+          }
+          j = j + 1
+        }
       }
     }
     (JsonValue::Array(xa), JsonValue::Array(xb)) => {
@@ -444,98 +1273,195 @@ pub fn diff_patch_impl(before : JsonValue, after : JsonValue) -> JsonPatch {
 }
 
 // ============================================================================
-// RFC 7396 JSON Merge Patch
+// Iterative RFC 7396 JSON Merge Patch
 // ============================================================================
 
-fn merge_patch_recurse(
+struct MergeFrame {
+  out : Array[(String, Option[JsonValue])]
+  mut idx_map : Option[Map[String, Int]]
+  p_entries : Array[(String, JsonValue)]
+  mut p_idx : Int
+  mut pending_key : String
+  mut pending_slot : Int
+}
+
+fn merge_frame_find(f : MergeFrame, key : String) -> Int {
+  match f.idx_map {
+    Some(m) => {
+      match m.get(key) {
+        Some(idx) => idx
+        None => -1
+      }
+    }
+    None => {
+      let mut i = f.out.length() - 1
+      while i >= 0 {
+        let (k, v_opt) = f.out[i]
+        if k == key {
+          match v_opt {
+            Some(_) => return i
+            None => return -1
+          }
+        }
+        i = i - 1
+      }
+      -1
+    }
+  }
+}
+
+fn merge_frame_set(f : MergeFrame, key : String, v : JsonValue) -> Unit {
+  let idx = merge_frame_find(f, key)
+  if idx >= 0 {
+    f.out[idx] = (key, Some(v))
+    return
+  }
+  let pos = f.out.length()
+  f.out.push((key, Some(v)))
+  match f.idx_map {
+    Some(m) => m.set(key, pos)
+    None => {
+      if f.out.length() >= 16 {
+        let m : Map[String, Int] = Map::new()
+        let mut i = 0
+        while i < f.out.length() {
+          let (k, v_opt) = f.out[i]
+          match v_opt {
+            Some(_) => m.set(k, i)
+            None => ()
+          }
+          i = i + 1
+        }
+        f.idx_map = Some(m)
+      }
+    }
+  }
+}
+
+fn merge_frame_delete(f : MergeFrame, key : String) -> Unit {
+  let idx = merge_frame_find(f, key)
+  if idx >= 0 {
+    f.out[idx] = (key, Option::None)
+    match f.idx_map {
+      Some(m) => m.set(key, -1)
+      None => ()
+    }
+  }
+}
+
+fn make_merge_frame(
   target : JsonValue,
-  patch : JsonValue,
-  depth : Int,
-  max_depth : Int,
-) -> Result[JsonValue, JsonPathError] {
-  if depth > max_depth {
-    return Err(
-      JsonPathError::new(
-        JsonPathErrorKind::LimitExceeded,
-        0,
-        "merge_patch exceeded max_depth",
-      ),
-    )
+  p_entries : Array[(String, JsonValue)],
+) -> MergeFrame {
+  let f = MergeFrame::{
+    out: [],
+    idx_map: Option::None,
+    p_entries: p_entries,
+    p_idx: 0,
+    pending_key: "",
+    pending_slot: -1,
   }
-  let p_entries = match patch {
-    JsonValue::Object(es) => es
-    _ => return Ok(patch)
-  }
-  // Start with copy of target entries (or empty if target is not an Object)
-  let out : Array[(String, JsonValue)] = []
   match target {
     JsonValue::Object(t_entries) => {
       let mut i = 0
       while i < t_entries.length() {
-        out.push(t_entries[i])
+        let (k, v) = t_entries[i]
+        merge_frame_set(f, k, v)
         i = i + 1
       }
     }
     _ => ()
   }
-  let mut pi = 0
-  while pi < p_entries.length() {
-    let (pk, pv) = p_entries[pi]
-    match pv {
-      JsonValue::Null => {
-        // Remove pk from out if present
-        let mut k = 0
-        while k < out.length() {
-          let (ok_key, _) = out[k]
-          if ok_key == pk {
-            // Shift left preserving order
-            let mut m = k
-            while m + 1 < out.length() {
-              out[m] = out[m + 1]
-              m = m + 1
-            }
-            let _ = out.pop()
-          } else {
-            k = k + 1
-          }
-        }
-      }
-      _ => {
-        let mut found = -1
-        let mut k = out.length() - 1
-        while k >= 0 {
-          let (ok_key, _) = out[k]
-          if ok_key == pk {
-            found = k
-            break
-          }
-          k = k - 1
-        }
-        let existing = if found >= 0 {
-          let (_, ev) = out[found]
-          ev
-        } else {
-          JsonValue::Object([])
-        }
-        let merged = match merge_patch_recurse(existing, pv, depth + 1, max_depth) {
-          Ok(v) => v
-          Err(e) => return Err(e)
-        }
-        if found >= 0 {
-          out[found] = (pk, merged)
-        } else {
-          out.push((pk, merged))
-        }
-      }
-    }
-    pi = pi + 1
-  }
-  Ok(JsonValue::Object(out))
+  f
 }
 
-///| Apply an RFC 7396 JSON Merge Patch.
+fn finish_merge_frame(f : MergeFrame) -> JsonValue {
+  let res : Array[(String, JsonValue)] = []
+  let mut i = 0
+  while i < f.out.length() {
+    let (k, v_opt) = f.out[i]
+    match v_opt {
+      Some(v) => res.push((k, v))
+      None => ()
+    }
+    i = i + 1
+  }
+  JsonValue::Object(res)
+}
+
+///| 100% iterative RFC 7396 JSON Merge Patch.
+///| `max_depth < 0` means unlimited depth (stack-safe on arbitrarily deep documents).
+fn merge_patch_iter(
+  target : JsonValue,
+  patch : JsonValue,
+  max_depth : Int,
+) -> Result[JsonValue, JsonPathError] {
+  let root_entries = match patch {
+    JsonValue::Object(es) => es
+    _ => return Ok(patch)
+  }
+  let frames : Array[MergeFrame] = [make_merge_frame(target, root_entries)]
+  while frames.length() > 0 {
+    let top_idx = frames.length() - 1
+    let f = frames[top_idx]
+    let mut descended = false
+    while f.p_idx < f.p_entries.length() {
+      let (pk, pv) = f.p_entries[f.p_idx]
+      f.p_idx = f.p_idx + 1
+      match pv {
+        JsonValue::Null => merge_frame_delete(f, pk)
+        JsonValue::Object(child_p_entries) => {
+          if max_depth >= 0 && frames.length() > max_depth {
+            return Err(
+              JsonPathError::new(
+                JsonPathErrorKind::LimitExceeded,
+                0,
+                "merge_patch exceeded max_depth",
+              ),
+            )
+          }
+          let slot = merge_frame_find(f, pk)
+          let existing = if slot >= 0 {
+            let (_, ev_opt) = f.out[slot]
+            match ev_opt {
+              Some(ev) => ev
+              None => JsonValue::Object([])
+            }
+          } else {
+            JsonValue::Object([])
+          }
+          f.pending_key = pk
+          f.pending_slot = slot
+          frames.push(make_merge_frame(existing, child_p_entries))
+          descended = true
+          break
+        }
+        _ => merge_frame_set(f, pk, pv)
+      }
+    }
+    if !descended {
+      let done_frame = match frames.pop() {
+        Some(df) => df
+        None => break
+      }
+      let merged = finish_merge_frame(done_frame)
+      if frames.length() == 0 {
+        return Ok(merged)
+      }
+      let parent = frames[frames.length() - 1]
+      if parent.pending_slot >= 0 {
+        parent.out[parent.pending_slot] = (parent.pending_key, Some(merged))
+      } else {
+        merge_frame_set(parent, parent.pending_key, merged)
+      }
+    }
+  }
+  Ok(patch)
+}
+
+///| Apply an RFC 7396 JSON Merge Patch (100% iterative, no artificial depth truncation).
 pub fn merge_patch_impl(target : JsonValue, patch : JsonValue) -> JsonValue {
-  match merge_patch_recurse(target, patch, 0, 512) {
+  match merge_patch_iter(target, patch, -1) {
     Ok(v) => v
     Err(_) => patch
   }
@@ -547,5 +1473,5 @@ pub fn merge_patch_with_limits_impl(
   patch : JsonValue,
   limits : JsonPathLimits,
 ) -> Result[JsonValue, JsonPathError] {
-  merge_patch_recurse(target, patch, 0, limits.max_depth)
+  merge_patch_iter(target, patch, limits.max_depth)
 }

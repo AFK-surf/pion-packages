@@ -85,6 +85,135 @@ pub fn eval_query_values(
   st.eval_segments_values([root], path.segments)
 }
 
+///| Shared parent-pointer Normalized Path chain (O(depth) memory during traversal).
+enum PathChain {
+  Root
+  Key(PathChain, String, Int)
+  Idx(PathChain, Int, Int)
+}
+
+///| Exact byte length of an RFC 9535 §2.7 escaped single-quoted key segment `['...']`.
+fn norm_name_seg_len(key : String) -> Int {
+  let n = key.length()
+  let mut len = 4 // "['" + "']"
+  let mut i = 0
+  while i < n {
+    let b = key.code_unit_at(i)
+    if b == 8 || b == 9 || b == 10 || b == 12 || b == 13 || b == 39 || b == 92 {
+      len = len + 2
+    } else if b < 0x20 {
+      len = len + 6
+    } else {
+      len = len + 1
+    }
+    i = i + 1
+  }
+  len
+}
+
+///| Exact byte length of an array index segment `[i]`.
+fn norm_index_seg_len(idx : Int) -> Int {
+  let mut v = idx
+  let mut digits = 1
+  while v >= 10 {
+    v = v / 10
+    digits = digits + 1
+  }
+  digits + 2 // "[" + digits + "]"
+}
+
+fn path_chain_len(p : PathChain) -> Int {
+  match p {
+    PathChain::Root => 1
+    PathChain::Key(_, _, l) => l
+    PathChain::Idx(_, _, l) => l
+  }
+}
+
+fn path_chain_push_key(parent : PathChain, key : String) -> PathChain {
+  PathChain::Key(parent, key, path_chain_len(parent) + norm_name_seg_len(key))
+}
+
+fn path_chain_push_idx(parent : PathChain, idx : Int) -> PathChain {
+  PathChain::Idx(parent, idx, path_chain_len(parent) + norm_index_seg_len(idx))
+}
+
+enum PathPart {
+  PKey(String)
+  PIdx(Int)
+}
+
+fn write_norm_name_seg(sb : StringBuilder, key : String) -> Unit {
+  sb.write_string("['")
+  let n = key.length()
+  let mut i = 0
+  while i < n {
+    let b = key.code_unit_at(i)
+    if b == 8 {
+      sb.write_string("\\b")
+    } else if b == 9 {
+      sb.write_string("\\t")
+    } else if b == 10 {
+      sb.write_string("\\n")
+    } else if b == 12 {
+      sb.write_string("\\f")
+    } else if b == 13 {
+      sb.write_string("\\r")
+    } else if b == 39 {
+      sb.write_string("\\'")
+    } else if b == 92 {
+      sb.write_string("\\\\")
+    } else if b < 0x20 {
+      sb.write_string("\\u00")
+      sb.write_byte(lower_hex_byte(b >> 4))
+      sb.write_byte(lower_hex_byte(b & 0xF))
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    i = i + 1
+  }
+  sb.write_string("']")
+}
+
+///| Materialize a `PathChain` to its RFC 9535 §2.7 Normalized Path string (100% iterative).
+fn materialize_path(chain : PathChain) -> String {
+  let parts : Array[PathPart] = []
+  let mut cur = chain
+  while true {
+    match cur {
+      PathChain::Root => break
+      PathChain::Key(p, k, _) => {
+        parts.push(PathPart::PKey(k))
+        cur = p
+      }
+      PathChain::Idx(p, idx, _) => {
+        parts.push(PathPart::PIdx(idx))
+        cur = p
+      }
+    }
+  }
+  let sb = StringBuilder::new()
+  sb.write_byte((36).to_byte())
+  let mut i = parts.length() - 1
+  while i >= 0 {
+    match parts[i] {
+      PathPart::PKey(k) => write_norm_name_seg(sb, k)
+      PathPart::PIdx(idx) => {
+        sb.write_byte((91).to_byte())
+        sb.write_string(idx.to_string())
+        sb.write_byte((93).to_byte())
+      }
+    }
+    i = i - 1
+  }
+  sb.to_string()
+}
+
+struct ChainMatch {
+  chain : PathChain
+  value : JsonValue
+}
+
 ///| Evaluate a compiled `JsonPath` returning `NodeMatch` with RFC 9535 §2.7 Normalized Paths.
 pub fn eval_query_with_paths(
   path : JsonPath,
@@ -92,7 +221,34 @@ pub fn eval_query_with_paths(
   limits : JsonPathLimits,
 ) -> Result[Array[NodeMatch], JsonPathError] {
   let st = EvalState::new(root, limits)
-  st.eval_segments_paths([NodeMatch::{ path: "$", value: root }], path.segments)
+  let matches = match st.eval_segments_chains([ChainMatch::{ chain: PathChain::Root, value: root }], path.segments) {
+    Ok(ms) => ms
+    Err(e) => return Err(e)
+  }
+  // Enforce a 64 MiB materialized path byte budget before allocating output strings
+  let max_path_bytes = 64L * 1024L * 1024L
+  let mut total_bytes = 0L
+  let mut i = 0
+  while i < matches.length() {
+    total_bytes = total_bytes + path_chain_len(matches[i].chain).to_int64()
+    if total_bytes > max_path_bytes {
+      return Err(
+        JsonPathError::new(
+          JsonPathErrorKind::LimitExceeded,
+          0,
+          "query_with_paths exceeded materialized path byte budget",
+        ),
+      )
+    }
+    i = i + 1
+  }
+  let out : Array[NodeMatch] = []
+  i = 0
+  while i < matches.length() {
+    out.push(NodeMatch::{ path: materialize_path(matches[i].chain), value: matches[i].value })
+    i = i + 1
+  }
+  Ok(out)
 }
 
 fn slice_bounds(
@@ -506,15 +662,15 @@ fn EvalState::eval_segments_values(
   Ok(current)
 }
 
-fn EvalState::apply_selector_paths(
+fn EvalState::apply_selector_chains(
   self : EvalState,
-  nm : NodeMatch,
+  cm : ChainMatch,
   sel : Selector,
-  out : Array[NodeMatch],
+  out : Array[ChainMatch],
 ) -> Result[Unit, JsonPathError] {
   match sel {
     Selector::Name(key) => {
-      match nm.value {
+      match cm.value {
         JsonValue::Object(entries) => {
           match json_object_get(entries, key) {
             Some(v) => {
@@ -527,7 +683,7 @@ fn EvalState::apply_selector_paths(
                   ),
                 )
               }
-              out.push(NodeMatch::{ path: format_norm_name(nm.path, key), value: v })
+              out.push(ChainMatch::{ chain: path_chain_push_key(cm.chain, key), value: v })
             }
             None => ()
           }
@@ -536,7 +692,7 @@ fn EvalState::apply_selector_paths(
       }
     }
     Selector::Wildcard => {
-      match nm.value {
+      match cm.value {
         JsonValue::Array(items) => {
           let mut i = 0
           let n = items.length()
@@ -554,7 +710,7 @@ fn EvalState::apply_selector_paths(
                 ),
               )
             }
-            out.push(NodeMatch::{ path: format_norm_index(nm.path, i), value: items[i] })
+            out.push(ChainMatch::{ chain: path_chain_push_idx(cm.chain, i), value: items[i] })
             i = i + 1
           }
         }
@@ -576,7 +732,7 @@ fn EvalState::apply_selector_paths(
               )
             }
             let (k, v) = entries[i]
-            out.push(NodeMatch::{ path: format_norm_name(nm.path, k), value: v })
+            out.push(ChainMatch::{ chain: path_chain_push_key(cm.chain, k), value: v })
             i = i + 1
           }
         }
@@ -584,7 +740,7 @@ fn EvalState::apply_selector_paths(
       }
     }
     Selector::Index(idx) => {
-      match nm.value {
+      match cm.value {
         JsonValue::Array(items) => {
           let len64 = items.length().to_int64()
           let norm = if idx >= 0L { idx } else { len64 + idx }
@@ -599,14 +755,14 @@ fn EvalState::apply_selector_paths(
                 ),
               )
             }
-            out.push(NodeMatch::{ path: format_norm_index(nm.path, ii), value: items[ii] })
+            out.push(ChainMatch::{ chain: path_chain_push_idx(cm.chain, ii), value: items[ii] })
           }
         }
         _ => ()
       }
     }
     Selector::Slice(s_opt, e_opt, step_opt) => {
-      match nm.value {
+      match cm.value {
         JsonValue::Array(items) => {
           let (lower, upper, step) = slice_bounds(items.length(), s_opt, e_opt, step_opt)
           if step > 0L {
@@ -622,7 +778,7 @@ fn EvalState::apply_selector_paths(
                   ),
                 )
               }
-              out.push(NodeMatch::{ path: format_norm_index(nm.path, ii), value: items[ii] })
+              out.push(ChainMatch::{ chain: path_chain_push_idx(cm.chain, ii), value: items[ii] })
               i = i + step
             }
           } else if step < 0L {
@@ -638,7 +794,7 @@ fn EvalState::apply_selector_paths(
                   ),
                 )
               }
-              out.push(NodeMatch::{ path: format_norm_index(nm.path, ii), value: items[ii] })
+              out.push(ChainMatch::{ chain: path_chain_push_idx(cm.chain, ii), value: items[ii] })
               i = i + step
             }
           }
@@ -647,7 +803,7 @@ fn EvalState::apply_selector_paths(
       }
     }
     Selector::Filter(expr) => {
-      match nm.value {
+      match cm.value {
         JsonValue::Array(items) => {
           let mut i = 0
           let n = items.length()
@@ -670,7 +826,7 @@ fn EvalState::apply_selector_paths(
                   ),
                 )
               }
-              out.push(NodeMatch::{ path: format_norm_index(nm.path, i), value: items[i] })
+              out.push(ChainMatch::{ chain: path_chain_push_idx(cm.chain, i), value: items[i] })
             }
             i = i + 1
           }
@@ -698,7 +854,7 @@ fn EvalState::apply_selector_paths(
                   ),
                 )
               }
-              out.push(NodeMatch::{ path: format_norm_name(nm.path, k), value: v })
+              out.push(ChainMatch::{ chain: path_chain_push_key(cm.chain, k), value: v })
             }
             i = i + 1
           }
@@ -710,23 +866,23 @@ fn EvalState::apply_selector_paths(
   Ok(())
 }
 
-fn EvalState::eval_segments_paths(
+fn EvalState::eval_segments_chains(
   self : EvalState,
-  initial : Array[NodeMatch],
+  initial : Array[ChainMatch],
   segments : Array[Segment],
-) -> Result[Array[NodeMatch], JsonPathError] {
+) -> Result[Array[ChainMatch], JsonPathError] {
   let mut current = initial
   let mut s_idx = 0
   while s_idx < segments.length() {
-    let next : Array[NodeMatch] = []
+    let next : Array[ChainMatch] = []
     match segments[s_idx] {
       Segment::Child(sels) => {
         let mut n_idx = 0
         while n_idx < current.length() {
-          let nm = current[n_idx]
+          let cm = current[n_idx]
           let mut k = 0
           while k < sels.length() {
-            match self.apply_selector_paths(nm, sels[k], next) {
+            match self.apply_selector_chains(cm, sels[k], next) {
               Ok(_) => ()
               Err(e) => return Err(e)
             }
@@ -738,7 +894,7 @@ fn EvalState::eval_segments_paths(
       Segment::Descendant(sels) => {
         let mut n_idx = 0
         while n_idx < current.length() {
-          let stack : Array[(NodeMatch, Int)] = [(current[n_idx], 0)]
+          let stack : Array[(ChainMatch, Int)] = [(current[n_idx], 0)]
           while stack.length() > 0 {
             let (cur, depth) = match stack.pop() {
               Some(p) => p
@@ -759,7 +915,7 @@ fn EvalState::eval_segments_paths(
             }
             let mut k = 0
             while k < sels.length() {
-              match self.apply_selector_paths(cur, sels[k], next) {
+              match self.apply_selector_chains(cur, sels[k], next) {
                 Ok(_) => ()
                 Err(e) => return Err(e)
               }
@@ -771,7 +927,7 @@ fn EvalState::eval_segments_paths(
                 while ci >= 0 {
                   stack.push(
                     (
-                      NodeMatch::{ path: format_norm_index(cur.path, ci), value: items[ci] },
+                      ChainMatch::{ chain: path_chain_push_idx(cur.chain, ci), value: items[ci] },
                       depth + 1,
                     ),
                   )
@@ -784,7 +940,7 @@ fn EvalState::eval_segments_paths(
                   let (ek, ev) = entries[ci]
                   stack.push(
                     (
-                      NodeMatch::{ path: format_norm_name(cur.path, ek), value: ev },
+                      ChainMatch::{ chain: path_chain_push_key(cur.chain, ek), value: ev },
                       depth + 1,
                     ),
                   )
