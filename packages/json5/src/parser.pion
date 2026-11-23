@@ -1,0 +1,977 @@
+///| High-performance, 100% iterative JSON5 v2.0 / JSONC / RFC 8259 JSON parser.
+///| Zero recursion (explicit heap container stack), zero-copy slice scanning on unescaped strings,
+///| 256-byte ASCII LUTs, and seeded HashIndex for large objects.
+
+struct ObjFrame {
+  entries : Array[(String, Json5Value)]
+  mut index : Option[HashIndex]
+  mut pending_key : String
+}
+
+enum ContainerFrame {
+  Arr(Array[Json5Value])
+  Obj(ObjFrame)
+}
+
+struct Parser {
+  src : String
+  len : Int
+  opts : ParseOptions
+  seed : UInt64
+  mut pos : Int
+  mut nodes : Int
+}
+
+fn Parser::new(src : String, opts : ParseOptions) -> Parser {
+  Parser::{
+    src: src,
+    len: src.length(),
+    opts: opts,
+    seed: derive_doc_seed(src),
+    pos: 0,
+    nodes: 0,
+  }
+}
+
+fn Parser::err(self : Parser, off : Int, msg : String) -> Json5Error {
+  let (ln, cl) = line_col_at(self.src, off)
+  Json5Error::new(ln, cl, off, msg)
+}
+
+fn Parser::bump_node(self : Parser, off : Int) -> Result[Unit, Json5Error] {
+  self.nodes = self.nodes + 1
+  if self.nodes > self.opts.max_nodes {
+    return Err(self.err(off, "maximum node count exceeded"))
+  }
+  Ok(())
+}
+
+///| Skip whitespace and (when allowed) `//` and `/* */` comments.
+fn Parser::skip_ws(self : Parser) -> Result[Unit, Json5Error] {
+  let s = self.src
+  let n = self.len
+  let allow_j5 = self.opts.allow_json5
+  let allow_comments = self.opts.allow_comments
+  let mut p = self.pos
+  while p < n {
+    let b = s.code_unit_at(p)
+    if b < 0x80 {
+      if allow_j5 {
+        if is_ascii_j5_ws(b) {
+          p = p + 1
+          continue
+        }
+      } else if is_ascii_json_ws(b) {
+        p = p + 1
+        continue
+      }
+      if b == 47 && allow_comments && p + 1 < n {
+        let b2 = s.code_unit_at(p + 1)
+        if b2 == 47 {
+          // Single-line comment // ... until LF, CR, U+2028, U+2029, or EOF
+          p = p + 2
+          while p < n {
+            let c = s.code_unit_at(p)
+            if c == 10 || c == 13 {
+              p = p + 1
+              break
+            }
+            if c == 0xE2 &&
+            p + 2 < n &&
+            s.code_unit_at(p + 1) == 0x80 &&
+            (s.code_unit_at(p + 2) == 0xA8 || s.code_unit_at(p + 2) == 0xA9) {
+              p = p + 3
+              break
+            }
+            p = p + 1
+          }
+          continue
+        }
+        if b2 == 42 {
+          // Multi-line block comment /* ... */
+          let start = p
+          p = p + 2
+          let mut closed = false
+          while p + 1 < n {
+            if s.code_unit_at(p) == 42 && s.code_unit_at(p + 1) == 47 {
+              p = p + 2
+              closed = true
+              break
+            }
+            p = p + 1
+          }
+          if !closed {
+            self.pos = start
+            return Err(self.err(start, "unterminated block comment"))
+          }
+          continue
+        }
+      }
+      break
+    } else if allow_j5 {
+      let (cp, clen) = decode_utf8_at(s, p)
+      if is_unicode_j5_ws(cp) {
+        p = p + clen
+        continue
+      }
+      break
+    } else {
+      break
+    }
+  }
+  self.pos = p
+  Ok(())
+}
+
+///| Parse 4 hex digits starting at `self.pos`.
+fn Parser::parse_hex4(self : Parser) -> Result[Int, Json5Error] {
+  if self.pos + 4 > self.len {
+    return Err(self.err(self.pos, "incomplete \\uXXXX escape"))
+  }
+  let s = self.src
+  let d0 = hex_val(s.code_unit_at(self.pos))
+  let d1 = hex_val(s.code_unit_at(self.pos + 1))
+  let d2 = hex_val(s.code_unit_at(self.pos + 2))
+  let d3 = hex_val(s.code_unit_at(self.pos + 3))
+  if (d0 | d1 | d2 | d3) >= 16 {
+    return Err(self.err(self.pos, "invalid hex digit in \\uXXXX escape"))
+  }
+  self.pos = self.pos + 4
+  Ok((d0 << 12) | (d1 << 8) | (d2 << 4) | d3)
+}
+
+///| Parse a double-quoted or single-quoted string literal.
+fn Parser::parse_string(self : Parser) -> Result[String, Json5Error] {
+  let s = self.src
+  let n = self.len
+  let quote = s.code_unit_at(self.pos)
+  if quote == 39 && !self.opts.allow_json5 {
+    return Err(self.err(self.pos, "single-quoted strings are not allowed in JSON/JSONC"))
+  }
+  let allow_j5 = self.opts.allow_json5
+  let stop_mask = if quote == 34 { 32 } else { 64 }
+  let start_pos = self.pos
+  let mut p = self.pos + 1
+  let content_start = p
+
+  // Fast zero-copy scan for unescaped strings
+  while p < n {
+    let b = s.code_unit_at(p)
+    if b < 0x80 {
+      if (ascii_lut[b].to_int() & stop_mask) != 0 {
+        if b == quote {
+          self.pos = p + 1
+          return Ok(s.slice(content_start, p))
+        }
+        break
+      }
+      p = p + 1
+    } else {
+      p = p + 1
+    }
+  }
+
+  // Slow path with StringBuilder for escapes / validation
+  let sb = StringBuilder::new()
+  if p > content_start {
+    sb.write_string(s.slice(content_start, p))
+  }
+  let mut chunk_start = p
+  while p < n {
+    let b = s.code_unit_at(p)
+    if b == quote {
+      if p > chunk_start {
+        sb.write_string(s.slice(chunk_start, p))
+      }
+      self.pos = p + 1
+      return Ok(sb.to_string())
+    }
+    if b == 92 {
+      // Backslash escape
+      if p > chunk_start {
+        sb.write_string(s.slice(chunk_start, p))
+      }
+      p = p + 1
+      if p >= n {
+        return Err(self.err(p, "unterminated escape sequence"))
+      }
+      let esc = s.code_unit_at(p)
+      if esc == 34 {
+        sb.write_byte((34).to_byte())
+        p = p + 1
+      } else if esc == 92 {
+        sb.write_byte((92).to_byte())
+        p = p + 1
+      } else if esc == 47 {
+        sb.write_byte((47).to_byte())
+        p = p + 1
+      } else if esc == 98 {
+        sb.write_byte((8).to_byte())
+        p = p + 1
+      } else if esc == 102 {
+        sb.write_byte((12).to_byte())
+        p = p + 1
+      } else if esc == 110 {
+        sb.write_byte((10).to_byte())
+        p = p + 1
+      } else if esc == 114 {
+        sb.write_byte((13).to_byte())
+        p = p + 1
+      } else if esc == 116 {
+        sb.write_byte((9).to_byte())
+        p = p + 1
+      } else if esc == 117 {
+        // \uXXXX (with strict surrogate pair decoding)
+        let u_pos = p - 1
+        self.pos = p + 1
+        let cp1 = match self.parse_hex4() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        p = self.pos
+        if cp1 >= 0xD800 && cp1 <= 0xDBFF {
+          // High surrogate: must be followed by \uDC00..\uDFFF
+          if p + 6 > n || s.code_unit_at(p) != 92 || s.code_unit_at(p + 1) != 117 {
+            return Err(self.err(u_pos, "unpaired high UTF-16 surrogate in string escape"))
+          }
+          self.pos = p + 2
+          let cp2 = match self.parse_hex4() {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          p = self.pos
+          if cp2 < 0xDC00 || cp2 > 0xDFFF {
+            return Err(self.err(u_pos, "invalid low UTF-16 surrogate in string escape"))
+          }
+          let full_cp = 0x10000 + ((cp1 - 0xD800) << 10) + (cp2 - 0xDC00)
+          write_utf8(sb, full_cp)
+        } else if cp1 >= 0xDC00 && cp1 <= 0xDFFF {
+          return Err(self.err(u_pos, "unpaired low UTF-16 surrogate in string escape"))
+        } else {
+          write_utf8(sb, cp1)
+        }
+      } else if allow_j5 {
+        if esc == 39 {
+          sb.write_byte((39).to_byte())
+          p = p + 1
+        } else if esc == 118 {
+          sb.write_byte((11).to_byte())
+          p = p + 1
+        } else if esc == 48 {
+          // \0: must NOT be followed by a decimal digit
+          if p + 1 < n && is_ascii_digit(s.code_unit_at(p + 1)) {
+            return Err(self.err(p, "octal escape sequence is not allowed in JSON5"))
+          }
+          sb.write_byte((0).to_byte())
+          p = p + 1
+        } else if esc >= 49 && esc <= 57 {
+          return Err(self.err(p, "numeric escape sequence is not allowed in JSON5"))
+        } else if esc == 120 {
+          // \xXX
+          if p + 3 > n {
+            return Err(self.err(p, "incomplete \\xXX escape"))
+          }
+          let h0 = hex_val(s.code_unit_at(p + 1))
+          let h1 = hex_val(s.code_unit_at(p + 2))
+          if (h0 | h1) >= 16 {
+            return Err(self.err(p, "invalid hex digit in \\xXX escape"))
+          }
+          write_utf8(sb, (h0 << 4) | h1)
+          p = p + 3
+        } else if esc == 10 {
+          // Line continuation: \ + LF
+          p = p + 1
+        } else if esc == 13 {
+          // Line continuation: \ + CR or \ + CRLF
+          if p + 1 < n && s.code_unit_at(p + 1) == 10 {
+            p = p + 2
+          } else {
+            p = p + 1
+          }
+        } else if esc == 0xE2 &&
+        p + 2 < n &&
+        s.code_unit_at(p + 1) == 0x80 &&
+        (s.code_unit_at(p + 2) == 0xA8 || s.code_unit_at(p + 2) == 0xA9) {
+          // Line continuation: \ + U+2028 or U+2029
+          p = p + 3
+        } else {
+          // ES5 NonEscapeCharacter: literal character
+          let (cp, clen) = decode_utf8_at(s, p)
+          write_utf8(sb, cp)
+          p = p + clen
+        }
+      } else {
+        return Err(self.err(p, "invalid escape sequence in JSON/JSONC string"))
+      }
+      chunk_start = p
+      continue
+    }
+    if b == 10 || b == 13 {
+      return Err(self.err(p, "unescaped newline in string literal"))
+    }
+    if !allow_j5 && b < 0x20 {
+      return Err(self.err(p, "unescaped control character in JSON string"))
+    }
+    p = p + 1
+  }
+  Err(self.err(start_pos, "unterminated string literal"))
+}
+
+///| Parse an unquoted ECMAScript 5.1 IdentifierName key (JSON5 only).
+fn Parser::parse_identifier_key(self : Parser) -> Result[String, Json5Error] {
+  let s = self.src
+  let n = self.len
+  let start = self.pos
+  if start >= n {
+    return Err(self.err(start, "unexpected EOF while parsing object key"))
+  }
+
+  // Fast path: pure ASCII identifier without \uXXXX escapes
+  let b0 = s.code_unit_at(start)
+  if b0 < 0x80 && is_ascii_id_start(b0) {
+    let mut p = start + 1
+    while p < n {
+      let b = s.code_unit_at(p)
+      if b < 0x80 && is_ascii_id_part(b) {
+        p = p + 1
+      } else {
+        break
+      }
+    }
+    if p >= n || (s.code_unit_at(p) < 0x80 && s.code_unit_at(p) != 92) {
+      self.pos = p
+      return Ok(s.slice(start, p))
+    }
+  }
+
+  // General path: Unicode characters and/or \uXXXX escapes
+  let sb = StringBuilder::new()
+  let mut p = start
+  let mut first = true
+  while p < n {
+    let b = s.code_unit_at(p)
+    if b == 92 {
+      // Must be \uXXXX
+      if p + 1 >= n || s.code_unit_at(p + 1) != 117 {
+        return Err(self.err(p, "invalid escape in unquoted identifier key"))
+      }
+      self.pos = p + 2
+      let cp = match self.parse_hex4() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      p = self.pos
+      let valid = if first { is_es5_id_start(cp) } else { is_es5_id_part(cp) }
+      if !valid {
+        return Err(self.err(start, "invalid Unicode escape in identifier key"))
+      }
+      write_utf8(sb, cp)
+      first = false
+    } else if b < 0x80 {
+      let valid = if first { is_ascii_id_start(b) } else { is_ascii_id_part(b) }
+      if !valid {
+        break
+      }
+      sb.write_byte(b.to_byte())
+      p = p + 1
+      first = false
+    } else {
+      let (cp, clen) = decode_utf8_at(s, p)
+      let valid = if first { is_es5_id_start(cp) } else { is_es5_id_part(cp) }
+      if !valid {
+        break
+      }
+      write_utf8(sb, cp)
+      p = p + clen
+      first = false
+    }
+  }
+  if first {
+    return Err(self.err(start, "invalid unquoted object key"))
+  }
+  self.pos = p
+  Ok(sb.to_string())
+}
+
+///| Parse an object key (quoted string, or unquoted identifier in JSON5 mode).
+fn Parser::parse_object_key(self : Parser) -> Result[String, Json5Error] {
+  if self.pos >= self.len {
+    return Err(self.err(self.pos, "unexpected EOF while expecting object key"))
+  }
+  let b = self.src.code_unit_at(self.pos)
+  if b == 34 || b == 39 {
+    self.parse_string()
+  } else if self.opts.allow_json5 {
+    self.parse_identifier_key()
+  } else {
+    Err(self.err(self.pos, "object keys must be double-quoted strings in JSON/JSONC"))
+  }
+}
+
+///| Check if `self.src` at `pos` matches literal `lit`.
+fn Parser::starts_with(self : Parser, pos : Int, lit : String) -> Bool {
+  let m = lit.length()
+  if pos + m > self.len {
+    return false
+  }
+  let mut i = 0
+  while i < m {
+    if self.src.code_unit_at(pos + i) != lit.code_unit_at(i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Check if byte at `pos` is a valid token boundary after a keyword or number.
+fn Parser::is_delim_at(self : Parser, pos : Int) -> Bool {
+  if pos >= self.len {
+    return true
+  }
+  let b = self.src.code_unit_at(pos)
+  if b < 0x80 {
+    b == 44 ||
+    b == 93 ||
+    b == 125 ||
+    b == 58 ||
+    b == 47 ||
+    is_ascii_j5_ws(b)
+  } else if self.opts.allow_json5 {
+    let (cp, _) = decode_utf8_at(self.src, pos)
+    is_unicode_j5_ws(cp)
+  } else {
+    false
+  }
+}
+
+///| Parse a JSON5 / JSON numeric literal (hex, Infinity, NaN, decimal int/float).
+fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
+  let s = self.src
+  let n = self.len
+  let allow_j5 = self.opts.allow_json5
+  let start = self.pos
+  let mut p = start
+  let mut neg = false
+  let mut has_plus = false
+
+  let b0 = s.code_unit_at(p)
+  if b0 == 45 {
+    neg = true
+    p = p + 1
+  } else if b0 == 43 {
+    if !allow_j5 {
+      return Err(self.err(p, "explicit '+' sign is not allowed in JSON/JSONC"))
+    }
+    has_plus = true
+    p = p + 1
+  }
+  if p >= n {
+    return Err(self.err(start, "unexpected EOF in number"))
+  }
+
+  // Infinity / NaN (JSON5 only)
+  let c = s.code_unit_at(p)
+  if c == 73 && allow_j5 && self.starts_with(p, "Infinity") {
+    let end = p + 8
+    if !self.is_delim_at(end) {
+      return Err(self.err(end, "unexpected trailing character after Infinity"))
+    }
+    self.pos = end
+    return Ok(if neg { -1.0 / 0.0 } else { 1.0 / 0.0 })
+  }
+  if c == 78 && allow_j5 && self.starts_with(p, "NaN") {
+    let end = p + 3
+    if !self.is_delim_at(end) {
+      return Err(self.err(end, "unexpected trailing character after NaN"))
+    }
+    self.pos = end
+    return Ok(0.0 / 0.0)
+  }
+
+  // Hexadecimal integer 0x... / 0X... (JSON5 only)
+  if c == 48 &&
+  p + 1 < n &&
+  (s.code_unit_at(p + 1) == 120 || s.code_unit_at(p + 1) == 88) {
+    if !allow_j5 {
+      return Err(self.err(start, "hexadecimal numbers are not allowed in JSON/JSONC"))
+    }
+    p = p + 2
+    let hex_start = p
+    let mut acc_u : UInt64 = 0UL
+    let mut acc_d : Double = 0.0
+    let mut use_double = false
+    while p < n {
+      let hv = hex_val(s.code_unit_at(p))
+      if hv >= 16 {
+        break
+      }
+      if !use_double {
+        if p - hex_start < 15 {
+          acc_u = (acc_u << 4UL) | hv.to_int64().reinterpret_as_uint64()
+        } else {
+          acc_d = acc_u.to_int64().to_double() * 16.0 + hv.to_double()
+          use_double = true
+        }
+      } else {
+        acc_d = acc_d * 16.0 + hv.to_double()
+      }
+      p = p + 1
+    }
+    if p == hex_start {
+      return Err(self.err(start, "expected hexadecimal digits after 0x"))
+    }
+    if !self.is_delim_at(p) {
+      return Err(self.err(p, "unexpected character after hexadecimal number"))
+    }
+    let num_val = if use_double { acc_d } else { acc_u.to_int64().to_double() }
+    if self.opts.reject_overflow && (num_val == 1.0 / 0.0 || num_val == -1.0 / 0.0) {
+      return Err(self.err(start, "hexadecimal number overflow"))
+    }
+    self.pos = p
+    if neg {
+      return Ok(if num_val == 0.0 { -0.0 } else { -num_val })
+    }
+    return Ok(num_val)
+  }
+
+  // Decimal number
+  let num_start = p
+  let mut has_int_digits = false
+  let mut has_dot = false
+  let mut has_frac_digits = false
+  let mut has_exp = false
+  let mut fast_int : Int64 = 0L
+  let mut fast_ok = true
+  let mut int_digit_count = 0
+
+  if c == 48 {
+    has_int_digits = true
+    int_digit_count = 1
+    p = p + 1
+    if p < n && is_ascii_digit(s.code_unit_at(p)) {
+      return Err(self.err(p, "leading zero is not allowed in number"))
+    }
+  } else if is_ascii_digit(c) {
+    has_int_digits = true
+    while p < n {
+      let d = s.code_unit_at(p)
+      if !is_ascii_digit(d) {
+        break
+      }
+      if int_digit_count < 15 {
+        fast_int = fast_int * 10L + (d - 48).to_int64()
+      } else {
+        fast_ok = false
+      }
+      int_digit_count = int_digit_count + 1
+      p = p + 1
+    }
+  } else if c != 46 {
+    return Err(self.err(p, "invalid number literal"))
+  }
+
+  // Fractional part
+  if p < n && s.code_unit_at(p) == 46 {
+    if !has_int_digits && !allow_j5 {
+      return Err(self.err(p, "leading decimal point is not allowed in JSON/JSONC"))
+    }
+    has_dot = true
+    fast_ok = false
+    p = p + 1
+    while p < n && is_ascii_digit(s.code_unit_at(p)) {
+      has_frac_digits = true
+      p = p + 1
+    }
+    if !has_int_digits && !has_frac_digits {
+      return Err(self.err(start, "lone decimal point is not a valid number"))
+    }
+    if !has_frac_digits && !allow_j5 {
+      return Err(self.err(p, "trailing decimal point is not allowed in JSON/JSONC"))
+    }
+  }
+
+  // Exponent part
+  if p < n && (s.code_unit_at(p) == 101 || s.code_unit_at(p) == 69) {
+    has_exp = true
+    fast_ok = false
+    p = p + 1
+    if p < n && (s.code_unit_at(p) == 43 || s.code_unit_at(p) == 45) {
+      p = p + 1
+    }
+    let exp_start = p
+    while p < n && is_ascii_digit(s.code_unit_at(p)) {
+      p = p + 1
+    }
+    if p == exp_start {
+      return Err(self.err(p, "expected exponent digits"))
+    }
+  }
+
+  if !self.is_delim_at(p) {
+    return Err(self.err(p, "unexpected trailing character in number"))
+  }
+  self.pos = p
+
+  // Fast path: exact small integer (no dot, no exp, <= 15 digits)
+  if fast_ok && !has_dot && !has_exp {
+    if neg {
+      if fast_int == 0L {
+        return Ok(-0.0)
+      }
+      return Ok((-fast_int).to_double())
+    }
+    return Ok(fast_int.to_double())
+  }
+
+  // General float path: normalize JSON5 leading '+' / leading '.' / trailing '.' for to_double()
+  let needs_norm = has_plus || !has_int_digits || (has_dot && !has_frac_digits)
+  let raw = if !needs_norm {
+    s.slice(start, p)
+  } else {
+    let sb = StringBuilder::new()
+    if neg {
+      sb.write_byte((45).to_byte())
+    }
+    if !has_int_digits {
+      sb.write_byte((48).to_byte())
+    }
+    // Copy body, inserting '0' after '.' if trailing decimal point before 'e'/'E' or end
+    let mut k = num_start
+    while k < p {
+      let ch = s.code_unit_at(k)
+      sb.write_byte(ch.to_byte())
+      if ch == 46 && !has_frac_digits {
+        sb.write_byte((48).to_byte())
+      }
+      k = k + 1
+    }
+    sb.to_string()
+  }
+
+  match raw.to_double() {
+    Some(v) => {
+      if self.opts.reject_overflow && (v == 1.0 / 0.0 || v == -1.0 / 0.0) {
+        return Err(self.err(start, "floating-point number overflow"))
+      }
+      if neg && v == 0.0 {
+        return Ok(-0.0)
+      }
+      Ok(v)
+    }
+    None => Err(self.err(start, "invalid floating-point number"))
+  }
+}
+
+///| Insert `(key, val)` into an `ObjFrame` honoring `DuplicateKeyPolicy`.
+fn insert_obj_entry(
+  frame : ObjFrame,
+  key : String,
+  value : Json5Value,
+  policy : DuplicateKeyPolicy,
+  seed : UInt64,
+  err_fn : () -> Json5Error,
+) -> Result[Unit, Json5Error] {
+  let entries = frame.entries
+  let n = entries.length()
+
+  // Upgrade to seeded HashIndex once object grows to 16 keys (defeats O(N^2) / HashDoS)
+  if n >= 16 {
+    let hi = match frame.index {
+      Some(existing) => existing
+      None => {
+        let idx = HashIndex::new(32, seed)
+        let mut i = 0
+        while i < n {
+          let (k, _) = entries[i]
+          idx.insert(k, i, -1)
+          i = i + 1
+        }
+        frame.index = Some(idx)
+        idx
+      }
+    }
+    let existing_pos = hi.get_entry(key)
+    if existing_pos >= 0 {
+      match policy {
+        DuplicateKeyPolicy::LastWins => {
+          entries[existing_pos] = (key, value)
+          return Ok(())
+        }
+        DuplicateKeyPolicy::FirstWins => return Ok(())
+        DuplicateKeyPolicy::Reject => return Err(err_fn())
+      }
+    }
+    hi.insert(key, n, -1)
+    entries.push((key, value))
+    return Ok(())
+  }
+
+  // Linear scan for small objects (< 16 keys, zero HashIndex allocation)
+  let mut i = 0
+  while i < n {
+    let (k, _) = entries[i]
+    if k == key {
+      match policy {
+        DuplicateKeyPolicy::LastWins => {
+          entries[i] = (key, value)
+          return Ok(())
+        }
+        DuplicateKeyPolicy::FirstWins => return Ok(())
+        DuplicateKeyPolicy::Reject => return Err(err_fn())
+      }
+    }
+    i = i + 1
+  }
+  entries.push((key, value))
+  Ok(())
+}
+
+///| Parse a validated UTF-8 `String` iteratively into a `Json5Value`.
+fn parse_validated(
+  src : String,
+  opts : ParseOptions,
+) -> Result[Json5Value, Json5Error] {
+  let p = Parser::new(src, opts)
+  let stack : Array[ContainerFrame] = []
+
+  // Iterative parse loop: each iteration parses one value (or opens a container),
+  // then runs the deliver loop when a value completes.
+  while true {
+    match p.skip_ws() {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    if p.pos >= p.len {
+      return Err(p.err(p.pos, "unexpected EOF while expecting value"))
+    }
+
+    let val_start = p.pos
+    let b = p.src.code_unit_at(val_start)
+    let mut completed : Option[Json5Value] = None
+
+    if b == 91 {
+      // '[' Array
+      match p.bump_node(val_start) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      if stack.length() >= opts.max_depth {
+        return Err(p.err(val_start, "maximum nesting depth exceeded"))
+      }
+      p.pos = val_start + 1
+      match p.skip_ws() {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      if p.pos < p.len && p.src.code_unit_at(p.pos) == 93 {
+        p.pos = p.pos + 1
+        completed = Some(Json5Value::Array([]))
+      } else {
+        stack.push(ContainerFrame::Arr([]))
+        continue
+      }
+    } else if b == 123 {
+      // '{' Object
+      match p.bump_node(val_start) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      if stack.length() >= opts.max_depth {
+        return Err(p.err(val_start, "maximum nesting depth exceeded"))
+      }
+      p.pos = val_start + 1
+      match p.skip_ws() {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      if p.pos < p.len && p.src.code_unit_at(p.pos) == 125 {
+        p.pos = p.pos + 1
+        completed = Some(Json5Value::Object([]))
+      } else {
+        let key = match p.parse_object_key() {
+          Ok(k) => k
+          Err(e) => return Err(e)
+        }
+        match p.skip_ws() {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        if p.pos >= p.len || p.src.code_unit_at(p.pos) != 58 {
+          return Err(p.err(p.pos, "expected ':' after object key"))
+        }
+        p.pos = p.pos + 1
+        stack.push(
+          ContainerFrame::Obj(
+            ObjFrame::{ entries: [], index: None, pending_key: key },
+          ),
+        )
+        continue
+      }
+    } else if b == 34 || b == 39 {
+      match p.bump_node(val_start) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      match p.parse_string() {
+        Ok(s) => completed = Some(Json5Value::Str(s))
+        Err(e) => return Err(e)
+      }
+    } else if b == 116 && p.starts_with(val_start, "true") && p.is_delim_at(val_start + 4) {
+      match p.bump_node(val_start) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      p.pos = val_start + 4
+      completed = Some(Json5Value::Bool(true))
+    } else if b == 102 && p.starts_with(val_start, "false") && p.is_delim_at(val_start + 5) {
+      match p.bump_node(val_start) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      p.pos = val_start + 5
+      completed = Some(Json5Value::Bool(false))
+    } else if b == 110 && p.starts_with(val_start, "null") && p.is_delim_at(val_start + 4) {
+      match p.bump_node(val_start) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      p.pos = val_start + 4
+      completed = Some(Json5Value::Null)
+    } else if is_ascii_digit(b) ||
+    b == 45 ||
+    b == 43 ||
+    b == 46 ||
+    b == 73 ||
+    b == 78 {
+      match p.bump_node(val_start) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      match p.parse_number() {
+        Ok(num) => completed = Some(Json5Value::Number(num))
+        Err(e) => return Err(e)
+      }
+    } else {
+      return Err(p.err(val_start, "unexpected character while parsing value"))
+    }
+
+    // Deliver completed value up the explicit container stack
+    let mut cur = match completed {
+      Some(v) => v
+      None => return Err(p.err(val_start, "internal parser state error"))
+    }
+    while true {
+      if stack.length() == 0 {
+        match p.skip_ws() {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        if p.pos != p.len {
+          return Err(p.err(p.pos, "unexpected trailing content after value"))
+        }
+        return Ok(cur)
+      }
+      let top_idx = stack.length() - 1
+      match stack[top_idx] {
+        ContainerFrame::Arr(items) => {
+          items.push(cur)
+          match p.skip_ws() {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          if p.pos >= p.len {
+            return Err(p.err(p.pos, "unterminated array"))
+          }
+          let sep = p.src.code_unit_at(p.pos)
+          if sep == 44 {
+            p.pos = p.pos + 1
+            match p.skip_ws() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            if p.pos < p.len && p.src.code_unit_at(p.pos) == 93 {
+              if !opts.allow_trailing_commas {
+                return Err(p.err(p.pos, "trailing comma is not allowed in strict JSON"))
+              }
+              p.pos = p.pos + 1
+              let _ = stack.pop()
+              cur = Json5Value::Array(items)
+              continue
+            }
+            // Parse next array element
+            break
+          } else if sep == 93 {
+            p.pos = p.pos + 1
+            let _ = stack.pop()
+            cur = Json5Value::Array(items)
+            continue
+          } else {
+            return Err(p.err(p.pos, "expected ',' or ']' in array"))
+          }
+        }
+        ContainerFrame::Obj(frame) => {
+          let key = frame.pending_key
+          let key_off = p.pos
+          match insert_obj_entry(
+            frame,
+            key,
+            cur,
+            opts.duplicate_keys,
+            p.seed,
+            fn() { p.err(key_off, "duplicate object key: " + key) },
+          ) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          match p.skip_ws() {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          if p.pos >= p.len {
+            return Err(p.err(p.pos, "unterminated object"))
+          }
+          let sep = p.src.code_unit_at(p.pos)
+          if sep == 44 {
+            p.pos = p.pos + 1
+            match p.skip_ws() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            if p.pos < p.len && p.src.code_unit_at(p.pos) == 125 {
+              if !opts.allow_trailing_commas {
+                return Err(p.err(p.pos, "trailing comma is not allowed in strict JSON"))
+              }
+              p.pos = p.pos + 1
+              let _ = stack.pop()
+              cur = Json5Value::Object(frame.entries)
+              continue
+            }
+            let next_key = match p.parse_object_key() {
+              Ok(k) => k
+              Err(e) => return Err(e)
+            }
+            match p.skip_ws() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            if p.pos >= p.len || p.src.code_unit_at(p.pos) != 58 {
+              return Err(p.err(p.pos, "expected ':' after object key"))
+            }
+            p.pos = p.pos + 1
+            frame.pending_key = next_key
+            break
+          } else if sep == 125 {
+            p.pos = p.pos + 1
+            let _ = stack.pop()
+            cur = Json5Value::Object(frame.entries)
+            continue
+          } else {
+            return Err(p.err(p.pos, "expected ',' or '}' in object"))
+          }
+        }
+      }
+    }
+  }
+  Err(p.err(p.pos, "unreachable"))
+}
