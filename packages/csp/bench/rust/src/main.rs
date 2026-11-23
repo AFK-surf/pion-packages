@@ -1,8 +1,15 @@
-//! Idiomatic zero-dependency Rust reference implementation of W3C CSP Level 3 +
-//! WHATWG Fetch CORS for head-to-head benchmarking against `packages/csp`.
-//! Compiled with `cargo build --release`.
+//! Independent Rust W3C CSP Level 3 + WHATWG Fetch CORS benchmark baseline
+//! powered by `servo/rust-url` (`url = 2.5`) and `percent-encoding = 2.3`,
+//! compiled with `cargo build --release`.
+//!
+//! Uses full byte-by-byte FNV-1a 64-bit hashing over every decision field
+//! (allowed, violated_directive, effective_directive, matched_source,
+//! exposed_headers, origin, max_age) for strict parity with `packages/csp`.
 
+use percent_encoding::percent_decode_str;
+use std::collections::HashSet;
 use std::env;
+use url::{Origin as UrlOrigin, Url};
 
 #[derive(Clone, Debug)]
 enum SourceExpression {
@@ -17,22 +24,16 @@ enum SourceExpression {
     Nonce(String),
     Hash(String, String),
     Scheme(String),
-    Host(Option<String>, String, Option<i32>, bool, String),
+    Host(Option<String>, String, Option<u16>, bool, String),
 }
 
 struct CspDirective {
     name: String,
     sources: Vec<SourceExpression>,
-    #[allow(dead_code)]
-    raw_values: Vec<String>,
 }
 
 struct CspPolicy {
     directives: Vec<CspDirective>,
-    #[allow(dead_code)]
-    upgrade_insecure_requests: bool,
-    #[allow(dead_code)]
-    block_all_mixed_content: bool,
 }
 
 struct CspDecision {
@@ -45,14 +46,7 @@ struct CspDecision {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CredentialsMode {
     Omit,
-    #[allow(dead_code)]
-    SameOrigin,
     Include,
-}
-
-enum Origin {
-    Opaque,
-    Tuple(String, String, i32),
 }
 
 struct CorsResponseDecision {
@@ -67,42 +61,74 @@ struct CorsPreflightDecision {
 }
 
 #[inline]
+fn fnv1a_byte(h: u64, b: u8) -> u64 {
+    (h ^ (b as u64)).wrapping_mul(1099511628211u64)
+}
+
+#[inline]
+fn fnv1a_str(mut h: u64, s: &str) -> u64 {
+    for &b in s.as_bytes() {
+        h = fnv1a_byte(h, b);
+    }
+    fnv1a_byte(h, 0xFF)
+}
+
+fn hash_decision(h: u64, d: &CspDecision) -> u64 {
+    let mut h = fnv1a_byte(h, if d.allowed { 1 } else { 0 });
+    h = fnv1a_str(h, &d.violated_directive);
+    h = fnv1a_str(h, &d.effective_directive);
+    match &d.matched_source {
+        Some(s) => fnv1a_str(fnv1a_byte(h, 1), s),
+        None => fnv1a_byte(h, 0),
+    }
+}
+
+#[inline]
 fn is_csp_ws(b: u8) -> bool {
     b == b' ' || b == b'\t' || b == 12
 }
 
 #[inline]
-fn default_port(scheme: &str) -> i32 {
+fn default_port(scheme: &str) -> Option<u16> {
     match scheme {
-        "http" | "ws" => 80,
-        "https" | "wss" => 443,
-        "ftp" => 21,
-        _ => -1,
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
     }
 }
 
 fn is_valid_scheme(s: &str) -> bool {
     let bytes = s.as_bytes();
-    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
-        return false;
-    }
-    bytes[1..]
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.')
+    !bytes.is_empty()
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1..]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
-fn parse_port(s: &str) -> i32 {
-    if s.is_empty() || s.len() > 5 {
-        return -1;
+fn is_valid_host_part(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
     }
-    let mut acc: i32 = 0;
-    for &b in s.as_bytes() {
-        if !b.is_ascii_digit() {
-            return -1;
+    if host == "*" {
+        return true;
+    }
+    if host.starts_with('[') && host.ends_with(']') && host.len() >= 3 {
+        return host[1..host.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+    }
+    let body = if let Some(rest) = host.strip_prefix("*.") {
+        if rest.is_empty() {
+            return false;
         }
-        acc = acc * 10 + (b - b'0') as i32;
-    }
-    if acc > 65535 { -1 } else { acc }
+        rest
+    } else {
+        host
+    };
+    body.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
 fn format_source_expression(expr: &SourceExpression) -> String {
@@ -140,12 +166,11 @@ fn format_source_expression(expr: &SourceExpression) -> String {
 }
 
 fn parse_source_expression(tok: &str) -> Option<SourceExpression> {
-    let bytes = tok.as_bytes();
-    let n = bytes.len();
-    if n == 0 {
+    if tok.is_empty() || !tok.is_ascii() {
         return None;
     }
-    if n >= 2 && bytes[0] == b'\'' && bytes[n - 1] == b'\'' {
+    let n = tok.len();
+    if n >= 2 && tok.starts_with('\'') && tok.ends_with('\'') {
         let lower = tok.to_ascii_lowercase();
         return match lower.as_str() {
             "'none'" => Some(SourceExpression::NoneExpr),
@@ -174,6 +199,9 @@ fn parse_source_expression(tok: &str) -> Option<SourceExpression> {
             _ => None,
         };
     }
+    if tok.starts_with('\'') || tok.contains(',') {
+        return None;
+    }
     if tok == "*" {
         return Some(SourceExpression::Host(
             None,
@@ -183,7 +211,7 @@ fn parse_source_expression(tok: &str) -> Option<SourceExpression> {
             String::new(),
         ));
     }
-    if bytes[n - 1] == b':' && !tok.contains('/') {
+    if tok.ends_with(':') && !tok.contains('/') {
         let sch = &tok[..n - 1];
         if is_valid_scheme(sch) {
             return Some(SourceExpression::Scheme(sch.to_ascii_lowercase()));
@@ -191,20 +219,19 @@ fn parse_source_expression(tok: &str) -> Option<SourceExpression> {
         return None;
     }
 
-    let mut opt_scheme = None;
-    let mut rest = tok;
-    if let Some(sep) = tok.find("://") {
-        let sch = &tok[..sep];
-        if !is_valid_scheme(sch) {
-            return None;
+    let (opt_scheme, rest) = match tok.find("://") {
+        Some(sep) => {
+            let sch = &tok[..sep];
+            if !is_valid_scheme(sch) {
+                return None;
+            }
+            (Some(sch.to_ascii_lowercase()), &tok[sep + 3..])
         }
-        opt_scheme = Some(sch.to_ascii_lowercase());
-        rest = &tok[sep + 3..];
-    }
+        None => (None, tok),
+    };
     if rest.is_empty() {
         return None;
     }
-
     let (hostport, path) = match rest.find('/') {
         Some(slash) => {
             let mut p = &rest[slash..];
@@ -218,11 +245,9 @@ fn parse_source_expression(tok: &str) -> Option<SourceExpression> {
         }
         None => (rest, String::new()),
     };
-
     if hostport.is_empty() {
         return None;
     }
-
     let (host, opt_port, port_wild) = if hostport.starts_with('[') {
         let rb = hostport.find(']')?;
         let h = hostport[..=rb].to_ascii_lowercase();
@@ -233,11 +258,7 @@ fn parse_source_expression(tok: &str) -> Option<SourceExpression> {
             if pstr == "*" {
                 (h, None, true)
             } else {
-                let p = parse_port(pstr);
-                if p < 0 {
-                    return None;
-                }
-                (h, Some(p), false)
+                (h, Some(pstr.parse::<u16>().ok()?), false)
             }
         } else {
             return None;
@@ -248,17 +269,12 @@ fn parse_source_expression(tok: &str) -> Option<SourceExpression> {
         if pstr == "*" {
             (h, None, true)
         } else {
-            let p = parse_port(pstr);
-            if p < 0 {
-                return None;
-            }
-            (h, Some(p), false)
+            (h, Some(pstr.parse::<u16>().ok()?), false)
         }
     } else {
         (hostport.to_ascii_lowercase(), None, false)
     };
-
-    if host.is_empty() {
+    if !is_valid_host_part(&host) {
         return None;
     }
     Some(SourceExpression::Host(
@@ -284,151 +300,51 @@ fn parse_csp(header: &str) -> Result<CspPolicy, &'static str> {
         return Err("header too large");
     }
     for &b in header.as_bytes() {
-        if b == 0 || b == 10 || b == 13 || b == 127 || b > 127 || (b < 32 && b != 9 && b != 12) {
-            return Err("invalid header byte");
+        if b == 0 || b == 10 || b == 13 || b == 127 || (b < 32 && b != 9 && b != 12) {
+            return Err("invalid control byte");
         }
     }
-    let mut directives: Vec<CspDirective> = Vec::new();
-    let mut upgrade_insecure_requests = false;
-    let mut block_all_mixed_content = false;
-
-    for raw in header.split(';') {
+    let first_policy = header.split(',').next().unwrap_or("");
+    let mut directives = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in first_policy.split(';') {
         let trimmed = raw.trim_matches(|c: char| is_csp_ws(c as u8));
         if trimmed.is_empty() {
             continue;
         }
-        let mut iter = trimmed.split(|c: char| is_csp_ws(c as u8)).filter(|s| !s.is_empty());
+        let mut iter = trimmed
+            .split(|c: char| is_csp_ws(c as u8))
+            .filter(|s| !s.is_empty());
         let name_raw = match iter.next() {
-            Some(n) => n,
-            None => continue,
+            Some(n) if n.is_ascii() => n,
+            _ => continue,
         };
         let name = name_raw.to_ascii_lowercase();
-        if directives.iter().any(|d| d.name == name) {
+        if !seen.insert(name.clone()) {
             continue;
         }
         let parse_sources = is_source_list_directive(&name);
         let mut sources = Vec::new();
-        let mut raw_values = Vec::new();
         for tok in iter {
-            raw_values.push(tok.to_string());
+            if !tok.is_ascii() {
+                continue;
+            }
             if parse_sources {
                 if let Some(expr) = parse_source_expression(tok) {
                     sources.push(expr);
                 }
             }
         }
-        if name == "upgrade-insecure-requests" {
-            upgrade_insecure_requests = true;
-        } else if name == "block-all-mixed-content" {
-            block_all_mixed_content = true;
-        }
-        directives.push(CspDirective {
-            name,
-            sources,
-            raw_values,
-        });
+        directives.push(CspDirective { name, sources });
     }
-    Ok(CspPolicy {
-        directives,
-        upgrade_insecure_requests,
-        block_all_mixed_content,
-    })
-}
-
-struct UrlParts<'a> {
-    scheme: String,
-    host: String,
-    port: i32,
-    path: &'a str,
-    has_host: bool,
-}
-
-fn parse_url_parts(raw: &str) -> UrlParts<'_> {
-    let s = raw.trim_matches(|c: char| is_csp_ws(c as u8));
-    let colon = match s.find(':') {
-        Some(c) if c > 0 => c,
-        _ => {
-            return UrlParts {
-                scheme: String::new(),
-                host: String::new(),
-                port: -1,
-                path: s,
-                has_host: false,
-            }
-        }
-    };
-    let scheme = s[..colon].to_ascii_lowercase();
-    let rest = &s[colon + 1..];
-    if !rest.starts_with("//") {
-        return UrlParts {
-            scheme,
-            host: String::new(),
-            port: -1,
-            path: rest,
-            has_host: false,
-        };
-    }
-    let after = &rest[2..];
-    let auth_end = after
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(after.len());
-    let auth = &after[..auth_end];
-    let mut path = if auth_end < after.len() && after.as_bytes()[auth_end] == b'/' {
-        let mut p = &after[auth_end..];
-        if let Some(q) = p.find('?') {
-            p = &p[..q];
-        }
-        if let Some(h) = p.find('#') {
-            p = &p[..h];
-        }
-        p
-    } else {
-        "/"
-    };
-    if path.is_empty() {
-        path = "/";
-    }
-    let hostport = match auth.find('@') {
-        Some(at) => &auth[at + 1..],
-        None => auth,
-    };
-    let mut host = String::new();
-    let mut port = default_port(&scheme);
-    if !hostport.is_empty() {
-        if hostport.starts_with('[') {
-            if let Some(rb) = hostport.find(']') {
-                host = hostport[..=rb].to_ascii_lowercase();
-                if let Some(pstr) = hostport[rb + 1..].strip_prefix(':') {
-                    let p = parse_port(pstr);
-                    if p >= 0 {
-                        port = p;
-                    }
-                }
-            }
-        } else if let Some(pc) = hostport.find(':') {
-            host = hostport[..pc].to_ascii_lowercase();
-            let p = parse_port(&hostport[pc + 1..]);
-            if p >= 0 {
-                port = p;
-            }
-        } else {
-            host = hostport.to_ascii_lowercase();
-        }
-    }
-    let has_host = !host.is_empty();
-    UrlParts {
-        scheme,
-        host,
-        port,
-        path,
-        has_host,
-    }
+    Ok(CspPolicy { directives })
 }
 
 fn scheme_matches(expr_scheme: &str, target_scheme: &str) -> bool {
     expr_scheme == target_scheme
         || (expr_scheme == "http" && target_scheme == "https")
-        || (expr_scheme == "ws" && target_scheme == "wss")
+        || (expr_scheme == "ws" && matches!(target_scheme, "wss" | "http" | "https"))
+        || (expr_scheme == "wss" && target_scheme == "https")
 }
 
 fn host_matches(pat: &str, target_host: &str) -> bool {
@@ -443,7 +359,7 @@ fn host_matches(pat: &str, target_host: &str) -> bool {
     pat == target_host
 }
 
-fn has_path_traversal(path: &str) -> bool {
+fn path_has_encoded_slash(path: &str) -> bool {
     let bytes = path.as_bytes();
     for i in 0..bytes.len() {
         if bytes[i] == b'\\' {
@@ -459,34 +375,6 @@ fn has_path_traversal(path: &str) -> bool {
             }
         }
     }
-    for seg in path.split('/') {
-        if seg.is_empty() {
-            continue;
-        }
-        let sb = seg.as_bytes();
-        let mut p = 0;
-        let mut dots = 0;
-        let mut all_dots = true;
-        while p < sb.len() {
-            if sb[p] == b'.' {
-                dots += 1;
-                p += 1;
-            } else if p + 2 < sb.len()
-                && sb[p] == b'%'
-                && sb[p + 1] == b'2'
-                && (sb[p + 2] == b'e' || sb[p + 2] == b'E')
-            {
-                dots += 1;
-                p += 3;
-            } else {
-                all_dots = false;
-                break;
-            }
-        }
-        if all_dots && dots == 2 {
-            return true;
-        }
-    }
     false
 }
 
@@ -494,71 +382,113 @@ fn path_matches(expr_path: &str, target_path: &str) -> bool {
     if expr_path.is_empty() {
         return true;
     }
-    if has_path_traversal(target_path) {
+    if expr_path == "/" && target_path.is_empty() {
+        return true;
+    }
+    if path_has_encoded_slash(target_path) {
         return false;
     }
-    if expr_path.ends_with('/') {
-        target_path.starts_with(expr_path)
-    } else {
-        expr_path == target_path
+    let exact = !expr_path.ends_with('/');
+    let a: Vec<&str> = expr_path.split('/').collect();
+    let b: Vec<&str> = target_path.split('/').collect();
+    if a.len() > b.len() || (exact && a.len() != b.len()) {
+        return false;
     }
+    let check_len = if exact { a.len() } else { a.len() - 1 };
+    for i in 0..check_len {
+        let da = percent_decode_str(a[i]).decode_utf8_lossy();
+        let db = percent_decode_str(b[i]).decode_utf8_lossy();
+        if da != db {
+            return false;
+        }
+    }
+    true
 }
 
-fn expr_matches_url(expr: &SourceExpression, page: &UrlParts<'_>, target: &UrlParts<'_>) -> bool {
+fn expr_matches_url(
+    expr: &SourceExpression,
+    page: Option<&(String, String, u16)>,
+    target: &Url,
+) -> bool {
+    let ts = target.scheme();
+    let th = target.host_str().unwrap_or("");
     match expr {
         SourceExpression::NoneExpr => false,
         SourceExpression::SelfExpr => {
-            if !page.has_host || !target.has_host {
+            let (ps, ph, pp) = match page {
+                Some(p) => p,
+                None => return false,
+            };
+            if th.is_empty() || ph != th {
                 return false;
             }
-            if !scheme_matches(&page.scheme, &target.scheme) || page.host != target.host {
-                return false;
-            }
-            if page.port == target.port {
+            let tp = target.port_or_known_default();
+            if ps == ts && tp == Some(*pp) {
                 return true;
             }
-            (page.scheme == "http" && target.scheme == "https" && page.port == 80 && target.port == 443)
-                || (page.scheme == "ws" && target.scheme == "wss" && page.port == 80 && target.port == 443)
+            let port_ok = tp == Some(*pp)
+                || (default_port(ps) == Some(*pp)
+                    && default_port(ts).is_some()
+                    && tp == default_port(ts));
+            if !port_ok {
+                return false;
+            }
+            ts == "https" || ts == "wss" || (ps == "http" && (ts == "http" || ts == "ws"))
         }
-        SourceExpression::Scheme(s) => scheme_matches(s, &target.scheme),
+        SourceExpression::Scheme(s) => scheme_matches(s, ts),
         SourceExpression::Host(opt_scheme, host_pat, opt_port, port_wild, path_pat) => {
-            if opt_scheme.is_none() && opt_port.is_none() && !*port_wild && host_pat == "*" && path_pat.is_empty() {
-                if matches!(
-                    target.scheme.as_str(),
-                    "data" | "blob" | "filesystem" | "javascript" | "about"
-                ) {
+            if opt_scheme.is_none()
+                && opt_port.is_none()
+                && !*port_wild
+                && host_pat == "*"
+                && path_pat.is_empty()
+            {
+                if matches!(ts, "data" | "blob" | "filesystem" | "javascript" | "about") {
                     return false;
                 }
-                return matches!(target.scheme.as_str(), "http" | "https" | "ws" | "wss")
-                    || (!page.scheme.is_empty() && target.scheme == page.scheme);
+                return matches!(ts, "http" | "https" | "ws" | "wss")
+                    || page.map(|(ps, _, _)| ps == ts).unwrap_or(false);
             }
-            if !target.has_host {
+            if th.is_empty() {
                 return false;
             }
-            let eff_scheme = opt_scheme.as_deref().unwrap_or(&page.scheme);
-            if !eff_scheme.is_empty() && !scheme_matches(eff_scheme, &target.scheme) {
-                return false;
-            }
-            if !host_matches(host_pat, &target.host) {
-                return false;
-            }
-            if !*port_wild {
-                if let Some(ep) = opt_port {
-                    if target.port != *ep {
-                        let up = (eff_scheme == "http" && target.scheme == "https" && *ep == 80 && target.port == 443)
-                            || (eff_scheme == "ws" && target.scheme == "wss" && *ep == 80 && target.port == 443);
-                        if !up {
-                            return false;
-                        }
-                    }
-                } else {
-                    let def_p = default_port(&target.scheme);
-                    if def_p >= 0 && target.port != def_p {
+            match opt_scheme {
+                Some(es) => {
+                    if !scheme_matches(es, ts) {
                         return false;
                     }
                 }
+                None => match page {
+                    Some((ps, _, _)) => {
+                        if !scheme_matches(ps, ts) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                },
             }
-            path_matches(path_pat, target.path)
+            if !host_matches(host_pat, th) {
+                return false;
+            }
+            if !*port_wild {
+                match opt_port {
+                    Some(ep) => {
+                        let eff = target.port_or_known_default();
+                        if eff != Some(*ep) {
+                            let up = *ep == 80 && (ts == "https" || ts == "wss") && eff == Some(443);
+                            if !up {
+                                return false;
+                            }
+                        }
+                    }
+                    None => {
+                        if target.port().is_some() {
+                            return false;
+                        }
+                    }
+                }
+            }
+            path_matches(path_pat, target.path())
         }
         _ => false,
     }
@@ -566,6 +496,26 @@ fn expr_matches_url(expr: &SourceExpression, page: &UrlParts<'_>, target: &UrlPa
 
 fn find_dir<'a>(policy: &'a CspPolicy, name: &str) -> Option<&'a CspDirective> {
     policy.directives.iter().find(|d| d.name == name)
+}
+
+fn is_non_fetch_directive(d: &str) -> bool {
+    matches!(
+        d,
+        "base-uri"
+            | "form-action"
+            | "frame-ancestors"
+            | "sandbox"
+            | "navigate-to"
+            | "report-uri"
+            | "report-to"
+            | "upgrade-insecure-requests"
+            | "block-all-mixed-content"
+            | "require-trusted-types-for"
+            | "trusted-types"
+            | "plugin-types"
+            | "referrer"
+            | "disown-opener"
+    )
 }
 
 fn find_effective_directive<'a>(policy: &'a CspPolicy, directive: &str) -> Option<&'a CspDirective> {
@@ -582,12 +532,20 @@ fn find_effective_directive<'a>(policy: &'a CspPolicy, directive: &str) -> Optio
         "worker-src" => find_dir(policy, "child-src")
             .or_else(|| find_dir(policy, "script-src"))
             .or_else(|| find_dir(policy, "default-src")),
+        "fenced-frame-src" => find_dir(policy, "frame-src")
+            .or_else(|| find_dir(policy, "child-src"))
+            .or_else(|| find_dir(policy, "default-src")),
         "frame-src" => find_dir(policy, "child-src").or_else(|| find_dir(policy, "default-src")),
-        "child-src" | "script-src" | "style-src" | "img-src" | "connect-src" | "media-src"
-        | "font-src" | "object-src" | "manifest-src" | "prefetch-src" => {
-            find_dir(policy, "default-src")
-        }
-        _ => None,
+        d if is_non_fetch_directive(d) => None,
+        _ => find_dir(policy, "default-src"),
+    }
+}
+
+fn parse_page_origin(page: &str) -> Option<(String, String, u16)> {
+    let u = Url::parse(page).ok()?;
+    match u.origin() {
+        UrlOrigin::Tuple(s, h, p) => Some((s, h.to_string(), p)),
+        UrlOrigin::Opaque(_) => None,
     }
 }
 
@@ -673,10 +631,20 @@ fn check_source(
         }
     }
 
-    let page = parse_url_parts(page_origin);
-    let target = parse_url_parts(target_url);
+    let target = match Url::parse(target_url) {
+        Ok(u) => u,
+        Err(_) => {
+            return CspDecision {
+                allowed: false,
+                violated_directive: dir.name.clone(),
+                effective_directive: eff,
+                matched_source: None,
+            }
+        }
+    };
+    let page = parse_page_origin(page_origin);
     for expr in &dir.sources {
-        if expr_matches_url(expr, &page, &target) {
+        if expr_matches_url(expr, page.as_ref(), &target) {
             return CspDecision {
                 allowed: true,
                 violated_directive: String::new(),
@@ -855,7 +823,7 @@ fn check_wasm_eval(policy: &CspPolicy) -> CspDecision {
 }
 
 // ============================================================================
-// WHATWG Fetch CORS
+// WHATWG Fetch CORS (using `url::Url::origin`)
 // ============================================================================
 
 fn is_cors_safelisted_method(method: &str) -> bool {
@@ -903,72 +871,18 @@ fn is_cors_safelisted_request_header(name: &str, value: &str) -> bool {
     }
 }
 
-fn parse_origin(url: &str) -> Origin {
-    let s = url.trim();
-    if s.is_empty() || s.eq_ignore_ascii_case("null") {
-        return Origin::Opaque;
+fn parse_origin(raw: &str) -> UrlOrigin {
+    match Url::parse(raw) {
+        Ok(u) => u.origin(),
+        Err(_) => UrlOrigin::new_opaque(),
     }
-    let sep = match s.find("://") {
-        Some(i) if i > 0 => i,
-        _ => return Origin::Opaque,
-    };
-    let scheme = s[..sep].to_ascii_lowercase();
-    let def_port = default_port(&scheme);
-    if def_port < 0 {
-        return Origin::Opaque;
-    }
-    let after = &s[sep + 3..];
-    let auth_end = after
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(after.len());
-    let auth = &after[..auth_end];
-    if auth.is_empty() || auth.bytes().any(|b| b <= 32 || b == 127) {
-        return Origin::Opaque;
-    }
-    let hp = match auth.find('@') {
-        Some(at) => &auth[at + 1..],
-        None => auth,
-    };
-    if hp.is_empty() {
-        return Origin::Opaque;
-    }
-    let (host, port) = if hp.starts_with('[') {
-        let rb = match hp.find(']') {
-            Some(r) => r,
-            None => return Origin::Opaque,
-        };
-        let h = hp[..=rb].to_ascii_lowercase();
-        let tail = &hp[rb + 1..];
-        if tail.is_empty() {
-            (h, def_port)
-        } else if let Some(pstr) = tail.strip_prefix(':') {
-            let p = parse_port(pstr);
-            if p <= 0 {
-                return Origin::Opaque;
-            }
-            (h, p)
-        } else {
-            return Origin::Opaque;
-        }
-    } else if let Some(colon) = hp.find(':') {
-        let h = hp[..colon].to_ascii_lowercase();
-        let p = parse_port(&hp[colon + 1..]);
-        if p <= 0 {
-            return Origin::Opaque;
-        }
-        (h, p)
-    } else {
-        (hp.to_ascii_lowercase(), def_port)
-    };
-    if host.is_empty() {
-        return Origin::Opaque;
-    }
-    Origin::Tuple(scheme, host, port)
 }
 
-fn origin_equals(a: &Origin, b: &Origin) -> bool {
+fn origin_equals(a: &UrlOrigin, b: &UrlOrigin) -> bool {
     match (a, b) {
-        (Origin::Tuple(sa, ha, pa), Origin::Tuple(sb, hb, pb)) => sa == sb && ha == hb && pa == pb,
+        (UrlOrigin::Tuple(sa, ha, pa), UrlOrigin::Tuple(sb, hb, pb)) => {
+            sa == sb && ha == hb && pa == pb
+        }
         _ => false,
     }
 }
@@ -1100,20 +1014,14 @@ fn check_cors_preflight(
         }
     }
     let parsed_max_age = max_age
-        .map(|s| s.trim().parse::<i32>().unwrap_or(0).max(0))
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|&v| v >= 0)
+        .map(|v| v.min(86400))
         .unwrap_or(0);
     CorsPreflightDecision {
         allowed: true,
         max_age: parsed_max_age,
     }
-}
-
-fn mix_decision(acc: i64, d: &CspDecision) -> i64 {
-    let b = if d.allowed { 1 } else { 0 };
-    let vl = d.violated_directive.len() as i64;
-    let el = d.effective_directive.len() as i64;
-    let ml = d.matched_source.as_ref().map(|s| s.len() as i64).unwrap_or(0);
-    (acc * 131 + b * 17 + vl * 7 + el * 3 + ml) % 1_000_000_007
 }
 
 fn bench_csp(rounds: i32) {
@@ -1132,7 +1040,7 @@ fn bench_csp(rounds: i32) {
         "https://www.figma.com",
     ];
 
-    let mut checksum: i64 = 0;
+    let mut digest: u64 = 14695981039346656037u64;
     let mut allowed_count: i32 = 0;
     let mut blocked_count: i32 = 0;
     let mut total_directives: usize = 0;
@@ -1148,12 +1056,12 @@ fn bench_csp(rounds: i32) {
             let orig = origins[s];
             let ds = [
                 check_source(&p, "script-src-elem", orig, "https://abs.twimg.com/responsive-web/app.js", "TwItTeR99", &[], true),
-                check_source(&p, "script-src", orig, "https://static.figma.com/webpack/main.js", "", &[("sha256", "FigMaHash01=")], true),
-                check_source(&p, "script-src", orig, "https://evil.example/xss.js", "", &[], false),
+                check_source(&p, "script-src", orig, "https://static.figma.com/webp%61ck/main.js", "", &[("sha256", "FigMaHash01=")], true),
+                check_source(&p, "script-src", orig, "https://evil.example\\@abs.twimg.com/xss.js", "", &[], true),
                 check_source(&p, "img-src", orig, "https://avatars.githubusercontent.com/u/42", "", &[], true),
                 check_source(&p, "img-src", orig, "data:image/png;base64,AA==", "", &[], true),
-                check_source(&p, "connect-src", orig, "wss://alive.github.com/ws", "", &[], true),
-                check_source(&p, "worker-src", orig, "https://github.com/assets-cdn/worker/../escape.js", "", &[], true),
+                check_source(&p, "connect-src", orig, "wss://www.figma.com/ws", "", &[], true),
+                check_source(&p, "worker-src", orig, "https://github.com/assets-cdn/worker/.\t./escape.js", "", &[], true),
                 check_inline_script(&p, "YtNoNcE42", &[], false),
                 check_eval(&p),
                 check_wasm_eval(&p),
@@ -1164,7 +1072,7 @@ fn bench_csp(rounds: i32) {
                 } else {
                     blocked_count += 1;
                 }
-                checksum = mix_decision(checksum, d);
+                digest = hash_decision(digest, d);
             }
         }
     }
@@ -1175,24 +1083,30 @@ fn bench_csp(rounds: i32) {
     println!("sources={}", total_sources);
     println!("allowed={}", allowed_count);
     println!("blocked={}", blocked_count);
-    println!("checksum={}", checksum);
+    println!("fnv1a64={:016x}", digest);
 }
 
 fn bench_cors(rounds: i32) {
-    let mut checksum: i64 = 0;
+    let mut digest: u64 = 14695981039346656037u64;
     let mut allowed_count: i32 = 0;
     let mut blocked_count: i32 = 0;
     let mut max_age_sum: i64 = 0;
 
     for _ in 0..rounds {
         let o1 = parse_origin("https://App.Example.COM:443/v1/feed");
-        let o2 = parse_origin("https://app.example.com");
-        let o3 = parse_origin("null");
-        if origin_equals(&o1, &o2) && !origin_equals(&o3, &o3) {
+        let o2 = parse_origin("blob:https://app.example.com/550e8400");
+        let o3 = parse_origin("https://evil.com\\@app.example.com/");
+        let eq12 = origin_equals(&o1, &o2);
+        let eq13 = origin_equals(&o1, &o3);
+        digest = fnv1a_str(digest, &o1.ascii_serialization());
+        digest = fnv1a_str(digest, &o2.ascii_serialization());
+        digest = fnv1a_str(digest, &o3.ascii_serialization());
+        if eq12 && !eq13 {
             allowed_count += 1;
-            checksum = (checksum * 131 + 11) % 1_000_000_007;
+            digest = fnv1a_byte(digest, 1);
         } else {
             blocked_count += 1;
+            digest = fnv1a_byte(digest, 0);
         }
 
         let safe1 = is_cors_safelisted_method("POST")
@@ -1200,9 +1114,10 @@ fn bench_cors(rounds: i32) {
         let safe2 = is_cors_safelisted_request_header("Content-Type", "application/json");
         if safe1 && !safe2 {
             allowed_count += 1;
-            checksum = (checksum * 131 + 23) % 1_000_000_007;
+            digest = fnv1a_byte(digest, 1);
         } else {
             blocked_count += 1;
+            digest = fnv1a_byte(digest, 0);
         }
 
         let r1 = check_cors_response(
@@ -1217,7 +1132,11 @@ fn bench_cors(rounds: i32) {
         } else {
             blocked_count += 1;
         }
-        checksum = (checksum * 131 + r1.exposed_headers.len() as i64) % 1_000_000_007;
+        digest = fnv1a_byte(digest, if r1.allowed { 1 } else { 0 });
+        digest = fnv1a_byte(digest, if r1.wildcard_exposed { 1 } else { 0 });
+        for h in &r1.exposed_headers {
+            digest = fnv1a_str(digest, h);
+        }
 
         let r2 = check_cors_response(
             "https://x.com",
@@ -1231,7 +1150,7 @@ fn bench_cors(rounds: i32) {
         } else {
             blocked_count += 1;
         }
-        checksum = (checksum * 131 + if r2.allowed { 1 } else { 2 }) % 1_000_000_007;
+        digest = fnv1a_byte(digest, if r2.allowed { 1 } else { 0 });
 
         let r3 = check_cors_response(
             "https://github.com",
@@ -1245,7 +1164,11 @@ fn bench_cors(rounds: i32) {
         } else {
             blocked_count += 1;
         }
-        checksum = (checksum * 131 + if r3.wildcard_exposed { 5 } else { 3 }) % 1_000_000_007;
+        digest = fnv1a_byte(digest, if r3.allowed { 1 } else { 0 });
+        digest = fnv1a_byte(digest, if r3.wildcard_exposed { 1 } else { 0 });
+        for h in &r3.exposed_headers {
+            digest = fnv1a_str(digest, h);
+        }
 
         let r4 = check_cors_response(
             "https://github.com",
@@ -1259,7 +1182,7 @@ fn bench_cors(rounds: i32) {
         } else {
             blocked_count += 1;
         }
-        checksum = (checksum * 131 + if r4.allowed { 1 } else { 7 }) % 1_000_000_007;
+        digest = fnv1a_byte(digest, if r4.allowed { 1 } else { 0 });
 
         let pf1 = check_cors_preflight(
             "https://www.figma.com",
@@ -1278,8 +1201,8 @@ fn bench_cors(rounds: i32) {
             blocked_count += 1;
         }
         max_age_sum += pf1.max_age as i64;
-        checksum = (checksum * 131 + pf1.max_age as i64 + if pf1.allowed { 1 } else { 9 })
-            % 1_000_000_007;
+        digest = fnv1a_byte(digest, if pf1.allowed { 1 } else { 0 });
+        digest = fnv1a_str(digest, &pf1.max_age.to_string());
 
         let pf2 = check_cors_preflight(
             "https://www.figma.com",
@@ -1290,7 +1213,7 @@ fn bench_cors(rounds: i32) {
             None,
             Some("GET, POST, PUT, DELETE"),
             Some("*, Authorization"),
-            Some("86400"),
+            Some("999999999"),
         );
         if pf2.allowed {
             allowed_count += 1;
@@ -1298,8 +1221,8 @@ fn bench_cors(rounds: i32) {
             blocked_count += 1;
         }
         max_age_sum += pf2.max_age as i64;
-        checksum = (checksum * 131 + pf2.max_age as i64 + if pf2.allowed { 1 } else { 9 })
-            % 1_000_000_007;
+        digest = fnv1a_byte(digest, if pf2.allowed { 1 } else { 0 });
+        digest = fnv1a_str(digest, &pf2.max_age.to_string());
 
         let pf3 = check_cors_preflight(
             "https://meet.google.com",
@@ -1318,8 +1241,8 @@ fn bench_cors(rounds: i32) {
             blocked_count += 1;
         }
         max_age_sum += pf3.max_age as i64;
-        checksum = (checksum * 131 + pf3.max_age as i64 + if pf3.allowed { 1 } else { 9 })
-            % 1_000_000_007;
+        digest = fnv1a_byte(digest, if pf3.allowed { 1 } else { 0 });
+        digest = fnv1a_str(digest, &pf3.max_age.to_string());
 
         let pf4 = check_cors_preflight(
             "https://meet.google.com",
@@ -1338,8 +1261,8 @@ fn bench_cors(rounds: i32) {
             blocked_count += 1;
         }
         max_age_sum += pf4.max_age as i64;
-        checksum = (checksum * 131 + pf4.max_age as i64 + if pf4.allowed { 1 } else { 9 })
-            % 1_000_000_007;
+        digest = fnv1a_byte(digest, if pf4.allowed { 1 } else { 0 });
+        digest = fnv1a_str(digest, &pf4.max_age.to_string());
     }
 
     println!("mode=cors");
@@ -1347,7 +1270,7 @@ fn bench_cors(rounds: i32) {
     println!("allowed={}", allowed_count);
     println!("blocked={}", blocked_count);
     println!("max_age_sum={}", max_age_sum);
-    println!("checksum={}", checksum);
+    println!("fnv1a64={:016x}", digest);
 }
 
 fn main() {
