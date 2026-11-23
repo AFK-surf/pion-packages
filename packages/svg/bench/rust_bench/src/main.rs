@@ -1,8 +1,9 @@
+use kurbo::{BezPath, Shape};
 use roxmltree::{Document, Node, NodeType};
 use std::env;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fs;
-use svgtypes::{PathParser, PathSegment, TransformListParser, TransformListToken};
+use svgtypes::{PathParser, PathSegment, SimplePathSegment, SimplifyingPathParser, TransformListParser, TransformListToken};
 
 #[derive(Clone, Copy)]
 enum CubicSeg {
@@ -606,6 +607,37 @@ fn main() {
         println!("mode=w1_paths");
         println!("paths={}", path_cnt);
         println!("cubics={}", cubic_cnt);
+        println!("bbox_sum_10={}", bbox_sum);
+        return;
+    }
+
+    if mode == "w1_kurbo" {
+        // Idiomatic upstream Rust pipeline: svgtypes::SimplifyingPathParser + kurbo::BezPath::bounding_box
+        let mut path_cnt: i64 = 0;
+        let mut seg_cnt: i64 = 0;
+        let mut bbox_sum: i64 = 0;
+        let mut bp = BezPath::new();
+        for line in src.lines() {
+            if line.is_empty() { continue; }
+            bp.truncate(0);
+            for r in SimplifyingPathParser::from(line) {
+                match r {
+                    Ok(SimplePathSegment::MoveTo { x, y }) => bp.move_to((x, y)),
+                    Ok(SimplePathSegment::LineTo { x, y }) => bp.line_to((x, y)),
+                    Ok(SimplePathSegment::Quadratic { x1, y1, x, y }) => bp.quad_to((x1, y1), (x, y)),
+                    Ok(SimplePathSegment::CurveTo { x1, y1, x2, y2, x, y }) => bp.curve_to((x1, y1), (x2, y2), (x, y)),
+                    Ok(SimplePathSegment::ClosePath) => bp.close_path(),
+                    Err(_) => break,
+                }
+            }
+            path_cnt += 1;
+            seg_cnt += bp.elements().len() as i64;
+            let r = bp.bounding_box();
+            bbox_sum += round_tenth(r.x0) + round_tenth(r.y0) + round_tenth(r.x1) + round_tenth(r.y1);
+        }
+        println!("mode=w1_kurbo");
+        println!("paths={}", path_cnt);
+        println!("elements={}", seg_cnt);
         println!("bbox_sum_10={}", bbox_sum);
         return;
     }
