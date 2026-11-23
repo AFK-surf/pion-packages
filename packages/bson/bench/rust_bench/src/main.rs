@@ -1,3 +1,4 @@
+use bson::raw::{RawBsonRef, RawDocument};
 use bson::{Bson, Document};
 use std::env;
 use std::fs;
@@ -33,25 +34,34 @@ fn fnv_update_u64(h: u64, v: u64) -> u64 {
 fn walk_doc_checksum(doc: &Document) -> (i64, u64) {
     let mut elems: i64 = 0;
     let mut h: u64 = 14695981039346656037u64;
-    let mut stack: Vec<Bson> = vec![Bson::Document(doc.clone())];
+    enum Node<'a> {
+        Doc(&'a Document),
+        Val(&'a Bson),
+    }
+    let mut stack: Vec<Node<'_>> = vec![Node::Doc(doc)];
     while let Some(cur) = stack.pop() {
-        match cur {
-            Bson::Document(d) => {
+        let v = match cur {
+            Node::Doc(d) => {
                 let n = d.len();
                 elems += n as i64;
                 h = fnv_update_u64(h, n as u64);
-                let entries: Vec<(String, Bson)> = d.into_iter().collect();
+                let entries: Vec<(&String, &Bson)> = d.iter().collect();
                 for (k, v) in entries.into_iter().rev() {
                     h = fnv_update_bytes(h, k.as_bytes());
-                    stack.push(v);
+                    stack.push(Node::Val(v));
                 }
+                continue;
             }
+            Node::Val(v) => v,
+        };
+        match v {
+            Bson::Document(d) => stack.push(Node::Doc(d)),
             Bson::Array(items) => {
                 let n = items.len();
                 elems += n as i64;
                 h = fnv_update_u64(h, n as u64);
-                for item in items.into_iter().rev() {
-                    stack.push(item);
+                for item in items.iter().rev() {
+                    stack.push(Node::Val(item));
                 }
             }
             Bson::Double(x) => h = fnv_update_u64(h, x.to_bits()),
@@ -62,12 +72,59 @@ fn walk_doc_checksum(doc: &Document) -> (i64, u64) {
                 h = fnv_update_bytes(h, &bin.bytes);
             }
             Bson::ObjectId(oid) => h = fnv_update_bytes(h, &oid.bytes()),
-            Bson::Boolean(b) => h = fnv_update_u64(h, if b { 1 } else { 0 }),
+            Bson::Boolean(b) => h = fnv_update_u64(h, if *b { 1 } else { 0 }),
             Bson::DateTime(dt) => h = fnv_update_u64(h, dt.timestamp_millis() as u64),
             Bson::Null => h = fnv_update_u64(h, 10),
-            Bson::Int32(n) => h = fnv_update_u64(h, (n as i64) as u64),
-            Bson::Int64(n) => h = fnv_update_u64(h, n as u64),
+            Bson::Int32(n) => h = fnv_update_u64(h, (*n as i64) as u64),
+            Bson::Int64(n) => h = fnv_update_u64(h, *n as u64),
             Bson::Decimal128(dec) => h = fnv_update_bytes(h, &dec.bytes()),
+            _ => h = fnv_update_u64(h, 99),
+        }
+    }
+    (elems, h)
+}
+
+fn walk_raw_checksum(doc: &RawDocument) -> (i64, u64) {
+    let mut elems: i64 = 0;
+    let mut h: u64 = 14695981039346656037u64;
+    let mut stack: Vec<RawBsonRef<'_>> = vec![RawBsonRef::Document(doc)];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            RawBsonRef::Document(d) => {
+                let entries: Vec<(&str, RawBsonRef<'_>)> =
+                    d.into_iter().map(|r| r.expect("raw doc")).collect();
+                let n = entries.len();
+                elems += n as i64;
+                h = fnv_update_u64(h, n as u64);
+                for (k, v) in entries.into_iter().rev() {
+                    h = fnv_update_bytes(h, k.as_bytes());
+                    stack.push(v);
+                }
+            }
+            RawBsonRef::Array(a) => {
+                let items: Vec<RawBsonRef<'_>> =
+                    a.into_iter().map(|r| r.expect("raw array")).collect();
+                let n = items.len();
+                elems += n as i64;
+                h = fnv_update_u64(h, n as u64);
+                for item in items.into_iter().rev() {
+                    stack.push(item);
+                }
+            }
+            RawBsonRef::Double(x) => h = fnv_update_u64(h, x.to_bits()),
+            RawBsonRef::String(s) => h = fnv_update_bytes(h, s.as_bytes()),
+            RawBsonRef::Binary(bin) => {
+                let sub: u8 = bin.subtype.into();
+                h = fnv_update_u64(h, sub as u64);
+                h = fnv_update_bytes(h, bin.bytes);
+            }
+            RawBsonRef::ObjectId(oid) => h = fnv_update_bytes(h, &oid.bytes()),
+            RawBsonRef::Boolean(b) => h = fnv_update_u64(h, if b { 1 } else { 0 }),
+            RawBsonRef::DateTime(dt) => h = fnv_update_u64(h, dt.timestamp_millis() as u64),
+            RawBsonRef::Null => h = fnv_update_u64(h, 10),
+            RawBsonRef::Int32(n) => h = fnv_update_u64(h, (n as i64) as u64),
+            RawBsonRef::Int64(n) => h = fnv_update_u64(h, n as u64),
+            RawBsonRef::Decimal128(dec) => h = fnv_update_bytes(h, &dec.bytes()),
             _ => h = fnv_update_u64(h, 99),
         }
     }
@@ -77,7 +134,7 @@ fn walk_doc_checksum(doc: &Document) -> (i64, u64) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: rust_bench <decode|encode|extjson> <corpus.bson> <rounds>");
+        eprintln!("usage: rust_bench <decode|decode_raw|encode|extjson> <corpus.bson> <rounds>");
         std::process::exit(1);
     }
     let mode = &args[1];
@@ -86,14 +143,19 @@ fn main() {
     let data = fs::read(path).expect("failed to read corpus");
     let raw_docs = split_corpus(&data);
 
-    if mode == "decode" {
+    if mode == "decode" || mode == "decode_raw" {
         let mut total_docs: i64 = 0;
         let mut total_elems: i64 = 0;
         let mut checksum: u64 = 14695981039346656037u64;
         for _ in 0..rounds {
             for raw in &raw_docs {
-                let doc = Document::from_reader(&mut &raw[..]).expect("decode failed");
-                let (ec, ch) = walk_doc_checksum(&doc);
+                let (ec, ch) = if mode == "decode" {
+                    let doc = Document::from_reader(&mut &raw[..]).expect("decode failed");
+                    walk_doc_checksum(&doc)
+                } else {
+                    let doc = RawDocument::from_bytes(raw).expect("raw decode failed");
+                    walk_raw_checksum(doc)
+                };
                 total_docs += 1;
                 total_elems += ec;
                 checksum = fnv_update_u64(checksum, ch);

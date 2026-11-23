@@ -6,7 +6,7 @@ set -eu
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/tmp/w13-bson-bench"
+OUT_DIR="${BENCH_OUT:-/private/tmp/fix-bson-bench}"
 BIN_DIR="$OUT_DIR/bin"
 CORPUS_FILE="$OUT_DIR/corpus_1000.bson"
 
@@ -33,8 +33,9 @@ echo "=== W1: BSON Decode (50,000 composite documents) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --title "BSON W1: Decode 50,000 Composite Documents" \
   --impl "pion=$BIN_DIR/pion_bench decode $CORPUS_FILE 50" \
-  --impl "rust_bson=$BIN_DIR/rust_bench decode $CORPUS_FILE 50" \
-  --baseline rust_bson \
+  --impl "rust_ref=$BIN_DIR/rust_bench decode $CORPUS_FILE 50" \
+  --impl "rust_raw=$BIN_DIR/rust_bench decode_raw $CORPUS_FILE 50" \
+  --baseline rust_ref \
   --warmup 1 --rounds 5 --ops 50000 --bytes "$TOTAL_50K_BYTES" \
   --md-out "$OUT_DIR/w1_decode.md" --json-out "$OUT_DIR/w1_decode.json"
 

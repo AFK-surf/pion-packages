@@ -7,7 +7,7 @@
 - **Complete BSON 1.1 Binary Codec (`src/types.pion`, `src/decode.pion`, `src/encode.pion`)**:
   - All 19+ BSON element types (`0x01` Double, `0x02` String, `0x03` Document, `0x04` Array, `0x05` Binary, `0x06` Undefined, `0x07` ObjectId, `0x08` Boolean, `0x09` DateTime, `0x0A` Null, `0x0B` Regex, `0x0C` DbPointer, `0x0D` JavaScript, `0x0E` Symbol, `0x0F` JavaScriptWithScope, `0x10` Int32, `0x11` Timestamp, `0x12` Int64, `0x13` Decimal128, `0xFF` MinKey, `0x7F` MaxKey).
   - Full `BinarySubtype` support: `Generic (0x00)`, `Function (0x01)`, `BinaryOld (0x02)` with inner 4-byte length validation, `UuidOld (0x03)`, `Uuid (0x04)`, `Md5 (0x05)`, `Encrypted (0x06)`, `Column (0x07)`, `Sensitive (0x08)`, `Vector (0x09)`, `Reserved(0x0A..0x7F)`, `UserDefined(0x80..0xFF)`.
-  - Strict validation: document length `>= 5`, trailing `0x00` terminator, no trailing unconsumed bytes, strict UTF-8 across keys/strings/regex/code/symbol, string length `>= 1` with NUL terminator, no embedded NUL in C-strings, strict Boolean (`0x00`/`0x01`), sequential array key validation, and `BsonLimits` (`max_depth`, `max_doc_bytes`, `max_elements`).
+  - Strict validation: document length `>= 5`, trailing `0x00` terminator, no trailing unconsumed bytes, overflow-safe length bounds checks, strict UTF-8 across keys/strings/regex/code/symbol/DBPointer (in both `decode`, `encode`, and `from_extjson`), string length `>= 1` with NUL terminator, no embedded NUL in C-strings, strict Boolean (`0x00`/`0x01`), alphabetical Regex options normalization, opt-in sequential array key validation (`validate_array_keys` defaults to `false` per BSON Corpus, enable via `BsonLimits::default().with_validate_array_keys(true)`), and `BsonLimits` (`max_depth`, `max_doc_bytes`, `max_elements`).
   - Two-pass pre-allocated iterative encoder and iterative decoder immune to deep-nesting stack overflow on both Native and `wasm32`.
 - **`ObjectId` (`src/oid.pion`) & IEEE 754-2008 BID `Decimal128` (`src/decimal128.pion`)**:
   - 12-byte `ObjectId`: 24-hex case-insensitive parse, lowercase hex format, big-endian 32-bit Unix timestamp extraction, lexicographical `compare` and `eq`.
@@ -26,6 +26,7 @@ pub struct BsonDocument { pub entries : Array[(String, BsonValue)] }
 pub enum BsonValue { Double(Double), Str(String), Document(BsonDocument), Array(Array[BsonValue]), Binary(BinarySubtype, Bytes), Undefined, ObjectId(ObjectId), Bool(Bool), DateTime(Int64), Null, Regex(String, String), DbPointer(String, ObjectId), JavaScript(String), Symbol(String), JavaScriptWithScope(String, BsonDocument), Int32(Int), Timestamp(Int64, Int64), Int64(Int64), Decimal128(Decimal128), MinKey, MaxKey }
 pub enum ExtJsonMode { Canonical, Relaxed }
 pub val struct BsonLimits { pub max_depth : Int, pub max_doc_bytes : Int, pub max_elements : Int, pub validate_array_keys : Bool }
+// BsonLimits::default().with_validate_array_keys(true) enables strict sequential array key checking (default: false)
 pub enum BsonError { ... }
 
 // Binary BSON 1.1
@@ -84,19 +85,21 @@ Run via `sh packages/bson/bench/run_bench.sh` against Rust **`bson 2.15.0` (`--r
 
 ### W1: BSON Decode (50,000 composite documents, 12,012,500 B)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_bson`) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_ref`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 60.810 | 59.853 | 61.295 | 197.54 | 1216.19 | 2.81 MiB | **2.14x** |
-| `rust_bson` (`2.15.0`, `--release --locked`) | 130.387 | 125.997 | 131.448 | 92.13 | 2607.74 | 2.89 MiB | 1.00x (baseline) |
+| `pion` (`--release`, owned `BsonDocument` + walk) | 59.839 | 57.878 | 67.074 | 200.75 | 1196.77 | 2.83 MiB | **1.67x** |
+| `rust_ref` (`bson 2.15.0`, `Document::from_reader` + walk by ref) | 99.650 | 97.915 | 110.859 | 120.55 | 1993.01 | 2.84 MiB | 1.00x (baseline) |
+| `rust_raw` (`bson 2.15.0`, `RawDocument::from_bytes` zero-copy walk) | **31.190** | 30.627 | 32.818 | 385.14 | 623.80 | 2.50 MiB | **3.19x** (`rust_raw` is **1.92x** faster than Pion) |
 
 - Verified stdout SHA-256: `5aaa2cd2a70a7fd150fdbe14ebfe1ef0c98b0a5c6cc23cd95f70595cae079a09`
+- Note: `rust_ref` walks `Document` strictly by reference (no `doc.clone()`). For read-only traversal without materializing an owned DOM, Rust's zero-copy `RawDocument` API (`rust_raw`) validates every element on the fly and is ~1.92x faster than Pion's owned-tree decode.
 
 ### W2: BSON Encode (50,000 composite documents, 12,012,500 B)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_bson`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 42.670 | 42.438 | 42.938 | 281.52 | 853.40 | 4.44 MiB | **1.12x** |
-| `rust_bson` (`2.15.0`, `--release --locked`) | 47.665 | 47.464 | 47.880 | 252.02 | 953.31 | 5.69 MiB | 1.00x (baseline) |
+| `pion` (`--release`) | 44.761 | 44.409 | 45.382 | 268.37 | 895.23 | 4.45 MiB | **1.05x** |
+| `rust_bson` (`2.15.0`, `--release --locked`) | 47.095 | 46.181 | 48.115 | 255.07 | 941.90 | 5.72 MiB | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `fb667c1dcaef24a105c6ba39aa0d733c65a33f7b9327d7877b94392fb11a7d7f`
 
@@ -104,7 +107,8 @@ Run via `sh packages/bson/bench/run_bench.sh` against Rust **`bson 2.15.0` (`--r
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_bson`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 138.277 | 136.704 | 140.809 | 34.75 | 6913.84 | 4.70 MiB | **1.75x** |
-| `rust_bson` (`2.15.0`, `--release --locked`) | 242.522 | 241.229 | 244.768 | 19.81 | 12126.09 | 5.98 MiB | 1.00x (baseline) |
+| `pion` (`--release`) | 175.664 | 173.493 | 189.812 | 27.35 | 8783.22 | 4.73 MiB | **1.40x** |
+| `rust_bson` (`2.15.0`, `--release --locked`) | 245.903 | 243.389 | 253.249 | 19.54 | 12295.13 | 5.98 MiB | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `f3a6ca6a2132d4c515a511e57fcfc1b1c126809eb78834e70af071b89ad9d016`
+- Note: Rust `bson`'s public Extended JSON API goes through `serde_json::Value` (with `preserve_order` / `IndexMap`), and `into_*_extjson(self)` consumes its input (requiring a `doc.clone()` per document). Pion serializes/parses directly between `BsonDocument` and JSON text.
