@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–9 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–11 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–9 + `fts`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。Wave 11 新增 `cel`（以 Go `cel-go v0.24.1` 为基线）、`wasm`（以 Rust `wasmparser` / `wasm-encoder` / `wasmprinter 0.221.3` 为基线）、`ical`（以 Rust `rrule 0.14.0` / `icalendar 0.16.17` 为基线）与 `ssh`（以 Go `golang.org/x/crypto/ssh v0.38.0` 为基线；Go 缺失的 `|1|` 哈希主机、RFC 4253 分包与 `SSHSIG` 由等价 Go 实现补齐）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -257,6 +257,21 @@
 | `webm` | YouTube MSE Init + Clusters（562 KB × 200） | 112.4 MB | **13.249 ms** (8,490.17 MB/s) | 20.020 ms (`rust_matroska 0.6.1`) | **1.51x** | 3.39 MiB | 3.30 MiB |
 | `csp` | 真实 CSP3 解析 + 评估（10k 策略 + 100k 检查，`rounds=11`） | 100,000 ops | 96.534 ms (`965.34 ns/op`) | 65.204 ms (`rust_csp`, `url 2.5.9`) | 0.68x | 2.80 MiB | 2.31 MiB |
 | `csp` | WHATWG Fetch CORS 预检 + 响应 + Origin（200k ops，`rounds=11`） | 200,000 ops | 67.541 ms (`337.71 ns/op`) | 42.427 ms (`rust_csp`, `url 2.5.9`) | 0.63x | 2.73 MiB | 2.16 MiB |
+| `cel` | 已编译 IAM / K8s 准入规则稳态求值（250k 上下文 × 4 规则） | 1,000,000 ops | 366.844 ms (`366.84 ns/op`) | **144.705 ms** (`go_cel v0.24.1`) | 0.39x | **2.95 MiB** | 17.66 MiB |
+| `cel` | 宏 + 正则 `matches` + 时间戳批量求值 | 20,000 ops | **32.911 ms** (`1645.58 ns/op`) | 145.960 ms (`go_cel v0.24.1`) | **4.43x** | **3.36 MiB** | 19.20 MiB |
+| `cel` | 端到端解析 + 类型检查 + 编译 + 求值（10 策略 × 200） | 2,000 ops | **22.450 ms** (`11224.79 ns/op`) | 152.088 ms (`go_cel v0.24.1`) | **6.77x** | **3.34 MiB** | 17.69 MiB |
+| `wasm` | 二进制全解码 + 指令遍历（20 × 395,839 B） | 7,916,780 B | 127.484 ms (62.10 MB/s) | **31.710 ms** (`rust_wasmparser 0.221.3`) | 0.25x | 10.36 MiB | **2.66 MiB** |
+| `wasm` | WebAssembly 规范全量校验（20 × 395,839 B） | 7,916,780 B | 105.034 ms (75.37 MB/s) | **29.676 ms** (`rust_wasmparser 0.221.3`) | 0.28x | **3.06 MiB** | 3.77 MiB |
+| `wasm` | 解码 → 重编码 + WAT 反汇编（5 × 395,839 B） | 1,979,195 B | **86.426 ms** (22.90 MB/s) | 107.445 ms (`rust_wasmtools 0.221.3`) | **1.24x** | 41.30 MiB | **20.50 MiB** |
+| `ical` | 4,000 `VEVENT` `.ics` 解析 + 序列化往返 | 1.93 MB | **47.27 ms** (40.76 MB/s) | 74.34 ms (`rust_icalendar 0.16.17`) | **1.57x** | **15.73 MiB** | 51.06 MiB |
+| `ical` | 复杂 `RRULE` 展开（80 规则，58,000 次） | 58,000 occs | **14.72 ms** (`253.85 ns/op`) | 24.70 ms (`rust_rrule 0.14.0`) | **1.68x** | **2.27 MiB** | 7.78 MiB |
+| `ical` | `RRuleSet` 窗口查询批量（200 集，72,200 次） | 72,200 occs | 26.04 ms (`130.21 µs/set`) | **24.18 ms** (`rust_rrule 0.14.0`) | 0.93x | **2.42 MiB** | 7.81 MiB |
+| `ssh` | 20,000 × `authorized_keys` 解析 + SHA-256 指纹 | 20,000 keys | 88.459 ms (`4422.96 ns/op`) | **41.307 ms** (`go_x_crypto_ssh v0.38.0`) | 0.47x | **2.16 MiB** | 16.22 MiB |
+| `ssh` | 5,000 × `known_hosts` `\|1\|` + 1,000 × 证书 Ed25519 CA 校验 | 6,000 ops | 214.219 ms (`35703.14 ns/op`) | **72.530 ms** (`go_x_crypto_ssh`，含等价 Go `\|1\|`) | 0.34x | **2.27 MiB** | 17.11 MiB |
+| `ssh` | 1,000 × `SSHSIG` Ed25519 校验 + 50,000 × RFC 4253 分包往返 | 51,000 ops | 148.606 ms (`2913.84 ns/op`) | **54.266 ms** (`go_x_crypto_ssh`，等价 Go SSHSIG + 分包) | 0.37x | **2.09 MiB** | 14.66 MiB |
+| `ssh` | `SSHSIG` RSA-2048 `rsa-sha2-256`（200 次） | 200 sigs | 93.666 ms | **22.696 ms** (`go_x_crypto_ssh`，等价 Go SSHSIG) | 0.24x | **2.33 MiB** | 10.33 MiB |
+| `ssh` | `SSHSIG` ECDSA P-256 `sha512`（500 次） | 500 sigs | 977.063 ms | **40.443 ms** (`go_x_crypto_ssh`，等价 Go SSHSIG) | 0.04x | **2.38 MiB** | 11.61 MiB |
+| `ssh` | `SSHSIG` Ed25519 `sha512`（500 次） | 500 sigs | 77.757 ms | **36.629 ms** (`go_x_crypto_ssh`，等价 Go SSHSIG) | 0.47x | **2.25 MiB** | 10.33 MiB |
 
 ## 各包明细
 
@@ -2060,3 +2075,54 @@ Single-certificate extension cliff (`N = 64,000` distinct extensions, `1.2 MB` D
 | WHATWG Fetch CORS Preflight + Response + Origin (200k ops) | 67.541 ms (`337.71 ns/op`) | **42.427 ms (`212.13 ns/op`)** | 66.518 / 84.032 | 41.177 / 47.698 | 2.73 MiB | **2.16 MiB** | 0.63x | `f78bb5cbd9976a46...` |
 
 红队：18 / 18 单测（复用 `url` 50 / 50），`audit/` 零改动且 `run_audit.sh all` 全绿（**32 / 32** unit = 12 / 12 control + 20 / 20 redteam，全部 2 P0 + 6 P1 + 10 P2 根治），对 Node WHATWG `URL` + CSP3 §6.7.2 独立参考差分 **88,856 / 88,856 (100.0%)** 零 bypass / 零 over-block / 零 origin mismatch，30k × 4 fuzz 零崩零差异，DoS 探针全线性（20k 指令 4 ms、100k 源 26 ms）。两项吞吐如实落后 Rust `servo/rust-url` 基线（0.68× / 0.63×），峰值 RSS 接近（2.73–2.80 vs 2.16–2.31 MiB）。
+
+### cel
+
+参考实现：Go [`google/cel-go`](https://github.com/google/cel-go) `v0.24.1`。`sh packages/cel/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，全部轮次与实现 stdout SHA-256 逐字节一致）运行。详见 [`packages/cel/README.md`](packages/cel/README.md)。
+
+| Workload | `pion` Median (`ns/op`) | `go_cel` Median (`ns/op`) | `pion` Min / P95 (ms) | `go_cel` Min / P95 (ms) | `pion` Peak RSS | `go_cel` Peak RSS | `pion` vs `go_cel` | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 Compiled IAM / K8s Admission Batch Eval (1,000,000 ops) | 366.844 ms (`366.84`) | **144.705 ms (`144.70`)** | 345.430 / 466.154 | 131.740 / 150.039 | **2.95 MiB** | 17.66 MiB | 0.39x | `593c1a054b215439…` |
+| W2 Macros + Regex `matches` + Timestamp Batch Eval (20,000 ops) | **32.911 ms (`1645.58`)** | 145.960 ms (`7297.99`) | 29.035 / 34.086 | 117.004 / 148.032 | **3.36 MiB** | 19.20 MiB | **4.43x** | `8e806c8d63c22d1a…` |
+| W3 End-to-End Compile + Eval (2,000 ops) | **22.450 ms (`11224.79`)** | 152.088 ms (`76043.96`) | 16.331 / 24.091 | 145.405 / 188.257 | **3.34 MiB** | 17.69 MiB | **6.77x** | `c32a199ce3539235…` |
+
+红队：14 / 14 单测（复用 `time` + `regex`），`audit/` 零改动且 `audit` **30 / 30** 全绿（24 / 24 redteam + 6 / 6 control，3 P0 + 11 P1 + 9 P2 全部根治）。领先项：手写单遍解析器写入扁平 `Array[ExprNode]` arena（无 ANTLR / protobuf `CheckedExpr` / 反射类型检查），宏走专用 `Comprehension` 节点、常量 `matches()` 预编译 RE2 兼容自动机。落后项：W1 稳态 1M 次已编译小规则求值仅 0.39×——Go 规划器把表达式编译为特化闭包树且默认零成本预算跟踪，Pion 为 AST 解释求值并对每次求值强制执行 `EvalLimits`（深度、成本、累计输出字节）。
+
+### wasm
+
+参考实现：Rust `wasmparser` / `wasm-encoder` / `wasmprinter` `0.221.3`（`--release --locked`）。`sh packages/wasm/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行于真实 395,839 B 编译器生成 `.wasm` 语料。详见 [`packages/wasm/README.md`](packages/wasm/README.md)。
+
+| Workload | `pion` Median (Throughput) | Rust Median (Throughput) | `pion` Min / P95 (ms) | Rust Min / P95 (ms) | `pion` Peak RSS | Rust Peak RSS | `pion` vs Rust | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 Full Binary Decode + Instruction Traversal (20 × 395,839 B) | 127.484 ms (62.10 MB/s) | **31.710 ms (249.66 MB/s)** (`rust_wasmparser`) | 127.245 / 127.900 | 30.928 / 32.015 | 10.36 MiB | **2.66 MiB** | 0.25x | `6b66e630579352fa…` |
+| W2 Full WebAssembly Spec Validation (20 × 395,839 B) | 105.034 ms (75.37 MB/s) | **29.676 ms (266.77 MB/s)** (`rust_wasmparser`) | 104.840 / 106.352 | 29.273 / 29.852 | **3.06 MiB** | 3.77 MiB | 0.28x | `287af374249e4709…` |
+| W3 Decode → Re-encode + WAT Disassembly (5 × 395,839 B) | **86.426 ms (22.90 MB/s)** | 107.445 ms (18.42 MB/s) (`rust_wasmtools`) | 85.767 / 88.055 | 106.149 / 107.714 | 41.30 MiB | **20.50 MiB** | **1.24x** | `8963bf896344fc38…` |
+
+红队：14 / 14 单测，`audit/` 零改动且 `audit` **63 / 63** 全绿（27 / 27 redteam + 36 / 36 control，7 P0 + 12 P1 + 8 P2 全部根治）；20,335 模块对 Rust `wasmparser` 与 Node v24 V8 三方差分 0 `ACCEPTS_INVALID` / 0 `REJECTS_VALID`，5,565 / 5,565 WASM2 合法 fuzz 模块 WAT 语义等价。领先项：W3 往返 + WAT 1.24×（`write_indent` 50 层封顶、整数 / 十六进制直写 `StringBuilder`），W2 单遍流式校验峰值 RSS 3.06 MiB 低于 Rust。落后项：W1 解码 0.25×（`decode_module` 物化完整 `Module` / `Array[Instr]` AST，而 `wasmparser` 零拷贝流式 `Operator`），W2 校验 0.28×。
+
+### ical
+
+参考实现：Rust [`rrule`](https://github.com/fmeringdal/rust-rrule) `0.14.0` + [`icalendar`](https://github.com/hoodie/icalendar-rs) `0.16.17`（`--release --locked`）。`sh packages/ical/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行。详见 [`packages/ical/README.md`](packages/ical/README.md)。
+
+| Workload | `pion` Median (Throughput / Latency) | Rust Median (Throughput / Latency) | `pion` Min / P95 (ms) | Rust Min / P95 (ms) | `pion` Peak RSS | Rust Peak RSS | `pion` vs Rust | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 4,000-VEVENT `.ics` Parse + Serialize Roundtrip (1.93 MB) | **47.27 ms (40.76 MB/s)** | 74.34 ms (25.92 MB/s) (`rust_icalendar`) | 45.59 / 49.21 | 70.98 / 78.51 | **15.73 MiB** | 51.06 MiB | **1.57x** | `e4e48bf0c572404c…` |
+| W2 Complex `RRULE` Expansion (80 rules, 58,000 occs) | **14.72 ms (`253.85 ns/op`)** | 24.70 ms (`425.86 ns/op`) (`rust_rrule`) | 13.82 / 15.04 | 24.03 / 29.12 | **2.27 MiB** | 7.78 MiB | **1.68x** | `8a01a8a0a03b5cbc…` |
+| W3 `RRuleSet` Window Query Batch (200 sets, 72,200 occs) | 26.04 ms (`130.21 µs/set`) | **24.18 ms (`120.90 µs/set`)** (`rust_rrule`) | 25.70 / 26.29 | 23.08 / 24.75 | **2.42 MiB** | 7.81 MiB | 0.93x | `f79e28a0fac65a54…` |
+
+红队：23 / 23 单测（复用 `time` 262 / 262），`audit/` 零改动且 `audit` **38 / 38** 全绿（24 / 24 redteam + 14 / 14 control，2 P0 + 8 P1 + 9 P2 全部根治）；4,000 条规则三方差分（`python-dateutil` + Rust `rrule`）一致率 75.4% → 87.6%，剩余 54 处差异均为参考实现偏离 RFC，0 真实缺陷；DoS 断崖 `D1a` 4,107 MiB / 1.29 s → 2.8 MiB / 0.01 s、`VTIMEZONE` `SECONDLY` `offset_at` 15.4 s → 0.00 s。领先项：W1 单遍流式反折行 + 扁平 `Array[Property]`，W2 惰性 `(days × timeset)` 流式展开。落后项：W3 `RRuleSet` 窗口查询 0.93×（流式 `ZonedRuleStream` 与逐次时区解析开销），但 RSS 低 3.2×；W2 / W3 语料仅 UTC。
+
+### ssh
+
+参考实现：Go [`golang.org/x/crypto/ssh`](https://pkg.go.dev/golang.org/x/crypto/ssh) `v0.38.0`（`go1.27.3 darwin/arm64`）；Go 未导出的 `|1|` 哈希主机匹配、RFC 4253 分包与 `SSHSIG` 由 `bench/go/main.go` / `audit/diff/go/main.go` 中等价 Go 实现补齐。`sh packages/ssh/bench/run_bench.sh` 与 `sh packages/ssh/audit/run_audit.sh bench` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，6 项全部 stdout SHA-256 逐字节一致）运行。Go 峰值 RSS 含约 10–14 MiB 运行时基线。详见 [`packages/ssh/README.md`](packages/ssh/README.md)。
+
+| Workload | `pion` Median (`ns/op`) | Go Median (`ns/op`) | `pion` Min / P95 (ms) | Go Min / P95 (ms) | `pion` Peak RSS | Go Peak RSS | `pion` vs Go | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 20,000 × `authorized_keys` parse + SHA-256 fingerprint | 88.459 ms (`4422.96`) | **41.307 ms (`2065.36`)** | 72.433 / 89.921 | 39.917 / 43.428 | **2.16 MiB** | 16.22 MiB | 0.47x | `8a48c5cbe0f0ef40…` |
+| W2 5,000 × `known_hosts` (`\|1\|` HMAC-SHA1) + 1,000 × Cert Ed25519 CA verify | 214.219 ms (`35703.14`) | **72.530 ms (`12088.38`)** | 203.608 / 223.219 | 69.580 / 96.976 | **2.27 MiB** | 17.11 MiB | 0.34x | `201b5c12cfa6c460…` |
+| W3 1,000 × `SSHSIG` Ed25519 verify + 50,000 × RFC 4253 packet roundtrip | 148.606 ms (`2913.84`) | **54.266 ms (`1064.04`)** | 145.698 / 160.819 | 51.365 / 59.989 | **2.09 MiB** | 14.66 MiB | 0.37x | `b09bb6eb1cb7a2df…` |
+| `SSHSIG` RSA-2048 (`rsa-sha2-256`, 200×) | 93.666 ms (`468332.50`) | **22.696 ms (`113480.62`)** | 92.260 / 103.798 | 19.759 / 24.033 | **2.33 MiB** | 10.33 MiB | 0.24x | `6d403f5828734861…` |
+| `SSHSIG` ECDSA P-256 (`sha512`, 500×) | 977.063 ms (`1954126.83`) | **40.443 ms (`80885.25`)** | 841.482 / 1255.210 | 35.611 / 44.862 | **2.38 MiB** | 11.61 MiB | 0.04x | `b8ac5346e99ad98e…` |
+| `SSHSIG` Ed25519 (`sha512`, 500×) | 77.757 ms (`155514.17`) | **36.629 ms (`73258.42`)** | 72.249 / 79.627 | 35.430 / 38.689 | **2.25 MiB** | 10.33 MiB | 0.47x | `b8ac5346e99ad98e…` |
+
+红队：19 / 19 单测（复用 `base64` + `crypto`），`audit/` 零改动且 `audit` **36 / 37**（16 / 16 control 全绿；2 P0 + 8 P1 + 11 P2 中仅保留 `p1_sshsig_verify_has_no_trust_anchor`：按已批准方案 `sshsig_verify` 保持 `ssh-keygen -Y check-novalidate` 语义，信任锚校验由 `sshsig_verify_with_key` / `sshsig_verify_allowed` 提供）。落后项：全部 6 项吞吐落后——Go `crypto/*` 使用 ARMv8 加密扩展与域运算汇编，`packages/crypto` 为纯标量可移植 Pion（ECDSA P-256 仅 0.04×，约慢 20–25×）。领先项：峰值 RSS 2.1–2.4 MiB vs Go 10.3–17.1 MiB；`known_hosts` 通配 `("a*" × n) + "b"` 在 `n = 20,000` 仍 0.03–0.05 s，而 Go `knownhosts`（`n = 11` 58.5 s）与 OpenSSH `ssh-keygen -F`（`n = 11` 17.0 s）指数回溯。
