@@ -38,9 +38,19 @@ python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --md-out "$OUT_DIR/bench_w2.md" --json-out "$OUT_DIR/bench_w2.json"
 
 echo ""
-echo "=== W3: High-Frequency Compile + Fresh Sandbox VM Exec (2000 scripts) ==="
+echo "=== W3 (Fair): Compile + Fresh Sandbox VM Exec (2000 scripts, Go same subset base/table/string/math) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
-  --title "W3: High-Frequency Compile + Fresh Sandbox VM Exec (2000 scripts)" \
+  --title "W3 (Fair): Fresh Sandbox VM Exec (2000 scripts, matched stdlib subset)" \
+  --impl "pion=$BIN_DIR/pion_lua w3" \
+  --impl "gopher_lua_fair=$BIN_DIR/go_lua w3_fair" \
+  --baseline gopher_lua_fair \
+  --warmup 1 --rounds 5 --ops 2000 \
+  --md-out "$OUT_DIR/bench_w3_fair.md" --json-out "$OUT_DIR/bench_w3_fair.json"
+
+echo ""
+echo "=== W3 (Full Go NewState): Compile + Fresh Sandbox VM Exec (2000 scripts, Go all libs) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "W3 (Full Go NewState): Fresh Sandbox VM Exec (2000 scripts, Go all libs)" \
   --impl "pion=$BIN_DIR/pion_lua w3" \
   --impl "gopher_lua=$BIN_DIR/go_lua w3" \
   --baseline gopher_lua \

@@ -105,10 +105,29 @@ func main() {
 			fmt.Fprintf(os.Stderr, "ERR: %v\n", err)
 			os.Exit(1)
 		}
-	case "w3":
+	case "w3", "w3_fair":
+		fair := mode == "w3_fair"
 		var acc int64
 		for i := 1; i <= 2000; i++ {
-			L := lua.NewState()
+			var L *lua.LState
+			if fair {
+				L = lua.NewState(lua.Options{SkipOpenLibs: true})
+				for _, pair := range []struct {
+					n string
+					f lua.LGFunction
+				}{
+					{lua.BaseLibName, lua.OpenBase},
+					{lua.TabLibName, lua.OpenTable},
+					{lua.StringLibName, lua.OpenString},
+					{lua.MathLibName, lua.OpenMath},
+				} {
+					L.Push(L.NewFunction(pair.f))
+					L.Push(lua.LString(pair.n))
+					L.Call(1, 0)
+				}
+			} else {
+				L = lua.NewState()
+			}
 			script := fmt.Sprintf("local k = %d\nlocal t = {a = k, b = k * 3 + 7}\nlocal function f(x) return x + t.a + t.b end\nreturn f(k %% 11)\n", i)
 			if err := L.DoString(script); err != nil {
 				L.Close()
@@ -123,7 +142,7 @@ func main() {
 		}
 		fmt.Printf("w3:2000:%d\n", acc)
 	default:
-		fmt.Fprintf(os.Stderr, "usage: go_lua <w1|w2|w3>\n")
+		fmt.Fprintf(os.Stderr, "usage: go_lua <w1|w2|w3|w3_fair>\n")
 		os.Exit(1)
 	}
 }

@@ -6,6 +6,21 @@
 ///| - Unbypassable sandbox limits (`FuelLimit`, `StackLimit`, `MemoryLimit`, `OutputLimit`)
 
 ///|
+fn LuaVm::valid_table(self : LuaVm, tid : Int) -> Bool {
+  tid >= 0 && tid < self.tables.length() && !self.table_free[tid]
+}
+
+///|
+fn LuaVm::valid_closure(self : LuaVm, cid : Int) -> Bool {
+  cid >= 0 && cid < self.closures.length() && !self.closure_free[cid]
+}
+
+///|
+fn LuaVm::valid_native(self : LuaVm, nid : Int) -> Bool {
+  nid >= 0 && nid < self.native_fns.length()
+}
+
+///|
 fn LuaVm::charge_fuel(self : LuaVm, cost : Int64) -> Result[Unit, LuaError] {
   self.fuel_used_count = self.fuel_used_count + cost
   if self.fuel_used_count > self.limits.max_fuel {
@@ -19,11 +34,261 @@ fn LuaVm::charge_mem(self : LuaVm, bytes : Int) -> Result[Unit, LuaError] {
   if bytes <= 0 {
     return Ok(())
   }
-  self.memory_used_bytes = self.memory_used_bytes + bytes
-  if self.memory_used_bytes > self.limits.max_memory_bytes {
+  if self.memory_used_bytes + bytes > self.gc_threshold || self.memory_used_bytes + bytes > self.limits.max_memory_bytes {
+    if !self.gc_running {
+      self.collect_garbage()
+    }
+  }
+  if self.memory_used_bytes + bytes > self.limits.max_memory_bytes {
     return Err(LuaError::new(LuaErrorKind::MemoryLimit, "memory budget exceeded", 0))
   }
+  self.memory_used_bytes = self.memory_used_bytes + bytes
   Ok(())
+}
+
+///| Iterative Mark-and-Sweep GC over VM arenas (`tables`, `closures`, `upvalues`) (P1-15).
+fn LuaVm::collect_garbage(self : LuaVm) -> Unit {
+  if self.gc_running {
+    return
+  }
+  self.gc_running = true
+  let ntbl = self.tables.length()
+  let nclo = self.closures.length()
+  let nuv = self.upvalues.length()
+  let nthr = self.threads.length()
+
+  let marked_tbl : Array[Bool] = []
+  let mut i = 0
+  while i < ntbl {
+    marked_tbl.push(false)
+    i = i + 1
+  }
+  let marked_clo : Array[Bool] = []
+  i = 0
+  while i < nclo {
+    marked_clo.push(false)
+    i = i + 1
+  }
+  let marked_uv : Array[Bool] = []
+  i = 0
+  while i < nuv {
+    marked_uv.push(false)
+    i = i + 1
+  }
+  let marked_thr : Array[Bool] = []
+  i = 0
+  while i < nthr {
+    marked_thr.push(false)
+    i = i + 1
+  }
+
+  let work_tbl : Array[Int] = []
+  let work_clo : Array[Int] = []
+  let work_uv : Array[Int] = []
+  let work_thr : Array[Int] = []
+  let mut live_bytes = self.pinned_mem_bytes
+
+  let mark_tbl = fn(tid : Int) {
+    if tid >= 0 && tid < ntbl && !self.table_free[tid] && !marked_tbl[tid] {
+      marked_tbl[tid] = true
+      work_tbl.push(tid)
+    }
+  }
+  let mark_clo = fn(cid : Int) {
+    if cid >= 0 && cid < nclo && !self.closure_free[cid] && !marked_clo[cid] {
+      marked_clo[cid] = true
+      work_clo.push(cid)
+    }
+  }
+  let mark_uv = fn(uid : Int) {
+    if uid >= 0 && uid < nuv && !self.upval_free[uid] && !marked_uv[uid] {
+      marked_uv[uid] = true
+      work_uv.push(uid)
+    }
+  }
+  let mark_thr = fn(thid : Int) {
+    if thid >= 0 && thid < nthr && !marked_thr[thid] {
+      marked_thr[thid] = true
+      work_thr.push(thid)
+    }
+  }
+  let mark_val = fn(v : LuaValue) {
+    match v {
+      LuaValue::Table(tid) => mark_tbl(tid)
+      LuaValue::Closure(cid) => mark_clo(cid)
+      LuaValue::Thread(thid) => mark_thr(thid)
+      LuaValue::Str(s) => live_bytes = live_bytes + s.length()
+      _ => ()
+    }
+  }
+
+  // Roots: globals, string metatable, host-created tables, last error, current stack & frames
+  mark_tbl(self.globals_id)
+  mark_tbl(self.string_mt_id)
+  i = 0
+  while i < self.host_table_roots.length() {
+    mark_tbl(self.host_table_roots[i])
+    i = i + 1
+  }
+  mark_val(self.last_error_val)
+  if self.current_thread >= 0 {
+    mark_thr(self.current_thread)
+  }
+
+  // Compute active stack extent of current thread
+  let mut active_top = self.top
+  i = 0
+  while i < self.frames.length() {
+    let fr = self.frames[i]
+    mark_clo(fr.closure_id)
+    if fr.closure_id >= 0 && fr.closure_id < nclo && !self.closure_free[fr.closure_id] {
+      let ftop = fr.base + self.closures[fr.closure_id].proto.max_stack
+      if ftop > active_top {
+        active_top = ftop
+      }
+    }
+    let mut vi = 0
+    while vi < fr.varargs.length() {
+      mark_val(fr.varargs[vi])
+      vi = vi + 1
+    }
+    i = i + 1
+  }
+  if active_top > self.stack.length() {
+    active_top = self.stack.length()
+  }
+  i = 0
+  while i < active_top {
+    mark_val(self.stack[i])
+    i = i + 1
+  }
+  i = 0
+  while i < self.open_upvalues.length() {
+    mark_uv(self.open_upvalues[i])
+    i = i + 1
+  }
+
+  // Drain worklists iteratively
+  while work_tbl.length() > 0 || work_clo.length() > 0 || work_uv.length() > 0 || work_thr.length() > 0 {
+    while work_tbl.length() > 0 {
+      let tid = work_tbl[work_tbl.length() - 1]
+      let _ = work_tbl.pop()
+      let t = self.tables[tid]
+      live_bytes = live_bytes + 64 + t.arr.length() * 16 + t.entries.length() * 32 + t.buckets.length() * 4
+      if t.metatable >= 0 {
+        mark_tbl(t.metatable)
+      }
+      let mut ai = 0
+      while ai < t.arr.length() {
+        mark_val(t.arr[ai])
+        ai = ai + 1
+      }
+      let mut ei = 0
+      while ei < t.entries.length() {
+        let e = t.entries[ei]
+        if e.alive {
+          mark_val(e.key)
+          mark_val(e.entry_val)
+        }
+        ei = ei + 1
+      }
+    }
+    while work_clo.length() > 0 {
+      let cid = work_clo[work_clo.length() - 1]
+      let _ = work_clo.pop()
+      let cl = self.closures[cid]
+      live_bytes = live_bytes + 48 + cl.upval_ids.length() * 8
+      let mut ui = 0
+      while ui < cl.upval_ids.length() {
+        mark_uv(cl.upval_ids[ui])
+        ui = ui + 1
+      }
+    }
+    while work_uv.length() > 0 {
+      let uid = work_uv[work_uv.length() - 1]
+      let _ = work_uv.pop()
+      let uv = self.upvalues[uid]
+      live_bytes = live_bytes + 24
+      if !uv.is_open {
+        mark_val(uv.closed_val)
+      }
+    }
+    while work_thr.length() > 0 {
+      let thid = work_thr[work_thr.length() - 1]
+      let _ = work_thr.pop()
+      let th = self.threads[thid]
+      live_bytes = live_bytes + 128 + th.stack.length() * 16
+      mark_val(th.entry_fn)
+      let mut si = 0
+      while si < th.stack.length() {
+        mark_val(th.stack[si])
+        si = si + 1
+      }
+      let mut fi = 0
+      while fi < th.frames.length() {
+        let fr = th.frames[fi]
+        mark_clo(fr.closure_id)
+        let mut vi = 0
+        while vi < fr.varargs.length() {
+          mark_val(fr.varargs[vi])
+          vi = vi + 1
+        }
+        fi = fi + 1
+      }
+      let mut ui = 0
+      while ui < th.open_upvalues.length() {
+        mark_uv(th.open_upvalues[ui])
+        ui = ui + 1
+      }
+      let mut yi = 0
+      while yi < th.yield_vals.length() {
+        mark_val(th.yield_vals[yi])
+        yi = yi + 1
+      }
+    }
+  }
+
+  // Sweep unreachable objects back into freelists
+  i = 0
+  while i < ntbl {
+    if !self.table_free[i] && !marked_tbl[i] {
+      self.tables[i] = LuaTable::new()
+      self.table_free[i] = true
+      self.table_free_list.push(i)
+    }
+    i = i + 1
+  }
+  let empty_proto = Proto::empty()
+  i = 0
+  while i < nclo {
+    if !self.closure_free[i] && !marked_clo[i] {
+      self.closures[i] = LuaClosure::{ proto: empty_proto, upval_ids: [] }
+      self.closure_free[i] = true
+      self.closure_free_list.push(i)
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < nuv {
+    if !self.upval_free[i] && !marked_uv[i] {
+      self.upvalues[i] = Upvalue::{ is_open: false, slot: -1, closed_val: LuaValue::Nil }
+      self.upval_free[i] = true
+      self.upval_free_list.push(i)
+    }
+    i = i + 1
+  }
+
+  // Recompute live memory baseline & next GC trigger threshold (never below live_bytes + 512 KiB!)
+  self.memory_used_bytes = live_bytes
+  let mut next_thresh = live_bytes * 2
+  if next_thresh < live_bytes + 524288 {
+    next_thresh = live_bytes + 524288
+  }
+  if next_thresh > self.limits.max_memory_bytes {
+    next_thresh = self.limits.max_memory_bytes
+  }
+  self.gc_threshold = next_thresh
+  self.gc_running = false
 }
 
 ///|
@@ -54,9 +319,47 @@ fn LuaVm::alloc_table(self : LuaVm) -> Result[Int, LuaError] {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
+  if self.table_free_list.length() > 0 {
+    let id = self.table_free_list[self.table_free_list.length() - 1]
+    let _ = self.table_free_list.pop()
+    self.tables[id] = LuaTable::new()
+    self.table_free[id] = false
+    return Ok(id)
+  }
   let id = self.tables.length()
   self.tables.push(LuaTable::new())
+  self.table_free.push(false)
   Ok(id)
+}
+
+///|
+fn LuaVm::alloc_closure(self : LuaVm, proto : Proto, upval_ids : Array[Int]) -> Int {
+  if self.closure_free_list.length() > 0 {
+    let cid = self.closure_free_list[self.closure_free_list.length() - 1]
+    let _ = self.closure_free_list.pop()
+    self.closures[cid] = LuaClosure::{ proto: proto, upval_ids: upval_ids }
+    self.closure_free[cid] = false
+    return cid
+  }
+  let cid = self.closures.length()
+  self.closures.push(LuaClosure::{ proto: proto, upval_ids: upval_ids })
+  self.closure_free.push(false)
+  cid
+}
+
+///|
+fn LuaVm::alloc_upval_slot(self : LuaVm, uv : Upvalue) -> Int {
+  if self.upval_free_list.length() > 0 {
+    let uid = self.upval_free_list[self.upval_free_list.length() - 1]
+    let _ = self.upval_free_list.pop()
+    self.upvalues[uid] = uv
+    self.upval_free[uid] = false
+    return uid
+  }
+  let uid = self.upvalues.length()
+  self.upvalues.push(uv)
+  self.upval_free.push(false)
+  uid
 }
 
 ///|
@@ -80,8 +383,7 @@ fn LuaVm::capture_upval(self : LuaVm, slot : Int) -> Int {
     }
     i = i + 1
   }
-  let uid = self.upvalues.length()
-  self.upvalues.push(Upvalue::{ is_open: true, slot: slot, closed_val: LuaValue::Nil })
+  let uid = self.alloc_upval_slot(Upvalue::{ is_open: true, slot: slot, closed_val: LuaValue::Nil })
   self.open_upvalues.push(uid)
   uid
 }
@@ -102,6 +404,69 @@ fn LuaVm::close_upvalues(self : LuaVm, min_slot : Int) -> Unit {
     } else {
       i = i + 1
     }
+  }
+}
+
+///| Close to-be-closed variables in the top frame at or above `min_slot` (in reverse order, P1-14).
+fn LuaVm::close_tbc_in_frame(self : LuaVm, fr : CallFrame, min_slot : Int, err_obj : LuaValue) -> Result[Unit, LuaError] {
+  while fr.tbc_slots.length() > 0 && fr.tbc_slots[fr.tbc_slots.length() - 1] >= min_slot {
+    let slot = fr.tbc_slots[fr.tbc_slots.length() - 1]
+    let _ = fr.tbc_slots.pop()
+    let val_c = if slot < self.stack.length() { self.stack[slot] } else { LuaValue::Nil }
+    if val_c.is_nil() || value_strict_eq(val_c, LuaValue::Bool(false)) {
+      continue
+    }
+    match self.get_metamethod(val_c, "__close") {
+      Some(mm) => {
+        match self.call_value(mm, [val_c, err_obj]) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      None => return Err(LuaError::new(LuaErrorKind::TypeError, "variable got a non-closable value", 0))
+    }
+  }
+  Ok(())
+}
+
+///| Build `chunk:line: ` prefix for the given 1-based stack level (1 = innermost Lua frame).
+fn LuaVm::frame_where(self : LuaVm, level : Int) -> (String, Int) {
+  if level <= 0 || self.frames.length() < level {
+    return ("", 0)
+  }
+  let fr = self.frames[self.frames.length() - level]
+  if !self.valid_closure(fr.closure_id) {
+    return ("", 0)
+  }
+  let p = self.closures[fr.closure_id].proto
+  let idx = if fr.pc > 0 && fr.pc - 1 < p.lines.length() {
+    fr.pc - 1
+  } else if fr.pc < p.lines.length() {
+    fr.pc
+  } else {
+    0
+  }
+  let line = if idx < p.lines.length() { p.lines[idx] } else { 0 }
+  if line > 0 {
+    (p.source_name + ":" + line.to_string() + ": ", line)
+  } else {
+    ("", 0)
+  }
+}
+
+///| Attach `chunk:line: ` prefix to runtime/type errors if not already prefixed (P2-1).
+fn LuaVm::decorate_error(self : LuaVm, e : LuaError) -> LuaError {
+  if is_sandbox_limit_error(e.kind) || e.is_kind(LuaErrorKind::SyntaxError) || e.is_kind(LuaErrorKind::UserError) {
+    return e
+  }
+  if e.line > 0 || e.message == "attempt to divide by zero" {
+    return e
+  }
+  let (prefix, line) = self.frame_where(1)
+  if prefix.length() > 0 {
+    LuaError::new(e.kind, prefix + e.message, line)
+  } else {
+    e
   }
 }
 
@@ -128,11 +493,16 @@ fn LuaVm::set_upval(self : LuaVm, uid : Int, v : LuaValue) -> Unit {
 ///| Look up a metamethod by name on a `LuaValue`.
 fn LuaVm::get_metamethod(self : LuaVm, v : LuaValue, mm_name : String) -> Option[LuaValue] {
   let mt_id = match v {
-    LuaValue::Table(tid) => self.tables[tid].metatable
+    LuaValue::Table(tid) => {
+      if !self.valid_table(tid) {
+        return None
+      }
+      self.tables[tid].metatable
+    }
     LuaValue::Str(_) => self.string_mt_id
     _ => -1
   }
-  if mt_id < 0 {
+  if !self.valid_table(mt_id) {
     return None
   }
   let mm = self.tables[mt_id].raw_get_str(mm_name)
@@ -160,7 +530,7 @@ fn to_lua_number(v : LuaValue) -> Option[LuaValue] {
   }
 }
 
-///| Coerce a `LuaValue` to `Int64` per Lua 5.4 bitwise rules.
+///| Coerce a `LuaValue` to `Int64` (accepts strings for stdlib functions like string.sub/table.insert).
 fn to_lua_int(v : LuaValue) -> Option[Int64] {
   match v {
     LuaValue::Int(n) => Some(n)
@@ -176,7 +546,79 @@ fn to_lua_int(v : LuaValue) -> Option[Int64] {
   }
 }
 
-///| `tostring(v)` honoring `__tostring` metamethod.
+///| Strict `Int64` conversion for Lua 5.4 bitwise operators (rejects strings, P2-3).
+fn to_lua_int_strict(v : LuaValue) -> Option[Int64] {
+  match v {
+    LuaValue::Int(n) => Some(n)
+    LuaValue::Float(f) => f64_to_exact_i64(f)
+    _ => None
+  }
+}
+
+///| Exact `Int64 < Double` comparison (P1-7).
+fn lua_lt_int_float(i : Int64, f : Double) -> Bool {
+  if f != f {
+    return false
+  }
+  if f >= 9223372036854775808.0 {
+    return true
+  }
+  if f < -9223372036854775808.0 {
+    return false
+  }
+  let fl = f64_floor(f)
+  let fi = fl.to_int64()
+  if i < fi {
+    true
+  } else if i > fi {
+    false
+  } else {
+    fl < f
+  }
+}
+
+///| Exact `Double < Int64` comparison (P1-7).
+fn lua_lt_float_int(f : Double, i : Int64) -> Bool {
+  if f != f {
+    return false
+  }
+  if f < -9223372036854775808.0 {
+    return true
+  }
+  if f >= 9223372036854775808.0 {
+    return false
+  }
+  let cl = f64_ceil(f)
+  if cl >= 9223372036854775808.0 {
+    return false
+  }
+  let fi = cl.to_int64()
+  if fi < i {
+    true
+  } else if fi > i {
+    false
+  } else {
+    f < cl
+  }
+}
+
+///| Exact `Int64 <= Double` comparison (P1-7).
+fn lua_le_int_float(i : Int64, f : Double) -> Bool {
+  if f != f {
+    return false
+  }
+  !lua_lt_float_int(f, i)
+}
+
+///| Exact `Double <= Int64` comparison (P1-7).
+fn lua_le_float_int(f : Double, i : Int64) -> Bool {
+  if f != f {
+    return false
+  }
+  !lua_lt_int_float(i, f)
+}
+
+///| `tostring(v)` honoring `__tostring` (accepting string or number, P2-8) and `__name` (P2-8).
 fn LuaVm::value_to_string(self : LuaVm, v : LuaValue) -> Result[String, LuaError] {
   match self.get_metamethod(v, "__tostring") {
     Some(mm) => {
@@ -185,6 +627,8 @@ fn LuaVm::value_to_string(self : LuaVm, v : LuaValue) -> Result[String, LuaError
           if res.length() > 0 {
             match res[0] {
               LuaValue::Str(s) => Ok(s)
+              LuaValue::Int(n) => Ok(n.to_string())
+              LuaValue::Float(f) => Ok(lua_float_to_string(f))
               _ => Err(LuaError::new(LuaErrorKind::TypeError, "'__tostring' must return a string", 0))
             }
           } else {
@@ -194,17 +638,30 @@ fn LuaVm::value_to_string(self : LuaVm, v : LuaValue) -> Result[String, LuaError
         Err(e) => Err(e)
       }
     }
-    None => Ok(lua_value_to_string_raw(v))
+    None => {
+      match v {
+        LuaValue::Table(tid) => {
+          match self.get_metamethod(v, "__name") {
+            Some(LuaValue::Str(name)) => Ok(name + ": 0x" + tid.to_string())
+            _ => Ok("table: 0x" + tid.to_string())
+          }
+        }
+        _ => Ok(lua_value_to_string_raw(v))
+      }
+    }
   }
 }
 
-///| Index read `obj[key]` with `__index` metamethod chain.
+///| Index read `obj[key]` with `__index` metamethod chain (limit 2000, P1-19; handle check, P2-9).
 fn LuaVm::index_get(self : LuaVm, obj : LuaValue, key : LuaValue) -> Result[LuaValue, LuaError] {
   let mut cur = obj
   let mut depth = 0
-  while depth < 100 {
+  while depth < 2000 {
     match cur {
       LuaValue::Table(tid) => {
+        if !self.valid_table(tid) {
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
+        }
         let v = self.tables[tid].raw_get(key)
         if !v.is_nil() {
           return Ok(v)
@@ -238,13 +695,16 @@ fn LuaVm::index_get(self : LuaVm, obj : LuaValue, key : LuaValue) -> Result[LuaV
   Err(LuaError::new(LuaErrorKind::RuntimeError, "'__index' chain too long", 0))
 }
 
-///| Index write `obj[key] = v` with `__newindex` metamethod chain.
+///| Index write `obj[key] = v` with `__newindex` metamethod chain (limit 2000, P1-19; handle check, P2-9).
 fn LuaVm::index_set(self : LuaVm, obj : LuaValue, key : LuaValue, v : LuaValue) -> Result[Unit, LuaError] {
   let mut cur = obj
   let mut depth = 0
-  while depth < 100 {
+  while depth < 2000 {
     match cur {
       LuaValue::Table(tid) => {
+        if !self.valid_table(tid) {
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
+        }
         let existing = self.tables[tid].raw_get(key)
         if !existing.is_nil() {
           match self.tables[tid].raw_set(key, v) {
@@ -322,6 +782,7 @@ fn lua_raw_eq(a : LuaValue, b : LuaValue) -> Bool {
     (LuaValue::Table(x), LuaValue::Table(y)) => x == y
     (LuaValue::Closure(x), LuaValue::Closure(y)) => x == y
     (LuaValue::NativeFn(x), LuaValue::NativeFn(y)) => x == y
+    (LuaValue::Thread(x), LuaValue::Thread(y)) => x == y
     _ => false
   }
 }
@@ -347,13 +808,13 @@ fn LuaVm::lua_eq(self : LuaVm, a : LuaValue, b : LuaValue) -> Result[Bool, LuaEr
   }
 }
 
-///| Full Lua 5.4 `<` comparison with `__lt` metamethod.
+///| Full Lua 5.4 `<` comparison with exact int/float compare (P1-7) and `__lt` metamethod.
 fn LuaVm::lua_lt(self : LuaVm, a : LuaValue, b : LuaValue) -> Result[Bool, LuaError] {
   match (a, b) {
     (LuaValue::Int(x), LuaValue::Int(y)) => Ok(x < y)
     (LuaValue::Float(x), LuaValue::Float(y)) => Ok(x < y)
-    (LuaValue::Int(x), LuaValue::Float(y)) => Ok(x.to_double() < y)
-    (LuaValue::Float(x), LuaValue::Int(y)) => Ok(x < y.to_double())
+    (LuaValue::Int(x), LuaValue::Float(y)) => Ok(lua_lt_int_float(x, y))
+    (LuaValue::Float(x), LuaValue::Int(y)) => Ok(lua_lt_float_int(x, y))
     (LuaValue::Str(x), LuaValue::Str(y)) => Ok(x < y)
     _ => {
       match self.get_bin_metamethod(a, b, "__lt") {
@@ -369,13 +830,13 @@ fn LuaVm::lua_lt(self : LuaVm, a : LuaValue, b : LuaValue) -> Result[Bool, LuaEr
   }
 }
 
-///| Full Lua 5.4 `<=` comparison with `__le` (fallback `not (b < a)`).
+///| Full Lua 5.4 `<=` comparison with exact int/float compare (P1-7) and `__le` (with `not __lt(b, a)` fallback).
 fn LuaVm::lua_le(self : LuaVm, a : LuaValue, b : LuaValue) -> Result[Bool, LuaError] {
   match (a, b) {
     (LuaValue::Int(x), LuaValue::Int(y)) => Ok(x <= y)
     (LuaValue::Float(x), LuaValue::Float(y)) => Ok(x <= y)
-    (LuaValue::Int(x), LuaValue::Float(y)) => Ok(x.to_double() <= y)
-    (LuaValue::Float(x), LuaValue::Int(y)) => Ok(x <= y.to_double())
+    (LuaValue::Int(x), LuaValue::Float(y)) => Ok(lua_le_int_float(x, y))
+    (LuaValue::Float(x), LuaValue::Int(y)) => Ok(lua_le_float_int(x, y))
     (LuaValue::Str(x), LuaValue::Str(y)) => Ok(x <= y)
     _ => {
       match self.get_bin_metamethod(a, b, "__le") {
@@ -511,13 +972,19 @@ fn LuaVm::arith_bin(self : LuaVm, op : Int, a : LuaValue, b : LuaValue) -> Resul
         Err(e) => Err(e)
       }
     }
-    None => Err(LuaError::new(LuaErrorKind::TypeError, "attempt to perform arithmetic on " + a.type_name() + " and " + b.type_name(), 0))
+    None => {
+      let bad_t = match to_lua_number(a) {
+        None => a.type_name()
+        Some(_) => b.type_name()
+      }
+      Err(LuaError::new(LuaErrorKind::TypeError, "attempt to perform arithmetic on a " + bad_t + " value", 0))
+    }
   }
 }
 
-///| Bitwise binary op dispatch.
+///| Bitwise binary op dispatch (P2-3: strict integer conversion, rejects strings).
 fn LuaVm::bitwise_bin(self : LuaVm, op : Int, a : LuaValue, b : LuaValue) -> Result[LuaValue, LuaError] {
-  match (to_lua_int(a), to_lua_int(b)) {
+  match (to_lua_int_strict(a), to_lua_int_strict(b)) {
     (Some(x), Some(y)) => {
       if op == OP_BAND {
         return Ok(LuaValue::Int(x & y))
@@ -556,91 +1023,134 @@ fn LuaVm::bitwise_bin(self : LuaVm, op : Int, a : LuaValue, b : LuaValue) -> Res
 }
 
 ///| Call any callable `LuaValue` (Lua closure, native fn, or table with `__call`) from host or metamethod.
+///| Iterative `__call` chain resolution (P0-2) and caller-frame stack protection (P0-5).
 fn LuaVm::call_value(self : LuaVm, callee : LuaValue, args : Array[LuaValue]) -> Result[Array[LuaValue], LuaError] {
-  match callee {
-    LuaValue::NativeFn(nid) => {
-      if self.frames.length() + 1 > self.limits.max_call_depth {
-        return Err(LuaError::new(LuaErrorKind::StackLimit, "call stack depth exceeded", 0))
-      }
-      let f = self.native_fns[nid]
-      f(self, args)
-    }
-    LuaValue::Closure(cid) => {
-      if self.frames.length() + 1 > self.limits.max_call_depth {
-        return Err(LuaError::new(LuaErrorKind::StackLimit, "call stack depth exceeded", 0))
-      }
-      let saved_top = self.top
-      let base = saved_top
-      let cl = self.closures[cid]
-      let p = cl.proto
-      match self.ensure_stack(base + p.max_stack + args.length() + 4) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
-      }
-      let mut i = 0
-      while i < p.num_params {
-        self.stack[base + i] = if i < args.length() { args[i] } else { LuaValue::Nil }
-        i = i + 1
-      }
-      let varargs : Array[LuaValue] = []
-      if p.is_vararg {
-        while i < args.length() {
-          varargs.push(args[i])
-          i = i + 1
+  let mut cur_callee = callee
+  let mut cur_args = args
+  let mut meta_depth = 0
+  while true {
+    match cur_callee {
+      LuaValue::NativeFn(nid) => {
+        if !self.valid_native(nid) {
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid native function handle", 0))
         }
-      }
-      self.top = base + p.max_stack
-      let target_depth = self.frames.length()
-      self.frames.push(
-        CallFrame::{
-          closure_id: cid,
-          pc: 0,
-          base: base,
-          varargs: varargs,
-          ret_reg: base,
-          want_results: -1,
-        },
-      )
-      match self.run_loop(target_depth) {
-        Ok(_) => {
-          let results : Array[LuaValue] = []
-          let mut r = base
-          while r < self.top {
-            results.push(self.stack[r])
-            r = r + 1
-          }
-          self.top = saved_top
-          Ok(results)
+        if self.frames.length() + 1 > self.limits.max_call_depth {
+          return Err(LuaError::new(LuaErrorKind::StackLimit, "call stack depth exceeded", 0))
         }
-        Err(e) => {
-          // Unwind frames down to target_depth and close upvalues
-          while self.frames.length() > target_depth {
-            let popped = self.frames.pop()
-            match popped {
-              Some(fr) => self.close_upvalues(fr.base)
-              None => ()
+        let f = self.native_fns[nid]
+        return f(self, cur_args)
+      }
+      LuaValue::Closure(cid) => {
+        if !self.valid_closure(cid) {
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid closure handle", 0))
+        }
+        if self.frames.length() + 1 > self.limits.max_call_depth {
+          return Err(LuaError::new(LuaErrorKind::StackLimit, "call stack depth exceeded", 0))
+        }
+        let saved_top = self.top
+        // P0-5: ensure callee frame base never overlaps any live register of the current caller frame!
+        let mut base = saved_top
+        if self.frames.length() > 0 {
+          let cur_fr = self.frames[self.frames.length() - 1]
+          if self.valid_closure(cur_fr.closure_id) {
+            let ftop = cur_fr.base + self.closures[cur_fr.closure_id].proto.max_stack
+            if ftop > base {
+              base = ftop
             }
           }
-          self.top = saved_top
-          Err(e)
         }
-      }
-    }
-    _ => {
-      match self.get_metamethod(callee, "__call") {
-        Some(mm) => {
-          let new_args : Array[LuaValue] = [callee]
-          let mut i = 0
-          while i < args.length() {
-            new_args.push(args[i])
+        let cl = self.closures[cid]
+        let p = cl.proto
+        match self.ensure_stack(base + p.max_stack + cur_args.length() + 4) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let mut i = 0
+        while i < p.num_params {
+          self.stack[base + i] = if i < cur_args.length() { cur_args[i] } else { LuaValue::Nil }
+          i = i + 1
+        }
+        let varargs : Array[LuaValue] = []
+        if p.is_vararg {
+          while i < cur_args.length() {
+            varargs.push(cur_args[i])
             i = i + 1
           }
-          self.call_value(mm, new_args)
         }
-        None => Err(LuaError::new(LuaErrorKind::TypeError, "attempt to call a " + callee.type_name() + " value", 0))
+        self.top = base + p.max_stack
+        let target_depth = self.frames.length()
+        self.frames.push(
+          CallFrame::{
+            closure_id: cid,
+            pc: 0,
+            base: base,
+            varargs: varargs,
+            ret_reg: base,
+            want_results: -1,
+            tbc_slots: [],
+          },
+        )
+        match self.run_loop(target_depth) {
+          Ok(_) => {
+            let results : Array[LuaValue] = []
+            let mut r = base
+            while r < self.top {
+              results.push(self.stack[r])
+              r = r + 1
+            }
+            self.top = saved_top
+            return Ok(results)
+          }
+          Err(e) => {
+            let err_obj = if e.is_kind(LuaErrorKind::UserError) && !self.last_error_val.is_nil() {
+              self.last_error_val
+            } else {
+              LuaValue::Str(e.message)
+            }
+            // Unwind frames down to target_depth, closing upvalues and <close> variables
+            let mut final_err = e
+            while self.frames.length() > target_depth {
+              let popped = self.frames.pop()
+              match popped {
+                Some(fr) => {
+                  self.close_upvalues(fr.base)
+                  if !is_sandbox_limit_error(final_err.kind) && fr.tbc_slots.length() > 0 {
+                    match self.close_tbc_in_frame(fr, fr.base, err_obj) {
+                      Ok(_) => ()
+                      Err(ce) => final_err = ce
+                    }
+                  }
+                }
+                None => ()
+              }
+            }
+            self.top = saved_top
+            return Err(final_err)
+          }
+        }
+      }
+      _ => {
+        meta_depth = meta_depth + 1
+        if meta_depth > 2000 || self.frames.length() + meta_depth > self.limits.max_call_depth {
+          return Err(LuaError::new(LuaErrorKind::StackLimit, "'__call' chain too long", 0))
+        }
+        match self.get_metamethod(cur_callee, "__call") {
+          Some(mm) => {
+            let next_args : Array[LuaValue] = [cur_callee]
+            let mut i = 0
+            while i < cur_args.length() {
+              next_args.push(cur_args[i])
+              i = i + 1
+            }
+            cur_callee = mm
+            cur_args = next_args
+          }
+          None => return Err(LuaError::new(LuaErrorKind::TypeError, "attempt to call a " + cur_callee.type_name() + " value", 0))
+        }
       }
     }
   }
+  Ok([])
 }
 
 ///| Helper for `OP_CONCAT`.
@@ -704,6 +1214,33 @@ fn LuaVm::op_concat_exec(self : LuaVm, base : Int, a : Int, b : Int, c : Int) ->
         acc = LuaValue::Str(s)
         handled = true
       }
+      (LuaValue::Int(n1), LuaValue::Float(f2)) => {
+        let s = n1.to_string() + lua_float_to_string(f2)
+        match self.charge_mem(s.length()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        acc = LuaValue::Str(s)
+        handled = true
+      }
+      (LuaValue::Float(f1), LuaValue::Int(n2)) => {
+        let s = lua_float_to_string(f1) + n2.to_string()
+        match self.charge_mem(s.length()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        acc = LuaValue::Str(s)
+        handled = true
+      }
+      (LuaValue::Float(f1), LuaValue::Float(f2)) => {
+        let s = lua_float_to_string(f1) + lua_float_to_string(f2)
+        match self.charge_mem(s.length()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        acc = LuaValue::Str(s)
+        handled = true
+      }
       _ => ()
     }
     if !handled {
@@ -723,20 +1260,58 @@ fn LuaVm::op_concat_exec(self : LuaVm, base : Int, a : Int, b : Int, c : Int) ->
   Ok(())
 }
 
-///| Helper for `OP_FORPREP`.
-fn LuaVm::op_forprep_exec(self : LuaVm, base : Int, a : Int) -> Result[Unit, LuaError] {
+///| Helper for `OP_FORPREP` (Lua 5.4 unsigned-counter integer `for` + float limit -> int, P1-6 & P2-7).
+///| Returns `Ok(true)` if loop should enter body, `Ok(false)` if loop should be skipped.
+fn LuaVm::op_forprep_exec(self : LuaVm, base : Int, a : Int) -> Result[Bool, LuaError] {
   let init_v = self.stack[base + a]
   let lim_v = self.stack[base + a + 1]
   let step_v = self.stack[base + a + 2]
   match (to_lua_number(init_v), to_lua_number(lim_v), to_lua_number(step_v)) {
-    (Some(LuaValue::Int(iv)), Some(LuaValue::Int(lv)), Some(LuaValue::Int(sv))) => {
+    (Some(LuaValue::Int(iv)), Some(nl), Some(LuaValue::Int(sv))) => {
       if sv == 0L {
         return Err(LuaError::new(LuaErrorKind::RuntimeError, "'for' step is zero", 0))
       }
-      self.stack[base + a] = LuaValue::Int(iv - sv)
-      self.stack[base + a + 1] = LuaValue::Int(lv)
+      let lv = match nl {
+        LuaValue::Int(n) => n
+        LuaValue::Float(fl) => {
+          if fl != fl {
+            return Ok(false)
+          }
+          if sv > 0L {
+            if fl < -9223372036854775808.0 {
+              return Ok(false)
+            }
+            if fl >= 9223372036854775808.0 {
+              9223372036854775807L
+            } else {
+              f64_floor(fl).to_int64()
+            }
+          } else {
+            if fl >= 9223372036854775808.0 {
+              return Ok(false)
+            }
+            if fl < -9223372036854775808.0 {
+              -9223372036854775807L - 1L
+            } else {
+              f64_ceil(fl).to_int64()
+            }
+          }
+        }
+        _ => return Ok(false)
+      }
+      if (sv > 0L && iv > lv) || (sv < 0L && iv < lv) {
+        return Ok(false)
+      }
+      let count : UInt64 = if sv > 0L {
+        (lv.reinterpret_as_uint64() - iv.reinterpret_as_uint64()) / sv.reinterpret_as_uint64()
+      } else {
+        (iv.reinterpret_as_uint64() - lv.reinterpret_as_uint64()) / (0UL - sv.reinterpret_as_uint64())
+      }
+      self.stack[base + a] = LuaValue::Int(iv)
+      self.stack[base + a + 1] = LuaValue::Int(count.reinterpret_as_int64())
       self.stack[base + a + 2] = LuaValue::Int(sv)
-      Ok(())
+      self.stack[base + a + 3] = LuaValue::Int(iv)
+      Ok(true)
     }
     (Some(ni), Some(nl), Some(ns)) => {
       let fi_v = match ni {
@@ -757,10 +1332,15 @@ fn LuaVm::op_forprep_exec(self : LuaVm, base : Int, a : Int) -> Result[Unit, Lua
       if fs_v == 0.0 {
         return Err(LuaError::new(LuaErrorKind::RuntimeError, "'for' step is zero", 0))
       }
-      self.stack[base + a] = LuaValue::Float(fi_v - fs_v)
-      self.stack[base + a + 1] = LuaValue::Float(fl_v)
-      self.stack[base + a + 2] = LuaValue::Float(fs_v)
-      Ok(())
+      if (fs_v > 0.0 && fi_v <= fl_v) || (fs_v < 0.0 && fi_v >= fl_v) {
+        self.stack[base + a] = LuaValue::Float(fi_v)
+        self.stack[base + a + 1] = LuaValue::Float(fl_v)
+        self.stack[base + a + 2] = LuaValue::Float(fs_v)
+        self.stack[base + a + 3] = LuaValue::Float(fi_v)
+        Ok(true)
+      } else {
+        Ok(false)
+      }
     }
     _ => Err(LuaError::new(LuaErrorKind::TypeError, "'for' initial/limit/step value must be a number", 0))
   }
@@ -772,6 +1352,9 @@ fn LuaVm::op_setlist_exec(self : LuaVm, base : Int, a : Int, b : Int, c : Int) -
   let offset = (c - 1) * 50
   match self.stack[base + a] {
     LuaValue::Table(tid) => {
+      if !self.valid_table(tid) {
+        return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
+      }
       let t = self.tables[tid]
       let mut i = 1
       while i <= count {
@@ -810,8 +1393,7 @@ fn LuaVm::op_closure_exec(self : LuaVm, cl : LuaClosure, base : Int, a : Int, b 
     Ok(_) => ()
     Err(e) => return Err(e)
   }
-  let cid = self.closures.length()
-  self.closures.push(LuaClosure::{ proto: sub_proto, upval_ids: uv_ids })
+  let cid = self.alloc_closure(sub_proto, uv_ids)
   self.stack[base + a] = LuaValue::Closure(cid)
   Ok(())
 }
@@ -849,6 +1431,7 @@ fn LuaVm::op_call_slow(
   dst_slot : Int,
   nargs : Int,
   want : Int,
+  frame_top : Int,
 ) -> Result[Unit, LuaError] {
   let args : Array[LuaValue] = []
   let mut k = 0
@@ -856,8 +1439,16 @@ fn LuaVm::op_call_slow(
     args.push(self.stack[arg_start + k])
     k = k + 1
   }
+  // P0-5: ensure `self.top` is above caller's live frame registers before invoking native/callback
+  let min_top = if arg_start + nargs > frame_top { arg_start + nargs } else { frame_top }
+  if self.top < min_top {
+    self.top = min_top
+  }
   let res = match callee {
     LuaValue::NativeFn(nid) => {
+      if !self.valid_native(nid) {
+        return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid native function handle", 0))
+      }
       let f = self.native_fns[nid]
       match f(self, args) {
         Ok(r) => r
@@ -870,6 +1461,10 @@ fn LuaVm::op_call_slow(
         Err(e) => return Err(e)
       }
     }
+  }
+  // If coroutine yielded inside native call, stop writing results now (resume will deliver them!)
+  if self.current_thread >= 0 && self.threads[self.current_thread].did_yield {
+    return Ok(())
   }
   if want < 0 {
     match self.ensure_stack(dst_slot + res.length() + 2) {
@@ -933,7 +1528,7 @@ fn LuaVm::op_unary_exec(self : LuaVm, op : Int, base : Int, a : Int, b : Int) ->
       }
     }
   } else if op == OP_BNOT {
-    match to_lua_int(vb) {
+    match to_lua_int_strict(vb) {
       Some(n) => {
         self.stack[base + a] = LuaValue::Int(n ^ -1L)
         return Ok(())
@@ -974,6 +1569,9 @@ fn LuaVm::op_unary_exec(self : LuaVm, op : Int, base : Int, a : Int, b : Int) ->
           None => {
             match vb {
               LuaValue::Table(tid) => {
+                if !self.valid_table(tid) {
+                  return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
+                }
                 self.stack[base + a] = LuaValue::Int(self.tables[tid].raw_len().to_int64())
                 return Ok(())
               }
@@ -986,9 +1584,22 @@ fn LuaVm::op_unary_exec(self : LuaVm, op : Int, base : Int, a : Int, b : Int) ->
   }
 }
 
-///| Main bytecode execution loop, running until `self.frames.length() == stop_depth`.
+///| Main bytecode execution loop with host re-entry depth guard (P0-4) and error line decoration (P2-1).
 fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
-  let stack = self.stack
+  if self.host_depth >= 40 {
+    return Err(LuaError::new(LuaErrorKind::StackLimit, "host re-entry stack depth exceeded", 0))
+  }
+  self.host_depth = self.host_depth + 1
+  let res = self.run_loop_inner(stop_depth)
+  self.host_depth = self.host_depth - 1
+  match res {
+    Ok(_) => Ok(())
+    Err(e) => Err(self.decorate_error(e))
+  }
+}
+
+///| Inner bytecode dispatch loop, running until `self.frames.length() == stop_depth`.
+fn LuaVm::run_loop_inner(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
   let max_fuel = self.limits.max_fuel
   let mut fr = self.frames[self.frames.length() - 1]
   let mut cl = self.closures[fr.closure_id]
@@ -1013,44 +1624,56 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
     let c = ((inst >> 40) & 0xFFFFL).to_int()
 
     match op {
-      0 => stack[base + a] = stack[base + b]
-      1 => stack[base + a] = consts[b]
-      4 => stack[base + a] = LuaValue::Int((((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS).to_int64())
+      0 => self.stack[base + a] = self.stack[base + b]
+      1 => self.stack[base + a] = consts[b]
+      49 => {
+        // OP_LOADKX followed by OP_EXTRAARG
+        let extra = code[pc]
+        pc = pc + 1
+        let kx = dec_ax(extra)
+        self.stack[base + a] = consts[kx]
+      }
+      4 => self.stack[base + a] = LuaValue::Int((((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS).to_int64())
       2 => {
         let mut i = 0
         while i <= b {
-          stack[base + a + i] = LuaValue::Nil
+          self.stack[base + a + i] = LuaValue::Nil
           i = i + 1
         }
       }
       3 => {
-        stack[base + a] = LuaValue::Bool(b != 0)
+        self.stack[base + a] = LuaValue::Bool(b != 0)
         if c != 0 {
           pc = pc + 1
         }
       }
-      5 => stack[base + a] = self.get_upval(cl.upval_ids[b])
-      6 => self.set_upval(cl.upval_ids[b], stack[base + a])
+      5 => self.stack[base + a] = self.get_upval(cl.upval_ids[b])
+      6 => self.set_upval(cl.upval_ids[b], self.stack[base + a])
       7 => {
         let tbl = self.get_upval(cl.upval_ids[b])
         let key = consts[c]
         match (tbl, key) {
           (LuaValue::Table(tid), LuaValue::Str(ks)) => {
-            let v = self.tables[tid].raw_get_str(ks)
-            if !v.is_nil() || self.tables[tid].metatable < 0 {
-              stack[base + a] = v
+            if self.valid_table(tid) {
+              let v = self.tables[tid].raw_get_str(ks)
+              if !v.is_nil() || self.tables[tid].metatable < 0 {
+                self.stack[base + a] = v
+              } else {
+                fr.pc = pc
+                match self.index_get(tbl, key) {
+                  Ok(rv) => self.stack[base + a] = rv
+                  Err(e) => return Err(e)
+                }
+              }
             } else {
               fr.pc = pc
-              match self.index_get(tbl, key) {
-                Ok(rv) => stack[base + a] = rv
-                Err(e) => return Err(e)
-              }
+              return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
             }
           }
           _ => {
             fr.pc = pc
             match self.index_get(tbl, key) {
-              Ok(rv) => stack[base + a] = rv
+              Ok(rv) => self.stack[base + a] = rv
               Err(e) => return Err(e)
             }
           }
@@ -1058,31 +1681,36 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       }
       8 => {
         fr.pc = pc
-        match self.index_set(self.get_upval(cl.upval_ids[a]), consts[b], stack[base + c]) {
+        match self.index_set(self.get_upval(cl.upval_ids[a]), consts[b], self.stack[base + c]) {
           Ok(_) => ()
           Err(e) => return Err(e)
         }
       }
       11 => {
-        let tbl = stack[base + b]
+        let tbl = self.stack[base + b]
         let key = consts[c]
         match (tbl, key) {
           (LuaValue::Table(tid), LuaValue::Str(ks)) => {
-            let v = self.tables[tid].raw_get_str(ks)
-            if !v.is_nil() || self.tables[tid].metatable < 0 {
-              stack[base + a] = v
+            if self.valid_table(tid) {
+              let v = self.tables[tid].raw_get_str(ks)
+              if !v.is_nil() || self.tables[tid].metatable < 0 {
+                self.stack[base + a] = v
+              } else {
+                fr.pc = pc
+                match self.index_get(tbl, key) {
+                  Ok(rv) => self.stack[base + a] = rv
+                  Err(e) => return Err(e)
+                }
+              }
             } else {
               fr.pc = pc
-              match self.index_get(tbl, key) {
-                Ok(rv) => stack[base + a] = rv
-                Err(e) => return Err(e)
-              }
+              return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
             }
           }
           _ => {
             fr.pc = pc
             match self.index_get(tbl, key) {
-              Ok(rv) => stack[base + a] = rv
+              Ok(rv) => self.stack[base + a] = rv
               Err(e) => return Err(e)
             }
           }
@@ -1090,51 +1718,61 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       }
       12 => {
         fr.pc = pc
-        match self.index_set(stack[base + a], consts[b], stack[base + c]) {
+        match self.index_set(self.stack[base + a], consts[b], self.stack[base + c]) {
           Ok(_) => ()
           Err(e) => return Err(e)
         }
       }
       9 => {
-        let tbl = stack[base + b]
-        let key = stack[base + c]
+        let tbl = self.stack[base + b]
+        let key = self.stack[base + c]
         match (tbl, key) {
           (LuaValue::Table(tid), LuaValue::Int(idx)) => {
-            let t = self.tables[tid]
-            if idx >= 1L && idx <= t.arr.length().to_int64() && (!t.arr[idx.to_int() - 1].is_nil() || t.metatable < 0) {
-              stack[base + a] = t.arr[idx.to_int() - 1]
+            if self.valid_table(tid) {
+              let t = self.tables[tid]
+              if idx >= 1L && idx <= t.arr.length().to_int64() && (!t.arr[idx.to_int() - 1].is_nil() || t.metatable < 0) {
+                self.stack[base + a] = t.arr[idx.to_int() - 1]
+              } else {
+                fr.pc = pc
+                match self.index_get(tbl, key) {
+                  Ok(rv) => self.stack[base + a] = rv
+                  Err(e) => return Err(e)
+                }
+              }
             } else {
               fr.pc = pc
-              match self.index_get(tbl, key) {
-                Ok(rv) => stack[base + a] = rv
-                Err(e) => return Err(e)
-              }
+              return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
             }
           }
           _ => {
             fr.pc = pc
             match self.index_get(tbl, key) {
-              Ok(rv) => stack[base + a] = rv
+              Ok(rv) => self.stack[base + a] = rv
               Err(e) => return Err(e)
             }
           }
         }
       }
       10 => {
-        let tbl = stack[base + a]
-        let key = stack[base + b]
-        let v = stack[base + c]
+        let tbl = self.stack[base + a]
+        let key = self.stack[base + b]
+        let v = self.stack[base + c]
         match (tbl, key) {
           (LuaValue::Table(tid), LuaValue::Int(idx)) => {
-            let t = self.tables[tid]
-            if idx >= 1L && idx <= t.arr.length().to_int64() && (!t.arr[idx.to_int() - 1].is_nil() || t.metatable < 0) {
-              t.arr[idx.to_int() - 1] = v
+            if self.valid_table(tid) {
+              let t = self.tables[tid]
+              if idx >= 1L && idx <= t.arr.length().to_int64() && (!t.arr[idx.to_int() - 1].is_nil() || t.metatable < 0) {
+                t.arr[idx.to_int() - 1] = v
+              } else {
+                fr.pc = pc
+                match self.index_set(tbl, key, v) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+              }
             } else {
               fr.pc = pc
-              match self.index_set(tbl, key, v) {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
+              return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid table handle", 0))
             }
           }
           _ => {
@@ -1148,7 +1786,7 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       }
       13 => {
         match self.alloc_table() {
-          Ok(tid) => stack[base + a] = LuaValue::Table(tid)
+          Ok(tid) => self.stack[base + a] = LuaValue::Table(tid)
           Err(e) => {
             fr.pc = pc
             return Err(e)
@@ -1163,45 +1801,45 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
         }
       }
       15 => {
-        let obj = stack[base + b]
-        stack[base + a + 1] = obj
+        let obj = self.stack[base + b]
+        self.stack[base + a + 1] = obj
         fr.pc = pc
         match self.index_get(obj, consts[c]) {
-          Ok(m) => stack[base + a] = m
+          Ok(m) => self.stack[base + a] = m
           Err(e) => return Err(e)
         }
       }
       16 => {
-        match (stack[base + b], stack[base + c]) {
-          (LuaValue::Int(x), LuaValue::Int(y)) => stack[base + a] = LuaValue::Int(x + y)
+        match (self.stack[base + b], self.stack[base + c]) {
+          (LuaValue::Int(x), LuaValue::Int(y)) => self.stack[base + a] = LuaValue::Int(x + y)
           _ => {
             fr.pc = pc
-            match self.arith_bin(OP_ADD, stack[base + b], stack[base + c]) {
-              Ok(r) => stack[base + a] = r
+            match self.arith_bin(OP_ADD, self.stack[base + b], self.stack[base + c]) {
+              Ok(r) => self.stack[base + a] = r
               Err(e) => return Err(e)
             }
           }
         }
       }
       17 => {
-        match (stack[base + b], stack[base + c]) {
-          (LuaValue::Int(x), LuaValue::Int(y)) => stack[base + a] = LuaValue::Int(x - y)
+        match (self.stack[base + b], self.stack[base + c]) {
+          (LuaValue::Int(x), LuaValue::Int(y)) => self.stack[base + a] = LuaValue::Int(x - y)
           _ => {
             fr.pc = pc
-            match self.arith_bin(OP_SUB, stack[base + b], stack[base + c]) {
-              Ok(r) => stack[base + a] = r
+            match self.arith_bin(OP_SUB, self.stack[base + b], self.stack[base + c]) {
+              Ok(r) => self.stack[base + a] = r
               Err(e) => return Err(e)
             }
           }
         }
       }
       18 => {
-        match (stack[base + b], stack[base + c]) {
-          (LuaValue::Int(x), LuaValue::Int(y)) => stack[base + a] = LuaValue::Int(x * y)
+        match (self.stack[base + b], self.stack[base + c]) {
+          (LuaValue::Int(x), LuaValue::Int(y)) => self.stack[base + a] = LuaValue::Int(x * y)
           _ => {
             fr.pc = pc
-            match self.arith_bin(OP_MUL, stack[base + b], stack[base + c]) {
-              Ok(r) => stack[base + a] = r
+            match self.arith_bin(OP_MUL, self.stack[base + b], self.stack[base + c]) {
+              Ok(r) => self.stack[base + a] = r
               Err(e) => return Err(e)
             }
           }
@@ -1209,15 +1847,15 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       }
       19 | 20 | 21 | 22 => {
         fr.pc = pc
-        match self.arith_bin(op, stack[base + b], stack[base + c]) {
-          Ok(r) => stack[base + a] = r
+        match self.arith_bin(op, self.stack[base + b], self.stack[base + c]) {
+          Ok(r) => self.stack[base + a] = r
           Err(e) => return Err(e)
         }
       }
       23 | 24 | 25 | 26 | 27 => {
         fr.pc = pc
-        match self.bitwise_bin(op, stack[base + b], stack[base + c]) {
-          Ok(r) => stack[base + a] = r
+        match self.bitwise_bin(op, self.stack[base + b], self.stack[base + c]) {
+          Ok(r) => self.stack[base + a] = r
           Err(e) => return Err(e)
         }
       }
@@ -1228,7 +1866,7 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
           Err(e) => return Err(e)
         }
       }
-      30 => stack[base + a] = LuaValue::Bool(!stack[base + b].is_truthy())
+      30 => self.stack[base + a] = LuaValue::Bool(!self.stack[base + b].is_truthy())
       32 => {
         fr.pc = pc
         match self.op_concat_exec(base, a, b, c) {
@@ -1238,17 +1876,17 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       }
       33 => {
         fr.pc = pc
-        match self.lua_eq(stack[base + b], stack[base + c]) {
+        match self.lua_eq(self.stack[base + b], self.stack[base + c]) {
           Ok(eq) => if eq != (a != 0) { pc = pc + 1 }
           Err(e) => return Err(e)
         }
       }
       34 => {
-        match (stack[base + b], stack[base + c]) {
+        match (self.stack[base + b], self.stack[base + c]) {
           (LuaValue::Int(x), LuaValue::Int(y)) => if (x < y) != (a != 0) { pc = pc + 1 }
           _ => {
             fr.pc = pc
-            match self.lua_lt(stack[base + b], stack[base + c]) {
+            match self.lua_lt(self.stack[base + b], self.stack[base + c]) {
               Ok(lt) => if lt != (a != 0) { pc = pc + 1 }
               Err(e) => return Err(e)
             }
@@ -1256,47 +1894,83 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
         }
       }
       35 => {
-        match (stack[base + b], stack[base + c]) {
+        match (self.stack[base + b], self.stack[base + c]) {
           (LuaValue::Int(x), LuaValue::Int(y)) => if (x <= y) != (a != 0) { pc = pc + 1 }
           _ => {
             fr.pc = pc
-            match self.lua_le(stack[base + b], stack[base + c]) {
+            match self.lua_le(self.stack[base + b], self.stack[base + c]) {
               Ok(le) => if le != (a != 0) { pc = pc + 1 }
               Err(e) => return Err(e)
             }
           }
         }
       }
-      36 => if stack[base + a].is_truthy() == (c != 0) { pc = pc + 1 }
+      36 => if self.stack[base + a].is_truthy() == (c != 0) { pc = pc + 1 }
       38 => {
         if a > 0 {
           self.close_upvalues(base + a - 1)
+          if fr.tbc_slots.length() > 0 {
+            fr.pc = pc
+            match self.close_tbc_in_frame(fr, base + a - 1, LuaValue::Nil) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
         }
         pc = pc + (((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS)
       }
-      48 => self.close_upvalues(base + a)
+      48 => {
+        self.close_upvalues(base + a)
+        if fr.tbc_slots.length() > 0 {
+          fr.pc = pc
+          match self.close_tbc_in_frame(fr, base + a, LuaValue::Nil) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+      }
+      51 => {
+        // OP_TBC: mark register base+a as to-be-closed; validate it has __close if not nil/false
+        let v = self.stack[base + a]
+        if !v.is_nil() && !value_strict_eq(v, LuaValue::Bool(false)) {
+          match self.get_metamethod(v, "__close") {
+            Some(_) => ()
+            None => {
+              fr.pc = pc
+              return Err(LuaError::new(LuaErrorKind::TypeError, "variable got a non-closable value", 0))
+            }
+          }
+        }
+        fr.tbc_slots.push(base + a)
+      }
       42 => {
         fr.pc = pc
         match self.op_forprep_exec(base, a) {
-          Ok(_) => pc = pc + (((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS)
+          Ok(enter) => {
+            if !enter {
+              pc = pc + (((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS) + 1
+            }
+          }
           Err(e) => return Err(e)
         }
       }
       43 => {
-        match (stack[base + a], stack[base + a + 1], stack[base + a + 2]) {
-          (LuaValue::Int(idx), LuaValue::Int(lim), LuaValue::Int(stp)) => {
-            let next_idx = idx + stp
-            if (stp > 0L && next_idx <= lim) || (stp <= 0L && next_idx >= lim) {
-              stack[base + a] = LuaValue::Int(next_idx)
-              stack[base + a + 3] = LuaValue::Int(next_idx)
+        match (self.stack[base + a], self.stack[base + a + 1], self.stack[base + a + 2]) {
+          (LuaValue::Int(idx), LuaValue::Int(rem_i), LuaValue::Int(stp)) => {
+            let rem = rem_i.reinterpret_as_uint64()
+            if rem > 0UL {
+              self.stack[base + a + 1] = LuaValue::Int((rem - 1UL).reinterpret_as_int64())
+              let next_idx = idx + stp
+              self.stack[base + a] = LuaValue::Int(next_idx)
+              self.stack[base + a + 3] = LuaValue::Int(next_idx)
               pc = pc + (((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS)
             }
           }
           (LuaValue::Float(idx), LuaValue::Float(lim), LuaValue::Float(stp)) => {
             let next_idx = idx + stp
-            if (stp > 0.0 && next_idx <= lim) || (stp <= 0.0 && next_idx >= lim) {
-              stack[base + a] = LuaValue::Float(next_idx)
-              stack[base + a + 3] = LuaValue::Float(next_idx)
+            if (stp > 0.0 && next_idx <= lim) || (stp < 0.0 && next_idx >= lim) {
+              self.stack[base + a] = LuaValue::Float(next_idx)
+              self.stack[base + a + 3] = LuaValue::Float(next_idx)
               pc = pc + (((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS)
             }
           }
@@ -1308,11 +1982,11 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       }
       44 => {
         fr.pc = pc
-        match self.call_value(stack[base + a], [stack[base + a + 1], stack[base + a + 2]]) {
+        match self.call_value(self.stack[base + a], [self.stack[base + a + 1], self.stack[base + a + 2]]) {
           Ok(res) => {
             let mut i = 0
             while i < c {
-              stack[base + a + 3 + i] = if i < res.length() { res[i] } else { LuaValue::Nil }
+              self.stack[base + a + 3 + i] = if i < res.length() { res[i] } else { LuaValue::Nil }
               i = i + 1
             }
           }
@@ -1320,8 +1994,8 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
         }
       }
       45 => {
-        if !stack[base + a + 3].is_nil() {
-          stack[base + a + 2] = stack[base + a + 3]
+        if !self.stack[base + a + 3].is_nil() {
+          self.stack[base + a + 2] = self.stack[base + a + 3]
           pc = pc + (((inst >> 24) & 0xFFFFFFL).to_int() - SBX_BIAS)
         }
       }
@@ -1341,12 +2015,46 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       }
       39 => {
         let func_slot = base + a
-        let nargs = if b == 0 { self.top - (func_slot + 1) } else { b - 1 }
+        let mut nargs = if b == 0 { self.top - (func_slot + 1) } else { b - 1 }
         let want = c - 1
-        let callee = stack[func_slot]
+        let mut callee = self.stack[func_slot]
         fr.pc = pc
+        // Resolve `__call` chains iteratively on the flat VM stack (P0-2 & P1-21)
+        let mut meta_d = 0
+        while true {
+          match callee {
+            LuaValue::Closure(_) | LuaValue::NativeFn(_) => break
+            _ => {
+              meta_d = meta_d + 1
+              if meta_d > 2000 || self.frames.length() + meta_d > self.limits.max_call_depth {
+                return Err(LuaError::new(LuaErrorKind::StackLimit, "'__call' chain too long", 0))
+              }
+              match self.get_metamethod(callee, "__call") {
+                Some(mm) => {
+                  match self.ensure_stack(func_slot + nargs + 4) {
+                    Ok(_) => ()
+                    Err(e) => return Err(e)
+                  }
+                  let mut sh = nargs
+                  while sh >= 1 {
+                    self.stack[func_slot + 1 + sh] = self.stack[func_slot + sh]
+                    sh = sh - 1
+                  }
+                  self.stack[func_slot + 1] = callee
+                  self.stack[func_slot] = mm
+                  nargs = nargs + 1
+                  callee = mm
+                }
+                None => return Err(LuaError::new(LuaErrorKind::TypeError, "attempt to call a " + callee.type_name() + " value", 0))
+              }
+            }
+          }
+        }
         match callee {
           LuaValue::Closure(cid) => {
+            if !self.valid_closure(cid) {
+              return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid closure handle", 0))
+            }
             if self.frames.length() + 1 > self.limits.max_call_depth {
               return Err(LuaError::new(LuaErrorKind::StackLimit, "call stack depth exceeded", 0))
             }
@@ -1361,13 +2069,13 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
             if new_p.is_vararg && nargs > new_p.num_params {
               let mut k = new_p.num_params
               while k < nargs {
-                varargs.push(stack[new_base + k])
+                varargs.push(self.stack[new_base + k])
                 k = k + 1
               }
             }
             let mut k = nargs
             while k < new_p.num_params {
-              stack[new_base + k] = LuaValue::Nil
+              self.stack[new_base + k] = LuaValue::Nil
               k = k + 1
             }
             let new_fr = CallFrame::{
@@ -1377,6 +2085,7 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
               varargs: varargs,
               ret_reg: func_slot,
               want_results: want,
+              tbc_slots: [],
             }
             self.frames.push(new_fr)
             fr = new_fr
@@ -1387,20 +2096,75 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
             pc = 0
           }
           _ => {
-            match self.op_call_slow(callee, func_slot + 1, func_slot, nargs, want) {
+            let ftop = base + cl.proto.max_stack
+            match self.op_call_slow(callee, func_slot + 1, func_slot, nargs, want, ftop) {
               Ok(_) => ()
               Err(e) => return Err(e)
+            }
+            if self.current_thread >= 0 && self.threads[self.current_thread].did_yield {
+              // Save PC and pending call return target, unwind out of run_loop!
+              fr.pc = pc
+              return Ok(())
             }
           }
         }
       }
       40 => {
         let func_slot = base + a
-        let nargs = if b == 0 { self.top - (func_slot + 1) } else { b - 1 }
-        let callee = stack[func_slot]
+        let mut nargs = if b == 0 { self.top - (func_slot + 1) } else { b - 1 }
+        let mut callee = self.stack[func_slot]
         self.close_upvalues(base)
+        if fr.tbc_slots.length() > 0 {
+          fr.pc = pc
+          match self.close_tbc_in_frame(fr, base, LuaValue::Nil) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        // Resolve `__call` chains iteratively for true TCO through `__call` (P0-2 & P1-21)
+        let mut meta_d = 0
+        while true {
+          match callee {
+            LuaValue::Closure(_) | LuaValue::NativeFn(_) => break
+            _ => {
+              meta_d = meta_d + 1
+              if meta_d > 2000 || self.frames.length() + meta_d > self.limits.max_call_depth {
+                fr.pc = pc
+                return Err(LuaError::new(LuaErrorKind::StackLimit, "'__call' chain too long", 0))
+              }
+              match self.get_metamethod(callee, "__call") {
+                Some(mm) => {
+                  match self.ensure_stack(func_slot + nargs + 4) {
+                    Ok(_) => ()
+                    Err(e) => {
+                      fr.pc = pc
+                      return Err(e)
+                    }
+                  }
+                  let mut sh = nargs
+                  while sh >= 1 {
+                    self.stack[func_slot + 1 + sh] = self.stack[func_slot + sh]
+                    sh = sh - 1
+                  }
+                  self.stack[func_slot + 1] = callee
+                  self.stack[func_slot] = mm
+                  nargs = nargs + 1
+                  callee = mm
+                }
+                None => {
+                  fr.pc = pc
+                  return Err(LuaError::new(LuaErrorKind::TypeError, "attempt to call a " + callee.type_name() + " value", 0))
+                }
+              }
+            }
+          }
+        }
         match callee {
           LuaValue::Closure(cid) => {
+            if !self.valid_closure(cid) {
+              fr.pc = pc
+              return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid closure handle", 0))
+            }
             let new_cl = self.closures[cid]
             let new_p = new_cl.proto
             match self.ensure_stack(base + new_p.max_stack + nargs + 4) {
@@ -1414,13 +2178,13 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
             if new_p.is_vararg && nargs > new_p.num_params {
               let mut k = new_p.num_params
               while k < nargs {
-                varargs.push(stack[func_slot + 1 + k])
+                varargs.push(self.stack[func_slot + 1 + k])
                 k = k + 1
               }
             }
             let mut k = 0
             while k < new_p.num_params {
-              stack[base + k] = if k < nargs { stack[func_slot + 1 + k] } else { LuaValue::Nil }
+              self.stack[base + k] = if k < nargs { self.stack[func_slot + 1 + k] } else { LuaValue::Nil }
               k = k + 1
             }
             fr.closure_id = cid
@@ -1433,9 +2197,13 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
           }
           _ => {
             fr.pc = pc
-            match self.op_call_slow(callee, func_slot + 1, fr.ret_reg, nargs, fr.want_results) {
+            let ftop = base + cl.proto.max_stack
+            match self.op_call_slow(callee, func_slot + 1, fr.ret_reg, nargs, fr.want_results, ftop) {
               Ok(_) => ()
               Err(e) => return Err(e)
+            }
+            if self.current_thread >= 0 && self.threads[self.current_thread].did_yield {
+              return Ok(())
             }
             let _ = self.frames.pop()
             if self.frames.length() <= stop_depth {
@@ -1453,6 +2221,13 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
       41 => {
         let nres = if b == 0 { self.top - (base + a) } else { b - 1 }
         self.close_upvalues(base)
+        if fr.tbc_slots.length() > 0 {
+          fr.pc = pc
+          match self.close_tbc_in_frame(fr, base, LuaValue::Nil) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
         let _ = self.frames.pop()
         if fr.want_results < 0 {
           match self.ensure_stack(fr.ret_reg + nres + 2) {
@@ -1461,14 +2236,14 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
           }
           let mut i = 0
           while i < nres {
-            stack[fr.ret_reg + i] = stack[base + a + i]
+            self.stack[fr.ret_reg + i] = self.stack[base + a + i]
             i = i + 1
           }
           self.top = fr.ret_reg + nres
         } else {
           let mut i = 0
           while i < fr.want_results {
-            stack[fr.ret_reg + i] = if i < nres { stack[base + a + i] } else { LuaValue::Nil }
+            self.stack[fr.ret_reg + i] = if i < nres { self.stack[base + a + i] } else { LuaValue::Nil }
             i = i + 1
           }
         }
@@ -1493,10 +2268,19 @@ fn LuaVm::run_loop(self : LuaVm, stop_depth : Int) -> Result[Unit, LuaError] {
 
 ///| Execute a compiled `Proto` in this VM with `_ENV` bound to `_G`.
 fn LuaVm::exec_proto(self : LuaVm, proto : Proto) -> Result[Array[LuaValue], LuaError] {
-  // Create a closed upvalue holding `_G` for `_ENV`
-  let env_uid = self.upvalues.length()
-  self.upvalues.push(Upvalue::{ is_open: false, slot: -1, closed_val: LuaValue::Table(self.globals_id) })
-  let cid = self.closures.length()
-  self.closures.push(LuaClosure::{ proto: proto, upval_ids: [env_uid] })
+  self.exec_proto_with_env(proto, LuaValue::Table(self.globals_id))
+}
+
+///| Execute a compiled `Proto` in this VM with explicit `_ENV`.
+fn LuaVm::exec_proto_with_env(self : LuaVm, proto : Proto, env : LuaValue) -> Result[Array[LuaValue], LuaError] {
+  let env_uid = self.alloc_upval_slot(Upvalue::{ is_open: false, slot: -1, closed_val: env })
+  let cid = self.alloc_closure(proto, [env_uid])
   self.call_value(LuaValue::Closure(cid), [])
+}
+
+///| Create a closure for a top-level compiled `Proto` with explicit `_ENV` (used by `load`).
+fn LuaVm::make_chunk_closure(self : LuaVm, proto : Proto, env : LuaValue) -> LuaValue {
+  let env_uid = self.alloc_upval_slot(Upvalue::{ is_open: false, slot: -1, closed_val: env })
+  let cid = self.alloc_closure(proto, [env_uid])
+  LuaValue::Closure(cid)
 }
