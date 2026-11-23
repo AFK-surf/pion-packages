@@ -1,0 +1,932 @@
+///| AWS Cedar expression evaluator & Authorizer (`Default Deny + Forbid Overrides Permit`).
+///| Strict checked 64-bit signed arithmetic, O(N*M) non-backtracking `like` matcher,
+///| per-policy error isolation, and explicit depth/step budgets.
+
+///| Insert `v` into `set` only if not already present (maintaining set uniqueness).
+fn set_insert_unique(set : Array[Value], v : Value) -> Unit {
+  let mut i = 0
+  while i < set.length() {
+    if value_eq_impl(set[i], v) {
+      return
+    }
+    i = i + 1
+  }
+  set.push(v)
+}
+
+fn set_contains(set : Array[Value], target : Value) -> Bool {
+  let mut i = 0
+  while i < set.length() {
+    if value_eq_impl(set[i], target) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn record_find(rec : Array[(String, Value)], key : String) -> Option[Value] {
+  let mut i = 0
+  while i < rec.length() {
+    let (k, v) = rec[i]
+    if k == key {
+      return Some(v)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn value_eq_impl(a : Value, b : Value) -> Bool {
+  match (a, b) {
+    (Value::Bool(x), Value::Bool(y)) => x == y
+    (Value::Long(x), Value::Long(y)) => x == y
+    (Value::String(x), Value::String(y)) => x == y
+    (Value::Entity(x), Value::Entity(y)) => x.equals(y)
+    (Value::Decimal(x), Value::Decimal(y)) => x.raw == y.raw
+    (Value::IpAddr(x), Value::IpAddr(y)) => ip_eq_impl(x, y)
+    (Value::Set(sa), Value::Set(sb)) => {
+      if sa.length() != sb.length() {
+        return false
+      }
+      let mut i = 0
+      while i < sa.length() {
+        if !set_contains(sb, sa[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    (Value::Record(ra), Value::Record(rb)) => {
+      if ra.length() != rb.length() {
+        return false
+      }
+      let mut i = 0
+      while i < ra.length() {
+        let (k, va) = ra[i]
+        match record_find(rb, k) {
+          Some(vb) =>
+          if !value_eq_impl(va, vb) {
+            return false
+          }
+          None => return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Strict Checked 64-bit Signed Arithmetic (zero silent wraparound)
+// ---------------------------------------------------------------------------
+
+fn i64_min() -> Int64 {
+  -9223372036854775807L - 1L
+}
+
+fn i64_max() -> Int64 {
+  9223372036854775807L
+}
+
+fn checked_neg_i64(a : Int64) -> Result[Int64, CedarError] {
+  if a == i64_min() {
+    Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer overflow in unary negation"))
+  } else {
+    Ok(0L - a)
+  }
+}
+
+fn checked_add_i64(a : Int64, b : Int64) -> Result[Int64, CedarError] {
+  if b > 0L && a > i64_max() - b {
+    Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer overflow in addition"))
+  } else if b < 0L && a < i64_min() - b {
+    Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer underflow in addition"))
+  } else {
+    Ok(a + b)
+  }
+}
+
+fn checked_sub_i64(a : Int64, b : Int64) -> Result[Int64, CedarError] {
+  if b < 0L && a > i64_max() + b {
+    Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer overflow in subtraction"))
+  } else if b > 0L && a < i64_min() + b {
+    Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer underflow in subtraction"))
+  } else {
+    Ok(a - b)
+  }
+}
+
+fn checked_mul_i64(a : Int64, b : Int64) -> Result[Int64, CedarError] {
+  if a == 0L || b == 0L {
+    return Ok(0L)
+  }
+  if a == i64_min() {
+    if b == 1L {
+      return Ok(i64_min())
+    } else {
+      return Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer overflow in multiplication"))
+    }
+  }
+  if b == i64_min() {
+    if a == 1L {
+      return Ok(i64_min())
+    } else {
+      return Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer overflow in multiplication"))
+    }
+  }
+  let neg = (a < 0L) != (b < 0L)
+  let ua : UInt64 = if a < 0L { (0L - a).reinterpret_as_uint64() } else { a.reinterpret_as_uint64() }
+  let ub : UInt64 = if b < 0L { (0L - b).reinterpret_as_uint64() } else { b.reinterpret_as_uint64() }
+  let limit : UInt64 = if neg { 9223372036854775808UL } else { 9223372036854775807UL }
+  if ua > limit / ub {
+    return Err(CedarError::new(CedarErrorKind::IntegerOverflow, -1, "integer overflow in multiplication"))
+  }
+  let prod = ua * ub
+  if neg {
+    if prod == 9223372036854775808UL {
+      Ok(i64_min())
+    } else {
+      Ok(0L - prod.reinterpret_as_int64())
+    }
+  } else {
+    Ok(prod.reinterpret_as_int64())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// O(N*M) Non-Backtracking Wildcard `like` Matcher (UTF-8 Codepoint-Aware)
+// ---------------------------------------------------------------------------
+
+fn match_like_pattern(s : String, pattern : Array[PatternElem]) -> Bool {
+  // Decode `s` into code points (ASCII fast path uses direct bytes)
+  let mut is_ascii = true
+  let slen = s.length()
+  let mut k = 0
+  while k < slen {
+    if s.code_unit_at(k) >= 0x80 {
+      is_ascii = false
+      break
+    }
+    k = k + 1
+  }
+
+  let plen = pattern.length()
+  if is_ascii {
+    let mut si = 0
+    let mut pi = 0
+    let mut star_pi = -1
+    let mut star_si = 0
+    while si < slen {
+      if pi < plen {
+        match pattern[pi] {
+          PatternElem::Wildcard => {
+            star_pi = pi
+            star_si = si
+            pi = pi + 1
+            continue
+          }
+          PatternElem::Literal(cp) =>
+          if s.code_unit_at(si) == cp {
+            si = si + 1
+            pi = pi + 1
+            continue
+          }
+        }
+      }
+      if star_pi >= 0 {
+        pi = star_pi + 1
+        star_si = star_si + 1
+        si = star_si
+      } else {
+        return false
+      }
+    }
+    while pi < plen {
+      match pattern[pi] {
+        PatternElem::Wildcard => pi = pi + 1
+        PatternElem::Literal(_) => return false
+      }
+    }
+    return true
+  }
+
+  // General UTF-8 codepoint path
+  let cps : Array[Int] = []
+  let mut pos = 0
+  while pos < slen {
+    let (cp, next_pos) = decode_utf8_at(s, pos)
+    cps.push(cp)
+    pos = next_pos
+  }
+  let clen = cps.length()
+  let mut si = 0
+  let mut pi = 0
+  let mut star_pi = -1
+  let mut star_si = 0
+  while si < clen {
+    if pi < plen {
+      match pattern[pi] {
+        PatternElem::Wildcard => {
+          star_pi = pi
+          star_si = si
+          pi = pi + 1
+          continue
+        }
+        PatternElem::Literal(cp) =>
+        if cps[si] == cp {
+          si = si + 1
+          pi = pi + 1
+          continue
+        }
+      }
+    }
+    if star_pi >= 0 {
+      pi = star_pi + 1
+      star_si = star_si + 1
+      si = star_si
+    } else {
+      return false
+    }
+  }
+  while pi < plen {
+    match pattern[pi] {
+      PatternElem::Wildcard => pi = pi + 1
+      PatternElem::Literal(_) => return false
+    }
+  }
+  true
+}
+
+// ---------------------------------------------------------------------------
+// Expression Evaluator & Authorizer
+// ---------------------------------------------------------------------------
+
+struct EvalCtx {
+  req : Request
+  entities : Entities
+  limits : CedarLimits
+  mut steps : Int
+}
+
+fn EvalCtx::tick(self : EvalCtx) -> Result[Unit, CedarError] {
+  self.steps = self.steps + 1
+  if self.steps > self.limits.max_steps {
+    Err(CedarError::new(CedarErrorKind::LimitExceeded, -1, "evaluation steps exceed max_steps"))
+  } else {
+    Ok(())
+  }
+}
+
+fn eval_expr(ctx : EvalCtx, expr : Expr, depth : Int) -> Result[Value, CedarError] {
+  if depth > ctx.limits.max_depth {
+    return Err(CedarError::new(CedarErrorKind::LimitExceeded, -1, "evaluation depth exceeds max_depth"))
+  }
+  let _ = match ctx.tick() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match expr {
+    Expr::BoolLit(b) => Ok(Value::Bool(b))
+    Expr::LongLit(v) => Ok(Value::Long(v))
+    Expr::StrLit(s) => Ok(Value::String(s))
+    Expr::EntityLit(u) => Ok(Value::Entity(u))
+    Expr::Var(v) =>
+    match v {
+      Var::Principal => Ok(Value::Entity(ctx.req.principal))
+      Var::Action => Ok(Value::Entity(ctx.req.action))
+      Var::Resource => Ok(Value::Entity(ctx.req.resource))
+      Var::Context => Ok(Value::Record(ctx.req.context))
+    }
+    Expr::Unary(op, inner) => {
+      let iv = match eval_expr(ctx, inner, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match op {
+        UnaryOp::Not =>
+        match iv {
+          Value::Bool(b) => Ok(Value::Bool(!b))
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'!' requires boolean operand"))
+        }
+        UnaryOp::Neg =>
+        match iv {
+          Value::Long(n) =>
+          match checked_neg_i64(n) {
+            Ok(r) => Ok(Value::Long(r))
+            Err(e) => Err(e)
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "unary '-' requires integer operand"))
+        }
+      }
+    }
+    Expr::Binary(op, l, r) =>
+    match op {
+      BinaryOp::And => {
+        let lv = match eval_expr(ctx, l, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        match lv {
+          Value::Bool(false) => Ok(Value::Bool(false))
+          Value::Bool(true) => {
+            let rv = match eval_expr(ctx, r, depth + 1) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+            match rv {
+              Value::Bool(b) => Ok(Value::Bool(b))
+              _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'&&' requires boolean operands"))
+            }
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'&&' requires boolean operands"))
+        }
+      }
+      BinaryOp::Or => {
+        let lv = match eval_expr(ctx, l, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        match lv {
+          Value::Bool(true) => Ok(Value::Bool(true))
+          Value::Bool(false) => {
+            let rv = match eval_expr(ctx, r, depth + 1) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+            match rv {
+              Value::Bool(b) => Ok(Value::Bool(b))
+              _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'||' requires boolean operands"))
+            }
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'||' requires boolean operands"))
+        }
+      }
+      BinaryOp::Eq => {
+        let lv = match eval_expr(ctx, l, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let rv = match eval_expr(ctx, r, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        Ok(Value::Bool(value_eq_impl(lv, rv)))
+      }
+      BinaryOp::Neq => {
+        let lv = match eval_expr(ctx, l, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let rv = match eval_expr(ctx, r, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        Ok(Value::Bool(!value_eq_impl(lv, rv)))
+      }
+      BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+        let lv = match eval_expr(ctx, l, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let rv = match eval_expr(ctx, r, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        match (lv, rv) {
+          (Value::Long(x), Value::Long(y)) =>
+          match op {
+            BinaryOp::Lt => Ok(Value::Bool(x < y))
+            BinaryOp::Le => Ok(Value::Bool(x <= y))
+            BinaryOp::Gt => Ok(Value::Bool(x > y))
+            _ => Ok(Value::Bool(x >= y))
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "ordering comparison requires integer operands"))
+        }
+      }
+      BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+        let lv = match eval_expr(ctx, l, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let rv = match eval_expr(ctx, r, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        match (lv, rv) {
+          (Value::Long(x), Value::Long(y)) => {
+            let res = match op {
+              BinaryOp::Add => checked_add_i64(x, y)
+              BinaryOp::Sub => checked_sub_i64(x, y)
+              _ => checked_mul_i64(x, y)
+            }
+            match res {
+              Ok(n) => Ok(Value::Long(n))
+              Err(e) => Err(e)
+            }
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "arithmetic requires integer operands"))
+        }
+      }
+      BinaryOp::In => {
+        let lv = match eval_expr(ctx, l, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let rv = match eval_expr(ctx, r, depth + 1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let child = match lv {
+          Value::Entity(u) => u
+          _ => return Err(CedarError::new(CedarErrorKind::TypeError, -1, "'in' lhs must be an entity"))
+        }
+        match rv {
+          Value::Entity(parent) => Ok(Value::Bool(entities_is_in_impl(ctx.entities, child, parent)))
+          Value::Set(elems) => {
+            let mut found = false
+            let mut i = 0
+            while i < elems.length() {
+              match elems[i] {
+                Value::Entity(parent) =>
+                if !found && entities_is_in_impl(ctx.entities, child, parent) {
+                  found = true
+                }
+                _ => return Err(CedarError::new(CedarErrorKind::TypeError, -1, "'in' rhs set must contain only entities"))
+              }
+              i = i + 1
+            }
+            Ok(Value::Bool(found))
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'in' rhs must be an entity or set of entities"))
+        }
+      }
+    }
+    Expr::If(c, t, e) => {
+      let cv = match eval_expr(ctx, c, depth + 1) {
+        Ok(v) => v
+        Err(err) => return Err(err)
+      }
+      match cv {
+        Value::Bool(true) => eval_expr(ctx, t, depth + 1)
+        Value::Bool(false) => eval_expr(ctx, e, depth + 1)
+        _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'if' condition must be boolean"))
+      }
+    }
+    Expr::GetAttr(obj, attr) => {
+      let ov = match eval_expr(ctx, obj, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match ov {
+        Value::Record(rec) =>
+        match record_find(rec, attr) {
+          Some(v) => Ok(v)
+          None => Err(CedarError::new(CedarErrorKind::AttrNotFound, -1, "record does not have attribute '" + attr + "'"))
+        }
+        Value::Entity(uid) =>
+        match entities_get_impl(ctx.entities, uid) {
+          Some(ent) =>
+          match record_find(ent.attrs, attr) {
+            Some(v) => Ok(v)
+            None => Err(CedarError::new(CedarErrorKind::AttrNotFound, -1, "entity does not have attribute '" + attr + "'"))
+          }
+          None =>
+          Err(
+            CedarError::new(
+              CedarErrorKind::EntityDoesNotExist,
+              -1,
+              "entity does not exist: " + format_entity_uid_impl(uid),
+            ),
+          )
+        }
+        _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "attribute access requires record or entity"))
+      }
+    }
+    Expr::HasAttr(obj, attr) => {
+      let ov = match eval_expr(ctx, obj, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match ov {
+        Value::Record(rec) =>
+        match record_find(rec, attr) {
+          Some(_) => Ok(Value::Bool(true))
+          None => Ok(Value::Bool(false))
+        }
+        Value::Entity(uid) =>
+        match entities_get_impl(ctx.entities, uid) {
+          Some(ent) =>
+          match record_find(ent.attrs, attr) {
+            Some(_) => Ok(Value::Bool(true))
+            None => Ok(Value::Bool(false))
+          }
+          None => Ok(Value::Bool(false))
+        }
+        _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'has' requires record or entity"))
+      }
+    }
+    Expr::Like(obj, pattern, _) => {
+      let ov = match eval_expr(ctx, obj, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match ov {
+        Value::String(s) => Ok(Value::Bool(match_like_pattern(s, pattern)))
+        _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'like' requires string operand"))
+      }
+    }
+    Expr::Is(obj, ty) => {
+      let ov = match eval_expr(ctx, obj, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match ov {
+        Value::Entity(uid) => Ok(Value::Bool(uid.entity_type == ty))
+        _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'is' requires entity operand"))
+      }
+    }
+    Expr::IsIn(obj, ty, rhs) => {
+      let ov = match eval_expr(ctx, obj, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let child = match ov {
+        Value::Entity(uid) => uid
+        _ => return Err(CedarError::new(CedarErrorKind::TypeError, -1, "'is' requires entity operand"))
+      }
+      if child.entity_type != ty {
+        return Ok(Value::Bool(false))
+      }
+      let rv = match eval_expr(ctx, rhs, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match rv {
+        Value::Entity(parent) => Ok(Value::Bool(entities_is_in_impl(ctx.entities, child, parent)))
+        Value::Set(elems) => {
+          let mut found = false
+          let mut i = 0
+          while i < elems.length() {
+            match elems[i] {
+              Value::Entity(parent) =>
+              if !found && entities_is_in_impl(ctx.entities, child, parent) {
+                found = true
+              }
+              _ => return Err(CedarError::new(CedarErrorKind::TypeError, -1, "'in' rhs set must contain only entities"))
+            }
+            i = i + 1
+          }
+          Ok(Value::Bool(found))
+        }
+        _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "'in' rhs must be an entity or set of entities"))
+      }
+    }
+    Expr::SetLit(elems) => {
+      let out : Array[Value] = []
+      let mut i = 0
+      while i < elems.length() {
+        let v = match eval_expr(ctx, elems[i], depth + 1) {
+          Ok(x) => x
+          Err(e) => return Err(e)
+        }
+        set_insert_unique(out, v)
+        i = i + 1
+      }
+      Ok(Value::Set(out))
+    }
+    Expr::RecordLit(entries) => {
+      let out : Array[(String, Value)] = []
+      let mut i = 0
+      while i < entries.length() {
+        let (k, ve) = entries[i]
+        let v = match eval_expr(ctx, ve, depth + 1) {
+          Ok(x) => x
+          Err(e) => return Err(e)
+        }
+        out.push((k, v))
+        i = i + 1
+      }
+      Ok(Value::Record(out))
+    }
+    Expr::ExtCall(name, args) => {
+      let eval_args : Array[Value] = []
+      let mut i = 0
+      while i < args.length() {
+        let v = match eval_expr(ctx, args[i], depth + 1) {
+          Ok(x) => x
+          Err(e) => return Err(e)
+        }
+        eval_args.push(v)
+        i = i + 1
+      }
+      if name == "decimal" {
+        if eval_args.length() != 1 {
+          return Err(CedarError::new(CedarErrorKind::ExtensionError, -1, "decimal() expects 1 argument"))
+        }
+        match eval_args[0] {
+          Value::String(s) =>
+          match parse_decimal_impl(s) {
+            Ok(d) => Ok(Value::Decimal(d))
+            Err(e) => Err(e)
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "decimal() expects a string argument"))
+        }
+      } else if name == "ip" {
+        if eval_args.length() != 1 {
+          return Err(CedarError::new(CedarErrorKind::ExtensionError, -1, "ip() expects 1 argument"))
+        }
+        match eval_args[0] {
+          Value::String(s) =>
+          match parse_ip_impl(s) {
+            Ok(ip) => Ok(Value::IpAddr(ip))
+            Err(e) => Err(e)
+          }
+          _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "ip() expects a string argument"))
+        }
+      } else {
+        Err(CedarError::new(CedarErrorKind::ExtensionError, -1, "unknown extension function: " + name))
+      }
+    }
+    Expr::MethodCall(recv_e, method_name, args_e) => {
+      let recv = match eval_expr(ctx, recv_e, depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let args : Array[Value] = []
+      let mut i = 0
+      while i < args_e.length() {
+        let v = match eval_expr(ctx, args_e[i], depth + 1) {
+          Ok(x) => x
+          Err(e) => return Err(e)
+        }
+        args.push(v)
+        i = i + 1
+      }
+      eval_method_call(ctx, recv, method_name, args)
+    }
+  }
+}
+
+fn eval_method_call(
+  ctx : EvalCtx,
+  recv : Value,
+  name : String,
+  args : Array[Value],
+) -> Result[Value, CedarError] {
+  // Set methods
+  if name == "contains" {
+    if args.length() != 1 {
+      return Err(CedarError::new(CedarErrorKind::EvalError, -1, "contains() expects 1 argument"))
+    }
+    match recv {
+      Value::Set(s) => Ok(Value::Bool(set_contains(s, args[0])))
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "contains() requires a set receiver"))
+    }
+  } else if name == "containsAll" {
+    if args.length() != 1 {
+      return Err(CedarError::new(CedarErrorKind::EvalError, -1, "containsAll() expects 1 argument"))
+    }
+    match (recv, args[0]) {
+      (Value::Set(s1), Value::Set(s2)) => {
+        let mut i = 0
+        while i < s2.length() {
+          if !set_contains(s1, s2[i]) {
+            return Ok(Value::Bool(false))
+          }
+          i = i + 1
+        }
+        Ok(Value::Bool(true))
+      }
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "containsAll() requires set receiver and set argument"))
+    }
+  } else if name == "containsAny" {
+    if args.length() != 1 {
+      return Err(CedarError::new(CedarErrorKind::EvalError, -1, "containsAny() expects 1 argument"))
+    }
+    match (recv, args[0]) {
+      (Value::Set(s1), Value::Set(s2)) => {
+        let mut i = 0
+        while i < s2.length() {
+          if set_contains(s1, s2[i]) {
+            return Ok(Value::Bool(true))
+          }
+          i = i + 1
+        }
+        Ok(Value::Bool(false))
+      }
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "containsAny() requires set receiver and set argument"))
+    }
+  } else if name == "isEmpty" {
+    if args.length() != 0 {
+      return Err(CedarError::new(CedarErrorKind::EvalError, -1, "isEmpty() expects 0 arguments"))
+    }
+    match recv {
+      Value::Set(s) => Ok(Value::Bool(s.length() == 0))
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "isEmpty() requires a set receiver"))
+    }
+  } else if name == "hasTag" {
+    if args.length() != 1 {
+      return Err(CedarError::new(CedarErrorKind::EvalError, -1, "hasTag() expects 1 argument"))
+    }
+    match (recv, args[0]) {
+      (Value::Entity(uid), Value::String(tag)) =>
+      match entities_get_impl(ctx.entities, uid) {
+        Some(ent) =>
+        match record_find(ent.tags, tag) {
+          Some(_) => Ok(Value::Bool(true))
+          None => Ok(Value::Bool(false))
+        }
+        None => Ok(Value::Bool(false))
+      }
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "hasTag() requires entity receiver and string tag"))
+    }
+  } else if name == "getTag" {
+    if args.length() != 1 {
+      return Err(CedarError::new(CedarErrorKind::EvalError, -1, "getTag() expects 1 argument"))
+    }
+    match (recv, args[0]) {
+      (Value::Entity(uid), Value::String(tag)) =>
+      match entities_get_impl(ctx.entities, uid) {
+        Some(ent) =>
+        match record_find(ent.tags, tag) {
+          Some(v) => Ok(v)
+          None => Err(CedarError::new(CedarErrorKind::TagNotFound, -1, "entity does not have tag '" + tag + "'"))
+        }
+        None =>
+        Err(
+          CedarError::new(
+            CedarErrorKind::EntityDoesNotExist,
+            -1,
+            "entity does not exist: " + format_entity_uid_impl(uid),
+          ),
+        )
+      }
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "getTag() requires entity receiver and string tag"))
+    }
+  } else if name == "lessThan" || name == "lessThanOrEqual" || name == "greaterThan" || name == "greaterThanOrEqual" {
+    if args.length() != 1 {
+      return Err(CedarError::new(CedarErrorKind::ExtensionError, -1, name + "() expects 1 argument"))
+    }
+    match (recv, args[0]) {
+      (Value::Decimal(a), Value::Decimal(b)) =>
+      if name == "lessThan" {
+        Ok(Value::Bool(a.raw < b.raw))
+      } else if name == "lessThanOrEqual" {
+        Ok(Value::Bool(a.raw <= b.raw))
+      } else if name == "greaterThan" {
+        Ok(Value::Bool(a.raw > b.raw))
+      } else {
+        Ok(Value::Bool(a.raw >= b.raw))
+      }
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, name + "() requires decimal operands"))
+    }
+  } else if name == "isIpv4" || name == "isIpv6" || name == "isLoopback" || name == "isMulticast" {
+    if args.length() != 0 {
+      return Err(CedarError::new(CedarErrorKind::ExtensionError, -1, name + "() expects 0 arguments"))
+    }
+    match recv {
+      Value::IpAddr(ip) =>
+      if name == "isIpv4" {
+        Ok(Value::Bool(ip_is_ipv4_impl(ip)))
+      } else if name == "isIpv6" {
+        Ok(Value::Bool(ip_is_ipv6_impl(ip)))
+      } else if name == "isLoopback" {
+        Ok(Value::Bool(ip_is_loopback_impl(ip)))
+      } else {
+        Ok(Value::Bool(ip_is_multicast_impl(ip)))
+      }
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, name + "() requires ip receiver"))
+    }
+  } else if name == "isInRange" {
+    if args.length() != 1 {
+      return Err(CedarError::new(CedarErrorKind::ExtensionError, -1, "isInRange() expects 1 argument"))
+    }
+    match (recv, args[0]) {
+      (Value::IpAddr(a), Value::IpAddr(b)) => Ok(Value::Bool(ip_is_in_range_impl(a, b)))
+      _ => Err(CedarError::new(CedarErrorKind::TypeError, -1, "isInRange() requires ip receiver and ip argument"))
+    }
+  } else {
+    Err(CedarError::new(CedarErrorKind::ExtensionError, -1, "unknown method: " + name))
+  }
+}
+
+fn scope_matches(pscope : PolicyScope, req : Request, entities : Entities) -> Bool {
+  let p_ok = match pscope.principal {
+    PrincipalConstraint::Any => true
+    PrincipalConstraint::Eq(u) => req.principal.equals(u)
+    PrincipalConstraint::In(u) => entities_is_in_impl(entities, req.principal, u)
+    PrincipalConstraint::Is(ty) => req.principal.entity_type == ty
+    PrincipalConstraint::IsIn(ty, u) =>
+    req.principal.entity_type == ty && entities_is_in_impl(entities, req.principal, u)
+  }
+  if !p_ok {
+    return false
+  }
+  let a_ok = match pscope.action {
+    ActionConstraint::Any => true
+    ActionConstraint::Eq(u) => req.action.equals(u)
+    ActionConstraint::In(u) => entities_is_in_impl(entities, req.action, u)
+    ActionConstraint::InSet(us) => {
+      let mut hit = false
+      let mut i = 0
+      while i < us.length() {
+        if entities_is_in_impl(entities, req.action, us[i]) {
+          hit = true
+          break
+        }
+        i = i + 1
+      }
+      hit
+    }
+  }
+  if !a_ok {
+    return false
+  }
+  match pscope.resource {
+    ResourceConstraint::Any => true
+    ResourceConstraint::Eq(u) => req.resource.equals(u)
+    ResourceConstraint::In(u) => entities_is_in_impl(entities, req.resource, u)
+    ResourceConstraint::Is(ty) => req.resource.entity_type == ty
+    ResourceConstraint::IsIn(ty, u) =>
+    req.resource.entity_type == ty && entities_is_in_impl(entities, req.resource, u)
+  }
+}
+
+fn eval_policy_conditions(ctx : EvalCtx, conditions : Array[Condition]) -> Result[Bool, CedarError] {
+  let mut i = 0
+  while i < conditions.length() {
+    let cond = conditions[i]
+    let v = match eval_expr(ctx, cond.expr, 0) {
+      Ok(x) => x
+      Err(e) => return Err(e)
+    }
+    let b = match v {
+      Value::Bool(flag) => flag
+      _ => return Err(CedarError::new(CedarErrorKind::TypeError, -1, "policy condition must evaluate to boolean"))
+    }
+    match cond.kind {
+      ConditionKind::When =>
+      if !b {
+        return Ok(false)
+      }
+      ConditionKind::Unless =>
+      if b {
+        return Ok(false)
+      }
+    }
+    i = i + 1
+  }
+  Ok(true)
+}
+
+fn is_authorized_impl(
+  auth : Authorizer,
+  req : Request,
+  policies : PolicySet,
+  entities : Entities,
+) -> Result[Response, CedarError] {
+  let _ = match validate_limits_impl(auth.limits) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let permits : Array[String] = []
+  let forbids : Array[String] = []
+  let errors : Array[PolicyEvalError] = []
+  let ctx = EvalCtx::{ req, entities, limits: auth.limits, steps: 0 }
+
+  let mut i = 0
+  while i < policies.policies.length() {
+    let pol = policies.policies[i]
+    if scope_matches(pol.policy_scope, req, entities) {
+      if pol.conditions.length() == 0 {
+        match pol.effect {
+          Effect::Permit => permits.push(pol.id)
+          Effect::Forbid => forbids.push(pol.id)
+        }
+      } else {
+        match eval_policy_conditions(ctx, pol.conditions) {
+          Ok(true) =>
+          match pol.effect {
+            Effect::Permit => permits.push(pol.id)
+            Effect::Forbid => forbids.push(pol.id)
+          }
+          Ok(false) => ()
+          Err(e) => errors.push(PolicyEvalError::{ policy_id: pol.id, error: e })
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  if forbids.length() > 0 {
+    Ok(Response::{ decision: Decision::Deny, diagnostics: Diagnostics::{ reason: forbids, errors } })
+  } else if permits.length() > 0 {
+    Ok(Response::{ decision: Decision::Allow, diagnostics: Diagnostics::{ reason: permits, errors } })
+  } else {
+    Ok(Response::{ decision: Decision::Deny, diagnostics: Diagnostics::{ reason: [], errors } })
+  }
+}
