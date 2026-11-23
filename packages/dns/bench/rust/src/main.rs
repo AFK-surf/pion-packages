@@ -10,7 +10,18 @@ fn mix(h: i64, v: i64) -> i64 {
     (h * 131 + v) % 1_000_000_007
 }
 
+fn hash_name(mut h: i64, name: &Name) -> i64 {
+    for lbl in name.iter() {
+        h = mix(h, lbl.len() as i64);
+        for &b in lbl {
+            h = mix(h, b as i64);
+        }
+    }
+    h
+}
+
 fn hash_rr(mut h: i64, rr: &Record) -> i64 {
+    h = hash_name(h, rr.name());
     let rtype = u16::from(rr.record_type()) as i64;
     h = mix(h, rtype);
     h = mix(h, rr.ttl() as i64);
@@ -24,22 +35,30 @@ fn hash_rr(mut h: i64, rr: &Record) -> i64 {
                 h = mix(h, oct[3] as i64);
             }
             RData::AAAA(aaaa) => {
-                let seg = aaaa.0.segments();
-                h = mix(h, seg[0] as i64);
-                h = mix(h, seg[7] as i64);
+                for seg in aaaa.0.segments() {
+                    h = mix(h, seg as i64);
+                }
             }
-            RData::CNAME(c) => h = mix(h, c.0.num_labels() as i64),
-            RData::NS(ns) => h = mix(h, ns.0.num_labels() as i64),
-            RData::PTR(p) => h = mix(h, p.0.num_labels() as i64),
+            RData::CNAME(c) => h = hash_name(h, &c.0),
+            RData::NS(ns) => h = hash_name(h, &ns.0),
+            RData::PTR(p) => h = hash_name(h, &p.0),
             RData::MX(mx) => {
                 h = mix(h, mx.preference() as i64);
-                h = mix(h, mx.exchange().num_labels() as i64);
+                h = hash_name(h, mx.exchange());
             }
             RData::TXT(txt) => {
-                let tlen: usize = txt.txt_data().iter().map(|b| b.len()).sum();
-                h = mix(h, tlen as i64);
+                let chunks = txt.txt_data();
+                h = mix(h, chunks.len() as i64);
+                for c in chunks.iter() {
+                    h = mix(h, c.len() as i64);
+                    for &b in c.iter() {
+                        h = mix(h, b as i64);
+                    }
+                }
             }
             RData::SOA(soa) => {
+                h = hash_name(h, soa.mname());
+                h = hash_name(h, soa.rname());
                 h = mix(h, soa.serial() as i64);
                 h = mix(h, soa.minimum() as i64);
             }
@@ -47,6 +66,7 @@ fn hash_rr(mut h: i64, rr: &Record) -> i64 {
                 h = mix(h, srv.priority() as i64);
                 h = mix(h, srv.weight() as i64);
                 h = mix(h, srv.port() as i64);
+                h = hash_name(h, srv.target());
             }
             _ => {}
         }
@@ -58,6 +78,7 @@ fn hash_msg(mut h: i64, m: &Message) -> i64 {
     h = mix(h, m.id() as i64);
     h = mix(h, u16::from(m.response_code()) as i64);
     for q in m.queries() {
+        h = hash_name(h, q.name());
         h = mix(h, u16::from(q.query_type()) as i64);
     }
     for rr in m.answers() {
@@ -122,7 +143,8 @@ fn bench_encode(data: &[u8]) {
         pos = pend;
     }
     let mut encoded: i64 = 0;
-    let mut hdr_hash: i64 = 0;
+    let mut wire_bytes: i64 = 0;
+    let mut wire_hash: i64 = 0;
     let mut rt_hash: i64 = 0;
     let mut buf = Vec::with_capacity(512);
     for round in 0..200 {
@@ -133,18 +155,19 @@ fn bench_encode(data: &[u8]) {
                 m.emit(&mut enc).expect("emit failed");
             }
             encoded += 1;
-            for &b in &buf[0..12] {
-                hdr_hash = mix(hdr_hash, b as i64);
-            }
+            wire_bytes += buf.len() as i64;
             if round == 0 {
+                for &b in &buf {
+                    wire_hash = mix(wire_hash, b as i64);
+                }
                 let rt = Message::from_bytes(&buf).expect("rt decode failed");
                 rt_hash = hash_msg(rt_hash, &rt);
             }
         }
     }
     println!(
-        "mode=encode\nencoded={}\nhdr_hash={}\nrt_hash={}",
-        encoded, hdr_hash, rt_hash
+        "mode=encode\nencoded={}\nwire_bytes={}\nwire_hash={}\nrt_hash={}",
+        encoded, wire_bytes, wire_hash, rt_hash
     );
 }
 

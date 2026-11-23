@@ -22,17 +22,17 @@ CORPUS_BYTES=$(($(wc -c < "$CORPUS" | tr -d ' ') * 200))
 echo "==> Building Pion Native benchmark (--release)"
 pionc build --release -o "$BIN_DIR/pion_dns_bench" "$BENCH_DIR/pion_bench"
 
-echo "==> Building Go miekg/dns benchmark (isolated in /private/tmp)"
+echo "==> Building Go miekg/dns benchmark (isolated in /private/tmp, locked go.sum)"
 rm -rf "$OUT_DIR/go-proj"
 mkdir -p "$OUT_DIR/go-proj"
-cp "$BENCH_DIR/go/go.mod" "$BENCH_DIR/go/main.go" "$OUT_DIR/go-proj/"
-(cd "$OUT_DIR/go-proj" && go mod tidy && go build -o "$BIN_DIR/go_dns_bench" .)
+cp "$BENCH_DIR/go/go.mod" "$BENCH_DIR/go/go.sum" "$BENCH_DIR/go/main.go" "$OUT_DIR/go-proj/"
+(cd "$OUT_DIR/go-proj" && go build -mod=readonly -o "$BIN_DIR/go_dns_bench" .)
 
-echo "==> Building Rust hickory-proto 0.24.2 benchmark (--release, isolated in /private/tmp)"
+echo "==> Building Rust hickory-proto 0.24.2 benchmark (--release --locked, isolated in /private/tmp)"
 rm -rf "$OUT_DIR/rust-proj"
 mkdir -p "$OUT_DIR/rust-proj"
-cp -R "$BENCH_DIR/rust/Cargo.toml" "$BENCH_DIR/rust/src" "$OUT_DIR/rust-proj/"
-CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release \
+cp -R "$BENCH_DIR/rust/Cargo.toml" "$BENCH_DIR/rust/Cargo.lock" "$BENCH_DIR/rust/src" "$OUT_DIR/rust-proj/"
+CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release --locked \
   --manifest-path "$OUT_DIR/rust-proj/Cargo.toml"
 cp "$OUT_DIR/rust-target/release/dns-bench-rust" "$BIN_DIR/rust_dns_bench"
 

@@ -12,12 +12,36 @@ func mix(h, v int64) int64 {
 	return (h*131 + v) % 1000000007
 }
 
-func labelCount(name string) int64 {
-	return int64(dns.CountLabel(name))
+func hashName(h int64, name string) int64 {
+	if name == "." || name == "" {
+		return h
+	}
+	start := 0
+	for i := 0; i < len(name); i++ {
+		if name[i] == '.' {
+			llen := i - start
+			if llen > 0 {
+				h = mix(h, int64(llen))
+				for j := start; j < i; j++ {
+					h = mix(h, int64(name[j]))
+				}
+			}
+			start = i + 1
+		}
+	}
+	if start < len(name) {
+		llen := len(name) - start
+		h = mix(h, int64(llen))
+		for j := start; j < len(name); j++ {
+			h = mix(h, int64(name[j]))
+		}
+	}
+	return h
 }
 
 func hashRR(h int64, rr dns.RR) int64 {
 	hdr := rr.Header()
+	h = hashName(h, hdr.Name)
 	h = mix(h, int64(hdr.Rrtype))
 	h = mix(h, int64(hdr.Ttl))
 	switch v := rr.(type) {
@@ -29,32 +53,37 @@ func hashRR(h int64, rr dns.RR) int64 {
 		h = mix(h, int64(ip4[3]))
 	case *dns.AAAA:
 		ip16 := v.AAAA.To16()
-		hi0 := uint16(ip16[0])<<8 | uint16(ip16[1])
-		lo7 := uint16(ip16[14])<<8 | uint16(ip16[15])
-		h = mix(h, int64(hi0))
-		h = mix(h, int64(lo7))
+		for k := 0; k < 16; k += 2 {
+			seg := uint16(ip16[k])<<8 | uint16(ip16[k+1])
+			h = mix(h, int64(seg))
+		}
 	case *dns.CNAME:
-		h = mix(h, labelCount(v.Target))
+		h = hashName(h, v.Target)
 	case *dns.NS:
-		h = mix(h, labelCount(v.Ns))
+		h = hashName(h, v.Ns)
 	case *dns.PTR:
-		h = mix(h, labelCount(v.Ptr))
+		h = hashName(h, v.Ptr)
 	case *dns.MX:
 		h = mix(h, int64(v.Preference))
-		h = mix(h, labelCount(v.Mx))
+		h = hashName(h, v.Mx)
 	case *dns.TXT:
-		var tlen int64
+		h = mix(h, int64(len(v.Txt)))
 		for _, s := range v.Txt {
-			tlen += int64(len(s))
+			h = mix(h, int64(len(s)))
+			for j := 0; j < len(s); j++ {
+				h = mix(h, int64(s[j]))
+			}
 		}
-		h = mix(h, tlen)
 	case *dns.SOA:
+		h = hashName(h, v.Ns)
+		h = hashName(h, v.Mbox)
 		h = mix(h, int64(v.Serial))
 		h = mix(h, int64(v.Minttl))
 	case *dns.SRV:
 		h = mix(h, int64(v.Priority))
 		h = mix(h, int64(v.Weight))
 		h = mix(h, int64(v.Port))
+		h = hashName(h, v.Target)
 	case *dns.OPT:
 		h = mix(h, int64(v.UDPSize()))
 	}
@@ -65,6 +94,7 @@ func hashMsg(h int64, m *dns.Msg) int64 {
 	h = mix(h, int64(m.Id))
 	h = mix(h, int64(m.Rcode))
 	for _, q := range m.Question {
+		h = hashName(h, q.Name)
 		h = mix(h, int64(q.Qtype))
 	}
 	for _, rr := range m.Answer {
@@ -119,7 +149,7 @@ func benchEncode(data []byte) {
 		msgs = append(msgs, m)
 		pos = pend
 	}
-	var encoded, hdrHash, rtHash int64
+	var encoded, wireBytes, wireHash, rtHash int64
 	for round := 0; round < 200; round++ {
 		for _, m := range msgs {
 			wire, err := m.Pack()
@@ -128,10 +158,11 @@ func benchEncode(data []byte) {
 				os.Exit(1)
 			}
 			encoded++
-			for b := 0; b < 12; b++ {
-				hdrHash = mix(hdrHash, int64(wire[b]))
-			}
+			wireBytes += int64(len(wire))
 			if round == 0 {
+				for _, b := range wire {
+					wireHash = mix(wireHash, int64(b))
+				}
 				var rt dns.Msg
 				if err := rt.Unpack(wire); err != nil {
 					fmt.Fprintf(os.Stderr, "rt error: %v\n", err)
@@ -141,7 +172,7 @@ func benchEncode(data []byte) {
 			}
 		}
 	}
-	fmt.Printf("mode=encode\nencoded=%d\nhdr_hash=%d\nrt_hash=%d\n", encoded, hdrHash, rtHash)
+	fmt.Printf("mode=encode\nencoded=%d\nwire_bytes=%d\nwire_hash=%d\nrt_hash=%d\n", encoded, wireBytes, wireHash, rtHash)
 }
 
 func benchQueryRT() {
