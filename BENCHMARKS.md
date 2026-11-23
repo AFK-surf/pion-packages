@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7）
+## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7 + Wave 8）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -141,6 +141,31 @@
 | `html` | Bench 3 HTML XSS 清洗（20 轮） | 2,451,400 B | 51.752 ms | 70.666 ms (`rust_ammonia`) | **1.37x** | **3.44 MiB** | 4.78 MiB |
 | `html` | 对抗：全部 2,125 个 WHATWG `;` 实体 × 40 | — | 22.9 ms | 103.7 ms (`html5ever`) | **4.53x** | — | — |
 | `html` | 对抗：`div.a div.b em`（30k 节点） | — | 17.1 ms | 13.9 ms (`scraper`) | 0.81x | — | — |
+| `cli` | W1 复杂 CLI（30 选项 + 5 级子命令）× 50,000 次解析 | 50,000 ops | 182.972 ms | 1318.488 ms (`rust_clap`) / 360.676 ms (`go_pflag`) | **7.21x**（vs Rust）/ **1.97x**（vs Go） | **1.95 MiB** | 2.81 / 17.84 MiB |
+| `cli` | W2 100k 参数批量（短标志聚合 + 重复 Append + `--`） | 100,000 args | 14.085 ms | 41.769 ms (`rust_clap`) / 13.829 ms (`go_pflag`) | **2.97x** / 0.98x | **4.78 MiB** | 45.55 / 10.33 MiB |
+| `cli` | W3 拼写建议 + 帮助渲染 | 20,000 ops | 62.663 ms | 397.137 ms (`rust_clap`) | **6.34x** | **2.03 MiB** | 2.95 MiB |
+| `cli` | 对抗：W1 冷启动（构建 + 解析 × 50k，红队修复前 949 ms） | — | 763.516 ms | 3872.762 ms (`rust_clap`) | **5.07x** | — | — |
+| `cli` | 对抗：16k 链式 `.arg()`（红队修复前 628 ms） | — | 10.792 ms | 13.743 ms (`rust_clap`) | **1.27x** | — | — |
+| `cli` | 对抗：4 KB 名称拼写建议（红队修复前 472 ms） | — | 15.166 ms | 178.246 ms (`rust_clap`) | **11.75x** | — | — |
+| `sql` | W1 复杂生产 PostgreSQL 解析（10 条 × 2,000） | 4,828,000 B（20,000 ops） | 136.493 ms | 1190.852 ms (`rust_sqlparser`) | **8.72x** | **2.56 MiB** | 3.33 MiB |
+| `sql` | W2 大 SQL 脚本分词（10 × 969.6 KB） | 9,696,000 B | 100.063 ms | 794.741 ms (`rust_sqlparser`) | **7.94x** | **23.47 MiB** | 38.66 MiB |
+| `sql` | W3 解析 → `to_sql()` → 重解析 + 结构化 `stmt_eq` 往返 | 2,414,000 B（10,000 ops） | 161.034 ms | 1172.362 ms (`rust_sqlparser`) | **7.28x** | **2.81 MiB** | 3.61 MiB |
+| `sql` | 对照：W1 / W3 对 `mimalloc` 链接的同版本 `sqlparser`（`audit/rust --features mimalloc`） | — | — | — | 约 2.6x | — | — |
+| `graph` | W1 Dijkstra（50,000 节点 / 250,000 边 × 3） | 750k 次松弛 | 47.174 ms (`pion_csr`) / 69.541 ms (`pion_digraph`) | 63.012 ms (`rust_petgraph`) | **1.34x** / 0.91x | 19.03 / 14.78 MiB | 10.36 MiB |
+| `graph` | W2 Tarjan SCC + 拓扑排序（100,000 节点 / 400,000 边 × 2） | 800k 边 | 79.203 ms (`pion_digraph`) / 80.140 ms (`pion_csr`) | 47.419 ms (`rust_petgraph`) | 0.60x / 0.59x | 50.98 / 57.16 MiB | 34.41 MiB |
+| `graph` | W3 Kruskal MST（50,000 节点 / 200,000 无向边） | 200k 边 | 20.565 ms | 26.138 ms (`rust_petgraph`) | **1.27x** | 20.88 MiB | 12.52 MiB |
+| `graph` | W4 CFG 支配树（20,000 节点 / 60,000 边 × 5） | 300k 次边检查 | 21.727 ms (`pion_csr`) / 24.869 ms (`pion_digraph`) | 41.751 ms (`rust_petgraph`) | **1.92x** / **1.68x** | **7.28 / 5.55 MiB** | 8.61 MiB |
+| `graph` | 对抗：A2 Dinic 最大流（200 层 × 10） | — | 14.2 ms | 25.9 ms (`petgraph`) | **1.83x** | 6 MiB | 5 MiB |
+| `graph` | 对抗：A9 Floyd-Warshall（300 节点稠密图） | — | 24.3 ms | 31.9 ms (`petgraph`) | **1.31x** | **6 MiB** | 7 MiB |
+| `graph` | 对抗：A10 传递规约（20k 链） | — | 13.7 ms | 1255.9 ms (`petgraph`) | **91.46x** | **7 MiB** | 912 MiB |
+| `graph` | 对抗：A10b 传递规约（100k 出星，红队修复前 1,217 MiB） | — | 58.3 ms | 21.0 ms (`petgraph`) | 0.36x | 28 MiB | 22 MiB |
+| `graph` | 对抗：A11 随机图支配树（50k / 200k） | — | 52.6 ms | 63.0 ms (`petgraph`) | **1.20x** | **27 MiB** | 29 MiB |
+| `css` | 零分配 `count_tokens()` vs `cssparser` token walk（5 语料） | 1.34–2.09 MB × 3 | 21.4–26.1 ms | 31.5–42.5 ms (`cssparser`) | **1.28x–1.63x** | — | — |
+| `css` | 全量物化 `tokenize()` vs `cssparser` token walk（5 语料） | 1.34–2.09 MB × 3 | 61.8–89.8 ms | 31.5–42.5 ms (`cssparser`) | 0.47x–0.52x | — | — |
+| `css` | 单遍流式 `parse_stylesheet()` vs `cssparser` 自有 AST（5 语料） | 1.34–2.09 MB × 3 | 37.8–91.2 ms | 29.7–107.2 ms (`cssparser`) | 0.79x–1.18x | 8.2–41.2 MB | 9.1–34.0 MB |
+| `css` | 单遍流式 `parse_stylesheet()` vs `lightningcss` 解析（5 语料） | 1.34–2.09 MB × 3 | 37.8–91.2 ms | 105.4–449.6 ms (`lightningcss`) | **1.62x–4.93x** | **8.2–41.2 MB** | 34.6–202.6 MB |
+| `css` | 单遍流式 `minify()` vs `lightningcss` 压缩器（5 语料；后者另做类型化属性优化） | 1.34–2.09 MB × 3 | 67.8–125.2 ms | 125.3–569.7 ms (`lightningcss`) | **1.26x–4.55x** | **5.7–7.6 MB** | 35.1–203.4 MB |
+| `css` | 单遍流式 `parse_stylesheet()` vs Node `css-tree` 解析（5 语料） | 1.34–2.09 MB × 3 | 37.8–91.2 ms | 442.8–1220.2 ms (`css-tree`) | **5.19x–19.86x** | **8.2–41.2 MB** | 164.1–448.6 MB |
 
 ## 各包明细
 
@@ -1074,7 +1099,7 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | St
 | `rust_json_patch` | 140.022 | 134.873 | 148.554 | 1400.22 | 2.14 MiB | 1.00x (baseline) |
 | `node_fast_json_patch` | 266.937 | 256.552 | 303.542 | 2669.37 | 52.78 MiB | 0.52x |
 
-_`pion` leads Rust `json-patch =4.2.0` by **1.19x** (1,362 ns/op vs 1,626 ns/op) and Node `fast-json-patch@3.1.1` by **2.29x**, at 2.16 MiB peak RSS._
+_`pion` leads Rust `json-patch =4.2.0` by **1.31x** (1,066 ns/op vs 1,400 ns/op) and Node `fast-json-patch@3.1.1` by **2.50x**, at 2.00 MiB peak RSS._
 
 **Adversarial Benchmarks (A1–A8, `packages/json5/audit`)**
 
@@ -1093,7 +1118,7 @@ Measured on `Darwin arm64` (`--warmup 1 --rounds 5`, strictly interleaved, manda
 
 _\*Default `apply_patch` enforces `max_depth: 512` and safely rejects the 6,000-level nesting DoS (0 Wasm32 crash on `patchgrow` 1,890 rounds). The A8 timing above uses `apply_patch_with_options(PatchOptions::{ max_depth: 8192, max_nodes: 1_000_000 })` with SHA-256-verified identical output against Rust._
 
-红队：242/242 单测；114/114 官方 `json5-tests`、108/108 RFC 6902 `json-patch-tests` 向量；独立红队审计 13/15（剩余 2 例为 `>2^53` 整数按 IEEE-754 `Double` 表示的已知边界）；对 Node `json5` 1,112,064 个 Unicode 标识符 0 分歧、37,995 个数值解析 0 分歧，59,999 次浮点往返 0 失败。领先项：W1 解析与 Rust `json5 =1.3.8` 持平（0.98x，min 更快、RSS 更低），W3 Patch + Pointer 1.31x（vs Rust）；A3 / A4 / A7 / A8 修复后提速 106x–341x。落后项：W2 序列化 0.84x（全迭代任务栈 vs `serde_json` 递归序列化），A1–A5 / A7 / A8 为 Rust 的 0.49x–0.93x，A6 宽对象单次 `pointer_get` 线性扫描 6,114 ms（重复查找应用 `ObjectIndex`）；`wasm32` 上递归 RC 析构限制文档深度约 1,400–1,600 层（默认 `max_depth` 128 / 512 兜底）。注：W3 表格中位数给出 1.31x（vs Rust），而包 README 表下注释写的是 1.19x / 2.29x（1,362 ns/op），两者不一致，本榜以表格中位数为准。
+红队：242/242 单测；114/114 官方 `json5-tests`、108/108 RFC 6902 `json-patch-tests` 向量；独立红队审计 13/15（剩余 2 例为 `>2^53` 整数按 IEEE-754 `Double` 表示的已知边界）；对 Node `json5` 1,112,064 个 Unicode 标识符 0 分歧、37,995 个数值解析 0 分歧，59,999 次浮点往返 0 失败。领先项：W1 解析与 Rust `json5 =1.3.8` 持平（0.98x，min 更快、RSS 更低），W3 Patch + Pointer 1.31x（vs Rust）；A3 / A4 / A7 / A8 修复后提速 106x–341x。落后项：W2 序列化 0.84x（全迭代任务栈 vs `serde_json` 递归序列化），A1–A5 / A7 / A8 为 Rust 的 0.49x–0.93x，A6 宽对象单次 `pointer_get` 线性扫描 6,114 ms（重复查找应用 `ObjectIndex`）；`wasm32` 上递归 RC 析构限制文档深度约 1,400–1,600 层（默认 `max_depth` 128 / 512 兜底）。
 
 ### html
 
@@ -1140,3 +1165,168 @@ Bench 1–3 use a curated synthetic corpus; on un-curated real-world / adversari
 - **Filtered html5lib messy corpus ×40**: parse Pion **277.9 ms** vs Rust **322.2 ms** (**1.16x**) vs Go **230.1 ms**; sanitize Pion **217.8 ms** vs `ammonia` **265.0 ms** (**1.22x**).
 
 红队：29/29 单测；红队审计 36/37（25/25 `p1_*`、8/8 `control_*`、3/4 `p2_*`，唯一差异为默认只允许 `http` / `https` / `mailto` 3 种 URL scheme，比 `ammonia` 的 25 种更严）；WHATWG 命名字符引用 2,231/2,231；html5lib tree-construction（`9329e64`，scripting-on）1,147/1,578（72.69%）；20,137 例 XSS / mXSS 往返 0 不安全输出、0 非幂等输出；CSS 选择器对 `scraper` 差分 139/141 一致（剩余 2 例为 EOF 未闭合 `[lang` 被有意拒绝）。领先项：Bench 1 解析 1.14x、Bench 3 清洗 1.37x（vs Rust），峰值 RSS 均最低；20k 兄弟节点伪类查询 1.19–1.43x，实体解码 4.53x。落后项：Bench 1 慢于 Go `x/net/html`（Go 为 Rust 的 1.43x），Bench 2 CSS 查询 0.91x（由 0.45x 优化而来），`div.a div.b em` 0.81x；`<template>` 内容未单独包 `DocumentFragment`，公开 `Node` API 无独立命名空间访问器。
+
+### cli
+
+参考实现：Rust [`clap`](https://github.com/clap-rs/clap) `=4.5.32`（`features = ["suggestions", "usage", "help", "error-context"]`，`cargo build --release`，`try_get_matches_from_mut(&mut cmd)` 免逐次 `Command::clone()`）、Go [`spf13/pflag`](https://github.com/spf13/pflag) `v1.0.6`（`go build`）。`--warmup 1 --rounds 5`，标准负载 `sh packages/cli/bench/run_bench.sh`，冷启动与对抗负载 `sh packages/cli/audit/run_audit.sh bench`。W1 的 Go 端为 5 级子命令分发 + 两个 `pflag.FlagSet`；W2 的 Rust 端以 `Append` + `num_args(0)` 规避 `Count` 的 `u8` 饱和；W3 因 `pflag` 无拼写建议只对比 `clap`。详见 [`packages/cli/README.md`](packages/cli/README.md)。
+
+**W1: Complex CLI (30 Options + 5-Level Subcommand) × 50,000 Parses**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_clap`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 182.972 | 165.857 | 189.389 | 3659.45 | 1.95 MiB | 7.21x |
+| `rust_clap` | 1318.488 | 1289.462 | 1410.804 | 26369.77 | 2.81 MiB | 1.00x (baseline) |
+| `go_pflag` | 360.676 | 258.459 | 407.668 | 7213.51 | 17.84 MiB | 3.66x |
+
+_SHA-256 verified identical across all implementations and rounds: `77494c5de5dede8eafd6b0d39b6df2500dea64184b2685fb02b72be7c4ddeb36`._
+
+**W2: 100k-Arg Batch (Short Clustering + Repeated Append + `--` Terminator)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_clap`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 14.085 | 11.652 | 17.057 | 140.85 | 4.78 MiB | 2.97x |
+| `rust_clap` | 41.769 | 40.426 | 53.805 | 417.69 | 45.55 MiB | 1.00x (baseline) |
+| `go_pflag` | 13.829 | 12.530 | 15.538 | 138.29 | 10.33 MiB | 3.02x |
+
+_SHA-256 verified identical across all implementations and rounds: `b83a9179ea608dbf1a8cfaab9274634be69bc0249e0da4a65b327edb524699c9`._
+
+**W3: Typo Suggestion + Help Rendering (20,000 ops, Pion vs Rust `clap`)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_clap`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 62.663 | 59.457 | 64.428 | 3133.17 | 2.03 MiB | 6.34x |
+| `rust_clap` | 397.137 | 381.026 | 401.087 | 19856.85 | 2.95 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `27bb597df1373cec45fce02623cc473dd3417a75b082e219db750b1b25dd96e4`._
+
+**Cold-Start & Adversarial Complexity Benchmarks (`run_audit.sh bench`, `--warmup 1 --rounds 5`, SHA-256 gated)**
+
+| Workload | Pion (Before Fix) | Pion (After Fix) | Rust `clap` (fair) | Speedup (vs `rust_clap`) |
+| --- | ---: | ---: | ---: | ---: |
+| W1 cold (build + parse × 50k) | 949 ms | 763.516 ms | 3872.762 ms | **5.07x** |
+| ADV 16k chained `.arg()` | 628 ms | 10.792 ms | 13.743 ms | **1.27x** |
+| ADV 16k chained `.subcommand()` | 691 ms | 10.358 ms | 12.569 ms | **1.21x** |
+| ADV 16k `.args(list)` + parse | 17.4 ms | 15.792 ms | 16.410 ms | **1.04x** |
+| ADV 3k options × 1k typos | 647 ms | 233.640 ms | 1620.184 ms | **6.93x** |
+| ADV 1 MB unknown flag | 11.5 ms | 14.775 ms | 136.869 ms | **9.26x** |
+| ADV 4 KB-name typo suggestion | 472 ms | 15.166 ms | 178.246 ms | **11.75x** |
+
+红队：21/21 单测；红队审计 `pionc test -p cli_audit packages/cli/audit` 35/40，原 9 个 P0（Bash / Zsh / Fish 补全脚本命令注入与语法破坏，经 `bash -n` / `zsh -n`、source + TAB 与真实 zle TAB 实测）与 P1 / P2 均已修复；剩余 5 例中 4 例 `div_*` 为 README「Semantic Divergences」表记录的有意差异（负数默认作位置参数、单值选项重复时后者生效、全局 `Count` 跨层累加、子命令深度上限 64），1 例 `p1_get_double_not_correctly_rounded` 为审计测试本身的期望常量错误（`2.5e-8` 断言写成 `4493456761410498376` = `0x3e5bf71dfd732f48` ≈ 2.604e-8，与同行注释 `0x3e5ad7f29abcaf48` 不符；Pion 实际返回 `0x3e5ad7f29abcaf48`，与 Rust `str::parse::<f64>` 一致，其余 3 个断言均通过）。领先项：W1 7.21x、W3 6.34x、冷启动 5.07x（vs `clap`），全部对抗负载 1.04x–11.75x，峰值 RSS 均最低。落后项：W2 与 Go `pflag` 持平略慢（0.98x）。
+
+### sql
+
+参考实现：Rust [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) `=0.53.0`（`--release`，`opt-level = 3`，`lto = true`，`codegen-units = 1`，`PostgreSqlDialect`，macOS 系统分配器）。`--warmup 1 --rounds 5`，`sh packages/sql/bench/run_bench.sh`；stdout 含 FNV-1a 语句标签序列哈希与结构化往返等价（`stmt_eq` / `PartialEq`）并经 SHA-256 逐字节校验。详见 [`packages/sql/README.md`](packages/sql/README.md)。
+
+**Workload 1: Complex Production SQL Parse (20,000 ops / 4.83 MB)**
+
+10 production-grade PostgreSQL statements (CTEs, recursive CTEs, multi-table `JOIN`s, window functions with `ROWS BETWEEN`, `EXISTS` subqueries, `CASE`/`CAST`/JSON operators, `FILTER (WHERE ...)`, `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, `UPDATE ... FROM ... RETURNING`, `DELETE ... RETURNING`, `CREATE TABLE` with FK/CHECK/array types, partial `CREATE UNIQUE INDEX`, `ALTER TABLE`) × 2,000 rounds:
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `85 B` (`sha256:f6751764383fb9cc...`) | Input: `4828000 B` | Ops: `20000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_sqlparser) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 136.493 | 130.175 | 154.151 | 35.37 | 6824.66 | 2.56 MiB | **8.72x** |
+| `rust_sqlparser` | 1190.852 | 1116.332 | 1416.671 | 4.05 | 59542.60 | 3.33 MiB | 1.00x (baseline) |
+
+**Workload 2: Large SQL Script Tokenize (10× 969.6 KB = 9.70 MB)**
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `45 B` (`sha256:f2f4b19293f241b0...`) | Input: `9696000 B` | Ops: `10`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_sqlparser) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 100.063 | 95.771 | 129.482 | 96.90 | 10006300.00 | 23.47 MiB | **7.94x** |
+| `rust_sqlparser` | 794.741 | 772.797 | 819.762 | 12.20 | 79474091.70 | 38.66 MiB | 1.00x (baseline) |
+
+**Workload 3: SQL Parse → `to_sql()` → Reparse + Structural `stmt_eq` Roundtrip (10,000 ops / 2.41 MB)**
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `105 B` (`sha256:e1463eb660ccacbc...`) | Input: `2414000 B` | Ops: `10000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_sqlparser) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 161.034 | 150.443 | 190.695 | 14.99 | 16103.44 | 2.81 MiB | **7.28x** |
+| `rust_sqlparser` | 1172.362 | 756.640 | 1541.544 | 2.06 | 117236.16 | 3.61 MiB | 1.00x (baseline) |
+
+分配器口径：改用 `mimalloc` 链接同版本 `sqlparser =0.53.0`（`packages/sql/audit/rust --features mimalloc`）后，Pion 在 W1 / W3 上仍约 2.6x，11 个对抗负载全部领先（`packages/sql/audit/REPORT.md`）；上表 7–9x 含 macOS 系统分配器差异。
+
+红队：35/35 单测；红队审计 `pionc test -p sql_redteam_audit packages/sql/audit` 36/37，原 `- -x` → `--` 注释注入（`to_sql` 往返变成 `DROP TABLE`）、`extract_tables` 漏报 9 处表读取与 O(n²)、SQLite 走私、`max_depth` 不约束左深链导致 wasm32 崩溃、运算符优先级与 `stmt_eq` 文本相等等发现均已修复；剩余 1 例 `p0_split_statements_has_no_dialect_sqlite_nested_comment` 调用不带方言的 `split_statements`（按 Generic 方言即 PostgreSQL 式嵌套注释切分），SQLite 脚本需用新增的 `split_statements_dialect(src, Dialect::SQLite)`，同一输入实测切出 2 段，与 SQLite 一致。领先项：W1–W3 全部 7.28x–8.72x，峰值 RSS 均更低。范围边界：仅 SQLite / PostgreSQL / Generic 三种方言，未实现存储过程、触发器、`MERGE`、`GRANT` / `REVOKE`、`COPY` 等；wasm32 上建议 `max_depth <= 128`。
+
+### graph
+
+参考实现：Rust [`petgraph`](https://github.com/petgraph/petgraph) `=0.8.3`（`cargo build --release`，`opt-level = 3`，`lto = true`，`codegen-units = 1`）。`--warmup 1 --rounds 5`，标准负载 `sh packages/graph/bench/run_bench.sh`，对抗负载 `sh packages/graph/audit/bench_adversarial.sh`。详见 [`packages/graph/README.md`](packages/graph/README.md)。
+
+**W1: Dijkstra Single-Source Shortest Path (50,000 nodes / 250,000 edges × 3 rounds, 750k edge relaxations)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_digraph` | 69.541 | 61.842 | 93.057 | 92.72 | 14.78 MiB | 0.91x |
+| `pion_csr` | 47.174 | 45.962 | 48.540 | 62.90 | 19.03 MiB | **1.34x** |
+| `rust_petgraph` | 63.012 | 56.597 | 73.541 | 84.02 | 10.36 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `7d2284ef80a7958750d57f68f5b7c13e778b90566e1aa519f59de9fa21baa83e`._
+
+**W2: Tarjan SCC + Topological Sort (100,000 nodes / 400,000 edges each, 800k edges total)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_digraph` | 79.203 | 69.790 | 80.445 | 99.00 | 50.98 MiB | 0.60x |
+| `pion_csr` | 80.140 | 67.131 | 91.331 | 100.18 | 57.16 MiB | 0.59x |
+| `rust_petgraph` | 47.419 | 44.977 | 58.554 | 59.27 | 34.41 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `765842299691f19a22f0cdf0c8aa82872f1736b55d15c90b19522f0eedae1b3f`._
+
+**W3: Kruskal Minimum Spanning Tree (50,000 nodes / 200,000 undirected edges)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 20.565 | 18.085 | 24.096 | 102.83 | 20.88 MiB | **1.27x** |
+| `rust_petgraph` | 26.138 | 25.721 | 28.549 | 130.69 | 12.52 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `99042b7e421ab0d812b17c519414d5c6b0d1622c526fd32fa3fd30314527198e`._
+
+**W4: CFG Dominators (20,000 nodes / 60,000 edges × 5 rounds, 300k edge inspections)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_digraph` | 24.869 | 22.975 | 26.494 | 82.90 | 5.55 MiB | **1.68x** |
+| `pion_csr` | 21.727 | 21.237 | 22.014 | 72.42 | 7.28 MiB | **1.92x** |
+| `rust_petgraph` | 41.751 | 40.911 | 42.089 | 139.17 | 8.61 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `8e7d2450047cbab918a4750d47eaac42b7146df5ba268c76f74c387920aabd2f`._
+
+**Additional Adversarial Benchmarks (`packages/graph/audit/bench_adversarial.sh`, SHA-256 verified)**
+
+| Workload | Pion (ms) | Rust `petgraph` (ms) | Speedup | Peak RSS (Pion / Rust) |
+| --- | ---: | ---: | ---: | --- |
+| `A2_dinic_layers` (200 layers × 10) | 14.2 | 25.9 | **1.83x** | 6 / 5 MiB |
+| `A9_floyd_dense` (300 dense) | 24.3 | 31.9 | **1.31x** | 6 / 7 MiB |
+| `A10_tred_chain` (20k chain) | 13.7 | 1255.9 | **91.46x** | **7 / 912 MiB** |
+| `A10b_tred_star` (100k out-star) | 58.3 | 21.0 | 0.36x | **28 / 22 MiB** (down from 1,217 MiB) |
+| `A11_dominators_rand` (50k / 200k) | 52.6 | 63.0 | **1.20x** | 27 / 29 MiB |
+
+红队：29/29 单测；红队审计 `pionc test -p graph_audit packages/graph/audit` 20/21，F1–F10（A* 非一致启发式次优、支配边界丢入口节点、Floyd-Warshall 误报溢出、传递规约 V²/64 内存与 32-bit 溢出 panic、建图开销、尺寸守卫等）均已修复；剩余 1 例 `p2_neighbor_order_matches_petgraph` 为 README 记录的有意设计（邻居按插入顺序迭代，`petgraph` 为新者在前）。10 seeds × 1,000 随机图 × 22 段对 `petgraph` + 精确 `i128` / `u128` / 暴力参考差分 0 正确性不一致，400,000 次随机增删 0 指针完整性违例。领先项：W1 CSR Dijkstra 1.34x、W3 Kruskal 1.27x、W4 支配树 1.68x–1.92x，Dinic 1.83x、Floyd-Warshall 1.31x、链上传递规约 91.46x（7 MiB vs 912 MiB）。落后项：W1 `DiGraph` Dijkstra 0.91x，W2 SCC + 拓扑 0.59x–0.60x（`add_edge` 建图开销，Tarjan 内核本身 2.4x–5.0x），100k 出星传递规约 0.36x，建图主导负载 `B0_build_dense` 0.30x / `B0_build_rand` 0.24x，峰值 RSS 多数高于 Rust。
+
+### css
+
+参考实现：Rust [`cssparser`](https://github.com/servo/rust-cssparser) `=0.35.0`（`tokcount` token walk 与对齐 Pion `Stylesheet` 形状的自有通用 AST）、[`lightningcss`](https://github.com/parcel-bundler/lightningcss) `=1.0.0-alpha.72`（完整类型化 AST 与生产级压缩器）、Node `css-tree@3.1.0`（`node v24.22.2`）。采样由 `packages/css/audit/scripts/perf.py --rounds 5`（每进程 3 次重复、预热后 5 轮严格交替、取中位数与峰值 RSS）完成，`sh packages/css/audit/run_audit.sh` 一键复现。详见 [`packages/css/README.md`](packages/css/README.md)。
+
+**5-Corpus Head-to-Head Matrix (median ms, lower is better)**
+
+| Corpus (size × 3) | Pion `count_tokens` | Pion `tokenize()` | `cssparser` tok walk | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify | `css-tree` parse |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `design_system` (2.09 MB) | **25.9** | 66.7 | 34.7 | **63.1** | 66.2 | 110.5 | **85.2** | 135.1 | 531.4 |
+| `color_heavy` (1.81 MB) | **25.7** | 69.3 | 33.0 | 64.9 | **61.0** | 105.4 | **99.7** | 125.3 | 626.1 |
+| `selector_heavy` (1.34 MB) | **21.4** | 61.8 | 31.5 | 37.8 | **29.7** | 110.2 | **84.0** | 172.0 | 750.9 |
+| `nesting_heavy` (1.74 MB) | **26.1** | 89.8 | 42.5 | **91.2** | 107.2 | 449.6 | **125.2** | 569.7 | 1220.2 |
+| `custom_props` (2.04 MB) | **24.6** | 70.1 | 33.6 | 85.3 | **76.4** | 202.8 | **67.8** | 237.1 | 442.8 |
+
+**Peak RSS (MB, lower is better)**
+
+| Corpus | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify | `css-tree` parse |
+|---|---:|---:|---:|---:|---:|---:|
+| `design_system` | 18.1 | **18.0** | 44.2 | **7.4** | 46.4 | 247.6 |
+| `color_heavy` | **16.8** | 17.0 | 34.6 | **7.1** | 35.1 | 326.0 |
+| `selector_heavy` | **8.2** | 9.1 | 36.2 | **5.7** | 37.7 | 280.8 |
+| `nesting_heavy` | 41.2 | **34.0** | 202.6 | **6.9** | 203.4 | 448.6 |
+| `custom_props` | 22.7 | **22.5** | 56.2 | **7.6** | 58.2 | 164.1 |
+
+红队：32/32 单测；红队审计 `pionc test -p css_audit packages/css/audit` 34/34，原 P0（CSS Nesting 声明顺序丢失、`:is()` / `:not()` / `:where()` / `:has()` 内后代组合器被压缩删除）与 P1 / P2 均已修复；`tok_diff.py` 17,904 例 + 2,014 例原始字节输入 99.85% 与 `cssparser` 一致（`tokenize_bytes` 2,014 / 2,014）；`minify_diff.py` 2,114 例 0 语义破坏、0 非幂等；`dos.py` 20 / 20 线性、0 崩溃；`wasm4.py` 12 语料 × 4 模式 SHA-256 逐字节一致。领先项：`count_tokens()` 1.28x–1.63x（vs `cssparser`），`parse_stylesheet()` 1.62x–4.93x（vs `lightningcss`），`minify()` 1.26x–4.55x 且内存低 4.9x–29.5x（vs `lightningcss`，后者另做简写合并、厂商前缀与颜色空间转换等深度优化）。落后项：全量物化 `tokenize()` 0.47x–0.52x，`parse_stylesheet()` 对 `cssparser` 自有 AST 在 `color_heavy` / `selector_heavy` / `custom_props` 上 0.79x–0.94x，`nesting_heavy` 峰值 RSS 41.2 MB 高于 `cssparser` 的 34.0 MB。

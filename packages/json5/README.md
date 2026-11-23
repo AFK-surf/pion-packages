@@ -179,7 +179,7 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | St
 | `rust_json_patch` | 140.022 | 134.873 | 148.554 | 1400.22 | 2.14 MiB | 1.00x (baseline) |
 | `node_fast_json_patch` | 266.937 | 256.552 | 303.542 | 2669.37 | 52.78 MiB | 0.52x |
 
-_`pion` leads Rust `json-patch =4.2.0` by **1.19x** (1,362 ns/op vs 1,626 ns/op) and Node `fast-json-patch@3.1.1` by **2.29x**, at 2.16 MiB peak RSS._
+_`pion` leads Rust `json-patch =4.2.0` by **1.31x** (1,066 ns/op vs 1,400 ns/op) and Node `fast-json-patch@3.1.1` by **2.50x**, at 2.00 MiB peak RSS._
 
 ### Adversarial Benchmarks (A1–A8, `packages/json5/audit`)
 
