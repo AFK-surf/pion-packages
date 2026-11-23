@@ -1,0 +1,1133 @@
+///| Thompson NFA compiler (forward + reverse), UTF-8 byte-range trie builder,
+///| O(N + 256) ByteClassSet equivalence-class compressor, and prefilter analyzer.
+
+///| Byte-level NFA transition kind.
+pub enum NfaKind {
+  Byte(Int) // exact byte 0..255
+  ByteRange(Int, Int) // inclusive byte range [lo, hi]
+  ByteClass(Int64, Int64, Int64, Int64) // 256-bit bitmap
+  Sparse(Array[Int]) // sorted disjoint triples [lo, hi, dst, ...] for compact UTF-8 tries
+  Split // ordered epsilon split: out1 (preferred) then out2
+  Capture(Int) // record byte offset into capture slot `slot`, then epsilon to out1
+  Look(LookKind) // zero-width assertion, then epsilon to out1
+  Match(Int) // accepting state for pattern `pat_id`
+}
+
+///| Single NFA state.
+pub struct NfaState {
+  pub kind : NfaKind
+  pub mut out1 : Int // -1 if none
+  pub mut out2 : Int // -1 if none (only for Split)
+}
+
+///| Fast prefilter extracted from HIR for accelerating unanchored search.
+pub enum Prefilter {
+  NoPrefilter
+  ExactLiteral(Array[Int]) // entire regex is an unanchored literal
+  PrefixBytes(Array[Int]) // required literal prefix (>= 1 byte), no leading look
+  LeadingLookPrefix(Array[Int]) // required literal prefix after leading zero-width look (e.g. `\bword\b`)
+  FirstBytes(Array[Int]) // 256-entry lookup table (1 = possible first byte, 0 = skip)
+}
+
+///| Compiled Thompson NFA (byte-level, O(N) size).
+pub struct Nfa {
+  pub states : Array[NfaState]
+  pub start_anchored : Int
+  pub start_unanchored : Int
+  pub num_captures : Int
+  pub capture_names : Array[String]
+  pub byte_classes : Array[Int] // 256 -> class_id
+  pub rep_bytes : Array[Int] // stride -> representative byte
+  pub stride : Int
+  pub has_look : Bool
+  pub has_line_anchor : Bool
+  pub has_word_boundary : Bool
+  pub has_unicode_word_boundary : Bool
+  pub anchored_start : Bool
+  pub prefilter : Prefilter
+}
+
+struct NfaBuilder {
+  states : Array[NfaState]
+  size_limit : Int
+  pattern : String
+  mut has_look : Bool
+  mut has_line_anchor : Bool
+  mut has_word_boundary : Bool
+  mut has_unicode_word_boundary : Bool
+}
+
+fn NfaBuilder::new(pattern : String, size_limit : Int) -> NfaBuilder {
+  NfaBuilder::{
+    states: Array::new(),
+    size_limit,
+    pattern,
+    has_look: false,
+    has_line_anchor: false,
+    has_word_boundary: false,
+    has_unicode_word_boundary: false,
+  }
+}
+
+fn NfaBuilder::add(
+  self : NfaBuilder,
+  kind : NfaKind,
+  out1 : Int,
+  out2 : Int,
+) -> Result[Int, RegexError] {
+  if self.states.length() >= self.size_limit {
+    return Err(RegexError::{
+      kind: RegexErrorKind::CompiledTooBig,
+      pattern: self.pattern,
+      offset: 0,
+      message: "compiled regex exceeds size limit",
+    })
+  }
+  let id = self.states.length()
+  self.states.push(NfaState::{ kind, out1, out2 })
+  Ok(id)
+}
+
+fn set_bit256(w : Array[Int64], b : Int) -> Unit {
+  let idx = b >> 6
+  w[idx] = w[idx] | (1L << (b & 63))
+}
+
+fn get_bit256(w : Array[Int64], b : Int) -> Bool {
+  (w[b >> 6] & (1L << (b & 63))) != 0L
+}
+
+fn mark_class_bound(bounds : Array[Int64], b : Int) -> Unit {
+  if b > 0 && b < 256 {
+    let idx = b >> 6
+    bounds[idx] = bounds[idx] | (1L << (b & 63))
+  }
+}
+
+///| Compile a forward or reverse HIR fragment, transitioning into `next`.
+fn NfaBuilder::compile_hir(
+  self : NfaBuilder,
+  hir : Hir,
+  next : Int,
+  reverse : Bool,
+  include_captures : Bool,
+) -> Result[Int, RegexError] {
+  match hir {
+    Hir::Empty => Ok(next)
+    Hir::Literal(bs) => {
+      let n = bs.length()
+      if n == 0 {
+        return Ok(next)
+      }
+      let mut cur = next
+      if !reverse {
+        let mut i = n - 1
+        while i >= 0 {
+          cur = match self.add(NfaKind::Byte(bs[i]), cur, -1) {
+            Ok(id) => id
+            Err(e) => return Err(e)
+          }
+          i = i - 1
+        }
+      } else {
+        let mut i = 0
+        while i < n {
+          cur = match self.add(NfaKind::Byte(bs[i]), cur, -1) {
+            Ok(id) => id
+            Err(e) => return Err(e)
+          }
+          i = i + 1
+        }
+      }
+      Ok(cur)
+    }
+    Hir::Class(ranges, unicode) => {
+      if ranges.length() == 0 {
+        // Empty class never matches: create an impossible ByteClass(0,0,0,0)
+        return self.add(NfaKind::ByteClass(0L, 0L, 0L, 0L), next, -1)
+      }
+      if !unicode {
+        // Pure byte class 0..255
+        let w : Array[Int64] = [0L, 0L, 0L, 0L]
+        let mut i = 0
+        while i < ranges.length() {
+          let r = ranges[i]
+          let lo = if r.lo < 0 { 0 } else { r.lo }
+          let hi = if r.hi > 255 { 255 } else { r.hi }
+          let mut b = lo
+          while b <= hi {
+            set_bit256(w, b)
+            b = b + 1
+          }
+          i = i + 1
+        }
+        return self.add(NfaKind::ByteClass(w[0], w[1], w[2], w[3]), next, -1)
+      }
+      // Unicode class: compile to UTF-8 byte-range sequences
+      let seqs = compile_utf8_ranges(ranges)
+      if seqs.length() == 0 {
+        return self.add(NfaKind::ByteClass(0L, 0L, 0L, 0L), next, -1)
+      }
+      if !reverse {
+        // Forward NFA: compile into a compact prefix-shared Sparse UTF-8 trie (1 state at entry!)
+        return self.compile_utf8_trie(seqs, 0, 0, seqs.length(), next)
+      }
+      // Reverse NFA: coalesce 1-byte sequences into ByteClass + compile multi-byte sequences
+      let w : Array[Int64] = [0L, 0L, 0L, 0L]
+      let mut has_1b = false
+      let multi : Array[Utf8Seq] = Array::new()
+      let mut i = 0
+      while i < seqs.length() {
+        let sq = seqs[i]
+        if sq.len == 1 {
+          has_1b = true
+          let mut b = sq.b0_lo
+          while b <= sq.b0_hi {
+            set_bit256(w, b)
+            b = b + 1
+          }
+        } else {
+          multi.push(sq)
+        }
+        i = i + 1
+      }
+      let entries : Array[Int] = Array::new()
+      if has_1b {
+        let id = match self.add(NfaKind::ByteClass(w[0], w[1], w[2], w[3]), next, -1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        entries.push(id)
+      }
+      i = 0
+      while i < multi.length() {
+        let sq = multi[i]
+        let sid = match self.compile_utf8_seq(sq, next, reverse) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        entries.push(sid)
+        i = i + 1
+      }
+      if entries.length() == 1 {
+        Ok(entries[0])
+      } else {
+        let mut cur = entries[entries.length() - 1]
+        let mut j = entries.length() - 2
+        while j >= 0 {
+          cur = match self.add(NfaKind::Split, entries[j], cur) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          j = j - 1
+        }
+        Ok(cur)
+      }
+    }
+    Hir::Look(lk) => {
+      self.has_look = true
+      let eff = if !reverse {
+        lk
+      } else {
+        match lk {
+          LookKind::StartText => LookKind::EndText
+          LookKind::EndText => LookKind::StartText
+          LookKind::StartLine => LookKind::EndLine
+          LookKind::EndLine => LookKind::StartLine
+          other => other
+        }
+      }
+      match eff {
+        LookKind::StartLine | LookKind::EndLine => self.has_line_anchor = true
+        LookKind::WordBoundaryAscii | LookKind::NotWordBoundaryAscii =>
+        self.has_word_boundary = true
+        LookKind::WordBoundaryUnicode | LookKind::NotWordBoundaryUnicode => {
+          self.has_word_boundary = true
+          self.has_unicode_word_boundary = true
+        }
+        _ => ()
+      }
+      self.add(NfaKind::Look(eff), next, -1)
+    }
+    Hir::Capture(group_idx, inner) => {
+      if !include_captures {
+        return self.compile_hir(inner, next, reverse, false)
+      }
+      let close_slot = group_idx * 2 + 1
+      let open_slot = group_idx * 2
+      let after = match self.add(NfaKind::Capture(close_slot), next, -1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let body = match self.compile_hir(inner, after, reverse, true) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      self.add(NfaKind::Capture(open_slot), body, -1)
+    }
+    Hir::Concat(items) => {
+      let mut cur = next
+      if !reverse {
+        let mut i = items.length() - 1
+        while i >= 0 {
+          cur = match self.compile_hir(items[i], cur, false, include_captures) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          i = i - 1
+        }
+      } else {
+        let mut i = 0
+        while i < items.length() {
+          cur = match self.compile_hir(items[i], cur, true, include_captures) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          i = i + 1
+        }
+      }
+      Ok(cur)
+    }
+    Hir::Alt(branches) => {
+      if branches.length() == 0 {
+        return Ok(next)
+      }
+      let entries : Array[Int] = Array::new()
+      let mut i = 0
+      while i < branches.length() {
+        let eid = match self.compile_hir(branches[i], next, reverse, include_captures) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        entries.push(eid)
+        i = i + 1
+      }
+      let mut cur = entries[entries.length() - 1]
+      let mut j = entries.length() - 2
+      while j >= 0 {
+        cur = match self.add(NfaKind::Split, entries[j], cur) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        j = j - 1
+      }
+      Ok(cur)
+    }
+    Hir::Repeat(inner, min, max, greedy) => {
+      // Optimizing empty / pure-lookaround repetitions (P2-2)
+      match inner {
+        Hir::Empty => return Ok(next)
+        Hir::Look(_) => {
+          if min >= 1 {
+            return self.compile_hir(inner, next, reverse, include_captures)
+          }
+          let body = match self.compile_hir(inner, next, reverse, include_captures) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          return if greedy {
+            self.add(NfaKind::Split, body, next)
+          } else {
+            self.add(NfaKind::Split, next, body)
+          }
+        }
+        _ => ()
+      }
+      let mut cur = next
+      if max < 0 {
+        // Rust regex-automata exact leftmost-first compilation (P1-3):
+        // - x+ (min >= 1): compiled -> plus_split(compiled, next), preceded by (min - 1) copies
+        // - x* (min == 0): (x+)? = question_split(body -> plus_split(body, next), next)
+        // This ensures nullable loop bodies exit on the first empty iteration with exact
+        // leftmost-first priority and preserve the final empty iteration's capture slots!
+        let plus = match self.add(NfaKind::Split, -1, -1) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let body = match self.compile_hir(inner, plus, reverse, include_captures) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if greedy {
+          self.states[plus].out1 = body
+          self.states[plus].out2 = cur
+        } else {
+          self.states[plus].out1 = cur
+          self.states[plus].out2 = body
+        }
+        if min == 0 {
+          cur = if greedy {
+            match self.add(NfaKind::Split, body, cur) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+          } else {
+            match self.add(NfaKind::Split, cur, body) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+          }
+        } else {
+          cur = body
+          let mut req = min - 1
+          while req > 0 {
+            cur = match self.compile_hir(inner, cur, reverse, include_captures) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+            req = req - 1
+          }
+        }
+        return Ok(cur)
+      } else {
+        // Optional copies: (max - min) times
+        let mut opt = max - min
+        while opt > 0 {
+          let body = match self.compile_hir(inner, cur, reverse, include_captures) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          cur = if greedy {
+            match self.add(NfaKind::Split, body, cur) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+          } else {
+            match self.add(NfaKind::Split, cur, body) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+          }
+          opt = opt - 1
+        }
+      }
+      // Mandatory copies: min times
+      let mut req = min
+      while req > 0 {
+        cur = match self.compile_hir(inner, cur, reverse, include_captures) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        req = req - 1
+      }
+      Ok(cur)
+    }
+  }
+}
+
+fn utf8_seq_range_at(sq : Utf8Seq, depth : Int) -> (Int, Int) {
+  if depth == 0 {
+    (sq.b0_lo, sq.b0_hi)
+  } else if depth == 1 {
+    (sq.b1_lo, sq.b1_hi)
+  } else if depth == 2 {
+    (sq.b2_lo, sq.b2_hi)
+  } else {
+    (sq.b3_lo, sq.b3_hi)
+  }
+}
+
+///| Compile sorted disjoint `Utf8Seq`s into a compact prefix-shared `NfaKind::Sparse` trie.
+fn NfaBuilder::compile_utf8_trie(
+  self : NfaBuilder,
+  seqs : Array[Utf8Seq],
+  depth : Int,
+  lo_idx : Int,
+  hi_idx : Int,
+  next : Int,
+) -> Result[Int, RegexError] {
+  let edges : Array[Int] = Array::new()
+  let mut i = lo_idx
+  while i < hi_idx {
+    let (rlo, rhi) = utf8_seq_range_at(seqs[i], depth)
+    let mut j = i + 1
+    while j < hi_idx {
+      let (nlo, nhi) = utf8_seq_range_at(seqs[j], depth)
+      if nlo != rlo || nhi != rhi {
+        break
+      }
+      j = j + 1
+    }
+    let dst = if seqs[i].len == depth + 1 {
+      next
+    } else {
+      match self.compile_utf8_trie(seqs, depth + 1, i, j, next) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    }
+    // Coalesce adjacent ranges pointing to the exact same destination
+    let elen = edges.length()
+    if elen >= 3 && edges[elen - 1] == dst && edges[elen - 2] + 1 == rlo {
+      edges[elen - 2] = rhi
+    } else {
+      edges.push(rlo)
+      edges.push(rhi)
+      edges.push(dst)
+    }
+    i = j
+  }
+  if edges.length() == 3 {
+    return self.add_byte_range(edges[0], edges[1], edges[2])
+  }
+  self.add(NfaKind::Sparse(edges), -1, -1)
+}
+
+///| Binary search a `Sparse` transition table `[lo, hi, dst, ...]` for byte `b`.
+///| Returns target state ID or `-1` if no range matches.
+pub fn nfa_sparse_next(edges : Array[Int], b : Int) -> Int {
+  let mut lo = 0
+  let mut hi = edges.length() / 3 - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let idx = mid * 3
+    let rlo = edges[idx]
+    if b < rlo {
+      hi = mid - 1
+    } else if b > edges[idx + 1] {
+      lo = mid + 1
+    } else {
+      return edges[idx + 2]
+    }
+  }
+  -1
+}
+
+fn NfaBuilder::compile_utf8_seq(
+  self : NfaBuilder,
+  sq : Utf8Seq,
+  next : Int,
+  reverse : Bool,
+) -> Result[Int, RegexError] {
+  let mut cur = next
+  if !reverse {
+    if sq.len == 4 {
+      cur = match self.add_byte_range(sq.b3_lo, sq.b3_hi, cur) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    }
+    if sq.len >= 3 {
+      cur = match self.add_byte_range(sq.b2_lo, sq.b2_hi, cur) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    }
+    if sq.len >= 2 {
+      cur = match self.add_byte_range(sq.b1_lo, sq.b1_hi, cur) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    }
+    self.add_byte_range(sq.b0_lo, sq.b0_hi, cur)
+  } else {
+    cur = match self.add_byte_range(sq.b0_lo, sq.b0_hi, cur) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if sq.len >= 2 {
+      cur = match self.add_byte_range(sq.b1_lo, sq.b1_hi, cur) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    }
+    if sq.len >= 3 {
+      cur = match self.add_byte_range(sq.b2_lo, sq.b2_hi, cur) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    }
+    if sq.len == 4 {
+      cur = match self.add_byte_range(sq.b3_lo, sq.b3_hi, cur) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    }
+    Ok(cur)
+  }
+}
+
+fn NfaBuilder::add_byte_range(
+  self : NfaBuilder,
+  lo : Int,
+  hi : Int,
+  next : Int,
+) -> Result[Int, RegexError] {
+  if lo == hi {
+    self.add(NfaKind::Byte(lo), next, -1)
+  } else {
+    self.add(NfaKind::ByteRange(lo, hi), next, -1)
+  }
+}
+
+///| Compute O(num_states + 256) byte equivalence classes.
+///| When `has_line_anchor` is true, isolates byte 10 (`\n`) into its own class.
+///| When `has_word_boundary` is true, isolates ASCII word byte ranges and non-ASCII bytes.
+pub fn compute_byte_classes(
+  states : Array[NfaState],
+  has_line_anchor : Bool,
+  has_word_boundary : Bool,
+) -> (Array[Int], Array[Int]) {
+  let bounds : Array[Int64] = [0L, 0L, 0L, 0L]
+  if has_line_anchor {
+    mark_class_bound(bounds, 10)
+    mark_class_bound(bounds, 11)
+  }
+  if has_word_boundary {
+    mark_class_bound(bounds, 48)
+    mark_class_bound(bounds, 58)
+    mark_class_bound(bounds, 65)
+    mark_class_bound(bounds, 91)
+    mark_class_bound(bounds, 95)
+    mark_class_bound(bounds, 96)
+    mark_class_bound(bounds, 97)
+    mark_class_bound(bounds, 123)
+    mark_class_bound(bounds, 128)
+  }
+  let mut i = 0
+  let n = states.length()
+  while i < n {
+    match states[i].kind {
+      NfaKind::Byte(b) => {
+        mark_class_bound(bounds, b)
+        mark_class_bound(bounds, b + 1)
+      }
+      NfaKind::ByteRange(lo, hi) => {
+        mark_class_bound(bounds, lo)
+        mark_class_bound(bounds, hi + 1)
+      }
+      NfaKind::ByteClass(w0, w1, w2, w3) => {
+        let w : Array[Int64] = [w0, w1, w2, w3]
+        let mut prev = get_bit256(w, 0)
+        let mut b = 1
+        while b < 256 {
+          let cur = get_bit256(w, b)
+          if cur != prev {
+            mark_class_bound(bounds, b)
+            prev = cur
+          }
+          b = b + 1
+        }
+      }
+      NfaKind::Sparse(edges) => {
+        let mut k = 0
+        let m = edges.length()
+        while k + 2 < m {
+          mark_class_bound(bounds, edges[k])
+          mark_class_bound(bounds, edges[k + 1] + 1)
+          k = k + 3
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  let byte_classes : Array[Int] = Array::new()
+  let rep_bytes : Array[Int] = Array::new()
+  let mut cls = 0
+  rep_bytes.push(0)
+  byte_classes.push(0)
+  let mut b = 1
+  while b < 256 {
+    if get_bit256(bounds, b) {
+      cls = cls + 1
+      rep_bytes.push(b)
+    }
+    byte_classes.push(cls)
+    b = b + 1
+  }
+  (byte_classes, rep_bytes)
+}
+
+///| Check whether a consuming NFA state matches byte `b`.
+pub fn nfa_state_matches_byte(kind : NfaKind, b : Int) -> Bool {
+  match kind {
+    NfaKind::Byte(x) => b == x
+    NfaKind::ByteRange(lo, hi) => b >= lo && b <= hi
+    NfaKind::ByteClass(w0, w1, w2, w3) => {
+      let idx = b >> 6
+      let mask = 1L << (b & 63)
+      let word = if idx == 0 {
+        w0
+      } else if idx == 1 {
+        w1
+      } else if idx == 2 {
+        w2
+      } else {
+        w3
+      }
+      (word & mask) != 0L
+    }
+    _ => false
+  }
+}
+
+///| Check if an HIR unconditionally starts with `StartText` (`^` without `(?m)`, or `\A`).
+fn hir_is_anchored_start(hir : Hir) -> Bool {
+  match hir {
+    Hir::Look(LookKind::StartText) => true
+    Hir::Capture(_, inner) => hir_is_anchored_start(inner)
+    Hir::Concat(items) =>
+    if items.length() > 0 {
+      hir_is_anchored_start(items[0])
+    } else {
+      false
+    }
+    Hir::Alt(branches) => {
+      if branches.length() == 0 {
+        return false
+      }
+      let mut i = 0
+      while i < branches.length() {
+        if !hir_is_anchored_start(branches[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///| Extract a fast prefilter from HIR (exact literal, literal prefix, or first-byte set).
+fn extract_prefilter(hir : Hir, anchored_start : Bool) -> Prefilter {
+  if anchored_start {
+    return Prefilter::NoPrefilter
+  }
+  // Exact literal check
+  match hir {
+    Hir::Literal(bs) =>
+    if bs.length() > 0 {
+      return Prefilter::ExactLiteral(bs)
+    }
+    _ => ()
+  }
+  // Required literal prefix extraction (without leading look)
+  let prefix : Array[Int] = Array::new()
+  collect_literal_prefix(hir, prefix)
+  if prefix.length() >= 1 {
+    return Prefilter::PrefixBytes(prefix)
+  }
+  // Required literal prefix after leading zero-width look (e.g. `\bword\b`)
+  let look_prefix : Array[Int] = Array::new()
+  if collect_leading_look_prefix(hir, look_prefix) && look_prefix.length() >= 2 {
+    return Prefilter::LeadingLookPrefix(look_prefix)
+  }
+  // First-byte set extraction (only useful if <= 128 of 256 bytes can start a match)
+  let first : Array[Int] = Array::new()
+  let mut i = 0
+  while i < 256 {
+    first.push(0)
+    i = i + 1
+  }
+  let ok = collect_first_bytes(hir, first)
+  if ok {
+    let mut cnt = 0
+    i = 0
+    while i < 256 {
+      if first[i] != 0 {
+        cnt = cnt + 1
+      }
+      i = i + 1
+    }
+    if cnt > 0 && cnt <= 128 {
+      return Prefilter::FirstBytes(first)
+    }
+  }
+  Prefilter::NoPrefilter
+}
+
+fn collect_leading_look_prefix(hir : Hir, out : Array[Int]) -> Bool {
+  match hir {
+    Hir::Capture(_, inner) => collect_leading_look_prefix(inner, out)
+    Hir::Concat(items) => {
+      let mut i = 0
+      let mut saw_look = false
+      while i < items.length() {
+        match items[i] {
+          Hir::Empty => ()
+          Hir::Look(_) => saw_look = true
+          Hir::Literal(bs) => {
+            let mut k = 0
+            while k < bs.length() {
+              out.push(bs[k])
+              k = k + 1
+            }
+            // Continue collecting adjacent literals
+            let mut j = i + 1
+            while j < items.length() {
+              match items[j] {
+                Hir::Literal(bs2) => {
+                  let mut m = 0
+                  while m < bs2.length() {
+                    out.push(bs2[m])
+                    m = m + 1
+                  }
+                }
+                _ => break
+              }
+              j = j + 1
+            }
+            return saw_look && out.length() > 0
+          }
+          _ => return false
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+fn collect_literal_prefix(hir : Hir, out : Array[Int]) -> Unit {
+  match hir {
+    Hir::Literal(bs) => {
+      let mut i = 0
+      while i < bs.length() {
+        out.push(bs[i])
+        i = i + 1
+      }
+    }
+    Hir::Capture(_, inner) => collect_literal_prefix(inner, out)
+    Hir::Concat(items) => {
+      let mut i = 0
+      while i < items.length() {
+        match items[i] {
+          Hir::Literal(bs) => {
+            let mut k = 0
+            while k < bs.length() {
+              out.push(bs[k])
+              k = k + 1
+            }
+          }
+          Hir::Capture(_, inner) => {
+            collect_literal_prefix(inner, out)
+            break
+          }
+          _ => break
+        }
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///| Returns true if the HIR MUST consume at least one byte from `first` to match.
+fn collect_first_bytes(hir : Hir, first : Array[Int]) -> Bool {
+  match hir {
+    Hir::Empty | Hir::Look(_) => false
+    Hir::Literal(bs) =>
+    if bs.length() > 0 {
+      first[bs[0]] = 1
+      true
+    } else {
+      false
+    }
+    Hir::Class(ranges, unicode) => {
+      if !unicode {
+        let mut i = 0
+        while i < ranges.length() {
+          let r = ranges[i]
+          let mut b = if r.lo < 0 { 0 } else { r.lo }
+          let hi = if r.hi > 255 { 255 } else { r.hi }
+          while b <= hi {
+            first[b] = 1
+            b = b + 1
+          }
+          i = i + 1
+        }
+        return true
+      }
+      let seqs = compile_utf8_ranges(ranges)
+      let mut i = 0
+      while i < seqs.length() {
+        let sq = seqs[i]
+        let mut b = sq.b0_lo
+        while b <= sq.b0_hi {
+          first[b] = 1
+          b = b + 1
+        }
+        i = i + 1
+      }
+      true
+    }
+    Hir::Capture(_, inner) => collect_first_bytes(inner, first)
+    Hir::Concat(items) => {
+      let mut i = 0
+      while i < items.length() {
+        if collect_first_bytes(items[i], first) {
+          return true
+        }
+        // Only skip pure empty or lookaround if we're conservative; bail on nullable
+        match items[i] {
+          Hir::Empty | Hir::Look(_) => ()
+          _ => return false
+        }
+        i = i + 1
+      }
+      false
+    }
+    Hir::Alt(branches) => {
+      if branches.length() == 0 {
+        return false
+      }
+      let mut i = 0
+      while i < branches.length() {
+        if !collect_first_bytes(branches[i], first) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    Hir::Repeat(inner, min, _, _) =>
+    if min >= 1 {
+      collect_first_bytes(inner, first)
+    } else {
+      false
+    }
+  }
+}
+
+///| Compile a single parsed pattern into a forward Thompson NFA.
+pub fn compile_forward_nfa(
+  parsed : ParsedPattern,
+  pattern : String,
+  size_limit : Int,
+) -> Result[Nfa, RegexError] {
+  let b = NfaBuilder::new(pattern, size_limit)
+  let match_st = match b.add(NfaKind::Match(0), -1, -1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let cap_close = match b.add(NfaKind::Capture(1), match_st, -1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let body = match b.compile_hir(parsed.hir, cap_close, false, true) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let start_anchored = match b.add(NfaKind::Capture(0), body, -1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let anchored_start = hir_is_anchored_start(parsed.hir)
+  let start_unanchored = if anchored_start {
+    start_anchored
+  } else {
+    // Unanchored prefix: (?s:.)*? -> start_anchored (lazy! start_anchored is out1!)
+    let any_b = match b.add(NfaKind::ByteRange(0, 255), -1, -1) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let loop_split = match b.add(NfaKind::Split, start_anchored, any_b) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    b.states[any_b].out1 = loop_split
+    loop_split
+  }
+  let (byte_classes, rep_bytes) = compute_byte_classes(
+    b.states,
+    b.has_line_anchor,
+    b.has_word_boundary,
+  )
+  let prefilter = extract_prefilter(parsed.hir, anchored_start)
+  Ok(Nfa::{
+    states: b.states,
+    start_anchored,
+    start_unanchored,
+    num_captures: parsed.num_captures,
+    capture_names: parsed.capture_names,
+    byte_classes,
+    rep_bytes,
+    stride: rep_bytes.length(),
+    has_look: b.has_look,
+    has_line_anchor: b.has_line_anchor,
+    has_word_boundary: b.has_word_boundary,
+    has_unicode_word_boundary: b.has_unicode_word_boundary,
+    anchored_start,
+    prefilter,
+  })
+}
+
+///| Compile a reverse Thompson NFA (no captures, anchored at match end) for finding match start.
+pub fn compile_reverse_nfa(
+  parsed : ParsedPattern,
+  pattern : String,
+  size_limit : Int,
+) -> Result[Nfa, RegexError] {
+  let b = NfaBuilder::new(pattern, size_limit)
+  let match_st = match b.add(NfaKind::Match(0), -1, -1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let start_anchored = match b.compile_hir(parsed.hir, match_st, true, false) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (byte_classes, rep_bytes) = compute_byte_classes(
+    b.states,
+    b.has_line_anchor,
+    b.has_word_boundary,
+  )
+  Ok(Nfa::{
+    states: b.states,
+    start_anchored,
+    start_unanchored: start_anchored,
+    num_captures: 1,
+    capture_names: [""],
+    byte_classes,
+    rep_bytes,
+    stride: rep_bytes.length(),
+    has_look: b.has_look,
+    has_line_anchor: b.has_line_anchor,
+    has_word_boundary: b.has_word_boundary,
+    has_unicode_word_boundary: b.has_unicode_word_boundary,
+    anchored_start: true,
+    prefilter: Prefilter::NoPrefilter,
+  })
+}
+
+///| Compile multiple parsed patterns into a single multi-pattern NFA for `RegexSet`.
+pub fn compile_set_nfa(
+  parsed_list : Array[ParsedPattern],
+  patterns : Array[String],
+  size_limit : Int,
+) -> Result[Nfa, RegexError] {
+  let pat_label = if patterns.length() > 0 { patterns[0] } else { "" }
+  let b = NfaBuilder::new(pat_label, size_limit)
+  let anchored_entries : Array[Int] = Array::new()
+  let unanchored_entries : Array[Int] = Array::new()
+  let mut i = 0
+  while i < parsed_list.length() {
+    let m = match b.add(NfaKind::Match(i), -1, -1) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let entry = match b.compile_hir(parsed_list[i].hir, m, false, false) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if hir_is_anchored_start(parsed_list[i].hir) {
+      anchored_entries.push(entry)
+    } else {
+      unanchored_entries.push(entry)
+    }
+    i = i + 1
+  }
+  let combine = fn(entries : Array[Int]) -> Result[Int, RegexError] {
+    if entries.length() == 0 {
+      return Ok(-1)
+    }
+    let mut cur = entries[entries.length() - 1]
+    let mut j = entries.length() - 2
+    while j >= 0 {
+      cur = match b.add(NfaKind::Split, entries[j], cur) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      j = j - 1
+    }
+    Ok(cur)
+  }
+  let anch_root = match combine(anchored_entries) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let unanch_body = match combine(unanchored_entries) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let unanch_root = if unanch_body >= 0 {
+    let any_b = match b.add(NfaKind::ByteRange(0, 255), -1, -1) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let split = match b.add(NfaKind::Split, unanch_body, any_b) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    b.states[any_b].out1 = split
+    split
+  } else {
+    -1
+  }
+  let start_unanchored = if anch_root >= 0 && unanch_root >= 0 {
+    match b.add(NfaKind::Split, anch_root, unanch_root) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+  } else if anch_root >= 0 {
+    anch_root
+  } else if unanch_root >= 0 {
+    unanch_root
+  } else {
+    match b.add(NfaKind::ByteClass(0L, 0L, 0L, 0L), -1, -1) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+  }
+  let (byte_classes, rep_bytes) = compute_byte_classes(
+    b.states,
+    b.has_line_anchor,
+    b.has_word_boundary,
+  )
+  Ok(Nfa::{
+    states: b.states,
+    start_anchored: start_unanchored,
+    start_unanchored,
+    num_captures: 0,
+    capture_names: [],
+    byte_classes,
+    rep_bytes,
+    stride: rep_bytes.length(),
+    has_look: b.has_look,
+    has_line_anchor: b.has_line_anchor,
+    has_word_boundary: b.has_word_boundary,
+    has_unicode_word_boundary: b.has_unicode_word_boundary,
+    anchored_start: unanch_root < 0,
+    prefilter: Prefilter::NoPrefilter,
+  })
+}
+
+///| Check whether an HIR contains any word-boundary lookaround (`\b`/`\B`).
+pub fn hir_has_word_boundary(hir : Hir) -> Bool {
+  match hir {
+    Hir::Look(lk) =>
+    match lk {
+      LookKind::WordBoundaryAscii
+      | LookKind::NotWordBoundaryAscii
+      | LookKind::WordBoundaryUnicode
+      | LookKind::NotWordBoundaryUnicode => true
+      _ => false
+    }
+    Hir::Capture(_, inner) => hir_has_word_boundary(inner)
+    Hir::Repeat(inner, _, _, _) => hir_has_word_boundary(inner)
+    Hir::Concat(items) => {
+      let mut i = 0
+      while i < items.length() {
+        if hir_has_word_boundary(items[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    Hir::Alt(branches) => {
+      let mut i = 0
+      while i < branches.length() {
+        if hir_has_word_boundary(branches[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}

@@ -1,0 +1,772 @@
+///| Top-level public API for `packages/regex`:
+///| - `compile` / `compile_with` / `escape`
+///| - `Regex`: `is_match`, `find`, `find_iter`, `find_span_at`, `find_spans_into`,
+///|   `captures`, `captures_iter`, `captures_slots_at`, `replace`, `replace_all`,
+///|   `replacen`, `split`, `splitn`
+///| - `compile_set` / `compile_set_with` / `RegexSet`: `is_match`, `matches`, `matches_into`
+
+///| Compile a regular expression with default options.
+pub fn compile(pattern : String) -> Result[Regex, RegexError] {
+  compile_with(pattern, RegexOptions::default())
+}
+
+///| Compile a regular expression with custom options.
+pub fn compile_with(
+  pattern : String,
+  opts : RegexOptions,
+) -> Result[Regex, RegexError] {
+  let parsed = match parse_pattern(pattern, opts) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  let fwd_nfa = match compile_forward_nfa(parsed, pattern, opts.size_limit) {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+  let rev_nfa = match compile_reverse_nfa(parsed, pattern, opts.size_limit) {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+  // Lazy DFA handles all patterns including ASCII \b/\B (bailing cleanly to PikeVM on non-ASCII under Unicode \b/\B)
+  let use_dfa = true
+  let fwd_dfa = LazyDfa::new(fwd_nfa, DfaMode::LeftmostFirst)
+  let rev_dfa = LazyDfa::new(rev_nfa, DfaMode::Reverse)
+  let onepass = if !fwd_nfa.has_look && fwd_nfa.num_captures > 1 {
+    compile_onepass(fwd_nfa)
+  } else {
+    Option::None
+  }
+  let pike_cache = PikeVmCache::new()
+  Ok(Regex::{ pattern, fwd_nfa, fwd_dfa, rev_dfa, onepass, pike_cache, use_dfa })
+}
+
+///| Escape all regex metacharacters in `text`.
+pub fn escape(text : String) -> String {
+  let sb = StringBuilder::new()
+  let n = text.length()
+  let mut i = 0
+  while i < n {
+    let b = text.code_unit_at(i)
+    if b == 92 || b == 46 || b == 43 || b == 42 || b == 63 ||
+    b == 40 || b == 41 || b == 124 || b == 91 || b == 93 ||
+    b == 123 || b == 125 || b == 94 || b == 36 || b == 35 ||
+    b == 38 || b == 45 || b == 126 {
+      sb.write_byte(92.to_byte())
+    }
+    sb.write_byte(b.to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Find exact byte needle `needle` in `text` starting at `start_pos`. Returns index or -1.
+fn find_bytes_at(text : String, start_pos : Int, needle : Array[Int]) -> Int {
+  let n = text.length()
+  let m = needle.length()
+  if m == 0 {
+    return start_pos
+  }
+  if start_pos + m > n {
+    return -1
+  }
+  let b0 = needle[0]
+  let limit = n - m
+  let mut pos = start_pos
+  if m == 1 {
+    while pos <= limit {
+      if text.code_unit_at(pos) == b0 {
+        return pos
+      }
+      pos = pos + 1
+    }
+    return -1
+  }
+  let b1 = needle[1]
+  let last = needle[m - 1]
+  let last_off = m - 1
+  while pos <= limit {
+    if text.code_unit_at(pos) == b0 &&
+    text.code_unit_at(pos + last_off) == last &&
+    text.code_unit_at(pos + 1) == b1 {
+      let mut k = 2
+      let mut ok = true
+      while k < last_off {
+        if text.code_unit_at(pos + k) != needle[k] {
+          ok = false
+          break
+        }
+        k = k + 1
+      }
+      if ok {
+        return pos
+      }
+    }
+    pos = pos + 1
+  }
+  -1
+}
+
+///| Returns the original pattern string.
+pub fn Regex::as_str(self : Regex) -> String {
+  self.pattern
+}
+
+///| Returns the number of capture groups (including group 0).
+pub fn Regex::captures_len(self : Regex) -> Int {
+  self.fwd_nfa.num_captures
+}
+
+///| Returns the capture group names (None for unnamed groups).
+pub fn Regex::capture_names(self : Regex) -> Array[Option[String]] {
+  let out : Array[Option[String]] = Array::new()
+  let mut i = 0
+  let n = self.fwd_nfa.capture_names.length()
+  while i < n {
+    let name = self.fwd_nfa.capture_names[i]
+    if name.length() == 0 {
+      out.push(Option::None)
+    } else {
+      out.push(Option::Some(name))
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Returns true if the regex matches anywhere in `text`.
+pub fn Regex::is_match(self : Regex, text : String) -> Bool {
+  self.is_match_at(text, 0)
+}
+
+///| Returns true if the regex matches anywhere in `text` starting at byte offset `start`.
+pub fn Regex::is_match_at(self : Regex, text : String, start : Int) -> Bool {
+  let n = text.length()
+  if start < 0 || start > n {
+    return false
+  }
+  if self.fwd_nfa.anchored_start && start > 0 {
+    return false
+  }
+  if self.use_dfa {
+    match self.fwd_nfa.prefilter {
+      Prefilter::ExactLiteral(bs) => return find_bytes_at(text, start, bs) >= 0
+      Prefilter::PrefixBytes(bs) | Prefilter::LeadingLookPrefix(bs) => {
+        let mut pos = start
+        let empty : Array[Int] = Array::new()
+        while pos <= n {
+          let cand = find_bytes_at(text, pos, bs)
+          if cand < 0 {
+            return false
+          }
+          let r = self.fwd_dfa.is_match_tri(text, cand, n, true)
+          if r == 1 {
+            return true
+          }
+          if r == -2 {
+            if pikevm_search(self.fwd_nfa, self.pike_cache, text, cand, n, true, false, empty) {
+              return true
+            }
+          }
+          pos = cand + 1
+        }
+        return false
+      }
+      _ => {
+        let r = self.fwd_dfa.is_match_tri(text, start, n, self.fwd_nfa.anchored_start)
+        if r >= 0 {
+          return r == 1
+        }
+      }
+    }
+  }
+  let empty : Array[Int] = Array::new()
+  pikevm_search(
+    self.fwd_nfa,
+    self.pike_cache,
+    text,
+    start,
+    n,
+    self.fwd_nfa.anchored_start,
+    false,
+    empty,
+  )
+}
+
+///| Finds the leftmost-first match in `text`.
+pub fn Regex::find(self : Regex, text : String) -> Option[Match] {
+  self.find_at(text, 0)
+}
+
+///| Finds the leftmost-first match in `text` starting at byte offset `start`.
+pub fn Regex::find_at(self : Regex, text : String, start : Int) -> Option[Match] {
+  match self.find_span_at(text, start) {
+    Some((s, e)) => Option::Some(Match::{ start: s, end: e, text: text.slice(s, e) })
+    None => Option::None
+  }
+}
+
+///| Finds the leftmost-first match span `(start, end)` without allocating a slice.
+pub fn Regex::find_span_at(
+  self : Regex,
+  text : String,
+  start : Int,
+) -> Option[(Int, Int)] {
+  let n = text.length()
+  if start < 0 || start > n {
+    return Option::None
+  }
+  if self.fwd_nfa.anchored_start && start > 0 {
+    return Option::None
+  }
+  if self.use_dfa {
+    match self.fwd_nfa.prefilter {
+      Prefilter::ExactLiteral(bs) => {
+        let idx = find_bytes_at(text, start, bs)
+        if idx >= 0 {
+          return Option::Some((idx, idx + bs.length()))
+        }
+        return Option::None
+      }
+      Prefilter::PrefixBytes(bs) | Prefilter::LeadingLookPrefix(bs) => {
+        let mut pos = start
+        let slots : Array[Int] = Array::new()
+        while pos <= n {
+          let cand = find_bytes_at(text, pos, bs)
+          if cand < 0 {
+            return Option::None
+          }
+          let m_end = self.fwd_dfa.find_end(text, cand, n, true)
+          if m_end >= 0 {
+            return Option::Some((cand, m_end))
+          }
+          if m_end == -2 {
+            if pikevm_search(self.fwd_nfa, self.pike_cache, text, cand, n, true, true, slots) {
+              return Option::Some((slots[0], slots[1]))
+            }
+          }
+          pos = cand + 1
+        }
+        return Option::None
+      }
+      _ => {
+        let m_end = self.fwd_dfa.find_end(text, start, n, self.fwd_nfa.anchored_start)
+        if m_end == -1 {
+          return Option::None
+        }
+        if m_end >= 0 {
+          if self.fwd_nfa.anchored_start {
+            return Option::Some((start, m_end))
+          }
+          let m_start = self.rev_dfa.find_start_rev(text, start, m_end)
+          if m_start >= 0 {
+            return Option::Some((m_start, m_end))
+          }
+          if m_start == -1 {
+            return Option::Some((start, m_end))
+          }
+          // m_start == -2: fall through to PikeVM
+        }
+        // m_end == -2: fall through to PikeVM
+      }
+    }
+  }
+  let slots : Array[Int] = Array::new()
+  if pikevm_search(
+    self.fwd_nfa,
+    self.pike_cache,
+    text,
+    start,
+    n,
+    self.fwd_nfa.anchored_start,
+    true,
+    slots,
+  ) {
+    Option::Some((slots[0], slots[1]))
+  } else {
+    Option::None
+  }
+}
+
+///| Finds all non-overlapping match spans into `starts` and `ends` (P1-1 Rust/Go empty-match rule).
+pub fn Regex::find_spans_into(
+  self : Regex,
+  text : String,
+  starts : Array[Int],
+  ends : Array[Int],
+) -> Unit {
+  starts.clear()
+  ends.clear()
+  let n = text.length()
+  let mut pos = 0
+  let mut last_match_end = -1
+  while pos <= n {
+    match self.find_span_at(text, pos) {
+      None => break
+      Some((s, e)) => {
+        if s == e && s == last_match_end {
+          if pos >= n {
+            break
+          }
+          pos = pos + utf8_char_len_at(text, pos)
+          continue
+        }
+        starts.push(s)
+        ends.push(e)
+        last_match_end = e
+        if s == e {
+          if e >= n {
+            break
+          }
+          pos = e + utf8_char_len_at(text, e)
+        } else {
+          pos = e
+        }
+      }
+    }
+  }
+}
+
+///| Finds all successive non-overlapping matches in `text`.
+pub fn Regex::find_iter(self : Regex, text : String) -> Array[Match] {
+  let starts : Array[Int] = Array::new()
+  let ends : Array[Int] = Array::new()
+  self.find_spans_into(text, starts, ends)
+  let out : Array[Match] = Array::new()
+  let mut i = 0
+  let n = starts.length()
+  while i < n {
+    let s = starts[i]
+    let e = ends[i]
+    out.push(Match::{ start: s, end: e, text: text.slice(s, e) })
+    i = i + 1
+  }
+  out
+}
+
+///| Writes capture slots into `slots` (length `2 * captures_len()`), returning true if matched.
+pub fn Regex::captures_slots_at(
+  self : Regex,
+  text : String,
+  start : Int,
+  slots : Array[Int],
+) -> Bool {
+  let n = text.length()
+  if start < 0 || start > n {
+    return false
+  }
+  if self.fwd_nfa.anchored_start && start > 0 {
+    return false
+  }
+  if self.use_dfa {
+    // Fast two-stage: Lazy DFA locates (s, e), then OnePass or anchored PikeVM extracts captures ONLY on [s, e]!
+    match self.find_span_at(text, start) {
+      None => return false
+      Some((s, e)) => {
+        if self.fwd_nfa.num_captures == 1 {
+          slots.clear()
+          slots.push(s)
+          slots.push(e)
+          return true
+        }
+        match self.onepass {
+          Some(op) =>
+          if op.captures(text, s, e, slots) {
+            return true
+          }
+          None => ()
+        }
+        return pikevm_search(self.fwd_nfa, self.pike_cache, text, s, e, true, true, slots)
+      }
+    }
+  }
+  pikevm_search(
+    self.fwd_nfa,
+    self.pike_cache,
+    text,
+    start,
+    n,
+    self.fwd_nfa.anchored_start,
+    true,
+    slots,
+  )
+}
+
+///| Returns capture groups for the leftmost-first match in `text`.
+pub fn Regex::captures(self : Regex, text : String) -> Option[Captures] {
+  self.captures_at(text, 0)
+}
+
+///| Returns capture groups for the leftmost-first match in `text` starting at `start`.
+pub fn Regex::captures_at(
+  self : Regex,
+  text : String,
+  start : Int,
+) -> Option[Captures] {
+  let slots : Array[Int] = Array::new()
+  if self.captures_slots_at(text, start, slots) {
+    Option::Some(Captures::{
+      haystack: text,
+      slots,
+      names: self.fwd_nfa.capture_names,
+    })
+  } else {
+    Option::None
+  }
+}
+
+///| Returns capture groups for all successive non-overlapping matches in `text` (P1-1).
+pub fn Regex::captures_iter(self : Regex, text : String) -> Array[Captures] {
+  let out : Array[Captures] = Array::new()
+  let n = text.length()
+  let mut pos = 0
+  let mut last_match_end = -1
+  while pos <= n {
+    match self.captures_at(text, pos) {
+      None => break
+      Some(caps) => {
+        let s = caps.slots[0]
+        let e = caps.slots[1]
+        if s == e && s == last_match_end {
+          if pos >= n {
+            break
+          }
+          pos = pos + utf8_char_len_at(text, pos)
+          continue
+        }
+        out.push(caps)
+        last_match_end = e
+        if s == e {
+          if e >= n {
+            break
+          }
+          pos = e + utf8_char_len_at(text, e)
+        } else {
+          pos = e
+        }
+      }
+    }
+  }
+  out
+}
+
+///| Replaces the leftmost-first match with `rep`.
+pub fn Regex::replace(self : Regex, text : String, rep : String) -> String {
+  self.replacen(text, 1, rep)
+}
+
+///| Replaces all non-overlapping matches with `rep`.
+pub fn Regex::replace_all(self : Regex, text : String, rep : String) -> String {
+  self.replacen(text, 0, rep)
+}
+
+///| Replaces at most `limit` matches (`limit == 0` replaces all) (P1-1).
+pub fn Regex::replacen(
+  self : Regex,
+  text : String,
+  limit : Int,
+  rep : String,
+) -> String {
+  let n = text.length()
+  let mut pos = 0
+  let mut count = 0
+  let mut last_end = 0
+  let mut last_match_end = -1
+  let mut any = false
+  let sb = StringBuilder::new()
+  while pos <= n {
+    if limit > 0 && count >= limit {
+      break
+    }
+    match self.captures_at(text, pos) {
+      None => break
+      Some(caps) => {
+        let s = caps.slots[0]
+        let e = caps.slots[1]
+        if s == e && s == last_match_end {
+          if pos >= n {
+            break
+          }
+          pos = pos + utf8_char_len_at(text, pos)
+          continue
+        }
+        any = true
+        if s > last_end {
+          sb.write_string(text.slice(last_end, s))
+        }
+        caps.expand_into(rep, sb)
+        last_end = e
+        last_match_end = e
+        count = count + 1
+        if s == e {
+          if e >= n {
+            break
+          }
+          pos = e + utf8_char_len_at(text, e)
+        } else {
+          pos = e
+        }
+      }
+    }
+  }
+  if !any {
+    return text
+  }
+  if last_end < n {
+    sb.write_string(text.slice(last_end, n))
+  }
+  sb.to_string()
+}
+
+///| Splits `text` by all matches of this regex.
+pub fn Regex::split(self : Regex, text : String) -> Array[String] {
+  self.splitn(text, 0)
+}
+
+///| Splits `text` into at most `limit` substrings (`limit == 0` means unlimited) (P1-1).
+pub fn Regex::splitn(
+  self : Regex,
+  text : String,
+  limit : Int,
+) -> Array[String] {
+  let out : Array[String] = Array::new()
+  if limit == 1 {
+    out.push(text)
+    return out
+  }
+  let n = text.length()
+  let mut pos = 0
+  let mut last_end = 0
+  let mut last_match_end = -1
+  while pos <= n {
+    if limit > 0 && out.length() + 1 >= limit {
+      break
+    }
+    match self.find_span_at(text, pos) {
+      None => break
+      Some((s, e)) => {
+        if s == e && s == last_match_end {
+          if pos >= n {
+            break
+          }
+          pos = pos + utf8_char_len_at(text, pos)
+          continue
+        }
+        out.push(text.slice(last_end, s))
+        last_end = e
+        last_match_end = e
+        if s == e {
+          if e >= n {
+            break
+          }
+          pos = e + utf8_char_len_at(text, e)
+        } else {
+          pos = e
+        }
+      }
+    }
+  }
+  out.push(text.slice(last_end, n))
+  out
+}
+
+///| Compile a set of regular expressions with default options.
+pub fn compile_set(patterns : Array[String]) -> Result[RegexSet, RegexError] {
+  compile_set_with(patterns, RegexOptions::default())
+}
+
+///| Compile a set of regular expressions with custom options.
+///| Splits rules into non-`\b` (pure Lazy DFA) and `\b` (Lazy DFA on ASCII + zero-alloc PikeVM fallback) (B4).
+pub fn compile_set_with(
+  patterns : Array[String],
+  opts : RegexOptions,
+) -> Result[RegexSet, RegexError] {
+  let dfa_parsed : Array[ParsedPattern] = Array::new()
+  let dfa_pats : Array[String] = Array::new()
+  let dfa_pids : Array[Int] = Array::new()
+  let wb_parsed : Array[ParsedPattern] = Array::new()
+  let wb_pats : Array[String] = Array::new()
+  let wb_pids : Array[Int] = Array::new()
+
+  let mut i = 0
+  while i < patterns.length() {
+    match parse_pattern(patterns[i], opts) {
+      Ok(p) =>
+      if hir_has_word_boundary(p.hir) {
+        wb_parsed.push(p)
+        wb_pats.push(patterns[i])
+        wb_pids.push(i)
+      } else {
+        dfa_parsed.push(p)
+        dfa_pats.push(patterns[i])
+        dfa_pids.push(i)
+      }
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+
+  let has_dfa_part = dfa_parsed.length() > 0
+  let has_wb_part = wb_parsed.length() > 0
+
+  let dfa_nfa = match compile_set_nfa(dfa_parsed, dfa_pats, opts.size_limit) {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+  let wb_nfa = match compile_set_nfa(wb_parsed, wb_pats, opts.size_limit) {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+
+  let dfa = LazyDfa::new(dfa_nfa, DfaMode::SetAll)
+  let wb_dfa = LazyDfa::new(wb_nfa, DfaMode::SetAll)
+  let wb_pike = PikeVmCache::new()
+  Ok(RegexSet::{
+    patterns,
+    has_dfa_part,
+    dfa_nfa,
+    dfa,
+    dfa_pids,
+    has_wb_part,
+    wb_nfa,
+    wb_dfa,
+    wb_pike,
+    wb_pids,
+    merge_buf_a: Array::new(),
+    merge_buf_b: Array::new(),
+  })
+}
+
+///| Returns the number of patterns in the set.
+pub fn RegexSet::len(self : RegexSet) -> Int {
+  self.patterns.length()
+}
+
+///| Returns true if the set contains no patterns.
+pub fn RegexSet::is_empty(self : RegexSet) -> Bool {
+  self.patterns.length() == 0
+}
+
+///| Returns the original pattern strings.
+pub fn RegexSet::patterns(self : RegexSet) -> Array[String] {
+  self.patterns
+}
+
+///| Returns true if any pattern in the set matches anywhere in `text`.
+pub fn RegexSet::is_match(self : RegexSet, text : String) -> Bool {
+  self.is_match_at(text, 0)
+}
+
+///| Returns true if any pattern in the set matches anywhere in `text` starting at `start`.
+pub fn RegexSet::is_match_at(
+  self : RegexSet,
+  text : String,
+  start : Int,
+) -> Bool {
+  let n = text.length()
+  if self.patterns.length() == 0 || start < 0 || start > n {
+    return false
+  }
+  if self.has_dfa_part {
+    if self.dfa.is_match_tri(text, start, n, false) == 1 {
+      return true
+    }
+  }
+  if self.has_wb_part {
+    let r = self.wb_dfa.is_match_tri(text, start, n, false)
+    if r == 1 {
+      return true
+    }
+    if r == -2 {
+      pikevm_set_matches(
+        self.wb_nfa,
+        self.wb_pike,
+        text,
+        start,
+        self.wb_pids.length(),
+        self.merge_buf_b,
+      )
+      return self.merge_buf_b.length() > 0
+    }
+  }
+  false
+}
+
+///| Returns sorted indices of all patterns matching `text`.
+pub fn RegexSet::matches(self : RegexSet, text : String) -> Array[Int] {
+  self.matches_at(text, 0)
+}
+
+///| Returns sorted indices of all patterns matching `text` starting at `start`.
+pub fn RegexSet::matches_at(
+  self : RegexSet,
+  text : String,
+  start : Int,
+) -> Array[Int] {
+  let out : Array[Int] = Array::new()
+  self.matches_into_at(text, start, out)
+  out
+}
+
+///| Writes sorted matching pattern indices into `into` (clearing it first).
+pub fn RegexSet::matches_into(
+  self : RegexSet,
+  text : String,
+  into : Array[Int],
+) -> Unit {
+  self.matches_into_at(text, 0, into)
+}
+
+fn RegexSet::matches_into_at(
+  self : RegexSet,
+  text : String,
+  start : Int,
+  into : Array[Int],
+) -> Unit {
+  into.clear()
+  let n = text.length()
+  if self.patterns.length() == 0 || start < 0 || start > n {
+    return
+  }
+  // Fast path: no word-boundary rules at all (zero overhead)
+  if !self.has_wb_part {
+    let _ = self.dfa.set_matches_into(text, start, self.dfa_pids.length(), into)
+    return
+  }
+  // Fast path: only word-boundary rules
+  if !self.has_dfa_part {
+    if !self.wb_dfa.set_matches_into(text, start, self.wb_pids.length(), into) {
+      pikevm_set_matches(self.wb_nfa, self.wb_pike, text, start, self.wb_pids.length(), into)
+    }
+    return
+  }
+  // Hybrid path: run non-WB rules in DFA, WB rules in WB-DFA (with PikeVM fallback on non-ASCII), merge sorted!
+  let buf_a = self.merge_buf_a
+  let buf_b = self.merge_buf_b
+  let _ = self.dfa.set_matches_into(text, start, self.dfa_pids.length(), buf_a)
+  if !self.wb_dfa.set_matches_into(text, start, self.wb_pids.length(), buf_b) {
+    pikevm_set_matches(self.wb_nfa, self.wb_pike, text, start, self.wb_pids.length(), buf_b)
+  }
+  let na = buf_a.length()
+  let nb = buf_b.length()
+  let mut ia = 0
+  let mut ib = 0
+  while ia < na && ib < nb {
+    let pa = self.dfa_pids[buf_a[ia]]
+    let pb = self.wb_pids[buf_b[ib]]
+    if pa < pb {
+      into.push(pa)
+      ia = ia + 1
+    } else {
+      into.push(pb)
+      ib = ib + 1
+    }
+  }
+  while ia < na {
+    into.push(self.dfa_pids[buf_a[ia]])
+    ia = ia + 1
+  }
+  while ib < nb {
+    into.push(self.wb_pids[buf_b[ib]])
+    ib = ib + 1
+  }
+}

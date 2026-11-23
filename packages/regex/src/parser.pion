@@ -1,0 +1,1312 @@
+///| Recursive-descent regex parser producing HIR (High-Level Intermediate Representation).
+///| Supports Rust `regex` / RE2 syntax:
+///| - literals, escapes (\n,\r,\t,\f,\v,\a,\xHH,\uHHHH,\u{...},\UHHHHHHHH)
+///| - character classes [...], [^...], POSIX [[:...:]], \p{...}/\P{...}, \d/\D/\w/\W/\s/\S
+///| - quantifiers *, +, ?, {m}, {m,}, {m,n} with greedy/lazy ? and (?U)
+///| - groups (...), (?:...), (?P<name>...), (?<name>...), inline/scoped flags (?imsUux-imsUux)
+///| - anchors ^, $, \A, \z, \b, \B
+///| - rejects backreferences & lookarounds with `UnsupportedFeature` (O(N) guarantee)
+///| - enforces `nest_limit` (`NestLimitExceeded`).
+
+///| Zero-width lookaround assertion kind.
+pub enum LookKind {
+  StartText
+  EndText
+  StartLine
+  EndLine
+  WordBoundaryAscii
+  NotWordBoundaryAscii
+  WordBoundaryUnicode
+  NotWordBoundaryUnicode
+}
+
+///| High-level intermediate representation of a parsed regex.
+pub enum Hir {
+  Empty
+  Literal(Array[Int]) // raw UTF-8 bytes
+  Class(Array[CharRange], Bool) // (normalized ranges, unicode_mode)
+  Look(LookKind)
+  Capture(Int, Hir) // (group_index >= 1, inner)
+  Concat(Array[Hir])
+  Alt(Array[Hir])
+  Repeat(Hir, Int, Int, Bool) // (inner, min, max (-1 = unbounded), greedy)
+}
+
+///| Result of parsing a pattern into HIR.
+pub struct ParsedPattern {
+  pub hir : Hir
+  pub num_captures : Int // includes group 0
+  pub capture_names : Array[String] // index -> name ("" if unnamed)
+}
+
+struct ParserFlags {
+  mut case_insensitive : Bool
+  mut multi_line : Bool
+  mut dot_matches_new_line : Bool
+  mut swap_greed : Bool
+  mut ignore_whitespace : Bool
+  mut unicode : Bool
+}
+
+struct Parser {
+  pat : String
+  len : Int
+  mut pos : Int
+  flags : ParserFlags
+  nest_limit : Int
+  mut depth : Int
+  mut next_capture : Int
+  capture_names : Array[String]
+}
+
+fn Parser::new(pat : String, opts : RegexOptions) -> Parser {
+  let names : Array[String] = [""]
+  Parser::{
+    pat,
+    len: pat.length(),
+    pos: 0,
+    flags: ParserFlags::{
+      case_insensitive: opts.case_insensitive,
+      multi_line: opts.multi_line,
+      dot_matches_new_line: opts.dot_matches_new_line,
+      swap_greed: opts.swap_greed,
+      ignore_whitespace: opts.ignore_whitespace,
+      unicode: opts.unicode,
+    },
+    nest_limit: opts.nest_limit,
+    depth: 0,
+    next_capture: 1,
+    capture_names: names,
+  }
+}
+
+fn Parser::err(self : Parser, kind : RegexErrorKind, msg : String) -> RegexError {
+  RegexError::{ kind, pattern: self.pat, offset: self.pos, message: msg }
+}
+
+fn Parser::skip_ws_and_comments(self : Parser) -> Unit {
+  if !self.flags.ignore_whitespace {
+    return
+  }
+  while self.pos < self.len {
+    let b = self.pat.code_unit_at(self.pos)
+    if b == 32 || b == 9 || b == 10 || b == 13 || b == 12 || b == 11 {
+      self.pos = self.pos + 1
+    } else if b == 35 {
+      // '#' comment until newline
+      self.pos = self.pos + 1
+      while self.pos < self.len && self.pat.code_unit_at(self.pos) != 10 {
+        self.pos = self.pos + 1
+      }
+    } else {
+      break
+    }
+  }
+}
+
+fn Parser::save_flags(self : Parser) -> (Bool, Bool, Bool, Bool, Bool, Bool) {
+  (
+    self.flags.case_insensitive,
+    self.flags.multi_line,
+    self.flags.dot_matches_new_line,
+    self.flags.swap_greed,
+    self.flags.ignore_whitespace,
+    self.flags.unicode,
+  )
+}
+
+fn Parser::restore_flags(
+  self : Parser,
+  saved : (Bool, Bool, Bool, Bool, Bool, Bool),
+) -> Unit {
+  let (ci, ml, dn, sg, iw, u) = saved
+  self.flags.case_insensitive = ci
+  self.flags.multi_line = ml
+  self.flags.dot_matches_new_line = dn
+  self.flags.swap_greed = sg
+  self.flags.ignore_whitespace = iw
+  self.flags.unicode = u
+}
+
+///| Validate that an HIR cannot match invalid UTF-8 bytes (P1-8, aligns with Rust `regex::Regex`).
+fn validate_utf8_hir(hir : Hir, pat : String) -> Result[Unit, RegexError] {
+  match hir {
+    Hir::Empty | Hir::Look(_) => Ok(())
+    Hir::Literal(bs) =>
+    if is_valid_utf8_bytes(bs) {
+      Ok(())
+    } else {
+      Err(RegexError::{
+        kind: RegexErrorKind::Syntax,
+        pattern: pat,
+        offset: 0,
+        message: "pattern can match invalid UTF-8",
+      })
+    }
+    Hir::Class(ranges, unicode) => {
+      if !unicode {
+        let mut i = 0
+        while i < ranges.length() {
+          if ranges[i].hi >= 128 {
+            return Err(RegexError::{
+              kind: RegexErrorKind::Syntax,
+              pattern: pat,
+              offset: 0,
+              message: "byte class under (?-u) can match invalid UTF-8",
+            })
+          }
+          i = i + 1
+        }
+      }
+      Ok(())
+    }
+    Hir::Capture(_, inner) => validate_utf8_hir(inner, pat)
+    Hir::Repeat(inner, _, _, _) => validate_utf8_hir(inner, pat)
+    Hir::Concat(items) => {
+      let mut i = 0
+      while i < items.length() {
+        match validate_utf8_hir(items[i], pat) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Hir::Alt(branches) => {
+      let mut i = 0
+      while i < branches.length() {
+        match validate_utf8_hir(branches[i], pat) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+  }
+}
+
+///| Parse a regex pattern into `ParsedPattern`.
+pub fn parse_pattern(
+  pat : String,
+  opts : RegexOptions,
+) -> Result[ParsedPattern, RegexError] {
+  let p = Parser::new(pat, opts)
+  let hir = match p.parse_alt() {
+    Ok(h) => h
+    Err(e) => return Err(e)
+  }
+  p.skip_ws_and_comments()
+  if p.pos < p.len {
+    return Err(p.err(RegexErrorKind::Syntax, "unmatched closing parenthesis ')'"))
+  }
+  match validate_utf8_hir(hir, pat) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  Ok(ParsedPattern::{
+    hir,
+    num_captures: p.next_capture,
+    capture_names: p.capture_names,
+  })
+}
+
+fn Parser::parse_alt(self : Parser) -> Result[Hir, RegexError] {
+  let branches : Array[Hir] = Array::new()
+  let first = match self.parse_concat() {
+    Ok(h) => h
+    Err(e) => return Err(e)
+  }
+  branches.push(first)
+  while self.pos < self.len {
+    self.skip_ws_and_comments()
+    if self.pos < self.len && self.pat.code_unit_at(self.pos) == 124 {
+      // '|'
+      self.pos = self.pos + 1
+      let next_branch = match self.parse_concat() {
+        Ok(h) => h
+        Err(e) => return Err(e)
+      }
+      branches.push(next_branch)
+    } else {
+      break
+    }
+  }
+  if branches.length() == 1 {
+    Ok(branches[0])
+  } else {
+    Ok(Hir::Alt(branches))
+  }
+}
+
+fn Parser::parse_concat(self : Parser) -> Result[Hir, RegexError] {
+  let items : Array[Hir] = Array::new()
+  while self.pos < self.len {
+    self.skip_ws_and_comments()
+    if self.pos >= self.len {
+      break
+    }
+    let b = self.pat.code_unit_at(self.pos)
+    if b == 41 || b == 124 {
+      // ')' or '|'
+      break
+    }
+    let (atom, can_repeat) = match self.parse_atom() {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    let item = match self.parse_quantifiers(atom, can_repeat) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    match item {
+      Hir::Empty => ()
+      _ => items.push(item)
+    }
+  }
+  if items.length() == 0 {
+    Ok(Hir::Empty)
+  } else if items.length() == 1 {
+    Ok(items[0])
+  } else {
+    // Coalesce adjacent Literal nodes for faster compilation & prefix extraction
+    let merged : Array[Hir] = Array::new()
+    let mut i = 0
+    while i < items.length() {
+      match items[i] {
+        Hir::Literal(bs) =>
+        if merged.length() > 0 {
+          match merged[merged.length() - 1] {
+            Hir::Literal(prev) => {
+              let mut k = 0
+              while k < bs.length() {
+                prev.push(bs[k])
+                k = k + 1
+              }
+            }
+            _ => merged.push(Hir::Literal(bs))
+          }
+        } else {
+          merged.push(Hir::Literal(bs))
+        }
+        other => merged.push(other)
+      }
+      i = i + 1
+    }
+    if merged.length() == 1 {
+      Ok(merged[0])
+    } else {
+      Ok(Hir::Concat(merged))
+    }
+  }
+}
+
+fn Parser::parse_quantifiers(
+  self : Parser,
+  initial : Hir,
+  can_repeat : Bool,
+) -> Result[Hir, RegexError] {
+  let mut cur = initial
+  let mut repeatable = can_repeat
+  while self.pos < self.len {
+    self.skip_ws_and_comments()
+    if self.pos >= self.len {
+      break
+    }
+    let b = self.pat.code_unit_at(self.pos)
+    if b == 42 || b == 43 || b == 63 || b == 123 {
+      // '*', '+', '?', '{'
+      if !repeatable {
+        return Err(
+          self.err(RegexErrorKind::Syntax, "repetition operator missing expression"),
+        )
+      }
+      repeatable = true
+      let mut min = 0
+      let mut max = -1
+      if b == 42 {
+        // '*'
+        self.pos = self.pos + 1
+        min = 0
+        max = -1
+      } else if b == 43 {
+        // '+'
+        self.pos = self.pos + 1
+        min = 1
+        max = -1
+      } else if b == 63 {
+        // '?'
+        self.pos = self.pos + 1
+        min = 0
+        max = 1
+      } else {
+        // '{m}' or '{m,}' or '{m,n}'
+        let (rmin, rmax) = match self.parse_counted_repeat() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        min = rmin
+        max = rmax
+      }
+      let mut greedy = !self.flags.swap_greed
+      self.skip_ws_and_comments()
+      if self.pos < self.len && self.pat.code_unit_at(self.pos) == 63 {
+        // Lazy modifier '?'
+        self.pos = self.pos + 1
+        greedy = !greedy
+      }
+      if min == 0 && max == 0 {
+        cur = Hir::Empty
+      } else if min == 1 && max == 1 {
+        ()
+      } else {
+        cur = Hir::Repeat(cur, min, max, greedy)
+      }
+    } else {
+      break
+    }
+  }
+  Ok(cur)
+}
+
+fn Parser::parse_counted_repeat(self : Parser) -> Result[(Int, Int), RegexError] {
+  // Consume '{'
+  self.pos = self.pos + 1
+  let start_digits = self.pos
+  let mut min = 0
+  while self.pos < self.len {
+    let b = self.pat.code_unit_at(self.pos)
+    if b >= 48 && b <= 57 {
+      min = min * 10 + (b - 48)
+      if min > 1000000 {
+        return Err(self.err(RegexErrorKind::CompiledTooBig, "repetition count too large"))
+      }
+      self.pos = self.pos + 1
+    } else {
+      break
+    }
+  }
+  if self.pos == start_digits {
+    return Err(self.err(RegexErrorKind::Syntax, "expected integer in counted repetition"))
+  }
+  if self.pos >= self.len {
+    return Err(self.err(RegexErrorKind::Syntax, "unclosed counted repetition '{'"))
+  }
+  let sep = self.pat.code_unit_at(self.pos)
+  if sep == 125 {
+    // '}'
+    self.pos = self.pos + 1
+    return Ok((min, min))
+  }
+  if sep != 44 {
+    // ','
+    return Err(self.err(RegexErrorKind::Syntax, "expected ',' or '}' in repetition"))
+  }
+  self.pos = self.pos + 1
+  if self.pos < self.len && self.pat.code_unit_at(self.pos) == 125 {
+    self.pos = self.pos + 1
+    return Ok((min, -1))
+  }
+  let max_start = self.pos
+  let mut max = 0
+  while self.pos < self.len {
+    let b = self.pat.code_unit_at(self.pos)
+    if b >= 48 && b <= 57 {
+      max = max * 10 + (b - 48)
+      if max > 1000000 {
+        return Err(self.err(RegexErrorKind::CompiledTooBig, "repetition count too large"))
+      }
+      self.pos = self.pos + 1
+    } else {
+      break
+    }
+  }
+  if self.pos == max_start || self.pos >= self.len || self.pat.code_unit_at(self.pos) != 125 {
+    return Err(self.err(RegexErrorKind::Syntax, "invalid counted repetition"))
+  }
+  self.pos = self.pos + 1
+  if max < min {
+    return Err(self.err(RegexErrorKind::Syntax, "repetition range max < min"))
+  }
+  Ok((min, max))
+}
+
+fn Parser::parse_atom(self : Parser) -> Result[(Hir, Bool), RegexError] {
+  let b = self.pat.code_unit_at(self.pos)
+  if b == 42 || b == 43 || b == 63 {
+    return Err(self.err(RegexErrorKind::Syntax, "repetition quantifier has nothing to repeat"))
+  }
+  if b == 40 {
+    // '('
+    return self.parse_group()
+  }
+  if b == 91 {
+    // '['
+    match self.parse_char_class() {
+      Ok(h) => return Ok((h, true))
+      Err(e) => return Err(e)
+    }
+  }
+  if b == 46 {
+    // '.'
+    self.pos = self.pos + 1
+    let u = self.flags.unicode
+    if self.flags.dot_matches_new_line {
+      let max_cp = if u { 0x10FFFF } else { 0xFF }
+      let ranges : Array[CharRange] = Array::new()
+      if u {
+        ranges.push(CharRange::{ lo: 0, hi: 0xD7FF })
+        ranges.push(CharRange::{ lo: 0xE000, hi: 0x10FFFF })
+      } else {
+        ranges.push(CharRange::{ lo: 0, hi: max_cp })
+      }
+      return Ok((Hir::Class(ranges, u), true))
+    } else {
+      let ranges : Array[CharRange] = Array::new()
+      ranges.push(CharRange::{ lo: 0, hi: 9 })
+      if u {
+        ranges.push(CharRange::{ lo: 11, hi: 0xD7FF })
+        ranges.push(CharRange::{ lo: 0xE000, hi: 0x10FFFF })
+      } else {
+        ranges.push(CharRange::{ lo: 11, hi: 0xFF })
+      }
+      return Ok((Hir::Class(ranges, u), true))
+    }
+  }
+  if b == 94 {
+    // '^'
+    self.pos = self.pos + 1
+    return Ok((
+      Hir::Look(
+        if self.flags.multi_line {
+          LookKind::StartLine
+        } else {
+          LookKind::StartText
+        },
+      ),
+      true,
+    ))
+  }
+  if b == 36 {
+    // '$'
+    self.pos = self.pos + 1
+    return Ok((
+      Hir::Look(
+        if self.flags.multi_line {
+          LookKind::EndLine
+        } else {
+          LookKind::EndText
+        },
+      ),
+      true,
+    ))
+  }
+  if b == 92 {
+    // '\'
+    match self.parse_escape_atom() {
+      Ok(h) => return Ok((h, true))
+      Err(e) => return Err(e)
+    }
+  }
+  // Ordinary literal codepoint
+  let (cp, next_pos) = decode_utf8(self.pat, self.pos)
+  self.pos = next_pos
+  Ok((self.make_literal_cp(cp), true))
+}
+
+fn Parser::make_literal_cp(self : Parser, cp : Int) -> Hir {
+  if self.flags.case_insensitive {
+    let folded = case_fold_ranges([CharRange::{ lo: cp, hi: cp }], self.flags.unicode)
+    if folded.length() == 1 && folded[0].lo == folded[0].hi {
+      return Hir::Literal(encode_utf8(folded[0].lo))
+    }
+    return Hir::Class(folded, self.flags.unicode)
+  }
+  Hir::Literal(encode_utf8(cp))
+}
+
+fn Parser::parse_group(self : Parser) -> Result[(Hir, Bool), RegexError] {
+  self.depth = self.depth + 1
+  if self.depth > self.nest_limit {
+    return Err(
+      self.err(RegexErrorKind::NestLimitExceeded, "exceeded maximum nesting depth"),
+    )
+  }
+  // Consume '('
+  self.pos = self.pos + 1
+  if self.pos >= self.len {
+    return Err(self.err(RegexErrorKind::Syntax, "unclosed group '('"))
+  }
+  let saved_flags = self.save_flags()
+  if self.pat.code_unit_at(self.pos) == 63 {
+    // '(?...'
+    self.pos = self.pos + 1
+    if self.pos >= self.len {
+      return Err(self.err(RegexErrorKind::Syntax, "unclosed group '(?'"))
+    }
+    let next = self.pat.code_unit_at(self.pos)
+    // Lookaround assertions are explicitly rejected (linear-time guarantee)
+    if next == 61 || next == 33 {
+      // '(?=' or '(?!'
+      return Err(
+        self.err(
+          RegexErrorKind::UnsupportedFeature,
+          "look-around is not supported (linear-time guarantee)",
+        ),
+      )
+    }
+    if next == 60 && self.pos + 1 < self.len {
+      let c2 = self.pat.code_unit_at(self.pos + 1)
+      if c2 == 61 || c2 == 33 {
+        // '(?<=' or '(?<!'
+        return Err(
+          self.err(
+            RegexErrorKind::UnsupportedFeature,
+            "look-behind is not supported (linear-time guarantee)",
+          ),
+        )
+      }
+    }
+    // Non-capturing group (?:...)
+    if next == 58 {
+      self.pos = self.pos + 1
+      let inner = match self.parse_alt() {
+        Ok(h) => h
+        Err(e) => return Err(e)
+      }
+      if self.pos >= self.len || self.pat.code_unit_at(self.pos) != 41 {
+        return Err(self.err(RegexErrorKind::Syntax, "unclosed group '(?:'"))
+      }
+      self.pos = self.pos + 1
+      self.restore_flags(saved_flags)
+      self.depth = self.depth - 1
+      return Ok((inner, true))
+    }
+    // Named capture (?P<name>...) or (?<name>...)
+    if (next == 80 && self.pos + 1 < self.len && self.pat.code_unit_at(self.pos + 1) == 60) ||
+    next == 60 {
+      if next == 80 {
+        self.pos = self.pos + 2
+      } else {
+        self.pos = self.pos + 1
+      }
+      let name_start = self.pos
+      while self.pos < self.len && self.pat.code_unit_at(self.pos) != 62 {
+        let ch = self.pat.code_unit_at(self.pos)
+        if !is_ascii_word_byte(ch) {
+          return Err(self.err(RegexErrorKind::Syntax, "invalid character in capture group name"))
+        }
+        self.pos = self.pos + 1
+      }
+      if self.pos >= self.len || self.pos == name_start {
+        return Err(self.err(RegexErrorKind::Syntax, "empty or unclosed capture group name"))
+      }
+      let name = self.pat.slice(name_start, self.pos)
+      self.pos = self.pos + 1 // consume '>'
+      // Reject duplicate capture names
+      let mut i = 1
+      while i < self.capture_names.length() {
+        if self.capture_names[i] == name {
+          return Err(
+            self.err(RegexErrorKind::Syntax, "duplicate capture group name '" + name + "'"),
+          )
+        }
+        i = i + 1
+      }
+      let idx = self.next_capture
+      self.next_capture = self.next_capture + 1
+      self.capture_names.push(name)
+      let inner = match self.parse_alt() {
+        Ok(h) => h
+        Err(e) => return Err(e)
+      }
+      if self.pos >= self.len || self.pat.code_unit_at(self.pos) != 41 {
+        return Err(self.err(RegexErrorKind::Syntax, "unclosed named capture group"))
+      }
+      self.pos = self.pos + 1
+      self.restore_flags(saved_flags)
+      self.depth = self.depth - 1
+      return Ok((Hir::Capture(idx, inner), true))
+    }
+    // Inline flags (?imsUux-imsUux) or scoped flags (?imsUux-imsUux:...)
+    let mut enabling = true
+    while self.pos < self.len {
+      let fb = self.pat.code_unit_at(self.pos)
+      if fb == 41 {
+        // ')' -> flags apply to remainder of enclosing scope (NOT repeatable!)
+        self.pos = self.pos + 1
+        self.depth = self.depth - 1
+        return Ok((Hir::Empty, false))
+      }
+      if fb == 58 {
+        // ':' -> scoped flags
+        self.pos = self.pos + 1
+        let inner = match self.parse_alt() {
+          Ok(h) => h
+          Err(e) => return Err(e)
+        }
+        if self.pos >= self.len || self.pat.code_unit_at(self.pos) != 41 {
+          return Err(self.err(RegexErrorKind::Syntax, "unclosed scoped flag group"))
+        }
+        self.pos = self.pos + 1
+        self.restore_flags(saved_flags)
+        self.depth = self.depth - 1
+        return Ok((inner, true))
+      }
+      if fb == 45 {
+        // '-'
+        enabling = false
+        self.pos = self.pos + 1
+      } else if fb == 105 {
+        // 'i'
+        self.flags.case_insensitive = enabling
+        self.pos = self.pos + 1
+      } else if fb == 109 {
+        // 'm'
+        self.flags.multi_line = enabling
+        self.pos = self.pos + 1
+      } else if fb == 115 {
+        // 's'
+        self.flags.dot_matches_new_line = enabling
+        self.pos = self.pos + 1
+      } else if fb == 85 {
+        // 'U'
+        self.flags.swap_greed = enabling
+        self.pos = self.pos + 1
+      } else if fb == 120 {
+        // 'x'
+        self.flags.ignore_whitespace = enabling
+        self.pos = self.pos + 1
+      } else if fb == 117 {
+        // 'u'
+        self.flags.unicode = enabling
+        self.pos = self.pos + 1
+      } else {
+        return Err(self.err(RegexErrorKind::Syntax, "unrecognized flag"))
+      }
+    }
+    return Err(self.err(RegexErrorKind::Syntax, "unclosed flag group"))
+  }
+
+  // Capturing group (...)
+  let idx = self.next_capture
+  self.next_capture = self.next_capture + 1
+  self.capture_names.push("")
+  let inner = match self.parse_alt() {
+    Ok(h) => h
+    Err(e) => return Err(e)
+  }
+  if self.pos >= self.len || self.pat.code_unit_at(self.pos) != 41 {
+    return Err(self.err(RegexErrorKind::Syntax, "unclosed group '('"))
+  }
+  self.pos = self.pos + 1
+  self.restore_flags(saved_flags)
+  self.depth = self.depth - 1
+  Ok((Hir::Capture(idx, inner), true))
+}
+
+fn hex_val(b : Int) -> Int {
+  if b >= 48 && b <= 57 {
+    b - 48
+  } else if b >= 65 && b <= 70 {
+    b - 65 + 10
+  } else if b >= 97 && b <= 102 {
+    b - 97 + 10
+  } else {
+    -1
+  }
+}
+
+fn Parser::parse_hex_digits(self : Parser, count : Int) -> Result[Int, RegexError] {
+  if self.pos + count > self.len {
+    return Err(self.err(RegexErrorKind::Syntax, "incomplete hex escape"))
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < count {
+    let d = hex_val(self.pat.code_unit_at(self.pos + i))
+    if d < 0 {
+      return Err(self.err(RegexErrorKind::Syntax, "invalid hex digit"))
+    }
+    acc = (acc << 4) | d
+    i = i + 1
+  }
+  self.pos = self.pos + count
+  Ok(acc)
+}
+
+fn Parser::parse_braced_hex(self : Parser) -> Result[Int, RegexError] {
+  // Consume '{'
+  self.pos = self.pos + 1
+  let start = self.pos
+  let mut acc = 0
+  while self.pos < self.len && self.pat.code_unit_at(self.pos) != 125 {
+    let d = hex_val(self.pat.code_unit_at(self.pos))
+    if d < 0 {
+      return Err(self.err(RegexErrorKind::Syntax, "invalid hex digit in braced escape"))
+    }
+    acc = (acc << 4) | d
+    if acc > 0x10FFFF {
+      return Err(self.err(RegexErrorKind::Syntax, "unicode escape out of range"))
+    }
+    self.pos = self.pos + 1
+  }
+  if self.pos == start || self.pos >= self.len || self.pat.code_unit_at(self.pos) != 125 {
+    return Err(self.err(RegexErrorKind::Syntax, "unclosed braced hex escape"))
+  }
+  self.pos = self.pos + 1
+  Ok(acc)
+}
+
+fn Parser::parse_unicode_prop(self : Parser, negated : Bool) -> Result[Array[CharRange], RegexError] {
+  if self.pos >= self.len {
+    return Err(self.err(RegexErrorKind::Syntax, "incomplete \\p escape"))
+  }
+  let mut name = ""
+  if self.pat.code_unit_at(self.pos) == 123 {
+    // '{'
+    self.pos = self.pos + 1
+    let start = self.pos
+    while self.pos < self.len && self.pat.code_unit_at(self.pos) != 125 {
+      self.pos = self.pos + 1
+    }
+    if self.pos >= self.len || self.pos == start {
+      return Err(self.err(RegexErrorKind::Syntax, "unclosed \\p{...} property"))
+    }
+    name = self.pat.slice(start, self.pos)
+    self.pos = self.pos + 1
+  } else {
+    name = self.pat.slice(self.pos, self.pos + 1)
+    self.pos = self.pos + 1
+  }
+  let base = match lookup_unicode_property(name) {
+    Some(rs) => rs
+    None =>
+    return Err(
+      self.err(RegexErrorKind::Syntax, "unknown Unicode property '" + name + "'"),
+    )
+  }
+  let mut rs = if self.flags.case_insensitive {
+    case_fold_ranges(base, true)
+  } else {
+    base
+  }
+  if negated {
+    rs = negate_ranges(rs, true)
+  }
+  Ok(rs)
+}
+
+fn Parser::parse_escape_atom(self : Parser) -> Result[Hir, RegexError] {
+  // Consume '\'
+  self.pos = self.pos + 1
+  if self.pos >= self.len {
+    return Err(self.err(RegexErrorKind::Syntax, "trailing backslash"))
+  }
+  let b = self.pat.code_unit_at(self.pos)
+  // Backreferences \1..\9 are unsupported (O(N) linear-time guarantee)
+  if b >= 49 && b <= 57 {
+    return Err(
+      self.err(
+        RegexErrorKind::UnsupportedFeature,
+        "backreferences are not supported (linear-time guarantee)",
+      ),
+    )
+  }
+  // Anchors
+  if b == 65 {
+    // \A
+    self.pos = self.pos + 1
+    return Ok(Hir::Look(LookKind::StartText))
+  }
+  if b == 122 {
+    // \z
+    self.pos = self.pos + 1
+    return Ok(Hir::Look(LookKind::EndText))
+  }
+  if b == 98 {
+    // \b
+    self.pos = self.pos + 1
+    return Ok(
+      Hir::Look(
+        if self.flags.unicode {
+          LookKind::WordBoundaryUnicode
+        } else {
+          LookKind::WordBoundaryAscii
+        },
+      ),
+    )
+  }
+  if b == 66 {
+    // \B
+    self.pos = self.pos + 1
+    return Ok(
+      Hir::Look(
+        if self.flags.unicode {
+          LookKind::NotWordBoundaryUnicode
+        } else {
+          LookKind::NotWordBoundaryAscii
+        },
+      ),
+    )
+  }
+  // Character class shorthands
+  let u = self.flags.unicode
+  if b == 100 {
+    // \d
+    self.pos = self.pos + 1
+    return Ok(Hir::Class(digit_ranges(u), u))
+  }
+  if b == 68 {
+    // \D
+    self.pos = self.pos + 1
+    return Ok(Hir::Class(negate_ranges(digit_ranges(u), u), u))
+  }
+  if b == 119 {
+    // \w
+    self.pos = self.pos + 1
+    return Ok(Hir::Class(word_ranges(u), u))
+  }
+  if b == 87 {
+    // \W
+    self.pos = self.pos + 1
+    return Ok(Hir::Class(negate_ranges(word_ranges(u), u), u))
+  }
+  if b == 115 {
+    // \s
+    self.pos = self.pos + 1
+    return Ok(Hir::Class(space_ranges(u), u))
+  }
+  if b == 83 {
+    // \S
+    self.pos = self.pos + 1
+    return Ok(Hir::Class(negate_ranges(space_ranges(u), u), u))
+  }
+  if b == 112 || b == 80 {
+    // \p{...} or \P{...}
+    self.pos = self.pos + 1
+    let rs = match self.parse_unicode_prop(b == 80) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(Hir::Class(rs, true))
+  }
+  // Literal character escape
+  let (cp, is_raw_byte) = match self.parse_escaped_cp() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if is_raw_byte {
+    if self.flags.case_insensitive && ((cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)) {
+      let folded = case_fold_ranges([CharRange::{ lo: cp, hi: cp }], false)
+      return Ok(Hir::Class(folded, false))
+    }
+    return Ok(Hir::Literal([cp]))
+  }
+  Ok(self.make_literal_cp(cp))
+}
+
+fn Parser::parse_escaped_cp(self : Parser) -> Result[(Int, Bool), RegexError] {
+  if self.pos >= self.len {
+    return Err(self.err(RegexErrorKind::Syntax, "trailing backslash"))
+  }
+  let b = self.pat.code_unit_at(self.pos)
+  if b == 110 {
+    self.pos = self.pos + 1
+    return Ok((10, false)) // \n
+  }
+  if b == 114 {
+    self.pos = self.pos + 1
+    return Ok((13, false)) // \r
+  }
+  if b == 116 {
+    self.pos = self.pos + 1
+    return Ok((9, false)) // \t
+  }
+  if b == 102 {
+    self.pos = self.pos + 1
+    return Ok((12, false)) // \f
+  }
+  if b == 118 {
+    self.pos = self.pos + 1
+    return Ok((11, false)) // \v
+  }
+  if b == 97 {
+    self.pos = self.pos + 1
+    return Ok((7, false)) // \a
+  }
+  if b == 120 {
+    // \xHH or \x{...}
+    self.pos = self.pos + 1
+    if self.pos < self.len && self.pat.code_unit_at(self.pos) == 123 {
+      match self.parse_braced_hex() {
+        Ok(v) => return Ok((v, false))
+        Err(e) => return Err(e)
+      }
+    }
+    match self.parse_hex_digits(2) {
+      Ok(v) => return Ok((v, !self.flags.unicode))
+      Err(e) => return Err(e)
+    }
+  }
+  if b == 117 {
+    // \uHHHH or \u{...}
+    self.pos = self.pos + 1
+    if self.pos < self.len && self.pat.code_unit_at(self.pos) == 123 {
+      match self.parse_braced_hex() {
+        Ok(v) => return Ok((v, false))
+        Err(e) => return Err(e)
+      }
+    }
+    match self.parse_hex_digits(4) {
+      Ok(v) => return Ok((v, false))
+      Err(e) => return Err(e)
+    }
+  }
+  if b == 85 {
+    // \UHHHHHHHH
+    self.pos = self.pos + 1
+    match self.parse_hex_digits(8) {
+      Ok(v) => return Ok((v, false))
+      Err(e) => return Err(e)
+    }
+  }
+  // Reject unrecognized ASCII alphanumeric escapes (e.g. \Q, \E, \Z, \0) per Rust regex-syntax (P2-1)
+  if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) {
+    return Err(self.err(RegexErrorKind::Syntax, "unrecognized escape sequence"))
+  }
+  // Any other escaped char (punctuation, space, etc.)
+  let (cp, next_pos) = decode_utf8(self.pat, self.pos)
+  self.pos = next_pos
+  Ok((cp, false))
+}
+
+fn Parser::is_shorthand_escape_at(self : Parser, idx : Int) -> Bool {
+  if idx + 1 >= self.len || self.pat.code_unit_at(idx) != 92 {
+    return false
+  }
+  let nb = self.pat.code_unit_at(idx + 1)
+  nb == 100 || nb == 68 || nb == 119 || nb == 87 || nb == 115 || nb == 83 || nb == 112 || nb == 80
+}
+
+fn Parser::is_single_dash_range_ahead(self : Parser) -> Bool {
+  let save = self.pos
+  self.skip_ws_and_comments()
+  let ok = if self.pos < self.len && self.pat.code_unit_at(self.pos) == 45 {
+    // Not '--' (set difference) and not '-]' (trailing literal '-')
+    let next_pos = self.pos + 1
+    if next_pos < self.len && self.pat.code_unit_at(next_pos) == 45 {
+      false
+    } else {
+      let save2 = self.pos
+      self.pos = next_pos
+      self.skip_ws_and_comments()
+      let is_end = self.pos >= self.len || self.pat.code_unit_at(self.pos) == 93
+      self.pos = save2
+      !is_end
+    }
+  } else {
+    false
+  }
+  self.pos = save
+  ok
+}
+
+fn apply_class_set_op(
+  op : Int,
+  lhs : Array[CharRange],
+  rhs : Array[CharRange],
+) -> Array[CharRange] {
+  if op == 1 {
+    intersect_ranges(lhs, rhs)
+  } else if op == 2 {
+    difference_ranges(lhs, rhs)
+  } else if op == 3 {
+    sym_diff_ranges(lhs, rhs)
+  } else {
+    rhs
+  }
+}
+
+fn Parser::parse_char_class(self : Parser) -> Result[Hir, RegexError] {
+  let u = self.flags.unicode
+  match self.parse_char_class_ranges() {
+    Ok(rs) => Ok(Hir::Class(rs, u))
+    Err(e) => Err(e)
+  }
+}
+
+fn Parser::parse_char_class_ranges(self : Parser) -> Result[Array[CharRange], RegexError] {
+  self.depth = self.depth + 1
+  if self.depth > self.nest_limit {
+    return Err(
+      self.err(RegexErrorKind::NestLimitExceeded, "exceeded maximum nesting depth"),
+    )
+  }
+  // Consume '['
+  self.pos = self.pos + 1
+  self.skip_ws_and_comments()
+  if self.pos >= self.len {
+    self.depth = self.depth - 1
+    return Err(self.err(RegexErrorKind::Syntax, "unclosed character class '['"))
+  }
+  let mut negated = false
+  if self.pat.code_unit_at(self.pos) == 94 {
+    // '^'
+    negated = true
+    self.pos = self.pos + 1
+    self.skip_ws_and_comments()
+  }
+  let mut lhs_ranges : Array[CharRange] = Array::new()
+  let mut cur_ranges : Array[CharRange] = Array::new()
+  let mut pending_op = 0 // 0=none, 1=&&, 2=--, 3=~~
+  let mut has_cur = false
+  let mut first = true
+  let u = self.flags.unicode
+  while self.pos < self.len {
+    self.skip_ws_and_comments()
+    if self.pos >= self.len {
+      break
+    }
+    let b = self.pat.code_unit_at(self.pos)
+    if b == 93 && !first {
+      // ']' closes class
+      self.pos = self.pos + 1
+      if pending_op != 0 && !has_cur {
+        self.depth = self.depth - 1
+        return Err(
+          self.err(RegexErrorKind::Syntax, "missing right-hand side of class set operation"),
+        )
+      }
+      let cur_norm = normalize_ranges(cur_ranges)
+      let mut res = if pending_op != 0 {
+        apply_class_set_op(pending_op, lhs_ranges, cur_norm)
+      } else {
+        cur_norm
+      }
+      if negated {
+        res = negate_ranges(res, u)
+      }
+      self.depth = self.depth - 1
+      return Ok(res)
+    }
+    // Check set operators &&, --, ~~ (only when not at very first char after [ or [^, or handle empty LHS)
+    if self.pos + 1 < self.len &&
+    ((b == 38 && self.pat.code_unit_at(self.pos + 1) == 38) ||
+      (b == 45 && self.pat.code_unit_at(self.pos + 1) == 45) ||
+      (b == 126 && self.pat.code_unit_at(self.pos + 1) == 126)) {
+      if !has_cur {
+        self.depth = self.depth - 1
+        return Err(
+          self.err(RegexErrorKind::Syntax, "missing left-hand side of class set operation"),
+        )
+      }
+      let op = if b == 38 { 1 } else if b == 45 { 2 } else { 3 }
+      let cur_norm = normalize_ranges(cur_ranges)
+      lhs_ranges = if pending_op != 0 {
+        apply_class_set_op(pending_op, lhs_ranges, cur_norm)
+      } else {
+        cur_norm
+      }
+      cur_ranges = Array::new()
+      pending_op = op
+      has_cur = false
+      first = false
+      self.pos = self.pos + 2
+      continue
+    }
+    first = false
+    // Check POSIX class [:name:] / [:^name:] OR nested class [...]
+    if b == 91 {
+      if self.pos + 1 < self.len && self.pat.code_unit_at(self.pos + 1) == 58 {
+        let save = self.pos
+        self.pos = self.pos + 2
+        let mut pneg = false
+        if self.pos < self.len && self.pat.code_unit_at(self.pos) == 94 {
+          pneg = true
+          self.pos = self.pos + 1
+        }
+        let name_start = self.pos
+        while self.pos < self.len && self.pat.code_unit_at(self.pos) != 58 {
+          self.pos = self.pos + 1
+        }
+        if self.pos + 1 < self.len &&
+        self.pat.code_unit_at(self.pos) == 58 &&
+        self.pat.code_unit_at(self.pos + 1) == 93 {
+          let pname = self.pat.slice(name_start, self.pos)
+          self.pos = self.pos + 2
+          match lookup_posix_class(pname) {
+            Some(prs) => {
+              let mut add = if self.flags.case_insensitive {
+                case_fold_ranges(prs, u)
+              } else {
+                prs
+              }
+              if pneg {
+                add = negate_ranges(add, u)
+              }
+              let mut k = 0
+              while k < add.length() {
+                cur_ranges.push(add[k])
+                k = k + 1
+              }
+              has_cur = true
+              if self.is_single_dash_range_ahead() {
+                self.depth = self.depth - 1
+                return Err(
+                  self.err(RegexErrorKind::Syntax, "POSIX class cannot be a range endpoint"),
+                )
+              }
+              continue
+            }
+            None => {
+              self.depth = self.depth - 1
+              return Err(
+                self.err(RegexErrorKind::Syntax, "unknown POSIX class '" + pname + "'"),
+              )
+            }
+          }
+        } else {
+          // Not a valid POSIX class, backtrack and parse as nested character class
+          self.pos = save
+        }
+      }
+      // Nested character class [...] (P1-4 & P1-5)
+      let nested = match self.parse_char_class_ranges() {
+        Ok(rs) => rs
+        Err(e) => {
+          self.depth = self.depth - 1
+          return Err(e)
+        }
+      }
+      let mut k = 0
+      while k < nested.length() {
+        cur_ranges.push(nested[k])
+        k = k + 1
+      }
+      has_cur = true
+      if self.is_single_dash_range_ahead() {
+        self.depth = self.depth - 1
+        return Err(
+          self.err(RegexErrorKind::Syntax, "nested class cannot be a range endpoint"),
+        )
+      }
+      continue
+    }
+    // Check shorthand class inside [...]
+    if self.is_shorthand_escape_at(self.pos) {
+      let nb = self.pat.code_unit_at(self.pos + 1)
+      self.pos = self.pos + 2
+      let sub = if nb == 100 {
+        digit_ranges(u)
+      } else if nb == 68 {
+        negate_ranges(digit_ranges(u), u)
+      } else if nb == 119 {
+        word_ranges(u)
+      } else if nb == 87 {
+        negate_ranges(word_ranges(u), u)
+      } else if nb == 115 {
+        space_ranges(u)
+      } else if nb == 83 {
+        negate_ranges(space_ranges(u), u)
+      } else {
+        match self.parse_unicode_prop(nb == 80) {
+          Ok(v) => v
+          Err(e) => {
+            self.depth = self.depth - 1
+            return Err(e)
+          }
+        }
+      }
+      let mut k = 0
+      while k < sub.length() {
+        cur_ranges.push(sub[k])
+        k = k + 1
+      }
+      has_cur = true
+      // Reject [\w-a] etc. (P2-1)
+      if self.is_single_dash_range_ahead() {
+        self.depth = self.depth - 1
+        return Err(
+          self.err(RegexErrorKind::Syntax, "character class shorthand cannot be a range endpoint"),
+        )
+      }
+      continue
+    }
+    // Single char or range lo-hi
+    let lo_cp = match self.parse_class_char() {
+      Ok(v) => v
+      Err(e) => {
+        self.depth = self.depth - 1
+        return Err(e)
+      }
+    }
+    has_cur = true
+    // Check if followed by single '-' (not '--' and not '-]')
+    if self.is_single_dash_range_ahead() {
+      self.skip_ws_and_comments()
+      self.pos = self.pos + 1 // consume '-'
+      self.skip_ws_and_comments()
+      if self.is_shorthand_escape_at(self.pos) ||
+      (self.pos < self.len && self.pat.code_unit_at(self.pos) == 91) {
+        self.depth = self.depth - 1
+        return Err(
+          self.err(RegexErrorKind::Syntax, "character class cannot be a range endpoint"),
+        )
+      }
+      let hi_cp = match self.parse_class_char() {
+        Ok(v) => v
+        Err(e) => {
+          self.depth = self.depth - 1
+          return Err(e)
+        }
+      }
+      if hi_cp < lo_cp {
+        self.depth = self.depth - 1
+        return Err(self.err(RegexErrorKind::Syntax, "invalid character class range"))
+      }
+      let item = CharRange::{ lo: lo_cp, hi: hi_cp }
+      if self.flags.case_insensitive {
+        let folded = case_fold_ranges([item], u)
+        let mut k = 0
+        while k < folded.length() {
+          cur_ranges.push(folded[k])
+          k = k + 1
+        }
+      } else {
+        cur_ranges.push(item)
+      }
+    } else {
+      let item = CharRange::{ lo: lo_cp, hi: lo_cp }
+      if self.flags.case_insensitive {
+        let folded = case_fold_ranges([item], u)
+        let mut k = 0
+        while k < folded.length() {
+          cur_ranges.push(folded[k])
+          k = k + 1
+        }
+      } else {
+        cur_ranges.push(item)
+      }
+    }
+  }
+  self.depth = self.depth - 1
+  Err(self.err(RegexErrorKind::Syntax, "unclosed character class '['"))
+}
+
+fn Parser::parse_class_char(self : Parser) -> Result[Int, RegexError] {
+  if self.pos >= self.len {
+    return Err(self.err(RegexErrorKind::Syntax, "unclosed character class"))
+  }
+  if self.pat.code_unit_at(self.pos) == 92 {
+    self.pos = self.pos + 1
+    match self.parse_escaped_cp() {
+      Ok((cp, _)) => return Ok(cp)
+      Err(e) => return Err(e)
+    }
+  }
+  let (cp, next_pos) = decode_utf8(self.pat, self.pos)
+  self.pos = next_pos
+  Ok(cp)
+}

@@ -1,0 +1,525 @@
+///| Exact O(N * M) Thompson / Russ Cox PikeVM simulator using flat parallel arrays
+///| and a reusable zero-allocation `PikeVmCache` (B3).
+///| - Guaranteed linear time in haystack length (zero exponential backtracking).
+///| - Zero per-call O(num_states) allocation/zeroing via monotonic generation stamp.
+///| - Supports full capture group extraction with exact Perl leftmost-first,
+///|   greedy, and lazy semantics.
+///| - Supports all lookaround assertions (^, $, \A, \z, (?m)^/$, ASCII & Unicode \b/\B)
+///|   with strict UTF-8 char-boundary enforcement (P0-2).
+
+///| Reusable scratch buffers for PikeVM searches (attached to `Regex` / `RegexSet`).
+pub struct PikeVmCache {
+  visited : Array[Int]
+  mut gen : Int
+  empty_slots : Array[Int]
+  scratch_slots : Array[Int]
+  stack_st : Array[Int]
+  stack_undo_slot : Array[Int]
+  stack_undo_val : Array[Int]
+  mut cur_st : Array[Int]
+  mut cur_sl : Array[Int]
+  mut nxt_st : Array[Int]
+  mut nxt_sl : Array[Int]
+  hit_gen : Array[Int]
+  mut set_gen : Int
+}
+
+///| Create an empty `PikeVmCache` (sized lazily on first search).
+pub fn PikeVmCache::new() -> PikeVmCache {
+  PikeVmCache::{
+    visited: Array::new(),
+    gen: 0,
+    empty_slots: Array::new(),
+    scratch_slots: Array::new(),
+    stack_st: Array::new(),
+    stack_undo_slot: Array::new(),
+    stack_undo_val: Array::new(),
+    cur_st: Array::new(),
+    cur_sl: Array::new(),
+    nxt_st: Array::new(),
+    nxt_sl: Array::new(),
+    hit_gen: Array::new(),
+    set_gen: 0,
+  }
+}
+
+fn PikeVmCache::prepare(self : PikeVmCache, num_states : Int, nslots : Int) -> Unit {
+  while self.visited.length() < num_states {
+    self.visited.push(0)
+  }
+  if self.gen > 2000000000 {
+    let mut i = 0
+    let n = self.visited.length()
+    while i < n {
+      self.visited[i] = 0
+      i = i + 1
+    }
+    self.gen = 0
+  }
+  while self.empty_slots.length() < nslots {
+    self.empty_slots.push(-1)
+    self.scratch_slots.push(-1)
+  }
+  self.cur_st.clear()
+  self.cur_sl.clear()
+  self.nxt_st.clear()
+  self.nxt_sl.clear()
+}
+
+///| Evaluate a zero-width lookaround assertion at byte position `pos` in `text`.
+pub fn eval_look(kind : LookKind, text : String, pos : Int) -> Bool {
+  let n = text.length()
+  match kind {
+    LookKind::StartText => pos == 0
+    LookKind::EndText => pos == n
+    LookKind::StartLine => pos == 0 || text.code_unit_at(pos - 1) == 10
+    LookKind::EndLine => pos == n || text.code_unit_at(pos) == 10
+    LookKind::WordBoundaryAscii => {
+      if !is_char_boundary(text, pos) {
+        return false
+      }
+      let before = pos > 0 && is_ascii_word_byte(text.code_unit_at(pos - 1))
+      let after = pos < n && is_ascii_word_byte(text.code_unit_at(pos))
+      before != after
+    }
+    LookKind::NotWordBoundaryAscii => {
+      if !is_char_boundary(text, pos) {
+        return false
+      }
+      let before = pos > 0 && is_ascii_word_byte(text.code_unit_at(pos - 1))
+      let after = pos < n && is_ascii_word_byte(text.code_unit_at(pos))
+      before == after
+    }
+    LookKind::WordBoundaryUnicode => {
+      if !is_char_boundary(text, pos) {
+        return false
+      }
+      let before = pos > 0 && is_unicode_word_cp(decode_utf8_before(text, pos))
+      let after = if pos < n {
+        let (cp, _) = decode_utf8(text, pos)
+        is_unicode_word_cp(cp)
+      } else {
+        false
+      }
+      before != after
+    }
+    LookKind::NotWordBoundaryUnicode => {
+      if !is_char_boundary(text, pos) {
+        return false
+      }
+      let before = pos > 0 && is_unicode_word_cp(decode_utf8_before(text, pos))
+      let after = if pos < n {
+        let (cp, _) = decode_utf8(text, pos)
+        is_unicode_word_cp(cp)
+      } else {
+        false
+      }
+      before == after
+    }
+  }
+}
+
+///| Iterative epsilon-closure adding active threads in exact priority order into
+///| flat `out_states` and `out_slots` (each thread occupies `nslots` ints).
+fn pike_add_thread_flat(
+  nfa : Nfa,
+  text : String,
+  pos : Int,
+  start_state : Int,
+  src_slots : Array[Int],
+  src_off : Int,
+  nslots : Int,
+  out_states : Array[Int],
+  out_slots : Array[Int],
+  visited : Array[Int],
+  gen : Int,
+  cur_slots : Array[Int],
+  stack_st : Array[Int],
+  stack_undo_slot : Array[Int],
+  stack_undo_val : Array[Int],
+) -> Unit {
+  if nslots > 0 {
+    let mut k = 0
+    while k < nslots {
+      cur_slots[k] = src_slots[src_off + k]
+      k = k + 1
+    }
+  }
+  stack_st.clear()
+  stack_undo_slot.clear()
+  stack_undo_val.clear()
+  stack_st.push(start_state)
+  stack_undo_slot.push(-1)
+  stack_undo_val.push(-1)
+  let states = nfa.states
+
+  while stack_st.length() > 0 {
+    let sid = match stack_st.pop() {
+      Some(v) => v
+      None => break
+    }
+    let undo_slot = match stack_undo_slot.pop() {
+      Some(v) => v
+      None => -1
+    }
+    let undo_val = match stack_undo_val.pop() {
+      Some(v) => v
+      None => -1
+    }
+    if sid < 0 {
+      if nslots > 0 && undo_slot >= 0 && undo_slot < nslots {
+        cur_slots[undo_slot] = undo_val
+      }
+      continue
+    }
+    if visited[sid] == gen {
+      continue
+    }
+    visited[sid] = gen
+    let st = states[sid]
+    match st.kind {
+      NfaKind::Split => {
+        if st.out2 >= 0 {
+          stack_st.push(st.out2)
+          stack_undo_slot.push(-1)
+          stack_undo_val.push(-1)
+        }
+        if st.out1 >= 0 {
+          stack_st.push(st.out1)
+          stack_undo_slot.push(-1)
+          stack_undo_val.push(-1)
+        }
+      }
+      NfaKind::Capture(slot) => {
+        if nslots > 0 && slot >= 0 && slot < nslots {
+          let old_val = cur_slots[slot]
+          stack_st.push(-1)
+          stack_undo_slot.push(slot)
+          stack_undo_val.push(old_val)
+          cur_slots[slot] = pos
+        }
+        if st.out1 >= 0 {
+          stack_st.push(st.out1)
+          stack_undo_slot.push(-1)
+          stack_undo_val.push(-1)
+        }
+      }
+      NfaKind::Look(lk) =>
+      if eval_look(lk, text, pos) && st.out1 >= 0 {
+        stack_st.push(st.out1)
+        stack_undo_slot.push(-1)
+        stack_undo_val.push(-1)
+      }
+      _ => {
+        out_states.push(sid)
+        if nslots > 0 {
+          let mut k = 0
+          while k < nslots {
+            out_slots.push(cur_slots[k])
+            k = k + 1
+          }
+        }
+      }
+    }
+  }
+}
+
+///| Run PikeVM on `text` over `[start_pos, end_pos]` using reusable `cache`.
+///| If `anchored` is true, match must start at `start_pos`.
+///| If `track_captures` is true, writes winning capture slots into `out_slots`.
+///| Returns `true` if a match was found.
+pub fn pikevm_search(
+  nfa : Nfa,
+  cache : PikeVmCache,
+  text : String,
+  start_pos : Int,
+  end_pos : Int,
+  anchored : Bool,
+  track_captures : Bool,
+  out_slots : Array[Int],
+) -> Bool {
+  let num_states = nfa.states.length()
+  let nslots = if track_captures { nfa.num_captures * 2 } else { 0 }
+  cache.prepare(num_states, nslots)
+
+  let visited = cache.visited
+  let empty_slots = cache.empty_slots
+  let scratch_slots = cache.scratch_slots
+  let stack_st = cache.stack_st
+  let stack_undo_slot = cache.stack_undo_slot
+  let stack_undo_val = cache.stack_undo_val
+
+  let mut cur_st = cache.cur_st
+  let mut cur_sl = cache.cur_sl
+  let mut nxt_st = cache.nxt_st
+  let mut nxt_sl = cache.nxt_sl
+
+  let start_state = if anchored { nfa.start_anchored } else { nfa.start_unanchored }
+  let mut matched = false
+  let mut pos = start_pos
+  cache.gen = cache.gen + 1
+
+  pike_add_thread_flat(
+    nfa,
+    text,
+    pos,
+    start_state,
+    empty_slots,
+    0,
+    nslots,
+    cur_st,
+    cur_sl,
+    visited,
+    cache.gen,
+    scratch_slots,
+    stack_st,
+    stack_undo_slot,
+    stack_undo_val,
+  )
+
+  while pos <= end_pos {
+    let has_byte = pos < end_pos
+    let b = if has_byte { text.code_unit_at(pos) } else { -1 }
+    nxt_st.clear()
+    nxt_sl.clear()
+    cache.gen = cache.gen + 1
+    let gen = cache.gen
+
+    let mut t = 0
+    let nt = cur_st.length()
+    while t < nt {
+      let sid = cur_st[t]
+      let st = nfa.states[sid]
+      match st.kind {
+        NfaKind::Match(_) => {
+          // Enforce UTF-8 char boundary for empty matches (P0-2)
+          if nslots > 0 {
+            let base = t * nslots
+            if cur_sl[base] == pos && !is_char_boundary(text, pos) {
+              t = t + 1
+              continue
+            }
+            matched = true
+            out_slots.clear()
+            let mut k = 0
+            while k < nslots {
+              out_slots.push(cur_sl[base + k])
+              k = k + 1
+            }
+          } else {
+            if !is_char_boundary(text, pos) {
+              t = t + 1
+              continue
+            }
+            matched = true
+          }
+          break
+        }
+        NfaKind::Sparse(edges) =>
+        if has_byte {
+          let dst = nfa_sparse_next(edges, b)
+          if dst >= 0 {
+            pike_add_thread_flat(
+              nfa,
+              text,
+              pos + 1,
+              dst,
+              cur_sl,
+              t * nslots,
+              nslots,
+              nxt_st,
+              nxt_sl,
+              visited,
+              gen,
+              scratch_slots,
+              stack_st,
+              stack_undo_slot,
+              stack_undo_val,
+            )
+          }
+        }
+        _ =>
+        if has_byte && nfa_state_matches_byte(st.kind, b) && st.out1 >= 0 {
+          pike_add_thread_flat(
+            nfa,
+            text,
+            pos + 1,
+            st.out1,
+            cur_sl,
+            t * nslots,
+            nslots,
+            nxt_st,
+            nxt_sl,
+            visited,
+            gen,
+            scratch_slots,
+            stack_st,
+            stack_undo_slot,
+            stack_undo_val,
+          )
+        }
+      }
+      t = t + 1
+    }
+
+    if !has_byte {
+      break
+    }
+    let tmp_st = cur_st
+    cur_st = nxt_st
+    nxt_st = tmp_st
+    let tmp_sl = cur_sl
+    cur_sl = nxt_sl
+    nxt_sl = tmp_sl
+
+    if cur_st.length() == 0 && matched {
+      break
+    }
+    pos = pos + 1
+  }
+  cache.cur_st = cur_st
+  cache.cur_sl = cur_sl
+  cache.nxt_st = nxt_st
+  cache.nxt_sl = nxt_sl
+  matched
+}
+
+///| Run PikeVM for `RegexSet` (collects ALL matching pattern IDs in `text` starting at `start_pos`).
+pub fn pikevm_set_matches(
+  nfa : Nfa,
+  cache : PikeVmCache,
+  text : String,
+  start_pos : Int,
+  num_patterns : Int,
+  into : Array[Int],
+) -> Unit {
+  into.clear()
+  if num_patterns == 0 {
+    return
+  }
+  let num_states = nfa.states.length()
+  cache.prepare(num_states, 0)
+  while cache.hit_gen.length() < num_patterns {
+    cache.hit_gen.push(0)
+  }
+  cache.set_gen = cache.set_gen + 1
+  let hgen = cache.set_gen
+  let hit = cache.hit_gen
+
+  let visited = cache.visited
+  let empty_slots = cache.empty_slots
+  let scratch_slots = cache.scratch_slots
+  let stack_st = cache.stack_st
+  let stack_undo_slot = cache.stack_undo_slot
+  let stack_undo_val = cache.stack_undo_val
+  let mut cur_st = cache.cur_st
+  let mut nxt_st = cache.nxt_st
+  let dummy_sl = cache.cur_sl
+  let end_pos = text.length()
+
+  cache.gen = cache.gen + 1
+  pike_add_thread_flat(
+    nfa,
+    text,
+    start_pos,
+    nfa.start_unanchored,
+    empty_slots,
+    0,
+    0,
+    cur_st,
+    dummy_sl,
+    visited,
+    cache.gen,
+    scratch_slots,
+    stack_st,
+    stack_undo_slot,
+    stack_undo_val,
+  )
+
+  let mut pos = start_pos
+  let mut hits_found = 0
+  while pos <= end_pos {
+    let has_byte = pos < end_pos
+    let b = if has_byte { text.code_unit_at(pos) } else { -1 }
+    nxt_st.clear()
+    cache.gen = cache.gen + 1
+    let gen = cache.gen
+    let mut t = 0
+    let nt = cur_st.length()
+    while t < nt {
+      let sid = cur_st[t]
+      let st = nfa.states[sid]
+      match st.kind {
+        NfaKind::Match(pid) =>
+        if hit[pid] != hgen {
+          hit[pid] = hgen
+          hits_found = hits_found + 1
+        }
+        NfaKind::Sparse(edges) =>
+        if has_byte {
+          let dst = nfa_sparse_next(edges, b)
+          if dst >= 0 {
+            pike_add_thread_flat(
+              nfa,
+              text,
+              pos + 1,
+              dst,
+              empty_slots,
+              0,
+              0,
+              nxt_st,
+              dummy_sl,
+              visited,
+              gen,
+              scratch_slots,
+              stack_st,
+              stack_undo_slot,
+              stack_undo_val,
+            )
+          }
+        }
+        _ =>
+        if has_byte && nfa_state_matches_byte(st.kind, b) && st.out1 >= 0 {
+          pike_add_thread_flat(
+            nfa,
+            text,
+            pos + 1,
+            st.out1,
+            empty_slots,
+            0,
+            0,
+            nxt_st,
+            dummy_sl,
+            visited,
+            gen,
+            scratch_slots,
+            stack_st,
+            stack_undo_slot,
+            stack_undo_val,
+          )
+        }
+      }
+      t = t + 1
+    }
+    if !has_byte || hits_found == num_patterns {
+      break
+    }
+    let tmp = cur_st
+    cur_st = nxt_st
+    nxt_st = tmp
+    if cur_st.length() == 0 {
+      break
+    }
+    pos = pos + 1
+  }
+  cache.cur_st = cur_st
+  cache.nxt_st = nxt_st
+
+  let mut i = 0
+  while i < num_patterns {
+    if hit[i] == hgen {
+      into.push(i)
+    }
+    i = i + 1
+  }
+}
