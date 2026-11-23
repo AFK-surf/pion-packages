@@ -34,6 +34,44 @@ pionc build --release --target wasm32 -o /tmp/jwt_wasm_smoke.wasm packages/jwt/w
 node "$HOME/.pion/share/pion/pion_wasm_rt.mjs" /tmp/jwt_wasm_smoke.wasm
 ```
 
+## Formal Verification (Lean 4)
+
+The security-critical pure kernels of `packages/jwt` are extracted directly from `packages/jwt/src/*.pion` (`#verify`) via `pionc extract-lean` into Lean 4 (`Jwt.Types`, `Jwt.Funs`) and verified end-to-end in Lean 4 (`v4.36.0-rc2` + `Aeneas` + `PionLean`) with **0 `sorry`**, **0 `admit`**, **0 `native_decide`**, **0 `bv_decide`**, and only the three standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`).
+
+Reproduce the full proof build, `#print axioms` audit, and Lean-vs-Native Pion differential check:
+
+```sh
+sh packages/jwt/proofs/run_proofs.sh
+```
+
+### Verified Theorems (`packages/jwt/proofs/JwtProofs.lean`)
+
+1. **Constant-Time Byte Comparison (`packages/jwt/src/crypto.pion`)**:
+   - `constant_time_eq_spec`, `constant_time_eq_total`, `constant_time_eq_iff`, `constant_time_eq_refl`, `constant_time_eq_symm`: For all valid `Bytes` `a, b`, `constant_time_eq` never panics/goes out-of-bounds and decides exact byte equality (`constant_time_eq a b = ok true ↔ a = b`).
+2. **Anti-CVE Algorithm & HMAC Key Gate (`packages/jwt/src/types.pion`, `packages/jwt/src/jwt.pion`)**:
+   - `algorithm_equals_iff`, `algorithm_from_str_as_str`, `algorithm_from_str_ok_iff`: `algorithm_from_str` accepts only `"HS256"`, `"HS384"`, `"HS512"` and roundtrips with `algorithm_as_str`.
+   - `algorithm_from_str_rejects_none_variants`, `algorithm_from_str_rejects_unknown`: All 16 case variants of `"none"` (`"none"`, `"None"`, `"NONE"`, `"nOnE"`, …) always return `Err(AlgorithmNoneNotAllowed)`; all other unknown algorithms return `Err(UnsupportedAlgorithm _)`.
+   - `hmac_key_valid_iff`, `hmac_key_valid_rejects_empty`: Empty HMAC keys (`key.length() == 0`) are unconditionally rejected.
+   - `alg_in_allowlist_spec`, `alg_in_allowlist_empty`, `check_verifier_alg_iff`: Empty allowlists reject all algorithms, and `check_verifier_alg` enforces both `header_alg ∈ allowlist` and `header_alg = verifier_alg` (immune to algorithm confusion).
+3. **Saturating `exp` / `nbf` Time-Window & Leeway Overflow Immunity (`packages/jwt/src/jwt.pion`)**:
+   - `saturating_add_nonneg_spec`, `saturating_sub_nonneg_spec`, `normalize_leeway_spec`: Exact `ℤ` saturation (`min(INT64_MAX, a + b)` and `max(INT64_MIN, a - b)` for `b ≥ 0`, negative leeway clamped to `0`).
+   - `is_expired_sound`, `is_expired_iff_of_gt_min`, `is_expired_zero_leeway`: Across all `Int64` values (including `INT64_MIN`, `INT64_MAX`, and extreme `leeway`), if `now ≥ exp + max(0, leeway)` in exact `ℤ`, `is_expired` always rejects (zero signed wraparound); `leeway = 0` matches `now ≥ exp` exactly.
+   - `is_immature_spec`, `is_immature_zero_leeway`: Exact mathematical equivalence `is_immature now nbf leeway = ok (decide (now + max(0, leeway) < nbf))` across all `Int64` values.
+4. **Strict Unpadded Base64URL Codec & Canonical Tail Bits (`packages/jwt/src/base64url.pion`)**:
+   - `b64url_encode_decode_roundtrip`: For all `0 ≤ v < 64`, `b64url_decode_byte (b64url_encode_val v) = ok v`.
+   - `b64url_decode_byte_spec`, `b64url_decode_rejects_invalid_chars`: Accepts only `A-Z`, `a-z`, `0-9`, `-`, `_`; unconditionally rejects `+`, `/`, `=`, whitespace, control bytes, and non-ASCII bytes (`-1`).
+   - `base64url_len_valid_iff`, `base64url_len_valid_rejects_mod4_eq1`, `base64url_encoded_decoded_len_roundtrip`: Rejects all `len % 4 = 1` and proves encoded/decoded length roundtrip.
+   - `base64url_tail_bits_valid_iff`: Enforces canonical zero trailing bits (`rem = 2 → last_val % 16 = 0`, `rem = 3 → last_val % 4 = 0`), preventing Base64URL signature malleability.
+5. **SHA-256 Bitwise Primitives (`packages/jwt/src/crypto.pion`)**:
+   - `sha256_ch_same`, `sha256_maj_same_xy`, `sha256_maj_symm_xy`, `sha256_rotr_spec`, `sha256_rotr_compose`, `sha256_sigmas_total`: Algebraic identities and shift-overflow freedom for `sha256_ch`, `sha256_maj`, `sha256_rotr`, and `Σ0`/`Σ1`/`σ0`/`σ1`.
+
+### Proof Artifacts
+
+- `packages/jwt/proofs/JwtProofs.lean`: Full Lean 4 proof suite over `Jwt.Funs`.
+- `packages/jwt/proofs/CheckAxioms.lean`: `#print axioms` audit across all 37 main theorems (only `propext`, `Classical.choice`, `Quot.sound`).
+- `packages/jwt/proofs/EvalDiff.lean`: `#guard` + `#eval` suite over extracted `Jwt.Funs`, cross-checked byte-for-byte (`diff -u`) against Pion native execution by `run_proofs.sh`.
+- `packages/jwt/proofs/run_proofs.sh`: Self-contained verification script using `/private/tmp/pion-lean-jwt` (zero git worktree pollution).
+
 ## Head-to-Head Benchmarks (Pion Native vs Rust `jsonwebtoken 12.0.0` vs Go `golang-jwt/jwt/v5 v5.3.1`)
 
 Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification). Reproducible via `sh packages/jwt/bench/run_bench.sh` (all build artifacts, `Cargo.lock`, `go.sum`, and corpus isolated in `/tmp`).
