@@ -104,10 +104,55 @@ fn run_w3(root: sxd_document::dom::Root<'_>, rounds: usize) -> String {
     format!("w3 rounds={} sum={} vec={}", rounds, acc, vec_str)
 }
 
+fn run_batch(tag: &str, queries: &[&str], root: sxd_document::dom::Root<'_>, rounds: usize) -> String {
+    let factory = Factory::new();
+    let ctx = Context::new();
+    let compiled: Vec<XPath> = queries
+        .iter()
+        .map(|q| factory.build(q).expect("parse").expect("some"))
+        .collect();
+
+    let mut acc: i64 = 0;
+    let mut vec_str = String::new();
+    for r in 0..rounds {
+        for xp in &compiled {
+            acc += eval_int(xp, &ctx, root);
+        }
+        if r == 0 {
+            let parts: Vec<String> = compiled
+                .iter()
+                .map(|xp| eval_int(xp, &ctx, root).to_string())
+                .collect();
+            vec_str = parts.join(",");
+        }
+    }
+    format!("{} rounds={} sum={} vec={}", tag, rounds, acc, vec_str)
+}
+
+fn run_w4(root: sxd_document::dom::Root<'_>, rounds: usize) -> String {
+    let queries = [
+        "number(//a = //b)",
+        "number(//a != //b)",
+        "number(//a < //b)",
+        "number(//a > //b)",
+    ];
+    run_batch("w4", &queries, root, rounds)
+}
+
+fn run_w5(root: sxd_document::dom::Root<'_>, rounds: usize) -> String {
+    let queries = [
+        "count(/r/e)",
+        "count(//@k)",
+        "count(//e[@k >= 25000])",
+        "sum(//e[@k < 1000]/@k)",
+    ];
+    run_batch("w5", &queries, root, rounds)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: rust_xpath <w1|w2|w3> <xml_path> <iters>");
+        eprintln!("usage: rust_xpath <w1|w2|w3|w4|w5> <xml_path> <iters>");
         std::process::exit(1);
     }
     let mode = &args[1];
@@ -120,7 +165,9 @@ fn main() {
     let out = match mode.as_str() {
         "w1" => run_w1(root, iters),
         "w2" => run_w2(root, iters),
-        _ => run_w3(root, iters),
+        "w3" => run_w3(root, iters),
+        "w4" => run_w4(root, iters),
+        _ => run_w5(root, iters),
     };
     println!("{}", out);
 }

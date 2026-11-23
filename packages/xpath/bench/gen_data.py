@@ -84,19 +84,47 @@ def gen_w3(path: str) -> None:
         f.write("".join(out))
 
 
+def gen_w4(path: str) -> None:
+    """Node-set comparison workload: 8,000 <a> and 8,000 <b> disjoint numeric elements."""
+    out = ['<?xml version="1.0" encoding="UTF-8"?>\n<r>\n']
+    for i in range(8000):
+        out.append(f'<a>{i}</a>')
+    for i in range(8000):
+        out.append(f'<b>{i + 10000}</b>')
+    out.append('\n</r>\n')
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+
+
+def gen_w5(path: str) -> None:
+    """> 1 MB document (~1.4 MB, 50,000 elements + attributes + text) under default limits."""
+    out = ['<?xml version="1.0" encoding="UTF-8"?>\n<r>\n']
+    for i in range(50000):
+        out.append(f'<e k="{i}">v{i:06d}</e>')
+    out.append('\n</r>\n')
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+
+
 def main() -> None:
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "/private/tmp/w15-xpath-bench/data"
     os.makedirs(out_dir, exist_ok=True)
     w1_path = os.path.join(out_dir, "w1.xml")
     w2_path = os.path.join(out_dir, "w2.xml")
     w3_path = os.path.join(out_dir, "w3.xml")
+    w4_path = os.path.join(out_dir, "w4.xml")
+    w5_path = os.path.join(out_dir, "w5.xml")
     gen_w1(w1_path)
     gen_w2(w2_path)
     gen_w3(w3_path)
+    gen_w4(w4_path)
+    gen_w5(w5_path)
     print(
         f"generated w1={os.path.getsize(w1_path)}B "
         f"w2={os.path.getsize(w2_path)}B "
-        f"w3={os.path.getsize(w3_path)}B"
+        f"w3={os.path.getsize(w3_path)}B "
+        f"w4={os.path.getsize(w4_path)}B "
+        f"w5={os.path.getsize(w5_path)}B"
     )
 
 
