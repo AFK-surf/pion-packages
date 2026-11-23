@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` `v0.2.0` 的数据取自包 README（未记录 pion commit），发布验证（`verify.sh` 44 包、`ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`（`v0.1.0` 为 `AFK-surf/pion@8d110a3`）；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`；Wave 10 四个包（`http2` / `jsonschema` / `mime` / `asn1`）的数据取自各包 README（未记录 pion commit），发布验证（`verify.sh` 51 包 4,706 / 4,706、4 个 `audit` 套件与 51 × 4 `wasm_smoke`，后者在逐包隔离的 `PION_CACHE_DIR` 下运行，以规避上游 `pionc` Wasm32 CAS 跨包污染缺陷）使用 `AFK-surf/pion@c375cee`；Wave 13 四个包（`bson` / `resp` / `hcl` / `email`）的数据取自各包红队修复后刷新的 README，发布验证（`verify.sh` 69 包 5,029 / 5,029、4 个 `audit` 套件与 69 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）使用 `AFK-surf/pion@66d2b4b`；Wave 14 四个包（`jsonpath` / `svg` / `promql` / `lua`）的数据取自各包红队修复后刷新的 README，发布验证（`verify.sh` 73 包 5,110 / 5,110、4 个 `audit` 套件与 73 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）同样使用 `AFK-surf/pion@66d2b4b`；Wave 15 四个包（`openapi` / `avro` / `kdl` / `xpath`）的数据取自各包红队修复后刷新的 README（红队审计在 `AFK-surf/pion@66d2b4b` 上产出），发布验证（`verify.sh` 77 包 5,218 / 5,218、4 个 `audit` 套件与 77 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）同样使用 `AFK-surf/pion@66d2b4b`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` `v0.2.0` 的数据取自包 README（未记录 pion commit），发布验证（`verify.sh` 44 包、`ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`（`v0.1.0` 为 `AFK-surf/pion@8d110a3`）；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`；Wave 10 四个包（`http2` / `jsonschema` / `mime` / `asn1`）的数据取自各包 README（未记录 pion commit），发布验证（`verify.sh` 51 包 4,706 / 4,706、4 个 `audit` 套件与 51 × 4 `wasm_smoke`，后者在逐包隔离的 `PION_CACHE_DIR` 下运行，以规避上游 `pionc` Wasm32 CAS 跨包污染缺陷）使用 `AFK-surf/pion@c375cee`；Wave 13 四个包（`bson` / `resp` / `hcl` / `email`）的数据取自各包红队修复后刷新的 README，发布验证（`verify.sh` 69 包 5,029 / 5,029、4 个 `audit` 套件与 69 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）使用 `AFK-surf/pion@66d2b4b`；Wave 14 四个包（`jsonpath` / `svg` / `promql` / `lua`）的数据取自各包红队修复后刷新的 README，发布验证（`verify.sh` 73 包 5,110 / 5,110、4 个 `audit` 套件与 73 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）同样使用 `AFK-surf/pion@66d2b4b`；Wave 15 四个包（`openapi` / `avro` / `kdl` / `xpath`）的数据取自各包红队修复后刷新的 README（红队审计在 `AFK-surf/pion@66d2b4b` 上产出），发布验证（`verify.sh` 77 包 5,218 / 5,218、4 个 `audit` 套件与 77 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）同样使用 `AFK-surf/pion@66d2b4b`；Wave 17 四个包（`json` / `sse` `v0.1.0` 与 `crypto` / `markdown` `v0.3.0`）的数据取自各包红队修复后刷新的 README（红队审计在 `AFK-surf/pion@66d2b4b` 上产出），发布验证（`verify.sh` 79 包 5,290 / 5,290、4 个审计套件与 79 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）同样使用 `AFK-surf/pion@66d2b4b`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,14 +30,18 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–15 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–10 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–15 + Wave 17 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–10 + `fts`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。Wave 11 新增 `cel`（以 Go `cel-go v0.24.1` 为基线）、`wasm`（以 Rust `wasmparser` / `wasm-encoder` / `wasmprinter 0.221.3` 为基线）、`ical`（以 Rust `rrule 0.14.0` / `icalendar 0.16.17` 为基线）与 `ssh`（以 Go `golang.org/x/crypto/ssh v0.38.0` 为基线；Go 缺失的 `|1|` 哈希主机、RFC 4253 分包与 `SSHSIG` 由等价 Go 实现补齐）`v0.1.0`，首发即红队修复后版本。Wave 12 新增 `git`（以 Rust `gix`（`gix-object 0.46` / `gix-pack 0.56` / `gix-index 0.37` / `gix-packetline 0.18`）为基线）、`jq`（以 Go `gojq v0.12.17` 为基线）、`qrcode`（以 Rust `qrcode 0.14.1` 为基线，另列 `qrcodegen 1.8.0` / `fast_qr 0.14.0`）与 `mqtt`（以 Rust `rumqttc 0.25.1` 为基线，另列 Go `paho.golang/packets v0.23.0`；`TopicTrie` 为同算法跨语言对照）`v0.1.0`，首发即红队修复后版本。Wave 13 新增 `bson`（以 Rust `bson 2.15.0` 为基线；解码另列零拷贝 `RawDocument` 遍历）、`resp`（以 Rust `redis-protocol 6.0.0` 零拷贝 `decode_bytes_mut` 为基线）、`hcl`（以 Go `hashicorp/hcl/v2 v2.23.0` 为基线）与 `email`（MIME 解析以 Rust `mail-parser 0.9.4`、地址 / 日期解析以 Go `net/mail`、DKIM 以 Go `go-msgauth v0.7.0` 为基线）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 14 新增 `jsonpath`（以 Rust `serde_json_path 0.7.2` + `json-patch 4.2.0` 为基线）、`svg`（以 Rust `svgtypes 0.15.3` / `roxmltree 0.20.0` 同算法实现为基线，另列地道 `kurbo 0.11.3` 与非等价参考 Node `svgo@3.3.2`）、`promql`（以 Go `prometheus/prometheus v0.302.1` 的 `promql/parser` 与 `promql.Engine` 为基线）与 `lua`（以 Go `gopher-lua v1.1.1` 为基线，W3 采用只开同等库子集的公平配置）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 15 新增 `openapi`（以 Go `kin-openapi v0.131.0` 为基线）、`avro`（以 Go `hamba/avro/v2 v2.28.0` 动态 `map[string]any` 为基线，另列 typed `struct`）、`kdl`（以 Rust `kdl 6.7.1` 无损 CST 解析器为基线，非同构对照）与 `xpath`（以 Rust `sxd-xpath 0.4.2` 为基线，另列 C `libxml2 -O2`）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。Wave 11 新增 `cel`（以 Go `cel-go v0.24.1` 为基线）、`wasm`（以 Rust `wasmparser` / `wasm-encoder` / `wasmprinter 0.221.3` 为基线）、`ical`（以 Rust `rrule 0.14.0` / `icalendar 0.16.17` 为基线）与 `ssh`（以 Go `golang.org/x/crypto/ssh v0.38.0` 为基线；Go 缺失的 `|1|` 哈希主机、RFC 4253 分包与 `SSHSIG` 由等价 Go 实现补齐）`v0.1.0`，首发即红队修复后版本。Wave 12 新增 `git`（以 Rust `gix`（`gix-object 0.46` / `gix-pack 0.56` / `gix-index 0.37` / `gix-packetline 0.18`）为基线）、`jq`（以 Go `gojq v0.12.17` 为基线）、`qrcode`（以 Rust `qrcode 0.14.1` 为基线，另列 `qrcodegen 1.8.0` / `fast_qr 0.14.0`）与 `mqtt`（以 Rust `rumqttc 0.25.1` 为基线，另列 Go `paho.golang/packets v0.23.0`；`TopicTrie` 为同算法跨语言对照）`v0.1.0`，首发即红队修复后版本。Wave 13 新增 `bson`（以 Rust `bson 2.15.0` 为基线；解码另列零拷贝 `RawDocument` 遍历）、`resp`（以 Rust `redis-protocol 6.0.0` 零拷贝 `decode_bytes_mut` 为基线）、`hcl`（以 Go `hashicorp/hcl/v2 v2.23.0` 为基线）与 `email`（MIME 解析以 Rust `mail-parser 0.9.4`、地址 / 日期解析以 Go `net/mail`、DKIM 以 Go `go-msgauth v0.7.0` 为基线）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 14 新增 `jsonpath`（以 Rust `serde_json_path 0.7.2` + `json-patch 4.2.0` 为基线）、`svg`（以 Rust `svgtypes 0.15.3` / `roxmltree 0.20.0` 同算法实现为基线，另列地道 `kurbo 0.11.3` 与非等价参考 Node `svgo@3.3.2`）、`promql`（以 Go `prometheus/prometheus v0.302.1` 的 `promql/parser` 与 `promql.Engine` 为基线）与 `lua`（以 Go `gopher-lua v1.1.1` 为基线，W3 采用只开同等库子集的公平配置）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 15 新增 `openapi`（以 Go `kin-openapi v0.131.0` 为基线）、`avro`（以 Go `hamba/avro/v2 v2.28.0` 动态 `map[string]any` 为基线，另列 typed `struct`）、`kdl`（以 Rust `kdl 6.7.1` 无损 CST 解析器为基线，非同构对照）与 `xpath`（以 Rust `sxd-xpath 0.4.2` 为基线，另列 C `libxml2 -O2`）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 17 新增 `json`（以 Rust `serde_json =1.0.145` 为基线，另列 Go `encoding/json`）与 `sse`（以 Rust `eventsource-stream =0.2.3` 为基线）`v0.1.0`，并发布 `crypto` `v0.3.0`（新增 AES-256-GCM、P-256 ECDH 与 P-256 公钥校验 4 行，迭代数按红队 P2-1 加大到 Go 侧 ≥ 45 ms 实际工作量的稳态口径，原 8 行同步刷新）与 `markdown` `v0.3.0`（新增树状 AST 与纯文本提取吞吐，无上游同构实现，仅列 Pion 自身数据），数据取自各包红队修复后刷新的 README。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `markdown` | CommonMark 0.31.2 `spec.txt` × 12 → HTML（v0.2.1 P49） | 2,458,295 B | 20.201 ms | 16.869 ms (`rust_pulldown_cmark`) | 0.84x | 12.30 MiB | 13.03 MiB |
 | `markdown` | Mixed GFM corpus → HTML（v0.2.1 P49） | 2,503,227 B | 23.326 ms | 19.904 ms (`rust_pulldown_cmark`) | 0.85x | 18.44 MiB | 24.36 MiB |
+| `markdown` | Mixed GFM corpus → HTML（v0.3.0 回归复测） | 2,503,227 B | 23.704 ms | 21.543 ms (`rust_pulldown_cmark`) | 0.91x | 18.44 MiB | — |
+| `markdown` | v0.3.0 `parse_document` 树状 AST（Mixed GFM） | 2,503,227 B | 35.851 ms (69.82 MB/s) | — | — | 33.84 MiB | — |
+| `markdown` | v0.3.0 `to_plain_text` 全文（`collapse_whitespace`） | 2,503,227 B | 41.174 ms (60.80 MB/s) | — | — | 34.88 MiB | — |
+| `markdown` | v0.3.0 `to_plain_text` 预览（`max_chars: 120` + 占位符） | 2,503,227 B | 34.076 ms (73.46 MB/s) | — | — | 33.86 MiB | — |
 | `markdown` | 对抗：`nested_strong_emph`（v0.1.0 6,019 ms） | 224 KB | 8.4 ms | — | **1.01x**（56 KB 交替基准） | — | — |
 | `texmath` | `bench/corpus.txt` × 20 → MathML（Native） | 10,000 ops | 122.69 ms | 282.46 ms (`node-katex`) | **2.30x** | 3.44 MiB | 68.86 MiB |
 | `texmath` | 同上（Wasm32，`AFK-surf/pion@69a0189d` 复测） | 10,000 ops | 343.3 ms | — (`node-katex`) | 0.78x | 274.8 MiB | — |
@@ -177,14 +181,18 @@
 | `effect` | W1 有界队列乒乓（cap = 16） | 50,000 msgs | 18.318 ms | 17.479 ms (Go) / 57.203 ms (Node) | 0.95x (vs Go) · **3.12x** (vs Node) | **1.83 MiB** | 4.59 / 48.62 MiB (Go / Node) |
 | `effect` | W2 虚拟时钟定时器调度（Pion 为完整结构化纤程，基线为裸最小堆，见明细） | 20,000 timers | 47.402 ms | 18.574 ms (Go) / 58.455 ms (Node) | 0.39x (vs Go) · **1.23x** (vs Node) | 28.23 MiB | 5.95 / 49.86 MiB (Go / Node) |
 | `effect` | W3 结构化扇出汇合（2,500 × 4） | 10,000 fibers | 19.481 ms | 18.090 ms (Go) / 51.110 ms (Node) | 0.93x (vs Go) · **2.62x** (vs Node) | **1.84 MiB** | 5.42 / 45.16 MiB (Go / Node) |
-| `crypto` | SHA-256 流式哈希 | 16 MiB | 99.222 ms | 16.040 ms (Go) | 0.16x | **1.83 MiB** | 5.00 MiB |
-| `crypto` | SHA-512 流式哈希 | 16 MiB | 63.226 ms | 20.020 ms (Go) | 0.32x | **1.81 MiB** | 5.02 MiB |
-| `crypto` | HMAC-SHA256 | 50,000 × 256 B | 148.533 ms | 31.896 ms (Go) | 0.21x | **1.80 MiB** | 11.38 MiB |
-| `crypto` | Ed25519 签名 + 验签 | 200 + 200 ops | 53.251 ms | 25.262 ms (Go) | 0.47x | **1.88 MiB** | 5.11 MiB |
-| `crypto` | X25519 密钥交换 | 200 次 | 25.949 ms | 24.797 ms (Go) | 0.96x | **1.84 MiB** | 4.92 MiB |
-| `crypto` | HKDF-SHA256 | 20,000 × 64 B | 95.725 ms | 32.600 ms (Go) | 0.34x | **1.84 MiB** | 12.11 MiB |
-| `crypto` | ChaCha20-Poly1305 加密 + 解密 | 4 MiB | 73.765 ms | 25.090 ms (Go) | 0.34x | **2.05 MiB** | 10.33 MiB |
-| `crypto` | NIST P-256 ES256 签名 + 验签 | 50 + 50 ops | 116.225 ms | 18.904 ms (Go) | 0.16x | **1.89 MiB** | 5.77 MiB |
+| `crypto` | SHA-256 流式哈希 | 16 MiB | 94.222 ms | 17.716 ms (Go) | 0.19x | **1.84 MiB** | 5.02 MiB |
+| `crypto` | SHA-512 流式哈希 | 16 MiB | 63.312 ms | 21.785 ms (Go) | 0.34x | **1.84 MiB** | 5.05 MiB |
+| `crypto` | HMAC-SHA256 | 50,000 × 256 B | 140.606 ms | 32.078 ms (Go) | 0.23x | **1.80 MiB** | 11.41 MiB |
+| `crypto` | Ed25519 签名 + 验签 | 200 + 200 ops | 60.823 ms | 24.094 ms (Go) | 0.40x | **1.89 MiB** | 5.03 MiB |
+| `crypto` | X25519 密钥交换 | 200 次 | 30.242 ms | 28.051 ms (Go) | 0.93x | **1.83 MiB** | 4.95 MiB |
+| `crypto` | HKDF-SHA256 | 20,000 × 64 B | 102.889 ms | 31.297 ms (Go) | 0.30x | **1.83 MiB** | 12.28 MiB |
+| `crypto` | ChaCha20-Poly1305 加密 + 解密 | 4 MiB | 73.418 ms | 20.921 ms (Go) | 0.28x | **2.05 MiB** | 10.80 MiB |
+| `crypto` | AES-256-GCM 加密 + 解密（v0.3.0） | 1,000 × 64 KiB | 2,033.434 ms (64.46 MB/s) | 55.673 ms (Go) | 0.03x | **2.05 MiB** | 14.75 MiB |
+| `crypto` | AES-256-GCM 小包加密 + 解密（v0.3.0） | 150,000 × 256 B | 2,315.511 ms (7.72 µs/op) | 46.906 ms (Go) | 0.02x | **1.88 MiB** | 11.84 MiB |
+| `crypto` | NIST P-256 ES256 签名 + 验签 | 50 + 50 ops | 121.651 ms | 14.271 ms (Go) | 0.12x | **1.97 MiB** | 5.81 MiB |
+| `crypto` | NIST P-256 ECDH（v0.3.0） | 2,000 次 | 1,402.492 ms (701.25 µs/op) | 69.888 ms (Go) | 0.05x | **1.89 MiB** | 7.09 MiB |
+| `crypto` | NIST P-256 公钥校验（v0.3.0，非压缩 + 压缩） | 20,000 + 20,000 | 828.830 ms (20.72 µs/op) | 81.086 ms (Go) | 0.10x | **1.81 MiB** | 11.11 MiB |
 | `brotli` | Web HTML/CSS/JS/JSON 解压（2 MiB q6 × 10） | 20 MiB | 34.820 ms | 25.524 ms (`rust_brotli`) / 24.281 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.70x (vs C) | — | — |
 | `brotli` | WOFF2 字体载荷解压（1 MiB q11 × 10） | 10 MiB | 33.678 ms | 24.419 ms (`rust_brotli`) / 25.004 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.74x (vs C) | — | — |
 | `brotli` | 小包批量解压（512 pkts q5 × 10） | 5,120 pkts | 43.355 ms | 69.620 ms (`rust_brotli`) / 35.054 ms (`c_brotlidec`) | **1.61x** (vs Rust) · 0.81x (vs C) | — | — |
@@ -366,6 +374,17 @@ v0.2.0 对照：CommonMark 23.001 ms（0.79x，15.73 MiB）、Mixed GFM 29.847 m
 50k 层 `>` 与 32k 层列表 0 SIGSEGV；85,152 例三路差分 `direct != events` 分歧为 0。
 
 落后项：端到端吞吐为 Rust 的 84%–85%（in-process 计算 CommonMark 9.16 ms vs 5.82 ms，Mixed GFM 12.11 ms vs 9.01 ms），峰值 RSS 低于 Rust 6%–24%。包 README 将剩余约 3.1–3.3 ms 计算差距归因于 QBE 标量字节扫描（无 NEON SIMD `memchr`）与 LUT 边界检查消除不跨函数参数传播。
+
+**4. `v0.3.0` 树状 AST 与纯文本提取（Mixed GFM corpus `2,503,227 B`，`warmup=1`、`rounds=5`）**
+
+| Operation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `to_html_pulldown`（回归复测，同轮 Rust 21.543 ms → 0.91x） | 23.704 | 21.792 | 24.299 | 105.60 | 18.44 MiB |
+| `parse_document`（完整树状 `Document` AST） | 35.851 | 34.484 | 36.133 | 69.82 | 33.84 MiB |
+| `to_plain_text`（全文，`collapse_whitespace: true`） | 41.174 | 39.394 | 43.375 | 60.80 | 34.88 MiB |
+| `to_plain_text`（`max_chars: 120` 预览 + 占位符） | 34.076 | 30.610 | 36.293 | 73.46 | 33.86 MiB |
+
+`pulldown-cmark` 只有事件流、没有树状 AST 与纯文本预览，这一组无同构上游实现，只列 Pion 自身数据。725 / 725 单测；`audit_v030`（0 P0 + 3 P1 + 6 P2 + 1 既有缺陷全部修复）`QUICK=1` **exit 0**；`wasm_smoke` 4 模式 stdout 均为 `639 B`、SHA-256 `dbb0840afd40e42a7fe5c059665a57695ae70099f6f96955722ced80b7a4ec02`。
 
 ### texmath
 
@@ -1524,20 +1543,28 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 
 ### crypto
 
-`v0.2.0`。参考实现：Go `go1.27.3` 标准库 `crypto/sha256` / `crypto/sha512` / `crypto/hmac` / `crypto/ed25519` / `crypto/ecdsa` 与 `golang.org/x/crypto` `v0.58.0`（`curve25519` / `chacha20poly1305` / `hkdf`），源码见 [`packages/crypto/bench/`](packages/crypto/bench/)。数据取自包 README（`Darwin arm64`，未记录 pion commit），发布验证（`verify.sh` 44 包、`audit/ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`。`sh packages/crypto/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对 8 个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5`（严格交替），双方 stdout SHA-256 在每个负载上逐字节一致。详见 [`packages/crypto/README.md`](packages/crypto/README.md)。
+`v0.3.0`。参考实现：Go `go1.27.3` 标准库 `crypto/sha256` / `crypto/sha512` / `crypto/hmac` / `crypto/ed25519` / `crypto/ecdsa` / `crypto/aes` + `cipher.NewGCMWithNonceSize` / `crypto/ecdh` 与 `golang.org/x/crypto` `v0.58.0`（`curve25519` / `chacha20poly1305` / `hkdf`），源码见 [`packages/crypto/bench/`](packages/crypto/bench/)。数据取自包 v0.3.0 红队修复后刷新的 README（`Darwin arm64`，`AFK-surf/pion@66d2b4b`），发布验证（`verify.sh` 79 包、`audit_v030/run_audit.sh tests` / `diff` / `ct`、`audit/ct_ssa_check.py` 与 `wasm_smoke` 4 模式）同样使用 `AFK-surf/pion@66d2b4b`（`v0.2.0` 为 `AFK-surf/pion@c375cee`）。`sh packages/crypto/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对 12 个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5`（严格交替），双方 stdout SHA-256 在每个负载上逐字节一致。详见 [`packages/crypto/README.md`](packages/crypto/README.md)。
 
 | Workload | Pion Median / Peak RSS | Go Median / Peak RSS | Pion 吞吐 / 单次 | Pion vs Go |
 | --- | ---: | ---: | ---: | ---: |
-| SHA-256（16 MiB 流式） | 99.222 ms / 1.83 MiB | 16.040 ms / 5.00 MiB | 169.09 MB/s | 0.16x |
-| SHA-512（16 MiB 流式） | 63.226 ms / 1.81 MiB | 20.020 ms / 5.02 MiB | 265.35 MB/s | 0.32x |
-| HMAC-SHA256（50,000 × 256 B） | 148.533 ms / 1.80 MiB | 31.896 ms / 11.38 MiB | 2,970.67 ns/op | 0.21x |
-| Ed25519（200 签名 + 200 验签） | 53.251 ms / 1.88 MiB | 25.262 ms / 5.11 MiB | 133.13 µs/op | 0.47x |
-| X25519（200 次密钥交换） | 25.949 ms / 1.84 MiB | 24.797 ms / 4.92 MiB | 129.75 µs/op | 0.96x |
-| HKDF-SHA256（20,000 × 64 B） | 95.725 ms / 1.84 MiB | 32.600 ms / 12.11 MiB | 4,786.25 ns/op | 0.34x |
-| ChaCha20-Poly1305（4 MiB 加密 + 解密） | 73.765 ms / 2.05 MiB | 25.090 ms / 10.33 MiB | 113.72 MB/s | 0.34x |
-| NIST P-256 ES256（50 签名 + 50 验签） | 116.225 ms / 1.89 MiB | 18.904 ms / 5.77 MiB | 1.16 ms/op | 0.16x |
+| SHA-256（16 MiB 流式） | 94.222 ms / 1.84 MiB | 17.716 ms / 5.02 MiB | 178.06 MB/s | 0.19x |
+| SHA-512（16 MiB 流式） | 63.312 ms / 1.84 MiB | 21.785 ms / 5.05 MiB | 264.99 MB/s | 0.34x |
+| HMAC-SHA256（50,000 × 256 B） | 140.606 ms / 1.80 MiB | 32.078 ms / 11.41 MiB | 2,812.11 ns/op | 0.23x |
+| Ed25519（200 签名 + 200 验签） | 60.823 ms / 1.89 MiB | 24.094 ms / 5.03 MiB | 152.06 µs/op | 0.40x |
+| X25519（200 次密钥交换） | 30.242 ms / 1.83 MiB | 28.051 ms / 4.95 MiB | 151.21 µs/op | 0.93x |
+| HKDF-SHA256（20,000 × 64 B） | 102.889 ms / 1.83 MiB | 31.297 ms / 12.28 MiB | 5,144.44 ns/op | 0.30x |
+| ChaCha20-Poly1305（4 MiB 加密 + 解密） | 73.418 ms / 2.05 MiB | 20.921 ms / 10.80 MiB | 114.26 MB/s | 0.28x |
+| AES-256-GCM（1,000 × 64 KiB 加密 + 解密，v0.3.0） | 2,033.434 ms / 2.05 MiB | 55.673 ms / 14.75 MiB | 64.46 MB/s | 0.03x |
+| AES-256-GCM 小包（150,000 × 256 B 加密 + 解密，v0.3.0） | 2,315.511 ms / 1.88 MiB | 46.906 ms / 11.84 MiB | 7.72 µs/op | 0.02x |
+| NIST P-256 ES256（50 签名 + 50 验签） | 121.651 ms / 1.97 MiB | 14.271 ms / 5.81 MiB | 1.22 ms/op | 0.12x |
+| NIST P-256 ECDH（2,000 次密钥交换，v0.3.0） | 1,402.492 ms / 1.89 MiB | 69.888 ms / 7.09 MiB | 701.25 µs/op | 0.05x |
+| NIST P-256 公钥校验（20,000 非压缩 + 20,000 压缩，v0.3.0） | 828.830 ms / 1.81 MiB | 81.086 ms / 11.11 MiB | 20.72 µs/op | 0.10x |
 
-69 / 69 单测（含 40 个红队测试）；`wasm_smoke` 4 模式 stdout 均为 `3525 B`、SHA-256 `feceef7d07daa52fb9aaf44c09dec5047d1b5838c71024d3ea1bd8bce296d7ee`。v0.2.0 红队审计无 P0，修复 P1 RT-4（常量时间 RSA CRT）、P2 RT-5（常量时间 P-256 标量运算）与 P2 RT-6（RSA `e < 2^33` 上限），三项修复不改变任何输出：8 个基准的 stdout 修复前后逐字节一致。领先项：峰值 RSS 1.80–2.05 MiB，比 Go 的 4.92–12.11 MiB 低 2.6×–6.6×；X25519 达 Go 的 0.96x。落后项：8 个负载全部慢于 Go（0.16x–0.96x），P-256 ES256 与 SHA-256 最弱（0.16x）。两侧实现手段不对等：Go 在 `darwin/arm64` 上用 ARMv8 加密扩展（`SHA256H` / `SHA512H`）加速 SHA-256 / SHA-512，ChaCha20 / Poly1305 用 NEON / ARM64 汇编，Ed25519 / P-256 用手写 ARM64 汇编与预计算表；本包是零 C FFI、零汇编的纯标量 Pion 代码，Native 与 `wasm32` 共用同一实现，签名路径额外付出无分支常量时间查表与运算的开销。
+v0.3.0：76 / 76 单测；`wasm_smoke` 4 模式 stdout 均为 `4127 B`、SHA-256 `a07d31d36c6e770f35416c4473bc83bacd595fb7578f2edfa9b0eb0df3f31611`（新增 AES-128 / 256-GCM 96 位与非 96 位 nonce 及篡改拒绝、P-256 ECDH / 公钥校验与解压）。v0.3.0 红队审计（[`packages/crypto/audit_v030/REPORT.md`](packages/crypto/audit_v030/REPORT.md)）：对 Go 20,054 个向量 4 模逐字节一致、SSA 常量时间门禁通过、10 / 10 变异体被检出，0 P0 / 0 P1；P2-1 指出新增 4 行原先只跑 64–400 次迭代，Go 侧中位数主要是约 3 ms 进程启动，使比值虚高 3.3–12.4×，修复后迭代数加大到 Go 侧 ≥ 45 ms 实际工作量（启动占比 < 7%），上表 4 行即稳态比值；INFO-1 的 ECDH 标量范围检查改为固定 8 limb 掩码比较。新增 4 行如实为本包最弱项：Go 在 `darwin/arm64` 上用 ARMv8 AES + PMULL 指令（约 2.35 GB/s）与 ARM64 汇编 `crypto/ecdh`（35 µs/op），本包是常量时间位切片软件 AES 与纯标量 P-256。原 8 行同轮刷新，与 v0.2.0 数据差异在 ±0.07x 以内；其中最短的 X25519（Go ≈ 28 ms）仍含约 3 ms 进程启动，比值为近似值。
+
+v0.2.0 对照：SHA-256 0.16x、SHA-512 0.32x、HMAC-SHA256 0.21x、Ed25519 0.47x、X25519 0.96x、HKDF-SHA256 0.34x、ChaCha20-Poly1305 0.34x、P-256 ES256 0.16x。
+
+v0.2.0：69 / 69 单测（含 40 个红队测试）；`wasm_smoke` 4 模式 stdout 均为 `3525 B`、SHA-256 `feceef7d07daa52fb9aaf44c09dec5047d1b5838c71024d3ea1bd8bce296d7ee`。v0.2.0 红队审计无 P0，修复 P1 RT-4（常量时间 RSA CRT）、P2 RT-5（常量时间 P-256 标量运算）与 P2 RT-6（RSA `e < 2^33` 上限），三项修复不改变任何输出：8 个基准的 stdout 修复前后逐字节一致。领先项：峰值 RSS 1.80–2.05 MiB，比 Go 的 4.92–12.11 MiB 低 2.6×–6.6×；X25519 达 Go 的 0.96x。落后项：8 个负载全部慢于 Go（0.16x–0.96x），P-256 ES256 与 SHA-256 最弱（0.16x）。两侧实现手段不对等：Go 在 `darwin/arm64` 上用 ARMv8 加密扩展（`SHA256H` / `SHA512H`）加速 SHA-256 / SHA-512，ChaCha20 / Poly1305 用 NEON / ARM64 汇编，Ed25519 / P-256 用手写 ARM64 汇编与预计算表；本包是零 C FFI、零汇编的纯标量 Pion 代码，Native 与 `wasm32` 共用同一实现，签名路径额外付出无分支常量时间查表与运算的开销。
 
 ### brotli
 
@@ -2513,3 +2540,31 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000` | SHA-256: `
 诚实说明：5 项全部快于 Rust `sxd-xpath`（1.28–7.53×，RSS 低 1.13–2.40×）；对 C `libxml2` 在 W4（O(n + m) 哈希集 `=`、单遍 `!=` 与最值归约，**15.95×**）与 W5（扁平数组连续扫描与 `//@attr` 融合，**1.16×**）领先，但 W1（0.84×）、W2（0.71×，高频短查询编译）、W3（0.86×）落后 14–29%。
 
 红队：29 / 29 单测（依赖树合计 67 / 67，复用 `xml`），`audit/` 零改动且 `run_audit.sh` **exit 0**（红队单测 38 / 38、数值模型 2,700 / 2,700、11,705 例语料 4 模逐字节一致、DoS 0 失败；0 P0 + 8 P1 + 4 P2 全部修复）。
+
+### json
+
+参考实现：Rust [`serde_json`](https://crates.io/crates/serde_json) `=1.0.145`（`--release`，默认特性，`bench/rust_bench/Cargo.lock` 锁定）与 Go `encoding/json`（go1.27.3 标准库）。`sh packages/json/bench/run_bench.sh` 经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行。详见 [`packages/json/README.md`](packages/json/README.md)。
+
+| Workload | Input | Pion Median (ms) | Rust Median (ms) | Go Median (ms) | Pion MB/s | Pion RSS | Rust RSS | Go RSS | vs Rust | vs Go | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 大型真实 JSON 文档解析（5 × 3,444,775 B） | 17,223,875 B | 100.040 | **55.022** | 147.643 | 172.17 | 30.53 MiB | **29.23 MiB** | 44.64 MiB | 0.55x | **1.48x** | `f6dc207b...` |
+| W2 解析 + 抽取 / 过滤 / 修改 + 序列化往返（8 × 2,074,535 B） | 16,596,280 B | 171.425 | **96.097** | 171.952 | 96.81 | **27.55 MiB** | 31.47 MiB | 44.12 MiB | 0.56x | 1.00x | `00d7bc92...` |
+| W3 5 万键对象解析 + 25 万次随机查找 + RFC 8785 规范化（5 × 1,550,101 B） | 7,750,505 B | 156.211 | **100.787** | 379.590 | 49.62 | 22.33 MiB | **11.62 MiB** | 29.77 MiB | 0.65x | **2.43x** | `db0c9e14...` |
+
+诚实说明：三项全部落后 Rust `serde_json`（0.55–0.65×），领先 / 持平 Go `encoding/json`。口径并不完全对等：`serde_json` 默认未开 `float_roundtrip`，浮点解析走更快但不保证 0-ULP 的路径，而本包严格 0-ULP；W3 中 Rust 用 `BTreeMap`（O(log n) 查找）并逐键分配字符串，略吃亏，W1 / W2 则略偏向 Rust。剩余差距来自解析前的整串 UTF-8 校验与带边界检查的字节扫描。W3 峰值 RSS 为 Rust 的 1.9 倍（索引与保序双结构）。对抗负载（`audit/run_audit.sh bench`）：4 万碰撞键 13.1 ms（Rust 的 0.83×，与普通键相差 1.1×），修复前为 2,624 ms。
+
+红队：28 / 28 单测，`audit/` 零改动；2 P0 + 5 P1 + 5 P2 全部修复，发布验证中 `run_audit.sh tests jcs ptr utf8 hashdos` 全部通过；`wasm_smoke` 4 模式 stdout 均为 `446 B`、SHA-256 `0c0ec01bb7ab362dcf231b0bef02bde9c8cd31e640054d5940dd8586a475f8f9`。
+
+### sse
+
+参考实现：Rust [`eventsource-stream`](https://crates.io/crates/eventsource-stream) `=0.2.3`（`--release --locked`，直接以 `Waker::noop()` 轮询 `EventStream`，无异步运行时开销）。`sh packages/sse/bench/run_bench.sh` 经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行。详见 [`packages/sse/README.md`](packages/sse/README.md)。
+
+| Workload | Input | Pion Median (ms) | Rust Median (ms) | Pion MB/s | Rust MB/s | Pion ns/event | Pion RSS | Rust RSS | Pion vs Rust | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 4 KiB 分块高吞吐流式解析（250,000 事件） | 21,433,090 B | **154.053** | 188.726 | **139.13** | 113.57 | **616.21** | 5.84 MiB | **4.59 MiB** | **1.23x** | `f012a70d...` |
+| W2 64 B 网络碎片分块解析（100,000 事件） | 8,440,170 B | **79.450** | 80.230 | **106.23** | 105.20 | **794.50** | 3.52 MiB | **3.22 MiB** | 1.01x | `cb0286ac...` |
+| W3 编码 + 解析往返（80,000 事件） | 6,752,136 B | 80.989 | **77.786** | 83.37 | **86.80** | 1,012.36 | 6.52 MiB | **6.19 MiB** | 0.96x | `b88c0954...` |
+
+诚实说明：W1 领先来自直接在传入 `Bytes` 上按行扫描、不移动内部缓冲（`eventsource-stream` 每行 `split_off`）；W2 / W3 在噪声范围内持平。W3 两侧都按 4 KiB 分块喂入，避免触发 `eventsource-stream` 在单个大缓冲上的 O(N²) 缓冲移动。语料不含前导 BOM 与非法 UTF-8，因为上游 0.2.3 遇前导 BOM 会 panic、遇非法 UTF-8 会停滞。峰值 RSS 三项均比 Rust 高 0.30–1.25 MiB（每块返回的 `Array[SseEvent]` 与运行时堆规模）。
+
+红队：20 / 20 单测，`audit/` 零改动；0 P0 + 3 P1 + 5 P2 全部修复，`audit/run_audit.sh` **exit 0**（3,087 条流 × 6 种分块对 §9.2.6 参考解析器 3,087 / 3,087 一致，Strict 模式 3,087 / 3,087，4 模逐字节一致）；`wasm_smoke` 4 模式 stdout 均为 `28 B`、SHA-256 `47b0f3077f6ce7915ba8c20cb42651dbc566b9fecf7571822b0148e3c6741312`。
