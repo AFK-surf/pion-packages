@@ -1,0 +1,460 @@
+///| Red-team audit harness for `markdown` v0.3.0 (`Document` AST + `plain_text`).
+///|
+///| batch <in>  : records `<mask>\t<len>\n<bytes>`; per record prints 2 frames (`<len>\n<html>`):
+///|               render_html_pulldown(parse*(src)) and render_html_pulldown(lower(parse_document*(src))),
+///|               then 1 frame with the front-matter content seen by each path (`E:<ev>|A:<ast>`).
+///|               mask bits 1..32 = Options fields, 64 = extended (footnotes + YAML + TOML frontmatter).
+///| pt <in> <mask> <collapse 0|1> <max_chars> <placeholders 0|1> : print plain text.
+///| ptbatch <in> : records as `batch`; per record prints frames of plain text under 6 option sets.
+///| gen <case> <n> : build a pathological input in-process (so Wasm32 needs no file I/O), run
+///|               parse_document + plain_text (default and max_chars=64 with placeholders) and print
+///|               `case n blocks len64 len_full` plus the max_chars=64 text.
+
+import "markdown"
+
+///|
+fn mask_opts(mask : Int) -> markdown::Options {
+  markdown::Options::{
+    tables: (mask & 1) != 0,
+    strikethrough: (mask & 2) != 0,
+    tasklists: (mask & 4) != 0,
+    autolinks: (mask & 8) != 0,
+    smart_punctuation: (mask & 16) != 0,
+    cjk_friendly: (mask & 32) != 0,
+  }
+}
+
+///|
+fn ext_opts(mask : Int) -> markdown::ExtendedOptions {
+  markdown::ExtendedOptions::{
+    base: mask_opts(mask),
+    footnotes: true,
+    yaml_frontmatter: true,
+    pluses_frontmatter: true,
+  }
+}
+
+///|
+fn parse_dec(s : String, start : Int, end : Int) -> Int {
+  let mut v = 0
+  let mut neg = false
+  let mut i = start
+  if i < end && s.code_unit_at(i) == 45 {
+    neg = true
+    i = i + 1
+  }
+  while i < end {
+    v = v * 10 + (s.code_unit_at(i) - 48)
+    i = i + 1
+  }
+  if neg {
+    0 - v
+  } else {
+    v
+  }
+}
+
+///|
+fn emit(sb : StringBuilder, h : String) -> Unit {
+  sb.write_string(h.length().to_string())
+  sb.write_byte((10).to_byte())
+  sb.write_string(h)
+}
+
+///| Lower `Array[Inline]` back to the flat event stream (explicit stack, no recursion).
+fn lower_inlines(out : Array[markdown::Event], inlines : Array[markdown::Inline]) -> Unit {
+  // work: (node, phase) encoded as two arrays; phase 0 = open, 1 = close
+  let nodes : Array[markdown::Inline] = Array::new()
+  let phases : Array[Int] = Array::new()
+  let mut k = inlines.length() - 1
+  while k >= 0 {
+    nodes.push(inlines[k])
+    phases.push(0)
+    k = k - 1
+  }
+  while nodes.length() > 0 {
+    let node = match nodes.pop() {
+      Some(x) => x
+      None => break
+    }
+    let ph = match phases.pop() {
+      Some(x) => x
+      None => 0
+    }
+    if ph == 1 {
+      match node {
+        markdown::Inline::Emphasis(_) => out.push(markdown::Event::End(markdown::TagEnd::Emphasis))
+        markdown::Inline::Strong(_) => out.push(markdown::Event::End(markdown::TagEnd::Strong))
+        markdown::Inline::Strikethrough(_) => out.push(markdown::Event::End(markdown::TagEnd::Strikethrough))
+        markdown::Inline::Link(_, _, _) => out.push(markdown::Event::End(markdown::TagEnd::Link))
+        markdown::Inline::Image(_, _, _) => out.push(markdown::Event::End(markdown::TagEnd::Image))
+        _ => ()
+      }
+      continue
+    }
+    let children : Array[markdown::Inline] = match node {
+      markdown::Inline::Text(s) => {
+        out.push(markdown::Event::Text(s))
+        Array::new()
+      }
+      markdown::Inline::Code(s) => {
+        out.push(markdown::Event::Code(s))
+        Array::new()
+      }
+      markdown::Inline::SoftBreak => {
+        out.push(markdown::Event::SoftBreak)
+        Array::new()
+      }
+      markdown::Inline::HardBreak => {
+        out.push(markdown::Event::HardBreak)
+        Array::new()
+      }
+      markdown::Inline::HtmlInline(s) => {
+        out.push(markdown::Event::InlineHtml(s))
+        Array::new()
+      }
+      markdown::Inline::FootnoteReference(l) => {
+        out.push(markdown::Event::FootnoteReference(l))
+        Array::new()
+      }
+      markdown::Inline::Math(_, tex) => {
+        out.push(markdown::Event::Text(tex))
+        Array::new()
+      }
+      markdown::Inline::Emphasis(ch) => {
+        out.push(markdown::Event::Start(markdown::Tag::Emphasis))
+        ch
+      }
+      markdown::Inline::Strong(ch) => {
+        out.push(markdown::Event::Start(markdown::Tag::Strong))
+        ch
+      }
+      markdown::Inline::Strikethrough(ch) => {
+        out.push(markdown::Event::Start(markdown::Tag::Strikethrough))
+        ch
+      }
+      markdown::Inline::Link(url, title, ch) => {
+        out.push(markdown::Event::Start(markdown::Tag::Link(markdown::LinkType::Inline, url, title, "")))
+        ch
+      }
+      markdown::Inline::Image(url, title, ch) => {
+        out.push(markdown::Event::Start(markdown::Tag::Image(markdown::LinkType::Inline, url, title, "")))
+        ch
+      }
+    }
+    match node {
+      markdown::Inline::Emphasis(_) | markdown::Inline::Strong(_) | markdown::Inline::Strikethrough(_) | markdown::Inline::Link(
+        _,
+        _,
+        _,
+      ) | markdown::Inline::Image(_, _, _) => {
+        nodes.push(node)
+        phases.push(1)
+        let mut j = children.length() - 1
+        while j >= 0 {
+          nodes.push(children[j])
+          phases.push(0)
+          j = j - 1
+        }
+      }
+      _ => ()
+    }
+  }
+}
+
+///| Lower blocks to events (recursive; only used on the shallow differential corpus).
+///| `marker`: a task-list checkbox that pulldown-cmark places inside the item's first paragraph.
+fn lower_blocks(
+  out : Array[markdown::Event],
+  blocks : Array[markdown::Block],
+  tight : Bool,
+  marker : Option[Bool],
+) -> Unit {
+  let mut i = 0
+  let mut pending = marker
+  if blocks.length() == 0 || !(blocks[0] is markdown::Block::Paragraph(_)) || tight {
+    match pending {
+      Some(c) => out.push(markdown::Event::TaskListMarker(c))
+      None => ()
+    }
+    pending = None
+  }
+  while i < blocks.length() {
+    match blocks[i] {
+      markdown::Block::Paragraph(inl) => if tight {
+        lower_inlines(out, inl)
+      } else {
+        out.push(markdown::Event::Start(markdown::Tag::Paragraph))
+        match pending {
+          Some(c) => out.push(markdown::Event::TaskListMarker(c))
+          None => ()
+        }
+        pending = None
+        lower_inlines(out, inl)
+        out.push(markdown::Event::End(markdown::TagEnd::Paragraph))
+      }
+      markdown::Block::Heading(l, inl) => {
+        out.push(markdown::Event::Start(markdown::Tag::Heading(l)))
+        lower_inlines(out, inl)
+        out.push(markdown::Event::End(markdown::TagEnd::Heading(l)))
+      }
+      markdown::Block::BlockQuote(ch) => {
+        out.push(markdown::Event::Start(markdown::Tag::BlockQuote))
+        lower_blocks(out, ch, false, None)
+        out.push(markdown::Event::End(markdown::TagEnd::BlockQuote))
+      }
+      markdown::Block::CodeBlock(kind, _info, code) => {
+        out.push(markdown::Event::Start(markdown::Tag::CodeBlock(kind)))
+        if code.length() > 0 {
+          out.push(markdown::Event::Text(code))
+        }
+        out.push(markdown::Event::End(markdown::TagEnd::CodeBlock))
+      }
+      markdown::Block::List(start, t, items) => {
+        let s : Option[Int] = match start {
+          Some(v) => Some(v.to_int())
+          None => None
+        }
+        out.push(markdown::Event::Start(markdown::Tag::List(s)))
+        let mut k = 0
+        while k < items.length() {
+          out.push(markdown::Event::Start(markdown::Tag::Item))
+          lower_blocks(out, items[k].blocks, t, items[k].checked)
+          out.push(markdown::Event::End(markdown::TagEnd::Item))
+          k = k + 1
+        }
+        out.push(markdown::Event::End(markdown::TagEnd::List(start is Some(_))))
+      }
+      markdown::Block::Table(aligns, headers, rows) => {
+        out.push(markdown::Event::Start(markdown::Tag::Table(aligns)))
+        out.push(markdown::Event::Start(markdown::Tag::TableHead))
+        let mut h = 0
+        while h < headers.length() {
+          out.push(markdown::Event::Start(markdown::Tag::TableCell))
+          lower_inlines(out, headers[h].inlines)
+          out.push(markdown::Event::End(markdown::TagEnd::TableCell))
+          h = h + 1
+        }
+        out.push(markdown::Event::End(markdown::TagEnd::TableHead))
+        let mut r = 0
+        while r < rows.length() {
+          out.push(markdown::Event::Start(markdown::Tag::TableRow))
+          let mut c = 0
+          while c < rows[r].length() {
+            out.push(markdown::Event::Start(markdown::Tag::TableCell))
+            lower_inlines(out, rows[r][c].inlines)
+            out.push(markdown::Event::End(markdown::TagEnd::TableCell))
+            c = c + 1
+          }
+          out.push(markdown::Event::End(markdown::TagEnd::TableRow))
+          r = r + 1
+        }
+        out.push(markdown::Event::End(markdown::TagEnd::Table))
+      }
+      markdown::Block::ThematicBreak => out.push(markdown::Event::Rule)
+      markdown::Block::HtmlBlock(raw) => {
+        out.push(markdown::Event::Start(markdown::Tag::HtmlBlock))
+        out.push(markdown::Event::Html(raw))
+        out.push(markdown::Event::End(markdown::TagEnd::HtmlBlock))
+      }
+      markdown::Block::FootnoteDefinition(lbl, ch) => {
+        out.push(markdown::Event::Start(markdown::Tag::FootnoteDefinition(lbl)))
+        lower_blocks(out, ch, false, None)
+        out.push(markdown::Event::End(markdown::TagEnd::FootnoteDefinition))
+      }
+    }
+    i = i + 1
+  }
+}
+
+///| Front-matter content as seen by the event stream (`MetadataBlock` text) or "-" when absent.
+fn ev_front_matter(evs : Array[markdown::Event]) -> String {
+  let sb = StringBuilder::new()
+  let mut inside = false
+  let mut seen = false
+  let mut i = 0
+  while i < evs.length() {
+    match evs[i] {
+      markdown::Event::Start(markdown::Tag::MetadataBlock(_)) => {
+        inside = true
+        seen = true
+      }
+      markdown::Event::End(markdown::TagEnd::MetadataBlock(_)) => inside = false
+      markdown::Event::Text(t) => if inside {
+        sb.write_string(t)
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  if seen {
+    sb.to_string()
+  } else {
+    "-"
+  }
+}
+
+///|
+fn pt_opts(collapse : Bool, max_chars : Int, ph : Bool) -> markdown::PlainTextOptions {
+  markdown::PlainTextOptions::{
+    image_placeholder: if ph { "[图片]" } else { "" },
+    link_placeholder: if ph { "[链接]" } else { "" },
+    code_block_placeholder: if ph { "[代码]" } else { "" },
+    math_placeholder: if ph { "[公式]" } else { "" },
+    collapse_whitespace: collapse,
+    max_chars,
+  }
+}
+
+///|
+fn parse_doc(src : String, mask : Int) -> markdown::Document {
+  if (mask & 64) != 0 {
+    markdown::parse_document_extended(src, ext_opts(mask))
+  } else {
+    markdown::parse_document(src, mask_opts(mask))
+  }
+}
+
+///|
+fn repeat(s : String, n : Int) -> String {
+  let sb = StringBuilder::with_capacity(s.length() * n + 16)
+  let mut i = 0
+  while i < n {
+    sb.write_string(s)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Pathological inputs, built in-process.
+fn gen_case(case : String, n : Int) -> String {
+  if case == "bq" {
+    repeat("> ", n) + "deep\n"
+  } else if case == "ul" {
+    repeat("- ", n) + "deep\n"
+  } else if case == "ol" {
+    repeat("1. ", n) + "deep\n"
+  } else if case == "emph" {
+    repeat("*a ", n) + "z" + repeat(" a*", n) + "\n"
+  } else if case == "strong" {
+    repeat("**a ", n) + "z" + repeat(" a**", n) + "\n"
+  } else if case == "brackets" {
+    repeat("[", n) + "a" + repeat("]", n) + "\n"
+  } else if case == "links" {
+    repeat("[", n) + "a" + repeat("](u)", n) + "\n"
+  } else if case == "escapes" {
+    // many adjacent Text events inside one paragraph (escapes / entities / unmatched brackets)
+    repeat("a\\*&amp;[", n) + "\n"
+  } else if case == "html_lt" {
+    "<div>\n" + repeat("<", n) + "\n</div>\n"
+  } else if case == "html_lt_open" {
+    "<div>\n" + repeat("< a", n) + "\n"
+  } else if case == "html_comment" {
+    "<!--" + repeat("- ", n) + "\n"
+  } else if case == "html_quote" {
+    "<div>\n" + repeat("<a \"", n) + "\n</div>\n"
+  } else if case == "inline_html" {
+    repeat("<b>x</b>", n) + "\n"
+  } else if case == "table_cols" {
+    repeat("|a", n) + "|\n" + repeat("|-", n) + "|\n" + repeat("|1", n) + "|\n"
+  } else if case == "table_rows" {
+    "|a|b|\n|-|-|\n" + repeat("|x|y|\n", n)
+  } else if case == "cjk" {
+    repeat("你好**世界**🚀é ", n) + "\n"
+  } else if case == "bq_list" {
+    repeat("> - ", n) + "deep\n"
+  } else {
+    "unknown case\n"
+  }
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 3 {
+    io_eprintln(world, "usage: harness batch|pt|ptbatch|gen ...")
+    return 2
+  }
+  let mode = args[1]
+  if mode == "gen" {
+    let n = if args.length() >= 4 { parse_dec(args[3], 0, args[3].length()) } else { 1000 }
+    let src = gen_case(args[2], n)
+    if args.length() >= 5 && args[4] == "events" {
+      let evs = markdown::parse(src, markdown::Options::gfm())
+      io_println(world, args[2] + " " + n.to_string() + " events=" + evs.length().to_string())
+      return 0
+    }
+    let doc = markdown::parse_document(src, markdown::Options::gfm())
+    let full = doc.plain_text(markdown::PlainTextOptions::default())
+    let short = doc.plain_text(pt_opts(true, 64, true))
+    io_println(
+      world,
+      args[2] + " " + n.to_string() + " blocks=" + doc.blocks.length().to_string() + " len64=" +
+      short.length().to_string() +
+      " len_full=" +
+      full.length().to_string(),
+    )
+    io_println(world, short)
+    return 0
+  }
+  let src = match fs_read(world, args[2]) {
+    Ok(s) => s
+    Err(_) => {
+      io_eprintln(world, "read failed")
+      return 1
+    }
+  }
+  if mode == "pt" {
+    let mask = parse_dec(args[3], 0, args[3].length())
+    let collapse = args[4] == "1"
+    let mx = parse_dec(args[5], 0, args[5].length())
+    let ph = args[6] == "1"
+    io_print(world, parse_doc(src, mask).plain_text(pt_opts(collapse, mx, ph)))
+    return 0
+  }
+  let out = StringBuilder::new()
+  let n = src.length()
+  let mut i = 0
+  while i < n {
+    let mut tab = i
+    while src.code_unit_at(tab) != 9 {
+      tab = tab + 1
+    }
+    let mut nl = tab
+    while src.code_unit_at(nl) != 10 {
+      nl = nl + 1
+    }
+    let mask = parse_dec(src, i, tab)
+    let len = parse_dec(src, tab + 1, nl)
+    let body = src.slice(nl + 1, nl + 1 + len)
+    if mode == "batch" {
+      let ext = (mask & 64) != 0
+      let evs = if ext {
+        markdown::parse_extended(body, ext_opts(mask))
+      } else {
+        markdown::parse(body, mask_opts(mask))
+      }
+      let doc = parse_doc(body, mask)
+      let low : Array[markdown::Event] = Array::new()
+      lower_blocks(low, doc.blocks, false, None)
+      emit(out, markdown::render_html_pulldown(evs))
+      emit(out, markdown::render_html_pulldown(low))
+      let afm = match doc.front_matter {
+        Some(fm) => fm.content
+        None => "-"
+      }
+      emit(out, "E:" + ev_front_matter(evs) + "|A:" + afm)
+    } else {
+      let doc = parse_doc(body, mask)
+      emit(out, doc.plain_text(pt_opts(true, 0, false)))
+      emit(out, doc.plain_text(pt_opts(true, 0, true)))
+      emit(out, doc.plain_text(pt_opts(false, 0, true)))
+      emit(out, doc.plain_text(pt_opts(true, 1, false)))
+      emit(out, doc.plain_text(pt_opts(true, 7, true)))
+      emit(out, doc.plain_text(pt_opts(false, 13, true)))
+    }
+    i = nl + 1 + len
+  }
+  io_print(world, out.to_string())
+  0
+}
