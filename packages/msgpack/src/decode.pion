@@ -1,52 +1,1528 @@
-///| MessagePack decoder (stub for Red phase).
+///| High-performance pure Pion MessagePack decoder:
+///  - Full MessagePack spec (all 256 first-byte markers, rejecting reserved 0xC1)
+///  - Standard Timestamp ext -1 (32/64/96-bit) with strict nanosecond validation (< 1e9)
+///  - Strict RFC 3629 UTF-8 validation with ASCII fast path
+///  - Pre-allocation OOM defense (rejects huge declared lengths before allocation)
+///  - Hybrid recursive (depth <= 64) + explicit heap-stack iterative decoding (0 SIGSEGV at 100k+ depth)
+///  - Optional O(n) open-addressing hash duplicate-key detection and canonical shortest validation
 
 ///|
-pub fn decode(data : Bytes, opts : DecodeOptions) -> Result[MsgpackValue, MsgpackError] {
-  let _ = data
-  let _ = opts
-  Result::Err(MsgpackError::InvalidMarker(0, 0))
+let decode_rec_limit : Int = 64
+
+///| Hard safety cap on constructed MsgpackValue tree depth to prevent Pion's recursive RC drop
+///  from overflowing the native call stack (same defense as packages/cbor).
+let max_safe_tree_depth : Int = 1024
+
+///|
+struct Decoder {
+  data : Bytes
+  mut data_str : String
+  mut has_data_str : Bool
+  len : Int
+  mut pos : Int
+  max_depth : Int
+  max_items : Int
+  max_bytes : Int
+  mut items : Int
+  reject_duplicate_keys : Bool
+  require_canonical : Bool
+  decode_timestamp : Bool
+  mut has_err : Bool
+  mut err : MsgpackError
 }
 
 ///|
+fn set_err(dec : Decoder, err : MsgpackError) -> Unit {
+  if !dec.has_err {
+    dec.has_err = true
+    dec.err = err
+  }
+}
+
+///|
+fn extract_utf8_str(dec : Decoder, start : Int, n : Int) -> String {
+  if n == 0 {
+    return ""
+  }
+  // For small/medium buffers (<= 64 KiB), cache data.to_string() once and slice cheaply.
+  // For large buffers (> 64 KiB, e.g. 64 MiB binary payloads), slice the sub-range only to avoid copying 64 MiB.
+  if dec.len <= 65536 {
+    if !dec.has_data_str {
+      dec.data_str = dec.data.to_string()
+      dec.has_data_str = true
+    }
+    dec.data_str.slice(start, start + n)
+  } else {
+    dec.data.slice(start, start + n).to_string()
+  }
+}
+
+///| Strict RFC 3629 UTF-8 validator with ASCII fast loop.
+fn is_valid_utf8_range(data : Bytes, start : Int, len : Int) -> Bool {
+  let end = start + len
+  let mut i = start
+  while i < end {
+    let b0 = data[i].to_int()
+    if b0 < 0x80 {
+      i = i + 1
+      while i < end && data[i].to_int() < 0x80 {
+        i = i + 1
+      }
+    } else if b0 >= 0xC2 && b0 <= 0xDF {
+      if i + 1 >= end {
+        return false
+      }
+      let b1 = data[i + 1].to_int()
+      if (b1 & 0xC0) != 0x80 {
+        return false
+      }
+      i = i + 2
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+      if i + 2 >= end {
+        return false
+      }
+      let b1 = data[i + 1].to_int()
+      let b2 = data[i + 2].to_int()
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+        return false
+      }
+      if b0 == 0xE0 && b1 < 0xA0 {
+        return false
+      }
+      if b0 == 0xED && b1 >= 0xA0 {
+        return false
+      }
+      i = i + 3
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+      if i + 3 >= end {
+        return false
+      }
+      let b1 = data[i + 1].to_int()
+      let b2 = data[i + 2].to_int()
+      let b3 = data[i + 3].to_int()
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+        return false
+      }
+      if b0 == 0xF0 && b1 < 0x90 {
+        return false
+      }
+      if b0 == 0xF4 && b1 > 0x8F {
+        return false
+      }
+      i = i + 4
+    } else {
+      return false
+    }
+  }
+  true
+}
+
+///| SplitMix64 finalizer for low-collision 64-bit key hashing.
+fn mix64(x : UInt64) -> UInt64 {
+  let mut z = x + 0x9E3779B97F4A7C15UL
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL
+  z ^ (z >> 31)
+}
+
+///| Iterative stack-safe 64-bit structural hash consistent with `msgpack_equals`.
+fn msgpack_key_hash(root : MsgpackValue) -> UInt64 {
+  match root {
+    Nil => 0x1010101010101010UL
+    Bool(b) => if b { 0x2020202020202021UL } else { 0x2020202020202020UL }
+    UInt(u) => mix64(u ^ 0x3030303030303030UL)
+    Int(v) =>
+    if v >= 0L {
+      mix64(v.to_uint64() ^ 0x3030303030303030UL)
+    } else {
+      mix64(v.to_uint64() ^ 0x4040404040404040UL)
+    }
+    Float32(d) => mix64(d.to_bits().to_uint64() ^ 0x5050505050505050UL)
+    Float64(d) => mix64(d.to_bits().to_uint64() ^ 0x6060606060606060UL)
+    Str(s) => {
+      let n = s.length()
+      let mut h = 0xCBF29CE484222325UL ^ n.to_int64().to_uint64()
+      let mut i = 0
+      while i < n {
+        h = (h ^ s.code_unit_at(i).to_int64().to_uint64()) * 0x100000001B3UL
+        i = i + 1
+      }
+      mix64(h ^ 0x7070707070707070UL)
+    }
+    Bin(b) => {
+      let n = b.length()
+      let mut h = 0xCBF29CE484222325UL ^ n.to_int64().to_uint64()
+      let mut i = 0
+      while i < n {
+        h = (h ^ b[i].to_int().to_int64().to_uint64()) * 0x100000001B3UL
+        i = i + 1
+      }
+      mix64(h ^ 0x8080808080808080UL)
+    }
+    Ext(tag, data) => {
+      let n = data.length()
+      let mut h = mix64(tag.to_int64().to_uint64() ^ n.to_int64().to_uint64())
+      let mut i = 0
+      while i < n {
+        h = (h ^ data[i].to_int().to_int64().to_uint64()) * 0x100000001B3UL
+        i = i + 1
+      }
+      mix64(h ^ 0x9090909090909090UL)
+    }
+    Timestamp(sec, nsec) =>
+    mix64(sec.to_uint64() ^ (nsec.to_int64().to_uint64() * 0x100000001B3UL) ^ 0xA0A0A0A0A0A0A0A0UL)
+    Array(_) | Map(_) => {
+      let stack : Array[MsgpackValue] = [root]
+      let mut h = 0xB0B0B0B0B0B0B0B0UL
+      while stack.length() > 0 {
+        let cur = match stack.pop() {
+          Some(v) => v
+          None => break
+        }
+        match cur {
+          Array(items) => {
+            let n = items.length()
+            h = mix64(h ^ n.to_int64().to_uint64() ^ 0xC0C0C0C0C0C0C0C0UL)
+            let mut i = n - 1
+            while i >= 0 {
+              stack.push(items[i])
+              i = i - 1
+            }
+          }
+          Map(pairs) => {
+            let n = pairs.length()
+            h = mix64(h ^ n.to_int64().to_uint64() ^ 0xD0D0D0D0D0D0D0D0UL)
+            let mut i = n - 1
+            while i >= 0 {
+              let (k, v) = pairs[i]
+              stack.push(v)
+              stack.push(k)
+              i = i - 1
+            }
+          }
+          leaf => h = mix64(h ^ msgpack_key_hash(leaf))
+        }
+      }
+      h
+    }
+  }
+}
+
+///| Open-addressing hash set referencing indices into `pairs` for O(n) duplicate-key detection.
+struct KeyHashSet {
+  mut table : Array[Int]
+  mut mask : Int
+  mut count : Int
+  hashes : Array[UInt64]
+}
+
+///|
+fn make_key_hash_set(initial_cap : Int) -> KeyHashSet {
+  let mut cap = 32
+  while cap < initial_cap {
+    cap = cap * 2
+  }
+  let table : Array[Int] = Array::with_capacity(cap)
+  let mut i = 0
+  while i < cap {
+    table.push(-1)
+    i = i + 1
+  }
+  KeyHashSet::{ table: table, mask: cap - 1, count: 0, hashes: [] }
+}
+
+///|
+fn key_hash_set_grow(set : KeyHashSet) -> Unit {
+  let new_cap = (set.mask + 1) * 2
+  let new_mask = new_cap - 1
+  let new_table : Array[Int] = Array::with_capacity(new_cap)
+  let mut i = 0
+  while i < new_cap {
+    new_table.push(-1)
+    i = i + 1
+  }
+  let old_table = set.table
+  let old_len = old_table.length()
+  let hashes = set.hashes
+  let mut j = 0
+  while j < old_len {
+    let idx = old_table[j]
+    if idx >= 0 {
+      let mut slot = (hashes[idx] & new_mask.to_int64().to_uint64()).to_int()
+      while new_table[slot] >= 0 {
+        slot = (slot + 1) & new_mask
+      }
+      new_table[slot] = idx
+    }
+    j = j + 1
+  }
+  set.table = new_table
+  set.mask = new_mask
+}
+
+///| Insert key `k` at `pair_idx`. Returns `false` if duplicate exists.
+fn key_hash_set_insert(
+  set : KeyHashSet,
+  pairs : Array[(MsgpackValue, MsgpackValue)],
+  k : MsgpackValue,
+  pair_idx : Int,
+) -> Bool {
+  if (set.count + 1) * 10 >= (set.mask + 1) * 7 {
+    key_hash_set_grow(set)
+  }
+  let h = msgpack_key_hash(k)
+  let mask = set.mask
+  let table = set.table
+  let hashes = set.hashes
+  let mut slot = (h & mask.to_int64().to_uint64()).to_int()
+  while true {
+    let existing = table[slot]
+    if existing < 0 {
+      table[slot] = pair_idx
+      hashes.push(h)
+      set.count = set.count + 1
+      return true
+    }
+    if hashes[existing] == h {
+      let (pk, _) = pairs[existing]
+      if msgpack_equals(pk, k) {
+        return false
+      }
+    }
+    slot = (slot + 1) & mask
+  }
+  true
+}
+
+///|
+fn read_u16_be(data : Bytes, p : Int) -> Int {
+  (data[p].to_int() << 8) | data[p + 1].to_int()
+}
+
+///|
+fn read_u32_be(data : Bytes, p : Int) -> UInt64 {
+  let b0 = data[p].to_int().to_int64().to_uint64()
+  let b1 = data[p + 1].to_int().to_int64().to_uint64()
+  let b2 = data[p + 2].to_int().to_int64().to_uint64()
+  let b3 = data[p + 3].to_int().to_int64().to_uint64()
+  (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+///|
+fn read_u64_be(data : Bytes, p : Int) -> UInt64 {
+  let b0 = data[p].to_int().to_int64().to_uint64()
+  let b1 = data[p + 1].to_int().to_int64().to_uint64()
+  let b2 = data[p + 2].to_int().to_int64().to_uint64()
+  let b3 = data[p + 3].to_int().to_int64().to_uint64()
+  let b4 = data[p + 4].to_int().to_int64().to_uint64()
+  let b5 = data[p + 5].to_int().to_int64().to_uint64()
+  let b6 = data[p + 6].to_int().to_int64().to_uint64()
+  let b7 = data[p + 7].to_int().to_int64().to_uint64()
+  (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+}
+
+///| Decode ext payload (handling Timestamp ext -1 when enabled).
+fn decode_ext_payload(
+  dec : Decoder,
+  marker : Int,
+  start_pos : Int,
+  len_u64 : UInt64,
+) -> MsgpackValue {
+  let pos = dec.pos
+  // Check remaining bytes BEFORE max_bytes/allocation to reject OOM bombs immediately.
+  if pos >= dec.len {
+    set_err(dec, MsgpackError::UnexpectedEof(pos))
+    return MsgpackValue::Nil
+  }
+  let rem_after_type = (dec.len - pos - 1).to_int64().to_uint64()
+  if len_u64 > rem_after_type {
+    set_err(dec, MsgpackError::UnexpectedEof(pos))
+    return MsgpackValue::Nil
+  }
+  let max_b = dec.max_bytes.to_int64().to_uint64()
+  if len_u64 > max_b {
+    set_err(dec, MsgpackError::MaxBytesExceeded(dec.max_bytes))
+    return MsgpackValue::Nil
+  }
+  let len = len_u64.to_int()
+  let raw_type = dec.data[pos].to_int()
+  let ext_type = if raw_type >= 128 { raw_type - 256 } else { raw_type }
+  let payload_pos = pos + 1
+  dec.pos = payload_pos + len
+
+  if dec.decode_timestamp && ext_type == -1 {
+    if len == 4 {
+      if dec.require_canonical && marker != 0xD6 {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      let sec = read_u32_be(dec.data, payload_pos).to_int64()
+      return MsgpackValue::Timestamp(sec, 0)
+    }
+    if len == 8 {
+      let data64 = read_u64_be(dec.data, payload_pos)
+      let nsec_u64 = (data64 >> 34) & 0x3FFFFFFFUL
+      if nsec_u64 > 999999999UL {
+        set_err(dec, MsgpackError::InvalidTimestamp(start_pos))
+        return MsgpackValue::Nil
+      }
+      let sec = (data64 & 0x3FFFFFFFFUL).to_int64()
+      let nsec = nsec_u64.to_int()
+      if dec.require_canonical && (marker != 0xD7 || (nsec == 0 && sec <= 0xFFFFFFFFL)) {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      return MsgpackValue::Timestamp(sec, nsec)
+    }
+    if len == 12 {
+      let nsec_u64 = read_u32_be(dec.data, payload_pos)
+      if nsec_u64 > 999999999UL {
+        set_err(dec, MsgpackError::InvalidTimestamp(start_pos))
+        return MsgpackValue::Nil
+      }
+      let sec = read_u64_be(dec.data, payload_pos + 4).to_int64()
+      if dec.require_canonical && (marker != 0xC7 || (sec >= 0L && (sec >> 34) == 0L)) {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      return MsgpackValue::Timestamp(sec, nsec_u64.to_int())
+    }
+    set_err(dec, MsgpackError::InvalidTimestamp(start_pos))
+    return MsgpackValue::Nil
+  }
+
+  // Canonical ext marker check for non-timestamp ext
+  if dec.require_canonical {
+    if marker == 0xC7 && (len == 1 || len == 2 || len == 4 || len == 8 || len == 16) {
+      set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+      return MsgpackValue::Nil
+    }
+    if marker == 0xC8 && len <= 0xFF {
+      set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+      return MsgpackValue::Nil
+    }
+    if marker == 0xC9 && len <= 0xFFFF {
+      set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+      return MsgpackValue::Nil
+    }
+  }
+
+  if len == 0 {
+    MsgpackValue::Ext(ext_type, Bytes::new(0))
+  } else {
+    MsgpackValue::Ext(ext_type, dec.data.slice(payload_pos, payload_pos + len))
+  }
+}
+
+///| Decode a validated string of `len_u64` bytes starting at `dec.pos`.
+fn decode_str_payload(dec : Decoder, len_u64 : UInt64) -> MsgpackValue {
+  let pos = dec.pos
+  let rem = (dec.len - pos).to_int64().to_uint64()
+  if len_u64 > rem {
+    set_err(dec, MsgpackError::UnexpectedEof(pos))
+    return MsgpackValue::Nil
+  }
+  let max_b = dec.max_bytes.to_int64().to_uint64()
+  if len_u64 > max_b {
+    set_err(dec, MsgpackError::MaxBytesExceeded(dec.max_bytes))
+    return MsgpackValue::Nil
+  }
+  let n = len_u64.to_int()
+  if n == 0 {
+    return MsgpackValue::Str("")
+  }
+  if !is_valid_utf8_range(dec.data, pos, n) {
+    set_err(dec, MsgpackError::InvalidUtf8(pos))
+    return MsgpackValue::Nil
+  }
+  dec.pos = pos + n
+  MsgpackValue::Str(extract_utf8_str(dec, pos, n))
+}
+
+///| Decode a binary byte slice of `len_u64` bytes starting at `dec.pos`.
+fn decode_bin_payload(dec : Decoder, len_u64 : UInt64) -> MsgpackValue {
+  let pos = dec.pos
+  let rem = (dec.len - pos).to_int64().to_uint64()
+  if len_u64 > rem {
+    set_err(dec, MsgpackError::UnexpectedEof(pos))
+    return MsgpackValue::Nil
+  }
+  let max_b = dec.max_bytes.to_int64().to_uint64()
+  if len_u64 > max_b {
+    set_err(dec, MsgpackError::MaxBytesExceeded(dec.max_bytes))
+    return MsgpackValue::Nil
+  }
+  let n = len_u64.to_int()
+  if n == 0 {
+    return MsgpackValue::Bin(Bytes::new(0))
+  }
+  dec.pos = pos + n
+  MsgpackValue::Bin(dec.data.slice(pos, pos + n))
+}
+
+///| Validate array count against remaining bytes and max_items BEFORE allocating.
+fn validate_array_count(dec : Decoder, count_u64 : UInt64) -> Int {
+  let rem = (dec.len - dec.pos).to_int64().to_uint64()
+  if count_u64 > rem {
+    set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+    return -1
+  }
+  let avail_items = (dec.max_items - dec.items).to_int64().to_uint64()
+  if count_u64 > avail_items {
+    set_err(dec, MsgpackError::MaxItemsExceeded(dec.max_items))
+    return -1
+  }
+  count_u64.to_int()
+}
+
+///| Validate map pair count against remaining bytes (2 bytes/pair min) and max_items BEFORE allocating.
+fn validate_map_count(dec : Decoder, count_u64 : UInt64) -> Int {
+  let rem = (dec.len - dec.pos).to_int64().to_uint64()
+  if count_u64 > rem / 2UL {
+    set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+    return -1
+  }
+  let avail_items = (dec.max_items - dec.items).to_int64().to_uint64()
+  if count_u64 > avail_items / 2UL {
+    set_err(dec, MsgpackError::MaxItemsExceeded(dec.max_items))
+    return -1
+  }
+  count_u64.to_int()
+}
+
+///| Explicit heap-stack iterative decoder for deep nesting (depth > decode_rec_limit).
+///  Guaranteed 0 SIGSEGV even at 100,000+ nesting depth!
+fn decode_iter(dec : Decoder, start_depth : Int) -> MsgpackValue {
+  let frame_kind : Array[Int] = [] // 0 = Array, 1 = Map
+  let frame_rem : Array[Int] = []
+  let frame_arr : Array[Array[MsgpackValue]] = []
+  let frame_map : Array[Array[(MsgpackValue, MsgpackValue)]] = []
+  let frame_has_key : Array[Bool] = []
+  let frame_key : Array[MsgpackValue] = []
+  let frame_key_pos : Array[Int] = []
+  let frame_hash : Array[Option[KeyHashSet]] = []
+
+  while true {
+    if dec.has_err {
+      return MsgpackValue::Nil
+    }
+    let cur_depth = start_depth + frame_kind.length()
+    let start_pos = dec.pos
+    if start_pos >= dec.len {
+      set_err(dec, MsgpackError::UnexpectedEof(start_pos))
+      return MsgpackValue::Nil
+    }
+    dec.items = dec.items + 1
+    if dec.items > dec.max_items {
+      set_err(dec, MsgpackError::MaxItemsExceeded(dec.max_items))
+      return MsgpackValue::Nil
+    }
+    let b = dec.data[start_pos].to_int()
+    dec.pos = start_pos + 1
+
+    let mut produced = false
+    let mut cur_val = MsgpackValue::Nil
+
+    if b <= 0x7F {
+      cur_val = MsgpackValue::UInt(b.to_int64().to_uint64())
+      produced = true
+    } else if b >= 0xE0 {
+      cur_val = MsgpackValue::Int((b - 256).to_int64())
+      produced = true
+    } else if b >= 0xA0 && b <= 0xBF {
+      cur_val = decode_str_payload(dec, (b & 0x1F).to_int64().to_uint64())
+      produced = true
+    } else if b >= 0x90 && b <= 0x9F {
+      let next_depth = cur_depth + 1
+      if next_depth > dec.max_depth {
+        set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+        return MsgpackValue::Nil
+      }
+      let n = b & 0x0F
+      if n == 0 {
+        cur_val = MsgpackValue::Array([])
+        produced = true
+      } else {
+        let count = validate_array_count(dec, n.to_int64().to_uint64())
+        if count < 0 {
+          return MsgpackValue::Nil
+        }
+        frame_kind.push(0)
+        frame_rem.push(count)
+        frame_arr.push(Array::with_capacity(count))
+        frame_map.push([])
+        frame_has_key.push(false)
+        frame_key.push(MsgpackValue::Nil)
+        frame_key_pos.push(0)
+        frame_hash.push(Option::None)
+      }
+    } else if b >= 0x80 && b <= 0x8F {
+      let next_depth = cur_depth + 1
+      if next_depth > dec.max_depth {
+        set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+        return MsgpackValue::Nil
+      }
+      let n = b & 0x0F
+      if n == 0 {
+        cur_val = MsgpackValue::Map([])
+        produced = true
+      } else {
+        let count = validate_map_count(dec, n.to_int64().to_uint64())
+        if count < 0 {
+          return MsgpackValue::Nil
+        }
+        frame_kind.push(1)
+        frame_rem.push(count)
+        frame_arr.push([])
+        frame_map.push(Array::with_capacity(count))
+        frame_has_key.push(false)
+        frame_key.push(MsgpackValue::Nil)
+        frame_key_pos.push(0)
+        if dec.reject_duplicate_keys && count > 8 {
+          frame_hash.push(Option::Some(make_key_hash_set(count * 2)))
+        } else {
+          frame_hash.push(Option::None)
+        }
+      }
+    } else if b == 0xDC || b == 0xDD {
+      let next_depth = cur_depth + 1
+      if next_depth > dec.max_depth {
+        set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+        return MsgpackValue::Nil
+      }
+      let count_u64 = if b == 0xDC {
+        if dec.len - dec.pos < 2 {
+          set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+          return MsgpackValue::Nil
+        }
+        let v = read_u16_be(dec.data, dec.pos).to_int64().to_uint64()
+        dec.pos = dec.pos + 2
+        if dec.require_canonical && v <= 15UL {
+          set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+          return MsgpackValue::Nil
+        }
+        v
+      } else {
+        if dec.len - dec.pos < 4 {
+          set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+          return MsgpackValue::Nil
+        }
+        let v = read_u32_be(dec.data, dec.pos)
+        dec.pos = dec.pos + 4
+        if dec.require_canonical && v <= 0xFFFFUL {
+          set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+          return MsgpackValue::Nil
+        }
+        v
+      }
+      if count_u64 == 0UL {
+        cur_val = MsgpackValue::Array([])
+        produced = true
+      } else {
+        let count = validate_array_count(dec, count_u64)
+        if count < 0 {
+          return MsgpackValue::Nil
+        }
+        frame_kind.push(0)
+        frame_rem.push(count)
+        frame_arr.push(Array::with_capacity(count))
+        frame_map.push([])
+        frame_has_key.push(false)
+        frame_key.push(MsgpackValue::Nil)
+        frame_key_pos.push(0)
+        frame_hash.push(Option::None)
+      }
+    } else if b == 0xDE || b == 0xDF {
+      let next_depth = cur_depth + 1
+      if next_depth > dec.max_depth {
+        set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+        return MsgpackValue::Nil
+      }
+      let count_u64 = if b == 0xDE {
+        if dec.len - dec.pos < 2 {
+          set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+          return MsgpackValue::Nil
+        }
+        let v = read_u16_be(dec.data, dec.pos).to_int64().to_uint64()
+        dec.pos = dec.pos + 2
+        if dec.require_canonical && v <= 15UL {
+          set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+          return MsgpackValue::Nil
+        }
+        v
+      } else {
+        if dec.len - dec.pos < 4 {
+          set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+          return MsgpackValue::Nil
+        }
+        let v = read_u32_be(dec.data, dec.pos)
+        dec.pos = dec.pos + 4
+        if dec.require_canonical && v <= 0xFFFFUL {
+          set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+          return MsgpackValue::Nil
+        }
+        v
+      }
+      if count_u64 == 0UL {
+        cur_val = MsgpackValue::Map([])
+        produced = true
+      } else {
+        let count = validate_map_count(dec, count_u64)
+        if count < 0 {
+          return MsgpackValue::Nil
+        }
+        frame_kind.push(1)
+        frame_rem.push(count)
+        frame_arr.push([])
+        frame_map.push(Array::with_capacity(count))
+        frame_has_key.push(false)
+        frame_key.push(MsgpackValue::Nil)
+        frame_key_pos.push(0)
+        if dec.reject_duplicate_keys && count > 8 {
+          frame_hash.push(Option::Some(make_key_hash_set(count * 2)))
+        } else {
+          frame_hash.push(Option::None)
+        }
+      }
+    } else {
+      cur_val = decode_scalar_marker(dec, b, start_pos)
+      produced = true
+    }
+
+    if dec.has_err {
+      return MsgpackValue::Nil
+    }
+
+    while produced {
+      let top = frame_kind.length() - 1
+      if top < 0 {
+        return cur_val
+      }
+      if frame_kind[top] == 0 {
+        // Array frame
+        let arr = frame_arr[top]
+        arr.push(cur_val)
+        let rem = frame_rem[top] - 1
+        frame_rem[top] = rem
+        if rem == 0 {
+          let _ = frame_kind.pop()
+          let _ = frame_rem.pop()
+          let _ = frame_arr.pop()
+          let _ = frame_map.pop()
+          let _ = frame_has_key.pop()
+          let _ = frame_key.pop()
+          let _ = frame_key_pos.pop()
+          let _ = frame_hash.pop()
+          cur_val = MsgpackValue::Array(arr)
+        } else {
+          produced = false
+        }
+      } else {
+        // Map frame
+        if !frame_has_key[top] {
+          frame_key[top] = cur_val
+          frame_key_pos[top] = start_pos
+          frame_has_key[top] = true
+          produced = false
+        } else {
+          let pairs = frame_map[top]
+          let k = frame_key[top]
+          if dec.reject_duplicate_keys {
+            match frame_hash[top] {
+              Some(hset) =>
+              if !key_hash_set_insert(hset, pairs, k, pairs.length()) {
+                set_err(dec, MsgpackError::DuplicateMapKey(frame_key_pos[top]))
+                return MsgpackValue::Nil
+              }
+              None => {
+                let mut j = 0
+                while j < pairs.length() {
+                  let (pk, _) = pairs[j]
+                  if msgpack_equals(pk, k) {
+                    set_err(dec, MsgpackError::DuplicateMapKey(frame_key_pos[top]))
+                    return MsgpackValue::Nil
+                  }
+                  j = j + 1
+                }
+              }
+            }
+          }
+          pairs.push((k, cur_val))
+          frame_has_key[top] = false
+          let rem = frame_rem[top] - 1
+          frame_rem[top] = rem
+          if rem == 0 {
+            let _ = frame_kind.pop()
+            let _ = frame_rem.pop()
+            let _ = frame_arr.pop()
+            let _ = frame_map.pop()
+            let _ = frame_has_key.pop()
+            let _ = frame_key.pop()
+            let _ = frame_key_pos.pop()
+            let _ = frame_hash.pop()
+            cur_val = MsgpackValue::Map(pairs)
+          } else {
+            produced = false
+          }
+        }
+      }
+    }
+  }
+  MsgpackValue::Nil
+}
+
+///| Decode non-container markers (`0xC0..=0xDB`, excluding arrays/maps/fixint/fixstr).
+fn decode_scalar_marker(dec : Decoder, b : Int, start_pos : Int) -> MsgpackValue {
+  let data = dec.data
+  let pos = dec.pos
+  let rem = dec.len - pos
+  match b {
+    0xC0 => MsgpackValue::Nil
+    0xC1 => {
+      set_err(dec, MsgpackError::InvalidMarker(0xC1, start_pos))
+      MsgpackValue::Nil
+    }
+    0xC2 => MsgpackValue::Bool(false)
+    0xC3 => MsgpackValue::Bool(true)
+    0xC4 => {
+      if rem < 1 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = data[pos].to_int().to_int64().to_uint64()
+      dec.pos = pos + 1
+      decode_bin_payload(dec, n)
+    }
+    0xC5 => {
+      if rem < 2 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = read_u16_be(data, pos).to_int64().to_uint64()
+      dec.pos = pos + 2
+      if dec.require_canonical && n <= 0xFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      decode_bin_payload(dec, n)
+    }
+    0xC6 => {
+      if rem < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = read_u32_be(data, pos)
+      dec.pos = pos + 4
+      if dec.require_canonical && n <= 0xFFFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      decode_bin_payload(dec, n)
+    }
+    0xC7 => {
+      if rem < 1 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = data[pos].to_int().to_int64().to_uint64()
+      dec.pos = pos + 1
+      decode_ext_payload(dec, 0xC7, start_pos, n)
+    }
+    0xC8 => {
+      if rem < 2 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = read_u16_be(data, pos).to_int64().to_uint64()
+      dec.pos = pos + 2
+      decode_ext_payload(dec, 0xC8, start_pos, n)
+    }
+    0xC9 => {
+      if rem < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = read_u32_be(data, pos)
+      dec.pos = pos + 4
+      decode_ext_payload(dec, 0xC9, start_pos, n)
+    }
+    0xCA => {
+      if rem < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let bits = read_u32_be(data, pos).to_int64()
+      dec.pos = pos + 4
+      MsgpackValue::Float32(float32_to_double(bits))
+    }
+    0xCB => {
+      if rem < 8 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let bits = read_u64_be(data, pos).to_int64()
+      dec.pos = pos + 8
+      MsgpackValue::Float64(Double::from_bits(bits))
+    }
+    0xCC => {
+      if rem < 1 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let v = data[pos].to_int().to_int64().to_uint64()
+      dec.pos = pos + 1
+      if dec.require_canonical && v <= 0x7FUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      MsgpackValue::UInt(v)
+    }
+    0xCD => {
+      if rem < 2 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u16_be(data, pos).to_int64().to_uint64()
+      dec.pos = pos + 2
+      if dec.require_canonical && v <= 0xFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      MsgpackValue::UInt(v)
+    }
+    0xCE => {
+      if rem < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u32_be(data, pos)
+      dec.pos = pos + 4
+      if dec.require_canonical && v <= 0xFFFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      MsgpackValue::UInt(v)
+    }
+    0xCF => {
+      if rem < 8 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u64_be(data, pos)
+      dec.pos = pos + 8
+      if dec.require_canonical && v <= 0xFFFFFFFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      MsgpackValue::UInt(v)
+    }
+    0xD0 => {
+      if rem < 1 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let raw = data[pos].to_int()
+      dec.pos = pos + 1
+      let v = (if raw >= 128 { raw - 256 } else { raw }).to_int64()
+      if dec.require_canonical && v >= -32L {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      if v >= 0L {
+        MsgpackValue::UInt(v.to_uint64())
+      } else {
+        MsgpackValue::Int(v)
+      }
+    }
+    0xD1 => {
+      if rem < 2 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let raw = read_u16_be(data, pos)
+      dec.pos = pos + 2
+      let v = (if raw >= 32768 { raw - 65536 } else { raw }).to_int64()
+      if dec.require_canonical && v >= -128L {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      if v >= 0L {
+        MsgpackValue::UInt(v.to_uint64())
+      } else {
+        MsgpackValue::Int(v)
+      }
+    }
+    0xD2 => {
+      if rem < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let u = read_u32_be(data, pos).to_int64()
+      dec.pos = pos + 4
+      let v = if u >= 0x80000000L { u - 0x100000000L } else { u }
+      if dec.require_canonical && v >= -32768L {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      if v >= 0L {
+        MsgpackValue::UInt(v.to_uint64())
+      } else {
+        MsgpackValue::Int(v)
+      }
+    }
+    0xD3 => {
+      if rem < 8 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u64_be(data, pos).to_int64()
+      dec.pos = pos + 8
+      if dec.require_canonical && v >= -2147483648L {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      if v >= 0L {
+        MsgpackValue::UInt(v.to_uint64())
+      } else {
+        MsgpackValue::Int(v)
+      }
+    }
+    0xD4 => decode_ext_payload(dec, 0xD4, start_pos, 1UL)
+    0xD5 => decode_ext_payload(dec, 0xD5, start_pos, 2UL)
+    0xD6 => decode_ext_payload(dec, 0xD6, start_pos, 4UL)
+    0xD7 => decode_ext_payload(dec, 0xD7, start_pos, 8UL)
+    0xD8 => decode_ext_payload(dec, 0xD8, start_pos, 16UL)
+    0xD9 => {
+      if rem < 1 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = data[pos].to_int().to_int64().to_uint64()
+      dec.pos = pos + 1
+      if dec.require_canonical && n <= 31UL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      decode_str_payload(dec, n)
+    }
+    0xDA => {
+      if rem < 2 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = read_u16_be(data, pos).to_int64().to_uint64()
+      dec.pos = pos + 2
+      if dec.require_canonical && n <= 0xFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      decode_str_payload(dec, n)
+    }
+    0xDB => {
+      if rem < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(pos))
+        return MsgpackValue::Nil
+      }
+      let n = read_u32_be(data, pos)
+      dec.pos = pos + 4
+      if dec.require_canonical && n <= 0xFFFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      decode_str_payload(dec, n)
+    }
+    _ => {
+      set_err(dec, MsgpackError::InvalidMarker(b, start_pos))
+      MsgpackValue::Nil
+    }
+  }
+}
+
+///| Fast recursive decoder for depth <= `decode_rec_limit`, falling back to `decode_iter`.
+fn decode_item(dec : Decoder, depth : Int) -> MsgpackValue {
+  if depth >= decode_rec_limit {
+    return decode_iter(dec, depth)
+  }
+  let start_pos = dec.pos
+  if start_pos >= dec.len {
+    set_err(dec, MsgpackError::UnexpectedEof(start_pos))
+    return MsgpackValue::Nil
+  }
+  dec.items = dec.items + 1
+  if dec.items > dec.max_items {
+    set_err(dec, MsgpackError::MaxItemsExceeded(dec.max_items))
+    return MsgpackValue::Nil
+  }
+  let b = dec.data[start_pos].to_int()
+  dec.pos = start_pos + 1
+
+  if b <= 0x7F {
+    return MsgpackValue::UInt(b.to_int64().to_uint64())
+  }
+  if b >= 0xE0 {
+    return MsgpackValue::Int((b - 256).to_int64())
+  }
+  if b >= 0xA0 && b <= 0xBF {
+    return decode_str_payload(dec, (b & 0x1F).to_int64().to_uint64())
+  }
+  if b >= 0x90 && b <= 0x9F {
+    let next_depth = depth + 1
+    if next_depth > dec.max_depth {
+      set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+      return MsgpackValue::Nil
+    }
+    let n = b & 0x0F
+    if n == 0 {
+      return MsgpackValue::Array([])
+    }
+    let count = validate_array_count(dec, n.to_int64().to_uint64())
+    if count < 0 {
+      return MsgpackValue::Nil
+    }
+    let items : Array[MsgpackValue] = Array::with_capacity(count)
+    let mut i = 0
+    while i < count {
+      let elem = decode_item(dec, next_depth)
+      if dec.has_err {
+        return MsgpackValue::Nil
+      }
+      items.push(elem)
+      i = i + 1
+    }
+    return MsgpackValue::Array(items)
+  }
+  if b >= 0x80 && b <= 0x8F {
+    let next_depth = depth + 1
+    if next_depth > dec.max_depth {
+      set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+      return MsgpackValue::Nil
+    }
+    let n = b & 0x0F
+    if n == 0 {
+      return MsgpackValue::Map([])
+    }
+    let count = validate_map_count(dec, n.to_int64().to_uint64())
+    if count < 0 {
+      return MsgpackValue::Nil
+    }
+    return decode_map_entries(dec, count, next_depth)
+  }
+  if b == 0xDC || b == 0xDD {
+    let next_depth = depth + 1
+    if next_depth > dec.max_depth {
+      set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+      return MsgpackValue::Nil
+    }
+    let count_u64 = if b == 0xDC {
+      if dec.len - dec.pos < 2 {
+        set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u16_be(dec.data, dec.pos).to_int64().to_uint64()
+      dec.pos = dec.pos + 2
+      if dec.require_canonical && v <= 15UL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      v
+    } else {
+      if dec.len - dec.pos < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u32_be(dec.data, dec.pos)
+      dec.pos = dec.pos + 4
+      if dec.require_canonical && v <= 0xFFFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      v
+    }
+    if count_u64 == 0UL {
+      return MsgpackValue::Array([])
+    }
+    let count = validate_array_count(dec, count_u64)
+    if count < 0 {
+      return MsgpackValue::Nil
+    }
+    let items : Array[MsgpackValue] = Array::with_capacity(count)
+    let mut i = 0
+    while i < count {
+      let elem = decode_item(dec, next_depth)
+      if dec.has_err {
+        return MsgpackValue::Nil
+      }
+      items.push(elem)
+      i = i + 1
+    }
+    return MsgpackValue::Array(items)
+  }
+  if b == 0xDE || b == 0xDF {
+    let next_depth = depth + 1
+    if next_depth > dec.max_depth {
+      set_err(dec, MsgpackError::MaxDepthExceeded(dec.max_depth))
+      return MsgpackValue::Nil
+    }
+    let count_u64 = if b == 0xDE {
+      if dec.len - dec.pos < 2 {
+        set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u16_be(dec.data, dec.pos).to_int64().to_uint64()
+      dec.pos = dec.pos + 2
+      if dec.require_canonical && v <= 15UL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      v
+    } else {
+      if dec.len - dec.pos < 4 {
+        set_err(dec, MsgpackError::UnexpectedEof(dec.pos))
+        return MsgpackValue::Nil
+      }
+      let v = read_u32_be(dec.data, dec.pos)
+      dec.pos = dec.pos + 4
+      if dec.require_canonical && v <= 0xFFFFUL {
+        set_err(dec, MsgpackError::NonCanonicalEncoding(start_pos))
+        return MsgpackValue::Nil
+      }
+      v
+    }
+    if count_u64 == 0UL {
+      return MsgpackValue::Map([])
+    }
+    let count = validate_map_count(dec, count_u64)
+    if count < 0 {
+      return MsgpackValue::Nil
+    }
+    return decode_map_entries(dec, count, next_depth)
+  }
+  decode_scalar_marker(dec, b, start_pos)
+}
+
+///|
+fn decode_map_entries(dec : Decoder, count : Int, next_depth : Int) -> MsgpackValue {
+  let pairs : Array[(MsgpackValue, MsgpackValue)] = Array::with_capacity(count)
+  if !dec.reject_duplicate_keys {
+    let mut i = 0
+    while i < count {
+      let k = decode_item(dec, next_depth)
+      if dec.has_err {
+        return MsgpackValue::Nil
+      }
+      let v = decode_item(dec, next_depth)
+      if dec.has_err {
+        return MsgpackValue::Nil
+      }
+      pairs.push((k, v))
+      i = i + 1
+    }
+    return MsgpackValue::Map(pairs)
+  }
+  if count <= 8 {
+    let mut i = 0
+    while i < count {
+      let kpos = dec.pos
+      let k = decode_item(dec, next_depth)
+      if dec.has_err {
+        return MsgpackValue::Nil
+      }
+      let mut j = 0
+      while j < i {
+        let (pk, _) = pairs[j]
+        if msgpack_equals(pk, k) {
+          set_err(dec, MsgpackError::DuplicateMapKey(kpos))
+          return MsgpackValue::Nil
+        }
+        j = j + 1
+      }
+      let v = decode_item(dec, next_depth)
+      if dec.has_err {
+        return MsgpackValue::Nil
+      }
+      pairs.push((k, v))
+      i = i + 1
+    }
+    return MsgpackValue::Map(pairs)
+  }
+  let hset = make_key_hash_set(count * 2)
+  let mut i = 0
+  while i < count {
+    let kpos = dec.pos
+    let k = decode_item(dec, next_depth)
+    if dec.has_err {
+      return MsgpackValue::Nil
+    }
+    if !key_hash_set_insert(hset, pairs, k, i) {
+      set_err(dec, MsgpackError::DuplicateMapKey(kpos))
+      return MsgpackValue::Nil
+    }
+    let v = decode_item(dec, next_depth)
+    if dec.has_err {
+      return MsgpackValue::Nil
+    }
+    pairs.push((k, v))
+    i = i + 1
+  }
+  MsgpackValue::Map(pairs)
+}
+
+///|
+fn make_decoder(data : Bytes, offset : Int, opts : DecodeOptions) -> Decoder {
+  let safe_depth = if opts.max_depth > max_safe_tree_depth {
+    max_safe_tree_depth
+  } else {
+    opts.max_depth
+  }
+  Decoder::{
+    data: data,
+    data_str: "",
+    has_data_str: false,
+    len: data.length(),
+    pos: offset,
+    max_depth: safe_depth,
+    max_items: opts.max_items,
+    max_bytes: opts.max_bytes,
+    items: 0,
+    reject_duplicate_keys: opts.reject_duplicate_keys,
+    require_canonical: opts.require_canonical,
+    decode_timestamp: opts.decode_timestamp,
+    has_err: false,
+    err: MsgpackError::UnexpectedEof(0),
+  }
+}
+
+///| Decode a single MessagePack value from `data` with custom options.
+pub fn decode(data : Bytes, opts : DecodeOptions) -> Result[MsgpackValue, MsgpackError] {
+  let dec = make_decoder(data, 0, opts)
+  let v = decode_item(dec, 0)
+  if dec.has_err {
+    return Result::Err(dec.err)
+  }
+  if !opts.allow_trailing_bytes && dec.pos < dec.len {
+    return Result::Err(MsgpackError::TrailingBytes(dec.pos))
+  }
+  Result::Ok(v)
+}
+
+///| Decode a single MessagePack value from `data` with default options.
 pub fn decode_default(data : Bytes) -> Result[MsgpackValue, MsgpackError] {
   decode(data, DecodeOptions::default())
 }
 
-///|
-pub fn decode_prefix(
-  data : Bytes,
-  opts : DecodeOptions,
-) -> Result[(MsgpackValue, Int), MsgpackError] {
-  let _ = data
-  let _ = opts
-  Result::Err(MsgpackError::InvalidMarker(0, 0))
-}
-
-///|
+///| Decode the first MessagePack value at `offset`, returning `(value, bytes_consumed)`.
 pub fn decode_prefix_at(
   data : Bytes,
   offset : Int,
   opts : DecodeOptions,
 ) -> Result[(MsgpackValue, Int), MsgpackError] {
-  let _ = data
-  let _ = offset
-  let _ = opts
-  Result::Err(MsgpackError::InvalidMarker(0, 0))
+  if offset < 0 || offset >= data.length() {
+    return Result::Err(MsgpackError::UnexpectedEof(offset))
+  }
+  let dec = make_decoder(data, offset, opts)
+  let v = decode_item(dec, 0)
+  if dec.has_err {
+    return Result::Err(dec.err)
+  }
+  Result::Ok((v, dec.pos - offset))
 }
 
-///|
+///| Decode the first MessagePack value at offset 0, returning `(value, bytes_consumed)`.
+pub fn decode_prefix(
+  data : Bytes,
+  opts : DecodeOptions,
+) -> Result[(MsgpackValue, Int), MsgpackError] {
+  decode_prefix_at(data, 0, opts)
+}
+
+///| Decode a concatenated stream of MessagePack values until EOF.
 pub fn decode_all(
   data : Bytes,
   opts : DecodeOptions,
 ) -> Result[Array[MsgpackValue], MsgpackError] {
-  let _ = data
-  let _ = opts
-  Result::Err(MsgpackError::InvalidMarker(0, 0))
+  let dec = make_decoder(data, 0, opts)
+  let out : Array[MsgpackValue] = []
+  while dec.pos < dec.len {
+    dec.items = 0
+    let v = decode_item(dec, 0)
+    if dec.has_err {
+      return Result::Err(dec.err)
+    }
+    out.push(v)
+  }
+  Result::Ok(out)
 }
 
-///|
+///| Zero-tree iterative validator supporting arbitrary nesting depth (100,000+ layers, 0 SIGSEGV).
+fn validate_iter(data : Bytes, opts : DecodeOptions) -> Result[Unit, MsgpackError] {
+  if opts.reject_duplicate_keys {
+    return match decode(data, opts) {
+      Ok(_) => Result::Ok(())
+      Err(e) => Result::Err(e)
+    }
+  }
+  let dec = Decoder::{
+    data: data,
+    data_str: "",
+    has_data_str: false,
+    len: data.length(),
+    pos: 0,
+    max_depth: opts.max_depth,
+    max_items: opts.max_items,
+    max_bytes: opts.max_bytes,
+    items: 0,
+    reject_duplicate_keys: false,
+    require_canonical: opts.require_canonical,
+    decode_timestamp: opts.decode_timestamp,
+    has_err: false,
+    err: MsgpackError::UnexpectedEof(0),
+  }
+  // Stack of remaining child value counts (for arrays: N; for maps: 2*N)
+  let rem_stack : Array[Int] = []
+  while true {
+    let start_pos = dec.pos
+    if start_pos >= dec.len {
+      return Result::Err(MsgpackError::UnexpectedEof(start_pos))
+    }
+    dec.items = dec.items + 1
+    if dec.items > dec.max_items {
+      return Result::Err(MsgpackError::MaxItemsExceeded(dec.max_items))
+    }
+    let b = dec.data[start_pos].to_int()
+    dec.pos = start_pos + 1
+    let mut pushed = false
+    if b <= 0x7F || b >= 0xE0 {
+      ()
+    } else if b >= 0xA0 && b <= 0xBF {
+      let _ = decode_str_payload(dec, (b & 0x1F).to_int64().to_uint64())
+      if dec.has_err {
+        return Result::Err(dec.err)
+      }
+    } else if b >= 0x90 && b <= 0x9F {
+      let next_depth = rem_stack.length() + 1
+      if next_depth > dec.max_depth {
+        return Result::Err(MsgpackError::MaxDepthExceeded(dec.max_depth))
+      }
+      let n = b & 0x0F
+      if n > 0 {
+        let count = validate_array_count(dec, n.to_int64().to_uint64())
+        if count < 0 {
+          return Result::Err(dec.err)
+        }
+        rem_stack.push(count)
+        pushed = true
+      }
+    } else if b >= 0x80 && b <= 0x8F {
+      let next_depth = rem_stack.length() + 1
+      if next_depth > dec.max_depth {
+        return Result::Err(MsgpackError::MaxDepthExceeded(dec.max_depth))
+      }
+      let n = b & 0x0F
+      if n > 0 {
+        let count = validate_map_count(dec, n.to_int64().to_uint64())
+        if count < 0 {
+          return Result::Err(dec.err)
+        }
+        rem_stack.push(count * 2)
+        pushed = true
+      }
+    } else if b == 0xDC || b == 0xDD {
+      let next_depth = rem_stack.length() + 1
+      if next_depth > dec.max_depth {
+        return Result::Err(MsgpackError::MaxDepthExceeded(dec.max_depth))
+      }
+      let count_u64 = if b == 0xDC {
+        if dec.len - dec.pos < 2 {
+          return Result::Err(MsgpackError::UnexpectedEof(dec.pos))
+        }
+        let v = read_u16_be(dec.data, dec.pos).to_int64().to_uint64()
+        dec.pos = dec.pos + 2
+        if dec.require_canonical && v <= 15UL {
+          return Result::Err(MsgpackError::NonCanonicalEncoding(start_pos))
+        }
+        v
+      } else {
+        if dec.len - dec.pos < 4 {
+          return Result::Err(MsgpackError::UnexpectedEof(dec.pos))
+        }
+        let v = read_u32_be(dec.data, dec.pos)
+        dec.pos = dec.pos + 4
+        if dec.require_canonical && v <= 0xFFFFUL {
+          return Result::Err(MsgpackError::NonCanonicalEncoding(start_pos))
+        }
+        v
+      }
+      if count_u64 > 0UL {
+        let count = validate_array_count(dec, count_u64)
+        if count < 0 {
+          return Result::Err(dec.err)
+        }
+        rem_stack.push(count)
+        pushed = true
+      }
+    } else if b == 0xDE || b == 0xDF {
+      let next_depth = rem_stack.length() + 1
+      if next_depth > dec.max_depth {
+        return Result::Err(MsgpackError::MaxDepthExceeded(dec.max_depth))
+      }
+      let count_u64 = if b == 0xDE {
+        if dec.len - dec.pos < 2 {
+          return Result::Err(MsgpackError::UnexpectedEof(dec.pos))
+        }
+        let v = read_u16_be(dec.data, dec.pos).to_int64().to_uint64()
+        dec.pos = dec.pos + 2
+        if dec.require_canonical && v <= 15UL {
+          return Result::Err(MsgpackError::NonCanonicalEncoding(start_pos))
+        }
+        v
+      } else {
+        if dec.len - dec.pos < 4 {
+          return Result::Err(MsgpackError::UnexpectedEof(dec.pos))
+        }
+        let v = read_u32_be(dec.data, dec.pos)
+        dec.pos = dec.pos + 4
+        if dec.require_canonical && v <= 0xFFFFUL {
+          return Result::Err(MsgpackError::NonCanonicalEncoding(start_pos))
+        }
+        v
+      }
+      if count_u64 > 0UL {
+        let count = validate_map_count(dec, count_u64)
+        if count < 0 {
+          return Result::Err(dec.err)
+        }
+        rem_stack.push(count * 2)
+        pushed = true
+      }
+    } else {
+      let _ = decode_scalar_marker(dec, b, start_pos)
+      if dec.has_err {
+        return Result::Err(dec.err)
+      }
+    }
+    if !pushed {
+      while rem_stack.length() > 0 {
+        let top = rem_stack.length() - 1
+        let rem = rem_stack[top] - 1
+        if rem == 0 {
+          let _ = rem_stack.pop()
+        } else {
+          rem_stack[top] = rem
+          break
+        }
+      }
+      if rem_stack.length() == 0 {
+        break
+      }
+    }
+  }
+  if !opts.allow_trailing_bytes && dec.pos < dec.len {
+    return Result::Err(MsgpackError::TrailingBytes(dec.pos))
+  }
+  Result::Ok(())
+}
+
+///| Validate that `data` is well-formed MessagePack under `opts`.
 pub fn validate(data : Bytes, opts : DecodeOptions) -> Result[Unit, MsgpackError] {
-  let _ = data
-  let _ = opts
-  Result::Err(MsgpackError::InvalidMarker(0, 0))
+  validate_iter(data, opts)
 }
