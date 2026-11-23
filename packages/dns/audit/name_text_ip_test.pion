@@ -1,0 +1,355 @@
+///| Red-team: RFC 1035 §5.1 presentation escapes, RFC 4343 case folding,
+///| zone-file `to_text()` injection, RFC 4291/5952 IPv6 text, RFC 8484 DoH GET
+///| and RFC 1035 §4.2.2 TCP framing, plus public-API panic surfaces.
+
+import "dns"
+
+///|
+fn parse_err(s : String) -> Bool {
+  match dns::Name::parse(s) {
+    Err(_) => true
+    Ok(_) => false
+  }
+}
+
+///|
+fn label_of(n : Int, c : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    sb.write_string(c)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+
+///|
+test "control_name_escape_and_length_boundaries" {
+  // \000 NUL label byte round-trips through to_string/parse
+  let nul = must_name("a\\000b.example.")
+  debug_assert(nul.wire[1].to_int() == 3 || nul.wire[0].to_int() == 3, "label length 3")
+  debug_assert(nul.to_string() == "a\\000b.example.", "NUL escaped as \\000: " + nul.to_string())
+  debug_assert(must_name(nul.to_string()).eq_exact(nul), "\\000 round-trip")
+  // \. and \\ inside a label
+  let dot = must_name("a\\.b\\\\c.example.")
+  debug_assert(dot.label_count() == 2, "escaped dot keeps one label")
+  debug_assert(must_name(dot.to_string()).eq_exact(dot), "\\. \\\\ round-trip")
+  // binary label 0x80..0xFF
+  let bin = must_name("\\128\\255\\200.")
+  debug_assert(bin.to_string() == "\\128\\255\\200.", "binary label: " + bin.to_string())
+  debug_assert(must_name(bin.to_string()).eq_exact(bin), "binary round-trip")
+  // invalid escapes
+  debug_assert(parse_err("a\\256.example."), "\\256")
+  debug_assert(parse_err("a\\999."), "\\999")
+  debug_assert(parse_err("a\\12"), "\\12 truncated at end")
+  debug_assert(parse_err("a\\1x."), "\\1x")
+  debug_assert(parse_err("abc\\"), "dangling backslash")
+  debug_assert(parse_err("a..b."), "empty label")
+  debug_assert(parse_err(".a."), "leading dot")
+  // 63 vs 64 byte label
+  debug_assert(!parse_err(label_of(63, "a") + ".example."), "63-byte label ok")
+  debug_assert(parse_err(label_of(64, "a") + ".example."), "64-byte label rejected")
+  // 255 vs 256 wire bytes: 3 x 63 + 61 label => 1+63+1+63+1+63+1+61+1 = 255
+  let n255 = label_of(63, "a") + "." + label_of(63, "b") + "." + label_of(63, "c") + "." + label_of(61, "d") + "."
+  match dns::Name::parse(n255) {
+    Ok(n) => debug_assert(n.wire_len() == 255, "255 wire bytes")
+    Err(e) => debug_assert(false, "255-byte name rejected: " + dns::dns_error_message(e))
+  }
+  let n256 = label_of(63, "a") + "." + label_of(63, "b") + "." + label_of(63, "c") + "." + label_of(62, "d") + "."
+  debug_assert(parse_err(n256), "256 wire bytes rejected")
+  // escapes count as one byte towards the 63 limit
+  debug_assert(!parse_err(label_of(63, "\\065") + "."), "63 escaped bytes ok")
+  debug_assert(parse_err(label_of(64, "\\065") + "."), "64 escaped bytes rejected")
+}
+
+///|
+test "control_rfc4343_ascii_only_case_folding_and_subdomain" {
+  let a = must_name("\\196bc.Example.")
+  let b = must_name("\\228bc.example.") // 0xC4 vs 0xE4 (Latin-1 Ä/ä) must NOT fold
+  debug_assert(!a.eq_ignore_case(b), "non-ASCII bytes folded")
+  debug_assert(must_name("WwW.ExAmPlE.").eq_ignore_case(must_name("www.example.")), "ASCII folding")
+  // '[' (0x5B) vs '{' (0x7B) differ by 0x20 but are not letters
+  debug_assert(!must_name("[.").eq_ignore_case(must_name("{.")), "0x5B vs 0x7B folded")
+  debug_assert(!must_name("@.").eq_ignore_case(must_name("`.")), "0x40 vs 0x60 folded")
+  debug_assert(must_name("a.b.Example.com.").is_subdomain_of(must_name("example.COM.")), "subdomain")
+  debug_assert(!must_name("aexample.com.").is_subdomain_of(must_name("example.com.")), "label boundary")
+  // "a\.example" is ONE label: the name is not under example.com.
+  debug_assert(!must_name("a\\.example.com.").is_subdomain_of(must_name("example.com.")), "escaped dot creates a single label")
+  debug_assert(must_name("example.com.").is_subdomain_of(must_name("example.com.")), "self")
+  debug_assert(must_name("x.").is_subdomain_of(dns::Name::root()), "root parent")
+}
+
+///|
+test "p1_name_to_string_does_not_escape_zone_file_specials" {
+  // miekg/dns escapes . space ' @ ; ( ) " \ (isDomainNameLabelSpecial) so that
+  // presentation output can be re-read by a zone parser. pion escapes only
+  // '.', '\' and non-printables: ';' starts a comment, '(' ')' open multi-line
+  // groups, '"' starts a quoted string, '@' is $ORIGIN.
+  let specials : Array[(String, Int)] = [(";", 59), ("(", 40), (")", 41), ("\"", 34), ("@", 64), ("$", 36), ("'", 39)]
+  let mut report = ""
+  let mut i = 0
+  while i < specials.length() {
+    let (ch, code) = specials[i]
+    match dns::Name::from_labels([bytes_of([0x61, code, 0x62]), "example".to_bytes()]) {
+      Ok(n) => {
+        let s = n.to_string()
+        if s == "a" + ch + "b.example." {
+          report = report + "'" + ch + "' unescaped; "
+        }
+      }
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  debug_assert(report == "", report)
+}
+
+///|
+test "p1_to_text_zone_injection_via_unescaped_fields" {
+  // A hostile authoritative answer decoded by pion and re-printed via to_text()
+  // can inject extra zone-file tokens/records.
+  let mut report = ""
+  // 1) owner name containing ";" comments out the rest of the line.
+  match dns::Name::from_labels([";evil".to_bytes(), "example".to_bytes()]) {
+    Ok(owner) => {
+      let t = rr(owner, dns::type_a, dns::RData::A(dns::Ipv4Addr::new(1, 2, 3, 4))).to_text()
+      if t.contains(";evil") && !t.contains("\;evil") && !t.contains("\\059evil") {
+        report = report + "owner ';' unescaped: " + t + " | "
+      }
+    }
+    Err(_) => ()
+  }
+  // 2) CAA tag is written raw (no quoting/escaping) - tag with a space + newline.
+  let caa = dns::RData::CAA(dns::CaaData::{ flags: 0, tag: "issue \"x\"\nevil.example. 60 IN A 6.6.6.6 ;", value: "ca.example".to_bytes() })
+  let ct = dns::rdata_to_text(caa)
+  if ct.contains("\nevil.example. 60 IN A 6.6.6.6") {
+    report = report + "CAA tag newline injection | "
+  }
+  // 3) SVCB alpn ids are written raw inside quotes: '"' and ',' break the value.
+  let sv = dns::RData::HTTPS(dns::SvcbData::{ priority: 1, target: dns::Name::root(), params: [dns::SvcParam::Alpn(["h2\",evil".to_bytes()])] })
+  let st = dns::rdata_to_text(sv)
+  if st.contains("alpn=\"h2\",evil\"") {
+    report = report + "alpn quote injection: " + st + " | "
+  }
+  // 4) mandatory=... placeholder: presentation is lossy (cannot be re-parsed).
+  let mand = dns::RData::SVCB(dns::SvcbData::{ priority: 1, target: dns::Name::root(), params: [dns::SvcParam::Mandatory([3])] })
+  if dns::rdata_to_text(mand).contains("mandatory=...") {
+    report = report + "mandatory printed as literal '...' | "
+  }
+  debug_assert(report == "", report)
+}
+
+// ---------------------------------------------------------------------------
+// IPv6 (RFC 4291 §2.2 / RFC 5952)
+// ---------------------------------------------------------------------------
+
+///|
+fn v6(s : String) -> Option[dns::Ipv6Addr] {
+  match dns::Ipv6Addr::parse(s) {
+    Ok(v) => Some(v)
+    Err(_) => None
+  }
+}
+
+///|
+test "control_rfc5952_canonical_text" {
+  let cases : Array[(String, String)] = [
+    ("2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"), // equal runs: leftmost wins
+    ("2001:0db8:0000:0001:0001:0001:0001:0001", "2001:db8:0:1:1:1:1:1"), // single :0: not compressed
+    ("2001:db8:0:0:0:0:2:1", "2001:db8::2:1"),
+    ("0:0:0:0:0:0:0:0", "::"),
+    ("0:0:0:0:0:0:0:1", "::1"),
+    ("1:0:0:0:0:0:0:0", "1::"),
+    ("2001:DB8::AbCd", "2001:db8::abcd"),
+    ("1:0:0:2:0:0:0:3", "1:0:0:2::3"), // longest run wins over earlier shorter
+    ("::1:2:3:4:5:6:7", "0:1:2:3:4:5:6:7"), // RFC 5952 §4.2.2: no :: for one group
+  ]
+  let mut i = 0
+  while i < cases.length() {
+    let (inp, want) = cases[i]
+    match v6(inp) {
+      Some(a) => debug_assert(a.to_string() == want, inp + " => " + a.to_string() + " (want " + want + ")")
+      None => debug_assert(false, inp + " rejected")
+    }
+    i = i + 1
+  }
+  let bad : Array[String] = [":::", "1::2::3", "12345::", "g::", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7", ":1::", "1::2:", "::1:2:3:4:5:6:7:8", ""]
+  i = 0
+  while i < bad.length() {
+    debug_assert(v6(bad[i]) is None, "'" + bad[i] + "' accepted")
+    i = i + 1
+  }
+}
+
+///|
+test "p1_ipv6_parse_rejects_embedded_ipv4_form" {
+  // RFC 4291 §2.2 (3): x:x:x:x:x:x:d.d.d.d is a valid text form; Go netip and
+  // Rust std::net (used by miekg/dns and hickory-proto) both accept it.
+  let mut report = ""
+  let forms : Array[String] = ["::ffff:192.0.2.1", "64:ff9b::192.0.2.33", "::192.0.2.1", "0:0:0:0:0:ffff:192.0.2.1"]
+  let mut i = 0
+  while i < forms.length() {
+    if v6(forms[i]) is None {
+      report = report + forms[i] + " rejected; "
+    }
+    i = i + 1
+  }
+  debug_assert(report == "", report)
+}
+
+///|
+test "p2_ipv6_ipv4_mapped_not_printed_in_mixed_notation" {
+  // RFC 5952 §5 RECOMMENDS ::ffff:192.0.2.1 for IPv4-mapped addresses (Go netip
+  // and Rust std both print it that way, so hickory/miekg text differs).
+  let a = dns::Ipv6Addr::from_segments(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0201)
+  debug_assert(a.to_string() == "::ffff:192.0.2.1", "got " + a.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// DoH GET (RFC 8484 §4.1, RFC 4648 §5 base64url without padding)
+// ---------------------------------------------------------------------------
+
+///|
+test "control_doh_get_param_strictness" {
+  let q = dns::Message::query(0, must_name("www.example.com."), dns::type_a)
+  let enc = match dns::encode_doh_get_param(q) {
+    Ok(s) => s
+    Err(_) => ""
+  }
+  // RFC 8484 §6 example vector
+  debug_assert(enc == "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB", "RFC 8484 vector: " + enc)
+  debug_assert(!is_err(dns::decode_doh_get_param(enc)), "decode vector")
+  // padding, '+', '/', whitespace, non-canonical trailing bits must be rejected
+  debug_assert(is_err(dns::decode_doh_get_param(enc + "==")), "padding")
+  debug_assert(is_err(dns::decode_doh_get_param("AAAB+AAB")), "'+' char")
+  debug_assert(is_err(dns::decode_doh_get_param("AAAB/AAB")), "'/' char")
+  debug_assert(is_err(dns::decode_doh_get_param("AAAB AAB")), "space")
+  debug_assert(is_err(dns::decode_doh_get_param("A")), "len%4==1")
+  // Non-canonical last char: 44 chars => rem 0 here; craft a 2-char tail with
+  // non-zero low bits: "AB" encodes 0x00 with stray bits.
+  debug_assert(is_err(dns::decode_doh_get_param("AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" + "AB")), "stray bits in 2-char tail")
+  debug_assert(is_err(dns::decode_doh_get_param("AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" + "AAB")), "stray bits in 3-char tail")
+}
+
+///|
+test "p2_doh_get_param_no_size_cap_before_allocation" {
+  // decode_doh_get_param allocates n*3/4 bytes before the 65535-byte message
+  // limit is checked. RFC 8484 messages are <= 65535 bytes, i.e. <= 87380
+  // base64url chars; anything longer should be rejected up-front.
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < 100000 {
+    sb.write_string("AAAA")
+    i = i + 1
+  }
+  match dns::decode_doh_get_param(sb.to_string()) {
+    Err(dns::DnsError::InvalidBase64Url(_)) => ()
+    Err(e) => debug_assert(false, "400000-char param decoded into a 300000-byte buffer first, then failed late with: " + dns::dns_error_message(e))
+    Ok(_) => debug_assert(false, "accepted")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TCP framing (RFC 1035 §4.2.2 / RFC 7766)
+// ---------------------------------------------------------------------------
+
+///|
+test "control_tcp_framing_stream" {
+  let q = dns::Message::query(0x1111, must_name("a.example."), dns::type_a)
+  let f = match dns::encode_tcp(q) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  // 0 / 1 byte => need 2
+  match dns::decode_tcp(Bytes::new(0)) {
+    Ok(dns::TcpDecodeStatus::Incomplete(2)) => ()
+    _ => debug_assert(false, "empty")
+  }
+  match dns::decode_tcp(bytes_of([0])) {
+    Ok(dns::TcpDecodeStatus::Incomplete(2)) => ()
+    _ => debug_assert(false, "1 byte")
+  }
+  // zero-length frame: must be an error (or skip), never a panic
+  debug_assert(
+    match dns::decode_tcp(bytes_of([0, 0])) {
+      Err(_) => true
+      _ => false
+    },
+    "0-length frame",
+  )
+  // two frames glued + 1 trailing byte: stream-decode both, then Incomplete
+  let n = f.length()
+  let mut s = Bytes::new(n * 2 + 1)
+  let mut i = 0
+  while i < n {
+    s[i] = f[i]
+    s[n + i] = f[i]
+    i = i + 1
+  }
+  match dns::decode_tcp(s) {
+    Ok(dns::TcpDecodeStatus::Complete(_, used)) => {
+      debug_assert(used == n, "first frame length")
+      let mut rest = Bytes::new(s.length() - used)
+      let mut k = 0
+      while k < rest.length() {
+        rest[k] = s[used + k]
+        k = k + 1
+      }
+      match dns::decode_tcp(rest) {
+        Ok(dns::TcpDecodeStatus::Complete(_, used2)) => debug_assert(used2 == n, "second frame")
+        _ => debug_assert(false, "second frame")
+      }
+    }
+    _ => debug_assert(false, "first frame")
+  }
+  // half frame
+  let mut half = Bytes::new(n - 3)
+  i = 0
+  while i < n - 3 {
+    half[i] = f[i]
+    i = i + 1
+  }
+  match dns::decode_tcp(half) {
+    Ok(dns::TcpDecodeStatus::Incomplete(need)) => debug_assert(need == n, "need")
+    _ => debug_assert(false, "half frame")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API panic surfaces ("0 panics" claim in README)
+// ---------------------------------------------------------------------------
+
+///|
+test "p1_decode_message_at_out_of_range_bounds_panics" {
+  // `decode_message_at` is `pub` and documented for zero-copy framing (the
+  // package's own bench calls it with lengths read from the stream). With
+  // `end > buf.length()` it indexes past the buffer instead of returning
+  // Err(UnexpectedEof): native panic / wasm32 trap.
+  // qdcount = 2 but only one question present; end claims 8 extra bytes.
+  let pkt = bytes_of([0, 1, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0x61, 0, 0, 1, 0, 1])
+  match dns::decode_message_at(pkt, 0, pkt.length() + 8, dns::DecodeLimits::default()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "accepted out-of-range end")
+  }
+}
+
+///|
+test "p1_decode_message_at_negative_start_panics" {
+  let pkt = bytes_of([0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0x61, 0, 0, 1, 0, 1])
+  match dns::decode_message_at(pkt, -4, pkt.length(), dns::DecodeLimits::default()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "accepted negative start")
+  }
+}
+
+///|
+test "p2_malformed_pub_name_wire_panics_in_accessors" {
+  // `Name { pub wire }` lets callers build a label that overruns the buffer;
+  // to_string()/labels() index out of bounds instead of degrading.
+  let bad = dns::Name::{ wire: bytes_of([5, 0x61]) }
+  debug_assert(bad.to_string().length() >= 0, "to_string on malformed wire")
+}

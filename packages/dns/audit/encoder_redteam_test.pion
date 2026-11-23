@@ -1,0 +1,410 @@
+///| Red-team: encoder boundaries (RFC 1035 §4.1.4 14-bit pointers, uint16/uint8
+///| length fields, RFC 9460 / 7871 / 7873 / 4034 encode-side validation).
+///|
+///| Convention: tests named `p0_*` / `p1_*` / `p2_*` assert the RFC-correct
+///| (or upstream-equivalent) behaviour and are EXPECTED TO FAIL on `45399ac`;
+///| each failure is a confirmed finding (see REPORT.md). `control_*` tests are
+///| the honest control group and are expected to PASS.
+
+import "dns"
+
+// ---------------------------------------------------------------------------
+// 14-bit compression pointer / large-message controls
+// ---------------------------------------------------------------------------
+
+///|
+fn big_response(n : Int) -> dns::Message {
+  let answers : Array[dns::ResourceRecord] = []
+  let mut i = 0
+  while i < n {
+    let owner = must_name("host" + i.to_string() + ".zone" + (i % 7).to_string() + ".example.")
+    // Targets re-use the previous owner: past offset 16,383 those owners can
+    // never be pointer targets, so the encoder must fall back to literals.
+    let target = if i == 0 {
+      must_name("tgt.zone0.example.")
+    } else {
+      must_name("host" + (i - 1).to_string() + ".zone" + ((i - 1) % 7).to_string() + ".example.")
+    }
+    answers.push(rr(owner, dns::type_cname, dns::RData::CNAME(target)))
+    i = i + 1
+  }
+  response_with(answers)
+}
+
+///|
+test "control_14bit_pointer_ceiling_large_response_roundtrips" {
+  // 1,500 CNAMEs with distinct names => ~45 KiB wire, far beyond 16,383.
+  let m = big_response(1500)
+  match round_trip(m) {
+    RoundTrip::Ok(d, w) => {
+      debug_assert(w.length() > 16384, "response must exceed the 14-bit pointer range")
+      debug_assert(d.answers.length() == 1500, "all answers decoded")
+      // Every owner/target must survive bit-exactly (no truncated pointer high bits).
+      let mut i = 0
+      while i < 1500 {
+        let a = d.answers[i]
+        debug_assert(a.name.eq_exact(m.answers[i].name), "owner " + i.to_string() + " corrupted")
+        match (a.rdata, m.answers[i].rdata) {
+          (dns::RData::CNAME(x), dns::RData::CNAME(y)) =>
+          debug_assert(x.eq_exact(y), "target " + i.to_string() + " corrupted")
+          _ => debug_assert(false, "rdata type changed")
+        }
+        i = i + 1
+      }
+    }
+    RoundTrip::EncodeErr(e) => debug_assert(false, "encode failed: " + e)
+    RoundTrip::DecodeErr(e, _) => debug_assert(false, "own output undecodable: " + e)
+  }
+}
+
+///|
+test "control_message_over_65535_bytes_is_rejected_not_truncated" {
+  // 64 TXT records of 4 x 255 bytes => > 65535 bytes total.
+  let chunks : Array[Bytes] = [bytes_fill(255, 0x41), bytes_fill(255, 0x42), bytes_fill(255, 0x43), bytes_fill(255, 0x44)]
+  let answers : Array[dns::ResourceRecord] = []
+  let mut i = 0
+  while i < 70 {
+    answers.push(rr(must_name("t" + i.to_string() + ".example."), dns::type_txt, dns::RData::TXT(chunks)))
+    i = i + 1
+  }
+  match dns::encode_message(response_with(answers)) {
+    Err(dns::DnsError::MessageTooLarge(_)) => ()
+    Err(e) => debug_assert(false, "unexpected error " + dns::dns_error_message(e))
+    Ok(w) => debug_assert(false, "65535+ byte message must be rejected, got " + w.length().to_string())
+  }
+  match dns::encode_tcp(response_with(answers)) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "encode_tcp must not silently truncate the 2-byte length prefix")
+  }
+}
+
+///|
+test "control_rdlength_over_65535_rejected" {
+  let raw = bytes_fill(70000, 7)
+  match dns::encode_message(response_with([rr(must_name("u.example."), 65280, dns::RData::Unknown(65280, raw))])) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "RDATA > 65535 must be rejected")
+  }
+}
+
+///|
+test "control_txt_chunk_over_255_rejected" {
+  match dns::encode_message(response_with([rr(must_name("u.example."), dns::type_txt, dns::RData::TXT([bytes_fill(256, 0x61)]))])) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "TXT chunk > 255 must be rejected")
+  }
+}
+
+///|
+test "control_section_count_over_65535_rejected" {
+  let qs : Array[dns::Question] = []
+  let mut i = 0
+  while i < 65536 {
+    qs.push(dns::Question::new(dns::Name::root(), dns::type_a, dns::class_in))
+    i = i + 1
+  }
+  let m = dns::Message::query(1, dns::Name::root(), dns::type_a)
+  let m2 = dns::Message::{ header: m.header, questions: qs, answers: [], authorities: [], additionals: [] }
+  match dns::encode_message(m2) {
+    Err(_) => ()
+    Ok(w) => {
+      let qd = (w[4].to_int() << 8) | w[5].to_int()
+      debug_assert(false, "65536 questions must be rejected; qdcount silently became " + qd.to_string())
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P0: encoder returns Ok(bytes) that the library's own decoder rejects
+// ---------------------------------------------------------------------------
+
+///|
+test "p0_edns_padding_negative_length_emits_corrupt_opt" {
+  let m = response_with([])
+  m.additionals.push(dns::ResourceRecord::opt(1232, 0, 0, false, [dns::EdnsOption::Padding(-1)]))
+  let (ok, why) = encoder_is_self_consistent(m)
+  debug_assert(ok, "Padding(-1): " + why)
+}
+
+///|
+test "p0_svcb_unsorted_and_duplicate_svcparams_emitted" {
+  // RFC 9460 §2.2: SvcParamKeys MUST be in strictly increasing order.
+  // miekg/dns sorts keys on pack and rejects duplicates; pion emits as-is.
+  let sd = dns::SvcbData::{
+    priority: 1,
+    target: dns::Name::root(),
+    params: [dns::SvcParam::Port(443), dns::SvcParam::Alpn(["h2".to_bytes()])],
+  }
+  let (ok1, why1) = encoder_is_self_consistent(response_with([rr(must_name("s.example."), dns::type_https, dns::RData::HTTPS(sd))]))
+  let mut report = ""
+  if !ok1 {
+    report = report + "unsorted SvcParams: " + why1 + "; "
+  }
+  let dup = dns::SvcbData::{
+    priority: 1,
+    target: dns::Name::root(),
+    params: [dns::SvcParam::Port(443), dns::SvcParam::Port(8443)],
+  }
+  let (ok2, why2) = encoder_is_self_consistent(response_with([rr(must_name("s.example."), dns::type_svcb, dns::RData::SVCB(dup))]))
+  if !ok2 {
+    report = report + "duplicate SvcParams: " + why2
+  }
+  debug_assert(report == "", report)
+}
+
+///|
+test "p0_svcb_aliasmode_with_params_emitted" {
+  // RFC 9460 §2.4.2: AliasMode (priority 0) records SHOULD NOT carry SvcParams;
+  // pion's own decoder treats them as fatal, yet the encoder happily emits them.
+  let sd = dns::SvcbData::{ priority: 0, target: must_name("pool.example."), params: [dns::SvcParam::Port(443)] }
+  let (ok, why) = encoder_is_self_consistent(response_with([rr(must_name("s.example."), dns::type_https, dns::RData::HTTPS(sd))]))
+  debug_assert(ok, "AliasMode+params: " + why)
+}
+
+///|
+test "p0_svcb_empty_list_params_emitted" {
+  let cases : Array[(String, dns::SvcParam)] = [
+    ("alpn=[]", dns::SvcParam::Alpn([])),
+    ("mandatory=[]", dns::SvcParam::Mandatory([])),
+    ("ipv4hint=[]", dns::SvcParam::Ipv4Hint([])),
+    ("ipv6hint=[]", dns::SvcParam::Ipv6Hint([])),
+  ]
+  let mut i = 0
+  let mut fails = ""
+  while i < cases.length() {
+    let (label, p) = cases[i]
+    let sd = dns::SvcbData::{ priority: 1, target: dns::Name::root(), params: [p] }
+    let (ok, why) = encoder_is_self_consistent(response_with([rr(must_name("s.example."), dns::type_svcb, dns::RData::SVCB(sd))]))
+    if !ok {
+      fails = fails + label + ": " + why + "; "
+    }
+    i = i + 1
+  }
+  debug_assert(fails == "", fails)
+}
+
+///|
+test "p0_edns_cookie_and_ecs_invalid_lengths_emitted" {
+  let m = response_with([])
+  // RFC 7873 §4: client cookie is exactly 8 bytes.
+  m.additionals.push(dns::ResourceRecord::opt(1232, 0, 0, false, [
+    dns::EdnsOption::Cookie(dns::CookieOption::{ client: bytes_fill(3, 1), server: Bytes::new(0) }),
+  ]))
+  let (ok1, why1) = encoder_is_self_consistent(m)
+  let mut report = ""
+  if !ok1 {
+    report = report + "Cookie(client=3B): " + why1 + "; "
+  }
+  let m2 = response_with([])
+  // RFC 7871 §6: IPv4 source prefix must be <= 32.
+  m2.additionals.push(dns::ResourceRecord::opt(1232, 0, 0, false, [
+    dns::EdnsOption::Ecs(dns::EcsOption::{ family: 1, source_prefix_len: 33, scope_prefix_len: 0, address: bytes_fill(5, 1) }),
+  ]))
+  let (ok2, why2) = encoder_is_self_consistent(m2)
+  if !ok2 {
+    report = report + "ECS(v4,/33): " + why2
+  }
+  debug_assert(report == "", report)
+}
+
+// ---------------------------------------------------------------------------
+// P1: silent integer truncation of out-of-range `Int` fields (upstreams use
+// uint16/uint32/uint8 so these values are unrepresentable there).
+// ---------------------------------------------------------------------------
+
+///|
+fn decoded_first_answer(m : dns::Message) -> Option[dns::ResourceRecord] {
+  match round_trip(m) {
+    RoundTrip::Ok(d, _) => if d.answers.length() > 0 { Some(d.answers[0]) } else { None }
+    _ => None
+  }
+}
+
+///|
+test "p1_u16_fields_silently_truncated_on_encode" {
+  let target = must_name("t.example.")
+  let mut report = ""
+  // SRV port 70000 => wire 4464
+  match dns::encode_message(response_with([rr(must_name("_s._tcp.example."), dns::type_srv, dns::RData::SRV(dns::SrvData::{ priority: 0, weight: 0, port: 70000, target: target }))])) {
+    Ok(_) => report = report + "SRV.port=70000 accepted (wire 4464); "
+    Err(_) => ()
+  }
+  // MX preference -1 => wire 65535
+  match dns::encode_message(response_with([rr(must_name("m.example."), dns::type_mx, dns::RData::MX(dns::MxData::{ preference: -1, exchange: target }))])) {
+    Ok(_) => report = report + "MX.preference=-1 accepted (wire 65535); "
+    Err(_) => ()
+  }
+  // SvcParam port 65536 => wire 0
+  let sd = dns::SvcbData::{ priority: 1, target: dns::Name::root(), params: [dns::SvcParam::Port(65536)] }
+  match dns::encode_message(response_with([rr(must_name("s.example."), dns::type_svcb, dns::RData::SVCB(sd))])) {
+    Ok(_) => report = report + "SvcParam.port=65536 accepted (wire 0); "
+    Err(_) => ()
+  }
+  // rtype 65536+1 => A
+  match dns::encode_message(response_with([rr(must_name("x.example."), 65537, dns::RData::Unknown(65537, bytes_fill(4, 1)))])) {
+    Ok(_) => report = report + "rtype=65537 accepted (wire type 1 = A); "
+    Err(_) => ()
+  }
+  // TTL 2^32 => 0 ; TTL -1 => 4294967295
+  let r1 = dns::ResourceRecord::{ name: must_name("x.example."), rtype: dns::type_a, rclass: dns::class_in, ttl: 4294967296L, rdata: dns::RData::A(dns::Ipv4Addr::new(1, 2, 3, 4)) }
+  match decoded_first_answer(response_with([r1])) {
+    Some(a) => if a.ttl != 4294967296L { report = report + "ttl=2^32 accepted, decodes as " + a.ttl.to_string() + "; " }
+    None => ()
+  }
+  // Header id 0x12345 (fast path) => 0x2345
+  let q = dns::Message::query(0, must_name("a.example."), dns::type_a)
+  let h = q.header
+  let q2 = dns::Message::{
+    header: dns::Header::{ ..h, id: 0x12345 },
+    questions: q.questions,
+    answers: [],
+    authorities: [],
+    additionals: [],
+  }
+  match dns::encode_message(q2) {
+    Ok(_) => report = report + "header.id=0x12345 accepted (wire 0x2345); "
+    Err(_) => ()
+  }
+  debug_assert(report == "", report)
+}
+
+///|
+test "p1_nsec_type_out_of_range_lands_in_wrong_window" {
+  // type 65536 is not a valid RR type; pion folds it into window 0 bit 0 and
+  // the decoded NSEC claims type 0 exists.
+  let nsec = dns::NsecData::{ next_domain: must_name("b.example."), types: [dns::type_a, 65536] }
+  match decoded_first_answer(response_with([rr(must_name("a.example."), dns::type_nsec, dns::RData::NSEC(nsec))])) {
+    Some(a) =>
+    match a.rdata {
+      dns::RData::NSEC(n) => {
+        let mut has0 = false
+        let mut j = 0
+        while j < n.types.length() {
+          if n.types[j] == 0 {
+            has0 = true
+          }
+          j = j + 1
+        }
+        debug_assert(!has0, "type 65536 silently encoded as type 0 (window 0, bit 0)")
+      }
+      _ => debug_assert(false, "not NSEC")
+    }
+    None => ()
+  }
+}
+
+///|
+test "p1_name_wire_invariant_not_enforced_pub_field" {
+  // `Name.wire` is a `pub` field. A 300-byte, 150-label wire (illegal: > 255 B,
+  // > 127 labels) is accepted by the uncompressed encoder and emitted verbatim.
+  let mut w = Bytes::new(301)
+  let mut i = 0
+  while i < 150 {
+    w[i * 2] = (1).to_byte()
+    w[i * 2 + 1] = (0x61).to_byte()
+    i = i + 1
+  }
+  w[300] = (0).to_byte()
+  let bad = dns::Name::{ wire: w }
+  let m = dns::Message::query(1, bad, dns::type_a)
+  match dns::encode_message_with(m, dns::EncodeOptions::uncompressed()) {
+    Ok(bytes) => {
+      let back = is_err(dns::decode_message(bytes))
+      debug_assert(false, "encoder emitted a 301-byte name (decoder rejects: " + back.to_string() + ")")
+    }
+    Err(_) => ()
+  }
+}
+
+///|
+test "p1_name_wire_invariant_compressed_path_panics" {
+  // Same illegal 150-label name through the compressing path: `lbl_starts` is a
+  // fixed 128-slot scratch => index-out-of-bounds panic (native) / trap (wasm32).
+  let mut w = Bytes::new(301)
+  let mut i = 0
+  while i < 150 {
+    w[i * 2] = (1).to_byte()
+    w[i * 2 + 1] = (0x61).to_byte()
+    i = i + 1
+  }
+  w[300] = (0).to_byte()
+  let bad = dns::Name::{ wire: w }
+  let m = response_with([rr(bad, dns::type_a, dns::RData::A(dns::Ipv4Addr::new(1, 1, 1, 1)))])
+  match dns::encode_message(m) {
+    Ok(_) => debug_assert(false, "illegal name accepted")
+    Err(_) => ()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P2 / behavioural differences vs miekg/dns + hickory-proto
+// ---------------------------------------------------------------------------
+
+///|
+test "p2_case_insensitive_compression_rewrites_owner_case" {
+  // miekg/dns and hickory-proto compress only byte-identical suffixes, so the
+  // answer owner keeps its case on the wire. pion points `WWW.EXAMPLE.ORG`
+  // at the question's `www.example.org`, changing the decoded case.
+  let qn = must_name("www.example.org.")
+  let q = dns::Message::query(7, qn, dns::type_a)
+  let m = dns::Message::response_for(q, 0)
+  let upper = must_name("WWW.EXAMPLE.ORG.")
+  m.answers.push(rr(upper, dns::type_a, dns::RData::A(dns::Ipv4Addr::new(1, 2, 3, 4))))
+  match round_trip(m) {
+    RoundTrip::Ok(d, _) =>
+    debug_assert(d.answers[0].name.eq_exact(upper), "owner case changed to " + d.answers[0].name.to_string())
+    _ => debug_assert(false, "round trip failed")
+  }
+}
+
+///|
+test "control_rfc3597_no_compression_in_srv_naptr_svcb_rrsig_nsec_targets" {
+  // pion is stricter than hickory-proto 0.24.2 here (hickory compresses SRV targets).
+  let t = must_name("q.example.")
+  let answers = [
+    rr(must_name("_x._tcp.q.example."), dns::type_srv, dns::RData::SRV(dns::SrvData::{ priority: 1, weight: 1, port: 1, target: t })),
+    rr(must_name("n.q.example."), dns::type_naptr, dns::RData::NAPTR(dns::NaptrData::{ order: 1, preference: 1, flags: "s".to_bytes(), service: "".to_bytes(), regexp: "".to_bytes(), replacement: t })),
+    rr(must_name("h.q.example."), dns::type_https, dns::RData::HTTPS(dns::SvcbData::{ priority: 0, target: t, params: [] })),
+    rr(must_name("n2.q.example."), dns::type_nsec, dns::RData::NSEC(dns::NsecData::{ next_domain: t, types: [1] })),
+  ]
+  match dns::encode_message(response_with(answers)) {
+    Ok(w) => {
+      // count 0xC0 0x0C pointers (to the question name) inside the message:
+      // owners may use them (4 of them), RDATA targets must not.
+      let mut ptrs = 0
+      let mut i = 12
+      while i + 1 < w.length() {
+        if w[i].to_int() == 0xC0 && w[i + 1].to_int() == 0x0C {
+          ptrs = ptrs + 1
+        }
+        i = i + 1
+      }
+      debug_assert(ptrs == 4, "expected only owner pointers, found " + ptrs.to_string())
+    }
+    Err(e) => debug_assert(false, dns::dns_error_message(e))
+  }
+}
+
+///|
+test "p2_srv_target_not_registered_for_glue_compression" {
+  // packages/dns/bench corpus message (seed_0297): 2 SRV + 2 glue A + OPT.
+  // miekg/dns writes SRV targets uncompressed (RFC 2782) but still records
+  // them in its compression map, so the glue owners become 2-byte pointers:
+  // 205 bytes. hickory-proto: 205 bytes. pion never registers names written
+  // with compression disabled, so each glue owner costs 8 bytes instead of 2:
+  // 217 bytes (+5.9 %; +1.5 % over the whole bench corpus, see REPORT.md).
+  let svc = "svc297.internal.example.org."
+  let q = dns::Message::query(0x3aed, must_name("_grpc._tcp." + svc), dns::type_srv)
+  let m = dns::Message::response_for(q, 0)
+  let m2 = dns::Message::{ ..m, header: dns::Header::{ ..m.header, ra: true } }
+  let owner = must_name("_grpc._tcp." + svc)
+  m2.answers.push(dns::ResourceRecord::{ name: owner, rtype: dns::type_srv, rclass: dns::class_in, ttl: 120L, rdata: dns::RData::SRV(dns::SrvData::{ priority: 10, weight: 50, port: 8443, target: must_name("node1." + svc) }) })
+  m2.answers.push(dns::ResourceRecord::{ name: owner, rtype: dns::type_srv, rclass: dns::class_in, ttl: 120L, rdata: dns::RData::SRV(dns::SrvData::{ priority: 20, weight: 50, port: 8444, target: must_name("node2." + svc) }) })
+  m2.additionals.push(dns::ResourceRecord::{ name: must_name("node1." + svc), rtype: dns::type_a, rclass: dns::class_in, ttl: 120L, rdata: dns::RData::A(dns::Ipv4Addr::new(10, 20, 1, 41)) })
+  m2.additionals.push(dns::ResourceRecord::{ name: must_name("node2." + svc), rtype: dns::type_a, rclass: dns::class_in, ttl: 120L, rdata: dns::RData::A(dns::Ipv4Addr::new(10, 21, 1, 41)) })
+  m2.additionals.push(dns::ResourceRecord::opt(4096, 0, 0, true, []))
+  match dns::encode_message(m2) {
+    Ok(w) => debug_assert(w.length() <= 205, "pion emits " + w.length().to_string() + " bytes; miekg/dns and hickory-proto emit 205")
+    Err(e) => debug_assert(false, dns::dns_error_message(e))
+  }
+}
