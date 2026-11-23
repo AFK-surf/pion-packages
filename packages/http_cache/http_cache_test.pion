@@ -1,0 +1,701 @@
+///| Comprehensive RFC 9111 (HTTP Caching) & RFC 9110 (HTTP-date / Conditional Requests)
+///| specification, security, and LRU store test suite.
+
+fn opt_i64_eq(a : Option[Int64], b : Option[Int64]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+fn opt_str_eq(a : Option[String], b : Option[String]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+fn find_header(headers : Array[Header], name_lower : String) -> Option[String] {
+  let mut i = 0
+  while i < headers.length() {
+    if headers[i].name == name_lower {
+      return Some(headers[i].value)
+    }
+    i = i + 1
+  }
+  None
+}
+
+// ---------------------------------------------------------------------------
+// 1. RFC 9110 §5.6.7 HTTP-date parsing & formatting
+// ---------------------------------------------------------------------------
+
+test "rfc9110_http_date_three_formats_and_roundtrip" {
+  // RFC 9110 §5.6.7 canonical example: Sun, 06 Nov 1994 08:49:37 GMT == 784111777
+  let expected = 784111777L
+  match parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT") {
+    Ok(ts) => debug_assert(ts == expected, "IMF-fixdate epoch")
+    Err(e) => debug_assert(false, "IMF-fixdate failed: " + cache_error_message(e))
+  }
+  match parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT") {
+    Ok(ts) => debug_assert(ts == expected, "RFC 850 epoch")
+    Err(e) => debug_assert(false, "RFC 850 failed: " + cache_error_message(e))
+  }
+  match parse_http_date("Sun Nov  6 08:49:37 1994") {
+    Ok(ts) => debug_assert(ts == expected, "asctime epoch")
+    Err(e) => debug_assert(false, "asctime failed: " + cache_error_message(e))
+  }
+  let formatted = format_http_date(expected)
+  debug_assert(formatted == "Sun, 06 Nov 1994 08:49:37 GMT", "format_http_date mismatch: " + formatted)
+
+  // Unix epoch 0
+  match parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT") {
+    Ok(ts) => debug_assert(ts == 0L, "epoch 0")
+    Err(_) => debug_assert(false, "epoch 0 failed")
+  }
+  debug_assert(format_http_date(0L) == "Thu, 01 Jan 1970 00:00:00 GMT", "format epoch 0")
+
+  // Leap year 2024-02-29 23:59:59 GMT == 1709251199
+  match parse_http_date("Thu, 29 Feb 2024 23:59:59 GMT") {
+    Ok(ts) => {
+      debug_assert(ts == 1709251199L, "leap year 2024")
+      debug_assert(format_http_date(ts) == "Thu, 29 Feb 2024 23:59:59 GMT", "roundtrip leap 2024")
+    }
+    Err(_) => debug_assert(false, "leap 2024 failed")
+  }
+
+  // Century leap year 2000-02-29 12:00:00 GMT == 951825600
+  match parse_http_date("Tue, 29 Feb 2000 12:00:00 GMT") {
+    Ok(ts) => debug_assert(ts == 951825600L, "leap year 2000")
+    Err(_) => debug_assert(false, "leap 2000 failed")
+  }
+
+  // RFC 850 2-digit year 00..69 -> 2000..2069
+  match parse_http_date("Monday, 23-Nov-26 10:00:00 GMT") {
+    Ok(ts) => debug_assert(format_http_date(ts) == "Mon, 23 Nov 2026 10:00:00 GMT", "rfc850 2026")
+    Err(_) => debug_assert(false, "rfc850 2026 failed")
+  }
+}
+
+test "rfc9110_http_date_validation_rejects_invalid" {
+  // Non-leap year Feb 29
+  match parse_http_date("Wed, 29 Feb 2023 00:00:00 GMT") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject non-leap Feb 29 2023")
+  }
+  // Non-leap century 1900 Feb 29
+  match parse_http_date("Thu, 29 Feb 1900 00:00:00 GMT") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject non-leap Feb 29 1900")
+  }
+  // April 31
+  match parse_http_date("Tue, 31 Apr 2024 00:00:00 GMT") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject Apr 31")
+  }
+  // Invalid hour/min/sec
+  match parse_http_date("Sun, 06 Nov 1994 24:00:00 GMT") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject hour 24")
+  }
+  match parse_http_date("Sun, 06 Nov 1994 08:60:00 GMT") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject minute 60")
+  }
+  match parse_http_date("Sun, 06 Nov 1994 08:49:60 GMT") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject second 60")
+  }
+  // Non-GMT timezone
+  match parse_http_date("Sun, 06 Nov 1994 08:49:37 UTC") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject non-GMT")
+  }
+  // Empty / garbage
+  match parse_http_date("") {
+    Err(CacheError::InvalidDate(_)) => ()
+    _ => debug_assert(false, "should reject empty date")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. RFC 9111 §5.2 Cache-Control parsing
+// ---------------------------------------------------------------------------
+
+test "rfc9111_cache_control_request_directives" {
+  let headers = [
+    Header::new("Cache-Control", "MAX-AGE=120, min-fresh=30, no-transform"),
+    Header::new("cache-control", "max-stale=600, only-if-cached, no-cache"),
+  ]
+  match parse_request_cache_control(headers) {
+    Ok(cc) => {
+      debug_assert(opt_i64_eq(cc.max_age, Some(120L)), "max-age=120")
+      debug_assert(opt_i64_eq(cc.min_fresh, Some(30L)), "min-fresh=30")
+      debug_assert(cc.has_max_stale, "has_max_stale")
+      debug_assert(opt_i64_eq(cc.max_stale_seconds, Some(600L)), "max-stale=600")
+      debug_assert(cc.no_transform, "no-transform")
+      debug_assert(cc.only_if_cached, "only-if-cached")
+      debug_assert(cc.no_cache, "no-cache")
+      debug_assert(!cc.no_store, "!no-store")
+    }
+    Err(e) => debug_assert(false, "parse_request_cache_control failed: " + cache_error_message(e))
+  }
+
+  // max-stale without value means accept any staleness
+  match parse_request_cc_value("max-stale, no-store") {
+    Ok(cc) => {
+      debug_assert(cc.has_max_stale, "bare max-stale")
+      debug_assert(opt_i64_eq(cc.max_stale_seconds, None), "bare max-stale value is None")
+      debug_assert(cc.no_store, "no-store")
+    }
+    Err(_) => debug_assert(false, "bare max-stale failed")
+  }
+}
+
+test "rfc9111_cache_control_response_quoted_and_overflow" {
+  let raw = "public, S-MaxAge=\"3600\", max-age=600, must-revalidate, proxy-revalidate, must-understand, immutable, stale-while-revalidate=60, stale-if-error=86400, x-ext=\"foo\\\"bar,baz\", no-cache=\"Set-Cookie, Authorization\", private=\"X-Custom-Header\""
+  match parse_response_cc_value(raw) {
+    Ok(cc) => {
+      debug_assert(cc.is_public, "public")
+      debug_assert(cc.is_private, "private")
+      debug_assert(cc.no_cache, "no-cache")
+      debug_assert(cc.no_cache_fields.length() == 2, "no_cache_fields len")
+      debug_assert(cc.no_cache_fields[0] == "set-cookie", "no_cache_fields[0]")
+      debug_assert(cc.no_cache_fields[1] == "authorization", "no_cache_fields[1]")
+      debug_assert(cc.private_fields.length() == 1, "private_fields len")
+      debug_assert(cc.private_fields[0] == "x-custom-header", "private_fields[0]")
+      debug_assert(cc.must_revalidate, "must-revalidate")
+      debug_assert(cc.proxy_revalidate, "proxy-revalidate")
+      debug_assert(cc.must_understand, "must-understand")
+      debug_assert(cc.immutable, "immutable")
+      debug_assert(opt_i64_eq(cc.s_maxage, Some(3600L)), "s-maxage")
+      debug_assert(opt_i64_eq(cc.max_age, Some(600L)), "max-age")
+      debug_assert(opt_i64_eq(cc.stale_while_revalidate, Some(60L)), "swr")
+      debug_assert(opt_i64_eq(cc.stale_if_error, Some(86400L)), "sie")
+    }
+    Err(e) => debug_assert(false, "parse_response_cc_value failed: " + cache_error_message(e))
+  }
+
+  // RFC 9111 §1.2.2 huge delta-seconds clamped to 2^31 (2147483648)
+  match parse_response_cc_value("max-age=999999999999999999999999") {
+    Ok(cc) => debug_assert(opt_i64_eq(cc.max_age, Some(max_delta_seconds)), "clamped delta-seconds")
+    Err(_) => debug_assert(false, "huge delta-seconds should clamp, not fail")
+  }
+
+  // Negative delta-seconds strictly rejected
+  match parse_response_cc_value("max-age=-10") {
+    Err(CacheError::InvalidCacheControl(_)) => ()
+    _ => debug_assert(false, "negative max-age must fail")
+  }
+
+  // Non-digit delta-seconds strictly rejected
+  match parse_request_cc_value("max-age=abc") {
+    Err(CacheError::InvalidCacheControl(_)) => ()
+    _ => debug_assert(false, "non-digit max-age must fail")
+  }
+
+  // Unterminated quote strictly rejected
+  match parse_response_cc_value("no-cache=\"Set-Cookie") {
+    Err(CacheError::InvalidCacheControl(_)) => ()
+    _ => debug_assert(false, "unterminated quote must fail")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3. RFC 9111 §3 Storability (Shared vs Private)
+// ---------------------------------------------------------------------------
+
+test "rfc9111_storability_shared_vs_private" {
+  let get_req = CacheRequest::new("GET", "https://cdn.example.com/app.js", [])
+  let post_req = CacheRequest::new("POST", "https://cdn.example.com/api", [])
+  let ok_resp = CacheResponse::new(200, [Header::new("Cache-Control", "max-age=300")])
+
+  // GET 200 storable in both
+  match is_storable(get_req, ok_resp, true) {
+    Ok(v) => debug_assert(v, "GET 200 shared storable")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+  match is_storable(get_req, ok_resp, false) {
+    Ok(v) => debug_assert(v, "GET 200 private storable")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // POST not storable
+  match is_storable(post_req, ok_resp, true) {
+    Ok(v) => debug_assert(!v, "POST not storable")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // Request no-store forbids storing even if response has public, max-age
+  let req_ns = CacheRequest::new("GET", "https://cdn.example.com/app.js", [Header::new("Cache-Control", "no-store")])
+  let pub_resp = CacheResponse::new(200, [Header::new("Cache-Control", "public, max-age=3600")])
+  match is_storable(req_ns, pub_resp, false) {
+    Ok(v) => debug_assert(!v, "request no-store forbids storing")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // Response no-store forbids storing
+  let resp_ns = CacheResponse::new(200, [Header::new("Cache-Control", "no-store, max-age=3600")])
+  match is_storable(get_req, resp_ns, false) {
+    Ok(v) => debug_assert(!v, "response no-store forbids storing")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // private: forbidden in shared cache, allowed in private cache
+  let priv_resp = CacheResponse::new(200, [Header::new("Cache-Control", "private, max-age=600")])
+  match is_storable(get_req, priv_resp, true) {
+    Ok(v) => debug_assert(!v, "private forbidden in shared")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+  match is_storable(get_req, priv_resp, false) {
+    Ok(v) => debug_assert(v, "private allowed in private cache")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // Authorization in shared cache: forbidden unless public/must-revalidate/s-maxage
+  let auth_req = CacheRequest::new("GET", "https://api.example.com/me", [Header::new("Authorization", "Bearer tok")])
+  match is_storable(auth_req, ok_resp, true) {
+    Ok(v) => debug_assert(!v, "Authorization forbidden in shared without public/s-maxage/must-revalidate")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+  match is_storable(auth_req, ok_resp, false) {
+    Ok(v) => debug_assert(v, "Authorization allowed in private cache")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+  let auth_ok_shared = CacheResponse::new(200, [Header::new("Cache-Control", "s-maxage=60")])
+  match is_storable(auth_req, auth_ok_shared, true) {
+    Ok(v) => debug_assert(v, "Authorization allowed in shared with s-maxage")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // Non-heuristically cacheable status (e.g. 302) requires explicit freshness or public
+  let resp_302_bare = CacheResponse::new(302, [Header::new("Location", "/new")])
+  match is_storable(get_req, resp_302_bare, true) {
+    Ok(v) => debug_assert(!v, "bare 302 not storable")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+  let resp_302_explicit = CacheResponse::new(302, [Header::new("Location", "/new"), Header::new("Cache-Control", "max-age=60")])
+  match is_storable(get_req, resp_302_explicit, true) {
+    Ok(v) => debug_assert(v, "302 with max-age storable")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // Heuristically cacheable status 404 is storable without explicit CC
+  let resp_404 = CacheResponse::new(404, [Header::new("Date", "Sun, 06 Nov 1994 08:49:37 GMT")])
+  match is_storable(get_req, resp_404, true) {
+    Ok(v) => debug_assert(v, "404 heuristically storable")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+
+  // Vary: * is not storable for reuse
+  let resp_vary_star = CacheResponse::new(200, [Header::new("Cache-Control", "max-age=60"), Header::new("Vary", "*")])
+  match is_storable(get_req, resp_vary_star, true) {
+    Ok(v) => debug_assert(!v, "Vary: * not storable")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. RFC 9111 §4.2 Freshness Lifetime & Age calculation
+// ---------------------------------------------------------------------------
+
+test "rfc9111_freshness_priority_and_age" {
+  let t_date = 1700000000L
+  let date_str = format_http_date(t_date)
+  let expires_str = format_http_date(t_date + 120L)
+  let lm_str = format_http_date(t_date - 10000L)
+
+  // s-maxage wins over max-age and Expires for shared cache, ignored for private cache
+  let resp = CacheResponse::new(200, [
+    Header::new("Date", date_str),
+    Header::new("Expires", expires_str),
+    Header::new("Cache-Control", "max-age=300, s-maxage=900"),
+  ])
+  match compute_freshness_lifetime(resp, t_date, CachePolicyOptions::shared()) {
+    Ok(fl) => debug_assert(fl == 900L, "shared uses s-maxage")
+    Err(_) => debug_assert(false, "shared fl err")
+  }
+  match compute_freshness_lifetime(resp, t_date, CachePolicyOptions::private_cache()) {
+    Ok(fl) => debug_assert(fl == 300L, "private ignores s-maxage")
+    Err(_) => debug_assert(false, "private fl err")
+  }
+
+  // Expires - Date when no max-age
+  let resp_exp = CacheResponse::new(200, [
+    Header::new("Date", date_str),
+    Header::new("Expires", expires_str),
+  ])
+  match compute_freshness_lifetime(resp_exp, t_date, CachePolicyOptions::shared()) {
+    Ok(fl) => debug_assert(fl == 120L, "Expires - Date == 120")
+    Err(_) => debug_assert(false, "expires fl err")
+  }
+
+  // Invalid Expires (e.g. "0") -> 0 freshness lifetime
+  let resp_exp0 = CacheResponse::new(200, [
+    Header::new("Date", date_str),
+    Header::new("Expires", "0"),
+  ])
+  match compute_freshness_lifetime(resp_exp0, t_date, CachePolicyOptions::shared()) {
+    Ok(fl) => debug_assert(fl == 0L, "Expires: 0 -> 0")
+    Err(_) => debug_assert(false, "expires 0 fl err")
+  }
+
+  // Heuristic freshness: 10% of (Date - Last-Modified) = 1000s
+  let resp_heur = CacheResponse::new(200, [
+    Header::new("Date", date_str),
+    Header::new("Last-Modified", lm_str),
+  ])
+  match compute_freshness_lifetime(resp_heur, t_date, CachePolicyOptions::shared()) {
+    Ok(fl) => debug_assert(fl == 1000L, "heuristic 10% = 1000")
+    Err(_) => debug_assert(false, "heuristic fl err")
+  }
+
+  // Age calculation: request_time=100, response_time=105 (delay=5), Date=95 (apparent=10), Age=20
+  // corrected_age_value = 20 + 5 = 25; initial_age = max(10, 25) = 25
+  let resp_age = CacheResponse::new(200, [
+    Header::new("Date", format_http_date(t_date - 10L)),
+    Header::new("Age", "20"),
+  ])
+  match compute_initial_age(resp_age, t_date - 5L, t_date) {
+    Ok(age) => debug_assert(age == 25L, "corrected initial_age == 25")
+    Err(_) => debug_assert(false, "initial_age err")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. RFC 9111 §4.1 Vary matching
+// ---------------------------------------------------------------------------
+
+test "rfc9111_vary_matching" {
+  let stored = [
+    Header::new("Accept-Encoding", "gzip"),
+    Header::new("Accept-Encoding", "br"),
+    Header::new("Accept-Language", "  en-US  "),
+  ]
+  let incoming_same = [
+    Header::new("accept-encoding", "gzip, br"),
+    Header::new("accept-language", "en-US"),
+  ]
+  let incoming_diff = [
+    Header::new("Accept-Encoding", "gzip"),
+    Header::new("Accept-Language", "en-US"),
+  ]
+  debug_assert(vary_matches(stored, incoming_same, ["accept-encoding", "accept-language"], false), "vary match normalized")
+  debug_assert(!vary_matches(stored, incoming_diff, ["accept-encoding", "accept-language"], false), "vary mismatch")
+  debug_assert(!vary_matches(stored, incoming_same, ["accept-encoding"], true), "vary star never matches")
+}
+
+// ---------------------------------------------------------------------------
+// 6. RFC 9111 Lookup, Conditional Revalidation, SWR, only-if-cached, 304 Merge
+// ---------------------------------------------------------------------------
+
+test "rfc9111_lookup_revalidation_swr_and_304_merge" {
+  let t0 = 1700000000L
+  let opts = CachePolicyOptions::private_cache()
+  let limits = CacheLimits::default()
+  let req = CacheRequest::new("GET", "https://cdn.example.com/main.css", [
+    Header::new("Accept-Encoding", "br"),
+  ])
+  let resp = CacheResponse::new(200, [
+    Header::new("Date", format_http_date(t0)),
+    Header::new("Cache-Control", "max-age=60, stale-while-revalidate=30"),
+    Header::new("ETag", "\"v1\""),
+    Header::new("Last-Modified", format_http_date(t0 - 3600L)),
+    Header::new("Content-Type", "text/css"),
+    Header::new("Content-Length", "12"),
+    Header::new("Vary", "Accept-Encoding"),
+  ])
+  let body = "body{color:0}".to_bytes()
+  let entry = match create_entry(req, resp, body, t0, t0, opts, limits) {
+    Ok(Some(e)) => e
+    _ => {
+      debug_assert(false, "expected storable entry")
+      return
+    }
+  }
+
+  // Fresh at t0 + 20 (remaining 40s)
+  match evaluate_lookup(req, entry, t0 + 20L, opts, limits) {
+    Ok(CacheLookup::Fresh(ttl)) => debug_assert(ttl == 40L, "fresh ttl 40")
+    _ => debug_assert(false, "expected Fresh")
+  }
+
+  // Stale-while-revalidate at t0 + 75 (stale by 15s <= 30s)
+  match evaluate_lookup(req, entry, t0 + 75L, opts, limits) {
+    Ok(CacheLookup::StaleWhileRevalidate(conds)) => {
+      debug_assert(opt_str_eq(find_header(conds, "if-none-match"), Some("\"v1\"")), "swr INM")
+      debug_assert(opt_str_eq(find_header(conds, "if-modified-since"), Some(format_http_date(t0 - 3600L))), "swr IMS")
+    }
+    _ => debug_assert(false, "expected StaleWhileRevalidate")
+  }
+
+  // StaleNeedsRevalidation at t0 + 100 (stale by 40s > 30s)
+  match evaluate_lookup(req, entry, t0 + 100L, opts, limits) {
+    Ok(CacheLookup::StaleNeedsRevalidation(conds)) => {
+      debug_assert(opt_str_eq(find_header(conds, "if-none-match"), Some("\"v1\"")), "reval INM")
+    }
+    _ => debug_assert(false, "expected StaleNeedsRevalidation")
+  }
+
+  // Request with only-if-cached when stale -> GatewayTimeout504
+  let oic_req = CacheRequest::new("GET", "https://cdn.example.com/main.css", [
+    Header::new("Accept-Encoding", "br"),
+    Header::new("Cache-Control", "only-if-cached"),
+  ])
+  match evaluate_lookup(oic_req, entry, t0 + 100L, opts, limits) {
+    Ok(CacheLookup::GatewayTimeout504) => ()
+    _ => debug_assert(false, "expected GatewayTimeout504")
+  }
+
+  // 304 Not Modified merge updates Cache-Control, ETag, Date, preserves body & Content-Type
+  let t1 = t0 + 100L
+  let resp_304 = CacheResponse::new(304, [
+    Header::new("Date", format_http_date(t1)),
+    Header::new("Cache-Control", "max-age=600"),
+    Header::new("ETag", "\"v2\""),
+  ])
+  match merge_304(entry, resp_304, t1, t1, opts, limits) {
+    Ok(merged) => {
+      debug_assert(merged.status == 200, "merged keeps 200")
+      debug_assert(merged.body.length() == body.length(), "merged keeps body")
+      debug_assert(merged.freshness_lifetime == 600L, "merged updates freshness")
+      debug_assert(opt_str_eq(merged.etag, Some("\"v2\"")), "merged updates etag")
+      debug_assert(opt_str_eq(find_header(merged.response_headers, "content-type"), Some("text/css")), "merged keeps content-type")
+      match evaluate_lookup(req, merged, t1 + 100L, opts, limits) {
+        Ok(CacheLookup::Fresh(ttl)) => debug_assert(ttl == 500L, "merged fresh ttl 500")
+        _ => debug_assert(false, "merged entry should be Fresh")
+      }
+    }
+    Err(e) => debug_assert(false, "merge_304 failed: " + cache_error_message(e))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 7. RFC 9111 §4.4 Unsafe method invalidation & Same-Origin security
+// ---------------------------------------------------------------------------
+
+test "rfc9111_invalidation_same_origin_security" {
+  debug_assert(same_origin("https://example.com:443/a", "https://EXAMPLE.COM/b"), "default port 443 same origin")
+  debug_assert(same_origin("http://example.com:80/a", "http://example.com/b"), "default port 80 same origin")
+  debug_assert(!same_origin("https://example.com/a", "http://example.com/a"), "scheme mismatch")
+  debug_assert(!same_origin("https://example.com/a", "https://evil.com/a"), "host mismatch")
+  debug_assert(!same_origin("https://example.com:8443/a", "https://example.com/a"), "port mismatch")
+
+  let post_req = CacheRequest::new("POST", "https://api.example.com/items", [])
+  let resp_201 = CacheResponse::new(201, [
+    Header::new("Location", "/items/42"),
+    Header::new("Content-Location", "https://evil.example.org/poison"),
+  ])
+  match invalidation_targets(post_req, resp_201) {
+    Ok(targets) => {
+      debug_assert(targets.length() == 2, "only target URI + same-origin Location")
+      debug_assert(targets[0] == "https://api.example.com/items", "target URI")
+      debug_assert(targets[1] == "https://api.example.com/items/42", "resolved relative Location")
+    }
+    Err(e) => debug_assert(false, "invalidation_targets failed: " + cache_error_message(e))
+  }
+
+  // Error response (4xx/5xx) must NOT invalidate
+  let resp_500 = CacheResponse::new(500, [Header::new("Location", "/items/42")])
+  match invalidation_targets(post_req, resp_500) {
+    Ok(targets) => debug_assert(targets.length() == 0, "500 must not invalidate")
+    Err(_) => debug_assert(false, "unexpected err")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Bounded LRU CacheStore & CacheLimits DoS protection
+// ---------------------------------------------------------------------------
+
+test "rfc9111_lru_store_vary_eviction_and_limits" {
+  // Negative limit rejected
+  match CacheStore::new(CachePolicyOptions::private_cache(), CacheLimits::new(-1, 10, 10, 10, 100L, 10, 1000L)) {
+    Err(CacheError::LimitExceeded(_)) => ()
+    _ => debug_assert(false, "negative limit must fail")
+  }
+
+  let limits = CacheLimits::new(4096, 64, 8, 32, 100L, 2, 150L)
+  let store = match CacheStore::new(CachePolicyOptions::private_cache(), limits) {
+    Ok(s) => s
+    Err(_) => {
+      debug_assert(false, "CacheStore::new failed")
+      return
+    }
+  }
+  let t0 = 1700000000L
+
+  // Store two Vary variants for same URL (60 bytes each -> 120 <= 150, 2 <= 2)
+  let req_br = CacheRequest::new("GET", "https://cdn.example.com/bundle.js", [Header::new("Accept-Encoding", "br")])
+  let req_gz = CacheRequest::new("GET", "https://cdn.example.com/bundle.js", [Header::new("Accept-Encoding", "gzip")])
+  let resp_v = CacheResponse::new(200, [
+    Header::new("Date", format_http_date(t0)),
+    Header::new("Cache-Control", "max-age=300"),
+    Header::new("Vary", "Accept-Encoding"),
+    Header::new("ETag", "\"br-1\""),
+  ])
+  let resp_gz = CacheResponse::new(200, [
+    Header::new("Date", format_http_date(t0)),
+    Header::new("Cache-Control", "max-age=300"),
+    Header::new("Vary", "Accept-Encoding"),
+    Header::new("ETag", "\"gz-1\""),
+  ])
+  let body_60 = Bytes::new(60)
+  debug_assert(match store.store(req_br, resp_v, body_60, t0, t0) { Ok(true) => true _ => false }, "store br")
+  debug_assert(match store.store(req_gz, resp_gz, body_60, t0, t0) { Ok(true) => true _ => false }, "store gz")
+  debug_assert(store.entry_count() == 2, "2 variants stored")
+  debug_assert(store.total_bytes() == 120L, "120 bytes stored")
+
+  // Access br to make it MRU (gz becomes LRU)
+  match store.lookup(req_br, t0 + 10L) {
+    Ok(StoreLookup::HitFresh(e, _)) => debug_assert(opt_str_eq(e.etag, Some("\"br-1\"")), "hit br")
+    _ => debug_assert(false, "expected HitFresh br")
+  }
+
+  // Insert a 3rd entry (60 bytes): exceeds max_entries=2 and max_total_bytes=150 -> evicts gz (LRU), keeps br
+  let req_img = CacheRequest::new("GET", "https://cdn.example.com/logo.png", [])
+  let resp_img = CacheResponse::new(200, [
+    Header::new("Date", format_http_date(t0)),
+    Header::new("Cache-Control", "max-age=300"),
+  ])
+  debug_assert(match store.store(req_img, resp_img, body_60, t0, t0) { Ok(true) => true _ => false }, "store img")
+  debug_assert(store.entry_count() == 2, "evicted to 2")
+  debug_assert(store.total_bytes() == 120L, "evicted to 120 bytes")
+
+  match store.lookup(req_gz, t0 + 10L) {
+    Ok(StoreLookup::Miss) => ()
+    _ => debug_assert(false, "gz should have been evicted")
+  }
+  match store.lookup(req_br, t0 + 10L) {
+    Ok(StoreLookup::HitFresh(_, _)) => ()
+    _ => debug_assert(false, "br should remain")
+  }
+
+  // Unsafe POST invalidates bundle.js
+  let post_req = CacheRequest::new("POST", "https://cdn.example.com/bundle.js", [])
+  let post_resp = CacheResponse::new(200, [])
+  match store.invalidate_for_response(post_req, post_resp) {
+    Ok(evicted) => debug_assert(evicted == 1, "invalidated 1 entry")
+    Err(_) => debug_assert(false, "invalidate err")
+  }
+  debug_assert(store.entry_count() == 1, "1 entry left")
+}
+
+test "rfc9111_request_constraints_and_limits_enforcement" {
+  let t0 = 1700000000L
+  let opts_shared = CachePolicyOptions::shared()
+  let limits = CacheLimits::default()
+
+  // Entry with max-age=100, proxy-revalidate
+  let req = CacheRequest::new("GET", "https://cdn.example.com/data.json", [])
+  let resp = CacheResponse::new(200, [
+    Header::new("Date", format_http_date(t0)),
+    Header::new("Cache-Control", "max-age=100, proxy-revalidate"),
+    Header::new("ETag", "\"d1\""),
+  ])
+  let entry = match create_entry(req, resp, "{}".to_bytes(), t0, t0, opts_shared, limits) {
+    Ok(Some(e)) => e
+    _ => {
+      debug_assert(false, "expected entry")
+      return
+    }
+  }
+
+  // HEAD request satisfied by GET entry
+  let head_req = CacheRequest::new("HEAD", "https://cdn.example.com/data.json", [])
+  match evaluate_lookup(head_req, entry, t0 + 10L, opts_shared, limits) {
+    Ok(CacheLookup::Fresh(ttl)) => debug_assert(ttl == 90L, "HEAD hits GET with ttl 90")
+    _ => debug_assert(false, "expected HEAD Fresh")
+  }
+
+  // min-fresh=50 at t0+60 (remaining 40 < 50) -> NeedsRevalidation
+  let mf_req = CacheRequest::new("GET", "https://cdn.example.com/data.json", [
+    Header::new("Cache-Control", "min-fresh=50"),
+  ])
+  match evaluate_lookup(mf_req, entry, t0 + 60L, opts_shared, limits) {
+    Ok(CacheLookup::StaleNeedsRevalidation(_)) => ()
+    _ => debug_assert(false, "min-fresh violation should trigger revalidation")
+  }
+
+  // max-stale=60 at t0+120 (stale by 20s): blocked in shared cache by proxy-revalidate, allowed in private cache
+  let ms_req = CacheRequest::new("GET", "https://cdn.example.com/data.json", [
+    Header::new("Cache-Control", "max-stale=60"),
+  ])
+  match evaluate_lookup(ms_req, entry, t0 + 120L, opts_shared, limits) {
+    Ok(CacheLookup::StaleNeedsRevalidation(_)) => ()
+    _ => debug_assert(false, "proxy-revalidate must block max-stale in shared cache")
+  }
+  match evaluate_lookup(ms_req, entry, t0 + 120L, CachePolicyOptions::private_cache(), limits) {
+    Ok(CacheLookup::Fresh(ttl)) => debug_assert(ttl == 0L, "max-stale ttl 0")
+    _ => debug_assert(false, "private cache ignores proxy-revalidate and allows max-stale")
+  }
+
+  // CacheLimits: max_vary_headers=1 rejects 2 Vary headers
+  let tight_limits = CacheLimits::new(1024, 16, 1, 2, 1024L, 4, 4096L)
+  let vary2_resp = CacheResponse::new(200, [
+    Header::new("Cache-Control", "max-age=60"),
+    Header::new("Vary", "Accept-Encoding, Accept-Language"),
+  ])
+  match is_storable_with_options(req, vary2_resp, opts_shared, tight_limits) {
+    Err(CacheError::LimitExceeded(_)) => ()
+    _ => debug_assert(false, "should reject Vary > max_vary_headers")
+  }
+
+  // CacheLimits: max_directives=2 rejects 3 directives
+  let dir3_headers = [Header::new("Cache-Control", "public, max-age=60, immutable")]
+  match parse_response_cache_control_with_limits(dir3_headers, tight_limits) {
+    Err(CacheError::LimitExceeded(_)) => ()
+    _ => debug_assert(false, "should reject directives > max_directives")
+  }
+}
+
+test "rfc9111_store_update_304_and_clear" {
+  let t0 = 1700000000L
+  let store = match CacheStore::new(CachePolicyOptions::private_cache(), CacheLimits::default()) {
+    Ok(s) => s
+    Err(_) => {
+      debug_assert(false, "store new failed")
+      return
+    }
+  }
+  let req = CacheRequest::new("GET", "https://example.com/app.wasm", [])
+  let resp = CacheResponse::new(200, [
+    Header::new("Date", format_http_date(t0)),
+    Header::new("Cache-Control", "max-age=10"),
+    Header::new("ETag", "\"w1\""),
+    Header::new("Content-Type", "application/wasm"),
+  ])
+  debug_assert(match store.store(req, resp, "wasm-bin".to_bytes(), t0, t0) { Ok(true) => true _ => false }, "store ok")
+  match store.lookup(req, t0 + 20L) {
+    Ok(StoreLookup::NeedsRevalidation(_, conds)) => {
+      debug_assert(opt_str_eq(find_header(conds, "if-none-match"), Some("\"w1\"")), "needs reval INM")
+    }
+    _ => debug_assert(false, "expected NeedsRevalidation")
+  }
+
+  let t1 = t0 + 20L
+  let resp_304 = CacheResponse::new(304, [
+    Header::new("Date", format_http_date(t1)),
+    Header::new("Cache-Control", "max-age=300"),
+    Header::new("ETag", "\"w2\""),
+  ])
+  match store.update_304(req, resp_304, t1, t1) {
+    Ok(Some(updated)) => {
+      debug_assert(opt_str_eq(updated.etag, Some("\"w2\"")), "updated etag")
+      debug_assert(updated.body.to_string() == "wasm-bin", "preserved body")
+    }
+    _ => debug_assert(false, "expected update_304 Some")
+  }
+  match store.lookup(req, t1 + 100L) {
+    Ok(StoreLookup::HitFresh(e, ttl)) => {
+      debug_assert(ttl == 200L, "fresh ttl 200 after 304")
+      debug_assert(e.body.to_string() == "wasm-bin", "body intact")
+    }
+    _ => debug_assert(false, "expected HitFresh after 304")
+  }
+
+  store.clear()
+  debug_assert(store.entry_count() == 0, "cleared count 0")
+  debug_assert(store.total_bytes() == 0L, "cleared bytes 0")
+}

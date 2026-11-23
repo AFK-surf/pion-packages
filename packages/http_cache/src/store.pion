@@ -1,0 +1,362 @@
+///| Pure Pion bounded Sans-IO LRU in-memory HTTP cache store.
+///| Supports O(1) LRU promotion/eviction, dual capacity limits (`max_entries`
+///| and `max_total_bytes`), multi-variant `Vary` storage per URI, 304 updates,
+///| and RFC 9111 §4.4 unsafe method invalidation.
+
+struct LruSlot {
+  mut active : Bool
+  mut uri : String
+  mut entry : Option[StoredEntry]
+  mut byte_size : Int64
+  mut prev : Int
+  mut next : Int
+}
+
+///| Bounded LRU cache store supporting multi-variant `Vary` storage,
+///| 304 Not Modified updates, and RFC 9111 §4.4 unsafe method invalidation.
+pub struct CacheStore {
+  opts : CachePolicyOptions
+  limits : CacheLimits
+  slots : Array[LruSlot]
+  free_slots : Array[Int]
+  uri_index : Map[String, Array[Int]]
+  mut head : Int
+  mut tail : Int
+  mut count : Int
+  mut bytes_used : Int64
+}
+
+///| Create a new bounded `CacheStore`.
+pub fn CacheStore::new(
+  opts : CachePolicyOptions,
+  limits : CacheLimits,
+) -> Result[CacheStore, CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(CacheStore::{
+    opts: opts,
+    limits: limits,
+    slots: [],
+    free_slots: [],
+    uri_index: Map::new(),
+    head: -1,
+    tail: -1,
+    count: 0,
+    bytes_used: 0L,
+  })
+}
+
+fn unlink_slot(self : CacheStore, idx : Int) -> Unit {
+  let p = self.slots[idx].prev
+  let n = self.slots[idx].next
+  if p >= 0 {
+    self.slots[p].next = n
+  } else {
+    self.head = n
+  }
+  if n >= 0 {
+    self.slots[n].prev = p
+  } else {
+    self.tail = p
+  }
+  self.slots[idx].prev = -1
+  self.slots[idx].next = -1
+}
+
+fn push_front_slot(self : CacheStore, idx : Int) -> Unit {
+  self.slots[idx].prev = -1
+  self.slots[idx].next = self.head
+  if self.head >= 0 {
+    self.slots[self.head].prev = idx
+  } else {
+    self.tail = idx
+  }
+  self.head = idx
+}
+
+fn touch_slot(self : CacheStore, idx : Int) -> Unit {
+  if self.head == idx {
+    return
+  }
+  unlink_slot(self, idx)
+  push_front_slot(self, idx)
+}
+
+fn remove_from_uri_index(self : CacheStore, uri : String, idx : Int) -> Unit {
+  match self.uri_index.get(uri) {
+    None => ()
+    Some(list) => {
+      let mut i = 0
+      while i < list.length() {
+        if list[i] == idx {
+          let last = list.length() - 1
+          if i != last {
+            list[i] = list[last]
+          }
+          let _ = list.pop()
+          break
+        }
+        i = i + 1
+      }
+      if list.length() == 0 {
+        self.uri_index.remove(uri)
+      }
+    }
+  }
+}
+
+fn evict_slot(self : CacheStore, idx : Int) -> Unit {
+  if !self.slots[idx].active {
+    return
+  }
+  let uri = self.slots[idx].uri
+  let sz = self.slots[idx].byte_size
+  unlink_slot(self, idx)
+  remove_from_uri_index(self, uri, idx)
+  self.slots[idx].active = false
+  self.slots[idx].uri = ""
+  self.slots[idx].entry = None
+  self.slots[idx].byte_size = 0L
+  self.count = self.count - 1
+  self.bytes_used = self.bytes_used - sz
+  self.free_slots.push(idx)
+}
+
+fn evict_until_fits(self : CacheStore, needed_bytes : Int64, needed_entries : Int) -> Unit {
+  while self.tail >= 0 &&
+  (self.count + needed_entries > self.limits.max_entries ||
+    self.bytes_used + needed_bytes > self.limits.max_total_bytes) {
+    evict_slot(self, self.tail)
+  }
+}
+
+fn find_matching_slot(self : CacheStore, req : CacheRequest) -> Option[Int] {
+  match self.uri_index.get(req.uri) {
+    None => None
+    Some(list) => {
+      let mut i = 0
+      while i < list.length() {
+        let idx = list[i]
+        if self.slots[idx].active {
+          match self.slots[idx].entry {
+            Some(e) => {
+              let method_ok = req.method == e.method ||
+              (req.method == "HEAD" && e.method == "GET")
+              if method_ok &&
+              vary_matches(e.request_headers, req.headers, e.vary_headers, e.vary_star) {
+                return Some(idx)
+              }
+            }
+            None => ()
+          }
+        }
+        i = i + 1
+      }
+      None
+    }
+  }
+}
+
+///| Look up a matching cached entry for `req` at Unix timestamp `now`.
+pub fn CacheStore::lookup(
+  self : CacheStore,
+  req : CacheRequest,
+  now : Int64,
+) -> Result[StoreLookup, CacheError] {
+  let req_cc = match parse_request_cache_control_with_limits(req.headers, self.limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match find_matching_slot(self, req) {
+    None => {
+      if req_cc.only_if_cached {
+        Ok(StoreLookup::GatewayTimeout504)
+      } else {
+        Ok(StoreLookup::Miss)
+      }
+    }
+    Some(idx) => {
+      let entry = match self.slots[idx].entry {
+        Some(e) => e
+        None => return Ok(StoreLookup::Miss)
+      }
+      match evaluate_lookup(req, entry, now, self.opts, self.limits) {
+        Err(e) => Err(e)
+        Ok(CacheLookup::Fresh(ttl)) => {
+          touch_slot(self, idx)
+          Ok(StoreLookup::HitFresh(entry, ttl))
+        }
+        Ok(CacheLookup::StaleWhileRevalidate(conds)) => {
+          touch_slot(self, idx)
+          Ok(StoreLookup::HitStaleWhileRevalidate(entry, conds))
+        }
+        Ok(CacheLookup::StaleNeedsRevalidation(conds)) => {
+          Ok(StoreLookup::NeedsRevalidation(entry, conds))
+        }
+        Ok(CacheLookup::GatewayTimeout504) => Ok(StoreLookup::GatewayTimeout504)
+        Ok(CacheLookup::Miss) => Ok(StoreLookup::Miss)
+      }
+    }
+  }
+}
+
+///| Store a response if storable and within `CacheLimits`.
+///| Returns `Ok(true)` if stored, `Ok(false)` if not storable or exceeds limits.
+pub fn CacheStore::store(
+  self : CacheStore,
+  req : CacheRequest,
+  resp : CacheResponse,
+  body : Bytes,
+  request_time : Int64,
+  response_time : Int64,
+) -> Result[Bool, CacheError] {
+  if self.limits.max_entries == 0 || self.limits.max_total_bytes == 0L {
+    return Ok(false)
+  }
+  let body_len = body.length().to_int64()
+  if body_len > self.limits.max_entry_bytes || body_len > self.limits.max_total_bytes {
+    return Ok(false)
+  }
+  let maybe_entry = match create_entry(req, resp, body, request_time, response_time, self.opts, self.limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let entry = match maybe_entry {
+    Some(e) => e
+    None => return Ok(false)
+  }
+
+  // If an identical variant already exists, evict it first to avoid duplicates
+  match find_matching_slot(self, req) {
+    Some(old_idx) => evict_slot(self, old_idx)
+    None => ()
+  }
+
+  // Evict LRU entries until capacity fits
+  evict_until_fits(self, body_len, 1)
+
+  let idx = match self.free_slots.pop() {
+    Some(free_idx) => {
+      self.slots[free_idx].active = true
+      self.slots[free_idx].uri = entry.uri
+      self.slots[free_idx].entry = Some(entry)
+      self.slots[free_idx].byte_size = body_len
+      self.slots[free_idx].prev = -1
+      self.slots[free_idx].next = -1
+      free_idx
+    }
+    None => {
+      let new_idx = self.slots.length()
+      self.slots.push(LruSlot::{
+        active: true,
+        uri: entry.uri,
+        entry: Some(entry),
+        byte_size: body_len,
+        prev: -1,
+        next: -1,
+      })
+      new_idx
+    }
+  }
+
+  push_front_slot(self, idx)
+  match self.uri_index.get(entry.uri) {
+    Some(list) => list.push(idx)
+    None => self.uri_index.set(entry.uri, [idx])
+  }
+  self.count = self.count + 1
+  self.bytes_used = self.bytes_used + body_len
+  Ok(true)
+}
+
+///| Merge a 304 Not Modified response into the matching cached variant.
+pub fn CacheStore::update_304(
+  self : CacheStore,
+  req : CacheRequest,
+  resp_304 : CacheResponse,
+  request_time : Int64,
+  response_time : Int64,
+) -> Result[Option[StoredEntry], CacheError] {
+  match find_matching_slot(self, req) {
+    None => Ok(None)
+    Some(idx) => {
+      let existing = match self.slots[idx].entry {
+        Some(e) => e
+        None => return Ok(None)
+      }
+      let merged = match merge_304(existing, resp_304, request_time, response_time, self.opts, self.limits) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      self.slots[idx].entry = Some(merged)
+      touch_slot(self, idx)
+      Ok(Some(merged))
+    }
+  }
+}
+
+///| Invalidate all cached variants for an exact URI. Returns number of evicted entries.
+pub fn CacheStore::invalidate_uri(self : CacheStore, uri : String) -> Int {
+  let to_evict : Array[Int] = match self.uri_index.get(uri) {
+    None => return 0
+    Some(list) => {
+      let copy : Array[Int] = []
+      let mut i = 0
+      while i < list.length() {
+        copy.push(list[i])
+        i = i + 1
+      }
+      copy
+    }
+  }
+  let mut evicted = 0
+  let mut i = 0
+  while i < to_evict.length() {
+    let idx = to_evict[i]
+    if self.slots[idx].active {
+      evict_slot(self, idx)
+      evicted = evicted + 1
+    }
+    i = i + 1
+  }
+  evicted
+}
+
+///| Invalidate cached entries affected by an unsafe request and its response (RFC 9111 §4.4).
+///| Returns the number of evicted entries.
+pub fn CacheStore::invalidate_for_response(
+  self : CacheStore,
+  req : CacheRequest,
+  resp : CacheResponse,
+) -> Result[Int, CacheError] {
+  let targets = match invalidation_targets(req, resp) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let mut total = 0
+  let mut i = 0
+  while i < targets.length() {
+    total = total + self.invalidate_uri(targets[i])
+    i = i + 1
+  }
+  Ok(total)
+}
+
+///| Current number of stored entries.
+pub fn CacheStore::entry_count(self : CacheStore) -> Int {
+  self.count
+}
+
+///| Current total body bytes stored.
+pub fn CacheStore::total_bytes(self : CacheStore) -> Int64 {
+  self.bytes_used
+}
+
+///| Remove all entries from the store.
+pub fn CacheStore::clear(self : CacheStore) -> Unit {
+  while self.head >= 0 {
+    evict_slot(self, self.head)
+  }
+}
