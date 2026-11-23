@@ -303,13 +303,18 @@ Wave 10 发布验证在 `AFK-surf/pion@c375cee` 上完成：`sh scripts/verify.s
 
 ### Lean 4 形式化验证
 
-经独立红队审计（`audit/redteam-lean-proofs`）与 Stage 1 全量清理加固，当前 **43 个包**共保留 **474 个** 0 `sorry` 定理（**106 个 A 级核心算法 / 协议不变量 + 368 个 B 级核心辅助定理，0 个 C 级定理**；原 C 级常量 / 单点定理已迁移为原生 Pion 单元测试，全仓 82 包 `sh scripts/verify.sh` 共 **5,381 / 5,381** 单测通过，同时 `base64` 与 `crdt` 修复 C5 问题并补齐 13 条全域 A 级定理）。
+经独立红队审计（`audit/redteam-lean-proofs`）、Stage 1 全量清理加固与 Stage 2 高危算法硬证明补齐，当前 **43 个包**共包含 **495 个** 0 `sorry` 定理（**127 个 A 级核心算法 / 协议不变量 [25.7%] + 368 个 B 级核心辅助定理 + 0 个 C 级定理**；原 C 级常量 / 单点定理已迁移为原生 Pion 单元测试，全仓 82 包 `sh scripts/verify.sh` 共 **5,381 / 5,381** 单测通过）：
+- **Stage 1 全量加固**：`base64` 与 `crdt` 修复 C5 问题并补齐 13 条全域 A 级定理，全 43 包完成 0-`sorry` / 0-warning / 1:1 白名单 / Native vs Lean 值差分收口（474 条定理）；
+- **Stage 2 高危核心 A 级硬证明（+21 条 A 级 + `30 / 30 = 100%` 语义变异击杀门禁）**：
+  - `packages/crypto`（+7 A，`mutation_check.sh` **10 / 10 = 100%**）：真实 Ref10 100 项 `GF(2^255-19)` `fe_mul`/`fe_sq` + 12 步 carry 归约同余与无溢出、`fe_add`/`fe_sub`、RFC 8439 §2.5 `poly1305_clamp_r`、`poly1305_final_reduce` 唯一规范 mod $2^{130}-5$、Ed25519 无分支 `ct_eq_nibble`（3 套 CT SSA 门禁全绿、Release 性能 `0.998×–1.012×`）；
+  - `packages/effect`（+8 A，`mutation_check.sh` **10 / 10 = 100%**）：`TimerHeap::push`/`pop` 最小堆上下滤序与最优子选择（击杀红队复现的 `pop` 乱序变异）、`xorshift32` 全 `UInt32` 显式双射与非零轨道封闭性、`RingDeque` 逻辑-物理槽位双射与四向 `push`/`pop` 互逆不覆盖；
+  - `packages/regex`（+6 A，`mutation_check.sh` **10 / 10 = 100%**）：PikeVM ↔ Lazy DFA 全 8 种 `LookKind` 精确语义等价与 P0-2 UTF-8 字符边界保护（击杀红队复现的双引擎分歧变异）、反向 NFA `reverse_look_kind` 对偶与对合、`CharRange` 合并完备性与集合并/交代数律、`OnePass` 64 位槽位掩码逐位规约与 63 位预算。
 
 全部 43 份 `packages/<name>/proofs/run_proofs.sh` 统一执行 4 项门禁加固：
-- **静态禁用词扫描**：零 `sorry` / `admit` / `axiom` / `native_decide` / `unsafe` / `partial` / `implemented_by` / `extern`；
+- **静态禁用词扫描**：零 `sorry` / `admit` / `axiom` / `bv_decide` / `native_decide` / `unsafe` / `partial` / `implemented_by` / `extern`；
 - **零告警构建**：在独立隔离目录提取当前 `src/*.pion` 并构建，`lake build` 严格 0 errors / 0 warnings；
 - **1:1 公理白名单审查**：`CheckAxioms.lean` 与声明定理列表精确 1:1 对齐，仅允许标准公理 `[propext, Classical.choice, Quot.sound]`；
-- **原生 vs Lean 值差分门禁**：`EvalDiff.lean` 与原生 `pionc run` 逐行精确值 `diff -u` 一致。
+- **原生 vs Lean 值差分门禁**：`EvalDiff.lean` 与原生 `pionc run` 逐行精确值 `diff -u` 一致；`crypto` / `effect` / `regex` 另配独立语义变异门禁 `mutation_check.sh`（要求 `>= 90%`，实测 `30 / 30 = 100%`）。
 
 逐包运行 `bash packages/<name>/proofs/run_proofs.sh`，全量串行限资源运行 `sh scripts/verify-lean.sh`（每包验证通过后自动清理 `.lake/build`）。Wave 14 与 Wave 15 及后续新包暂未纳入证明。
 
