@@ -1,0 +1,830 @@
+///| Apache Avro 1.11.1 Reader/Writer Schema Resolution (Schema Evolution) with pre-compiled plans.
+
+///| Pre-compiled resolution step for a `(writer_node, reader_node)` pair.
+enum ResolveOp {
+  ExactNull
+  ExactBool
+  ExactInt
+  ExactLong
+  ExactFloat
+  ExactDouble
+  ExactBytes
+  ExactString
+  ExactFixed(Int)
+  PromoteIntToLong
+  PromoteIntToFloat
+  PromoteIntToDouble
+  PromoteLongToFloat
+  PromoteLongToDouble
+  PromoteFloatToDouble
+  PromoteStringToBytes
+  PromoteBytesToString
+  ResolveEnum(FixedArray[Int], Array[String]) // writer_idx -> reader_idx (-1 if error), reader_symbols
+  ResolveArray(Int) // item plan id
+  ResolveMap(Int) // value plan id
+  ResolveRecord(
+    Array[String], // reader field names in reader order
+    FixedArray[Int], // for each writer field i: reader slot index (-1 = skip)
+    FixedArray[Int], // for each writer field i: plan id (if mapped) or writer field schema_id (if skip)
+    Array[(Int, AvroValue)], // (reader slot, default value) for reader fields absent in writer
+  )
+  ResolveWriterUnion(Array[Int]) // for each writer branch: plan id (-1 if incompatible)
+  ResolveReaderUnion(Int, Int) // (matched reader branch index, inner plan id)
+  Incompatible(String)
+}
+
+///| Pre-compiled schema evolution resolver from `writer` schema to `reader` schema.
+pub struct SchemaResolver {
+  pub writer : Schema
+  pub reader : Schema
+  root_plan : Int
+  plans : Array[ResolveOp]
+}
+
+fn names_match(w_name : String, r_name : String, r_aliases : Array[String]) -> Bool {
+  if w_name == r_name {
+    return true
+  }
+  let (_, w_simple) = split_fullname(w_name)
+  let (_, r_simple) = split_fullname(r_name)
+  if w_simple == r_simple {
+    return true
+  }
+  let mut i = 0
+  while i < r_aliases.length() {
+    if r_aliases[i] == w_name {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Check if writer node `wid` can match reader node `rid` (exact or promotion).
+///| Returns 2 for exact match, 1 for promotion match, 0 for no match.
+fn match_score(writer : Schema, wid : Int, reader : Schema, rid : Int) -> Int {
+  let w = writer.resolve_id(wid)
+  let r = reader.resolve_id(rid)
+  match (writer.nodes[w].kind, reader.nodes[r].kind) {
+    (SchemaKind::Null, SchemaKind::Null) => 2
+    (SchemaKind::Boolean, SchemaKind::Boolean) => 2
+    (SchemaKind::Int, SchemaKind::Int) => 2
+    (SchemaKind::Long, SchemaKind::Long) => 2
+    (SchemaKind::Float, SchemaKind::Float) => 2
+    (SchemaKind::Double, SchemaKind::Double) => 2
+    (SchemaKind::Bytes, SchemaKind::Bytes) => 2
+    (SchemaKind::String, SchemaKind::String) => 2
+    (SchemaKind::Int, SchemaKind::Long) => 1
+    (SchemaKind::Int, SchemaKind::Float) => 1
+    (SchemaKind::Int, SchemaKind::Double) => 1
+    (SchemaKind::Long, SchemaKind::Float) => 1
+    (SchemaKind::Long, SchemaKind::Double) => 1
+    (SchemaKind::Float, SchemaKind::Double) => 1
+    (SchemaKind::String, SchemaKind::Bytes) => 1
+    (SchemaKind::Bytes, SchemaKind::String) => 1
+    (SchemaKind::Array(_), SchemaKind::Array(_)) => 2
+    (SchemaKind::Map(_), SchemaKind::Map(_)) => 2
+    (SchemaKind::Fixed(wn, _, ws), SchemaKind::Fixed(rn, ra, rs)) =>
+    if ws == rs && names_match(wn, rn, ra) { 2 } else { 0 }
+    (SchemaKind::Enum(wn, _, _, _), SchemaKind::Enum(rn, ra, _, _)) =>
+    if names_match(wn, rn, ra) { 2 } else { 0 }
+    (SchemaKind::Record(wn, _, _), SchemaKind::Record(rn, ra, _)) =>
+    if names_match(wn, rn, ra) { 2 } else { 0 }
+    _ => 0
+  }
+}
+
+struct PlanCompiler {
+  writer : Schema
+  reader : Schema
+  plans : Array[ResolveOp]
+  memo : Array[(Int, Int, Int)] // (wid, rid, plan_id)
+}
+
+fn pc_find_memo(c : PlanCompiler, wid : Int, rid : Int) -> Option[Int] {
+  let mut i = 0
+  while i < c.memo.length() {
+    let (w, r, pid) = c.memo[i]
+    if w == wid && r == rid {
+      return Some(pid)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn pc_compile(c : PlanCompiler, wid_raw : Int, rid_raw : Int) -> Result[Int, AvroError] {
+  let wid = c.writer.resolve_id(wid_raw)
+  let rid = c.reader.resolve_id(rid_raw)
+  match pc_find_memo(c, wid, rid) {
+    Some(pid) => return Ok(pid)
+    None => ()
+  }
+  let pid = c.plans.length()
+  c.plans.push(ResolveOp::Incompatible("pending"))
+  c.memo.push((wid, rid, pid))
+
+  let wkind = c.writer.nodes[wid].kind
+  let rkind = c.reader.nodes[rid].kind
+
+  // Rule 1: Writer is a Union -> resolve each writer branch against reader
+  match wkind {
+    SchemaKind::Union(wbranches) => {
+      let bplans : Array[Int] = []
+      let mut i = 0
+      while i < wbranches.length() {
+        match pc_compile(c, wbranches[i], rid) {
+          Ok(bp) => bplans.push(bp)
+          Err(_) => bplans.push(-1)
+        }
+        i = i + 1
+      }
+      c.plans[pid] = ResolveOp::ResolveWriterUnion(bplans)
+      return Ok(pid)
+    }
+    _ => ()
+  }
+
+  // Rule 2: Reader is a Union (and writer is not) -> find best matching reader branch
+  match rkind {
+    SchemaKind::Union(rbranches) => {
+      let mut best_idx = -1
+      let mut best_score = 0
+      let mut i = 0
+      while i < rbranches.length() {
+        let sc = match_score(c.writer, wid, c.reader, rbranches[i])
+        if sc > best_score {
+          best_score = sc
+          best_idx = i
+          if sc == 2 {
+            break
+          }
+        }
+        i = i + 1
+      }
+      if best_idx < 0 {
+        let msg = "no matching reader union branch for writer schema"
+        c.plans[pid] = ResolveOp::Incompatible(msg)
+        return Err(AvroError::ResolutionError(msg))
+      }
+      let inner_pid = match pc_compile(c, wid, rbranches[best_idx]) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      c.plans[pid] = ResolveOp::ResolveReaderUnion(best_idx, inner_pid)
+      return Ok(pid)
+    }
+    _ => ()
+  }
+
+  // Rule 3: Concrete writer vs concrete reader
+  match (wkind, rkind) {
+    (SchemaKind::Null, SchemaKind::Null) => {
+      c.plans[pid] = ResolveOp::ExactNull
+      Ok(pid)
+    }
+    (SchemaKind::Boolean, SchemaKind::Boolean) => {
+      c.plans[pid] = ResolveOp::ExactBool
+      Ok(pid)
+    }
+    (SchemaKind::Int, SchemaKind::Int) => {
+      c.plans[pid] = ResolveOp::ExactInt
+      Ok(pid)
+    }
+    (SchemaKind::Long, SchemaKind::Long) => {
+      c.plans[pid] = ResolveOp::ExactLong
+      Ok(pid)
+    }
+    (SchemaKind::Float, SchemaKind::Float) => {
+      c.plans[pid] = ResolveOp::ExactFloat
+      Ok(pid)
+    }
+    (SchemaKind::Double, SchemaKind::Double) => {
+      c.plans[pid] = ResolveOp::ExactDouble
+      Ok(pid)
+    }
+    (SchemaKind::Bytes, SchemaKind::Bytes) => {
+      c.plans[pid] = ResolveOp::ExactBytes
+      Ok(pid)
+    }
+    (SchemaKind::String, SchemaKind::String) => {
+      c.plans[pid] = ResolveOp::ExactString
+      Ok(pid)
+    }
+    (SchemaKind::Int, SchemaKind::Long) => {
+      c.plans[pid] = ResolveOp::PromoteIntToLong
+      Ok(pid)
+    }
+    (SchemaKind::Int, SchemaKind::Float) => {
+      c.plans[pid] = ResolveOp::PromoteIntToFloat
+      Ok(pid)
+    }
+    (SchemaKind::Int, SchemaKind::Double) => {
+      c.plans[pid] = ResolveOp::PromoteIntToDouble
+      Ok(pid)
+    }
+    (SchemaKind::Long, SchemaKind::Float) => {
+      c.plans[pid] = ResolveOp::PromoteLongToFloat
+      Ok(pid)
+    }
+    (SchemaKind::Long, SchemaKind::Double) => {
+      c.plans[pid] = ResolveOp::PromoteLongToDouble
+      Ok(pid)
+    }
+    (SchemaKind::Float, SchemaKind::Double) => {
+      c.plans[pid] = ResolveOp::PromoteFloatToDouble
+      Ok(pid)
+    }
+    (SchemaKind::String, SchemaKind::Bytes) => {
+      c.plans[pid] = ResolveOp::PromoteStringToBytes
+      Ok(pid)
+    }
+    (SchemaKind::Bytes, SchemaKind::String) => {
+      c.plans[pid] = ResolveOp::PromoteBytesToString
+      Ok(pid)
+    }
+    (SchemaKind::Fixed(wn, _, ws), SchemaKind::Fixed(rn, ra, rs)) => {
+      if !names_match(wn, rn, ra) || ws != rs {
+        return Err(AvroError::ResolutionError("incompatible fixed schemas: " + wn + " vs " + rn))
+      }
+      c.plans[pid] = ResolveOp::ExactFixed(ws)
+      Ok(pid)
+    }
+    (SchemaKind::Enum(wn, _, wsyms, _), SchemaKind::Enum(rn, ra, rsyms, rdef)) => {
+      if !names_match(wn, rn, ra) {
+        return Err(AvroError::ResolutionError("incompatible enum names: " + wn + " vs " + rn))
+      }
+      let rsym_map : Map[String, Int] = Map::new()
+      let mut rk = 0
+      while rk < rsyms.length() {
+        rsym_map.set(rsyms[rk], rk)
+        rk = rk + 1
+      }
+      let def_idx = match rdef {
+        None => -1
+        Some(ds) =>
+        match rsym_map.get(ds) {
+          Some(k) => k
+          None => -1
+        }
+      }
+      let sym_map : FixedArray[Int] = FixedArray::make(wsyms.length(), -1)
+      let mut i = 0
+      while i < wsyms.length() {
+        let ws = wsyms[i]
+        sym_map[i] = match rsym_map.get(ws) {
+          Some(ridx) => ridx
+          None => def_idx
+        }
+        i = i + 1
+      }
+      c.plans[pid] = ResolveOp::ResolveEnum(sym_map, rsyms)
+      Ok(pid)
+    }
+    (SchemaKind::Array(witem), SchemaKind::Array(ritem)) => {
+      let item_pid = match pc_compile(c, witem, ritem) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      c.plans[pid] = ResolveOp::ResolveArray(item_pid)
+      Ok(pid)
+    }
+    (SchemaKind::Map(wval), SchemaKind::Map(rval)) => {
+      let val_pid = match pc_compile(c, wval, rval) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      c.plans[pid] = ResolveOp::ResolveMap(val_pid)
+      Ok(pid)
+    }
+    (SchemaKind::Record(wn, _, wfields), SchemaKind::Record(rn, ra, rfields)) => {
+      if !names_match(wn, rn, ra) {
+        return Err(AvroError::ResolutionError("incompatible record names: " + wn + " vs " + rn))
+      }
+      let r_len = rfields.length()
+      let w_len = wfields.length()
+      let r_names : Array[String] = []
+      let r_matched : FixedArray[Bool] = FixedArray::make(r_len, false)
+      // Build O(1) lookup from field name or alias -> first matching reader field index
+      let r_lookup : Map[String, Int] = Map::new()
+      let mut ri = 0
+      while ri < r_len {
+        let rf = rfields[ri]
+        r_names.push(rf.name)
+        match r_lookup.get(rf.name) {
+          None => r_lookup.set(rf.name, ri)
+          Some(_) => ()
+        }
+        let mut ai = 0
+        while ai < rf.aliases.length() {
+          let al = rf.aliases[ai]
+          match r_lookup.get(al) {
+            None => r_lookup.set(al, ri)
+            Some(_) => ()
+          }
+          ai = ai + 1
+        }
+        ri = ri + 1
+      }
+      let w_to_r : FixedArray[Int] = FixedArray::make(w_len, -1)
+      let w_fplans : FixedArray[Int] = FixedArray::make(w_len, -1)
+      let mut wi = 0
+      while wi < w_len {
+        let wf = wfields[wi]
+        let target_r = match r_lookup.get(wf.name) {
+          Some(k) => if !r_matched[k] { k } else { -1 }
+          None => -1
+        }
+        if target_r >= 0 {
+          let fp = match pc_compile(c, wf.schema_id, rfields[target_r].schema_id) {
+            Ok(p) => p
+            Err(e) => return Err(e)
+          }
+          w_to_r[wi] = target_r
+          w_fplans[wi] = fp
+          r_matched[target_r] = true
+        } else {
+          w_to_r[wi] = -1
+          w_fplans[wi] = wf.schema_id
+        }
+        wi = wi + 1
+      }
+      let r_defaults : Array[(Int, AvroValue)] = []
+      let mut j = 0
+      while j < r_len {
+        if !r_matched[j] {
+          match rfields[j].default_val {
+            Some(dv) => r_defaults.push((j, dv))
+            None =>
+            return Err(
+              AvroError::ResolutionError(
+                "reader field '" + rfields[j].name + "' missing in writer and has no default",
+              ),
+            )
+          }
+        }
+        j = j + 1
+      }
+      c.plans[pid] = ResolveOp::ResolveRecord(r_names, w_to_r, w_fplans, r_defaults)
+      Ok(pid)
+    }
+    _ => Err(AvroError::ResolutionError("incompatible writer and reader schemas"))
+  }
+}
+
+enum ResolveFrame {
+  ResArray(Int, Array[AvroValue], Int)
+  ResMap(Int, Array[(String, AvroValue)], Int, String)
+  ResReaderUnion(Int)
+  ResWriterUnion
+  ResRecord(
+    Array[String],
+    FixedArray[Int],
+    FixedArray[Int],
+    FixedArray[AvroValue],
+    Int, // current writer field index waiting for value
+  )
+}
+
+fn exec_resolve(
+  r : BinReader,
+  res : SchemaResolver,
+  root_plan_id : Int,
+) -> Result[AvroValue, AvroError] {
+  let stack : Array[ResolveFrame] = []
+  let mut cur_pid = root_plan_id
+  let mut has_val = false
+  let mut out_val = AvroValue::Null
+  while true {
+    if !has_val {
+      if stack.length() > r.limits.max_depth {
+        return Err(AvroError::LimitExceeded("max_depth exceeded in schema resolution"))
+      }
+      match res.plans[cur_pid] {
+        ResolveOp::ExactNull => {
+          out_val = AvroValue::Null
+          has_val = true
+        }
+        ResolveOp::ExactBool =>
+        match br_read_bool(r) {
+          Ok(b) => {
+            out_val = AvroValue::Boolean(b)
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ExactInt =>
+        match br_read_i32(r) {
+          Ok(v) => {
+            out_val = AvroValue::Int(v)
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ExactLong =>
+        match br_read_i64(r) {
+          Ok(v) => {
+            out_val = AvroValue::Long(v)
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ExactFloat =>
+        match br_read_f32_bits(r) {
+          Ok(bits) => {
+            out_val = AvroValue::Float32(float32_bits_to_double(bits))
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ExactDouble =>
+        match br_read_f64_bits(r) {
+          Ok(bits) => {
+            out_val = AvroValue::Float64(Double::from_bits(bits))
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ExactBytes =>
+        match br_read_bytes(r) {
+          Ok(b) => {
+            out_val = AvroValue::Bytes(b)
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ExactString =>
+        match br_read_string(r) {
+          Ok(s) => {
+            out_val = AvroValue::String(s)
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ExactFixed(size) =>
+        match br_read_fixed(r, size) {
+          Ok(b) => {
+            out_val = AvroValue::Fixed(b)
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteIntToLong =>
+        match br_read_i32(r) {
+          Ok(v) => {
+            out_val = AvroValue::Long(v.to_int64())
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteIntToFloat =>
+        match br_read_i32(r) {
+          Ok(v) => {
+            out_val = AvroValue::Float32(float32_bits_to_double(int64_to_float32_bits(v.to_int64())))
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteIntToDouble =>
+        match br_read_i32(r) {
+          Ok(v) => {
+            out_val = AvroValue::Float64(v.to_double())
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteLongToFloat =>
+        match br_read_i64(r) {
+          Ok(v) => {
+            out_val = AvroValue::Float32(float32_bits_to_double(int64_to_float32_bits(v)))
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteLongToDouble =>
+        match br_read_i64(r) {
+          Ok(v) => {
+            out_val = AvroValue::Float64(v.to_double())
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteFloatToDouble =>
+        match br_read_f32_bits(r) {
+          Ok(bits) => {
+            out_val = AvroValue::Float64(float32_bits_to_double_quiet(bits))
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteStringToBytes =>
+        match br_read_string(r) {
+          Ok(s) => {
+            out_val = AvroValue::Bytes(s.to_bytes())
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::PromoteBytesToString =>
+        match br_read_bytes(r) {
+          Ok(b) => {
+            if !is_valid_utf8_range(b, 0, b.length()) {
+              return Err(AvroError::InvalidUtf8("bytes->string promotion encountered invalid UTF-8"))
+            }
+            out_val = AvroValue::String(b.to_string())
+            has_val = true
+          }
+          Err(e) => return Err(e)
+        }
+        ResolveOp::ResolveEnum(sym_map, rsyms) => {
+          let widx = match br_read_i32(r) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          if widx < 0 || widx >= sym_map.length() {
+            return Err(AvroError::InvalidBinary("writer enum index out of range"))
+          }
+          let ridx = sym_map[widx]
+          if ridx < 0 {
+            return Err(AvroError::ResolutionError("writer enum symbol not in reader enum and no default"))
+          }
+          out_val = AvroValue::Enum(ridx, rsyms[ridx])
+          has_val = true
+        }
+        ResolveOp::ResolveArray(item_pid) => {
+          let count = match br_read_block_count(r) {
+            Ok(c) => c
+            Err(e) => return Err(e)
+          }
+          if count == 0L {
+            out_val = AvroValue::Array([])
+            has_val = true
+          } else {
+            if count > (r.limits.max_elements - r.elements).to_int64() {
+              return Err(AvroError::LimitExceeded("array exceeds max_elements in resolve"))
+            }
+            let n = count.to_int()
+            r.elements = r.elements + n
+            stack.push(ResolveFrame::ResArray(item_pid, [], n - 1))
+            cur_pid = item_pid
+          }
+        }
+        ResolveOp::ResolveMap(val_pid) => {
+          let count = match br_read_block_count(r) {
+            Ok(c) => c
+            Err(e) => return Err(e)
+          }
+          if count == 0L {
+            out_val = AvroValue::Map([])
+            has_val = true
+          } else {
+            if count > (r.limits.max_elements - r.elements).to_int64() {
+              return Err(AvroError::LimitExceeded("map exceeds max_elements in resolve"))
+            }
+            let n = count.to_int()
+            r.elements = r.elements + n
+            let k = match br_read_string(r) {
+              Ok(s) => s
+              Err(e) => return Err(e)
+            }
+            stack.push(ResolveFrame::ResMap(val_pid, [], n - 1, k))
+            cur_pid = val_pid
+          }
+        }
+        ResolveOp::ResolveRecord(r_names, w_to_r, w_fplans, r_defaults) => {
+          let r_len = r_names.length()
+          let slots : FixedArray[AvroValue] = FixedArray::make(r_len, AvroValue::Null)
+          let mut di = 0
+          while di < r_defaults.length() {
+            let (slot, dv) = r_defaults[di]
+            slots[slot] = dv
+            di = di + 1
+          }
+          let mut wi = 0
+          let mut found_mapped = false
+          while wi < w_to_r.length() {
+            if w_to_r[wi] >= 0 {
+              stack.push(ResolveFrame::ResRecord(r_names, w_to_r, w_fplans, slots, wi))
+              cur_pid = w_fplans[wi]
+              found_mapped = true
+              break
+            } else {
+              let saved_depth = r.depth
+              r.depth = stack.length() + 1
+              let sk = skip_datum_from(r, res.writer, w_fplans[wi])
+              r.depth = saved_depth
+              match sk {
+                Ok(_) => ()
+                Err(e) => return Err(e)
+              }
+            }
+            wi = wi + 1
+          }
+          if !found_mapped {
+            let out : Array[(String, AvroValue)] = []
+            let mut ri = 0
+            while ri < r_len {
+              out.push((r_names[ri], slots[ri]))
+              ri = ri + 1
+            }
+            out_val = AvroValue::Record(out)
+            has_val = true
+          }
+        }
+        ResolveOp::ResolveWriterUnion(bplans) => {
+          let widx64 = match br_read_i64(r) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          if widx64 < 0L || widx64 >= bplans.length().to_int64() {
+            return Err(AvroError::InvalidBinary("writer union index out of range"))
+          }
+          let bpid = bplans[widx64.to_int()]
+          if bpid < 0 {
+            return Err(AvroError::ResolutionError("writer union branch incompatible with reader schema"))
+          }
+          stack.push(ResolveFrame::ResWriterUnion)
+          cur_pid = bpid
+        }
+        ResolveOp::ResolveReaderUnion(ridx, inner_pid) => {
+          stack.push(ResolveFrame::ResReaderUnion(ridx))
+          cur_pid = inner_pid
+        }
+        ResolveOp::Incompatible(msg) => return Err(AvroError::ResolutionError(msg))
+      }
+    } else {
+      match stack.pop() {
+        None => return Ok(out_val)
+        Some(ResolveFrame::ResWriterUnion) => ()
+        Some(ResolveFrame::ResReaderUnion(ridx)) => out_val = AvroValue::Union(ridx, out_val)
+        Some(ResolveFrame::ResRecord(r_names, w_to_r, w_fplans, slots, cur_wi)) => {
+          slots[w_to_r[cur_wi]] = out_val
+          let mut wi = cur_wi + 1
+          let mut found_mapped = false
+          while wi < w_to_r.length() {
+            if w_to_r[wi] >= 0 {
+              stack.push(ResolveFrame::ResRecord(r_names, w_to_r, w_fplans, slots, wi))
+              cur_pid = w_fplans[wi]
+              has_val = false
+              found_mapped = true
+              break
+            } else {
+              let saved_depth = r.depth
+              r.depth = stack.length() + 1
+              let sk = skip_datum_from(r, res.writer, w_fplans[wi])
+              r.depth = saved_depth
+              match sk {
+                Ok(_) => ()
+                Err(e) => return Err(e)
+              }
+            }
+            wi = wi + 1
+          }
+          if !found_mapped {
+            let out : Array[(String, AvroValue)] = []
+            let mut ri = 0
+            while ri < r_names.length() {
+              out.push((r_names[ri], slots[ri]))
+              ri = ri + 1
+            }
+            out_val = AvroValue::Record(out)
+          }
+        }
+        Some(ResolveFrame::ResArray(item_pid, items, rem)) => {
+          items.push(out_val)
+          if rem > 0 {
+            stack.push(ResolveFrame::ResArray(item_pid, items, rem - 1))
+            cur_pid = item_pid
+            has_val = false
+          } else {
+            let count = match br_read_block_count(r) {
+              Ok(c) => c
+              Err(e) => return Err(e)
+            }
+            if count == 0L {
+              out_val = AvroValue::Array(items)
+            } else {
+              if count > (r.limits.max_elements - r.elements).to_int64() {
+                return Err(AvroError::LimitExceeded("array exceeds max_elements in resolve"))
+              }
+              let n = count.to_int()
+              r.elements = r.elements + n
+              stack.push(ResolveFrame::ResArray(item_pid, items, n - 1))
+              cur_pid = item_pid
+              has_val = false
+            }
+          }
+        }
+        Some(ResolveFrame::ResMap(val_pid, entries, rem, key)) => {
+          entries.push((key, out_val))
+          if rem > 0 {
+            let next_k = match br_read_string(r) {
+              Ok(s) => s
+              Err(e) => return Err(e)
+            }
+            stack.push(ResolveFrame::ResMap(val_pid, entries, rem - 1, next_k))
+            cur_pid = val_pid
+            has_val = false
+          } else {
+            let count = match br_read_block_count(r) {
+              Ok(c) => c
+              Err(e) => return Err(e)
+            }
+            if count == 0L {
+              out_val = AvroValue::Map(entries)
+            } else {
+              if count > (r.limits.max_elements - r.elements).to_int64() {
+                return Err(AvroError::LimitExceeded("map exceeds max_elements in resolve"))
+              }
+              let n = count.to_int()
+              r.elements = r.elements + n
+              let next_k = match br_read_string(r) {
+                Ok(s) => s
+                Err(e) => return Err(e)
+              }
+              stack.push(ResolveFrame::ResMap(val_pid, entries, n - 1, next_k))
+              cur_pid = val_pid
+              has_val = false
+            }
+          }
+        }
+      }
+    }
+  }
+  Ok(out_val)
+}
+
+///| Compile and validate a `SchemaResolver` for evolving datums from `writer` to `reader`.
+pub fn compile_resolver(writer : Schema, reader : Schema) -> Result[SchemaResolver, AvroError] {
+  let c = PlanCompiler::{ writer: writer, reader: reader, plans: [], memo: [] }
+  let root_plan = match pc_compile(c, writer.root, reader.root) {
+    Ok(pid) => pid
+    Err(e) => return Err(e)
+  }
+  Ok(SchemaResolver::{ writer: writer, reader: reader, root_plan: root_plan, plans: c.plans })
+}
+
+///| Decode a binary datum written with `writer` schema into a value conforming to `reader` schema.
+pub fn decode_datum_resolved(
+  writer : Schema,
+  reader : Schema,
+  data : Bytes,
+) -> Result[AvroValue, AvroError] {
+  decode_datum_resolved_with_limits(writer, reader, data, AvroLimits::default())
+}
+
+///| Decode a binary datum with schema evolution and custom limits.
+pub fn decode_datum_resolved_with_limits(
+  writer : Schema,
+  reader : Schema,
+  data : Bytes,
+  limits : AvroLimits,
+) -> Result[AvroValue, AvroError] {
+  let res = match compile_resolver(writer, reader) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  decode_datum_with_resolver(res, data, limits)
+}
+
+///| Decode a binary datum using a pre-compiled `SchemaResolver`.
+pub fn decode_datum_with_resolver(
+  resolver : SchemaResolver,
+  data : Bytes,
+  limits : AvroLimits,
+) -> Result[AvroValue, AvroError] {
+  let r = BinReader::new(data, 0, data.length(), limits)
+  let decoded = match exec_resolve(r, resolver, resolver.root_plan) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if r.pos != r.end {
+    return Err(AvroError::TrailingBytes(r.end - r.pos))
+  }
+  Ok(decoded)
+}
+
+///| Decode `count` back-to-back binary datums using a pre-compiled `SchemaResolver`.
+pub fn decode_datums_with_resolver(
+  resolver : SchemaResolver,
+  data : Bytes,
+  count : Int,
+  limits : AvroLimits,
+) -> Result[Array[AvroValue], AvroError] {
+  let r = BinReader::new(data, 0, data.length(), limits)
+  let out : Array[AvroValue] = []
+  let mut i = 0
+  while i < count {
+    r.elements = 0
+    let decoded = match exec_resolve(r, resolver, resolver.root_plan) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    out.push(decoded)
+    i = i + 1
+  }
+  if r.pos != r.end {
+    return Err(AvroError::TrailingBytes(r.end - r.pos))
+  }
+  Ok(out)
+}
