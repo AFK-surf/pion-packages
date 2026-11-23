@@ -101,3 +101,16 @@ SHA-256: `7a4ec307b3a987955ac58fb6a748b43c0242950e35c5a4b48480c14a7de98224`
 - **Canonical Formatting (W3, 1.37x faster, 7.2x lower RSS)**: Even with a full syntax validation pass (`parse_file_impl`) and full multi-line value group breaking + trailing comment alignment, `format_hcl` outperforms `hclwrite.Format` on realistic Terraform configurations with 7.2x lower peak RSS.
 - **Large Config Parsing (W1, 0.71x speed, 2.5x lower RSS)**: After upgrading `ExprNode::LitNumber` to carry full `HclValue` (supporting exact `BigDec` literals) and adding full bracket-newline tracking, single-pass parsing on 2,111-block files is currently ~0.71x of Go's `hclsyntax.ParseConfig` while maintaining 2.5x lower peak RSS (24.05 MiB vs 59.62 MiB).
 - **Safety & Cross-Runtime Guarantees**: All recursion paths clamp `max_depth` to a stack-safe ceiling (`160`) to prevent native stack overflow (`SIGSEGV`) and Wasm32 `RangeError`; all number-to-integer conversions are range-checked to avoid Wasm32 `f64→i32/i64` traps; `max_output_bytes` bounds templates, `join`, `format`, `jsonencode`, and `eval_body_to_json` incrementally.
+
+## Formal Verification (Lean 4)
+
+The core HCL2 stack-safety depth clamper, `HclLimits`/`Pos`/`Span` constructors, lexer identifier/hex predicates, and Go-compatible Unicode whitespace & case-folding kernels (`src/types.pion`, `src/lexer.pion`, `src/unicode_util.pion`) are annotated with `#verify`, extracted directly via `pionc extract-lean` (`3` types, `14` functions, `0` externals), and formally verified in Lean 4 with **24 theorems**, **0 `sorry`**, **0 `admit`**, **0 custom `axiom`**, **0 `bv_decide`**, **0 `native_decide`**, and **44/44** native-vs-Lean differential cross-checks:
+
+- `proofs/HclProofs/LimitsAndLexer.lean` (12 theorems): `hcl_effective_max_depth` exact `[1, 160]` clamping, bounds, monotonicity, and idempotency across all `Int32`; `HclLimits::default` and `Pos::zero`/`Span::zero` invariants; `is_hcl_ident_start ⊆ is_hcl_ident_cont`, strict disjointness from `is_hcl_digit`, digit/hyphen continuation inclusion, and `hcl_hex_val` `[0, 15]` / `-1` bounds, digit exactness, and `'A'..'F'` case-insensitivity.
+- `proofs/HclProofs/UnicodeCore.lean` (12 theorems): `is_unicode_space` exact ASCII characterization, all Go `unicode.IsSpace` non-ASCII whitespace codepoints (`U+0085`, `U+00A0`, `U+1680`, `U+2000..U+200A`, `U+2028/2029/202F/205F`, `U+3000`), and strict disjointness from ASCII identifiers; `unicode_cp_to_lower` / `unicode_cp_to_upper` ASCII exactness, bidirectional roundtrips, ASCII idempotency, Latin-1 `À..Ö` and Fullwidth `Ａ..Ｚ` roundtrips, and special Go mappings (`İ→i`, `ı→I`, `ÿ↔Ÿ`, `ς→Σ`, `µ→Μ`).
+- `proofs/CheckAxioms.lean`: verifies all 24 theorems depend only on Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`).
+- `proofs/EvalDiff.lean`: 44-case Lean vs native Pion differential cross-check (`diff -u` zero differences).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/hcl/proofs/run_proofs.sh
+```
