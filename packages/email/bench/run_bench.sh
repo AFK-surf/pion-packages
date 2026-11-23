@@ -34,10 +34,10 @@ CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release --locked \
   --manifest-path "$OUT_DIR/rust-proj/Cargo.toml"
 cp "$OUT_DIR/rust-target/release/email-bench-rust" "$BIN_DIR/rust_email_bench"
 
-echo "==> Building Go stdlib benchmark (isolated in $OUT_DIR)"
+echo "==> Building Go net/mail + emersion/go-msgauth v0.7.0 benchmark (isolated in $OUT_DIR)"
 rm -rf "$OUT_DIR/go-proj"
 mkdir -p "$OUT_DIR/go-proj"
-cp "$BENCH_DIR/go/go.mod" "$BENCH_DIR/go/main.go" "$OUT_DIR/go-proj/"
+cp "$BENCH_DIR/go/go.mod" "$BENCH_DIR/go/go.sum" "$BENCH_DIR/go/main.go" "$OUT_DIR/go-proj/"
 (cd "$OUT_DIR/go-proj" && go build -mod=readonly -o "$BIN_DIR/go_email_bench" .)
 
 echo ""
@@ -61,11 +61,11 @@ python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --md-out "$OUT_DIR/bench_w2.md" --json-out "$OUT_DIR/bench_w2.json"
 
 echo ""
-echo "=== W3: 2,000 Email Build + DKIM relaxed/relaxed Ed25519 Sign/Verify (Pion vs Go crypto/ed25519) ==="
+echo "=== W3: 2,000 Email Build + DKIM relaxed/relaxed Ed25519 Sign/Verify (Pion vs Go go-msgauth v0.7.0) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
-  --title "W3: 2,000 Email Build + DKIM Ed25519 Sign/Verify (Pion vs Go stdlib)" \
+  --title "W3: 2,000 Email Build + DKIM Ed25519 Sign/Verify (Pion vs Go go-msgauth)" \
   --impl "pion=$BIN_DIR/pion_email_bench w3_dkim" \
-  --impl "go_stdlib=$BIN_DIR/go_email_bench w3_dkim" \
-  --baseline go_stdlib \
+  --impl "go_msgauth=$BIN_DIR/go_email_bench w3_dkim" \
+  --baseline go_msgauth \
   --warmup 1 --rounds 5 --ops 2000 \
   --md-out "$OUT_DIR/bench_w3.md" --json-out "$OUT_DIR/bench_w3.json"

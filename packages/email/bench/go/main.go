@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/emersion/go-msgauth/dkim"
 )
 
 func mix(h, v int64) int64 {
@@ -69,74 +71,6 @@ func benchW2AddrDate(data []byte) int {
 	return 0
 }
 
-func canonHeaderRelaxed(name, rawVal string) string {
-	var b strings.Builder
-	b.WriteString(strings.ToLower(strings.TrimSpace(name)))
-	b.WriteByte(':')
-	inWsp := false
-	wrote := false
-	for i := 0; i < len(rawVal); i++ {
-		c := rawVal[i]
-		if c == '\r' || c == '\n' {
-			continue
-		}
-		if c == ' ' || c == '\t' {
-			if wrote {
-				inWsp = true
-			}
-		} else {
-			if inWsp {
-				b.WriteByte(' ')
-				inWsp = false
-			}
-			b.WriteByte(c)
-			wrote = true
-		}
-	}
-	return b.String()
-}
-
-func canonBodyRelaxed(body []byte) []byte {
-	if len(body) == 0 {
-		return nil
-	}
-	rawLines := bytes.Split(body, []byte("\n"))
-	lines := make([][]byte, 0, len(rawLines))
-	for idx, l := range rawLines {
-		if idx == len(rawLines)-1 && len(l) == 0 {
-			break
-		}
-		l = bytes.TrimSuffix(l, []byte("\r"))
-		l = bytes.TrimRight(l, " \t")
-		var out []byte
-		prevWsp := false
-		for _, c := range l {
-			if c == ' ' || c == '\t' {
-				if !prevWsp {
-					out = append(out, ' ')
-					prevWsp = true
-				}
-			} else {
-				out = append(out, c)
-				prevWsp = false
-			}
-		}
-		lines = append(lines, out)
-	}
-	for len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
-		lines = lines[:len(lines)-1]
-	}
-	if len(lines) == 0 {
-		return nil
-	}
-	var buf bytes.Buffer
-	for _, l := range lines {
-		buf.Write(l)
-		buf.WriteString("\r\n")
-	}
-	return buf.Bytes()
-}
-
 func benchW3Dkim() int {
 	seed := make([]byte, 32)
 	for i := 0; i < 32; i++ {
@@ -144,6 +78,24 @@ func benchW3Dkim() int {
 	}
 	priv := ed25519.NewKeyFromSeed(seed)
 	pub := priv.Public().(ed25519.PublicKey)
+	pubTxt := "v=DKIM1; k=ed25519; p=" + base64.StdEncoding.EncodeToString(pub)
+
+	signOpts := &dkim.SignOptions{
+		Domain:                 "example.com",
+		Selector:               "ed2026",
+		Signer:                 priv,
+		HeaderCanonicalization: dkim.CanonicalizationRelaxed,
+		BodyCanonicalization:   dkim.CanonicalizationRelaxed,
+		HeaderKeys:             []string{"From", "To", "Subject", "Date"},
+	}
+	verifyOpts := &dkim.VerifyOptions{
+		LookupTXT: func(domain string) ([]string, error) {
+			if domain == "ed2026._domainkey.example.com" {
+				return []string{pubTxt}, nil
+			}
+			return nil, fmt.Errorf("unknown domain: %s", domain)
+		},
+	}
 
 	var ops int64
 	var verified int64
@@ -153,58 +105,50 @@ func benchW3Dkim() int {
 		subj := "DKIM Bench #" + strconv.Itoa(i)
 		bodyTxt := "Benchmark body line " + strconv.Itoa(i) + " with payload."
 		b64Body := base64.StdEncoding.EncodeToString([]byte(bodyTxt))
-		rawMsg := "From: Sender <sender@example.com>\r\n" +
-			"To: Recipient <recv@example.com>\r\n" +
-			"Subject: " + subj + "\r\n" +
-			"Date: Mon, 23 Nov 2026 12:00:00 +0000\r\n" +
-			"MIME-Version: 1.0\r\n" +
-			"Content-Type: text/plain; charset=\"utf-8\"\r\n" +
-			"Content-Transfer-Encoding: base64\r\n\r\n" +
-			b64Body
 
-		// Sign relaxed/relaxed
-		sep := strings.Index(rawMsg, "\r\n\r\n")
-		bodyBytes := []byte(rawMsg[sep+4:])
-		cbody := canonBodyRelaxed(bodyBytes)
-		bh := sha256.Sum256(cbody)
-		bhB64 := base64.StdEncoding.EncodeToString(bh[:])
-		dkimValNoB := " v=1; a=ed25519-sha256; c=relaxed/relaxed; d=example.com; s=ed2026; t=1795435200; h=from:to:subject:date; bh=" + bhB64 + "; b="
+		var rawBuf bytes.Buffer
+		rawBuf.WriteString("From: Sender <sender@example.com>\r\n")
+		rawBuf.WriteString("To: Recipient <recv@example.com>\r\n")
+		rawBuf.WriteString("Subject: ")
+		rawBuf.WriteString(subj)
+		rawBuf.WriteString("\r\n")
+		rawBuf.WriteString("Date: Mon, 23 Nov 2026 12:00:00 +0000\r\n")
+		rawBuf.WriteString("MIME-Version: 1.0\r\n")
+		rawBuf.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
+		rawBuf.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+		rawBuf.WriteString(b64Body)
+		rawBytes := rawBuf.Bytes()
 
-		var sigIn bytes.Buffer
-		sigIn.WriteString(canonHeaderRelaxed("From", " Sender <sender@example.com>"))
-		sigIn.WriteString("\r\n")
-		sigIn.WriteString(canonHeaderRelaxed("To", " Recipient <recv@example.com>"))
-		sigIn.WriteString("\r\n")
-		sigIn.WriteString(canonHeaderRelaxed("Subject", " "+subj))
-		sigIn.WriteString("\r\n")
-		sigIn.WriteString(canonHeaderRelaxed("Date", " Mon, 23 Nov 2026 12:00:00 +0000"))
-		sigIn.WriteString("\r\n")
-		sigIn.WriteString(canonHeaderRelaxed("DKIM-Signature", dkimValNoB))
-
-		hDigest := sha256.Sum256(sigIn.Bytes())
-		sigBytes := ed25519.Sign(priv, hDigest[:])
-		sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
-		signedMsg := "DKIM-Signature:" + dkimValNoB + sigB64 + "\r\n" + rawMsg
-
-		// Verify roundtrip from signedMsg
-		sep2 := strings.Index(signedMsg, "\r\n\r\n")
-		vBody := canonBodyRelaxed([]byte(signedMsg[sep2+4:]))
-		vBh := sha256.Sum256(vBody)
-		if !bytes.Equal(vBh[:], bh[:]) {
+		// Full RFC 6376/8463 DKIM signing via emersion/go-msgauth v0.7.0
+		var signedBuf bytes.Buffer
+		if err := dkim.Sign(&signedBuf, bytes.NewReader(rawBytes), signOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "dkim sign err: %v\n", err)
 			return 10
 		}
-		firstEOL := strings.Index(signedMsg, "\r\n")
-		dkimLine := signedMsg[:firstEOL]
-		bTagIdx := strings.Index(dkimLine, "; b=")
-		decSig, err := base64.StdEncoding.DecodeString(dkimLine[bTagIdx+4:])
-		if err != nil {
+		signedBytes := signedBuf.Bytes()
+
+		// Full RFC 6376/8463 DKIM re-parse, re-canonicalization, and Ed25519 verify
+		verifications, err := dkim.VerifyWithOptions(bytes.NewReader(signedBytes), verifyOpts)
+		if err != nil || len(verifications) != 1 || verifications[0].Err != nil {
+			fmt.Fprintf(os.Stderr, "dkim verify err: %v\n", err)
 			return 11
 		}
-		if !ed25519.Verify(pub, hDigest[:], decSig) {
+		v := verifications[0]
+		if v.Domain != "example.com" {
 			return 12
 		}
+
+		// Hash the exact built message bytes, verified domain, signed header count, and canonicalized body SHA-256
+		sep := bytes.Index(signedBytes, []byte("\r\n\r\n"))
+		if sep < 0 {
+			return 13
+		}
+		bh := sha256.Sum256(append(append([]byte{}, signedBytes[sep+4:]...), '\r', '\n'))
 		verified++
-		checksum = hashBytes(checksum, vBh[:])
+		checksum = hashBytes(checksum, rawBytes)
+		checksum = hashStr(checksum, v.Domain)
+		checksum = mix(checksum, int64(len(v.HeaderKeys)))
+		checksum = hashBytes(checksum, bh[:])
 		ops++
 	}
 
