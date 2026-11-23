@@ -138,3 +138,16 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000,000` | Stdout
 > - **W1 (0.94x vs Rust `redis-protocol` zero-copy `decode_bytes_mut`)**: After fixing the Rust harness to use idiomatic zero-copy `decode_bytes_mut` (eliminating `buf.clone().freeze()`) and upgrading Pion's `StreamDecoder` to an O(n) incremental state machine, Pion reaches near parity with Rust (`53.3 ms` vs `50.3 ms`, `107.5 MB/s` vs `113.8 MB/s`).
 > - **W2 (0.75x)**: `redis-protocol` uses zero-copy `bytes::Bytes` reference-counted sub-slicing during batch decode, whereas Pion allocates owned `Bytes` slices per `BulkString`.
 > - **W3 (0.67x, improved from 0.31x)**: Both sides now parse `MOVED` and `ASK` and materialize an owned `host` string; Pion's single-pass `key_slot` and zero-`to_bytes()` `parse_cluster_redirect` cut median runtime from `109.9 ms` to `48.3 ms` (`2.27x` faster), with the remaining gap due to bounds-checked CRC16 table lookups vs Rust's `crc16` crate.
+
+## Formal Verification (Lean 4)
+
+The core RESP2/RESP3 wire-prefix & inline-space classifiers, signed 64-bit decimal overflow guard, `RespLimits` framing-slack invariants, CRC16-XMODEM (`poly 0x1021`) bit-step, and Redis Cluster 16384-slot routing guards (`src/types.pion`, `src/decode.pion`, `src/cluster.pion`) are annotated with `#verify`, extracted directly via `pionc extract-lean` (`1` type, `12` functions, `0` externals), and formally verified in Lean 4 with **24 theorems**, **0 `sorry`**, **0 `admit`**, **0 custom `axiom`**, **0 `bv_decide`**, **0 `native_decide`**, and **44/44** native-vs-Lean differential cross-checks:
+
+- `proofs/RespProofs/WireAndLimits.lean` (12 theorems): `RespLimits::default` / `with_max_inline_len` invariants, `effective_max_buffer_bytes` non-shrinking / overflow-free ≥16 B framing slack / idempotency, exact 15-byte `is_resp_prefix` characterization and strict disjointness from both C `isspace()` (`is_inline_space`) and ASCII alphanumerics, `hex_nibble` bounds & `'A'..'F'` case-insensitivity, and exact signed 64-bit `i64_parse_will_overflow` iff characterization.
+- `proofs/RespProofs/ClusterAndCrc16.lean` (12 theorems): `crc16_bit_step` `[0, 65535]` totality, `0 → 0`, `0x8000 → 0x1021` generator polynomial exactness, and `2 * crc` linearity for `0 ≤ crc < 32768`; `crc16_to_slot` `[0, 16383]` validity / `crc % 16384` / idempotency; `is_valid_cluster_slot` & `is_valid_slot_range` exact iff characterizations, boundary checks, endpoint validity, and singleton equivalence.
+- `proofs/CheckAxioms.lean`: verifies all 24 theorems depend only on Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`).
+- `proofs/EvalDiff.lean`: 44-case Lean vs native Pion differential cross-check (`diff -u` zero differences).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/resp/proofs/run_proofs.sh
+```
