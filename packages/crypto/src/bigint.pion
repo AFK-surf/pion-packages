@@ -387,3 +387,230 @@ fn big_mod_pow(base : BigUint, exp : BigUint, m : BigUint) -> BigUint {
   let res = mont_mul_limbs(acc, one, m_limbs, k, n0_inv)
   big_trim(res, k)
 }
+
+// ── Constant-time helpers for secret operands (RSA CRT signing, ECDSA scalar arithmetic) ──
+//
+// Every routine below runs a fixed, public number of iterations derived only from limb counts
+// (never from operand values) and replaces data-dependent branches with masks, so that Pion's
+// QBE lowering emits no `jnz` on secret data (only loop and bounds checks on public indices).
+
+///| Constant-time `a mod m`: binary long division over exactly `32 * a_limbs` bits of `a`
+///| with a branch-free conditional subtraction per bit. `a` must fit in `a_limbs` limbs,
+///| `m` must be non-zero; only `a_limbs` and `m.len` influence control flow.
+fn big_mod_ct(a : BigUint, a_limbs : Int, m : BigUint) -> FixedArray[UInt64] {
+  let k = m.len
+  let ml = to_fixed_limbs(m, k + 1)
+  let al = to_fixed_limbs(a, a_limbs)
+  let rem = FixedArray::make(k + 1, 0UL)
+  let diff = FixedArray::make(k + 1, 0UL)
+  let mut bit = a_limbs * 32 - 1
+  while bit >= 0 {
+    // rem = 2 * rem + bit(a); rem < m < 2^(32k) so the result fits in k + 1 limbs.
+    let sh = (bit & 31).to_int64().to_uint64()
+    let mut carry = (al[bit >> 5] >> sh) & 1UL
+    let mut i = 0
+    while i <= k {
+      let v = (rem[i] << 1UL) | carry
+      rem[i] = v & 0xFFFFFFFFUL
+      carry = v >> 32UL
+      i = i + 1
+    }
+    // diff = rem - m; keep diff iff it did not borrow (rem >= m).
+    let mut borrow = 0UL
+    i = 0
+    while i <= k {
+      let d = (rem[i] + 0x100000000UL) - ml[i] - borrow
+      diff[i] = d & 0xFFFFFFFFUL
+      borrow = 1UL - (d >> 32UL)
+      i = i + 1
+    }
+    let mask = borrow - 1UL
+    i = 0
+    while i <= k {
+      rem[i] = rem[i] ^ (mask & (rem[i] ^ diff[i]))
+      i = i + 1
+    }
+    bit = bit - 1
+  }
+  to_fixed_limbs(BigUint::{ limbs: rem, len: k + 1 }, k)
+}
+
+///| Montgomery context for an odd modulus `m` (`k = m.len` limbs), built without any
+///| data-dependent branch on `m` (safe for secret moduli such as the RSA primes).
+struct MontCtx {
+  m : FixedArray[UInt64]
+  k : Int
+  n0_inv : UInt64
+  r2 : FixedArray[UInt64]
+  one : FixedArray[UInt64]
+  one_mont : FixedArray[UInt64]
+}
+
+///|
+fn mont_ctx_ct(m : BigUint) -> MontCtx {
+  let k = m.len
+  let m_limbs = to_fixed_limbs(m, k)
+  let n0_inv = mont_n0_inv(m_limbs[0])
+  let rl = FixedArray::make(2 * k + 1, 0UL)
+  rl[2 * k] = 1UL
+  let r2 = big_mod_ct(BigUint::{ limbs: rl, len: 2 * k + 1 }, 2 * k + 1, m)
+  let one = FixedArray::make(k, 0UL)
+  one[0] = 1UL
+  let one_mont = mont_mul_limbs(one, r2, m_limbs, k, n0_inv)
+  MontCtx::{ m: m_limbs, k: k, n0_inv: n0_inv, r2: r2, one: one, one_mont: one_mont }
+}
+
+///| Constant-time `a * b mod m` for `a, b < m` (plain representation in and out).
+fn mont_mul_mod_ct(ctx : MontCtx, a : FixedArray[UInt64], b : FixedArray[UInt64]) -> FixedArray[UInt64] {
+  let t = mont_mul_limbs(a, b, ctx.m, ctx.k, ctx.n0_inv)
+  mont_mul_limbs(t, ctx.r2, ctx.m, ctx.k, ctx.n0_inv)
+}
+
+///| Constant-time `(a + b) mod m` for `a, b < m`.
+fn mod_add_ct(ctx : MontCtx, a : FixedArray[UInt64], b : FixedArray[UInt64]) -> FixedArray[UInt64] {
+  let k = ctx.k
+  let sum = FixedArray::make(k, 0UL)
+  let mut carry = 0UL
+  let mut i = 0
+  while i < k {
+    let s = a[i] + b[i] + carry
+    sum[i] = s & 0xFFFFFFFFUL
+    carry = s >> 32UL
+    i = i + 1
+  }
+  let diff = FixedArray::make(k, 0UL)
+  let mut borrow = 0UL
+  i = 0
+  while i < k {
+    let d = (sum[i] + 0x100000000UL) - ctx.m[i] - borrow
+    diff[i] = d & 0xFFFFFFFFUL
+    borrow = 1UL - (d >> 32UL)
+    i = i + 1
+  }
+  // Use the difference iff (carry : sum) >= m, i.e. carry - borrow does not underflow.
+  let mask = 0UL - (1UL - ((carry - borrow) >> 63UL))
+  let out = FixedArray::make(k, 0UL)
+  i = 0
+  while i < k {
+    out[i] = sum[i] ^ (mask & (sum[i] ^ diff[i]))
+    i = i + 1
+  }
+  out
+}
+
+///| Constant-time `(a - b) mod m` for `a, b < m`.
+fn mod_sub_ct(ctx : MontCtx, a : FixedArray[UInt64], b : FixedArray[UInt64]) -> FixedArray[UInt64] {
+  let k = ctx.k
+  let diff = FixedArray::make(k, 0UL)
+  let mut borrow = 0UL
+  let mut i = 0
+  while i < k {
+    let d = (a[i] + 0x100000000UL) - b[i] - borrow
+    diff[i] = d & 0xFFFFFFFFUL
+    borrow = 1UL - (d >> 32UL)
+    i = i + 1
+  }
+  let mask = 0UL - borrow
+  let out = FixedArray::make(k, 0UL)
+  let mut carry = 0UL
+  i = 0
+  while i < k {
+    let s = diff[i] + (ctx.m[i] & mask) + carry
+    out[i] = s & 0xFFFFFFFFUL
+    carry = s >> 32UL
+    i = i + 1
+  }
+  out
+}
+
+///| Constant-time `base^exp mod m` for `base < m` (plain representation in and out).
+///| Fixed 4-bit window over exactly `32 * exp_limbs` exponent bits: every window performs four
+///| squarings, a branch-free scan of all 16 table entries and one multiplication, so neither the
+///| exponent bits nor its bit length influence control flow or the number of multiplications.
+fn mont_pow_ct(
+  ctx : MontCtx,
+  base : FixedArray[UInt64],
+  exp : BigUint,
+  exp_limbs : Int,
+) -> FixedArray[UInt64] {
+  let k = ctx.k
+  let el = to_fixed_limbs(exp, exp_limbs)
+  let table = FixedArray::make(16, ctx.one_mont)
+  table[1] = mont_mul_limbs(base, ctx.r2, ctx.m, k, ctx.n0_inv)
+  let mut i = 2
+  while i < 16 {
+    table[i] = mont_mul_limbs(table[i - 1], table[1], ctx.m, k, ctx.n0_inv)
+    i = i + 1
+  }
+  let mut acc = ctx.one_mont
+  let sel = FixedArray::make(k, 0UL)
+  let mut w = exp_limbs * 8 - 1
+  while w >= 0 {
+    acc = mont_mul_limbs(acc, acc, ctx.m, k, ctx.n0_inv)
+    acc = mont_mul_limbs(acc, acc, ctx.m, k, ctx.n0_inv)
+    acc = mont_mul_limbs(acc, acc, ctx.m, k, ctx.n0_inv)
+    acc = mont_mul_limbs(acc, acc, ctx.m, k, ctx.n0_inv)
+    let sh = ((w & 7) * 4).to_int64().to_uint64()
+    let nib = ((el[w >> 3] >> sh) & 0xFUL).to_int()
+    let mut t = 0
+    while t < k {
+      sel[t] = 0UL
+      t = t + 1
+    }
+    let mut j = 0
+    while j < 16 {
+      let mask = 0UL - ct_eq_nibble(nib, j).to_uint64()
+      let entry = table[j]
+      t = 0
+      while t < k {
+        sel[t] = sel[t] | (mask & entry[t])
+        t = t + 1
+      }
+      j = j + 1
+    }
+    acc = mont_mul_limbs(acc, sel, ctx.m, k, ctx.n0_inv)
+    w = w - 1
+  }
+  mont_mul_limbs(acc, ctx.one, ctx.m, k, ctx.n0_inv)
+}
+
+///| Constant-time `a * b + c` over fixed limb counts (`a`: `ka`, `b`: `kb`, `c`: `kc <= ka + kb`),
+///| returning `ka + kb + 1` limbs.
+fn limbs_mul_add_ct(
+  a : FixedArray[UInt64],
+  ka : Int,
+  b : FixedArray[UInt64],
+  kb : Int,
+  c : FixedArray[UInt64],
+  kc : Int,
+) -> FixedArray[UInt64] {
+  let out_len = ka + kb + 1
+  let out = FixedArray::make(out_len, 0UL)
+  let mut i = 0
+  while i < kc {
+    out[i] = c[i]
+    i = i + 1
+  }
+  i = 0
+  while i < ka {
+    let ai = a[i]
+    let mut carry = 0UL
+    let mut j = 0
+    while j < kb {
+      let cur = out[i + j] + ai * b[j] + carry
+      out[i + j] = cur & 0xFFFFFFFFUL
+      carry = cur >> 32UL
+      j = j + 1
+    }
+    // Propagate the final carry through the remaining limbs (fixed length, branch-free).
+    let mut p = i + kb
+    while p < out_len {
+      let cur = out[p] + carry
+      out[p] = cur & 0xFFFFFFFFUL
+      carry = cur >> 32UL
+      p = p + 1
+    }
+    i = i + 1
+  }
+  out
+}

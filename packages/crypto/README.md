@@ -10,7 +10,7 @@ Zero-dependency, pure-Pion cryptographic primitives package (`World`-free, porta
 - **Strict RFC 8032 Ed25519**: `Ed25519KeyPair` (`from_seed`, `public_key`, `sign`), `ed25519_public_key`, `ed25519_sign`, `ed25519_verify`, `ed25519_verify_strict`.
 - **RFC 7748 X25519**: `x25519_public_key`, `x25519`, `x25519_raw`.
 - **NIST P-256 (secp256r1 / ES256 / WebAuthn)**: `p256_public_key`, `p256_sign_es256` (RFC 6979 deterministic), `p256_verify_es256`, `p256_verify_der`, `p256_secret_from_pkcs8_der`, `p256_secret_from_pkcs8_pem`.
-- **RFC 8017 RSA-2048+ (RS256)**: `RsaPrivateKey` (`from_pkcs8_der`, `from_pkcs8_pem`, `public_key`), `RsaPublicKey` (`from_components`, `from_spki_der`), `rsa_sign_rs256` (CRT + Bellcore fault check), `rsa_verify_rs256`.
+- **RFC 8017 RSA-2048+ (RS256)**: `RsaPrivateKey` (`from_pkcs8_der`, `from_pkcs8_pem`, `public_key`), `RsaPublicKey` (`from_components`, `from_spki_der`), `rsa_sign_rs256` (constant-time CRT + Bellcore fault check), `rsa_verify_rs256`.
 
 ## Security Semantics
 
@@ -39,14 +39,15 @@ Zero-dependency, pure-Pion cryptographic primitives package (`World`-free, porta
 
 ### NIST P-256 (ES256 / DER / PKCS#8)
 
-- Signing (`p256_sign_es256`) uses RFC 6979 deterministic nonces with branch-free Montgomery field arithmetic, complete projective addition/doubling (Renes-Costello-Batina 2015, `a = -3`), and a branch-free 4-bit windowed base-point scalar multiplication.
+- Signing (`p256_sign_es256`) uses RFC 6979 deterministic nonces with branch-free Montgomery field arithmetic, complete projective addition/doubling (Renes-Costello-Batina 2015, `a = -3`), and a branch-free 4-bit windowed base-point scalar multiplication. The nonce inverse, `Z^-1` and `s = k^-1 (z + r·d) mod n` use the fixed-window ladder and branch-free modular helpers of `bigint.pion` over fixed 8-limb operands.
+- Signatures are byte-identical to Go's RFC 6979 `crypto/ecdsa` output. Like Go, OpenSSL and WebCrypto, verification accepts both `s` and `n - s` (ECDSA is malleable; normalise to low-`s` at the protocol layer if needed).
 - Verification (`p256_verify_es256`) validates `x < p`, `y < p`, curve membership `y^2 ≡ x^3 - 3x + b (mod p)`, non-infinity, and `1 <= r < n && 1 <= s < n`.
 - `p256_verify_der` enforces strict ASN.1 DER (`SEQUENCE { INTEGER r, INTEGER s }`), rejecting trailing bytes, non-minimal lengths, negative integers, and redundant leading zero padding (WebAuthn/Passkey compliant).
 
 ### RSA-2048+ (RS256)
 
-- Enforces modulus size `2048 <= bits(n) <= 8192`, odd `n` and `e >= 3`, and full CRT parameter consistency (`p * q == n`, `dp == d mod (p-1)`, `dq == d mod (q-1)`, `e * dp ≡ 1 (mod p-1)`, `e * dq ≡ 1 (mod q-1)`, `q * qinv ≡ 1 (mod p)`).
-- `rsa_sign_rs256` performs CRT exponentiation followed by a **Bellcore fault self-check** (`s^e mod n == em`) before returning the signature.
+- Enforces modulus size `2048 <= bits(n) <= 8192`, odd `n`, odd `3 <= e < 2^33` (the BoringSSL bound, which caps verification cost), and full CRT parameter consistency (`p * q == n`, `dp == d mod (p-1)`, `dq == d mod (q-1)`, `e * dp ≡ 1 (mod p-1)`, `e * dq ≡ 1 (mod q-1)`, `q * qinv ≡ 1 (mod p)`).
+- `rsa_sign_rs256` performs constant-time CRT exponentiation (fixed 4-bit window with branch-free table scan over every limb of `dp`/`dq`, branch-free reductions modulo the secret primes) followed by a **Bellcore fault self-check** (`s^e mod n == em`) before returning the signature. `audit/ct_ssa_check.py` checks the release SSA for data-dependent branches on these paths.
 - `rsa_verify_rs256` rejects wrong lengths and `sig >= n`, and performs a full-length `constant_time_eq` comparison of `s^e mod n` against the single canonical RFC 8017 PKCS#1 v1.5 SHA-256 `DigestInfo` block (with explicit ASN.1 `NULL`), preventing Bleichenbacher's forgery attacks.
 
 ### General Notes
@@ -64,7 +65,7 @@ sh packages/crypto/bench/run_bench.sh   # 4-mode wasm_smoke parity + head-to-hea
 
 ### 4-Mode Cross-Target Parity (`wasm_smoke`)
 
-Native debug, Native release, Wasm32 debug, and Wasm32 release all produce byte-identical stdout (`3283 B`, `sha256:163cbdd5aee50ebe403ad43791062c9d80ac10691b9d51640e8385d6410b5493`), covering SHA-1/2, HMAC-SHA2, Ed25519 (including red-team boundary and adversarial rejection vectors), X25519, HKDF-SHA256/512, ChaCha20-Poly1305 AEAD, NIST P-256 ES256/DER, and RSA-2048 RS256.
+Native debug, Native release, Wasm32 debug, and Wasm32 release all produce byte-identical stdout (`3525 B`, `sha256:feceef7d07daa52fb9aaf44c09dec5047d1b5838c71024d3ea1bd8bce296d7ee`), covering SHA-1/2, HMAC-SHA2, Ed25519 (including red-team boundary and adversarial rejection vectors), X25519, HKDF-SHA256/512, ChaCha20-Poly1305 AEAD, NIST P-256 ES256/DER (including RFC 6979 at `d = n - 1` against Go), RSA-2048 RS256, the Poly1305 accumulator landing exactly on `2^130 - 5`, and the RSA public-exponent cap.
 
 ### Red-team audit
 
