@@ -1,30 +1,394 @@
 ///| QR Code character classification, optimal mixed-mode DP segmentation,
-///| and bitstream packing.
+///| and ISO/IEC 18004 bitstream packing.
 
 ///| Return true if `b` is an ASCII digit `'0'..'9'`.
 pub fn is_numeric_byte(b : Int) -> Bool {
-  let _ = b
-  false
+  b >= 48 && b <= 57
 }
+
+///| Build lookup table for ISO/IEC 18004 45-character Alphanumeric set.
+fn build_alnum_table() -> FixedArray[Int] {
+  let tbl : FixedArray[Int] = FixedArray::make(256, -1)
+  let chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+  let mut i = 0
+  while i < chars.length() {
+    tbl[chars.code_unit_at(i)] = i
+    i = i + 1
+  }
+  tbl
+}
+
+let alnum_table : FixedArray[Int] = build_alnum_table()
 
 ///| Return the 0..44 ISO/IEC 18004 Alphanumeric value for ASCII byte `b`, or -1 if invalid.
 pub fn alphanumeric_value(b : Int) -> Int {
-  let _ = b
-  -1
+  if b < 0 || b > 255 {
+    return -1
+  }
+  alnum_table[b]
 }
 
 ///| Return the 13-bit Kanji value for Shift-JIS byte pair `(b0, b1)`, or -1 if not QR Kanji.
 pub fn kanji_value(b0 : Int, b1 : Int) -> Int {
-  let _ = b0
-  let _ = b1
+  if b0 < 0 || b0 > 255 || b1 < 0 || b1 > 255 {
+    return -1
+  }
+  // Valid Shift-JIS trail byte ranges: 0x40..0x7E or 0x80..0xFC
+  if b1 < 0x40 || b1 == 0x7F || b1 > 0xFC {
+    return -1
+  }
+  let word = (b0 << 8) | b1
+  if word >= 0x8140 && word <= 0x9FFC {
+    let diff = word - 0x8140
+    return (diff >> 8) * 0xC0 + (diff & 0xFF)
+  }
+  if word >= 0xE040 && word <= 0xEBBF {
+    let diff = word - 0xC140
+    return (diff >> 8) * 0xC0 + (diff & 0xFF)
+  }
   -1
 }
 
+///| Decode a 13-bit Kanji value back to Shift-JIS 16-bit word `(b0 << 8) | b1`.
+pub fn kanji_from_value(kv : Int) -> Int {
+  let hi = kv / 0xC0
+  let lo = kv % 0xC0
+  let base = (hi << 8) | lo
+  let w = base + 0x8140
+  if w <= 0x9FFC {
+    w
+  } else {
+    base + 0xC140
+  }
+}
+
+///| Helper: slice `data[start..end]` into a `Bytes`.
+fn slice_bytes(data : Bytes, start : Int, end : Int) -> Bytes {
+  let n = end - start
+  let mut out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = data[start + i]
+    i = i + 1
+  }
+  out
+}
+
 ///| Compute optimal mixed-mode segmentation of `data` for `version` using dynamic programming.
+///| Minimizes exact bit cost over Numeric (0), Alphanumeric (1), and Byte (2) modes
+///| (exact fractional bit costs tracked in 6ths of a bit to avoid rounding error:
+///|  Numeric = 10/3 = 20/6 bits/char, Alphanumeric = 11/2 = 33/6 bits/char, Byte = 8 = 48/6 bits/char).
 pub fn optimize_segments(data : Bytes, version : Int) -> Array[Segment] {
-  let _ = data
-  let _ = version
-  []
+  let n = data.length()
+  let out : Array[Segment] = []
+  if n == 0 {
+    return out
+  }
+
+  // Fast path: check if entire input is pure Numeric or pure Alphanumeric
+  let mut all_num = true
+  let mut all_alnum = true
+  let mut i = 0
+  while i < n {
+    let b = data[i].to_int() & 0xFF
+    if !is_numeric_byte(b) {
+      all_num = false
+      if alphanumeric_value(b) < 0 {
+        all_alnum = false
+        break
+      }
+    }
+    i = i + 1
+  }
+  if all_num {
+    out.push(Segment::{ mode: Mode::Numeric, data: data, eci_designator: -1 })
+    return out
+  }
+  if all_alnum {
+    // Check if DP could benefit from Numeric sub-runs inside Alphanumeric;
+    // only possible if there is a numeric run of length >= 6.
+    let mut has_long_num = false
+    let mut run = 0
+    let mut k = 0
+    while k < n {
+      if is_numeric_byte(data[k].to_int() & 0xFF) {
+        run = run + 1
+        if run >= 6 {
+          has_long_num = true
+          break
+        }
+      } else {
+        run = 0
+      }
+      k = k + 1
+    }
+    if !has_long_num {
+      out.push(Segment::{ mode: Mode::Alphanumeric, data: data, eci_designator: -1 })
+      return out
+    }
+  }
+
+  // Full DP over 3 modes: 0=Numeric, 1=Alphanumeric, 2=Byte
+  // Header cost in 6ths of a bit: (4 + char_count_bits) * 6
+  let hdr_num = (4 + char_count_bits(version, Mode::Numeric)) * 6
+  let hdr_alnum = (4 + char_count_bits(version, Mode::Alphanumeric)) * 6
+  let hdr_byte = (4 + char_count_bits(version, Mode::Byte)) * 6
+  let inf = 1073741823
+
+  // dp[m] = min cost (in 6ths of a bit) ending at current char in mode m
+  // parent[i * 3 + m] = previous mode (0,1,2) or -1 if new segment started at i=0
+  let parent : FixedArray[Int] = FixedArray::make(n * 3, -1)
+  let mut dp0 = inf
+  let mut dp1 = inf
+  let mut dp2 = inf
+
+  let b0 = data[0].to_int() & 0xFF
+  if is_numeric_byte(b0) {
+    dp0 = hdr_num + 20
+  }
+  if alphanumeric_value(b0) >= 0 {
+    dp1 = hdr_alnum + 33
+  }
+  dp2 = hdr_byte + 48
+
+  let mut pos = 1
+  while pos < n {
+    let b = data[pos].to_int() & 0xFF
+    let can_num = is_numeric_byte(b)
+    let can_alnum = can_num || alphanumeric_value(b) >= 0
+
+    let mut ndp0 = inf
+    let mut ndp1 = inf
+    let mut ndp2 = inf
+    let mut p0 = -1
+    let mut p1 = -1
+    let mut p2 = -1
+
+    // Transition into Numeric (mode 0)
+    if can_num {
+      if dp0 < inf {
+        let c = dp0 + 20
+        if c < ndp0 {
+          ndp0 = c
+          p0 = 0
+        }
+      }
+      if dp1 < inf {
+        // Rounding up previous Alnum segment if odd length (~3 sixths average; use exact ceiling +3)
+        let c = dp1 + 3 + hdr_num + 20
+        if c < ndp0 {
+          ndp0 = c
+          p0 = 1
+        }
+      }
+      if dp2 < inf {
+        let c = dp2 + hdr_num + 20
+        if c < ndp0 {
+          ndp0 = c
+          p0 = 2
+        }
+      }
+    }
+
+    // Transition into Alphanumeric (mode 1)
+    if can_alnum {
+      if dp0 < inf {
+        let c = dp0 + 4 + hdr_alnum + 33
+        if c < ndp1 {
+          ndp1 = c
+          p1 = 0
+        }
+      }
+      if dp1 < inf {
+        let c = dp1 + 33
+        if c < ndp1 {
+          ndp1 = c
+          p1 = 1
+        }
+      }
+      if dp2 < inf {
+        let c = dp2 + hdr_alnum + 33
+        if c < ndp1 {
+          ndp1 = c
+          p1 = 2
+        }
+      }
+    }
+
+    // Transition into Byte (mode 2)
+    if dp0 < inf {
+      let c = dp0 + 4 + hdr_byte + 48
+      if c < ndp2 {
+        ndp2 = c
+        p2 = 0
+      }
+    }
+    if dp1 < inf {
+      let c = dp1 + 3 + hdr_byte + 48
+      if c < ndp2 {
+        ndp2 = c
+        p2 = 1
+      }
+    }
+    if dp2 < inf {
+      let c = dp2 + 48
+      if c < ndp2 {
+        ndp2 = c
+        p2 = 2
+      }
+    }
+
+    parent[pos * 3] = p0
+    parent[pos * 3 + 1] = p1
+    parent[pos * 3 + 2] = p2
+    dp0 = ndp0
+    dp1 = ndp1
+    dp2 = ndp2
+    pos = pos + 1
+  }
+
+  // Backtrack best ending mode
+  let mut best_m = 2
+  let mut best_cost = dp2
+  if dp1 < best_cost {
+    best_cost = dp1
+    best_m = 1
+  }
+  if dp0 < best_cost {
+    best_m = 0
+  }
+
+  let modes : FixedArray[Int] = FixedArray::make(n, 2)
+  let mut cur_m = best_m
+  let mut idx = n - 1
+  while idx >= 0 {
+    modes[idx] = cur_m
+    if idx > 0 {
+      cur_m = parent[idx * 3 + cur_m]
+    }
+    idx = idx - 1
+  }
+
+  // Group contiguous runs of identical mode into Segments
+  let mut start = 0
+  while start < n {
+    let m = modes[start]
+    let mut end = start + 1
+    while end < n && modes[end] == m {
+      end = end + 1
+    }
+    let seg_mode = if m == 0 {
+      Mode::Numeric
+    } else if m == 1 {
+      Mode::Alphanumeric
+    } else {
+      Mode::Byte
+    }
+    out.push(Segment::{
+      mode: seg_mode,
+      data: slice_bytes(data, start, end),
+      eci_designator: -1,
+    })
+    start = end
+  }
+  out
+}
+
+///| Compute exact bit length of `segments` for `version`, validating characters & ECI.
+pub fn segments_bit_length(segments : Array[Segment], version : Int) -> Result[Int, QrError] {
+  let mut total = 0
+  let mut i = 0
+  while i < segments.length() {
+    let seg = segments[i]
+    let dlen = seg.data.length()
+    match seg.mode {
+      Mode::Eci => {
+        let e = seg.eci_designator
+        if e < 0 || e > 999999 {
+          return Result::Err(QrError::InvalidEci(e))
+        }
+        let eci_bits = if e < 128 { 8 } else if e < 16384 { 16 } else { 24 }
+        total = total + 4 + eci_bits
+      }
+      Mode::Numeric => {
+        let ccb = char_count_bits(version, Mode::Numeric)
+        if dlen >= (1 << ccb) {
+          return Result::Err(QrError::DataTooLong("numeric segment exceeds char count bits"))
+        }
+        let mut j = 0
+        while j < dlen {
+          if !is_numeric_byte(seg.data[j].to_int() & 0xFF) {
+            return Result::Err(QrError::InvalidCharacter("non-digit in Numeric segment"))
+          }
+          j = j + 1
+        }
+        let full = dlen / 3
+        let rem = dlen % 3
+        let rem_bits = if rem == 0 { 0 } else if rem == 1 { 4 } else { 7 }
+        total = total + 4 + ccb + full * 10 + rem_bits
+      }
+      Mode::Alphanumeric => {
+        let ccb = char_count_bits(version, Mode::Alphanumeric)
+        if dlen >= (1 << ccb) {
+          return Result::Err(QrError::DataTooLong("alphanumeric segment exceeds char count bits"))
+        }
+        let mut j = 0
+        while j < dlen {
+          if alphanumeric_value(seg.data[j].to_int() & 0xFF) < 0 {
+            return Result::Err(QrError::InvalidCharacter("invalid char in Alphanumeric segment"))
+          }
+          j = j + 1
+        }
+        total = total + 4 + ccb + (dlen / 2) * 11 + (dlen % 2) * 6
+      }
+      Mode::Byte => {
+        let ccb = char_count_bits(version, Mode::Byte)
+        if dlen >= (1 << ccb) {
+          return Result::Err(QrError::DataTooLong("byte segment exceeds char count bits"))
+        }
+        total = total + 4 + ccb + dlen * 8
+      }
+      Mode::Kanji => {
+        if dlen % 2 != 0 {
+          return Result::Err(QrError::InvalidCharacter("Kanji segment must have even Shift-JIS byte length"))
+        }
+        let chars = dlen / 2
+        let ccb = char_count_bits(version, Mode::Kanji)
+        if chars >= (1 << ccb) {
+          return Result::Err(QrError::DataTooLong("kanji segment exceeds char count bits"))
+        }
+        let mut j = 0
+        while j < dlen {
+          let b0 = seg.data[j].to_int() & 0xFF
+          let b1 = seg.data[j + 1].to_int() & 0xFF
+          if kanji_value(b0, b1) < 0 {
+            return Result::Err(QrError::InvalidCharacter("invalid Shift-JIS pair in Kanji segment"))
+          }
+          j = j + 2
+        }
+        total = total + 4 + ccb + chars * 13
+      }
+    }
+    i = i + 1
+  }
+  Result::Ok(total)
+}
+
+///| Helper to append `nbits` (MSB-first) of `bits_val` into `buf` at bit offset `bit_pos`.
+fn write_bits(buf : FixedArray[Byte], bit_pos : Int, bits_val : Int, nbits : Int) -> Int {
+  let mut pos = bit_pos
+  let mut shift = nbits - 1
+  while shift >= 0 {
+    let bit = (bits_val >> shift) & 1
+    if bit != 0 {
+      let byte_idx = pos >> 3
+      let bit_idx = 7 - (pos & 7)
+      buf[byte_idx] = ((buf[byte_idx].to_int() & 0xFF) | (1 << bit_idx)).to_byte()
+    }
+    pos = pos + 1
+    shift = shift - 1
+  }
+  pos
 }
 
 ///| Pack `segments` into `data_codewords(version, ec)` bytes with terminator and 0xEC/0x11 padding.
@@ -33,8 +397,117 @@ pub fn encode_segments_to_codewords(
   version : Int,
   ec : EcLevel,
 ) -> Result[FixedArray[Byte], QrError] {
-  let _ = segments
-  let _ = version
-  let _ = ec
-  Result::Err(QrError::DataTooLong("not implemented"))
+  if version < 1 || version > 40 {
+    return Result::Err(QrError::InvalidVersion(version))
+  }
+  let cap_bytes = data_codewords(version, ec)
+  let cap_bits = cap_bytes * 8
+  let total_bits = match segments_bit_length(segments, version) {
+    Result::Ok(b) => b
+    Result::Err(e) => return Result::Err(e)
+  }
+  if total_bits > cap_bits {
+    return Result::Err(
+      QrError::DataTooLong(
+        "needs " + total_bits.to_string() + " bits, capacity is " + cap_bits.to_string(),
+      ),
+    )
+  }
+
+  let out : FixedArray[Byte] = FixedArray::make(cap_bytes, (0).to_byte())
+  let mut bit_pos = 0
+  let mut si = 0
+  while si < segments.length() {
+    let seg = segments[si]
+    let dlen = seg.data.length()
+    match seg.mode {
+      Mode::Eci => {
+        bit_pos = write_bits(out, bit_pos, 0x7, 4)
+        let e = seg.eci_designator
+        if e < 128 {
+          bit_pos = write_bits(out, bit_pos, e, 8)
+        } else if e < 16384 {
+          bit_pos = write_bits(out, bit_pos, 0x8000 | e, 16)
+        } else {
+          bit_pos = write_bits(out, bit_pos, 0xC00000 | e, 24)
+        }
+      }
+      Mode::Numeric => {
+        bit_pos = write_bits(out, bit_pos, 0x1, 4)
+        bit_pos = write_bits(out, bit_pos, dlen, char_count_bits(version, Mode::Numeric))
+        let mut j = 0
+        while j + 3 <= dlen {
+          let v =
+          (seg.data[j].to_int() - 48) * 100 +
+          (seg.data[j + 1].to_int() - 48) * 10 +
+          (seg.data[j + 2].to_int() - 48)
+          bit_pos = write_bits(out, bit_pos, v, 10)
+          j = j + 3
+        }
+        let rem = dlen - j
+        if rem == 2 {
+          let v = (seg.data[j].to_int() - 48) * 10 + (seg.data[j + 1].to_int() - 48)
+          bit_pos = write_bits(out, bit_pos, v, 7)
+        } else if rem == 1 {
+          let v = seg.data[j].to_int() - 48
+          bit_pos = write_bits(out, bit_pos, v, 4)
+        }
+      }
+      Mode::Alphanumeric => {
+        bit_pos = write_bits(out, bit_pos, 0x2, 4)
+        bit_pos = write_bits(out, bit_pos, dlen, char_count_bits(version, Mode::Alphanumeric))
+        let mut j = 0
+        while j + 2 <= dlen {
+          let v =
+          alphanumeric_value(seg.data[j].to_int() & 0xFF) * 45 +
+          alphanumeric_value(seg.data[j + 1].to_int() & 0xFF)
+          bit_pos = write_bits(out, bit_pos, v, 11)
+          j = j + 2
+        }
+        if j < dlen {
+          let v = alphanumeric_value(seg.data[j].to_int() & 0xFF)
+          bit_pos = write_bits(out, bit_pos, v, 6)
+        }
+      }
+      Mode::Byte => {
+        bit_pos = write_bits(out, bit_pos, 0x4, 4)
+        bit_pos = write_bits(out, bit_pos, dlen, char_count_bits(version, Mode::Byte))
+        let mut j = 0
+        while j < dlen {
+          bit_pos = write_bits(out, bit_pos, seg.data[j].to_int() & 0xFF, 8)
+          j = j + 1
+        }
+      }
+      Mode::Kanji => {
+        bit_pos = write_bits(out, bit_pos, 0x8, 4)
+        bit_pos = write_bits(out, bit_pos, dlen / 2, char_count_bits(version, Mode::Kanji))
+        let mut j = 0
+        while j < dlen {
+          let kv = kanji_value(seg.data[j].to_int() & 0xFF, seg.data[j + 1].to_int() & 0xFF)
+          bit_pos = write_bits(out, bit_pos, kv, 13)
+          j = j + 2
+        }
+      }
+    }
+    si = si + 1
+  }
+
+  // Terminator (up to 4 zero bits) + zero pad to byte boundary
+  let rem_bits = cap_bits - bit_pos
+  let term_bits = if rem_bits < 4 { rem_bits } else { 4 }
+  bit_pos = bit_pos + term_bits
+  if (bit_pos & 7) != 0 {
+    bit_pos = bit_pos + (8 - (bit_pos & 7))
+  }
+
+  // Alternating pad bytes 0xEC (236) and 0x11 (17)
+  let mut byte_idx = bit_pos >> 3
+  let mut pad_toggle = 0
+  while byte_idx < cap_bytes {
+    out[byte_idx] = if pad_toggle == 0 { (0xEC).to_byte() } else { (0x11).to_byte() }
+    pad_toggle = 1 - pad_toggle
+    byte_idx = byte_idx + 1
+  }
+
+  Result::Ok(out)
 }
