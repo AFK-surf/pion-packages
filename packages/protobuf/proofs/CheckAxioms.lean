@@ -1,0 +1,26 @@
+import ProtobufProofs
+
+#print axioms ProtobufProofs.zigzag_i64_roundtrip
+#print axioms ProtobufProofs.zigzag_i64_decode_encode_roundtrip
+#print axioms ProtobufProofs.zigzag_i64_injective
+#print axioms ProtobufProofs.zigzag_i64_nonneg_even
+#print axioms ProtobufProofs.zigzag_i64_neg_odd
+#print axioms ProtobufProofs.zigzag_i32_bounds
+#print axioms ProtobufProofs.zigzag_i32_roundtrip
+#print axioms ProtobufProofs.zigzag_i32_decode_encode_roundtrip
+#print axioms ProtobufProofs.zigzag_i32_injective
+#print axioms ProtobufProofs.varint_len_u64_bounds
+#print axioms ProtobufProofs.varint_len_u64_exact_tiers
+#print axioms ProtobufProofs.varint_len_u64_mono
+#print axioms ProtobufProofs.decode_options_default_safe
+#print axioms ProtobufProofs.json_options_default_canonical
+#print axioms ProtobufProofs.wire_type_roundtrip
+#print axioms ProtobufProofs.wire_type_from_code_valid_iff
+#print axioms ProtobufProofs.wire_type_eq_iff
+#print axioms ProtobufProofs.encode_tag_raw_exact
+#print axioms ProtobufProofs.tag_encode_decode_roundtrip
+#print axioms ProtobufProofs.tag_len_bounds
+#print axioms ProtobufProofs.tag_len_single_byte_iff
+#print axioms ProtobufProofs.field_number_err_code_spec
+#print axioms ProtobufProofs.field_number_reserved_rejected_iff
+#print axioms ProtobufProofs.field_number_err_code_range

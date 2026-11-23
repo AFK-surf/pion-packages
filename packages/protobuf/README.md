@@ -54,6 +54,23 @@ let json = protobuf::to_proto3_json(schema, msg)?
 - **`audit/redteam_test.pion` (44 tests)**: 31 red-team differential regression tests + 13 control tests verified against Go `google.golang.org/protobuf` v1.36.6 (`dynamicpb` / `protojson` / `protocompile`) and Rust `prost` 0.13.5.
 - **`wasm_smoke/`**: Verified exit code `0` across all 4 modes (Native debug, Native release, Wasm32 debug via Node `pion_wasm_rt.mjs`, Wasm32 release via Node `pion_wasm_rt.mjs`).
 
+## Formal Verification (Lean 4)
+
+Production pure kernels in `src/types.pion` and `src/wire.pion` are annotated with `#verify` and extracted directly to Lean 4 via `pionc extract-lean` (**3 types**, **15 functions**, **0 externals**):
+
+- **Annotated types**: `WireType`, `DecodeOptions`, `JsonOptions` (plus `Tag`).
+- **Annotated hot-path functions**: `wire_type_code`, `wire_type_from_code`, `wire_type_eq`, `DecodeOptions::default`, `JsonOptions::default`, `zigzag_encode_i32`, `zigzag_decode_i32`, `zigzag_encode_i64`, `zigzag_decode_i64`, `varint_len_u64`, `encode_tag_raw`, `decode_tag_wire_type`, `decode_tag_field_num`, `tag_len`, `field_number_err_code`.
+- **Machine-checked proofs** (`proofs/ProtobufProofs/ZigZagAndVarint.lean`, `proofs/ProtobufProofs/TagsAndOptions.lean`): **24 theorems**, **0 `sorry` / `admit` / `axiom` / `bv_decide` / `native_decide`**, verified by `proofs/CheckAxioms.lean` to depend solely on standard Lean axioms (`[propext, Classical.choice, Quot.sound]`):
+  - **Full-domain ZigZag bijectivity**: exact encode↔decode roundtrip and injectivity for `sint64` across all `2^64` `Int64`/`UInt64` values (plus exact algebraic formulas `n ≥ 0 ↦ 2n` and `n < 0 ↦ -2n - 1`) and for `sint32` across all `2^32` `Int32` values (plus `[0, 2^32 - 1]` output range).
+  - **Base-128 Varint length**: exact 10-tier partition (`1..10` bytes) and global monotonicity over all `UInt64`.
+  - **WireType & Tag codec**: `WireType` (`0..5`) bijection & equality decision, exact `(field_number << 3) | wire_type` encoding and lossless decode roundtrip for all legal field numbers `1..536870911`, tag length `[1, 5]` and single-byte iff `field_number ≤ 15`.
+  - **Field number & resource-limit safety**: `field_number_err_code` exact 3-way partition (`0`=valid, `1`=out of `1..536870911`, `2`=reserved `19000..19999` when `reject_reserved = true`), `DecodeOptions::default` positive DoS limits & `strict_utf8 = true`, and `JsonOptions::default` canonical flags.
+- **Differential cross-check**: `proofs/EvalDiff.lean` checks **44 cases** against native Pion execution via `diff -u` (0 differences).
+
+```sh
+packages/protobuf/proofs/run_proofs.sh
+```
+
 ## Head-to-Head Benchmarks
 
 Run the reproducible benchmark suite (`Pion Native --release` vs `Rust prost 0.13.5 --release --locked` vs `Go google.golang.org/protobuf v1.36.6`, pinned via `Cargo.lock` & `go.sum`, strictly interleaved `--warmup 1 --rounds 5`, mandatory byte-for-byte stdout SHA-256 verification):
