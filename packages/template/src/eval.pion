@@ -26,6 +26,8 @@ struct EvalState {
   max_output_bytes : Int
   mut out : StringBuilder
   mut out_bytes : Int
+  mut suppress_output : Bool
+  mut pending_extends : Option[(String, Int, Int)]
 }
 
 fn EvalState::new(
@@ -56,6 +58,8 @@ fn EvalState::new(
     max_output_bytes: env.max_output_bytes,
     out: out,
     out_bytes: 0,
+    suppress_output: false,
+    pending_extends: None,
   }
 }
 
@@ -195,10 +199,15 @@ fn EvalState::write_value_escaped(
       }
     }
     AutoEscape::Json => {
-      let sb = StringBuilder::new()
-      match write_json_value(sb, v, 0, 0) {
-        Ok(()) => self.write_raw(sb.to_string(), line, col)
-        Err(e) => Err(e)
+      match v.kind {
+        ValueKind::SafeString(s) => self.write_raw(s, line, col)
+        _ => {
+          let sb = StringBuilder::new()
+          match write_json_value(sb, v, -1, 0, false) {
+            Ok(()) => self.write_raw(sb.to_string(), line, col)
+            Err(e) => Err(e)
+          }
+        }
       }
     }
   }
@@ -365,6 +374,53 @@ fn EvalState::invoke_macro(
   line : Int,
   col : Int,
 ) -> Result[Value, TemplateError] {
+  // Reject too many positional arguments (P1-12)
+  if pos_args.length() > md.params.length() {
+    return Err(
+      self.err(
+        ErrorKind::TooManyArguments,
+        "macro '" + md.name + "' takes at most " + md.params.length().to_string() + " arguments",
+        line,
+        col,
+      ),
+    )
+  }
+  // Reject unknown keyword arguments or duplicate positional+keyword binding (P1-12)
+  let mut ki = 0
+  while ki < kwargs.length() {
+    let (kname, _) = kwargs[ki]
+    let mut found_idx = -1
+    let mut pj = 0
+    while pj < md.params.length() {
+      let (pn, _) = md.params[pj]
+      if pn == kname {
+        found_idx = pj
+        break
+      }
+      pj = pj + 1
+    }
+    if found_idx < 0 {
+      return Err(
+        self.err(
+          ErrorKind::TooManyArguments,
+          "macro '" + md.name + "' got an unexpected keyword argument '" + kname + "'",
+          line,
+          col,
+        ),
+      )
+    }
+    if found_idx < pos_args.length() {
+      return Err(
+        self.err(
+          ErrorKind::InvalidOperation,
+          "macro '" + md.name + "' got multiple values for argument '" + kname + "'",
+          line,
+          col,
+        ),
+      )
+    }
+    ki = ki + 1
+  }
   match self.enter_depth(line, col) {
     Ok(()) => ()
     Err(e) => return Err(e)
@@ -426,6 +482,45 @@ fn EvalState::invoke_macro(
   }
 }
 
+///| Check whether `v` has container nesting depth >= `limit` (stops at `limit`,
+///| preventing runtime-built deeply nested lists/maps from overflowing Wasm32 stack).
+fn container_exceeds_depth(v : Value, limit : Int) -> Bool {
+  if limit <= 0 {
+    return match v.kind {
+      ValueKind::Seq(_) => true
+      ValueKind::Map(_) => true
+      _ => false
+    }
+  }
+  match v.kind {
+    ValueKind::Seq(items) => {
+      // Only need to descend into nested containers; cap scan width for O(1) fast path
+      let n = if items.length() < 8 { items.length() } else { 8 }
+      let mut i = 0
+      while i < n {
+        if container_exceeds_depth(items[i], limit - 1) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    ValueKind::Map(entries) => {
+      let n = if entries.length() < 8 { entries.length() } else { 8 }
+      let mut i = 0
+      while i < n {
+        let (_, ev) = entries[i]
+        if container_exceeds_depth(ev, limit - 1) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
 fn EvalState::eval_expr(
   self : EvalState,
   expr : Expr,
@@ -433,19 +528,31 @@ fn EvalState::eval_expr(
   match expr {
     Expr::Const(v, _, _) => Ok(v)
     Expr::Var(name, _, _) => Ok(self.lookup_var(name))
-    Expr::List(items, _, _) => {
+    Expr::List(items, line, col) => {
       let out : Array[Value] = []
       let mut i = 0
       while i < items.length() {
         match self.eval_expr(items[i]) {
-          Ok(v) => out.push(v)
+          Ok(v) => {
+            if self.env.max_depth > 0 && container_exceeds_depth(v, self.env.max_depth) {
+              return Err(
+                self.err(
+                  ErrorKind::RecursionLimit,
+                  "maximum container nesting depth exceeded",
+                  line,
+                  col,
+                ),
+              )
+            }
+            out.push(v)
+          }
           Err(e) => return Err(e)
         }
         i = i + 1
       }
       Ok(Value::from_seq(out))
     }
-    Expr::Map(pairs, _, _) => {
+    Expr::Map(pairs, line, col) => {
       let entries : Array[(String, Value)] = []
       let mut i = 0
       while i < pairs.length() {
@@ -457,6 +564,16 @@ fn EvalState::eval_expr(
         let vv = match self.eval_expr(ve) {
           Ok(v) => v
           Err(e) => return Err(e)
+        }
+        if self.env.max_depth > 0 && container_exceeds_depth(vv, self.env.max_depth) {
+          return Err(
+            self.err(
+              ErrorKind::RecursionLimit,
+              "maximum container nesting depth exceeded",
+              line,
+              col,
+            ),
+          )
         }
         entries.push((kv.to_display_string(), vv))
         i = i + 1
@@ -477,7 +594,26 @@ fn EvalState::eval_expr(
         }
         UnaryOp::Neg =>
         match v.kind {
-          ValueKind::Int(n) => Ok(Value::from_i64(0L - n))
+          ValueKind::Int(n) =>
+          if n == I64_MIN {
+            match i128_neg(i128_from_i64(n)) {
+              Some(r) => Ok(value_from_i128(r))
+              None =>
+              Err(
+                self.err(ErrorKind::InvalidOperation, "integer negation overflow", line, col),
+              )
+            }
+          } else {
+            Ok(Value::from_i64(0L - n))
+          }
+          ValueKind::BigInt(b) =>
+          match i128_neg(b) {
+            Some(r) => Ok(value_from_i128(r))
+            None =>
+            Err(
+              self.err(ErrorKind::InvalidOperation, "integer negation overflow", line, col),
+            )
+          }
           ValueKind::Float(f) => Ok(Value::from_float(0.0 - f))
           _ =>
           Err(
@@ -492,6 +628,7 @@ fn EvalState::eval_expr(
         UnaryOp::Pos =>
         match v.kind {
           ValueKind::Int(_) => Ok(v)
+          ValueKind::BigInt(_) => Ok(v)
           ValueKind::Float(_) => Ok(v)
           _ =>
           Err(
@@ -522,6 +659,30 @@ fn EvalState::eval_expr(
           None => Ok(Value::undefined())
         }
       }
+    }
+    Expr::Compare(first_e, cmps, line, col) => {
+      let mut prev = match self.eval_expr(first_e) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < cmps.length() {
+        let (op, rhs_e) = cmps[i]
+        let cur = match self.eval_expr(rhs_e) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        match self.eval_binop(op, prev, cur, line, col) {
+          Ok(res) =>
+          if !res.is_truthy() {
+            return Ok(Value::from_bool(false))
+          }
+          Err(e) => return Err(e)
+        }
+        prev = cur
+        i = i + 1
+      }
+      Ok(Value::from_bool(true))
     }
     Expr::Bin(op, lhs_e, rhs_e, line, col) => {
       // Short-circuit logical operators
@@ -719,7 +880,7 @@ fn EvalState::eval_expr(
         Ok(p) => p
         Err(e) => return Err(e)
       }
-      eval_filter(self.env, fname, v, pos, kw, self.template_name, line, col)
+      eval_filter(self, fname, v, pos, kw, self.template_name, line, col)
     }
     Expr::Test(target_e, tname, args, negated, line, col) => {
       let v = match self.eval_expr(target_e) {
@@ -797,48 +958,10 @@ fn EvalState::eval_slice(
       }
       Ok(Value::from_seq(out))
     }
-    ValueKind::String(str_val) => {
-      let n = str_val.length()
-      let sb = StringBuilder::new()
-      if step > 0 {
-        let mut s = match start_opt {
-          Some(x) => if x < 0 { n + x } else { x }
-          None => 0
-        }
-        let mut e = match stop_opt {
-          Some(x) => if x < 0 { n + x } else { x }
-          None => n
-        }
-        if s < 0 { s = 0 }
-        if s > n { s = n }
-        if e < 0 { e = 0 }
-        if e > n { e = n }
-        let mut i = s
-        while i < e {
-          sb.write_byte(str_val.code_unit_at(i).to_byte())
-          i = i + step
-        }
-      } else {
-        let mut s = match start_opt {
-          Some(x) => if x < 0 { n + x } else { x }
-          None => n - 1
-        }
-        let mut e = match stop_opt {
-          Some(x) => if x < 0 { n + x } else { x }
-          None => -1
-        }
-        if s >= n { s = n - 1 }
-        if s < -1 { s = -1 }
-        if e >= n { e = n - 1 }
-        if e < -1 { e = -1 }
-        let mut i = s
-        while i > e {
-          sb.write_byte(str_val.code_unit_at(i).to_byte())
-          i = i + step
-        }
-      }
-      Ok(Value::from_string(sb.to_string()))
-    }
+    ValueKind::String(str_val) =>
+    Ok(Value::from_string(utf8_slice(str_val, start_opt, stop_opt, step)))
+    ValueKind::SafeString(str_val) =>
+    Ok(Value::from_string(utf8_slice(str_val, start_opt, stop_opt, step)))
     _ =>
     Err(
       self.err(
@@ -851,6 +974,103 @@ fn EvalState::eval_slice(
   }
 }
 
+fn eval_float_pow(base : Double, exp : Double) -> Double {
+  if exp == 0.0 {
+    return 1.0
+  }
+  if exp == 1.0 {
+    return base
+  }
+  // Exact integer exponent fast path
+  if exp >= -1000.0 && exp <= 1000.0 {
+    let ei = exp.to_int64()
+    if ei.to_double() == exp {
+      let neg = ei < 0L
+      let mut e = if neg { 0L - ei } else { ei }
+      let mut acc = 1.0
+      let mut b = base
+      while e > 0L {
+        if (e & 1L) != 0L {
+          acc = acc * b
+        }
+        b = b * b
+        e = e >> 1
+      }
+      return if neg { 1.0 / acc } else { acc }
+    }
+  }
+  // Common 0.5 (sqrt via Newton-Raphson)
+  if exp == 0.5 && base >= 0.0 {
+    if base == 0.0 {
+      return 0.0
+    }
+    let mut x = if base > 1.0 { base * 0.5 } else { 1.0 }
+    let mut k = 0
+    while k < 30 {
+      x = 0.5 * (x + base / x)
+      k = k + 1
+    }
+    return x
+  }
+  // Fallback for positive base: exp(exp * ln(base)) via range-reduced series
+  if base > 0.0 {
+    // Reduce base = m * 2^k with m in [0.5, 1.5]
+    let mut m = base
+    let mut k = 0
+    while m > 1.5 {
+      m = m * 0.5
+      k = k + 1
+    }
+    while m < 0.75 {
+      m = m * 2.0
+      k = k - 1
+    }
+    let y = (m - 1.0) / (m + 1.0)
+    let y2 = y * y
+    let mut term = y
+    let mut sum = y
+    let mut n = 3
+    while n <= 25 {
+      term = term * y2
+      sum = sum + term / n.to_double()
+      n = n + 2
+    }
+    let ln_base = 2.0 * sum + k.to_double() * 0.6931471805599453
+    let p = exp * ln_base
+    // Compute exp(p) = 2^q * exp(r)
+    let ln2 = 0.6931471805599453
+    let q_d = p / ln2
+    if q_d > 1024.0 {
+      return 1.0 / 0.0
+    }
+    if q_d < -1075.0 {
+      return 0.0
+    }
+    let q = safe_floor_i64(q_d + 0.5).to_int()
+    let r = p - q.to_double() * ln2
+    let mut eterm = 1.0
+    let mut esum = 1.0
+    let mut j = 1
+    while j <= 20 {
+      eterm = eterm * r / j.to_double()
+      esum = esum + eterm
+      j = j + 1
+    }
+    let mut scale = 1.0
+    let mut abs_q = if q < 0 { 0 - q } else { q }
+    let mut step_b = if q < 0 { 0.5 } else { 2.0 }
+    while abs_q > 0 {
+      if (abs_q & 1) != 0 {
+        scale = scale * step_b
+      }
+      step_b = step_b * step_b
+      abs_q = abs_q >> 1
+    }
+    return esum * scale
+  }
+  0.0 / 0.0
+}
+
 fn EvalState::eval_binop(
   self : EvalState,
   op : BinOp,
@@ -861,8 +1081,21 @@ fn EvalState::eval_binop(
 ) -> Result[Value, TemplateError] {
   match op {
     BinOp::Concat => {
-      let ls = lv.to_display_string()
-      let rs = rv.to_display_string()
+      let is_html = match self.auto_escape {
+        AutoEscape::Html => true
+        _ => false
+      }
+      let any_safe = is_html && (lv.is_safe() || rv.is_safe())
+      let ls = if any_safe && !lv.is_safe() {
+        escape_html(lv.to_display_string())
+      } else {
+        lv.to_display_string()
+      }
+      let rs = if any_safe && !rv.is_safe() {
+        escape_html(rv.to_display_string())
+      } else {
+        rv.to_display_string()
+      }
       if self.max_output_bytes > 0 &&
       ls.length() + rs.length() > self.max_output_bytes {
         return Err(
@@ -874,40 +1107,51 @@ fn EvalState::eval_binop(
           ),
         )
       }
-      Ok(Value::from_string(ls + rs))
+      Ok(if any_safe { Value::safe(ls + rs) } else { Value::from_string(ls + rs) })
     }
     BinOp::Eq => Ok(Value::from_bool(lv.equals(rv)))
     BinOp::Ne => Ok(Value::from_bool(!lv.equals(rv)))
-    BinOp::Lt =>
-    match value_compare(lv, rv) {
-      Some(c) => Ok(Value::from_bool(c < 0))
-      None => Ok(Value::from_bool(false))
-    }
-    BinOp::Le =>
-    match value_compare(lv, rv) {
-      Some(c) => Ok(Value::from_bool(c <= 0))
-      None => Ok(Value::from_bool(false))
-    }
-    BinOp::Gt =>
-    match value_compare(lv, rv) {
-      Some(c) => Ok(Value::from_bool(c > 0))
-      None => Ok(Value::from_bool(false))
-    }
-    BinOp::Ge =>
-    match value_compare(lv, rv) {
-      Some(c) => Ok(Value::from_bool(c >= 0))
-      None => Ok(Value::from_bool(false))
-    }
+    BinOp::Lt => Ok(Value::from_bool(value_sort_compare(lv, rv, true, 0) < 0))
+    BinOp::Le => Ok(Value::from_bool(value_sort_compare(lv, rv, true, 0) <= 0))
+    BinOp::Gt => Ok(Value::from_bool(value_sort_compare(lv, rv, true, 0) > 0))
+    BinOp::Ge => Ok(Value::from_bool(value_sort_compare(lv, rv, true, 0) >= 0))
     BinOp::In => Ok(Value::from_bool(eval_in(lv, rv)))
     BinOp::NotIn => Ok(Value::from_bool(!eval_in(lv, rv)))
     BinOp::Add =>
     match (lv.kind, rv.kind) {
-      (ValueKind::Int(a), ValueKind::Int(b)) => Ok(Value::from_i64(a + b))
+      (ValueKind::Int(a), ValueKind::Int(b)) =>
+      match checked_add_i64(a, b) {
+        Some(v) => Ok(v)
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer addition overflow", line, col))
+      }
+      (ValueKind::BigInt(a), ValueKind::BigInt(b)) =>
+      match i128_add(a, b) {
+        Some(r) => Ok(value_from_i128(r))
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer addition overflow", line, col))
+      }
+      (ValueKind::Int(a), ValueKind::BigInt(b)) =>
+      match i128_add(i128_from_i64(a), b) {
+        Some(r) => Ok(value_from_i128(r))
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer addition overflow", line, col))
+      }
+      (ValueKind::BigInt(a), ValueKind::Int(b)) =>
+      match i128_add(a, i128_from_i64(b)) {
+        Some(r) => Ok(value_from_i128(r))
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer addition overflow", line, col))
+      }
       (ValueKind::Float(a), ValueKind::Float(b)) => Ok(Value::from_float(a + b))
       (ValueKind::Int(a), ValueKind::Float(b)) =>
       Ok(Value::from_float(a.to_double() + b))
       (ValueKind::Float(a), ValueKind::Int(b)) =>
       Ok(Value::from_float(a + b.to_double()))
+      (ValueKind::BigInt(a), ValueKind::Float(b)) =>
+      Ok(Value::from_float(i128_to_double(a) + b))
+      (ValueKind::Float(a), ValueKind::BigInt(b)) =>
+      Ok(Value::from_float(a + i128_to_double(b)))
       (ValueKind::String(a), ValueKind::String(b)) => {
         if self.max_output_bytes > 0 &&
         a.length() + b.length() > self.max_output_bytes {
@@ -922,7 +1166,34 @@ fn EvalState::eval_binop(
         }
         Ok(Value::from_string(a + b))
       }
+      (ValueKind::SafeString(_), ValueKind::String(_)) =>
+      self.eval_binop(BinOp::Concat, lv, rv, line, col)
+      (ValueKind::String(_), ValueKind::SafeString(_)) =>
+      self.eval_binop(BinOp::Concat, lv, rv, line, col)
+      (ValueKind::SafeString(_), ValueKind::SafeString(_)) =>
+      self.eval_binop(BinOp::Concat, lv, rv, line, col)
       (ValueKind::Seq(a), ValueKind::Seq(b)) => {
+        let total = a.length() + b.length()
+        let max_elems = if self.max_output_bytes > 0 {
+          let by_bytes = self.max_output_bytes / 8
+          if by_bytes < 100000 { by_bytes } else { 100000 }
+        } else {
+          100000
+        }
+        if total > max_elems {
+          return Err(
+            self.err(
+              ErrorKind::OutputLimitExceeded,
+              "list concatenation exceeds size limit",
+              line,
+              col,
+            ),
+          )
+        }
+        match self.consume_fuel(total.to_int64(), line, col) {
+          Ok(()) => ()
+          Err(e) => return Err(e)
+        }
         let out : Array[Value] = []
         let mut i = 0
         while i < a.length() {
@@ -948,12 +1219,39 @@ fn EvalState::eval_binop(
     }
     BinOp::Sub =>
     match (lv.kind, rv.kind) {
-      (ValueKind::Int(a), ValueKind::Int(b)) => Ok(Value::from_i64(a - b))
+      (ValueKind::Int(a), ValueKind::Int(b)) =>
+      match checked_sub_i64(a, b) {
+        Some(v) => Ok(v)
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer subtraction overflow", line, col))
+      }
+      (ValueKind::BigInt(a), ValueKind::BigInt(b)) =>
+      match i128_sub(a, b) {
+        Some(r) => Ok(value_from_i128(r))
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer subtraction overflow", line, col))
+      }
+      (ValueKind::Int(a), ValueKind::BigInt(b)) =>
+      match i128_sub(i128_from_i64(a), b) {
+        Some(r) => Ok(value_from_i128(r))
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer subtraction overflow", line, col))
+      }
+      (ValueKind::BigInt(a), ValueKind::Int(b)) =>
+      match i128_sub(a, i128_from_i64(b)) {
+        Some(r) => Ok(value_from_i128(r))
+        None =>
+        Err(self.err(ErrorKind::InvalidOperation, "integer subtraction overflow", line, col))
+      }
       (ValueKind::Float(a), ValueKind::Float(b)) => Ok(Value::from_float(a - b))
       (ValueKind::Int(a), ValueKind::Float(b)) =>
       Ok(Value::from_float(a.to_double() - b))
       (ValueKind::Float(a), ValueKind::Int(b)) =>
       Ok(Value::from_float(a - b.to_double()))
+      (ValueKind::BigInt(a), ValueKind::Float(b)) =>
+      Ok(Value::from_float(i128_to_double(a) - b))
+      (ValueKind::Float(a), ValueKind::BigInt(b)) =>
+      Ok(Value::from_float(a - i128_to_double(b)))
       _ =>
       Err(
         self.err(
@@ -967,16 +1265,43 @@ fn EvalState::eval_binop(
     BinOp::Mul => {
       // String repeat or list repeat with output limit protection!
       match (lv.kind, rv.kind) {
-        (ValueKind::Int(a), ValueKind::Int(b)) => Ok(Value::from_i64(a * b))
+        (ValueKind::Int(a), ValueKind::Int(b)) =>
+        match checked_mul_i64(a, b) {
+          Some(v) => Ok(v)
+          None =>
+          Err(self.err(ErrorKind::InvalidOperation, "integer multiplication overflow", line, col))
+        }
+        (ValueKind::BigInt(a), ValueKind::BigInt(b)) =>
+        match i128_mul(a, b) {
+          Some(r) => Ok(value_from_i128(r))
+          None =>
+          Err(self.err(ErrorKind::InvalidOperation, "integer multiplication overflow", line, col))
+        }
+        (ValueKind::Int(a), ValueKind::BigInt(b)) =>
+        match i128_mul(i128_from_i64(a), b) {
+          Some(r) => Ok(value_from_i128(r))
+          None =>
+          Err(self.err(ErrorKind::InvalidOperation, "integer multiplication overflow", line, col))
+        }
+        (ValueKind::BigInt(a), ValueKind::Int(b)) =>
+        match i128_mul(a, i128_from_i64(b)) {
+          Some(r) => Ok(value_from_i128(r))
+          None =>
+          Err(self.err(ErrorKind::InvalidOperation, "integer multiplication overflow", line, col))
+        }
         (ValueKind::Float(a), ValueKind::Float(b)) => Ok(Value::from_float(a * b))
         (ValueKind::Int(a), ValueKind::Float(b)) =>
         Ok(Value::from_float(a.to_double() * b))
         (ValueKind::Float(a), ValueKind::Int(b)) =>
         Ok(Value::from_float(a * b.to_double()))
-        (ValueKind::String(s), ValueKind::Int(n)) => self.repeat_string(s, n, line, col)
-        (ValueKind::Int(n), ValueKind::String(s)) => self.repeat_string(s, n, line, col)
-        (ValueKind::SafeString(s), ValueKind::Int(n)) => self.repeat_string(s, n, line, col)
-        (ValueKind::Int(n), ValueKind::SafeString(s)) => self.repeat_string(s, n, line, col)
+        (ValueKind::BigInt(a), ValueKind::Float(b)) =>
+        Ok(Value::from_float(i128_to_double(a) * b))
+        (ValueKind::Float(a), ValueKind::BigInt(b)) =>
+        Ok(Value::from_float(a * i128_to_double(b)))
+        (ValueKind::String(s), ValueKind::Int(n)) => self.repeat_string(s, n, false, line, col)
+        (ValueKind::Int(n), ValueKind::String(s)) => self.repeat_string(s, n, false, line, col)
+        (ValueKind::SafeString(s), ValueKind::Int(n)) => self.repeat_string(s, n, true, line, col)
+        (ValueKind::Int(n), ValueKind::SafeString(s)) => self.repeat_string(s, n, true, line, col)
         (ValueKind::Seq(items), ValueKind::Int(n)) => self.repeat_seq(items, n, line, col)
         (ValueKind::Int(n), ValueKind::Seq(items)) => self.repeat_seq(items, n, line, col)
         _ =>
@@ -1028,10 +1353,31 @@ fn EvalState::eval_binop(
             ),
           )
         }
+        // Guard I64_MIN // -1 against hardware / Wasm32 trap (P0-2)
+        if a == I64_MIN && b == -1L {
+          return Ok(
+            value_from_i128(I128::{ neg: false, l0: 0L, l1: 0L, l2: 2048L, l3: 0L, l4: 0L }),
+          )
+        }
         let q = a / b
         let r = a % b
         let adj = if r != 0L && ((r < 0L) != (b < 0L)) { q - 1L } else { q }
         Ok(Value::from_i64(adj))
+      }
+      (ValueKind::BigInt(a), ValueKind::BigInt(b)) =>
+      match i128_floor_divmod(a, b) {
+        Some((q, _)) => Ok(value_from_i128(q))
+        None => Err(self.err(ErrorKind::InvalidOperation, "integer division error", line, col))
+      }
+      (ValueKind::Int(a), ValueKind::BigInt(b)) =>
+      match i128_floor_divmod(i128_from_i64(a), b) {
+        Some((q, _)) => Ok(value_from_i128(q))
+        None => Err(self.err(ErrorKind::InvalidOperation, "integer division error", line, col))
+      }
+      (ValueKind::BigInt(a), ValueKind::Int(b)) =>
+      match i128_floor_divmod(a, i128_from_i64(b)) {
+        Some((q, _)) => Ok(value_from_i128(q))
+        None => Err(self.err(ErrorKind::InvalidOperation, "integer division error", line, col))
       }
       _ =>
       match (lv.as_f64(), rv.as_f64()) {
@@ -1047,9 +1393,10 @@ fn EvalState::eval_binop(
             )
           }
           let q = a / b
-          let qi = q.to_int64()
-          let qf = if q < qi.to_double() { (qi - 1L).to_double() } else { qi.to_double() }
-          Ok(Value::from_float(qf))
+          if q != q || (q - q) != 0.0 || q >= 4503599627370496.0 || q <= -4503599627370496.0 {
+            return Ok(Value::from_float(q))
+          }
+          Ok(Value::from_float(safe_floor_i64(q).to_double()))
         }
         _ =>
         Err(
@@ -1075,24 +1422,67 @@ fn EvalState::eval_binop(
             ),
           )
         }
+        // Guard I64_MIN % -1 against Wasm32 trap (P0-2)
+        if a == I64_MIN && b == -1L {
+          return Ok(Value::from_i64(0L))
+        }
         let r = a % b
         let adj = if r != 0L && ((r < 0L) != (b < 0L)) { r + b } else { r }
         Ok(Value::from_i64(adj))
       }
+      (ValueKind::BigInt(a), ValueKind::BigInt(b)) =>
+      match i128_floor_divmod(a, b) {
+        Some((_, r)) => Ok(value_from_i128(r))
+        None => Err(self.err(ErrorKind::InvalidOperation, "modulo error", line, col))
+      }
+      (ValueKind::Int(a), ValueKind::BigInt(b)) =>
+      match i128_floor_divmod(i128_from_i64(a), b) {
+        Some((_, r)) => Ok(value_from_i128(r))
+        None => Err(self.err(ErrorKind::InvalidOperation, "modulo error", line, col))
+      }
+      (ValueKind::BigInt(a), ValueKind::Int(b)) =>
+      match i128_floor_divmod(a, i128_from_i64(b)) {
+        Some((_, r)) => Ok(value_from_i128(r))
+        None => Err(self.err(ErrorKind::InvalidOperation, "modulo error", line, col))
+      }
       _ =>
-      Err(
-        self.err(
-          ErrorKind::InvalidOperation,
-          "invalid operands for '%'",
-          line,
-          col,
-        ),
-      )
+      match (lv.as_f64(), rv.as_f64()) {
+        (Some(a), Some(b)) => {
+          if b == 0.0 {
+            return Err(
+              self.err(ErrorKind::InvalidOperation, "modulo by zero", line, col),
+            )
+          }
+          let q = a / b
+          if q != q || (q - q) != 0.0 || q >= 4503599627370496.0 || q <= -4503599627370496.0 {
+            return Ok(Value::from_float(0.0))
+          }
+          let fl = safe_floor_i64(q).to_double()
+          Ok(Value::from_float(a - fl * b))
+        }
+        _ =>
+        Err(
+          self.err(
+            ErrorKind::InvalidOperation,
+            "invalid operands for '%'",
+            line,
+            col,
+          ),
+        )
+      }
     }
     BinOp::Pow =>
     match (lv.kind, rv.kind) {
       (ValueKind::Int(base), ValueKind::Int(exp)) => {
         if exp < 0L {
+          if base == 0L {
+            return Err(
+              self.err(ErrorKind::InvalidOperation, "0 cannot be raised to a negative power", line, col),
+            )
+          }
+          if exp < -1075L {
+            return Ok(Value::from_float(0.0))
+          }
           let mut acc = 1.0
           let mut e = 0L - exp
           let mut b = base.to_double()
@@ -1105,7 +1495,19 @@ fn EvalState::eval_binop(
           }
           return Ok(Value::from_float(1.0 / acc))
         }
-        if exp > 62L && (base > 1L || base < -1L) {
+        if exp == 0L {
+          return Ok(Value::from_i64(1L))
+        }
+        if base == 0L {
+          return Ok(Value::from_i64(0L))
+        }
+        if base == 1L {
+          return Ok(Value::from_i64(1L))
+        }
+        if base == -1L {
+          return Ok(Value::from_i64(if (exp & 1L) == 0L { 1L } else { -1L }))
+        }
+        if exp > 127L {
           return Err(
             self.err(
               ErrorKind::InvalidOperation,
@@ -1115,27 +1517,45 @@ fn EvalState::eval_binop(
             ),
           )
         }
-        let mut acc = 1L
-        let mut b = base
+        let mut acc = i128_from_i64(1L)
+        let mut b = i128_from_i64(base)
         let mut e = exp
         while e > 0L {
           if (e & 1L) != 0L {
-            acc = acc * b
+            match i128_mul(acc, b) {
+              Some(na) => acc = na
+              None =>
+              return Err(
+                self.err(ErrorKind::InvalidOperation, "integer exponent overflow", line, col),
+              )
+            }
           }
-          b = b * b
           e = e >> 1
+          if e > 0L {
+            match i128_mul(b, b) {
+              Some(nb) => b = nb
+              None =>
+              return Err(
+                self.err(ErrorKind::InvalidOperation, "integer exponent overflow", line, col),
+              )
+            }
+          }
         }
-        Ok(Value::from_i64(acc))
+        Ok(value_from_i128(acc))
       }
       _ =>
-      Err(
-        self.err(
-          ErrorKind::InvalidOperation,
-          "invalid operands for '**'",
-          line,
-          col,
-        ),
-      )
+      match (lv.as_f64(), rv.as_f64()) {
+        (Some(a), Some(b)) => Ok(Value::from_float(eval_float_pow(a, b)))
+        _ =>
+        Err(
+          self.err(
+            ErrorKind::InvalidOperation,
+            "invalid operands for '**'",
+            line,
+            col,
+          ),
+        )
+      }
     }
     _ => Ok(Value::undefined())
   }
@@ -1145,11 +1565,12 @@ fn EvalState::repeat_string(
   self : EvalState,
   s : String,
   n : Int64,
+  is_safe : Bool,
   line : Int,
   col : Int,
 ) -> Result[Value, TemplateError] {
   if n <= 0L || s.length() == 0 {
-    return Ok(Value::from_string(""))
+    return Ok(if is_safe { Value::safe("") } else { Value::from_string("") })
   }
   let limit = if self.max_output_bytes > 0 {
     self.max_output_bytes.to_int64()
@@ -1174,7 +1595,7 @@ fn EvalState::repeat_string(
     sb.write_string(s)
     i = i + 1
   }
-  Ok(Value::from_string(sb.to_string()))
+  Ok(if is_safe { Value::safe(sb.to_string()) } else { Value::from_string(sb.to_string()) })
 }
 
 fn EvalState::repeat_seq(
@@ -1187,7 +1608,12 @@ fn EvalState::repeat_seq(
   if n <= 0L || items.length() == 0 {
     return Ok(Value::from_seq([]))
   }
-  let limit = 100000L
+  let limit = if self.max_output_bytes > 0 {
+    let by_bytes = (self.max_output_bytes / 8).to_int64()
+    if by_bytes < 100000L { by_bytes } else { 100000L }
+  } else {
+    100000L
+  }
   let ilen = items.length().to_int64()
   if n > limit || ilen * n > limit {
     return Err(
@@ -1198,6 +1624,10 @@ fn EvalState::repeat_seq(
         col,
       ),
     )
+  }
+  match self.consume_fuel(ilen * n, line, col) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
   }
   let out : Array[Value] = []
   let count = n.to_int()
@@ -1276,9 +1706,35 @@ fn EvalState::eval_call(
       }
       if name == "dict" || name == "namespace" {
         let entries : Array[(String, Value)] = []
+        if pos_args.length() >= 1 {
+          match pos_args[0].kind {
+            ValueKind::Map(base_entries) => {
+              let mut bi = 0
+              while bi < base_entries.length() {
+                entries.push(base_entries[bi])
+                bi = bi + 1
+              }
+            }
+            _ => ()
+          }
+        }
         let mut i = 0
         while i < kwargs.length() {
-          entries.push(kwargs[i])
+          let (kk, kv) = kwargs[i]
+          let mut replaced = false
+          let mut ei = 0
+          while ei < entries.length() {
+            let (ek, _) = entries[ei]
+            if ek == kk {
+              entries[ei] = (kk, kv)
+              replaced = true
+              break
+            }
+            ei = ei + 1
+          }
+          if !replaced {
+            entries.push((kk, kv))
+          }
           i = i + 1
         }
         return Ok(Value::from_map(entries))
@@ -1465,8 +1921,12 @@ fn EvalState::exec_stmt(
   stmt : Stmt,
 ) -> Result[Unit, TemplateError] {
   match stmt {
-    Stmt::EmitRaw(s) => self.write_raw(s, 0, 0)
+    Stmt::EmitRaw(s) =>
+    if self.suppress_output { Ok(()) } else { self.write_raw(s, 0, 0) }
     Stmt::EmitExpr(e, line, col) => {
+      if self.suppress_output {
+        return Ok(())
+      }
       match self.consume_fuel(1L, line, col) {
         Ok(()) => ()
         Err(er) => return Err(er)
@@ -1526,11 +1986,21 @@ fn EvalState::exec_stmt(
       // Lazy fast-path for `Range` (avoids OOM on `range(100000000)` and respects fuel!)
       match iter_v.kind {
         ValueKind::Range(start, stop, step) => {
+          if targets.length() != 1 {
+            return Err(
+              self.err(
+                ErrorKind::InvalidOperation,
+                "cannot unpack int in for loop",
+                line,
+                col,
+              ),
+            )
+          }
           let total = range_len(start, stop, step)
           if total == 0L {
             return self.exec_stmts(else_body)
           }
-          let depth = self.loop_stack.length() + 1
+          let depth = 1
           let mut ran_any = false
           let mut idx = 0L
           while idx < total {
@@ -1621,7 +2091,13 @@ fn EvalState::exec_stmt(
               Err(er) => return Err(er)
             }
             self.push_scope()
-            self.bind_for_targets(targets, raw_items[ri])
+            match self.bind_for_targets(targets, raw_items[ri], line, col) {
+              Ok(()) => ()
+              Err(er) => {
+                self.pop_scope()
+                return Err(er)
+              }
+            }
             let fv = match self.eval_expr(fe) {
               Ok(v) => v
               Err(er) => {
@@ -1648,7 +2124,7 @@ fn EvalState::exec_stmt(
       if items.length() == 0 {
         return self.exec_stmts(else_body)
       }
-      let depth = self.loop_stack.length() + 1
+      let depth = 1
       let len = items.length()
       let mut idx = 0
       while idx < len {
@@ -1659,7 +2135,13 @@ fn EvalState::exec_stmt(
         let prev = if idx > 0 { items[idx - 1] } else { Value::undefined() }
         let next_v = if idx + 1 < len { items[idx + 1] } else { Value::undefined() }
         self.push_scope()
-        self.bind_for_targets(targets, items[idx])
+        match self.bind_for_targets(targets, items[idx], line, col) {
+          Ok(()) => ()
+          Err(er) => {
+            self.pop_scope()
+            return Err(er)
+          }
+        }
         self.loop_stack.push(
           LoopFrame::{
             index0: idx,
@@ -1687,6 +2169,11 @@ fn EvalState::exec_stmt(
       }
       match target {
         SetTarget::Var(name) => self.set_local(name, v)
+        SetTarget::Tuple(names) =>
+        match self.bind_for_targets(names, v, line, col) {
+          Ok(()) => ()
+          Err(er) => return Err(er)
+        }
         SetTarget::Attr(obj_name, attr) => {
           let obj = self.lookup_var(obj_name)
           match obj.kind {
@@ -1723,11 +2210,14 @@ fn EvalState::exec_stmt(
     Stmt::SetBlock(name, filter_opt, body, line, col) => {
       let saved_out = self.out
       let saved_bytes = self.out_bytes
+      let saved_suppress = self.suppress_output
+      self.suppress_output = false
       self.out = StringBuilder::new()
       let res = self.exec_stmts(body)
       let captured = self.out.to_string()
       self.out = saved_out
       self.out_bytes = saved_bytes
+      self.suppress_output = saved_suppress
       match res {
         Ok(()) => ()
         Err(er) => return Err(er)
@@ -1743,7 +2233,7 @@ fn EvalState::exec_stmt(
             Err(er) => return Err(er)
           }
           item_val = match eval_filter(
-            self.env,
+            self,
             fname,
             item_val,
             pos,
@@ -1785,6 +2275,9 @@ fn EvalState::exec_stmt(
       res
     }
     Stmt::FilterBlock(fname, fargs, body, line, col) => {
+      if self.suppress_output {
+        return Ok(())
+      }
       let saved_out = self.out
       let saved_bytes = self.out_bytes
       self.out = StringBuilder::new()
@@ -1800,10 +2293,15 @@ fn EvalState::exec_stmt(
         Ok(p) => p
         Err(er) => return Err(er)
       }
+      // Body rendered inside {% filter %} already underwent auto-escaping (P1-5)
+      let cap_val = match self.auto_escape {
+        AutoEscape::Html => Value::safe(captured)
+        _ => Value::from_string(captured)
+      }
       let fv = match eval_filter(
-        self.env,
+        self,
         fname,
-        Value::from_string(captured),
+        cap_val,
         pos,
         kw,
         self.template_name,
@@ -1816,6 +2314,9 @@ fn EvalState::exec_stmt(
       self.write_value_escaped(fv, line, col)
     }
     Stmt::Block(bname, body, _, _) => {
+      if self.suppress_output {
+        return Ok(())
+      }
       match self.block_chains.get(bname) {
         Some(chain) => {
           if chain.length() > 0 {
@@ -1830,29 +2331,49 @@ fn EvalState::exec_stmt(
         None => self.exec_stmts(body)
       }
     }
-    Stmt::Extends(_, _, _) => Ok(())
+    Stmt::Extends(expr, line, col) => {
+      let pv = match self.eval_expr(expr) {
+        Ok(v) => v
+        Err(er) => return Err(er)
+      }
+      self.pending_extends = Some((pv.to_display_string(), line, col))
+      Ok(())
+    }
     Stmt::Include(tpl_expr, ignore_missing, line, col) => {
+      if self.suppress_output {
+        return Ok(())
+      }
       let name_v = match self.eval_expr(tpl_expr) {
         Ok(v) => v
         Err(er) => return Err(er)
       }
-      let inc_name = name_v.to_display_string()
-      // Cycle check
-      let mut si = 0
-      while si < self.include_stack.length() {
-        if self.include_stack[si] == inc_name {
-          return Err(
-            self.err(
-              ErrorKind::RecursionLimit,
-              "include cycle detected: '" + inc_name + "'",
-              line,
-              col,
-            ),
-          )
+      // Support both single template name and list of fallback names
+      let candidates : Array[String] = match name_v.kind {
+        ValueKind::Seq(arr) => {
+          let cs : Array[String] = []
+          let mut ci = 0
+          while ci < arr.length() {
+            cs.push(arr[ci].to_display_string())
+            ci = ci + 1
+          }
+          cs
         }
-        si = si + 1
+        _ => [name_v.to_display_string()]
       }
-      match self.env.find_compiled(inc_name) {
+      let mut found_pair : Option[(String, CompiledTemplate)] = None
+      let mut ci = 0
+      while ci < candidates.length() {
+        let cname = candidates[ci]
+        match self.env.find_compiled(cname) {
+          Some(ct) => {
+            found_pair = Some((cname, ct))
+            break
+          }
+          None => ()
+        }
+        ci = ci + 1
+      }
+      match found_pair {
         None =>
         if ignore_missing {
           Ok(())
@@ -1860,13 +2381,28 @@ fn EvalState::exec_stmt(
           Err(
             self.err(
               ErrorKind::TemplateNotFound,
-              "included template not found: '" + inc_name + "'",
+              "included template not found: '" + name_v.to_display_string() + "'",
               line,
               col,
             ),
           )
         }
-        Some(ct) => {
+        Some((inc_name, ct)) => {
+          // Cycle check
+          let mut si = 0
+          while si < self.include_stack.length() {
+            if self.include_stack[si] == inc_name {
+              return Err(
+                self.err(
+                  ErrorKind::RecursionLimit,
+                  "include cycle detected: '" + inc_name + "'",
+                  line,
+                  col,
+                ),
+              )
+            }
+            si = si + 1
+          }
           match self.enter_depth(line, col) {
             Ok(()) => ()
             Err(er) => return Err(er)
@@ -1887,6 +2423,9 @@ fn EvalState::exec_stmt(
       Ok(())
     }
     Stmt::CallBlock(callee, args, caller_params, body, line, col) => {
+      if self.suppress_output {
+        return Ok(())
+      }
       let (pos, kw) = match self.eval_call_args(args) {
         Ok(p) => p
         Err(er) => return Err(er)
@@ -1910,21 +2449,13 @@ fn EvalState::exec_stmt(
         Err(er) => return Err(er)
       }
       let mod_tpl_name = name_v.to_display_string()
-      match self.env.find_compiled(mod_tpl_name) {
-        None =>
-        Err(
-          self.err(
-            ErrorKind::TemplateNotFound,
-            "imported template not found: '" + mod_tpl_name + "'",
-            line,
-            col,
-          ),
-        )
-        Some(ct) => {
-          let defs = collect_macros(ct.body)
+      match self.eval_imported_module(mod_tpl_name, line, col) {
+        Ok((exports, defs)) => {
           self.modules.push((alias, defs))
+          self.set_local(alias, Value::from_map(exports))
           Ok(())
         }
+        Err(er) => Err(er)
       }
     }
     Stmt::FromImport(tpl_expr, names, line, col) => {
@@ -1933,46 +2464,48 @@ fn EvalState::exec_stmt(
         Err(er) => return Err(er)
       }
       let mod_tpl_name = name_v.to_display_string()
-      match self.env.find_compiled(mod_tpl_name) {
-        None =>
-        Err(
-          self.err(
-            ErrorKind::TemplateNotFound,
-            "imported template not found: '" + mod_tpl_name + "'",
-            line,
-            col,
-          ),
-        )
-        Some(ct) => {
-          let defs = collect_macros(ct.body)
-          let mut ni = 0
-          while ni < names.length() {
-            let (orig, alias) = names[ni]
-            let mut found = false
-            let mut di = 0
-            while di < defs.length() {
-              if defs[di].name == orig {
-                self.macros.push((alias, defs[di]))
-                found = true
-                break
-              }
-              di = di + 1
-            }
-            if !found {
-              return Err(
-                self.err(
-                  ErrorKind::UndefinedError,
-                  "macro '" + orig + "' not found in '" + mod_tpl_name + "'",
-                  line,
-                  col,
-                ),
-              )
-            }
-            ni = ni + 1
-          }
-          Ok(())
-        }
+      let (exports, defs) = match self.eval_imported_module(mod_tpl_name, line, col) {
+        Ok(pair) => pair
+        Err(er) => return Err(er)
       }
+      let mut ni = 0
+      while ni < names.length() {
+        let (orig, alias) = names[ni]
+        let mut found = false
+        let mut di = 0
+        while di < defs.length() {
+          if defs[di].name == orig {
+            self.macros.push((alias, defs[di]))
+            found = true
+            break
+          }
+          di = di + 1
+        }
+        if !found {
+          let mut ei = 0
+          while ei < exports.length() {
+            let (ek, ev) = exports[ei]
+            if ek == orig {
+              self.set_local(alias, ev)
+              found = true
+              break
+            }
+            ei = ei + 1
+          }
+        }
+        if !found {
+          return Err(
+            self.err(
+              ErrorKind::UndefinedError,
+              "symbol '" + orig + "' not found in '" + mod_tpl_name + "'",
+              line,
+              col,
+            ),
+          )
+        }
+        ni = ni + 1
+      }
+      Ok(())
     }
     Stmt::AutoEscapeBlock(flag_expr, body, line, col) => {
       let fv = match self.eval_expr(flag_expr) {
@@ -2009,61 +2542,143 @@ fn EvalState::exec_stmt(
   }
 }
 
+///| Execute an imported template in an isolated module scope to collect both
+///| exported variables (`{% set %}`) and macros, with cycle detection (P1-8).
+fn EvalState::eval_imported_module(
+  self : EvalState,
+  mod_tpl_name : String,
+  line : Int,
+  col : Int,
+) -> Result[(Array[(String, Value)], Array[MacroDef]), TemplateError] {
+  // Cycle check via include_stack
+  let mut si = 0
+  while si < self.include_stack.length() {
+    if self.include_stack[si] == mod_tpl_name {
+      return Err(
+        self.err(
+          ErrorKind::BadInclude,
+          "import cycle detected: '" + mod_tpl_name + "'",
+          line,
+          col,
+        ),
+      )
+    }
+    si = si + 1
+  }
+  let ct = match self.env.find_compiled(mod_tpl_name) {
+    Some(c) => c
+    None =>
+    return Err(
+      self.err(
+        ErrorKind::TemplateNotFound,
+        "imported template not found: '" + mod_tpl_name + "'",
+        line,
+        col,
+      ),
+    )
+  }
+  match self.enter_depth(line, col) {
+    Ok(()) => ()
+    Err(er) => return Err(er)
+  }
+  let sub = EvalState::new(
+    self.env,
+    Some(mod_tpl_name),
+    self.auto_escape,
+    StringBuilder::new(),
+  )
+  sub.depth = self.depth
+  sub.has_fuel = self.has_fuel
+  sub.fuel_left = self.fuel_left
+  let mut ii = 0
+  while ii < self.include_stack.length() {
+    sub.include_stack.push(self.include_stack[ii])
+    ii = ii + 1
+  }
+  sub.include_stack.push(mod_tpl_name)
+  // Expose root context in scope 0 and capture module-defined vars in scope 1
+  sub.push_scope()
+  if self.scopes.length() > 0 {
+    let root_scope = self.scopes[0]
+    let mut ri = 0
+    while ri < root_scope.length() {
+      let (rk, rv) = root_scope[ri]
+      sub.set_local(rk, rv)
+      ri = ri + 1
+    }
+  }
+  sub.push_scope()
+  let res = sub.exec_stmts(ct.body)
+  self.fuel_left = sub.fuel_left
+  self.leave_depth()
+  match res {
+    Ok(()) => {
+      let exports : Array[(String, Value)] = if sub.scopes.length() >= 2 {
+        sub.scopes[1]
+      } else {
+        []
+      }
+      let defs : Array[MacroDef] = []
+      let mut mi = 0
+      while mi < sub.macros.length() {
+        let (_, md) = sub.macros[mi]
+        defs.push(md)
+        mi = mi + 1
+      }
+      Ok((exports, defs))
+    }
+    Err(er) => Err(er)
+  }
+}
+
 fn EvalState::bind_for_targets(
   self : EvalState,
   targets : Array[String],
   item : Value,
-) -> Unit {
+  line : Int,
+  col : Int,
+) -> Result[Unit, TemplateError] {
   if targets.length() == 1 {
     self.set_local(targets[0], item)
-    return
+    return Ok(())
   }
   match item.kind {
     ValueKind::Seq(elems) => {
+      if elems.length() != targets.length() {
+        return Err(
+          self.err(
+            ErrorKind::InvalidOperation,
+            "cannot unpack sequence of length " +
+            elems.length().to_string() +
+            " into " +
+            targets.length().to_string() +
+            " variables",
+            line,
+            col,
+          ),
+        )
+      }
       let mut i = 0
       while i < targets.length() {
-        let v = if i < elems.length() { elems[i] } else { Value::undefined() }
-        self.set_local(targets[i], v)
+        self.set_local(targets[i], elems[i])
         i = i + 1
       }
+      Ok(())
     }
-    _ => {
-      self.set_local(targets[0], item)
-      let mut i = 1
-      while i < targets.length() {
-        self.set_local(targets[i], Value::undefined())
-        i = i + 1
-      }
-    }
+    _ =>
+    Err(
+      self.err(
+        ErrorKind::InvalidOperation,
+        "cannot unpack non-sequence value",
+        line,
+        col,
+      ),
+    )
   }
 }
 
-fn collect_macros(stmts : Array[Stmt]) -> Array[MacroDef] {
-  let out : Array[MacroDef] = []
-  let mut i = 0
-  while i < stmts.length() {
-    match stmts[i] {
-      Stmt::Macro(md) => out.push(md)
-      _ => ()
-    }
-    i = i + 1
-  }
-  out
-}
-
-fn find_extends_stmt(stmts : Array[Stmt]) -> Option[(Expr, Int, Int)] {
-  let mut i = 0
-  while i < stmts.length() {
-    match stmts[i] {
-      Stmt::Extends(e, l, c) => return Some((e, l, c))
-      _ => ()
-    }
-    i = i + 1
-  }
-  None
-}
-
-///| Render a compiled template (handling `extends` inheritance chains + cycle detection).
+///| Render a compiled template (handling unconditional & conditional `extends`,
+///| child top-level `set`/`macro`/`import`, and cycle detection).
 fn render_compiled(
   env : Environment,
   ct : CompiledTemplate,
@@ -2095,7 +2710,9 @@ fn render_compiled(
     return state.exec_stmts(ct.body)
   }
 
-  // Build inheritance chain [leaf, ..., root_base] with cycle detection!
+  // Build inheritance chain [leaf, ..., root_base] dynamically so conditional
+  // `{% if ... %}{% extends ... %}{% endif %}` and child top-level `{% set %}`
+  // / `{% macro %}` / `{% import %}` are evaluated in order (P1-7 & P1-8).
   let chain : Array[CompiledTemplate] = [ct]
   let visited : Array[String] = []
   if ct.name.length() > 0 {
@@ -2103,14 +2720,16 @@ fn render_compiled(
   }
   let mut cur = ct
   while cur.has_extends {
-    match find_extends_stmt(cur.body) {
+    state.suppress_output = true
+    state.pending_extends = None
+    match state.exec_stmts(cur.body) {
+      Ok(()) => ()
+      Err(e) => return Err(e)
+    }
+    state.suppress_output = false
+    match state.pending_extends {
       None => break
-      Some((parent_expr, line, col)) => {
-        let pv = match state.eval_expr(parent_expr) {
-          Ok(v) => v
-          Err(e) => return Err(e)
-        }
-        let pname = pv.to_display_string()
+      Some((pname, line, col)) => {
         let mut vi = 0
         while vi < visited.length() {
           if visited[vi] == pname {
@@ -2155,12 +2774,16 @@ fn render_compiled(
     }
   }
 
+  // If conditional extends never triggered on the leaf template, render it normally.
+  if chain.length() == 1 {
+    return state.exec_stmts(ct.body)
+  }
+
   // Populate block_chains from leaf -> root so index 0 is most-derived override,
   // and `super()` walks index + 1 toward root!
   let mut ci = 0
   while ci < chain.length() {
     let tpl = chain[ci]
-    // Also register any top-level macros/imports/sets from child templates
     let mut bi = 0
     while bi < tpl.blocks.length() {
       let (bname, bbody) = tpl.blocks[bi]
