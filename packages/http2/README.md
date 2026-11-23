@@ -65,6 +65,15 @@ let res = conn.feed(wire)
   - Stream-table memory/CPU probe: `1,000,000` finished streams + `100` `SETTINGS` frames completes in `0.43s` at **2.08 MiB** peak RSS
 - `packages/http2/wasm_smoke` 4-mode matrix (Native debug/release + Wasm32 debug/release on Node.js): all exit `0`, identical stdout `http2_wasm_smoke ok events=2 huff_len=583 win=65524` (`sha256: 5b5fc5548c1108f60ad754071778d89669d4870d8081f872636391fa5493d95e`).
 
+## Formal Verification (Lean 4)
+
+Run `sh packages/http2/proofs/run_proofs.sh` (or `sh scripts/verify-lean.sh http2`) to extract `packages/http2/src/*.pion` via `pionc extract-lean` and machine-check **26 production theorems** (`0 sorry`, `0 admit`, `0 native_decide`, `0 bv_decide`, only `{propext, Classical.choice, Quot.sound}`):
+
+- **Core & Stream State Machine (`Http2Proofs/Core.lean`, 6 theorems)**: RFC 7541 §4.1 HPACK dynamic entry size (`name_len + value_len + 32 ≥ 32`), RFC 9113 §5.1 `StreamState` exact decidable equality, §5.1.1 server/client stream ID parity partition, §6.9.1 flow-control window addition overflow immunity (`cur + inc ≤ 2^31 - 1`), §5.1 DATA receive permission classification & `END_STREAM` closure invariant.
+- **Frame Wire Codec & Priority/Flags (`Http2Proofs/Frame.lean`, 10 theorems)**: RFC 9113 §4.1 24-bit frame length pack/unpack roundtrip & byte bounds, 31-bit stream ID pack/unpack roundtrip, reserved R-bit (`0x80`) ignore invariant & non-negativity, §6.2/§6.3 priority dependency word bijection (exclusive bit + 31-bit dependency), §6.2 `HEADERS` flags packing (`PADDED=0`), §6.9 `WINDOW_UPDATE` increment range `[1, 2^31 - 1]`.
+- **SETTINGS & Header Semantics (`Http2Proofs/SettingsHeaders.lean`, 10 theorems)**: RFC 9113 §6.5.2 & RFC 8441 `SETTINGS` validation (`ENABLE_PUSH`, `INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE`, `ENABLE_CONNECT_PROTOCOL`, unknown ID ignore), RFC 9113 §8.2.1 header name uppercase/CTL/space rejection & lowercase/digit acceptance, header value CTL classification (HTAB + printable allowed, `0..8`/`10..31`/`127` rejected), ASCII digit vs edge-whitespace disjointness.
+- **Native vs Lean Differential**: `50/50` cases byte-identical (`diff -u` exit `0`).
+
 ## Head-to-Head Benchmarks
 
 Run with `sh packages/http2/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `go.sum` / `Cargo.lock`, mandatory full-content stdout SHA-256 verification) on **Darwin arm64** against modern production HTTP/2 engines:
