@@ -2,7 +2,7 @@
 
 Pure Pion GIF87a / GIF89a multi-frame animated LZW decoder.
 
-- **100% Pure Pion**: `0 extern "C"`, `0 World`, `0` external dependencies, `Send`-clean.
+- **100% Pure Pion**: `0 extern "C"`, `0 World`, `0` external dependencies, `0` module-level mutable state (`DecodeLimits` is `Send`).
 - **Full GIF87a / GIF89a Support**:
   - Header & Logical Screen Descriptor (`GIF87a` / `GIF89a`, GCT, background index, pixel aspect ratio).
   - Graphic Control Extension (`0x21 0xF9`: `delay_cs`, transparency, all 4 Disposal Methods: `Unspecified`, `DoNotDispose`, `RestoreToBackground`, `RestoreToPrevious`).
