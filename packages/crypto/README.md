@@ -5,6 +5,7 @@ Zero-dependency, pure-Pion cryptographic primitives package (`World`-free, porta
 - **Hash functions (FIPS 180-4)**: `Sha1`, `Sha256`, `Sha384`, `Sha512` (streaming `new`, `update`, `update_slice`, `finalize`, `finalize_hex`, `reset` + one-shot `sha1`, `sha256`, `sha384`, `sha512`, `*_hex`).
 - **Message Authentication Codes (RFC 2104 / RFC 4231)**: `HmacSha256`, `HmacSha384`, `HmacSha512` (streaming with precomputed inner/outer pad states + one-shot `hmac_sha256`, `hmac_sha384`, `hmac_sha512`, `*_hex`).
 - **Key Derivation (RFC 5869)**: `hkdf_sha256_extract`, `hkdf_sha256_expand`, `hkdf_sha256`, `hkdf_sha512_extract`, `hkdf_sha512_expand`, `hkdf_sha512`.
+- **Password-Based Key Derivation (RFC 8018 & RFC 7914)**: `pbkdf2_hmac_sha256`, `pbkdf2_hmac_sha512`, `scrypt`, `scrypt_with_max_mem`.
 - **Authenticated Encryption (RFC 8439 & NIST SP 800-38D)**: `chacha20_xor`, `poly1305_mac`, `chacha20_poly1305_seal`, `chacha20_poly1305_open`, `aes128_gcm_seal`, `aes128_gcm_open`, `aes256_gcm_seal`, `aes256_gcm_open`.
 - **Constant-Time Equality & Hex Codec**: `constant_time_eq(a, b)`, `bytes_to_hex(data)`, `hex_to_bytes(hex)`.
 - **Strict RFC 8032 Ed25519**: `Ed25519KeyPair` (`from_seed`, `public_key`, `sign`), `ed25519_public_key`, `ed25519_sign`, `ed25519_verify`, `ed25519_verify_strict`.
@@ -53,6 +54,12 @@ Zero-dependency, pure-Pion cryptographic primitives package (`World`-free, porta
 - `rsa_sign_rs256` performs constant-time CRT exponentiation (fixed 4-bit window with branch-free table scan over every limb of `dp`/`dq`, branch-free reductions modulo the secret primes) followed by a **Bellcore fault self-check** (`s^e mod n == em`) before returning the signature. `audit/ct_ssa_check.py` checks the release SSA for data-dependent branches on these paths.
 - `rsa_verify_rs256` rejects wrong lengths and `sig >= n`, and performs a full-length `constant_time_eq` comparison of `s^e mod n` against the single canonical RFC 8017 PKCS#1 v1.5 SHA-256 `DigestInfo` block (with explicit ASN.1 `NULL`), preventing Bleichenbacher's forgery attacks.
 
+### PBKDF2 (RFC 8018) & scrypt (RFC 7914)
+
+- `pbkdf2_hmac_sha256` and `pbkdf2_hmac_sha512` reject `iterations <= 0` (`CryptoError::InvalidParam`) and `dk_len <= 0` or `dk_len > 2^30` (1 GiB cap, `CryptoError::InvalidLength`, checked before allocating; the block count is computed as `(dk_len - 1) / hLen + 1` so it cannot wrap). Both precompute HMAC ipad/opad states once and run the inner iteration loop directly over fixed word arrays with zero per-iteration heap allocations.
+- `scrypt` and `scrypt_with_max_mem` enforce RFC 7914 §6 parameter validity (`N > 1` and power of 2, RFC 7914 §2 `N < 2^(16 r)` — i.e. `r = 1` refuses `N >= 65536` as OpenSSL / Node.js do, `r > 0`, `p > 0`, `r * p < 2^30`, `0 < dk_len <= 2^30`, `max_mem_bytes > 0`) and guard against OOM via the standard `128 * r * (N + p + 2) <= max_mem_bytes` check (`CryptoError::MemoryLimitExceeded`). Regardless of `max_mem_bytes`, the ROMix `V` table is hard-capped below 1 GiB (`32 * r * N < 2^28` words, `MemoryLimitExceeded`), so Native and Wasm32 (debug and release) make identical accept/refuse decisions with zero traps (RT-crypto-v040 P1-1 / P2-1 / P2-2 / P2-3). `scrypt` defaults to a `256 MiB` ceiling (covering `.mlogin.enc` v1 decrypt parameters up to `N = 131072, r = 8, p = 1`); callers with tighter budgets (e.g. `64 MiB` for `N = 32768, r = 8, p = 1`) use `scrypt_with_max_mem`.
+- `ROMix` uses ping-pong double buffering over flat `FixedArray[UInt]` storage and a 16-register Salsa20/8 core with zero inner-loop allocations.
+
 ### General Notes
 
 - **Zero-length inputs**: empty messages (`Bytes::new(0)`), empty HMAC keys, empty HKDF salt/info, and empty AEAD plaintext/AAD are handled safely without panics.
@@ -68,7 +75,7 @@ sh packages/crypto/bench/run_bench.sh   # 4-mode wasm_smoke parity + head-to-hea
 
 ### 4-Mode Cross-Target Parity (`wasm_smoke`)
 
-Native debug, Native release, Wasm32 debug, and Wasm32 release all produce byte-identical stdout (`4127 B`, `sha256:a07d31d36c6e770f35416c4473bc83bacd595fb7578f2edfa9b0eb0df3f31611`), covering SHA-1/2, HMAC-SHA2, Ed25519 (including red-team boundary and adversarial rejection vectors), X25519, HKDF-SHA256/512, ChaCha20-Poly1305 AEAD, AES-128/256-GCM (96-bit and non-96-bit nonces + tamper rejection), NIST P-256 ES256/DER/ECDH/pubkey validation & decompression (including RFC 6979 at `d = n - 1` against Go), RSA-2048 RS256, the Poly1305 accumulator landing exactly on `2^130 - 5`, and the RSA public-exponent cap.
+Native debug, Native release, Wasm32 debug, and Wasm32 release all produce byte-identical stdout (`4605 B`, `sha256:10520b20c8735bf7eec51d3ef5c4fb5c744b47e12161e43a0f2798b62bc38fac`), covering SHA-1/2, HMAC-SHA2, Ed25519 (including red-team boundary and adversarial rejection vectors), X25519, HKDF-SHA256/512, ChaCha20-Poly1305 AEAD, AES-128/256-GCM (96-bit and non-96-bit nonces + tamper rejection), NIST P-256 ES256/DER/ECDH/pubkey validation & decompression (including RFC 6979 at `d = n - 1` against Go), RSA-2048 RS256, PBKDF2-HMAC-SHA256/512, scrypt (RFC 7914 + `.mlogin.enc` v1 + `max_mem` / invalid parameter rejection), the Poly1305 accumulator landing exactly on `2^130 - 5`, and the RSA public-exponent cap.
 
 ### Red-team audit
 
@@ -92,10 +99,13 @@ Measured on `Darwin arm64` with `scripts/bench_compare.py --warmup 1 --rounds 5`
 | NIST P-256 ES256 (50 sign + 50 verify) | 121.651 | 14.271 | 1.22 ms/op | 1.97 MiB | 5.81 MiB | 0.12x |
 | NIST P-256 ECDH (2,000 key exchanges) | 1402.492 | 69.888 | 701.25 µs/op | 1.89 MiB | 7.09 MiB | 0.05x |
 | NIST P-256 Pubkey Validate (20,000 uncomp + 20,000 comp) | 828.830 | 81.086 | 20.72 µs/op | 1.81 MiB | 11.11 MiB | 0.10x |
+| PBKDF2-HMAC-SHA256 (500,000 iters, 32 B) | 251.241 | 51.484 | 502.48 ns/op | 1.78 MiB | 4.95 MiB | 0.20x |
+| scrypt (N=16384, r=8, p=1, 32 B × 4) | 130.075 | 80.441 | 32.52 ms/op | 33.78 MiB | 39.81 MiB | 0.62x |
 
 **Honest hardware & runtime gap note**:
 - On `Darwin arm64`, Go stdlib / `golang.org/x/crypto` accelerates SHA-256/SHA-512 via ARMv8 Cryptography Extensions (`SHA256H`/`SHA512H`), AES-GCM via ARMv8 AES+PMULL hardware instructions, ChaCha20/Poly1305 via NEON/ARM64 assembly, and Ed25519/P-256 via hand-tuned ARM64 assembly + precomputed tables, whereas `packages/crypto` is 100% pure-Pion portable constant-time scalar code (zero C FFI / zero assembly, identical on Native and `wasm32`).
-- Pure Pion reaches **0.93× of Go stdlib on X25519**, sustains **114.3 MB/s** ChaCha20-Poly1305 AEAD, **178.1 MB/s** SHA-256, and **265.0 MB/s** SHA-512 while using **2.6×–7.2× lower Peak RSS** (1.80–2.05 MiB vs 4.95–14.75 MiB).
+- Pure Pion reaches **0.93× of Go stdlib on X25519** and **0.62× of Go `golang.org/x/crypto/scrypt`** (32.5 ms/op vs 20.1 ms/op at `N=16384, r=8, p=1`, with lower Peak RSS: 33.8 MiB vs 39.8 MiB), sustains **114.3 MB/s** ChaCha20-Poly1305 AEAD, **178.1 MB/s** SHA-256, and **265.0 MB/s** SHA-512 while using **2.6×–7.2× lower Peak RSS** on non-memory-hard workloads (1.78–2.05 MiB vs 4.95–14.75 MiB).
+- For v0.4.0 KDFs (sized so Go runs ≥ 50 ms): PBKDF2-HMAC-SHA256 reaches **502 ns/op (0.20×** of Go's ARMv8 `SHA256H`-accelerated path at 103 ns/op, matching the SHA-256 scalar-vs-hardware gap), while memory-hard `scrypt` (dominated by Salsa20/8 and RAM bandwidth rather than SHA-256 hardware instructions) reaches **0.62×** of Go.
 - The v0.3.0 rows (AES-256-GCM, P-256 ECDH, P-256 pubkey validation) are sized so Go's side runs ≥ 45 ms of real work (process start-up ≈ 3 ms, < 7% of the Go median), so their ratios reflect steady-state throughput. They are Pion's weakest rows: the constant-time bitsliced software AES-256-GCM reaches **64.5 MB/s** (**0.03×** of Go's ARMv8 AES+PMULL path at ≈ 2.35 GB/s; **0.02×** on 256 B packets), P-256 ECDH runs at **701 µs/op (0.05×** of Go's ARM64-assembly `crypto/ecdh` at 35 µs/op), and P-256 public-key validation at **20.7 µs/op (0.10×)**. The earlier 64–400-iteration rows (0.10×–0.65×) were dominated by process start-up and overstated these ratios (see [`audit_v030/REPORT.md`](audit_v030/REPORT.md) P2-1).
 - The older v0.2.0 rows keep their original sizes; the shortest of them (X25519, Go ≈ 28 ms) still include ≈ 3 ms of process start-up per side, so the ratio is approximate.
 

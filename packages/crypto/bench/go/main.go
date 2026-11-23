@@ -18,6 +18,8 @@ import (
 	"os"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/crypto/scrypt"
 )
 
 func makeBuf(n int) []byte {
@@ -333,6 +335,33 @@ func benchP256Validate() int {
 	return 2
 }
 
+func benchPbkdf2Sha256() int {
+	pass := []byte("pion-crypto-bench-pbkdf2-passphrase-2026!")
+	salt := []byte("pion-crypto-bench-pbkdf2-salt-0123456789")
+	dk := pbkdf2.Key(pass, salt, 500000, 32, sha256.New)
+	fmt.Printf("pbkdf2_sha256=%s\n", hex.EncodeToString(dk))
+	return 0
+}
+
+func benchScrypt() int {
+	pass := []byte("monoid-login-passphrase-2026!")
+	salt, err := hex.DecodeString("0123456789abcdeffedcba9876543210")
+	if err != nil {
+		return 1
+	}
+	h := sha256.New()
+	for i := 0; i < 4; i++ {
+		salt[0] = byte(i & 0xFF)
+		dk, err := scrypt.Key(pass, salt, 16384, 8, 1, 32)
+		if err != nil {
+			return 2
+		}
+		h.Write(dk)
+	}
+	fmt.Printf("scrypt_sha256=%s\n", hex.EncodeToString(h.Sum(nil)))
+	return 0
+}
+
 func main() {
 	mode := "sha256"
 	if len(os.Args) > 1 {
@@ -363,8 +392,12 @@ func main() {
 		os.Exit(benchP256Ecdh())
 	case "p256_validate":
 		os.Exit(benchP256Validate())
+	case "pbkdf2_sha256":
+		os.Exit(benchPbkdf2Sha256())
+	case "scrypt":
+		os.Exit(benchScrypt())
 	default:
-		fmt.Println("usage: crypto_bench_go [sha256|sha512|hmac256|ed25519|x25519|hkdf256|chacha20|p256|aes256gcm|aes256gcm_small|p256_ecdh|p256_validate]")
+		fmt.Println("usage: crypto_bench_go [sha256|sha512|hmac256|ed25519|x25519|hkdf256|chacha20|p256|aes256gcm|aes256gcm_small|p256_ecdh|p256_validate|pbkdf2_sha256|scrypt]")
 		os.Exit(1)
 	}
 }
