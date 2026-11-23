@@ -1,0 +1,627 @@
+///| Red-team audit probe for `packages/kdl` (Native + Wasm32, 4 modes).
+///|
+///| Sub-commands (all output is byte-for-byte deterministic so the 4 build modes can be
+///| compared by SHA-256; timings are taken by the driver, never printed here):
+///|   dump <list>       one case per line `id<TAB>v2|v1<TAB>path<TAB>fmt_prefix`
+///|                     -> `id<TAB>OK<TAB><canon>` | `id<TAB>ERR<TAB><Kind>`
+///|                     and, for v2 documents that parse and a non-empty fmt_prefix:
+///|                     `id<TAB>FMT<TAB><status>` / `id<TAB>CMP<TAB><status>` after writing
+///|                     `format` / `format_compact` output to `<fmt_prefix>.fmt.kdl` / `.cmp.kdl`.
+///|   query <list>      one case per line `id<TAB>docpath<TAB>selector`
+///|                     -> `id<TAB>OK<TAB><count><TAB><name:arg0,...>` | `id<TAB>ERR<TAB><Kind>`
+///|   dos <case> <n>    synthesized pathological input of size `n`; prints one summary line.
+///|   api               API-level checks; prints `PASS|FAIL <id> <sev> <title>` lines.
+///|
+///| The canonical AST (`canon_doc`) is shared byte-for-byte with `oracle/rust/src/main.rs`.
+
+import "kdl"
+
+let hex_digits : String = "0123456789abcdef"
+
+fn write_hex(sb : StringBuilder, v : Int) -> Unit {
+  if v >= 16 {
+    write_hex(sb, v >> 4)
+  }
+  sb.write_byte(hex_digits.code_unit_at(v & 15).to_byte())
+}
+
+///| Decode one UTF-8 scalar at `i` (input is valid UTF-8: it came out of the parser).
+fn dec_at(s : String, i : Int) -> (Int, Int) {
+  let b0 = s.code_unit_at(i)
+  if b0 < 0x80 {
+    (b0, 1)
+  } else if b0 < 0xE0 {
+    (((b0 & 0x1F) << 6) | (s.code_unit_at(i + 1) & 0x3F), 2)
+  } else if b0 < 0xF0 {
+    (
+      ((b0 & 0x0F) << 12) |
+      ((s.code_unit_at(i + 1) & 0x3F) << 6) |
+      (s.code_unit_at(i + 2) & 0x3F),
+      3,
+    )
+  } else {
+    (
+      ((b0 & 0x07) << 18) |
+      ((s.code_unit_at(i + 1) & 0x3F) << 12) |
+      ((s.code_unit_at(i + 2) & 0x3F) << 6) |
+      (s.code_unit_at(i + 3) & 0x3F),
+      4,
+    )
+  }
+}
+
+fn esc(sb : StringBuilder, s : String) -> Unit {
+  sb.write_byte((34).to_byte())
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let (cp, len) = dec_at(s, i)
+    if cp == 34 {
+      sb.write_string("\\\"")
+    } else if cp == 92 {
+      sb.write_string("\\\\")
+    } else if cp < 0x20 || cp >= 0x7F {
+      sb.write_string("\\u{")
+      write_hex(sb, cp)
+      sb.write_byte((125).to_byte())
+    } else {
+      sb.write_byte(cp.to_byte())
+    }
+    i = i + len
+  }
+  sb.write_byte((34).to_byte())
+}
+
+fn canon_val(sb : StringBuilder, v : kdl::KdlValue) -> Unit {
+  match v {
+    kdl::KdlValue::Str(s) => {
+      sb.write_byte((115).to_byte())
+      esc(sb, s)
+    }
+    kdl::KdlValue::Int(n) => sb.write_string("i" + n.to_string())
+    kdl::KdlValue::Float(f) => {
+      if f != f {
+        sb.write_string("fnan")
+      } else {
+        let bits = f.reinterpret_as_uint64()
+        sb.write_byte((102).to_byte())
+        let mut k = 60
+        while k >= 0 {
+          let nib = ((bits >> k.to_int64().reinterpret_as_uint64()) & 15UL).to_int()
+          sb.write_byte(hex_digits.code_unit_at(nib).to_byte())
+          k = k - 4
+        }
+      }
+    }
+    kdl::KdlValue::Bool(b) => sb.write_string(if b { "b1" } else { "b0" })
+    kdl::KdlValue::Null => sb.write_byte((110).to_byte())
+  }
+}
+
+fn canon_ty(sb : StringBuilder, t : Option[String]) -> Unit {
+  match t {
+    Some(s) => {
+      sb.write_byte((40).to_byte())
+      esc(sb, s)
+      sb.write_byte((41).to_byte())
+    }
+    None => ()
+  }
+}
+
+fn bytes_less(a : String, b : String) -> Bool {
+  let n = if a.length() < b.length() { a.length() } else { b.length() }
+  let mut i = 0
+  while i < n {
+    let x = a.code_unit_at(i)
+    let y = b.code_unit_at(i)
+    if x != y {
+      return x < y
+    }
+    i = i + 1
+  }
+  a.length() < b.length()
+}
+
+///| Canonical node header (type, name, args, de-duplicated sorted props).
+fn canon_head(sb : StringBuilder, nd : kdl::KdlNode) -> Unit {
+  canon_ty(sb, nd.ty)
+  esc(sb, nd.name)
+  sb.write_byte((91).to_byte())
+  let mut first = true
+  let mut i = 0
+  while i < nd.entries.length() {
+    let e = nd.entries[i]
+    if e.is_arg() {
+      if !first {
+        sb.write_byte((44).to_byte())
+      }
+      first = false
+      canon_ty(sb, e.ty)
+      canon_val(sb, e.value)
+    }
+    i = i + 1
+  }
+  sb.write_string("][")
+  let keys : Array[String] = []
+  let ents : Array[kdl::KdlEntry] = []
+  i = 0
+  while i < nd.entries.length() {
+    let e = nd.entries[i]
+    match e.name {
+      Some(k) => {
+        let mut j = 0
+        let mut found = false
+        while j < keys.length() {
+          if keys[j] == k {
+            ents[j] = e
+            found = true
+            break
+          }
+          j = j + 1
+        }
+        if !found {
+          keys.push(k)
+          ents.push(e)
+        }
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+  // insertion sort by key bytes
+  let mut a = 1
+  while a < keys.length() {
+    let mut b = a
+    while b > 0 && bytes_less(keys[b], keys[b - 1]) {
+      let tk = keys[b]
+      keys[b] = keys[b - 1]
+      keys[b - 1] = tk
+      let te = ents[b]
+      ents[b] = ents[b - 1]
+      ents[b - 1] = te
+      b = b - 1
+    }
+    a = a + 1
+  }
+  i = 0
+  while i < keys.length() {
+    if i > 0 {
+      sb.write_byte((44).to_byte())
+    }
+    esc(sb, keys[i])
+    sb.write_byte((61).to_byte())
+    canon_ty(sb, ents[i].ty)
+    canon_val(sb, ents[i].value)
+    i = i + 1
+  }
+  sb.write_byte((93).to_byte())
+}
+
+struct CFrame {
+  nodes : Array[kdl::KdlNode]
+  mut idx : Int
+}
+
+///| Iterative canonical dump (stack-safe for deep documents).
+fn canon_doc(doc : kdl::KdlDocument) -> String {
+  let sb = StringBuilder::new()
+  let stack : Array[CFrame] = [CFrame::{ nodes: doc.nodes, idx: 0 }]
+  while stack.length() > 0 {
+    let fr = stack[stack.length() - 1]
+    if fr.idx >= fr.nodes.length() {
+      let _ = stack.pop()
+      if stack.length() > 0 {
+        sb.write_byte((125).to_byte())
+      }
+      continue
+    }
+    if fr.idx > 0 {
+      sb.write_byte((59).to_byte())
+    }
+    let nd = fr.nodes[fr.idx]
+    fr.idx = fr.idx + 1
+    canon_head(sb, nd)
+    if nd.child_nodes.length() > 0 {
+      sb.write_byte((123).to_byte())
+      stack.push(CFrame::{ nodes: nd.child_nodes, idx: 0 })
+    }
+  }
+  sb.to_string()
+}
+
+fn split_byte(s : String, sep : Int) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  while i < s.length() {
+    if s.code_unit_at(i) == sep {
+      out.push(s.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(s.slice(start, s.length()))
+  out
+}
+
+fn kind(e : kdl::KdlError) -> String {
+  kdl::error_kind_as_str(e.kind)
+}
+
+fn roundtrip_status(
+  orig_canon : String,
+  orig : kdl::KdlDocument,
+  text : String,
+  compact : Bool,
+) -> String {
+  match kdl::parse(text) {
+    Err(e) => "reparse-err:" + kind(e)
+    Ok(d2) => {
+      let c2 = canon_doc(d2)
+      if c2 != orig_canon {
+        return "ast-diff:" + c2
+      }
+      if !d2.equals(orig) {
+        return "equals-false"
+      }
+      let again = if compact { kdl::format_compact(d2) } else { kdl::format(d2) }
+      if again != text {
+        return "not-idempotent"
+      }
+      "same"
+    }
+  }
+}
+
+fn cmd_dump(world : World, list_path : String) -> Int {
+  let list = match fs_read_bytes(world, list_path) {
+    Ok(b) => b.to_string()
+    Err(_) => {
+      io_println(world, "HARNESS cannot read " + list_path)
+      return 2
+    }
+  }
+  let lines = split_byte(list, 10)
+  let mut li = 0
+  while li < lines.length() {
+    let line = lines[li]
+    li = li + 1
+    if line.length() == 0 {
+      continue
+    }
+    let f = split_byte(line, 9)
+    if f.length() < 4 {
+      continue
+    }
+    let id = f[0]
+    let v1 = f[1] == "v1"
+    let data = match fs_read_bytes(world, f[2]) {
+      Ok(b) => b
+      Err(_) => {
+        io_println(world, id + "\tERR\tHARNESS-READ")
+        continue
+      }
+    }
+    let res = if v1 { kdl::parse_v1(data.to_string()) } else { kdl::parse_bytes(data) }
+    match res {
+      Err(e) => io_println(world, id + "\tERR\t" + kind(e))
+      Ok(doc) => {
+        let c = canon_doc(doc)
+        io_println(world, id + "\tOK\t" + c)
+        if !v1 && f[3].length() > 0 {
+          let t1 = kdl::format(doc)
+          let _ = fs_write(world, f[3] + ".fmt.kdl", t1)
+          io_println(world, id + "\tFMT\t" + roundtrip_status(c, doc, t1, false))
+          let t2 = kdl::format_compact(doc)
+          let _ = fs_write(world, f[3] + ".cmp.kdl", t2)
+          io_println(world, id + "\tCMP\t" + roundtrip_status(c, doc, t2, true))
+        }
+      }
+    }
+  }
+  0
+}
+
+fn cmd_query(world : World, list_path : String) -> Int {
+  let list = match fs_read_bytes(world, list_path) {
+    Ok(b) => b.to_string()
+    Err(_) => {
+      io_println(world, "HARNESS cannot read " + list_path)
+      return 2
+    }
+  }
+  let lines = split_byte(list, 10)
+  let mut li = 0
+  while li < lines.length() {
+    let line = lines[li]
+    li = li + 1
+    if line.length() == 0 {
+      continue
+    }
+    let f = split_byte(line, 9)
+    if f.length() < 3 {
+      continue
+    }
+    let id = f[0]
+    let src = match fs_read_bytes(world, f[1]) {
+      Ok(b) => b
+      Err(_) => {
+        io_println(world, id + "\tERR\tHARNESS-READ")
+        continue
+      }
+    }
+    let doc = match kdl::parse_bytes(src) {
+      Ok(d) => d
+      Err(e) => {
+        io_println(world, id + "\tERR\tDOC-" + kind(e))
+        continue
+      }
+    }
+    match kdl::query(doc, f[2]) {
+      Err(e) => io_println(world, id + "\tERR\t" + kind(e))
+      Ok(nodes) => {
+        let sb = StringBuilder::new()
+        let mut i = 0
+        while i < nodes.length() && i < 64 {
+          if i > 0 {
+            sb.write_byte((44).to_byte())
+          }
+          sb.write_string(nodes[i].name)
+          match nodes[i].arg(0) {
+            Some(v) => {
+              sb.write_byte((58).to_byte())
+              canon_val(sb, v)
+            }
+            None => ()
+          }
+          i = i + 1
+        }
+        if nodes.length() > 64 {
+          sb.write_string(",...")
+        }
+        io_println(
+          world,
+          id + "\tOK\t" + nodes.length().to_string() + "\t" + sb.to_string(),
+        )
+      }
+    }
+  }
+  0
+}
+
+fn rep(s : String, n : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    sb.write_string(s)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn depth_of(doc : kdl::KdlDocument) -> Int {
+  let mut d = 0
+  let mut cur = doc.nodes
+  while cur.length() > 0 {
+    d = d + 1
+    cur = cur[0].child_nodes
+  }
+  d
+}
+
+fn summarize(world : World, tag : String, r : Result[kdl::KdlDocument, kdl::KdlError]) -> Unit {
+  match r {
+    Ok(d) => io_println(world, tag + " OK nodes=" + d.nodes.length().to_string() + " depth=" + depth_of(d).to_string())
+    Err(e) => io_println(world, tag + " ERR " + kind(e))
+  }
+}
+
+///| Pathological inputs synthesized in-process (no giant fixture files).
+fn cmd_dos(world : World, case : String, n : Int) -> Int {
+  let big = kdl::KdlLimits::new(n + 8, 0, 0)
+  if case == "deep_children" {
+    // `a {` * n + `}` * n with max_depth raised above n: parse, compact format + re-parse,
+    // equals, query and finally drop the whole tree (pretty `format` is O(depth^2) bytes of
+    // indentation by design and is exercised separately by `deep_format`).
+    let src = rep("a {", n) + rep("}", n)
+    match kdl::parse_with_limits(src, big) {
+      Err(e) => io_println(world, "deep_children ERR " + kind(e))
+      Ok(d) => {
+        let c = kdl::format_compact(d)
+        let eq = d.equals(d)
+        let q = match kdl::query(d, ">> a") {
+          Ok(x) => x.length()
+          Err(_) => -1
+        }
+        let re = match kdl::parse_with_limits(c, big) {
+          Ok(d2) => if d2.equals(d) { "same" } else { "diff" }
+          Err(e) => "reparse-err:" + kind(e)
+        }
+        io_println(world, "deep_children OK depth=" + depth_of(d).to_string() + " cmp_len=" + c.length().to_string() + " equals=" + eq.to_string() + " query=" + q.to_string() + " compact_reparse=" + re)
+      }
+    }
+  } else if case == "deep_format" {
+    match kdl::parse_with_limits(rep("a {", n) + rep("}", n), big) {
+      Err(e) => io_println(world, "deep_format ERR " + kind(e))
+      Ok(d) => {
+        let f = kdl::format(d)
+        let re = match kdl::parse_with_limits(f, big) {
+          Ok(d2) => if d2.equals(d) { "same" } else { "diff" }
+          Err(e) => "reparse-err:" + kind(e)
+        }
+        io_println(world, "deep_format OK fmt_len=" + f.length().to_string() + " reparse=" + re)
+      }
+    }
+  } else if case == "deep_children_default" {
+    summarize(world, "deep_children_default", kdl::parse(rep("a {", n) + rep("}", n)))
+  } else if case == "deep_children_unlimited" {
+    // KdlLimits(0, 0, 0) disables every budget.
+    summarize(world, "deep_children_unlimited", kdl::parse_with_limits(rep("a{", n) + rep("}", n), kdl::KdlLimits::new(0, 0, 0)))
+  } else if case == "deep_slashdash_children" {
+    summarize(world, "deep_slashdash_children", kdl::parse_with_limits("x /-{" + rep("a {", n) + rep("}", n) + "}", big))
+  } else if case == "deep_block_comment" {
+    summarize(world, "deep_block_comment", kdl::parse("node " + rep("/*", n) + rep("*/", n) + " 1"))
+  } else if case == "deep_block_comment_unclosed" {
+    summarize(world, "deep_block_comment_unclosed", kdl::parse("node " + rep("/*", n) + rep("*/", n - 1)))
+  } else if case == "slashdash_run" {
+    summarize(world, "slashdash_run", kdl::parse("node" + rep(" /-x", n) + " y"))
+  } else if case == "wide_props" {
+    // n distinct property keys on a single node (duplicate-key bookkeeping must be ~linear).
+    let sb = StringBuilder::new()
+    sb.write_string("node")
+    let mut i = 0
+    while i < n {
+      sb.write_string(" k" + i.to_string() + "=1")
+      i = i + 1
+    }
+    match kdl::parse(sb.to_string()) {
+      Ok(d) => io_println(world, "wide_props OK entries=" + d.nodes[0].entries.length().to_string())
+      Err(e) => io_println(world, "wide_props ERR " + kind(e))
+    }
+  } else if case == "wide_args" {
+    match kdl::parse("node" + rep(" 1", n)) {
+      Ok(d) => io_println(world, "wide_args OK entries=" + d.nodes[0].entries.length().to_string())
+      Err(e) => io_println(world, "wide_args ERR " + kind(e))
+    }
+  } else if case == "wide_doc" {
+    summarize(world, "wide_doc", kdl::parse(rep("a;", n)))
+  } else if case == "raw_hashes" {
+    // `#`*n `"` ( `"` `#`*(n-1) )*8 `"` `#`*n  : near-miss closers
+    let h = rep("#", n)
+    let near = rep("\"" + rep("#", n - 1), 8)
+    match kdl::parse("n " + h + "\"" + near + "\"" + h) {
+      Ok(d) => {
+        let s = match d.nodes[0].arg(0) {
+          Some(kdl::KdlValue::Str(x)) => x.length()
+          _ => -1
+        }
+        io_println(world, "raw_hashes OK len=" + s.to_string())
+      }
+      Err(e) => io_println(world, "raw_hashes ERR " + kind(e))
+    }
+  } else if case == "multiline_lines" {
+    let body = rep("    line \\s\\u{1F600}\n", n)
+    match kdl::parse("n \"\"\"\n" + body + "    \"\"\"") {
+      Ok(d) => {
+        let s = match d.nodes[0].arg(0) {
+          Some(kdl::KdlValue::Str(x)) => x.length()
+          _ => -1
+        }
+        io_println(world, "multiline_lines OK len=" + s.to_string())
+      }
+      Err(e) => io_println(world, "multiline_lines ERR " + kind(e))
+    }
+  } else if case == "long_float" {
+    summarize(world, "long_float", kdl::parse("n 1." + rep("0", n) + "1e" + n.to_string()))
+  } else if case == "long_int_digits" {
+    summarize(world, "long_int_digits", kdl::parse("n 0" + rep("0", n) + "1"))
+  } else if case == "query_dup_explosion" {
+    // Chain of n nested `a` nodes; the 8-step descendant selector should match each node at
+    // depth >= 8 exactly once (n - 7 nodes).
+    let d = match kdl::parse_with_limits(rep("a{", n) + rep("}", n), big) {
+      Ok(x) => x
+      Err(e) => {
+        io_println(world, "query_dup_explosion ERR " + kind(e))
+        return 0
+      }
+    }
+    match kdl::query(d, "a a a a a a a a") {
+      Ok(r) => io_println(world, "query_dup_explosion OK count=" + r.length().to_string() + " expected=" + (n - 7).to_string())
+      Err(e) => io_println(world, "query_dup_explosion ERR " + kind(e))
+    }
+  } else {
+    io_println(world, "unknown dos case " + case)
+    return 2
+  }
+  0
+}
+
+fn show(s : String) -> String {
+  let sb = StringBuilder::new()
+  esc(sb, s)
+  sb.to_string()
+}
+
+fn check(world : World, ok : Bool, id : String, sev : String, title : String, obs : String) -> Unit {
+  if ok {
+    io_println(world, "PASS " + id + " " + sev + " " + title)
+  } else {
+    io_println(world, "FAIL " + id + " " + sev + " " + title + " :: " + obs)
+  }
+}
+
+fn parse_canon(src : String) -> String {
+  match kdl::parse(src) {
+    Ok(d) => "OK " + canon_doc(d)
+    Err(e) => "ERR " + kind(e)
+  }
+}
+
+fn cmd_api(world : World) -> Int {
+  // Empty children block is dropped by the AST, so `format` cannot reproduce `node {}`.
+  let a = match kdl::parse("node {}") {
+    Ok(d) => kdl::format(d)
+    Err(e) => "ERR " + kind(e)
+  }
+  check(world, a == "node {\n}\n" || a == "node {}\n", "api_empty_children_lossless", "P2", "format keeps an explicitly empty children block `node {}`", "format(parse(\"node {}\")) = " + show(a))
+  // Duplicate property keeps first position: harmless for lookup, but changes entry order.
+  let b = match kdl::parse("n a=1 b=2 a=3") {
+    Ok(d) => kdl::format(d)
+    Err(e) => "ERR " + kind(e)
+  }
+  check(world, b == "n b=2 a=3\n", "api_dup_prop_position", "P2", "last-wins duplicate property keeps the position of the last occurrence (Rust kdl / spec test `repeated_prop`)", "format = " + show(b))
+  // Limits: negative / zero values silently disable a budget.
+  let deep = rep("a{", 300) + rep("}", 300)
+  let c = match kdl::parse_with_limits(deep, kdl::KdlLimits::new(-1, -1, -1)) {
+    Ok(_) => "OK"
+    Err(e) => "ERR " + kind(e)
+  }
+  check(world, c != "OK", "api_negative_limits", "P2", "negative KdlLimits are rejected or clamped instead of meaning `unlimited`", "max_depth=-1 on 300-deep input -> " + c)
+  // Off-by-one in max_depth: depth N with max_depth N must parse, N+1 must fail.
+  let d1 = match kdl::parse_with_limits(rep("a{", 4) + rep("}", 4), kdl::KdlLimits::new(4, 0, 0)) {
+    Ok(_) => "OK"
+    Err(e) => "ERR " + kind(e)
+  }
+  let d2 = match kdl::parse_with_limits(rep("a{", 6) + rep("}", 6), kdl::KdlLimits::new(4, 0, 0)) {
+    Ok(_) => "OK"
+    Err(e) => "ERR " + kind(e)
+  }
+  check(world, d2 != "OK", "api_max_depth_enforced", "P1", "max_depth=4 rejects 6 nested children blocks", "depth4=" + d1 + " depth6=" + d2)
+  // format_compact must emit grammar-valid KDL: base-node needs node-space+ before node-children.
+  let fc = match kdl::parse("n 1 {\n  a\n}\n") {
+    Ok(d) => kdl::format_compact(d)
+    Err(e) => "ERR " + kind(e)
+  }
+  check(world, fc == "n 1 {a}", "api_compact_space_before_children", "P2", "format_compact keeps node-space before `{` (grammar: `node-space+ node-children`)", "format_compact = " + show(fc))
+  // KdlValue::equals: NaN == NaN and +0 != -0 are documented; Int(1) vs Float(1.0) differ.
+  check(world, kdl::KdlValue::Float(0.0 / 0.0).equals(kdl::KdlValue::Float(0.0 / 0.0)), "api_nan_equals", "P2", "KdlValue::equals treats NaN == NaN (documented)", "false")
+  // Int64 boundaries are exact.
+  check(world, parse_canon("n -9223372036854775808 9223372036854775807 -0x8000000000000000") == "OK \"n\"[i-9223372036854775808,i9223372036854775807,i-9223372036854775808][]", "api_i64_bounds", "P1", "Int64 MIN/MAX parse exactly", parse_canon("n -9223372036854775808 9223372036854775807 -0x8000000000000000"))
+  0
+}
+
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() >= 3 && args[1] == "dump" {
+    return cmd_dump(world, args[2])
+  }
+  if args.length() >= 3 && args[1] == "query" {
+    return cmd_query(world, args[2])
+  }
+  if args.length() >= 4 && args[1] == "dos" {
+    let mut n = 0
+    let s = args[3]
+    let mut i = 0
+    while i < s.length() {
+      n = n * 10 + (s.code_unit_at(i) - 48)
+      i = i + 1
+    }
+    return cmd_dos(world, args[2], n)
+  }
+  if args.length() >= 2 && args[1] == "api" {
+    return cmd_api(world)
+  }
+  io_println(world, "usage: kdl_audit dump|query <list> | dos <case> <n> | api")
+  2
+}
