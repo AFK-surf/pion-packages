@@ -1,0 +1,749 @@
+///| Strict RFC 8259 iterative JSON parser (zero recursion, zero global state).
+///| Supports lossless Int64 / Double (Eisel-Lemire + BigInt) / BigNum,
+///| order-preserving O(1) JsonObject, DuplicateKeyPolicy, and explicit JsonLimits.
+
+enum ParseFrame {
+  Arr(Array[Json])
+  ///| (entries, optional hash index builder once len >= 8, pending_key)
+  Obj(Array[(String, Json)], Option[ObjIndexBuilder], String)
+}
+
+fn is_rfc8259_ws(b : Int) -> Bool {
+  b == 32 || b == 9 || b == 10 || b == 13
+}
+
+fn skip_ws(src : String, n : Int, pos0 : Int) -> Int {
+  let mut p = pos0
+  while p < n {
+    let b = src.code_unit_at(p)
+    if b == 32 || b == 9 || b == 10 || b == 13 {
+      p = p + 1
+    } else {
+      break
+    }
+  }
+  p
+}
+
+fn parse_hex4(src : String, n : Int, pos : Int) -> Int {
+  if pos + 4 > n {
+    return -1
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < 4 {
+    let b = src.code_unit_at(pos + i)
+    let d = if b >= 48 && b <= 57 {
+      b - 48
+    } else if b >= 97 && b <= 102 {
+      b - 87
+    } else if b >= 65 && b <= 70 {
+      b - 55
+    } else {
+      return -1
+    }
+    v = (v << 4) | d
+    i = i + 1
+  }
+  v
+}
+
+fn make_err(src : String, kind : JsonErrorKind, off : Int, msg : String) -> JsonError {
+  let (ln, cl) = line_col_at(src, off)
+  JsonError::new(kind, ln, cl, off, msg)
+}
+
+///| Parse a strict RFC 8259 JSON string starting at `pos` (pointing at opening `"`).
+///| Returns `(decoded_string, next_pos)`.
+fn parse_json_string(
+  src : String,
+  n : Int,
+  pos : Int,
+  max_string_bytes : Int,
+) -> Result[(String, Int), JsonError] {
+  let start = pos + 1
+  let mut i = start
+  // Fast path: scan until `"`, `\`, or control char < 0x20.
+  while i < n {
+    let b = src.code_unit_at(i)
+    if b == 34 {
+      let byte_len = i - start
+      if byte_len > max_string_bytes {
+        return Err(make_err(src, JsonErrorKind::StringLimitExceeded, pos, "string exceeds max_string_bytes"))
+      }
+      return Ok((src.slice(start, i), i + 1))
+    }
+    if b == 92 {
+      break
+    }
+    if b < 0x20 {
+      return Err(make_err(src, JsonErrorKind::Syntax, i, "unescaped control character in string"))
+    }
+    i = i + 1
+  }
+  if i >= n {
+    return Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "unterminated string"))
+  }
+
+  // Slow path: string contains escape sequences.
+  let sb = StringBuilder::new()
+  let mut out_bytes = 0
+  if i > start {
+    let seg_len = i - start
+    out_bytes = out_bytes + seg_len
+    if out_bytes > max_string_bytes {
+      return Err(make_err(src, JsonErrorKind::StringLimitExceeded, pos, "string exceeds max_string_bytes"))
+    }
+    sb.write_string(src.slice(start, i))
+  }
+  let mut chunk_start = i
+  while i < n {
+    let b = src.code_unit_at(i)
+    if b == 34 {
+      if i > chunk_start {
+        let seg_len = i - chunk_start
+        out_bytes = out_bytes + seg_len
+        if out_bytes > max_string_bytes {
+          return Err(make_err(src, JsonErrorKind::StringLimitExceeded, pos, "string exceeds max_string_bytes"))
+        }
+        sb.write_string(src.slice(chunk_start, i))
+      }
+      return Ok((sb.to_string(), i + 1))
+    }
+    if b < 0x20 {
+      return Err(make_err(src, JsonErrorKind::Syntax, i, "unescaped control character in string"))
+    }
+    if b == 92 {
+      if i > chunk_start {
+        let seg_len = i - chunk_start
+        out_bytes = out_bytes + seg_len
+        if out_bytes > max_string_bytes {
+          return Err(make_err(src, JsonErrorKind::StringLimitExceeded, pos, "string exceeds max_string_bytes"))
+        }
+        sb.write_string(src.slice(chunk_start, i))
+      }
+      if i + 1 >= n {
+        return Err(make_err(src, JsonErrorKind::UnexpectedEof, i, "unterminated escape sequence"))
+      }
+      let esc = src.code_unit_at(i + 1)
+      if esc == 34 {
+        sb.write_byte((34).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 92 {
+        sb.write_byte((92).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 47 {
+        sb.write_byte((47).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 98 {
+        sb.write_byte((8).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 102 {
+        sb.write_byte((12).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 110 {
+        sb.write_byte((10).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 114 {
+        sb.write_byte((13).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 116 {
+        sb.write_byte((9).to_byte())
+        out_bytes = out_bytes + 1
+        i = i + 2
+      } else if esc == 117 {
+        let cu = parse_hex4(src, n, i + 2)
+        if cu < 0 {
+          return Err(make_err(src, JsonErrorKind::InvalidEscape, i, "invalid \\uXXXX escape"))
+        }
+        if cu >= 0xDC00 && cu <= 0xDFFF {
+          return Err(make_err(src, JsonErrorKind::InvalidUnicode, i, "lone low UTF-16 surrogate"))
+        }
+        if cu >= 0xD800 && cu <= 0xDBFF {
+          // Must be immediately followed by \uDC00..\uDFFF
+          if i + 11 >= n || src.code_unit_at(i + 6) != 92 || src.code_unit_at(i + 7) != 117 {
+            return Err(make_err(src, JsonErrorKind::InvalidUnicode, i, "lone high UTF-16 surrogate"))
+          }
+          let lo = parse_hex4(src, n, i + 8)
+          if lo < 0xDC00 || lo > 0xDFFF {
+            return Err(make_err(src, JsonErrorKind::InvalidUnicode, i + 6, "invalid low UTF-16 surrogate"))
+          }
+          let cp = 0x10000 + ((cu - 0xD800) << 10) + (lo - 0xDC00)
+          write_utf8_scalar(sb, cp)
+          out_bytes = out_bytes + 4
+          i = i + 12
+        } else {
+          write_utf8_scalar(sb, cu)
+          out_bytes = out_bytes + (if cu < 0x80 { 1 } else if cu < 0x800 { 2 } else { 3 })
+          i = i + 6
+        }
+      } else {
+        return Err(make_err(src, JsonErrorKind::InvalidEscape, i, "invalid escape character"))
+      }
+      if out_bytes > max_string_bytes {
+        return Err(make_err(src, JsonErrorKind::StringLimitExceeded, pos, "string exceeds max_string_bytes"))
+      }
+      chunk_start = i
+    } else {
+      i = i + 1
+    }
+  }
+  Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "unterminated string"))
+}
+
+///| Parse a strict RFC 8259 JSON number starting at `pos`.
+///| Returns `(Json, next_pos)`:
+///| - Exact integer in i64::MIN..=i64::MAX -> `Json::Int(Int64)`
+///| - Out-of-range integer -> `Json::BigNum(raw)`
+///| - Fractional/exponent finite binary64 -> `Json::Float(Double)` (Eisel-Lemire + BigInt 0-ULP)
+///| - Fractional/exponent overflowing binary64 -> `Json::BigNum(raw)`
+fn parse_json_number(src : String, n : Int, pos : Int) -> Result[(Json, Int), JsonError] {
+  let start = pos
+  let mut i = pos
+  let neg = if i < n && src.code_unit_at(i) == 45 {
+    i = i + 1
+    true
+  } else {
+    false
+  }
+  if i >= n {
+    return Err(make_err(src, JsonErrorKind::InvalidNumber, pos, "unexpected end of number"))
+  }
+
+  // Integer part: "0" or [1-9][0-9]*
+  let int_start = i
+  let b0 = src.code_unit_at(i)
+  if b0 == 48 {
+    i = i + 1
+    if i < n {
+      let next = src.code_unit_at(i)
+      if next >= 48 && next <= 57 {
+        return Err(make_err(src, JsonErrorKind::InvalidNumber, i, "leading zero in number"))
+      }
+    }
+  } else if b0 >= 49 && b0 <= 57 {
+    i = i + 1
+    while i < n {
+      let b = src.code_unit_at(i)
+      if b >= 48 && b <= 57 {
+        i = i + 1
+      } else {
+        break
+      }
+    }
+  } else {
+    return Err(make_err(src, JsonErrorKind::InvalidNumber, i, "invalid number"))
+  }
+  let int_end = i
+
+  // Fractional part: "." [0-9]+
+  let mut is_float = false
+  let mut frac_start = i
+  let mut frac_end = i
+  if i < n && src.code_unit_at(i) == 46 {
+    is_float = true
+    i = i + 1
+    frac_start = i
+    if i >= n || src.code_unit_at(i) < 48 || src.code_unit_at(i) > 57 {
+      return Err(make_err(src, JsonErrorKind::InvalidNumber, i, "expected digit after decimal point"))
+    }
+    while i < n {
+      let b = src.code_unit_at(i)
+      if b >= 48 && b <= 57 {
+        i = i + 1
+      } else {
+        break
+      }
+    }
+    frac_end = i
+  }
+
+  // Exponent part: ("e"|"E") ["+"|"-"] [0-9]+
+  let mut exp_val = 0
+  let mut exp_overflow = false
+  let mut exp_neg = false
+  if i < n {
+    let eb = src.code_unit_at(i)
+    if eb == 101 || eb == 69 {
+      is_float = true
+      i = i + 1
+      if i < n {
+        let sb = src.code_unit_at(i)
+        if sb == 45 {
+          exp_neg = true
+          i = i + 1
+        } else if sb == 43 {
+          i = i + 1
+        }
+      }
+      if i >= n || src.code_unit_at(i) < 48 || src.code_unit_at(i) > 57 {
+        return Err(make_err(src, JsonErrorKind::InvalidNumber, i, "expected digit in exponent"))
+      }
+      while i < n {
+        let b = src.code_unit_at(i)
+        if b >= 48 && b <= 57 {
+          if exp_val < 10000000 {
+            exp_val = exp_val * 10 + (b - 48)
+          } else {
+            exp_overflow = true
+          }
+          i = i + 1
+        } else {
+          break
+        }
+      }
+    }
+  }
+  let end = i
+
+  // Case 1: Pure integer (no '.' and no 'e'/'E')
+  if !is_float {
+    let num_digits = int_end - int_start
+    // Fast path for <= 19 digits: fits in UInt64, check i64 bounds directly.
+    if num_digits <= 19 {
+      let mut mag : UInt64 = 0UL
+      let mut j = int_start
+      while j < int_end {
+        mag = mag * 10UL + (src.code_unit_at(j) - 48).to_int64().reinterpret_as_uint64()
+        j = j + 1
+      }
+      if !neg {
+        if mag <= 9223372036854775807UL {
+          return Ok((Json::Int(mag.reinterpret_as_int64()), end))
+        }
+      } else {
+        if mag == 0UL {
+          return Ok((Json::Int(0L), end))
+        }
+        if mag <= 9223372036854775808UL {
+          return Ok((Json::Int((0UL - mag).reinterpret_as_int64()), end))
+        }
+      }
+    }
+    // Out of Int64 range: preserve exact raw literal as BigNum.
+    return Ok((Json::BigNum(src.slice(start, end)), end))
+  }
+
+  // Case 2: Float (has '.' or 'e'/'E')
+  // Scan significant digits for Eisel-Lemire fast path (<= 19 significant digits).
+  let signed_exp = if exp_neg { -exp_val } else { exp_val }
+  let mut mant : UInt64 = 0UL
+  let mut sig_digits = 0
+  let mut truncated = false
+  let mut exp_adjust = 0
+
+  // Integer digits
+  let mut j = int_start
+  while j < int_end {
+    let d = src.code_unit_at(j) - 48
+    if sig_digits == 0 && d == 0 {
+      j = j + 1
+      continue
+    }
+    if sig_digits < 19 {
+      mant = mant * 10UL + d.to_int64().reinterpret_as_uint64()
+      sig_digits = sig_digits + 1
+    } else {
+      exp_adjust = exp_adjust + 1
+      if d != 0 {
+        truncated = true
+      }
+    }
+    j = j + 1
+  }
+  // Fractional digits
+  j = frac_start
+  while j < frac_end {
+    let d = src.code_unit_at(j) - 48
+    if sig_digits == 0 && d == 0 {
+      exp_adjust = exp_adjust - 1
+      j = j + 1
+      continue
+    }
+    if sig_digits < 19 {
+      mant = mant * 10UL + d.to_int64().reinterpret_as_uint64()
+      sig_digits = sig_digits + 1
+      exp_adjust = exp_adjust - 1
+    } else {
+      if d != 0 {
+        truncated = true
+      }
+    }
+    j = j + 1
+  }
+
+  if sig_digits == 0 {
+    // Exact zero (preserve -0.0 sign bit)
+    let zero_bits : Int64 = if neg { -9223372036854775807L - 1L } else { 0L }
+    return Ok((Json::Float(Double::from_bits(zero_bits)), end))
+  }
+
+  if exp_overflow {
+    if exp_neg {
+      let zero_bits : Int64 = if neg { -9223372036854775807L - 1L } else { 0L }
+      return Ok((Json::Float(Double::from_bits(zero_bits)), end))
+    } else {
+      return Ok((Json::BigNum(src.slice(start, end)), end))
+    }
+  }
+
+  let q = signed_exp + exp_adjust
+  // Quick exponent bounds before Eisel-Lemire / BigInt
+  let sci_exp = q + sig_digits - 1
+  if sci_exp > 309 {
+    return Ok((Json::BigNum(src.slice(start, end)), end))
+  }
+  if sci_exp < -325 {
+    let zero_bits : Int64 = if neg { -9223372036854775807L - 1L } else { 0L }
+    return Ok((Json::Float(Double::from_bits(zero_bits)), end))
+  }
+
+  // Fast path: Eisel-Lemire 128-bit exact conversion when not truncated.
+  if !truncated {
+    match eisel_lemire_f64(mant, q) {
+      Some(abs_d) => {
+        let bits = abs_d.reinterpret_as_uint64()
+        if ((bits >> 52UL) & 0x7FFUL) == 0x7FFUL {
+          return Ok((Json::BigNum(src.slice(start, end)), end))
+        }
+        let final_d = if neg { -abs_d } else { abs_d }
+        return Ok((Json::Float(final_d), end))
+      }
+      None => ()
+    }
+  }
+
+  // Exact 0-ULP BigInt fallback (Algorithm M) for midpoints, subnormals, and > 19 digits.
+  let abs_d = parse_decimal_float_bigint(src, int_start, int_end, frac_start, frac_end, signed_exp)
+  let bits = abs_d.reinterpret_as_uint64()
+  if ((bits >> 52UL) & 0x7FFUL) == 0x7FFUL {
+    return Ok((Json::BigNum(src.slice(start, end)), end))
+  }
+  let final_d = if neg {
+    Double::from_bits((bits | 0x8000000000000000UL).reinterpret_as_int64())
+  } else {
+    abs_d
+  }
+  Ok((Json::Float(final_d), end))
+}
+
+///| Insert `(key, val)` into an in-progress object frame according to `DuplicateKeyPolicy`.
+fn obj_frame_insert(
+  entries : Array[(String, Json)],
+  idx_opt : Option[ObjIndexBuilder],
+  key : String,
+  v : Json,
+  policy : DuplicateKeyPolicy,
+  doc_seed : UInt64,
+  src : String,
+  key_off : Int,
+) -> Result[Option[ObjIndexBuilder], JsonError] {
+  let n = entries.length()
+  match idx_opt {
+    Some(b) => {
+      let existing = b.insert_if_absent(key, n)
+      if existing >= 0 {
+        match policy {
+          DuplicateKeyPolicy::LastWins => {
+            entries[existing] = (key, v)
+            Ok(Some(b))
+          }
+          DuplicateKeyPolicy::FirstWins => Ok(Some(b))
+          DuplicateKeyPolicy::Reject => {
+            Err(make_err(src, JsonErrorKind::DuplicateKey, key_off, "duplicate object key: " + key))
+          }
+        }
+      } else {
+        entries.push((key, v))
+        Ok(Some(b))
+      }
+    }
+    None => {
+      // Linear scan for small objects (<= 8 entries)
+      let mut i = 0
+      while i < n {
+        let (ek, _) = entries[i]
+        if ek == key {
+          match policy {
+            DuplicateKeyPolicy::LastWins => {
+              entries[i] = (key, v)
+              return Ok(None)
+            }
+            DuplicateKeyPolicy::FirstWins => return Ok(None)
+            DuplicateKeyPolicy::Reject => {
+              return Err(make_err(src, JsonErrorKind::DuplicateKey, key_off, "duplicate object key: " + key))
+            }
+          }
+        }
+        i = i + 1
+      }
+      entries.push((key, v))
+      if n + 1 > 8 {
+        // Promote to O(1) hash index on crossing 8 entries
+        let b = ObjIndexBuilder::new(32, doc_seed)
+        let mut j = 0
+        while j <= n {
+          let (k, _) = entries[j]
+          let _ = b.insert_if_absent(k, j)
+          j = j + 1
+        }
+        Ok(Some(b))
+      } else {
+        Ok(None)
+      }
+    }
+  }
+}
+
+///| Top-level strict RFC 8259 iterative parser.
+fn parse_str_impl(src : String, limits : JsonLimits) -> Result[Json, JsonError] {
+  let n = src.length()
+  if n > limits.max_bytes {
+    return Err(
+      JsonError::new(
+        JsonErrorKind::ByteLimitExceeded,
+        1,
+        1,
+        0,
+        "input byte length exceeds max_bytes limit",
+      ),
+    )
+  }
+  match validate_utf8_str(src) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  let doc_seed = derive_seed_from_str(src)
+  let stack : Array[ParseFrame] = []
+  let mut pos = skip_ws(src, n, 0)
+  if pos >= n {
+    return Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "empty JSON input"))
+  }
+
+  let mut elements = 0
+  let mut root_val : Option[Json] = None
+
+  // State machine:
+  // expect_value == true  -> parse a value (or empty container close if just opened)
+  // expect_value == false -> we just completed a value `cur_val`, attach to parent or finish
+  let mut expect_value = true
+  let mut cur_val : Json = Json::Null
+
+  while true {
+    if expect_value {
+      pos = skip_ws(src, n, pos)
+      if pos >= n {
+        return Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "unexpected end of input"))
+      }
+      elements = elements + 1
+      if elements > limits.max_elements {
+        return Err(make_err(src, JsonErrorKind::ElementLimitExceeded, pos, "element count exceeds max_elements"))
+      }
+      let b = src.code_unit_at(pos)
+      if b == 91 {
+        // '['
+        if stack.length() + 1 > limits.max_depth {
+          return Err(make_err(src, JsonErrorKind::DepthLimitExceeded, pos, "nesting depth exceeds max_depth"))
+        }
+        pos = skip_ws(src, n, pos + 1)
+        if pos < n && src.code_unit_at(pos) == 93 {
+          pos = pos + 1
+          cur_val = Json::Array([])
+          expect_value = false
+        } else {
+          stack.push(ParseFrame::Arr([]))
+          expect_value = true
+        }
+      } else if b == 123 {
+        // '{'
+        if stack.length() + 1 > limits.max_depth {
+          return Err(make_err(src, JsonErrorKind::DepthLimitExceeded, pos, "nesting depth exceeds max_depth"))
+        }
+        pos = skip_ws(src, n, pos + 1)
+        if pos < n && src.code_unit_at(pos) == 125 {
+          pos = pos + 1
+          cur_val = Json::Object(JsonObject::empty())
+          expect_value = false
+        } else {
+          if pos >= n {
+            return Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "unterminated object"))
+          }
+          if src.code_unit_at(pos) != 34 {
+            return Err(make_err(src, JsonErrorKind::Syntax, pos, "expected string key in object"))
+          }
+          let key_pos = pos
+          let (k, next_p) = match parse_json_string(src, n, pos, limits.max_string_bytes) {
+            Ok(pair) => pair
+            Err(e) => return Err(e)
+          }
+          pos = skip_ws(src, n, next_p)
+          if pos >= n || src.code_unit_at(pos) != 58 {
+            return Err(make_err(src, JsonErrorKind::Syntax, pos, "expected ':' after object key"))
+          }
+          pos = pos + 1
+          let _ = key_pos
+          stack.push(ParseFrame::Obj([], None, k))
+          expect_value = true
+        }
+      } else if b == 34 {
+        // '"'
+        let (s, next_p) = match parse_json_string(src, n, pos, limits.max_string_bytes) {
+          Ok(pair) => pair
+          Err(e) => return Err(e)
+        }
+        pos = next_p
+        cur_val = Json::Str(s)
+        expect_value = false
+      } else if b == 116 {
+        // 'true'
+        if pos + 4 <= n &&
+        src.code_unit_at(pos + 1) == 114 &&
+        src.code_unit_at(pos + 2) == 117 &&
+        src.code_unit_at(pos + 3) == 101 {
+          pos = pos + 4
+          cur_val = Json::Bool(true)
+          expect_value = false
+        } else {
+          return Err(make_err(src, JsonErrorKind::Syntax, pos, "invalid literal"))
+        }
+      } else if b == 102 {
+        // 'false'
+        if pos + 5 <= n &&
+        src.code_unit_at(pos + 1) == 97 &&
+        src.code_unit_at(pos + 2) == 108 &&
+        src.code_unit_at(pos + 3) == 115 &&
+        src.code_unit_at(pos + 4) == 101 {
+          pos = pos + 5
+          cur_val = Json::Bool(false)
+          expect_value = false
+        } else {
+          return Err(make_err(src, JsonErrorKind::Syntax, pos, "invalid literal"))
+        }
+      } else if b == 110 {
+        // 'null'
+        if pos + 4 <= n &&
+        src.code_unit_at(pos + 1) == 117 &&
+        src.code_unit_at(pos + 2) == 108 &&
+        src.code_unit_at(pos + 3) == 108 {
+          pos = pos + 4
+          cur_val = Json::Null
+          expect_value = false
+        } else {
+          return Err(make_err(src, JsonErrorKind::Syntax, pos, "invalid literal"))
+        }
+      } else if b == 45 || (b >= 48 && b <= 57) {
+        let (nv, next_p) = match parse_json_number(src, n, pos) {
+          Ok(pair) => pair
+          Err(e) => return Err(e)
+        }
+        pos = next_p
+        cur_val = nv
+        expect_value = false
+      } else {
+        return Err(make_err(src, JsonErrorKind::Syntax, pos, "unexpected token"))
+      }
+    } else {
+      // Attach `cur_val` to top container frame, or finish if stack is empty.
+      if stack.length() == 0 {
+        root_val = Some(cur_val)
+        break
+      }
+      let frame = match stack.pop() {
+        Some(f) => f
+        None => break
+      }
+      match frame {
+        ParseFrame::Arr(items) => {
+          items.push(cur_val)
+          pos = skip_ws(src, n, pos)
+          if pos >= n {
+            return Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "unterminated array"))
+          }
+          let sep = src.code_unit_at(pos)
+          if sep == 44 {
+            // ','
+            pos = pos + 1
+            stack.push(ParseFrame::Arr(items))
+            expect_value = true
+          } else if sep == 93 {
+            // ']'
+            pos = pos + 1
+            cur_val = Json::Array(items)
+            expect_value = false
+          } else {
+            return Err(make_err(src, JsonErrorKind::Syntax, pos, "expected ',' or ']' in array"))
+          }
+        }
+        ParseFrame::Obj(entries, idx_opt, key) => {
+          let new_idx = match obj_frame_insert(
+            entries,
+            idx_opt,
+            key,
+            cur_val,
+            limits.duplicate_keys,
+            doc_seed,
+            src,
+            pos,
+          ) {
+            Ok(io) => io
+            Err(e) => return Err(e)
+          }
+          pos = skip_ws(src, n, pos)
+          if pos >= n {
+            return Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "unterminated object"))
+          }
+          let sep = src.code_unit_at(pos)
+          if sep == 44 {
+            // ','
+            pos = skip_ws(src, n, pos + 1)
+            if pos >= n {
+              return Err(make_err(src, JsonErrorKind::UnexpectedEof, pos, "unterminated object after ','"))
+            }
+            if src.code_unit_at(pos) != 34 {
+              return Err(make_err(src, JsonErrorKind::Syntax, pos, "expected string key after ','"))
+            }
+            let (next_key, next_p) = match parse_json_string(src, n, pos, limits.max_string_bytes) {
+              Ok(pair) => pair
+              Err(e) => return Err(e)
+            }
+            pos = skip_ws(src, n, next_p)
+            if pos >= n || src.code_unit_at(pos) != 58 {
+              return Err(make_err(src, JsonErrorKind::Syntax, pos, "expected ':' after object key"))
+            }
+            pos = pos + 1
+            stack.push(ParseFrame::Obj(entries, new_idx, next_key))
+            expect_value = true
+          } else if sep == 125 {
+            // '}'
+            pos = pos + 1
+            let frozen = match new_idx {
+              Some(b) => Some(b.freeze())
+              None => None
+            }
+            cur_val = Json::Object(JsonObject::{ entries: entries, index: frozen })
+            expect_value = false
+          } else {
+            return Err(make_err(src, JsonErrorKind::Syntax, pos, "expected ',' or '}' in object"))
+          }
+        }
+      }
+    }
+  }
+
+  pos = skip_ws(src, n, pos)
+  if pos < n {
+    return Err(make_err(src, JsonErrorKind::TrailingData, pos, "unexpected trailing data after JSON value"))
+  }
+  match root_val {
+    Some(v) => Ok(v)
+    None => Err(make_err(src, JsonErrorKind::UnexpectedEof, 0, "empty JSON input"))
+  }
+}
