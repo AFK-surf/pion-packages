@@ -1,0 +1,130 @@
+///| Regression tests for Wave 8 red-team fixes (P0 F1–F5, P1 F6–F11, P2 F12–F16).
+
+///|
+test "rt_f1_to_sql_double_minus_and_constructed_ast_safety" {
+  // Double-minus must never glue into SQL `--` line comment
+  let src = "SELECT - -1, '\n1; DROP TABLE secret; --'"
+  let stmt = assert_parse_one(src, ParseOptions::postgres())
+  let out = to_sql(stmt)
+  match parse_postgres(out) {
+    Ok(stmts) => {
+      debug_assert(stmts.length() == 1, "must re-parse as 1 statement: " + out)
+      debug_assert(stmt_eq(stmt, stmts[0]), "structural round-trip mismatch: " + out)
+    }
+    Err(e) => debug_assert(false, "re-parse failed: " + e.message + " in " + out)
+  }
+
+  // Bracket identifier containing `]` falls back to safe double-quoted identifier
+  let bad_bracket = Ident::quoted("x] FROM t; DROP TABLE secret; --", QuoteStyle::Bracket)
+  let b_out = expr_to_sql(Expr::Identifier(bad_bracket))
+  match parse_sqlite("SELECT " + b_out) {
+    Ok(stmts) => debug_assert(stmts.length() == 1, "bracket escape failed: " + b_out)
+    Err(e) => debug_assert(false, "bracket escape unparseable: " + e.message)
+  }
+
+  // Dollar-quoted body containing its own delimiter chooses a fresh safe tag
+  let d_out = expr_to_sql(Expr::DollarQuotedString("", "x$$; DROP TABLE secret; --"))
+  match parse_postgres("SELECT " + d_out) {
+    Ok(stmts) => debug_assert(stmts.length() == 1, "dollar escape failed: " + d_out)
+    Err(e) => debug_assert(false, "dollar escape unparseable: " + e.message)
+  }
+}
+
+///|
+test "rt_f2_extract_tables_complete_case_folding_and_linear" {
+  let cases = [
+    "INSERT INTO t (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a = (SELECT max(id) FROM secret)",
+    "INSERT INTO t (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a = 2 WHERE EXISTS (SELECT 1 FROM secret)",
+    "INSERT INTO t (id, a) VALUES (7, 1) RETURNING (SELECT pw FROM secret LIMIT 1)",
+    "UPDATE t SET a = 2 WHERE id = 1 RETURNING (SELECT pw FROM secret LIMIT 1)",
+    "DELETE FROM t WHERE id = 1 RETURNING (SELECT pw FROM secret LIMIT 1)",
+    "SELECT DISTINCT ON ((SELECT max(id) FROM secret)) a FROM t",
+    "CREATE TABLE x_fk (a int, FOREIGN KEY (a) REFERENCES secret (id))",
+    "WITH \"SECRET\" AS (SELECT 1 AS id) SELECT * FROM SECRET",
+    "WITH \"Secret\" AS (SELECT 1 AS id) SELECT * FROM Secret",
+  ]
+  let mut i = 0
+  while i < cases.length() {
+    let tables = extract_tables(assert_parse_one(cases[i], ParseOptions::postgres()))
+    let mut found = false
+    let mut j = 0
+    while j < tables.length() {
+      if tables[j] == "secret" {
+        found = true
+      }
+      j = j + 1
+    }
+    debug_assert(found, "secret missing in extract_tables for: " + cases[i])
+    i = i + 1
+  }
+
+  // Case-folding distinction between SECRET and "SECRET"
+  let t_unq = extract_tables(assert_parse_one("SELECT * FROM SECRET", ParseOptions::postgres()))
+  let t_quo = extract_tables(assert_parse_one("SELECT * FROM \"SECRET\"", ParseOptions::postgres()))
+  debug_assert(t_unq.length() == 1 && t_unq[0] == "secret", "unquoted folds to lowercase")
+  debug_assert(t_quo.length() == 1 && t_quo[0] == "SECRET", "quoted preserves uppercase")
+}
+
+///|
+test "rt_f3_f4_dialect_aware_sqlite_lexing_and_streaming_split" {
+  // SQLite dialect prevents all 3 statement smuggling vectors
+  match parse_sqlite("SELECT 1 /* /* */; DROP TABLE secret; -- */") {
+    Ok(stmts) => debug_assert(stmts.length() == 2, "sqlite non-nested comment -> 2 stmts")
+    Err(e) => debug_assert(false, e.message)
+  }
+  match parse_sqlite("SELECT $a$; DROP TABLE secret; SELECT $a$") {
+    Ok(stmts) => debug_assert(stmts.length() == 3, "sqlite $a$ bind param -> 3 stmts")
+    Err(e) => debug_assert(false, e.message)
+  }
+  match parse_sqlite("SELECT e'\\' FROM (SELECT 1 AS e); DROP TABLE secret; --'") {
+    Ok(stmts) => debug_assert(stmts.length() == 2, "sqlite no E-string -> 2 stmts")
+    Err(e) => debug_assert(false, e.message)
+  }
+
+  // Dialect-aware streaming split_statements_dialect
+  match split_statements_dialect("SELECT 1 /* /* */; DROP TABLE secret; -- */", Dialect::SQLite) {
+    Ok(parts) => debug_assert(parts.length() == 2, "sqlite split non-nested comment")
+    Err(e) => debug_assert(false, e.message)
+  }
+  match split_statements_dialect("SELECT $a$; DROP TABLE secret; SELECT $a$", Dialect::SQLite) {
+    Ok(parts) => debug_assert(parts.length() == 3, "sqlite split $a$")
+    Err(e) => debug_assert(false, e.message)
+  }
+  match split_statements_dialect("SELECT e'\\' FROM (SELECT 1 AS e); DROP TABLE secret; --'", Dialect::SQLite) {
+    Ok(parts) => debug_assert(parts.length() == 2, "sqlite split e'\\'")
+    Err(e) => debug_assert(false, e.message)
+  }
+  match split_statements_with_options("SELECT 1 AS [x; DROP TABLE secret; SELECT 2 AS y]", ParseOptions::postgres()) {
+    Ok(parts) => debug_assert(parts.length() == 3, "postgres split ignores [ ]")
+    Err(e) => debug_assert(false, e.message)
+  }
+}
+
+///|
+test "rt_f6_f11_precedence_escapes_double_precision_struct_eq_and_case" {
+  // Escape strings decode \x, \u, \U, octal
+  match parse_select_expr("E'\\x41\\u0042\\U00000043\\104'", ParseOptions::postgres()) {
+    Expr::EscapedString(v) => debug_assert(v == "ABCD", "got: " + v)
+    _ => debug_assert(false, "expected EscapedString")
+  }
+
+  // DOUBLE PRECISION formatting
+  let dp = to_sql(assert_parse_one("SELECT a::double precision FROM t", ParseOptions::postgres()))
+  debug_assert(dp.contains("DOUBLE PRECISION"), dp)
+
+  // Non-associative comparisons rejected in Postgres
+  match parse_postgres("SELECT 3 > 2 > FALSE") {
+    Ok(_) => debug_assert(false, "chained comparison must be rejected in Postgres")
+    Err(_) => ()
+  }
+
+  // Trailing junk after $1 rejected in Postgres
+  match parse_postgres("SELECT $1a$") {
+    Ok(_) => debug_assert(false, "$1a$ must be rejected in Postgres")
+    Err(_) => ()
+  }
+
+  // Keyword identifiers preserve original spelling
+  let kw_out = to_sql(assert_parse_one("SELECT date, time, key FROM key", ParseOptions::postgres()))
+  debug_assert(kw_out == "SELECT date, time, key FROM key", kw_out)
+}

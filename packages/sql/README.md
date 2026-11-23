@@ -3,33 +3,32 @@
 Pure Pion **SQL Lexer**, **Pratt Recursive-Descent AST Parser**, **Canonical SQL Formatter**, and **Static Analyzer** supporting **SQLite**, **PostgreSQL**, and **Generic** dialects — modeled after Rust [`sqlparser-rs`](https://github.com/apache/datafusion-sqlparser-rs).
 
 - **Zero external / C / `World` dependencies** — pure Pion, `Send`-safe immutable AST types, verified across **Native** and **`wasm32`** (`debug` & `release`, 4/4 smoke modes exit 0).
-- **Rich SQLite + PostgreSQL Lexer**:
-  - Case-insensitive ASCII keywords (zero-allocation static keyword matching).
-  - Double-quoted (`"a""b"`), backtick (`` `a``b` ``), and SQLite bracket (`[a b]`) identifiers.
-  - Single-quoted strings (`'it''s'`), PostgreSQL escaped strings (`E'...\n\t\\\''`), and dollar-quoted strings (`$$...$$`, `$tag$...$tag$`).
-  - Decimal, floating-point, scientific, and hexadecimal (`0xFF`) numeric literals.
-  - Line comments (`--`) and PostgreSQL-standard **nested block comments** (`/* /* ... */ */`).
-  - Placeholders (`?`, `?1`, `$1`, `:name`, `@name`) and full operator set (`=`, `!=`, `<>`, `<=`, `>=`, `||`, `->`, `->>`, `#>`, `#>>`, `::`, `@>`, `<@`, `~`, `~*`, `!~`, `!~*`, bitwise/shift).
+- **Rich Dialect-Aware SQLite + PostgreSQL Lexer**:
+  - Case-insensitive ASCII keywords (zero-allocation static keyword matching; non-reserved keywords used as identifiers preserve original spelling).
+  - Double-quoted (`"a""b"`), backtick (`` `a``b` ``, SQLite/Generic), and bracket (`[a b]`, SQLite/Generic) identifiers.
+  - Single-quoted strings (`'it''s'`), PostgreSQL escaped strings (`E'...\n\t\xHH\uHHHH\UHHHHHHHH\ooo\\\''`, disabled in SQLite), dollar-quoted strings (`$$...$$`, `$tag$...$tag$`, disabled in SQLite), and SQLite hex blob literals (`X'0102'`).
+  - Decimal, floating-point, scientific, underscore-separated (`1_000`), binary (`0b`), octal (`0o`), and hexadecimal (`0xFF`) numeric literals.
+  - Line comments (`--`) and dialect-accurate block comments (nested `/* /* ... */ */` in PostgreSQL/Generic; non-nested `/* ... */` in SQLite).
+  - Placeholders (`?`, `?1`, `$1`, `:name`, `@name`) and full operator set (`=`, `==` in SQLite, `!=`, `<>`, `<=`, `>=`, `||`, `->`, `->>`, `#>`, `#>>`, `::`, `@>`, `<@`, `~`, `~*`, `!~`, `!~*`, `@`, `|/`, bitwise/shift).
   - Precise 1-based `line`/`col` and 0-based byte `offset` diagnostics.
 - **Complete Core DML / DDL / TCL AST**:
-  - `SELECT` (`DISTINCT`, `ALL`, `DISTINCT ON (...)`, aliases, `FROM`, `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL` `JOIN` with `ON`/`USING`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ASC/DESC NULLS FIRST/LAST`, `LIMIT`/`OFFSET`, `UNION`/`INTERSECT`/`EXCEPT [ALL]`, `WITH [RECURSIVE]` CTEs, subqueries, `EXISTS`, window functions `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE/GROUPS BETWEEN ...)`).
-  - `INSERT INTO ... VALUES / SELECT ... [ON CONFLICT (...) DO NOTHING | DO UPDATE SET ... [WHERE ...]] [RETURNING ...]`.
-  - `UPDATE ... SET ... [FROM ...] [WHERE ...] [RETURNING ...]`.
-  - `DELETE FROM ... [WHERE ...] [RETURNING ...]`.
-  - `CREATE [TEMP] TABLE [IF NOT EXISTS]` (column types including `[]` arrays, `PRIMARY KEY [AUTOINCREMENT]`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `REFERENCES ... ON DELETE/UPDATE ...`, table constraints, `WITHOUT ROWID`), `CREATE [UNIQUE] INDEX [IF NOT EXISTS] ... [WHERE ...]`, `CREATE [OR REPLACE] [TEMP] VIEW`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO`), `DROP TABLE/INDEX/VIEW [IF EXISTS] ... [CASCADE]`.
-  - `BEGIN`, `COMMIT`, `ROLLBACK [TO SAVEPOINT]`, `SAVEPOINT`, `RELEASE SAVEPOINT`, `EXPLAIN [ANALYZE]`.
-- **Pratt Expression Engine**:
-  - Full SQL precedence hierarchy (`OR` < `AND` < `NOT` < comparisons/`IS [NOT] NULL|TRUE|FALSE|DISTINCT FROM`/`[NOT] IN`/`[NOT] BETWEEN`/`[NOT] LIKE|ILIKE` < bitwise < `+`/`-`/`||` < `*`/`/`/`%` < `^` < JSON `->`/`->>`/`#>`/`#>>` < unary `+`/`-`/`~` < `COLLATE` < `::` cast / `[idx]` subscript).
-  - `CASE [expr] WHEN ... THEN ... ELSE ... END`, `CAST(x AS T)`, `x::T`, function calls with `DISTINCT` & `FILTER (WHERE ...)`, `ARRAY[...]` literals & subscripts, tuples.
-- **Formatting & Static Analysis**:
-  - `to_sql()` / `statements_to_sql()` / `expr_to_sql()` with roundtrip structural AST equivalence (`stmt_eq(stmt, parse_one(to_sql(stmt)))`).
-  - `extract_tables(stmt)` — deduplicated base table names in encounter order (excluding CTE aliases).
+  - `SELECT` (`DISTINCT`, `ALL`, `DISTINCT ON (...)`, aliases, `FROM`, table functions `generate_series(...)`, `ONLY`, `TABLESAMPLE`, `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL` `JOIN` with `ON`/`USING`, `WHERE`, `GROUP BY [ROLLUP|CUBE|GROUPING SETS]`, `HAVING`, `WINDOW w AS (...)`, `ORDER BY ASC/DESC NULLS FIRST/LAST`, `LIMIT`/`OFFSET`, SQLite `LIMIT offset, count`, `FETCH FIRST/NEXT ... ROWS ONLY`, `FOR UPDATE/SHARE [NOWAIT|SKIP LOCKED]`, `UNION`/`INTERSECT`/`EXCEPT [ALL]` with standard `INTERSECT > UNION/EXCEPT` precedence, `WITH [RECURSIVE]` CTEs, subqueries, `EXISTS`, window functions `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE/GROUPS BETWEEN ... [EXCLUDE ...])` and `OVER w`, `WITHIN GROUP (ORDER BY ...)`, `TABLE tbl`).
+  - `INSERT [OR REPLACE|IGNORE|ABORT|FAIL|ROLLBACK] INTO ... VALUES / DEFAULT VALUES / SELECT ... [ON CONFLICT (...) DO NOTHING | DO UPDATE SET ... [WHERE ...]] [RETURNING ...]`, `REPLACE INTO ...`.
+  - `UPDATE ... SET col = expr | (a, b) = (1, 2) ... [FROM ...] [WHERE ...] [RETURNING ...]`.
+  - `DELETE FROM ... [USING ...] [WHERE ...] [RETURNING ...]`.
+  - `CREATE [UNLOGGED] [TEMP] TABLE [IF NOT EXISTS]` (typed & SQLite type-less columns, `[]` arrays, `DOUBLE PRECISION`, `GENERATED ALWAYS AS (...) STORED` / `IDENTITY`, named `CONSTRAINT` column/table constraints, `PRIMARY KEY [AUTOINCREMENT]`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `REFERENCES ... ON DELETE/UPDATE ...`, `WITHOUT ROWID`, `STRICT`, `CREATE TABLE ... AS SELECT`, `CREATE TABLE ... (LIKE ...)`), `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] ... [USING method] ... [WHERE ...]`, `CREATE [OR REPLACE] [TEMP] VIEW`, `CREATE SCHEMA/SEQUENCE`, `ALTER TABLE` (`ADD`/`DROP`/`RENAME COLUMN`, `ALTER COLUMN ... TYPE`, `ADD`/`DROP CONSTRAINT`, `RENAME TO`), `DROP TABLE/INDEX/VIEW [IF EXISTS] ... [CASCADE]`, `TRUNCATE`.
+  - `BEGIN [ISOLATION LEVEL ...]`, `START TRANSACTION`, `COMMIT`, `ROLLBACK [TO SAVEPOINT]`, `SAVEPOINT`, `RELEASE SAVEPOINT`, `EXPLAIN [ANALYZE | (FORMAT ...)]`, `SET`, `SHOW`, `ANALYZE`, `PRAGMA`, `VACUUM`.
+- **PostgreSQL-Aligned Pratt Expression Engine**:
+  - Matches PostgreSQL operator precedence & associativity (`OR` < `AND` < `NOT` < `IS`/`ISNULL`/`NOTNULL` < non-associative comparisons `=`/`!=`/`<`/`>`/`<=`/`>=` < `IN`/`BETWEEN`/`LIKE`/`ILIKE`/`SIMILAR TO`/`GLOB`/`REGEXP` < general operators `||`/`~`/`@>`/`->`/`&`/`|`/`<<`/`>>` < `+`/`-` < `*`/`/`/`%` < `^` < unary `+`/`-`/`~`/`@`/`|/` < `COLLATE` < `::` cast / `[idx]` subscript / `[lo:hi]` slice).
+  - `= ANY/SOME/ALL (...)`, `EXTRACT(... FROM ...)`, `POSITION(... IN ...)`, `SUBSTRING(... FROM ... FOR ...)`, `TRIM(... FROM ...)`, typed literals (`DATE '...'`, `INTERVAL '...'`, `TIMESTAMP '...'`), `CASE`, `CAST(x AS T)`, `x::T`, function calls with `DISTINCT`, `ORDER BY`, `WITHIN GROUP` & `FILTER (WHERE ...)`, `ARRAY[...]` & `ARRAY(SELECT ...)`, tuples.
+- **Safe Formatting & O(N) Static Analysis**:
+  - `to_sql()` / `statements_to_sql()` / `expr_to_sql()` with safe serialization (prevents `- -x` → `--` comment injection, escapes unsafe constructed bracket/dollar-quoted/identifier nodes) and true structural AST equality (`stmt_eq(stmt, parse_one(to_sql(stmt)))`).
+  - `extract_tables(stmt)` — O(N) hash-indexed, SQL case-folding & quote-aware base table extraction covering all subquery, `DISTINCT ON`, `ON CONFLICT`, `RETURNING`, and table/column `FOREIGN KEY` positions (excluding shadowed CTE aliases).
   - `extract_placeholders(stmt)` — ordered parameter placeholder list preserving duplicates.
-  - `split_statements(src)` — lexically-aware top-level `;` splitter (ignores semicolons inside strings, comments, dollar-quotes, and parentheses).
-- **Day-1 Red-Team Defenses**:
-  - Explicit `max_depth` (default `128`), `max_tokens` (default `500,000`), and `max_nodes` (default `1,000,000`) guards with zero crashes on adversarial nesting.
-  - Iterative Pratt infix loop guarantees O(1) recursion depth and O(N) linear time for massive `OR`/`AND`/comma-list chains.
-  - Unterminated strings, identifiers, nested block comments, and dollar-quotes fail fast with exact opening `line`/`col`.
+  - `split_statements(src)` / `split_statements_dialect(src, dialect)` / `split_statements_with_options(src, opts)` — streaming, dialect-aware top-level `;` splitter with no fixed token-count cap.
+- **Red-Team Hardened Resource Guards**:
+  - `ParseOptions.max_depth` (default `128`) strictly bounds **both** recursive nesting (parentheses, subqueries, CTEs, CASE, functions, joins) **and** left-deep operator/postfix/set-op chains (`+`, `OR`, `||`, `::T`, `[i]`, `IS NULL`, `COLLATE`, `UNION`), preventing stack overflows across Native and `wasm32`.
+  - Explicit `max_tokens` (default `500,000`) and `max_nodes` (default `1,000,000`) budgets; unterminated strings, identifiers, block comments, and dollar-quotes fail fast with exact opening `line`/`col`.
 
 ## API
 
@@ -68,6 +67,8 @@ pub fn stmts_eq(a : Array[Statement], b : Array[Statement]) -> Bool
 pub fn extract_tables(stmt : Statement) -> Array[String]
 pub fn extract_placeholders(stmt : Statement) -> Array[String]
 pub fn split_statements(src : String) -> Result[Array[String], SqlError]
+pub fn split_statements_dialect(src : String, dialect : Dialect) -> Result[Array[String], SqlError]
+pub fn split_statements_with_options(src : String, opts : ParseOptions) -> Result[Array[String], SqlError]
 ```
 
 ## Example
@@ -104,19 +105,21 @@ pionc run --target wasm32 --release packages/sql/wasm_smoke
 
 ## Head-to-Head Benchmarks
 
-All benchmarks run via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, **mandatory stdout SHA-256 byte-for-byte verification**) on `Darwin arm64` against:
-- **Rust**: `sqlparser =0.53.0` (`--release`, `opt-level = 3`, `lto = true`, `codegen-units = 1`, `PostgreSqlDialect`)
+All benchmarks run via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, **mandatory stdout SHA-256 byte-for-byte verification** including FNV-1a statement-tag sequence hash and structural roundtrip equality `stmt_eq` / `PartialEq`) on `Darwin arm64` against:
+- **Rust**: `sqlparser =0.53.0` (`--release`, `opt-level = 3`, `lto = true`, `codegen-units = 1`, `PostgreSqlDialect`, macOS system allocator)
+
+> **Allocator & Corpus Transparency**: On macOS, the default Rust system allocator adds allocation overhead relative to Pion's allocator. Against the identical `sqlparser =0.53.0` baseline linked with **`mimalloc`** (`packages/sql/audit/rust --features mimalloc`), Pion remains **~2.6× faster** on W1/W3 (vs ~4–8× against the macOS system allocator) and faster across all 11 adversarial workloads (`packages/sql/audit/REPORT.md`). All W1–W3 queries belong to the common PostgreSQL subset supported by both parsers.
 
 ### Workload 1: Complex Production SQL Parse (20,000 ops / 4.83 MB)
 
 10 production-grade PostgreSQL statements (CTEs, recursive CTEs, multi-table `JOIN`s, window functions with `ROWS BETWEEN`, `EXISTS` subqueries, `CASE`/`CAST`/JSON operators, `FILTER (WHERE ...)`, `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, `UPDATE ... FROM ... RETURNING`, `DELETE ... RETURNING`, `CREATE TABLE` with FK/CHECK/array types, partial `CREATE UNIQUE INDEX`, `ALTER TABLE`) × 2,000 rounds:
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `55 B` (`sha256:a65a4e5f68854393...`) | Input: `4828000 B` | Ops: `20000`
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `85 B` (`sha256:f6751764383fb9cc...`) | Input: `4828000 B` | Ops: `20000`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_sqlparser) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 83.843 | 82.331 | 87.270 | 57.58 | 4192.12 | 2.34 MiB | **4.83x** |
-| `rust_sqlparser` | 404.660 | 379.527 | 417.358 | 11.93 | 20232.99 | 3.22 MiB | 1.00x (baseline) |
+| `pion` | 136.493 | 130.175 | 154.151 | 35.37 | 6824.66 | 2.56 MiB | **8.72x** |
+| `rust_sqlparser` | 1190.852 | 1116.332 | 1416.671 | 4.05 | 59542.60 | 3.33 MiB | 1.00x (baseline) |
 
 ### Workload 2: Large SQL Script Tokenize (10× 969.6 KB = 9.70 MB)
 
@@ -124,23 +127,23 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | St
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_sqlparser) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 62.303 | 61.267 | 72.205 | 155.63 | 6230266.60 | 23.44 MiB | **3.99x** |
-| `rust_sqlparser` | 248.595 | 241.422 | 294.234 | 39.00 | 24859520.80 | 38.64 MiB | 1.00x (baseline) |
+| `pion` | 100.063 | 95.771 | 129.482 | 96.90 | 10006300.00 | 23.47 MiB | **7.94x** |
+| `rust_sqlparser` | 794.741 | 772.797 | 819.762 | 12.20 | 79474091.70 | 38.66 MiB | 1.00x (baseline) |
 
-### Workload 3: SQL Parse → `to_sql()` → Reparse Roundtrip (10,000 ops / 2.41 MB)
+### Workload 3: SQL Parse → `to_sql()` → Reparse + Structural `stmt_eq` Roundtrip (10,000 ops / 2.41 MB)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `75 B` (`sha256:7b645eeb0b2e6cef...`) | Input: `2414000 B` | Ops: `10000`
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `105 B` (`sha256:e1463eb660ccacbc...`) | Input: `2414000 B` | Ops: `10000`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_sqlparser) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 89.286 | 87.601 | 89.741 | 27.04 | 8928.61 | 2.55 MiB | **4.40x** |
-| `rust_sqlparser` | 392.566 | 383.373 | 466.444 | 6.15 | 39256.60 | 3.55 MiB | 1.00x (baseline) |
+| `pion` | 161.034 | 150.443 | 190.695 | 14.99 | 16103.44 | 2.81 MiB | **7.28x** |
+| `rust_sqlparser` | 1172.362 | 756.640 | 1541.544 | 2.06 | 117236.16 | 3.61 MiB | 1.00x (baseline) |
 
 ## Design Boundaries & Honest Trade-offs
 
-- **Scope vs `sqlparser-rs`**: `packages/sql` focuses on SQLite, PostgreSQL, and Generic core SQL (DML, DDL, TCL, CTEs, window functions, Pratt expressions, static analysis). `sqlparser-rs` supports 15+ dialects (MySQL, Snowflake, BigQuery, MSSQL, DuckDB, ClickHouse, Hive, etc.) with much larger AST enum variants and per-token spans/whitespace tokens, which is a primary contributor to `packages/sql`'s 4.0x–4.8x throughput advantage and lower peak RSS on the benchmarked PostgreSQL/SQLite workloads.
-- **Unimplemented dialect extensions**: Stored procedures / `CREATE FUNCTION` / `DO $$ ... $$` PL/pgSQL blocks, triggers, `MERGE`, `GRANT`/`REVOKE`, `COPY`, and vendor-specific storage clauses (e.g. `TABLESPACE`, `PARTITION BY RANGE` DDL) are out of scope for `v0.1.0`.
-- **Nesting depth**: Recursive descent is strictly bounded by `ParseOptions.max_depth` (default `128`). On `wasm32`, keep `max_depth <= 256` to stay well within Wasm stack limits during recursive AST teardown.
+- **Scope vs `sqlparser-rs`**: `packages/sql` focuses on SQLite, PostgreSQL, and Generic core SQL (DML, DDL, TCL, CTEs, window functions, Pratt expressions, static analysis). `sqlparser-rs` supports 15+ dialects (MySQL, Snowflake, BigQuery, MSSQL, DuckDB, ClickHouse, Hive, etc.) with much larger AST enum variants and per-token spans/whitespace tokens, which together with allocator differences explains Pion's throughput and peak RSS advantage on the benchmarked PostgreSQL/SQLite workloads.
+- **Unimplemented dialect extensions**: Stored procedures / `CREATE FUNCTION` / `DO $$ ... $$` PL/pgSQL blocks, triggers, `MERGE`, `GRANT`/`REVOKE`, `COMMENT ON`, `PREPARE`, `ATTACH`, `COPY`, and vendor-specific storage clauses (e.g. `TABLESPACE`, `PARTITION BY RANGE` DDL) are out of scope for `v0.1.0`.
+- **Nesting depth & Wasm32 measured limit**: Both recursive nesting and left-deep operator/postfix/set-operation chains are strictly bounded by `ParseOptions.max_depth` (default `128`). On `wasm32` (Node.js V8 Wasm stack), **keep `max_depth <= 128`** — empirically verified with 0 crashes across all 9 nested shapes (`paren`, `not`, `neg`, `subq`, `from`, `case`, `func`, `join`, `cte`) and all 8 left-deep chains (`plus`, `or`, `concat`, `cast`, `subscript`, `isnull`, `collate`, `union`) in both `wasm32` debug and release builds (`max_depth >= 256` can hit V8's Wasm call stack limit on deeply nested subqueries/expressions).
 
 Reproduce:
 

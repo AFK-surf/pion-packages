@@ -28,13 +28,16 @@ fn run_parse(path: &str, rounds: usize) -> i32 {
     let dialect = PostgreSqlDialect {};
     let mut total_stmts: i64 = 0;
     let mut tag_sum: i64 = 0;
+    let mut tag_hash: i64 = 1469598103934665603;
     for _ in 0..rounds {
         for q in &queries {
             match Parser::parse_sql(&dialect, q) {
                 Ok(stmts) => {
                     total_stmts += stmts.len() as i64;
                     for s in &stmts {
-                        tag_sum += stmt_tag(s);
+                        let tg = stmt_tag(s);
+                        tag_sum += tg;
+                        tag_hash = (tag_hash ^ tg).wrapping_mul(1099511628211);
                     }
                 }
                 Err(e) => {
@@ -48,6 +51,7 @@ fn run_parse(path: &str, rounds: usize) -> i32 {
     println!("rounds={}", rounds);
     println!("total_stmts={}", total_stmts);
     println!("tag_sum={}", tag_sum);
+    println!("tag_hash={}", tag_hash);
     0
 }
 
@@ -90,6 +94,7 @@ fn run_roundtrip(path: &str, rounds: usize) -> i32 {
     let mut total_stmts: i64 = 0;
     let mut tag_sum: i64 = 0;
     let mut non_empty: i64 = 0;
+    let mut tag_hash: i64 = 1469598103934665603;
     for _ in 0..rounds {
         for q in &queries {
             match Parser::parse_sql(&dialect, q) {
@@ -102,8 +107,14 @@ fn run_roundtrip(path: &str, rounds: usize) -> i32 {
                         match Parser::parse_sql(&dialect, &formatted) {
                             Ok(reparsed) => {
                                 total_stmts += reparsed.len() as i64;
+                                if reparsed.len() != 1 || reparsed[0] != *s {
+                                    eprintln!("roundtrip structural mismatch");
+                                    return 1;
+                                }
                                 for rs in &reparsed {
-                                    tag_sum += stmt_tag(rs);
+                                    let tg = stmt_tag(rs);
+                                    tag_sum += tg;
+                                    tag_hash = (tag_hash ^ tg).wrapping_mul(1099511628211);
                                 }
                             }
                             Err(e) => {
@@ -125,6 +136,7 @@ fn run_roundtrip(path: &str, rounds: usize) -> i32 {
     println!("total_stmts={}", total_stmts);
     println!("non_empty={}", non_empty);
     println!("tag_sum={}", tag_sum);
+    println!("tag_hash={}", tag_hash);
     0
 }
 
