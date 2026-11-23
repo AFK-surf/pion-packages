@@ -93,3 +93,16 @@ Run via `sh packages/http_cache/bench/run_bench.sh` against pure-Rust **`http-ca
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `pion` (`--release`) | 65.263 | 63.918 | 70.426 | 299.71 | 1087.72 | 2.05 MiB | **1.14x** |
 | `rust_http_cache_semantics_prebuilt` (`3.0.0`, `--release`) | 74.413 | 71.017 | 78.214 | 262.86 | 1240.22 | 2.50 MiB | 1.00x (baseline) |
+
+## Formal Verification (Lean 4)
+
+The RFC 9111 age-clamping, HTTP status cacheability, `CacheLimits` DoS guard, and RFC 9110 calendar kernels (`src/policy.pion`, `src/types.pion`, `src/date.pion`) are annotated with `#verify`, extracted directly via `pionc extract-lean` (`3` types, `15` functions, `0` externals), and formally verified in Lean 4 with **24 theorems**, **0 `sorry`**, **0 `admit`**, **0 custom `axiom`**, **0 `bv_decide`**, **0 `native_decide`**, and **36/36** native-vs-Lean differential cross-checks:
+
+- `proofs/HttpCacheProofs/AgeAndFreshness.lean` (12 theorems): full `Int64`-domain overflow-free exactness, `[0, 2^31]` bounds, and monotonicity of `clamped_add_i64` and `clamped_sub_i64`; RFC 9111 §4.2.3 `compute_initial_age_core` exactness/bounds/dominance and `compute_current_age_core` bounds, wall-clock monotonicity in `now`, and identity at/before `response_time`.
+- `proofs/HttpCacheProofs/StatusAndCalendar.lean` (12 theorems): `CacheLimits::default` non-negativity, `limits_all_nonneg` exact 7-field iff characterization, `CachePolicyOptions::shared` vs `private_cache` invariants, `RequestCacheControl::empty` fail-closed defaults, RFC 9111 §3 / §3.1 11-status `is_heuristically_cacheable_status` characterization (excluding `206` & `1xx`) and implication of `is_understood_status` within `[200, 501]`, `is_ascii_digit`, Gregorian `is_leap_year`, and `days_in_month` bounds & Feb 28/29 leap-year iff.
+- `proofs/CheckAxioms.lean`: verifies all 24 theorems depend only on Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`).
+- `proofs/EvalDiff.lean`: 36-case Lean vs native Pion differential cross-check (`diff -u` zero differences).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/http_cache/proofs/run_proofs.sh
+```
