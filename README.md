@@ -85,8 +85,9 @@ pionc add <package-name>
 | [`sdp`](packages/sdp) | `0.1.0` | RFC 8866（SDP）/ RFC 8829（JSEP）/ RFC 8843（BUNDLE）/ RFC 8839（ICE）/ RFC 8851·8853（RID & Simulcast）WebRTC 会话描述解析、无损 CRLF 序列化、结构化 `extract_webrtc_summary` 与 `ParseLimits` 放大炸弹防护，零依赖无 `World` | Rust [`webrtc-rs/sdp`](https://github.com/webrtc-rs/sdp) `0.9.0` + Mozilla `webrtc-sdp 0.3.17` | 10 / 10 | ✅ `wasm_smoke` | [Meet Offer 解析 **1.95×** · Offer 往返 **1.46×** · SFU Answer 往返 **1.66×**（vs Rust `webrtc-rs/sdp`）](BENCHMARKS.md#sdp) | `pionc add sdp --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`stun`](packages/stun) | `0.1.0` | RFC 8489 STUN 线格式编解码与 `MESSAGE-INTEGRITY` / `MESSAGE-INTEGRITY-SHA256` / `FINGERPRINT`（复用 `crypto`，内置 RFC 2104 HMAC-SHA1 / CRC-32 / MD5）、RFC 5769 全 4 组官方向量、RFC 7983 Demux 与 RFC 8445 Sans-IO ICE 状态机（`IceAgent`、角色冲突 `487`、多网卡 `handle_inbound_on`、有界 checklist），零 C 依赖无 `World` | Rust [`webrtc-rs/stun`](https://github.com/webrtc-rs/stun) `v0.8.0`（`ring` ASM SHA-1）+ RFC 5769 / RFC 8489 / RFC 8445 | 12 / 12（另复用 `crypto` 69 / 69） | ✅ `wasm_smoke` | [编码签名 0.60× · 解码验签 0.39×（vs Rust `ring` ASM SHA-1）· 峰值 RSS 更低（1.86–1.89 MiB）](BENCHMARKS.md#stun) | `pionc add stun --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`rtp`](packages/rtp) | `0.1.0` | RFC 3550 RTP/RTCP、RFC 5285 1/2 字节扩展头、RFC 4585/5104/REMB 反馈、RFC 3711 SRTP/SRTCP（`AES128_CM_HMAC_SHA1_80/32`）与 RFC 7714 `AEAD_AES_128_GCM`（复用 `crypto`，内置纯 Pion AES-128/GCM/HMAC-SHA1，每 SSRC 独立 ROC 与 64 包防重放窗、先验签后分配防 SSRC 洪泛 DoS），零 C 依赖无 `World` | Rust [`webrtc-rs`](https://github.com/webrtc-rs/webrtc)（`rtp 0.12.0` / `rtcp 0.12.0` / `webrtc-srtp 0.14.0`）+ RFC 3711 / RFC 7714 官方向量 | 10 / 10（另复用 `crypto` 69 / 69） | ✅ `wasm_smoke` | [RTCP 0.86× · SRTP GCM 48.52 MB/s (0.49×) · SRTP CM-SHA1 44.28 MB/s (0.48×) · RTP 0.39×（vs Rust 硬件 AES/PMULL）](BENCHMARKS.md#rtp) | `pionc add rtp --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`webm`](packages/webm) | `0.1.0` | RFC 8794 EBML、Matroska / WebM 容器与 W3C MSE WebM 字节流零拷贝解复用器：定长 / 未知长度流式 Segment & Cluster、`SimpleBlock` / `BlockGroup` 与全 4 种 lacing 模式、`Cues` 与 `build_keyframe_index` 关键帧索引、RFC 6381 codec 探测与严格 `DecodeLimits` 防放大炸弹，零依赖无 `World` | Rust [`matroska-demuxer`](https://crates.io/crates/matroska-demuxer) `0.6.1` + `ffmpeg` 真实语料 | 10 / 10 | ✅ `wasm_smoke` | [VP9+Opus **1.68×** · Pure Opus **1.76×** · AV1+Opus **1.49×** · MSE Init+Clusters **1.51×**（vs Rust `matroska-demuxer`）](BENCHMARKS.md#webm) | `pionc add webm --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 54 个包合计 **4,738 / 4,738** 单测通过（`sh scripts/verify.sh`）。
+全仓 55 个包合计 **4,748 / 4,748** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -185,6 +186,10 @@ Wave 10 发布验证在 `AFK-surf/pion@c375cee` 上完成：`sh scripts/verify.s
 ### Farview 生态沉淀波 7：`rtp` `v0.1.0`
 
 - **`rtp` `v0.1.0`**：复用 `crypto` 的纯 Pion RFC 3550 RTP/RTCP、RFC 5285 扩展头、RFC 3711 SRTP/SRTCP 与 RFC 7714 `AEAD_AES_128_GCM` 媒体传输库，经独立红队审计与全量修复后合入（`audit/` 零改动，`run_audit.sh all` 全绿：**22 / 22** unit = 14 / 14 control + 8 / 8 redteam、Rust `webrtc-rs` 双向 **282 / 282 + 492 / 492** 互通、12k fuzz 0 崩 / 0 trap / 0 diff、10 万伪造 SSRC DoS 从 10.0 s / 9.1 MiB 降至 **0.24 s / 1.9 MiB**）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`c3a2d664…`）。头对头基准对照 Rust `webrtc-rs`：RTCP 复合包 0.86×（峰值 RSS 1.84 vs 2.20 MiB）、SRTP `AEAD_AES_128_GCM` 48.52 MB/s（0.49×）、`AES128_CM_HMAC_SHA1_80` 44.28 MB/s（0.48×）、RTP 1,200 B 解析封装 0.39×（纯标量 Pion 含重放窗 vs Rust 硬件 AES/PMULL 与零拷贝 slice），详见 [`BENCHMARKS.md`](BENCHMARKS.md#rtp)。
+
+### Farview 生态沉淀波 8：`webm` `v0.1.0`
+
+- **`webm` `v0.1.0`**：零依赖纯 Pion RFC 8794 EBML / Matroska / WebM 与 W3C MSE 字节流零拷贝解复用器，经独立红队审计与全量修复后合入（`audit/` 零改动，10 / 10 单测，`audit unit` **19 / 19** 全绿 = 11 / 11 redteam + 8 / 8 control，1 P0 + 2 P1 + 11 P2 清零，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 `wasm_trap` / 0 差异）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`8d8bfd8d…`）。头对头基准对照 Rust `matroska-demuxer 0.6.1` 在 4 项真实 `ffmpeg` WebM 语料上全面反超（**1.49×–1.76×**）且全帧元数据与载荷 FNV-1a SHA-256 逐字节一致，详见 [`BENCHMARKS.md`](BENCHMARKS.md#webm)。
 
 ## 贡献与移植流程
 
