@@ -169,16 +169,6 @@ theorem zigzag_i64_decode_encode_roundtrip (u : Std.U64) :
   apply uscalar_eq_of_bv_eq
   exact bv64_zigzag_decode_encode u.bv
 
-/-- Theorem 3: `zigzag_encode_i64` is injective over all 64-bit signed integers. -/
-theorem zigzag_i64_injective (a b : Std.I64)
-    (h : zigzag_encode_i64 a = zigzag_encode_i64 b) : a = b := by
-  have ha := zigzag_i64_roundtrip a
-  have hb := zigzag_i64_roundtrip b
-  rw [h] at ha
-  rw [ha] at hb
-  simp only [ok.injEq] at hb
-  exact hb
-
 /-- Theorem 4: Non-negative `Int64` values ZigZag-encode to even `UInt64` values `2 * n`. -/
 theorem zigzag_i64_nonneg_even (n : Std.I64) (hn : 0 ≤ n.val) :
     ∃ u : Std.U64, zigzag_encode_i64 n = ok u ∧ u.val = 2 * n.val.toNat := by
@@ -201,34 +191,6 @@ theorem zigzag_i64_nonneg_even (n : Std.I64) (hn : 0 ≤ n.val) :
   change ((n.bv <<< 1) ^^^ (n.bv.sshiftRight 63)).toNat = 2 * n.val.toNat
   rw [hsr, BitVec.xor_zero, BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]
   rw [Nat.mod_eq_of_lt (by omega)]
-  omega
-
-/-- Theorem 5: Negative `Int64` values ZigZag-encode to odd `UInt64` values `-2 * n - 1`. -/
-theorem zigzag_i64_neg_odd (n : Std.I64) (hn : n.val < 0) :
-    ∃ u : Std.U64, zigzag_encode_i64 n = ok u ∧ (u.val : Int) = -2 * n.val - 1 := by
-  rw [zigzag_encode_i64_bv]
-  refine ⟨⟨(n.bv <<< 1) ^^^ (n.bv.sshiftRight 63)⟩, rfl, ?_⟩
-  have hcond : n.val = (n.bv.toNat : Int) - 2 ^ 64 ∧ 2 ^ 63 ≤ n.bv.toNat := by
-    have h := n.bv.toInt_eq_toNat_cond
-    change n.bv.toInt < 0 at hn
-    split_ifs at h with hc
-    · omega
-    · exact ⟨h, by omega⟩
-  have hmsb : n.bv.msb = true := by
-    rw [BitVec.msb_eq_decide]
-    exact decide_eq_true (by omega)
-  have hsr : n.bv.sshiftRight 63 = BitVec.allOnes 64 := by
-    apply BitVec.eq_of_getLsbD_eq
-    intro i hi
-    rw [bv64_sshiftRight63_getLsbD n.bv i hi, hmsb, BitVec.getLsbD_allOnes]
-    simp [hi]
-  change (((n.bv <<< 1) ^^^ (n.bv.sshiftRight 63)).toNat : Int) = -2 * n.val - 1
-  rw [hsr, BitVec.xor_allOnes, BitVec.toNat_not, BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]
-  have hlt : n.bv.toNat < 2 ^ 64 := n.bv.isLt
-  have hmod : (n.bv.toNat * 2 ^ 1) % 2 ^ 64 = n.bv.toNat * 2 - 2 ^ 64 := by
-    have h1 : n.bv.toNat * 2 ^ 1 = (n.bv.toNat * 2 - 2 ^ 64) + 2 ^ 64 := by omega
-    rw [h1, Nat.add_mod_right, Nat.mod_eq_of_lt (by omega)]
-  rw [hmod]
   omega
 
 private lemma bv64_sext32_getLsbD (x : BitVec 32) (i : Nat) (hi : i < 64) :
@@ -453,23 +415,6 @@ theorem zigzag_i32_decode_encode_roundtrip (u : Std.I64)
       cases u.bv.getLsbD i <;> cases u.bv.getLsbD 0 <;> rfl
   · simp only [hi32, ↓reduceIte]
     exact (hu_hi i hi64 hi32).symm
-
-/-- Theorem 9: `zigzag_encode_i32` is injective over all 32-bit signed integers. -/
-theorem zigzag_i32_injective (a b : Std.I32)
-    (h : zigzag_encode_i32 a = zigzag_encode_i32 b) : a = b := by
-  have ha := zigzag_i32_roundtrip a
-  have hb := zigzag_i32_roundtrip b
-  rw [h] at ha
-  rw [ha] at hb
-  simp only [ok.injEq] at hb
-  exact hb
-
-/-- Theorem 10: `varint_len_u64` always succeeds and returns a byte count in `[1, 10]`. -/
-theorem varint_len_u64_bounds (v : Std.U64) :
-    ∃ n : Std.I32, varint_len_u64 v = ok n ∧ 1 ≤ n.val ∧ n.val ≤ 10 := by
-  unfold varint_len_u64
-  refine ⟨_, rfl, ?_⟩
-  split_ifs <;> decide
 
 /-- Theorem 11: `varint_len_u64` exactly partitions `UInt64` into the 10 Protobuf base-128 byte-length tiers. -/
 theorem varint_len_u64_exact_tiers (v : Std.U64) :

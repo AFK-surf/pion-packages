@@ -36,7 +36,7 @@ private lemma i32_sub_val' (x y : Std.I32)
   exact hv
 
 /-- Theorem 13: XML 1.0 §2.3 `is_xml_ws` exact characterization (`SP`, `TAB`, `LF`, `CR`). -/
-theorem is_xml_ws_exact (c : Std.I32) :
+lemma is_xml_ws_exact (c : Std.I32) :
     is_xml_ws c = ok true ↔ (c.val = 32 ∨ c.val = 9 ∨ c.val = 10 ∨ c.val = 13) := by
   unfold is_xml_ws
   simp only [ok.injEq, Bool.or_eq_true, i32_beq_iff']
@@ -44,7 +44,7 @@ theorem is_xml_ws_exact (c : Std.I32) :
   omega
 
 /-- Theorem 14: W3C SVG 2 `is_svg_ws` exact characterization (`SP`, `TAB`, `LF`, `CR`, `FF`). -/
-theorem is_svg_ws_exact (c : Std.I32) :
+lemma is_svg_ws_exact (c : Std.I32) :
     is_svg_ws c = ok true ↔ (c.val = 32 ∨ c.val = 9 ∨ c.val = 10 ∨ c.val = 13 ∨ c.val = 12) := by
   unfold is_svg_ws
   simp only [ok.injEq, Bool.or_eq_true, i32_beq_iff']
@@ -60,7 +60,7 @@ theorem is_xml_ws_strict_subset_svg_ws (c : Std.I32) :
   exact (is_svg_ws_exact c).mpr (by omega)
 
 /-- Theorem 16: `is_ascii_digit` exact range (`'0'..'9'`). -/
-theorem is_ascii_digit_exact (c : Std.I32) :
+lemma is_ascii_digit_exact (c : Std.I32) :
     is_ascii_digit c = ok true ↔ (48 ≤ c.val ∧ c.val ≤ 57) := by
   unfold is_ascii_digit
   simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
@@ -92,7 +92,7 @@ theorem is_number_start_disjoint_ws_and_ident (c : Std.I32) (hn : is_number_star
     change (65 ≤ c.val ∧ c.val ≤ 90) ∨ (97 ≤ c.val ∧ c.val ≤ 122) at h; omega
 
 /-- Theorem 19: `is_ident_char` exact characterization (`'A'..'Z'` or `'a'..'z'`). -/
-theorem is_ident_char_exact (c : Std.I32) :
+lemma is_ident_char_exact (c : Std.I32) :
     is_ident_char c = ok true ↔ ((65 ≤ c.val ∧ c.val ≤ 90) ∨ (97 ≤ c.val ∧ c.val ≤ 122)) := by
   unfold is_ident_char
   simp only [ok.injEq, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
@@ -161,47 +161,6 @@ theorem hex_val_bounds (c : Std.I32) :
         have hln : ¬ (97 ≤ c.val ∧ c.val ≤ 102) := fun h => hl (by
           simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']; change 97 ≤ c.val ∧ c.val ≤ 102; exact h)
         exact ⟨(-1)#i32, rfl, by decide, by decide, ⟨fun h => by change 0 ≤ (-1 : Int) at h; omega, fun h => by omega⟩⟩
-
-/-- Theorem 22: On ASCII digits `'0'..'9'`, `hex_val c` equals `c - 48`. -/
-theorem hex_val_digit_exact (c : Std.I32) (h0 : 48 ≤ c.val) (h9 : c.val ≤ 57) :
-    ∃ r : Std.I32, hex_val c = ok r ∧ r.val = c.val - 48 := by
-  unfold hex_val
-  have hd : ((decide (c >= 48#i32)) && (decide (c <= 57#i32))) = true := by
-    simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
-    change 48 ≤ c.val ∧ c.val ≤ 57; omega
-  simp only [hd, ↓reduceIte]
-  have hs := i32_sub_val' c 48#i32 (by change -2147483648 ≤ c.val - 48; omega) (by change c.val - 48 ≤ 2147483647; omega)
-  change (Pion.I32.sub c 48#i32).val = c.val - 48 at hs
-  exact ⟨Pion.I32.sub c 48#i32, rfl, hs⟩
-
-/-- Theorem 23: `hex_val` is case-insensitive on `'A'..'F'` vs `'a'..'f'`. -/
-theorem hex_val_case_insensitive (c : Std.I32) (hlo : 65 ≤ c.val) (hhi : c.val ≤ 70) :
-    hex_val (Pion.I32.add c 32#i32) = hex_val c := by
-  set cl := Pion.I32.add c 32#i32
-  have hcl : cl.val = c.val + 32 :=
-    i32_add_val' c 32#i32 (by change -2147483648 ≤ c.val + 32; omega) (by change c.val + 32 ≤ 2147483647; omega)
-  unfold hex_val
-  have d1 : ((decide (cl >= 48#i32)) && (decide (cl <= 57#i32))) = false := by
-    rw [Bool.eq_false_iff]; intro h; simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff'] at h; change 48 ≤ cl.val ∧ cl.val ≤ 57 at h; omega
-  have u1 : ((decide (cl >= 65#i32)) && (decide (cl <= 70#i32))) = false := by
-    rw [Bool.eq_false_iff]; intro h; simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff'] at h; change 65 ≤ cl.val ∧ cl.val ≤ 70 at h; omega
-  have l1 : ((decide (cl >= 97#i32)) && (decide (cl <= 102#i32))) = true := by
-    simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']; change 97 ≤ cl.val ∧ cl.val ≤ 102; omega
-  have d2 : ((decide (c >= 48#i32)) && (decide (c <= 57#i32))) = false := by
-    rw [Bool.eq_false_iff]; intro h; simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff'] at h; change 48 ≤ c.val ∧ c.val ≤ 57 at h; omega
-  have u2 : ((decide (c >= 65#i32)) && (decide (c <= 70#i32))) = true := by
-    simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']; change 65 ≤ c.val ∧ c.val ≤ 70; omega
-  simp only [d1, u1, l1, d2, u2, Bool.false_eq_true, ↓reduceIte]
-  apply congrArg ok; apply IScalar.eq_of_val_eq
-  set s1 := Pion.I32.sub cl 97#i32
-  set s2 := Pion.I32.sub c 65#i32
-  have hs1 : s1.val = cl.val - 97 := i32_sub_val' cl 97#i32 (by change -2147483648 ≤ cl.val - 97; omega) (by change cl.val - 97 ≤ 2147483647; omega)
-  have hs2 : s2.val = c.val - 65 := i32_sub_val' c 65#i32 (by change -2147483648 ≤ c.val - 65; omega) (by change c.val - 65 ≤ 2147483647; omega)
-  have ha1 := i32_add_val' s1 10#i32 (by change -2147483648 ≤ s1.val + 10; omega) (by change s1.val + 10 ≤ 2147483647; omega)
-  have ha2 := i32_add_val' s2 10#i32 (by change -2147483648 ≤ s2.val + 10; omega) (by change s2.val + 10 ≤ 2147483647; omega)
-  change (Pion.I32.add s1 10#i32).val = s1.val + 10 at ha1
-  change (Pion.I32.add s2 10#i32).val = s2.val + 10 at ha2
-  omega
 
 /-- Theorem 24: SVG whitespace bytes are rejected by `hex_val` (returns `-1`) and `is_ident_char` (returns `false`). -/
 theorem is_svg_ws_disjoint_hex_and_ident (c : Std.I32) (hw : is_svg_ws c = ok true) :

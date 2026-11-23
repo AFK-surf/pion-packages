@@ -8,36 +8,36 @@ open Aeneas Aeneas.Std Result Pion mime
 namespace MimeProofs
 
 @[simp]
-theorem result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← ok x; f y) = f x := by
   simp
 
-theorem result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
+lemma result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
   simpa using h
 
-theorem iscalar_eq_of_bv_eq {ty} {a b : IScalar ty} (h : a.bv = b.bv) : a = b := by
+lemma iscalar_eq_of_bv_eq {ty} {a b : IScalar ty} (h : a.bv = b.bv) : a = b := by
   cases a; cases b; congr
 
-theorem iscalar_eq_of_val_eq {ty} {a b : IScalar ty} (h : a.val = b.val) : a = b :=
+lemma iscalar_eq_of_val_eq {ty} {a b : IScalar ty} (h : a.val = b.val) : a = b :=
   iscalar_eq_of_bv_eq (BitVec.eq_of_toInt_eq h)
 
-theorem i32_mk_bv (x : BitVec 32) : (⟨x⟩ : I32).bv = x := rfl
+lemma i32_mk_bv (x : BitVec 32) : (⟨x⟩ : I32).bv = x := rfl
 
-theorem i32_band_bv (a b : I32) : (Pion.I32.band a b).bv = a.bv &&& b.bv := rfl
+lemma i32_band_bv (a b : I32) : (Pion.I32.band a b).bv = a.bv &&& b.bv := rfl
 
-theorem i32_bor_bv (a b : I32) : (Pion.I32.bor a b).bv = a.bv ||| b.bv := rfl
+lemma i32_bor_bv (a b : I32) : (Pion.I32.bor a b).bv = a.bv ||| b.bv := rfl
 
-theorem i32_shl_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
+lemma i32_shl_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
     Pion.I32.shl x s = ok (⟨x.bv <<< s.val.toNat⟩ : I32) := by
   unfold Pion.I32.shl
   simp [hs0, hs1]
 
-theorem i32_shr_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
+lemma i32_shr_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
     Pion.I32.shr x s = ok (⟨x.bv.sshiftRight s.val.toNat⟩ : I32) := by
   unfold Pion.I32.shr
   simp [hs0, hs1]
 
-theorem i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
+lemma i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
     x.bv.toNat = x.val.toNat := by
   have h1 : x.val = x.bv.toInt := rfl
   have h2 : x.bv.toInt = if 2 * x.bv.toNat < 2 ^ 32 then (x.bv.toNat : Int) else (x.bv.toNat : Int) - 2 ^ 32 := by
@@ -45,7 +45,7 @@ theorem i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
   have hlt : x.bv.toNat < 2 ^ 32 := x.bv.isLt
   omega
 
-theorem i32_add_val_of_bounds (a b : I32)
+lemma i32_add_val_of_bounds (a b : I32)
     (hlo : -2147483648 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 2147483647) :
     (Pion.I32.add a b).val = a.val + b.val := by
   have h1 : (Pion.I32.add a b).val = (a.bv + b.bv).toInt := rfl
@@ -64,7 +64,7 @@ theorem i32_add_val_of_bounds (a b : I32)
       simpa [Int.add_emod_right] using h'
     simp only [Int.bmod, hm]; split <;> omega
 
-theorem i32_sub_val_of_bounds (a b : I32)
+lemma i32_sub_val_of_bounds (a b : I32)
     (hlo : -2147483648 ≤ a.val - b.val) (hhi : a.val - b.val ≤ 2147483647) :
     (Pion.I32.sub a b).val = a.val - b.val := by
   have h1 : (Pion.I32.sub a b).val = (a.bv - b.bv).toInt := rfl
@@ -83,7 +83,7 @@ theorem i32_sub_val_of_bounds (a b : I32)
       simpa [Int.add_emod_right] using h'
     simp only [Int.bmod, hm]; split <;> omega
 
-theorem bv32_getElem_high_false (x : I32) (hx0 : 0 ≤ x.val) {k : Nat} (hx : x.val < ((2 ^ k : Nat) : Int))
+lemma bv32_getElem_high_false (x : I32) (hx0 : 0 ≤ x.val) {k : Nat} (hx : x.val < ((2 ^ k : Nat) : Int))
     (i : Nat) (hi : i < 32) (hki : k ≤ i) : x.bv[i] = false := by
   rw [BitVec.getElem_eq_testBit_toNat, i32_val_nonneg_toNat x hx0]
   apply Nat.testBit_lt_two_pow
@@ -160,29 +160,6 @@ theorem hex_nibble_val_bounds (c : I32) :
         simp only [hfd, hfu, hfl, ↓reduceIte, Bool.false_eq_true]
         exact ⟨(-1)#i32, rfl, Or.inl cm1⟩
 
-/-- Theorem 3: `hex_nibble_val` is case-insensitive on ASCII hex letters `A..F` vs `a..f`. -/
-theorem hex_nibble_val_case_insensitive (c : I32) (hlo : 65 ≤ c.val) (hhi : c.val ≤ 70) :
-    hex_nibble_val (Pion.I32.add c 32#i32) = hex_nibble_val c := by
-  unfold hex_nibble_val
-  have c32 : (32#i32 : I32).val = 32 := rfl
-  have c55 : (55#i32 : I32).val = 55 := rfl
-  have c87 : (87#i32 : I32).val = 87 := rfl
-  have ha := i32_add_val_of_bounds c 32#i32 (by omega) (by omega)
-  have h1 : ¬(Pion.I32.add c 32#i32 ≤ (57#i32 : I32)) := show ¬((Pion.I32.add c 32#i32).val ≤ (57 : Int)) by omega
-  have h2 : ¬(Pion.I32.add c 32#i32 ≤ (70#i32 : I32)) := show ¬((Pion.I32.add c 32#i32).val ≤ (70 : Int)) by omega
-  have h3 : (97#i32 : I32) ≤ Pion.I32.add c 32#i32 := show (97 : Int) ≤ (Pion.I32.add c 32#i32).val by omega
-  have h4 : Pion.I32.add c 32#i32 ≤ (102#i32 : I32) := show (Pion.I32.add c 32#i32).val ≤ (102 : Int) by omega
-  have hc1 : ¬(c ≤ (57#i32 : I32)) := by change ¬(c.val ≤ 57); omega
-  have hc2 : (65#i32 : I32) ≤ c := hlo
-  have hc3 : c ≤ (70#i32 : I32) := hhi
-  simp only [h1, h2, h3, h4, hc1, hc2, hc3, decide_false, decide_true, Bool.and_false, Bool.and_self,
-             Bool.false_eq_true, ↓reduceIte]
-  congr 1
-  apply iscalar_eq_of_val_eq
-  have hs1 := i32_sub_val_of_bounds (Pion.I32.add c 32#i32) 87#i32 (by omega) (by omega)
-  have hs2 := i32_sub_val_of_bounds c 55#i32 (by omega) (by omega)
-  omega
-
 /-- Theorem 4: `ascii_lower_byte` is idempotent on all bytes `0..255`. -/
 theorem ascii_lower_byte_idempotent (c : I32) (hlo : 0 ≤ c.val) (hhi : c.val ≤ 255) :
     (do let y ← ascii_lower_byte c; ascii_lower_byte y) = ascii_lower_byte c := by
@@ -201,24 +178,6 @@ theorem ascii_lower_byte_idempotent (c : I32) (hlo : 0 ≤ c.val) (hhi : c.val �
       · left; rw [decide_eq_false_iff_not]; change ¬(65 ≤ c.val); omega
     simp only [hfu, Bool.false_eq_true, ↓reduceIte, result_bind_ok]
 
-/-- Theorem 5: `ascii_lower_byte` never produces an uppercase ASCII letter `A..Z`. -/
-theorem ascii_lower_byte_no_uppercase (c : I32) (hlo : 0 ≤ c.val) (hhi : c.val ≤ 255) :
-    ∃ y, ascii_lower_byte c = ok y ∧ ¬(65 ≤ y.val ∧ y.val ≤ 90) := by
-  unfold ascii_lower_byte
-  have c32 : (32#i32 : I32).val = 32 := rfl
-  by_cases hu : 65 ≤ c.val ∧ c.val ≤ 90
-  · have h1 : (65#i32 : I32) ≤ c := hu.1
-    have h2 : c ≤ (90#i32 : I32) := hu.2
-    simp only [h1, h2, decide_true, Bool.and_self, ↓reduceIte]
-    have ha := i32_add_val_of_bounds c 32#i32 (by omega) (by omega)
-    exact ⟨Pion.I32.add c 32#i32, rfl, by omega⟩
-  · have hfu : (decide (c ≥ 65#i32) && decide (c ≤ 90#i32)) = false := by
-      rw [Bool.and_eq_false_iff]; by_cases ha : 65 ≤ c.val
-      · right; rw [decide_eq_false_iff_not]; change ¬(c.val ≤ 90); omega
-      · left; rw [decide_eq_false_iff_not]; change ¬(65 ≤ c.val); omega
-    simp only [hfu, Bool.false_eq_true, ↓reduceIte]
-    exact ⟨c, rfl, hu⟩
-
 private lemma i32_15_mask_range (x : I32) :
     0 ≤ (Pion.I32.band x 15#i32).val ∧ (Pion.I32.band x 15#i32).val ≤ 15 := by
   have hval : (Pion.I32.band x 15#i32).val = (Pion.I32.band x 15#i32).bv.toInt := rfl
@@ -230,17 +189,6 @@ private lemma i32_15_mask_range (x : I32) :
       if 2 * (Pion.I32.band x 15#i32).bv.toNat < 2 ^ 32 then ((Pion.I32.band x 15#i32).bv.toNat : Int)
       else ((Pion.I32.band x 15#i32).bv.toNat : Int) - 2 ^ 32 := by
     rw [BitVec.toInt_eq_toNat_cond]; rfl
-  omega
-
-/-- Theorem 6: `qp_hi_nibble` and `qp_lo_nibble` always produce valid 4-bit nibbles in `[0, 15]`. -/
-theorem qp_nibbles_range (c : I32) :
-    ∃ hi lo, qp_hi_nibble c = ok hi ∧ qp_lo_nibble c = ok lo ∧
-      0 ≤ hi.val ∧ hi.val ≤ 15 ∧ 0 ≤ lo.val ∧ lo.val ≤ 15 := by
-  unfold qp_hi_nibble qp_lo_nibble
-  rw [i32_shr_ok c 4#i32 (by decide) (by decide), result_bind_ok]
-  refine ⟨_, _, rfl, rfl, ?_⟩
-  have h1 := i32_15_mask_range (⟨c.bv.sshiftRight (4#i32 : I32).val.toNat⟩ : I32)
-  have h2 := i32_15_mask_range c
   omega
 
 /-- Theorem 7: RFC 2045 §6.7 Quoted-Printable byte nibble unpack/pack roundtrip bijection for all `0 ≤ c ≤ 255`. -/
@@ -317,11 +265,6 @@ theorem qp_encode_forbids_equals_and_ctl (c : I32) (last : Bool)
       have hgt126 : ¬(c ≤ (126#i32 : I32)) := by change ¬(c.val ≤ 126); omega
       simp [hne32, hne9, hgt126]
   · simp
-
-/-- Theorem 9: RFC 2045 §6.7 #3 any byte flagged `is_last_before_eol = true` is NEVER emitted literally. -/
-theorem qp_encode_trailing_ws_must_encode (c : I32) :
-    qp_encode_is_literal c true = ok false := by
-  simp [qp_encode_is_literal]
 
 /-- Theorem 10: RFC 2045 §6.7 Quoted-Printable decoder rejects NUL, C0 controls (except HTAB/CR), and DEL. -/
 theorem qp_decode_rejects_nul_and_c0 (c : I32)

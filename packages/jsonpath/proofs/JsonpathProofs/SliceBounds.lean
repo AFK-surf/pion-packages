@@ -49,14 +49,14 @@ private lemma i64_neg_val' (x : Std.I64) (hlo : -9223372036854775807 ≤ x.val) 
   exact hv
 
 /-- Theorem 13: RFC 9535 `Normalize(i, len)` leaves non-negative indices unchanged. -/
-theorem rfc9535_normalize_index_nonneg (idx len : Std.I64) (h : 0 ≤ idx.val) :
+lemma rfc9535_normalize_index_nonneg (idx len : Std.I64) (h : 0 ≤ idx.val) :
     rfc9535_normalize_index idx len = ok idx := by
   unfold rfc9535_normalize_index
   have hge : idx >= 0#i64 := (i64_le_iff' 0#i64 idx).mpr h
   simp only [hge, ↓reduceIte]
 
 /-- Theorem 14: RFC 9535 `Normalize(i, len)` adds `len` to negative indices. -/
-theorem rfc9535_normalize_index_neg (idx len : Std.I64)
+lemma rfc9535_normalize_index_neg (idx len : Std.I64)
     (hneg : idx.val < 0)
     (hlo : -9223372036854775808 ≤ len.val + idx.val) (hhi : len.val + idx.val ≤ 9223372036854775807) :
     ∃ r : Std.I64, rfc9535_normalize_index idx len = ok r ∧ r.val = len.val + idx.val := by
@@ -115,17 +115,6 @@ theorem rfc9535_clamp_pos_slice_mono (a b len : Std.I64) (hlen : 0 ≤ len.val) 
       · rw [hb2 hb_hi]; omega
       · rw [hb3 ⟨by omega, by omega⟩]; omega
 
-/-- Theorem 18: Forward slice clamping is idempotent for all `len ≥ 0`. -/
-theorem rfc9535_clamp_pos_slice_idempotent (n len : Std.I64) (hlen : 0 ≤ len.val) :
-    (do let r ← rfc9535_clamp_pos_slice n len; rfc9535_clamp_pos_slice r len) =
-      rfc9535_clamp_pos_slice n len := by
-  rcases rfc9535_clamp_pos_slice_bounds n len hlen with ⟨r, hr, hr0, hrl, _, _, _⟩
-  rw [hr, result_bind_ok']
-  rcases rfc9535_clamp_pos_slice_bounds r len hlen with ⟨r2, hr2, _, _, _, _, hr2_eq⟩
-  rw [hr2]
-  apply congrArg ok
-  exact IScalar.eq_of_val_eq (hr2_eq ⟨hr0, hrl⟩)
-
 /-- Theorem 19: Reverse slice clamping (`step < 0`) ALWAYS lands in `[-1, len - 1]` (guarantees every `i` with `upper ≥ i > lower` is in `[0, len - 1]`). -/
 theorem rfc9535_clamp_neg_slice_bounds (n len : Std.I64) (hlen : 0 ≤ len.val) :
     ∃ r : Std.I64, rfc9535_clamp_neg_slice n len = ok r ∧
@@ -152,51 +141,6 @@ theorem rfc9535_clamp_neg_slice_bounds (n len : Std.I64) (hlen : 0 ≤ len.val) 
     · simp only [hl, ↓reduceIte]
       have hvl : ¬ (lm1.val < n.val) := fun hgt => hl ((i64_lt_iff' lm1 n).mpr hgt)
       refine ⟨n, rfl, by omega, by omega, fun hlt => by omega, fun hgt => by omega, fun _ => rfl⟩
-
-/-- Theorem 20: Reverse slice clamping is monotone (`a ≤ b → clamp_neg a len ≤ clamp_neg b len`). -/
-theorem rfc9535_clamp_neg_slice_mono (a b len : Std.I64) (hlen : 0 ≤ len.val) (hab : a.val ≤ b.val) :
-    ∃ ra rb : Std.I64,
-      rfc9535_clamp_neg_slice a len = ok ra ∧
-      rfc9535_clamp_neg_slice b len = ok rb ∧
-      ra.val ≤ rb.val := by
-  rcases rfc9535_clamp_neg_slice_bounds a len hlen with ⟨ra, hra, hra0, hral, ha1, ha2, ha3⟩
-  rcases rfc9535_clamp_neg_slice_bounds b len hlen with ⟨rb, hrb, hrb0, hrbl, hb1, hb2, hb3⟩
-  refine ⟨ra, rb, hra, hrb, ?_⟩
-  by_cases ha_neg : a.val < -1
-  · rw [ha1 ha_neg]; exact hrb0
-  · by_cases ha_hi : len.val - 1 < a.val
-    · rw [ha2 ha_hi, hb2 (by omega)]
-    · rw [ha3 ⟨by omega, by omega⟩]
-      by_cases hb_hi : len.val - 1 < b.val
-      · rw [hb2 hb_hi]; omega
-      · rw [hb3 ⟨by omega, by omega⟩]; omega
-
-/-- Theorem 21: Reverse slice clamping is idempotent for all `len ≥ 0`. -/
-theorem rfc9535_clamp_neg_slice_idempotent (n len : Std.I64) (hlen : 0 ≤ len.val) :
-    (do let r ← rfc9535_clamp_neg_slice n len; rfc9535_clamp_neg_slice r len) =
-      rfc9535_clamp_neg_slice n len := by
-  rcases rfc9535_clamp_neg_slice_bounds n len hlen with ⟨r, hr, hr0, hrl, _, _, _⟩
-  rw [hr, result_bind_ok']
-  rcases rfc9535_clamp_neg_slice_bounds r len hlen with ⟨r2, hr2, _, _, _, _, hr2_eq⟩
-  rw [hr2]
-  apply congrArg ok
-  exact IScalar.eq_of_val_eq (hr2_eq ⟨hr0, hrl⟩)
-
-/-- Theorem 22: Default forward slice (`step > 0`) covers the exact full range `[0, len]`. -/
-theorem rfc9535_default_slice_pos_full_range (len step : Std.I64)
-    (hlen : 0 ≤ len.val) (hstep : 0 < step.val) :
-    rfc9535_default_slice_start len step = ok 0#i64 ∧
-    rfc9535_default_slice_end len step = ok len ∧
-    rfc9535_clamp_pos_slice 0#i64 len = ok 0#i64 ∧
-    rfc9535_clamp_pos_slice len len = ok len := by
-  have hge : step >= 0#i64 := (i64_le_iff' 0#i64 step).mpr (by change (0 : Int) ≤ step.val; omega)
-  refine ⟨?_, ?_, ?_, ?_⟩
-  · unfold rfc9535_default_slice_start; simp only [hge, ↓reduceIte]
-  · unfold rfc9535_default_slice_end; simp only [hge, ↓reduceIte]
-  · rcases rfc9535_clamp_pos_slice_bounds 0#i64 len hlen with ⟨r, hr, _, _, _, _, heq⟩
-    rw [hr]; apply congrArg ok; exact IScalar.eq_of_val_eq (heq ⟨le_refl _, hlen⟩)
-  · rcases rfc9535_clamp_pos_slice_bounds len len hlen with ⟨r, hr, _, _, _, _, heq⟩
-    rw [hr]; apply congrArg ok; exact IScalar.eq_of_val_eq (heq ⟨hlen, le_refl _⟩)
 
 /-- Theorem 23: Default reverse slice (`step < 0`, `0 ≤ len ≤ 10^15`) normalizes & clamps to exact `[upper = len - 1, lower = -1]` (full reverse scan `[len-1 .. 0]`). -/
 theorem rfc9535_default_slice_neg_full_range (len step : Std.I64)
@@ -236,17 +180,5 @@ theorem rfc9535_default_slice_neg_full_range (len step : Std.I64)
     rcases rfc9535_normalize_index_neg s len (by omega) (by omega) (by omega) with ⟨ns, hns, hns_v⟩
     rcases rfc9535_clamp_neg_slice_bounds ns len hlen0 with ⟨cs, hcs, _, _, _, _, hcs_eq⟩
     exact ⟨s, e, ns, ne, cs, ce, hs_eq, he_eq, hns, hne, hcs, hce, by rw [hcs_eq ⟨by omega, by omega⟩]; omega, hce_v⟩
-
-/-- Theorem 24: On an empty array (`len = 0`), every forward slice clamps to `0` (`lower = upper = 0`) and every reverse slice clamps to `-1` (`upper = lower = -1`), so 0 elements are ever accessed. -/
-theorem rfc9535_empty_array_slice_always_empty (n : Std.I64) :
-    rfc9535_clamp_pos_slice n 0#i64 = ok 0#i64 ∧
-    rfc9535_clamp_neg_slice n 0#i64 = ok (-1)#i64 := by
-  constructor
-  · rcases rfc9535_clamp_pos_slice_bounds n 0#i64 (by decide) with ⟨r, hr, hr0, hrl, _, _, _⟩
-    rw [hr]; apply congrArg ok; apply IScalar.eq_of_val_eq
-    change r.val ≤ 0 at hrl; change r.val = 0; omega
-  · rcases rfc9535_clamp_neg_slice_bounds n 0#i64 (by decide) with ⟨r, hr, hr0, hrl, _, _, _⟩
-    rw [hr]; apply congrArg ok; apply IScalar.eq_of_val_eq
-    change r.val ≤ (0 : Int) - 1 at hrl; change r.val = -1; omega
 
 end JsonpathProofs

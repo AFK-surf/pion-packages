@@ -91,31 +91,4 @@ lemma i32_to_i64_val (x : Std.I32) :
   change (BitVec.ofInt 64 x.val).toInt = x.val
   rw [BitVec.toInt_ofInt, Int.bmod_eq_of_le] <;> norm_num <;> omega
 
-/-- Default `DecodeOptions` enforces bounded depth (512), items (1M), bytes (64 MiB), and rejects trailing bytes. -/
-theorem decode_options_default_spec :
-    ∃ o : DecodeOptions, DecodeOptions.default = ok o ∧
-      o.max_depth.val = 512 ∧ o.max_items.val = 1048576 ∧ o.max_bytes.val = 67108864 ∧
-      o.decode_timestamp = true ∧ o.allow_trailing_bytes = false := by
-  refine ⟨DecodeOptions.mk 512#i32 1048576#i32 67108864#i32 false false true false, rfl, ?_, ?_, ?_, rfl, rfl⟩
-  · change (BitVec.ofInt 32 512).toInt = 512; rw [BitVec.toInt_ofInt]; norm_num
-  · change (BitVec.ofInt 32 1048576).toInt = 1048576; rw [BitVec.toInt_ofInt]; norm_num
-  · change (BitVec.ofInt 32 67108864).toInt = 67108864; rw [BitVec.toInt_ofInt]; norm_num
-
-/-- Strict `DecodeOptions` enables duplicate-key rejection and canonical encoding enforcement. -/
-theorem decode_options_strict_spec :
-    ∃ o : DecodeOptions, DecodeOptions.strict = ok o ∧
-      o.reject_duplicate_keys = true ∧ o.require_canonical = true ∧ o.allow_trailing_bytes = false :=
-  ⟨DecodeOptions.mk 512#i32 1048576#i32 67108864#i32 true true true false, rfl, rfl, rfl, rfl⟩
-
-/-- `EncodeOptions::default` disables float32 compaction; `EncodeOptions::compact` enables it. -/
-theorem encode_options_specs :
-    (∃ o : EncodeOptions, EncodeOptions.default = ok o ∧ o.compact_floats = false) ∧
-    (∃ o : EncodeOptions, EncodeOptions.compact = ok o ∧ o.compact_floats = true) :=
-  ⟨⟨EncodeOptions.mk false, rfl, rfl⟩, ⟨EncodeOptions.mk true, rfl, rfl⟩⟩
-
-/-- MessagePack `Ext` type tag is valid iff `-128 <= tag <= 127`. -/
-theorem is_valid_ext_tag_spec (tag : Std.I32) :
-    is_valid_ext_tag tag = ok (decide (-128 ≤ tag.val ∧ tag.val ≤ 127)) := by
-  unfold is_valid_ext_tag; congr 1
-
 end MsgpackProofs

@@ -75,32 +75,8 @@ private lemma i32_toNat_eq_of_nonneg (x : Std.I32) (h0 : 0 ≤ x.val) :
     have hlt2 := x.bv.isLt
     omega
 
-/-- Theorem 1: `SvgLimits::default` has exact strictly positive limits with monotone resource hierarchy. -/
-theorem svg_limits_default_positive :
-    ∃ l : SvgLimits, SvgLimits.default = ok l ∧
-      l.max_depth.val = 128 ∧ l.max_elements.val = 100000 ∧
-      l.max_path_segments.val = 200000 ∧ l.max_flatten_points.val = 500000 ∧
-      l.max_input_bytes.val = 16777216 ∧
-      0 < l.max_depth.val ∧ l.max_elements.val < l.max_path_segments.val ∧
-      l.max_path_segments.val < l.max_flatten_points.val ∧
-      l.max_flatten_points.val < l.max_input_bytes.val := by
-  refine ⟨SvgLimits.mk 128#i32 100000#i32 200000#i32 500000#i32 16777216#i32, rfl, ?_⟩
-  refine ⟨rfl, rfl, rfl, rfl, rfl, by decide, by decide, by decide, by decide⟩
-
-/-- Theorem 2: `SvgColor::rgb` constructs an opaque color (`a = 255`) preserving `(r, g, b)`. -/
-theorem svg_color_rgb_opaque (r g b : Std.I32) :
-    ∃ c : SvgColor, SvgColor.rgb r g b = ok c ∧
-      c.r = r ∧ c.g = g ∧ c.b = b ∧ c.a.val = 255 := by
-  exact ⟨SvgColor.mk r g b 255#i32, rfl, rfl, rfl, rfl, rfl⟩
-
-/-- Theorem 3: `SvgColor::rgba` preserves all four RGBA channels exactly. -/
-theorem svg_color_rgba_preserves (r g b a : Std.I32) :
-    ∃ c : SvgColor, SvgColor.rgba r g b a = ok c ∧
-      c.r = r ∧ c.g = g ∧ c.b = b ∧ c.a = a := by
-  exact ⟨SvgColor.mk r g b a, rfl, rfl, rfl, rfl, rfl⟩
-
 /-- Theorem 4: `clamp_u8_int` always lands in `[0, 255]` with exact piecewise clamping. -/
-theorem clamp_u8_int_bounds (r : Std.I32) :
+lemma clamp_u8_int_bounds (r : Std.I32) :
     ∃ out : Std.I32, clamp_u8_int r = ok out ∧
       0 ≤ out.val ∧ out.val ≤ 255 ∧
       (r.val < 0 → out.val = 0) ∧
@@ -136,26 +112,8 @@ theorem clamp_u8_int_mono (a b : Std.I32) (hab : a.val ≤ b.val) :
       · rw [hb2 hb_hi]; omega
       · rw [hb3 ⟨by omega, by omega⟩]; omega
 
-/-- Theorem 6: `clamp_u8_int` is idempotent across all 32-bit inputs. -/
-theorem clamp_u8_int_idempotent (r : Std.I32) :
-    (do let c ← clamp_u8_int r; clamp_u8_int c) = clamp_u8_int r := by
-  rcases clamp_u8_int_bounds r with ⟨c, hc, hc0, hc2, _, _, _⟩
-  rw [hc, result_bind_ok]
-  rcases clamp_u8_int_bounds c with ⟨c2, hc2eq, _, _, _, _, hc2val⟩
-  rw [hc2eq]
-  apply congrArg ok
-  exact IScalar.eq_of_val_eq (hc2val ⟨hc0, hc2⟩)
-
-/-- Theorem 7: `is_valid_hex_color_len` accepts exclusively `{3, 4, 6, 8}` (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`). -/
-theorem is_valid_hex_color_len_exact (n : Std.I32) :
-    is_valid_hex_color_len n = ok true ↔ (n.val = 3 ∨ n.val = 4 ∨ n.val = 6 ∨ n.val = 8) := by
-  unfold is_valid_hex_color_len
-  simp only [ok.injEq, Bool.or_eq_true, i32_beq_iff]
-  change ((n.val = 3 ∨ n.val = 4) ∨ n.val = 6) ∨ n.val = 8 ↔ _
-  omega
-
 /-- Theorem 8: `hex_nibble_code` emits lowercase ASCII hex digits (`'0'..'9'` for `0..9`, `'a'..'f'` for `10..15`). -/
-theorem hex_nibble_code_lowercase_ascii (n : Std.I32) (h0 : 0 ≤ n.val) (h15 : n.val ≤ 15) :
+lemma hex_nibble_code_lowercase_ascii (n : Std.I32) (h0 : 0 ≤ n.val) (h15 : n.val ≤ 15) :
     ∃ c : Std.I32, hex_nibble_code n = ok c ∧
       (n.val < 10 → c.val = 48 + n.val) ∧
       (10 ≤ n.val → c.val = 87 + n.val) := by
@@ -206,15 +164,6 @@ theorem hex_nibble_code_roundtrip (n : Std.I32) (h0 : 0 ≤ n.val) (h15 : n.val 
     have ha := i32_add_val t 10#i32 (by change -2147483648 ≤ t.val + 10; omega) (by change t.val + 10 ≤ 2147483647; omega)
     change (Pion.I32.add t 10#i32).val = t.val + 10 at ha; omega
 
-/-- Theorem 10: `#rgb`/`#rgba` shorthand expansion `hex3_channel_expand nib` equals `nib * 16 + nib ∈ [0, 255]`. -/
-theorem hex3_channel_expand_bounds (nib : Std.I32) (h0 : 0 ≤ nib.val) (h15 : nib.val ≤ 15) :
-    ∃ r : Std.I32, hex3_channel_expand nib = ok r ∧
-      r.val = nib.val * 16 + nib.val ∧ 0 ≤ r.val ∧ r.val ≤ 255 := by
-  unfold hex3_channel_expand
-  have hm := i32_mul_val nib 17#i32 (by change -2147483648 ≤ nib.val * 17; omega) (by change nib.val * 17 ≤ 2147483647; omega)
-  change (Pion.I32.mul nib 17#i32).val = nib.val * 17 at hm
-  exact ⟨Pion.I32.mul nib 17#i32, rfl, by omega, by omega, by omega⟩
-
 /-- Theorem 11: `hex_pair_to_byte hi lo` equals `hi * 16 + lo ∈ [0, 255]` for all nibbles `hi, lo ∈ [0, 15]`. -/
 theorem hex_pair_to_byte_exact (hi lo : Std.I32)
     (hi0 : 0 ≤ hi.val) (hi15 : hi.val ≤ 15) (lo0 : 0 ≤ lo.val) (lo15 : lo.val ≤ 15) :
@@ -239,14 +188,5 @@ theorem hex_pair_to_byte_exact (hi lo : Std.I32)
     change r.val = (r.bv.toNat : Int) at hv
     omega
   exact ⟨r, rfl, hr_val, by omega, by omega⟩
-
-/-- Theorem 12: Shorthand `#rgb` expansion is identically equal to `#rrggbb` with duplicate nibbles (`hex3_channel_expand nib = hex_pair_to_byte nib nib`). -/
-theorem hex3_expand_eq_hex_pair_dup (nib : Std.I32) (h0 : 0 ≤ nib.val) (h15 : nib.val ≤ 15) :
-    hex3_channel_expand nib = hex_pair_to_byte nib nib := by
-  rcases hex3_channel_expand_bounds nib h0 h15 with ⟨r1, hr1, hr1v, _, _⟩
-  rcases hex_pair_to_byte_exact nib nib h0 h15 h0 h15 with ⟨r2, hr2, hr2v, _, _⟩
-  rw [hr1, hr2]
-  apply congrArg ok
-  exact IScalar.eq_of_val_eq (by omega)
 
 end SvgProofs

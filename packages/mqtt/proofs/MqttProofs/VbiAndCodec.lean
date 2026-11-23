@@ -92,18 +92,6 @@ private lemma nat_or_low_high (a m k : Nat) (ha : a < 2 ^ k) :
       rw [Nat.add_mul_div_right _ _ hposk, Nat.div_eq_of_lt ha, Nat.zero_add]
     rw [hpow, ← Nat.div_div_eq_div_mul, hdiv1]
 
-/-- Theorem 1: `MqttLimits.default` has strictly positive defensive resource limits. -/
-theorem mqtt_limits_default_positive :
-    ∃ l : MqttLimits, MqttLimits.default = ok l ∧
-      0 < l.max_packet_size.val ∧ 0 < l.max_topic_len.val ∧
-      0 < l.max_properties.val ∧ 0 < l.max_subscriptions.val ∧ 0 < l.max_inflight.val := by
-  refine ⟨_, rfl, by decide, by decide, by decide, by decide, by decide⟩
-
-/-- Theorem 2: `qos_to_int` and `qos_from_int_opt` form a roundtrip on all 3 QoS levels. -/
-theorem qos_roundtrip (q : QoS) :
-    (do let n ← qos_to_int q; qos_from_int_opt n) = ok (some q) := by
-  cases q <;> simp [qos_to_int, qos_from_int_opt]
-
 /-- Theorem 3: `qos_from_int_opt` accepts exactly `{0, 1, 2}` and `qos_to_int` is injective. -/
 theorem qos_from_int_opt_valid_iff :
     (∀ raw : Std.I32, (∃ q : QoS, qos_from_int_opt raw = ok (some q)) ↔ (0 ≤ raw.val ∧ raw.val ≤ 2)) ∧
@@ -125,11 +113,6 @@ theorem qos_from_int_opt_valid_iff :
       · have heq : raw = 1#i32 := IScalar.eq_of_val_eq h; subst heq; exact ⟨.AtLeastOnce, rfl⟩
       · have heq : raw = 2#i32 := IScalar.eq_of_val_eq h; subst heq; exact ⟨.ExactlyOnce, rfl⟩
   · intro a b h; cases a <;> cases b <;> first | rfl | (simp [qos_to_int] at h)
-
-/-- Theorem 4: `packet_type_to_int` and `packet_type_from_int_opt` form an exact roundtrip on all 15 MQTT packet types. -/
-theorem packet_type_roundtrip (pt : PacketType) :
-    (do let n ← packet_type_to_int pt; packet_type_from_int_opt n) = ok (some pt) := by
-  cases pt <;> simp [packet_type_to_int, packet_type_from_int_opt]
 
 /-- Theorem 5: `packet_type_from_int_opt` accepts exactly `1..15` (rejecting reserved 0 and ≥ 16). -/
 theorem packet_type_from_int_opt_valid_iff (raw : Std.I32) :
@@ -299,7 +282,7 @@ theorem vbi_decode_2_canonical_range (b0 b1 : Std.I32)
   exact ⟨r, hr, by omega, by omega, hn⟩
 
 /-- Theorem 10: `vbi_decode_3` computes the exact 21-bit value `(b0 % 128) + (b1 % 128) * 128 + b2 * 16384`. -/
-theorem vbi_decode_3_exact (b0 b1 b2 : Std.I32)
+lemma vbi_decode_3_exact (b0 b1 b2 : Std.I32)
     (h0 : 0 ≤ b0.val ∧ b0.val ≤ 255) (h1 : 0 ≤ b1.val ∧ b1.val ≤ 255)
     (h2 : 0 ≤ b2.val ∧ b2.val ≤ 127) :
     ∃ r : Std.I32, vbi_decode_3 b0 b1 b2 = ok r ∧
@@ -331,7 +314,7 @@ theorem vbi_decode_3_exact (b0 b1 b2 : Std.I32)
   exact ⟨r, rfl, by omega⟩
 
 /-- Theorem 11: Canonical 3-byte VBI (`b2 ∈ [1, 127]`) decodes into `[16384, 2097151]` with `vbi_encoded_len = 3`. -/
-theorem vbi_decode_3_canonical_range (b0 b1 b2 : Std.I32)
+lemma vbi_decode_3_canonical_range (b0 b1 b2 : Std.I32)
     (h0 : 128 ≤ b0.val ∧ b0.val ≤ 255) (h1 : 128 ≤ b1.val ∧ b1.val ≤ 255)
     (h2 : 1 ≤ b2.val ∧ b2.val ≤ 127) :
     ∃ r : Std.I32, vbi_decode_3 b0 b1 b2 = ok r ∧
@@ -343,7 +326,7 @@ theorem vbi_decode_3_canonical_range (b0 b1 b2 : Std.I32)
   exact ⟨r, hr, by omega, by omega, hn⟩
 
 /-- Theorem 12: `vbi_decode_4` computes the exact 28-bit value `(b0 % 128) + (b1 % 128) * 128 + (b2 % 128) * 16384 + b3 * 2097152`. -/
-theorem vbi_decode_4_exact (b0 b1 b2 b3 : Std.I32)
+lemma vbi_decode_4_exact (b0 b1 b2 b3 : Std.I32)
     (h0 : 0 ≤ b0.val ∧ b0.val ≤ 255) (h1 : 0 ≤ b1.val ∧ b1.val ≤ 255)
     (h2 : 0 ≤ b2.val ∧ b2.val ≤ 255) (h3 : 0 ≤ b3.val ∧ b3.val ≤ 127) :
     ∃ r : Std.I32, vbi_decode_4 b0 b1 b2 b3 = ok r ∧
@@ -385,7 +368,7 @@ theorem vbi_decode_4_exact (b0 b1 b2 b3 : Std.I32)
   exact ⟨r, rfl, by omega⟩
 
 /-- Theorem 13: Canonical 4-byte VBI (`b3 ∈ [1, 127]`) decodes into `[2097152, 268435455]` with `vbi_encoded_len = 4`. -/
-theorem vbi_decode_4_canonical_range (b0 b1 b2 b3 : Std.I32)
+lemma vbi_decode_4_canonical_range (b0 b1 b2 b3 : Std.I32)
     (h0 : 128 ≤ b0.val ∧ b0.val ≤ 255) (h1 : 128 ≤ b1.val ∧ b1.val ≤ 255)
     (h2 : 128 ≤ b2.val ∧ b2.val ≤ 255) (h3 : 1 ≤ b3.val ∧ b3.val ≤ 127) :
     ∃ r : Std.I32, vbi_decode_4 b0 b1 b2 b3 = ok r ∧

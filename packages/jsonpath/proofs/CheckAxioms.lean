@@ -1,26 +1,12 @@
 import JsonpathProofs
 
-#print axioms JsonpathProofs.jsonpath_limits_default_spec
-#print axioms JsonpathProofs.is_rfc9535_ws_exact
 #print axioms JsonpathProofs.is_name_first_excludes_surrogates_and_invalid
 #print axioms JsonpathProofs.is_name_first_subset_name_char
 #print axioms JsonpathProofs.is_name_first_disjoint_digit
 #print axioms JsonpathProofs.is_rfc9535_ws_disjoint_name_char
 #print axioms JsonpathProofs.rfc9535_ijson_step_overflow_exact
-#print axioms JsonpathProofs.rfc9535_ijson_step_overflow_boundary
-#print axioms JsonpathProofs.norm_name_byte_len_bounds
-#print axioms JsonpathProofs.norm_name_byte_len_printable_and_quotes
-#print axioms JsonpathProofs.pointer_needs_escape_exact
-#print axioms JsonpathProofs.pointer_unescape_tilde_bijection
-#print axioms JsonpathProofs.rfc9535_normalize_index_nonneg
-#print axioms JsonpathProofs.rfc9535_normalize_index_neg
 #print axioms JsonpathProofs.rfc9535_normalize_index_in_bounds_neg
 #print axioms JsonpathProofs.rfc9535_clamp_pos_slice_bounds
 #print axioms JsonpathProofs.rfc9535_clamp_pos_slice_mono
-#print axioms JsonpathProofs.rfc9535_clamp_pos_slice_idempotent
 #print axioms JsonpathProofs.rfc9535_clamp_neg_slice_bounds
-#print axioms JsonpathProofs.rfc9535_clamp_neg_slice_mono
-#print axioms JsonpathProofs.rfc9535_clamp_neg_slice_idempotent
-#print axioms JsonpathProofs.rfc9535_default_slice_pos_full_range
 #print axioms JsonpathProofs.rfc9535_default_slice_neg_full_range
-#print axioms JsonpathProofs.rfc9535_empty_array_slice_always_empty

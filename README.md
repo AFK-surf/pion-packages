@@ -112,7 +112,7 @@ pionc add <package-name>
 | [`sse`](packages/sse) | `0.1.0` | WHATWG HTML §9.2 Server-Sent Events（EventSource）：任意分块边界的流式解析器（BOM、`CR` / `LF` / `CRLF` 跨块、`id` / `retry` / 注释与未知字段语义、`Replace` / `Strict` 两种 UTF-8 策略、出错后粘滞且不丢已分发事件）、防字段注入的编码器、Sans-IO 重连状态机（服务端 `retry`、带确定性抖动的封顶指数退避、`Last-Event-ID` 头与游标查询参数），`SseLimits` 防 DoS，零依赖无 `World` | Rust [`eventsource-stream`](https://crates.io/crates/eventsource-stream) `=0.2.3`；红队差分另用逐步实现 §9.2.6 的 Python 参考解析器 | 20 / 20 | ✅ `wasm_smoke` | [4 KiB 分块流式解析 **1.23×** · 64 B 碎片分块 1.01× · 编码 + 解析往返 0.96×（vs Rust），峰值 RSS 高 0.3–1.25 MiB](BENCHMARKS.md#sse) | `pionc add sse --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`proxy`](packages/proxy) | `0.1.1` | Sans-IO 代理协议与代理 URL：RFC 1928 / 1929 SOCKS5 双向流式编解码（客户端与服务端，`socks5h` 远端 DNS 语义，精确 `consumed` 与任意分片 / 流水线安全）、RFC 9110 / 9112 HTTP `CONNECT` 请求 / 响应（`407` 与 `Proxy-Authenticate` 结构化保留、`Proxy-Authorization: Basic`）、明文正向代理请求改写与逐跳头清洗（含 `Connection` 动态提名，但 `Host` / `Content-Length` / `Transfer-Encoding` 受保护，拒绝 CL/TE 走私）、`http` / `https` / `socks5` / `socks5h` / `ssh` 代理 URL 解析与强制凭据脱敏 `redacted()`（含 token-in-username；`ssh://` 保留转义后的用户名并剥离 `?identity=`）、`NO_PROXY` 匹配（`*.domain`、CIDR、`::ffff:` 映射地址），`ProxyLimits` 防 DoS，零依赖无 `World` | [`AFK-surf/monoid-login`](https://github.com/AFK-surf/monoid-login) `src/proxy-bridge.ts`（被替换实现）+ Go `golang.org/x/net/http/httpproxy` `v0.62.0` 与 `net/http`（go1.27.3） | 16 / 16 | ✅ `wasm_smoke` | [URL + `NO_PROXY` **1.20×** · SOCKS5 握手 0.18× · HTTP `CONNECT` + 正向代理清洗 **1.55×**（vs Go），峰值 RSS 低 5.0–10.0×](BENCHMARKS.md#proxy) | `pionc add proxy --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 80 个包合计 **5,313 / 5,313** 单测通过（`sh scripts/verify.sh`）。
+全仓 80 个包合计 **5,354 / 5,354** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -294,7 +294,15 @@ Wave 10 发布验证在 `AFK-surf/pion@c375cee` 上完成：`sh scripts/verify.s
 
 ### Lean 4 形式化验证
 
-截至本次发布的 `origin/main`（`9629fb0`），Lean 4 串行证明线程已为 **36 个包**交付 **992 个** 0 `sorry` 定理（`packages/<name>/proofs/`，逐包 `sh packages/<name>/proofs/run_proofs.sh`，全量串行限资源运行 `sh scripts/verify-lean.sh`）。Wave 14 与 Wave 15 共八个新包暂未纳入证明。
+经独立红队审计（`audit/redteam-lean-proofs`）与 Stage 1 全量清理加固，当前 **43 个包**共保留 **474 个** 0 `sorry` 定理（**106 个 A 级核心算法 / 协议不变量 + 368 个 B 级核心辅助定理，0 个 C 级定理**；原 C 级常量 / 单点定理已迁移为原生 Pion 单元测试，全仓 80 包 `sh scripts/verify.sh` 共 **5,354 / 5,354** 单测通过，同时 `base64` 与 `crdt` 修复 C5 问题并补齐 13 条全域 A 级定理）。
+
+全部 43 份 `packages/<name>/proofs/run_proofs.sh` 统一执行 4 项门禁加固：
+- **静态禁用词扫描**：零 `sorry` / `admit` / `axiom` / `native_decide` / `unsafe` / `partial` / `implemented_by` / `extern`；
+- **零告警构建**：在独立隔离目录提取当前 `src/*.pion` 并构建，`lake build` 严格 0 errors / 0 warnings；
+- **1:1 公理白名单审查**：`CheckAxioms.lean` 与声明定理列表精确 1:1 对齐，仅允许标准公理 `[propext, Classical.choice, Quot.sound]`；
+- **原生 vs Lean 值差分门禁**：`EvalDiff.lean` 与原生 `pionc run` 逐行精确值 `diff -u` 一致。
+
+逐包运行 `bash packages/<name>/proofs/run_proofs.sh`，全量串行限资源运行 `sh scripts/verify-lean.sh`（每包验证通过后自动清理 `.lake/build`）。Wave 14 与 Wave 15 及后续新包暂未纳入证明。
 
 ## 贡献与移植流程
 

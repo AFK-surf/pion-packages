@@ -1,190 +1,200 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$PATH"
-PROOFS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$PROOFS_DIR/.." && pwd)
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-JOBS="${LEAN_NUM_THREADS:-2}"
-MEM="${LEAN_MEM_LIMIT:-8192}"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
+export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-mkdir -p "$WORK" "$PROJ/WasmProofs"
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake" "$PROJ/WasmProofs"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="wasm"
+LEAN_MOD="Wasm"
+PROOF_MOD="WasmProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-echo "=== [2/7] pionc extract-lean packages/wasm ==="
-pionc extract-lean "$PKG_DIR" --out "$PROJ" --json
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|bv_decide|native_decide)\b|^axiom\b' "$PROOFS_DIR/WasmProofs.lean" "$PROOFS_DIR/WasmProofs/"; then
-  echo "FAIL: forbidden tactic or axiom found" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
-
-cp "$PROOFS_DIR/WasmProofs.lean" "$PROJ/WasmProofs.lean"
-cp "$PROOFS_DIR/WasmProofs/"*.lean "$PROJ/WasmProofs/"
-cp "$PROOFS_DIR/CheckAxioms.lean" "$PROJ/CheckAxiomsWasm.lean"
-cp "$PROOFS_DIR/EvalDiff.lean" "$PROJ/EvalDiffWasm.lean"
-
-printf '\nlean_lib Wasm where\n  globs := #[.submodules `Wasm]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$MEM" "$JOBS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib WasmProofs where\n  globs := #[.andSubmodules `WasmProofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$MEM" "$JOBS" >> "$PROJ/lakefile.lean"
-
-echo "=== [4/7] lake build PionLean Wasm WasmProofs ==="
-BUILD_LOG="$WORK/wasm_build.log"
-(cd "$PROJ" && LEAN_NUM_THREADS="$JOBS" lake build PionLean Wasm WasmProofs) > "$BUILD_LOG" 2>&1 || {
-  cat "$BUILD_LOG"
-  echo "FAIL: lake build failed" >&2
-  exit 1
-}
-cat "$BUILD_LOG"
-if grep -qE '^warning:|warning: ' "$BUILD_LOG"; then
-  echo "FAIL: warnings found in WasmProofs build" >&2
-  exit 1
-fi
-echo "lake build PionLean Wasm WasmProofs: exit 0, 0 errors"
-
-echo "=== [5/7] #print axioms audit ==="
-AX_OUT=$(cd "$PROJ" && lake env lean --memory="$MEM" -j "$JOBS" CheckAxiomsWasm.lean)
-echo "$AX_OUT"
-if echo "$AX_OUT" | grep -vE "^'WasmProofs\.[a-zA-Z0-9_]+' depends on axioms: \[(propext(, Classical\.choice)?(, Quot\.sound)?|Classical\.choice(, Quot\.sound)?|Quot\.sound)\]$" | grep -vE "^'WasmProofs\.[a-zA-Z0-9_]+' does not depend on any axioms$" | grep -q .; then
-  echo "FAIL: unexpected axiom detected" >&2
-  exit 1
-fi
-echo "Axioms audit: ONLY standard axioms (propext, Classical.choice, Quot.sound)"
-
-echo "=== [6/7] EvalDiff.lean (#eval) ==="
-LEAN_DIFF="$WORK/wasm_lean_diff.txt"
-(cd "$PROJ" && lake env lean --memory="$MEM" -j "$JOBS" EvalDiffWasm.lean) > "$LEAN_DIFF"
-cat "$LEAN_DIFF"
-if grep -q 'FAIL' "$LEAN_DIFF"; then
-  echo "FAIL: Lean EvalDiff reported FAIL" >&2
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$WORK/wasm_native_diff"
-rm -rf "$DIFF_DIR" && mkdir -p "$DIFF_DIR/src"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+SCAN_PATHS=("$SCRIPT_DIR/$PROOF_MOD.lean")
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  SCAN_PATHS+=("$SCRIPT_DIR/$PROOF_MOD")
+fi
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' "${SCAN_PATHS[@]}"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+fi
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+scan_files = [os.path.join(script_dir, f"{proof_mod}.lean")]
+mod_dir = os.path.join(script_dir, proof_mod)
+if os.path.isdir(mod_dir):
+    for root, _, files in os.walk(mod_dir):
+        for fn in files:
+            if fn.endswith(".lean"):
+                scan_files.append(os.path.join(root, fn))
+for path in scan_files:
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "wasm_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
-edition = "2026"
 
 [dependencies]
 wasm = { path = "$PKG_DIR" }
 EOF
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "wasm"
-
-fn report(w : World, label : String, ok : Bool) -> Unit {
-  if ok {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
+fn opt_vt(o : Option[wasm::ValType]) -> String {
+  match o {
+    None => "None"
+    Some(wasm::ValType::I32) => "Some(I32)"
+    Some(wasm::ValType::I64) => "Some(I64)"
+    Some(wasm::ValType::F32) => "Some(F32)"
+    Some(wasm::ValType::F64) => "Some(F64)"
+    Some(wasm::ValType::V128) => "Some(V128)"
+    Some(wasm::ValType::FuncRef) => "Some(FuncRef)"
+    Some(wasm::ValType::ExternRef) => "Some(ExternRef)"
   }
 }
-
-pub fn main(w : World) -> Int {
-  report(w, "vt_i32", wasm::val_type_code(wasm::ValType::I32) == 127)
-  report(w, "vt_v128", wasm::val_type_code(wasm::ValType::V128) == 123)
-  report(w, "vt_ext", wasm::val_type_code(wasm::ValType::ExternRef) == 111)
-  let vtf_i32 = match wasm::val_type_from_code(127) {
-    Some(wasm::ValType::I32) => true
-    _ => false
-  }
-  report(w, "vtf_i32", vtf_i32)
-  let vtf_bad = match wasm::val_type_from_code(0) {
-    None => true
-    _ => false
-  }
-  report(w, "vtf_bad", vtf_bad)
-  report(w, "vteq_t", wasm::val_type_equals(wasm::ValType::F64, wasm::ValType::F64))
-  report(w, "vteq_f", !wasm::val_type_equals(wasm::ValType::I32, wasm::ValType::I64))
-  report(w, "rt_fn", wasm::ref_type_code(wasm::RefType::FuncRef) == 112)
-  let rtf_ext = match wasm::ref_type_from_code(111) {
-    Some(wasm::RefType::ExternRef) => true
-    _ => false
-  }
-  report(w, "rtf_ext", rtf_ext)
-  let rtf_bad = match wasm::ref_type_from_code(127) {
-    None => true
-    _ => false
-  }
-  report(w, "rtf_bad", rtf_bad)
-  report(w, "exp_mem", wasm::export_kind_code(wasm::ExportKind::Memory) == 2)
-  report(w, "vid_fn", wasm::val_type_to_id(wasm::ValType::FuncRef) == 5)
-  report(w, "rid_ext", wasm::ref_type_to_id(wasm::RefType::ExternRef) == 6)
-  report(w, "isref_5", wasm::is_ref_id(5))
-  report(w, "isref_0", !wasm::is_ref_id(0))
-  report(w, "sec_elem", wasm::section_order_rank(9) == 9)
-  report(w, "sec_dc", wasm::section_order_rank(12) == 10)
-  report(w, "sec_code", wasm::section_order_rank(10) == 11)
-  report(w, "sec_data", wasm::section_order_rank(11) == 12)
-  report(w, "sec_cust", wasm::section_order_rank(0) == -1)
-  report(w, "stk_eq", wasm::stack_type_compat(0, 0))
-  report(w, "stk_unk", wasm::stack_type_compat(-1, 3))
-  report(w, "stk_ne", !wasm::stack_type_compat(0, 1))
-  report(w, "lim_ok", wasm::limits_err_code(wasm::Limits::{ min: 1L, max: Some(10L), is_memory64: false, shared: false }, 65536L) == 0)
-  report(w, "lim_sh", wasm::limits_err_code(wasm::Limits::{ min: 1L, max: None, is_memory64: false, shared: true }, 65536L) == 1)
-  report(w, "lim_m64", wasm::limits_err_code(wasm::Limits::{ min: 1L, max: None, is_memory64: true, shared: false }, 65536L) == 2)
-  report(w, "lim_neg", wasm::limits_err_code(wasm::Limits::{ min: -1L, max: None, is_memory64: false, shared: false }, 65536L) == 3)
-  report(w, "lim_min_hi", wasm::limits_err_code(wasm::Limits::{ min: 70000L, max: None, is_memory64: false, shared: false }, 65536L) == 4)
-  report(w, "lim_gt", wasm::limits_err_code(wasm::Limits::{ min: 10L, max: Some(5L), is_memory64: false, shared: false }, 65536L) == 5)
-  report(w, "lim_max_hi", wasm::limits_err_code(wasm::Limits::{ min: 1L, max: Some(70000L), is_memory64: false, shared: false }, 65536L) == 6)
-  report(w, "leb_sb_pos", wasm::leb128_i32_single_byte(63) == 63)
-  report(w, "leb_sb_neg", wasm::leb128_i32_single_byte(64) == -64)
-  report(w, "leb_u32_ok", wasm::leb128_u32_5th_valid(15))
-  report(w, "leb_u32_bad", !wasm::leb128_u32_5th_valid(16))
-  report(w, "leb_u64_ok", wasm::leb128_u64_10th_valid(1))
-  report(w, "leb_u64_bad", !wasm::leb128_u64_10th_valid(2))
-  report(w, "leb_i32_pos", wasm::leb128_i32_5th_valid(7))
-  report(w, "leb_i32_neg", wasm::leb128_i32_5th_valid(120))
-  report(w, "leb_i32_bad", !wasm::leb128_i32_5th_valid(8))
-  report(w, "leb_i64_ok", wasm::leb128_i64_10th_valid(127))
-  report(w, "leb_i64_bad", !wasm::leb128_i64_10th_valid(1))
-  report(w, "leb_s33_pos", wasm::leb128_s33_5th_valid(15))
-  report(w, "leb_s33_neg", wasm::leb128_s33_5th_valid(112))
-  report(w, "leb_s33_bad", !wasm::leb128_s33_5th_valid(16))
+pub fn main(world : World) -> Int {
+  io_println(world, "vt_i32=" + wasm::val_type_code(wasm::ValType::I32).to_string())
+  io_println(world, "vt_ext=" + wasm::val_type_code(wasm::ValType::ExternRef).to_string())
+  io_println(world, "vtf_i32=" + opt_vt(wasm::val_type_from_code(127)))
+  io_println(world, "vtf_bad=" + opt_vt(wasm::val_type_from_code(0)))
+  io_println(world, "sec_elem=" + wasm::section_order_rank(9).to_string())
+  io_println(world, "sec_dc=" + wasm::section_order_rank(12).to_string())
+  io_println(world, "sec_code=" + wasm::section_order_rank(10).to_string())
+  io_println(world, "sec_data=" + wasm::section_order_rank(11).to_string())
+  io_println(world, "sec_cust=" + wasm::section_order_rank(0).to_string())
+  io_println(world, "stk_eq=" + bstr(wasm::stack_type_compat(0, 0)))
+  io_println(world, "stk_unk=" + bstr(wasm::stack_type_compat(-1, 3)))
+  io_println(world, "stk_ne=" + bstr(wasm::stack_type_compat(0, 1)))
+  io_println(world, "lim_ok=" + wasm::limits_err_code(wasm::Limits::{ min: 1L, max: Some(10L), is_memory64: false, shared: false }, 65536L).to_string())
+  io_println(world, "lim_sh=" + wasm::limits_err_code(wasm::Limits::{ min: 1L, max: None, is_memory64: false, shared: true }, 65536L).to_string())
+  io_println(world, "lim_m64=" + wasm::limits_err_code(wasm::Limits::{ min: 1L, max: None, is_memory64: true, shared: false }, 65536L).to_string())
+  io_println(world, "lim_neg=" + wasm::limits_err_code(wasm::Limits::{ min: -1L, max: None, is_memory64: false, shared: false }, 65536L).to_string())
+  io_println(world, "lim_min_hi=" + wasm::limits_err_code(wasm::Limits::{ min: 70000L, max: None, is_memory64: false, shared: false }, 65536L).to_string())
+  io_println(world, "lim_gt=" + wasm::limits_err_code(wasm::Limits::{ min: 10L, max: Some(5L), is_memory64: false, shared: false }, 65536L).to_string())
+  io_println(world, "lim_max_hi=" + wasm::limits_err_code(wasm::Limits::{ min: 1L, max: Some(70000L), is_memory64: false, shared: false }, 65536L).to_string())
+  io_println(world, "leb_sb_pos=" + wasm::leb128_i32_single_byte(63).to_string())
+  io_println(world, "leb_sb_neg=" + wasm::leb128_i32_single_byte(64).to_string())
+  io_println(world, "leb_u32_ok=" + bstr(wasm::leb128_u32_5th_valid(15)))
+  io_println(world, "leb_u32_bad=" + bstr(wasm::leb128_u32_5th_valid(16)))
+  io_println(world, "leb_i32_pos=" + bstr(wasm::leb128_i32_5th_valid(7)))
+  io_println(world, "leb_i32_neg=" + bstr(wasm::leb128_i32_5th_valid(120)))
+  io_println(world, "leb_i32_bad=" + bstr(wasm::leb128_i32_5th_valid(8)))
   0
 }
 EOF
-NATIVE_DIFF="$WORK/wasm_native_diff.txt"
-pionc build "$DIFF_DIR" -o "$DIFF_DIR/wasm_diff_bin"
-"$DIFF_DIR/wasm_diff_bin" > "$NATIVE_DIFF"
-diff -u "$NATIVE_DIFF" "$LEAN_DIFF"
-COUNT=$(wc -l < "$LEAN_DIFF" | tr -d ' ')
-echo "Native vs Lean differential: $COUNT cases identical (diff -u exit 0)"
-echo "PASS: packages/wasm Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

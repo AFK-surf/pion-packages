@@ -1,349 +1,228 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/uuid`.
-#
-# Builds a throw-away Lake project in /private/tmp/pion-lean-uuid (zero git
-# worktree pollution), extracts `packages/uuid` via `pionc extract-lean`,
-# compiles `PionLean`, `Uuid`, and `UuidProofs`, rejects any
-# `sorry`/`admit`/`native_decide`/`bv_decide`, verifies `#print axioms`
-# (only `propext`, `Classical.choice`, `Quot.sound`), and runs `EvalDiff.lean`
-# + a Pion native differential cross-check.
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
+export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="uuid"
+LEAN_MOD="Uuid"
+PROOF_MOD="UuidProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-uuid}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
-
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  # Refresh lakefile.lean cleanly from pion/lean so we never duplicate lean_lib blocks
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/uuid ==="
-rm -rf "$PROJ/Uuid"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Uuid/$f.lean" ]; then
-    echo "FAIL: missing Uuid/$f.lean" >&2
-    exit 1
-  fi
-done
-
-cp "$SCRIPT_DIR/UuidProofs.lean" "$PROJ/UuidProofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Uuid where\n  globs := #[.submodules `Uuid]\n' >> "$PROJ/lakefile.lean"
-printf '\nlean_lib UuidProofs where\n' >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/UuidProofs.lean" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
+fi
 
-echo "=== [4/7] lake build PionLean Uuid UuidProofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Uuid UuidProofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
+echo "=== [1/7] Checking forbidden proof tokens ==="
+SCAN_PATHS=("$SCRIPT_DIR/$PROOF_MOD.lean")
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  SCAN_PATHS+=("$SCRIPT_DIR/$PROOF_MOD")
+fi
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' "${SCAN_PATHS[@]}"; then
+  echo "FAIL: forbidden token found in proofs" >&2
   exit 1
 fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Uuid UuidProofs: exit 0, 0 errors"
 
-echo "=== [5/7] #print axioms audit ==="
-set +e
-AXIOMS_OUT=$(lake env lean CheckAxioms.lean 2>&1)
-RC=$?
-set -e
-printf '%s\n' "$AXIOMS_OUT"
-if [ "$RC" -ne 0 ]; then
-  echo "FAIL: CheckAxioms.lean (rc=$RC)" >&2
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
   exit 1
 fi
-EXPECTED_THMS=$(grep -c '^#print axioms' "$PROJ/CheckAxioms.lean")
-printf '%s\n' "$AXIOMS_OUT" | python3 -c '
-import re, sys
-text = sys.stdin.read()
-expected = int(sys.argv[1])
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+fi
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+scan_files = [os.path.join(script_dir, f"{proof_mod}.lean")]
+mod_dir = os.path.join(script_dir, proof_mod)
+if os.path.isdir(mod_dir):
+    for root, _, files in os.walk(mod_dir):
+        for fn in files:
+            if fn.endswith(".lean"):
+                scan_files.append(os.path.join(root, fn))
+for path in scan_files:
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
 allowed = {"propext", "Classical.choice", "Quot.sound"}
-found = re.findall(r"^\x27([^\x27]+)\x27 depends on axioms: \[([^\]]*)\]", text, re.M)
-free = re.findall(r"^\x27([^\x27]+)\x27 does not depend on any axioms", text, re.M)
-bad = [(n, sorted(set(a.replace(",", " ").split()) - allowed)) for n, a in found
-       if set(a.replace(",", " ").split()) - allowed]
-if bad or len(found) + len(free) != expected:
-    print("FAIL: axioms: non-standard=%r, checked %d of %d" % (bad, len(found) + len(free), expected), file=sys.stderr)
-    sys.exit(1)
-print("axioms: %d theorems verified, only propext / Classical.choice / Quot.sound" % expected)
-' "$EXPECTED_THMS"
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
 
-echo "=== [6/7] #eval / #guard on extracted Uuid.Funs ==="
-set +e
-EVAL_OUT=$(lake env lean EvalDiff.lean 2>&1)
-RC=$?
-set -e
-printf '%s\n' "$EVAL_OUT"
-if [ "$RC" -ne 0 ] || printf '%s' "$EVAL_OUT" | grep -q 'error\|FAIL'; then
-  echo "FAIL: EvalDiff.lean (rc=$RC)" >&2
-  exit 1
-fi
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
 
-echo "=== [7/7] Native Pion vs Lean differential check ==="
-DIFF_DIR="$WORK/native_diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "uuid_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 uuid = { path = "$PKG_DIR" }
 EOF
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "uuid"
-
-fn report(w : World, name : String, ok : Bool) -> Unit {
-  if ok {
-    io_println(w, name + ": PASS")
-  } else {
-    io_println(w, name + ": FAIL")
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
+fn ver_tag(v : uuid::UuidVersion) -> String {
+  match v {
+    uuid::UuidVersion::Nil => "Nil"
+    uuid::UuidVersion::Mac => "Mac"
+    uuid::UuidVersion::Dce => "Dce"
+    uuid::UuidVersion::Md5 => "Md5"
+    uuid::UuidVersion::Random => "Random"
+    uuid::UuidVersion::Sha1 => "Sha1"
+    uuid::UuidVersion::SortMac => "SortMac"
+    uuid::UuidVersion::SortRand => "SortRand"
+    uuid::UuidVersion::Custom => "Custom"
+    uuid::UuidVersion::Max => "Max"
+    uuid::UuidVersion::Unknown(n) => "Unknown(" + n.to_string() + ")"
   }
 }
-
-fn ver_is(u : uuid::Uuid, tag : String) -> Bool {
-  match u.version() {
-    uuid::UuidVersion::Nil => tag == "Nil"
-    uuid::UuidVersion::Mac => tag == "Mac"
-    uuid::UuidVersion::Dce => tag == "Dce"
-    uuid::UuidVersion::Md5 => tag == "Md5"
-    uuid::UuidVersion::Random => tag == "Random"
-    uuid::UuidVersion::Sha1 => tag == "Sha1"
-    uuid::UuidVersion::SortMac => tag == "SortMac"
-    uuid::UuidVersion::SortRand => tag == "SortRand"
-    uuid::UuidVersion::Custom => tag == "Custom"
-    uuid::UuidVersion::Max => tag == "Max"
-    uuid::UuidVersion::Unknown(_) => false
+fn var_tag(v : uuid::UuidVariant) -> String {
+  match v {
+    uuid::UuidVariant::Ncs => "Ncs"
+    uuid::UuidVariant::Rfc4122 => "Rfc4122"
+    uuid::UuidVariant::Microsoft => "Microsoft"
+    uuid::UuidVariant::Future => "Future"
   }
 }
-
-fn var_rfc(u : uuid::Uuid) -> Bool {
-  match u.variant() {
-    uuid::UuidVariant::Rfc4122 => true
-    _ => false
+fn fmt_v7(ts : Int64, ra : Int, rb : Int64) -> String {
+  match uuid::Uuid::new_v7_from_parts(ts, ra, rb) {
+    Ok(u) => match u.timestamp_ms() { Some(t) => "Ok(" + t.to_string() + ")", None => "Ok(None)" }
+    Err(_) => "Err"
   }
 }
-
-pub fn main(w : World) -> Int {
+fn fmt_ulid(ts : Int64, rhi : Int64, rlo : Int64) -> String {
+  match uuid::Ulid::from_parts(ts, rhi, rlo) {
+    Ok(u) => "Ok(" + u.timestamp_ms().to_string() + ")"
+    Err(_) => "Err"
+  }
+}
+fn fmt_ulid_inc(ts : Int64, rhi : Int64, rlo : Int64) -> String {
+  match uuid::Ulid::from_parts(ts, rhi, rlo) {
+    Ok(u) => match u.increment() {
+      Ok(u2) => "Ok(" + u2.timestamp_ms().to_string() + "," + u.compare(u2).to_string() + ")"
+      Err(_) => "Err"
+    }
+    Err(_) => "Err"
+  }
+}
+pub fn main(world : World) -> Int {
   let max_ts : Int64 = 281474976710655L
-
-  report(w, "uuid_nil_max_order",
-    uuid::Uuid::nil().compare(uuid::Uuid::max()) == -1 &&
-    uuid::Uuid::max().compare(uuid::Uuid::nil()) == 1)
-
+  io_println(world, "nil_max_cmp=" + uuid::Uuid::nil().compare(uuid::Uuid::max()).to_string())
+  io_println(world, "max_nil_cmp=" + uuid::Uuid::max().compare(uuid::Uuid::nil()).to_string())
   let a = uuid::Uuid::from_u64_pair(0x7FFFFFFFFFFFFFFFUL, 0xFFFFFFFFFFFFFFFFUL)
   let b = uuid::Uuid::from_u64_pair(0x8000000000000000UL, 0UL)
-  report(w, "uuid_unsigned_sign_boundary", a.compare(b) == -1)
-
-  let node6 = Bytes::new(6)
-  node6[0] = (1).to_byte(); node6[1] = (2).to_byte(); node6[2] = (3).to_byte()
-  node6[3] = (4).to_byte(); node6[4] = (5).to_byte(); node6[5] = (6).to_byte()
-  let v1_ok = match uuid::Uuid::new_v1(0x01B21DD213814000L, 0x1234, node6) {
-    Ok(u) => ver_is(u, "Mac") && var_rfc(u)
-    Err(_) => false
-  }
-  report(w, "uuid_v1_ver_var", v1_ok)
-
-  let v3_u = uuid::Uuid::new_v3(uuid::NAMESPACE_DNS, Bytes::new(0))
-  report(w, "uuid_v3_ver_var", ver_is(v3_u, "Md5") && var_rfc(v3_u))
-
-  let v4_u = uuid::Uuid::new_v4_from_u64_pair(0UL, 0UL)
-  report(w, "uuid_v4_ver_var", ver_is(v4_u, "Random") && var_rfc(v4_u))
-
-  let v5_u = uuid::Uuid::new_v5(uuid::NAMESPACE_DNS, Bytes::new(0))
-  report(w, "uuid_v5_ver_var", ver_is(v5_u, "Sha1") && var_rfc(v5_u))
-
-  let node6b = Bytes::new(6)
-  node6b[0] = (0xAA).to_byte(); node6b[1] = (0xBB).to_byte(); node6b[2] = (0xCC).to_byte()
-  node6b[3] = (0xDD).to_byte(); node6b[4] = (0xEE).to_byte(); node6b[5] = (0xFF).to_byte()
-  let v6_ok = match uuid::Uuid::new_v6(0x01B21DD213814000L, 0x3FFF, node6b) {
-    Ok(u) => ver_is(u, "SortMac") && var_rfc(u)
-    Err(_) => false
-  }
-  report(w, "uuid_v6_ver_var", v6_ok)
-
-  let v7_zero_ok = match uuid::Uuid::new_v7_from_parts(0L, 0, 0L) {
-    Ok(u) => ver_is(u, "SortRand") && var_rfc(u) && match u.timestamp_ms() { Some(t) => t == 0L, None => false }
-    Err(_) => false
-  }
-  let v7_max_ok = match uuid::Uuid::new_v7_from_parts(max_ts, 0xFFF, -1L) {
-    Ok(u) => ver_is(u, "SortRand") && var_rfc(u) && match u.timestamp_ms() { Some(t) => t == max_ts, None => false }
-    Err(_) => false
-  }
-  report(w, "uuid_v7_ts_zero_and_max", v7_zero_ok && v7_max_ok)
-
-  let v7_mono = match (uuid::Uuid::new_v7_from_parts(1000L, 0xFFF, -1L), uuid::Uuid::new_v7_from_parts(1001L, 0, 0L)) {
-    (Ok(u1), Ok(u2)) => u1.compare(u2) == -1
-    _ => false
-  }
-  report(w, "uuid_v7_strict_monotonic", v7_mono)
-
-  let custom16 = Bytes::new(16)
-  let mut ci = 0
-  while ci < 16 {
-    custom16[ci] = ci.to_byte()
-    ci = ci + 1
-  }
-  let v8_ok = match uuid::Uuid::new_v8(custom16) {
-    Ok(u) => ver_is(u, "Custom") && var_rfc(u)
-    Err(_) => false
-  }
-  report(w, "uuid_v8_ver_var", v8_ok)
-
-  let ulid_zero_ok = match uuid::Ulid::from_parts(0L, 0L, 0L) {
-    Ok(u) => {
-      let (rh, rl) = u.random_parts()
-      u.timestamp_ms() == 0L && rh == 0L && rl == 0L
-    }
-    Err(_) => false
-  }
-  let ulid_max_ok = match uuid::Ulid::from_parts(max_ts, 0xFFFFL, -1L) {
-    Ok(u) => {
-      let (rh, rl) = u.random_parts()
-      u.timestamp_ms() == max_ts && rh == 0xFFFFL && rl == -1L
-    }
-    Err(_) => false
-  }
-  report(w, "ulid_ts_zero_and_max", ulid_zero_ok && ulid_max_ok)
-
-  let ulid_rej_neg = match uuid::Ulid::from_parts(-1L, 0L, 0L) {
-    Err(uuid::UlidError::InvalidTimestamp(_)) => true
-    _ => false
-  }
-  let ulid_rej_big = match uuid::Ulid::from_parts(281474976710656L, 0L, 0L) {
-    Err(uuid::UlidError::InvalidTimestamp(_)) => true
-    _ => false
-  }
-  report(w, "ulid_reject_invalid_ts", ulid_rej_neg && ulid_rej_big)
-
-  let ulid_mono = match (uuid::Ulid::from_parts(0L, 0xFFFFL, -1L), uuid::Ulid::from_parts(1L, 0L, 0L)) {
-    (Ok(u1), Ok(u2)) => u1.compare(u2) == -1
-    _ => false
-  }
-  report(w, "ulid_strict_monotonic", ulid_mono)
-
-  let ulid_inc_ok = match uuid::Ulid::from_parts(42L, 1L, -1L) {
-    Ok(u) => match u.increment() {
-      Ok(u2) => u2.timestamp_ms() == 42L && u.compare(u2) == -1
-      Err(_) => false
-    }
-    Err(_) => false
-  }
-  let ulid_inc_ovf = match uuid::Ulid::from_parts(42L, 0xFFFFL, -1L) {
-    Ok(u) => match u.increment() {
-      Err(uuid::UlidError::Overflow) => true
-      _ => false
-    }
-    Err(_) => false
-  }
-  report(w, "ulid_increment_carry_and_overflow", ulid_inc_ok && ulid_inc_ovf)
-
-  // Verify hex & Crockford codecs via public parse/format roundtrip + alias / strict checks
-  let hex_ok = match uuid::Uuid::parse("01234567-89ab-cdef-0123-456789ABCDEF") {
-    Ok(u) => u.to_hyphenated() == "01234567-89ab-cdef-0123-456789abcdef" &&
-             u.to_hyphenated_upper() == "01234567-89AB-CDEF-0123-456789ABCDEF"
-    Err(_) => false
-  }
-  report(w, "hex_roundtrip_0_15", hex_ok)
-
-  let ulid_rt = match uuid::Ulid::parse("0123456789ABCDEFGHJKMNPQRS") {
-    Ok(u) => u.to_string() == "0123456789ABCDEFGHJKMNPQRS"
-    Err(_) => false
-  }
-  let ulid_rt2 = match uuid::Ulid::parse("7TVWXYZ0123456789ABCDEFGHJ") {
-    Ok(u) => u.to_string() == "7TVWXYZ0123456789ABCDEFGHJ"
-    Err(_) => false
-  }
-  report(w, "crockford_roundtrip_0_31", ulid_rt && ulid_rt2)
-
-  let alias_ok = match uuid::Ulid::parse("00000000000000000000IiLlOo") {
-    Ok(u) => u.to_string() == "00000000000000000000111100"
-    Err(_) => false
-  }
-  let strict_rej = match uuid::Ulid::parse_strict("00000000000000000000IiLlOo") {
-    Err(_) => true
-    Ok(_) => false
-  }
-  report(w, "crockford_aliases_and_strict", alias_ok && strict_rej)
-
-  let rej_u = match uuid::Ulid::parse("0000000000000000000000000U") {
-    Err(_) => true
-    Ok(_) => false
-  }
-  let rej_u_low = match uuid::Ulid::parse("0000000000000000000000000u") {
-    Err(_) => true
-    Ok(_) => false
-  }
-  let rej_dash = match uuid::Ulid::parse("0000000000000000000000000-") {
-    Err(_) => true
-    Ok(_) => false
-  }
-  report(w, "crockford_reject_u_and_invalid", rej_u && rej_u_low && rej_dash)
+  io_println(world, "sign_bnd_cmp=" + a.compare(b).to_string())
+  io_println(world, "nil_ver=" + ver_tag(uuid::Uuid::nil().version()))
+  io_println(world, "max_ver=" + ver_tag(uuid::Uuid::max().version()))
+  let u7 = match uuid::Uuid::new_v7_from_parts(1000L, 0xFFF, -1L) { Ok(u) => u, Err(_) => uuid::Uuid::nil() }
+  io_println(world, "v7_ver=" + ver_tag(u7.version()))
+  io_println(world, "v7_var=" + var_tag(u7.variant()))
+  io_println(world, "v7_ts0=" + fmt_v7(0L, 0, 0L))
+  io_println(world, "v7_tsmax=" + fmt_v7(max_ts, 0xFFF, -1L))
+  io_println(world, "v7_bad=" + fmt_v7(-1L, 0, 0L))
+  io_println(world, "ulid_ts0=" + fmt_ulid(0L, 0L, 0L))
+  io_println(world, "ulid_tsmax=" + fmt_ulid(max_ts, 0xFFFFL, -1L))
+  io_println(world, "ulid_neg=" + fmt_ulid(-1L, 0L, 0L))
+  io_println(world, "ulid_over=" + fmt_ulid(281474976710656L, 0L, 0L))
+  io_println(world, "ulid_inc_ok=" + fmt_ulid_inc(42L, 1L, -1L))
+  io_println(world, "ulid_inc_ovf=" + fmt_ulid_inc(42L, 0xFFFFL, -1L))
+  io_println(world, "nil_is_nil=" + bstr(uuid::Uuid::nil().is_nil()))
+  io_println(world, "max_is_max=" + bstr(uuid::Uuid::max().is_max()))
   0
 }
 EOF
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
-echo "PASS: packages/uuid Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

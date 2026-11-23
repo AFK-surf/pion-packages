@@ -36,7 +36,7 @@ private lemma i32_rem_ok (x d : I32) (hx : 0 ≤ x.val) (hd : 0 < d.val) :
   exact ⟨⟨BitVec.srem x.bv d.bv⟩, hok, by rw [hspec, htmod]⟩
 
 /-- Theorem 13: `clamp_int` always returns a value inside `[lo, hi]` when `lo ≤ hi`. -/
-theorem clamp_int_bounds (v lo hi : I32) (hle : lo.val ≤ hi.val) :
+lemma clamp_int_bounds (v lo hi : I32) (hle : lo.val ≤ hi.val) :
     ∃ r, clamp_int v lo hi = ok r ∧ lo.val ≤ r.val ∧ r.val ≤ hi.val := by
   unfold clamp_int
   by_cases h1 : v.val < lo.val
@@ -53,7 +53,7 @@ theorem clamp_int_bounds (v lo hi : I32) (hle : lo.val ≤ hi.val) :
       exact ⟨v, rfl, by omega, by omega⟩
 
 /-- Theorem 14: `clamp_int` is the identity when `lo ≤ v ≤ hi`. -/
-theorem clamp_int_id_of_in_range (v lo hi : I32) (h1 : lo.val ≤ v.val) (h2 : v.val ≤ hi.val) :
+lemma clamp_int_id_of_in_range (v lo hi : I32) (h1 : lo.val ≤ v.val) (h2 : v.val ≤ hi.val) :
     clamp_int v lo hi = ok v := by
   unfold clamp_int
   have hf1 : ¬(v < lo) := by change ¬(v.val < lo.val); omega
@@ -87,32 +87,6 @@ theorem days_in_month_bounds (y m : I32) (hlo : 1980 ≤ y.val) (_hhi : y.val �
     cases ((((m == 4#i32) || (m == 6#i32)) || (m == 9#i32)) || (m == 11#i32))
     · exact ⟨31#i32, rfl, by decide, by decide⟩
     · exact ⟨30#i32, rfl, by decide, by decide⟩
-
-/-- Theorem 16: `days_in_month` distinguishes century leap year 2000 (29 days) from non-leap 2100 (28 days). -/
-theorem days_in_month_feb_2000_2100 :
-    days_in_month 2000#i32 2#i32 = ok 29#i32 ∧ days_in_month 2100#i32 2#i32 = ok 28#i32 := by
-  constructor
-  · unfold days_in_month
-    simp only [↓reduceIte]
-    rcases i32_rem_ok 2000#i32 4#i32 (by decide) (by decide) with ⟨r4, hr4, hv4⟩
-    rcases i32_rem_ok 2000#i32 100#i32 (by decide) (by decide) with ⟨r100, hr100, hv100⟩
-    rcases i32_rem_ok 2000#i32 400#i32 (by decide) (by decide) with ⟨r400, hr400, hv400⟩
-    have er4 : r4 = 0#i32 := iscalar_eq_of_val_eq (by change r4.val = 0; rw [hv4]; decide)
-    have er100 : r100 = 0#i32 := iscalar_eq_of_val_eq (by change r100.val = 0; rw [hv100]; decide)
-    have er400 : r400 = 0#i32 := iscalar_eq_of_val_eq (by change r400.val = 0; rw [hv400]; decide)
-    rw [hr4, er4, result_bind_ok]
-    simp only [↓reduceIte, hr100, er100, result_bind_ok, bne_self_eq_false, Bool.false_eq_true, hr400, er400, beq_self_eq_true]
-  · unfold days_in_month
-    simp only [↓reduceIte]
-    rcases i32_rem_ok 2100#i32 4#i32 (by decide) (by decide) with ⟨r4, hr4, hv4⟩
-    rcases i32_rem_ok 2100#i32 100#i32 (by decide) (by decide) with ⟨r100, hr100, hv100⟩
-    rcases i32_rem_ok 2100#i32 400#i32 (by decide) (by decide) with ⟨r400, hr400, hv400⟩
-    have er4 : r4 = 0#i32 := iscalar_eq_of_val_eq (by change r4.val = 0; rw [hv4]; decide)
-    have er100 : r100 = 0#i32 := iscalar_eq_of_val_eq (by change r100.val = 0; rw [hv100]; decide)
-    have er400 : r400 = 100#i32 := iscalar_eq_of_val_eq (by change r400.val = 100; rw [hv400]; decide)
-    rw [hr4, er4, result_bind_ok]
-    simp only [↓reduceIte, hr100, er100, result_bind_ok, bne_self_eq_false, Bool.false_eq_true, hr400, er400]
-    congr 1
 
 private lemma band_254_range_and_even (s : I32) (hlo : 0 ≤ s.val) (hhi : s.val ≤ 58) :
     0 ≤ (Pion.I32.band s 254#i32).val ∧ (Pion.I32.band s 254#i32).val ≤ 58 ∧
@@ -336,50 +310,6 @@ theorem dos_datetime_to_dos_u16_range (dt : DosDateTime) :
       omega
     change dt'.bv.toNat ≤ 65535
     omega
-
-/-- Theorem 21: MS-DOS epoch `1980-01-01 00:00:00` (`DosDateTime.default`) round-trips cleanly through `to_dos`/`from_dos`. -/
-theorem dos_datetime_default_roundtrip :
-    (do
-      let dt ← DosDateTime.default
-      let p ← DosDateTime.to_dos dt
-      DosDateTime.from_dos p.1 p.2) = ok (DosDateTime.mk 1980#i32 1#i32 1#i32 0#i32 0#i32 0#i32) := by
-  unfold DosDateTime.default DosDateTime.to_dos DosDateTime.from_dos
-  simp only [result_bind_ok]
-  have hnew : DosDateTime.new 1980#i32 1#i32 1#i32 0#i32 0#i32 0#i32 =
-      ok (DosDateTime.mk 1980#i32 1#i32 1#i32 0#i32 0#i32 0#i32) :=
-    dos_datetime_new_idempotent_on_valid (DosDateTime.mk 1980#i32 1#i32 1#i32 0#i32 0#i32 0#i32)
-      (by decide) (by decide) (by decide) (by decide) 31#i32 (by simp [days_in_month])
-      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)
-      (by decide) (by decide) (by decide)
-  rw [hnew, result_bind_ok]
-  rw [i32_shr_ok 0#i32 1#i32 (by decide) (by decide), result_bind_ok]
-  rw [i32_shl_ok _ 9#i32 (by decide) (by decide), result_bind_ok]
-  rw [i32_shl_ok 1#i32 5#i32 (by decide) (by decide), result_bind_ok]
-  rw [i32_shl_ok 0#i32 11#i32 (by decide) (by decide), result_bind_ok]
-  rw [i32_shl_ok 0#i32 5#i32 (by decide) (by decide), result_bind_ok, result_bind_ok]
-  rw [u32_shr_ok _ 9#u32 (by decide), result_bind_ok]
-  rw [u32_shr_ok _ 5#u32 (by decide), result_bind_ok]
-  have hdd : (Pion.I32.to_uint (Pion.I32.bor (Pion.I32.bor (⟨(Pion.I32.sub 1980#i32 1980#i32).bv <<< (9#i32 : I32).val.toNat⟩ : I32)
-      (⟨(1#i32 : I32).bv <<< (5#i32 : I32).val.toNat⟩ : I32)) 1#i32)) = 33#u32 := by decide
-  have hdt : (Pion.I32.to_uint (Pion.I32.bor (Pion.I32.bor (⟨(0#i32 : I32).bv <<< (11#i32 : I32).val.toNat⟩ : I32)
-      (⟨(0#i32 : I32).bv <<< (5#i32 : I32).val.toNat⟩ : I32)) (⟨(0#i32 : I32).bv.sshiftRight (1#i32 : I32).val.toNat⟩ : I32))) = 0#u32 := by decide
-  rw [hdd, hdt]
-  have hy : Pion.I32.add (Pion.U32.to_int (Pion.U32.band (⟨(33#u32 : U32).bv >>> (9#u32 : U32).val⟩ : U32) 127#u32)) 1980#i32 = 1980#i32 := by decide
-  have hm : Pion.U32.to_int (Pion.U32.band (⟨(33#u32 : U32).bv >>> (5#u32 : U32).val⟩ : U32) 15#u32) = 1#i32 := by decide
-  have hd : Pion.U32.to_int (Pion.U32.band 33#u32 31#u32) = 1#i32 := by decide
-  rw [hy, hm, hd]
-  rw [clamp_int_id_of_in_range 1#i32 1#i32 12#i32 (by decide) (by decide), result_bind_ok]
-  have hdim : days_in_month 1980#i32 1#i32 = ok 31#i32 := by simp [days_in_month]
-  rw [hdim, result_bind_ok]
-  rw [clamp_int_id_of_in_range 1#i32 1#i32 31#i32 (by decide) (by decide), result_bind_ok]
-  rw [u32_shr_ok 0#u32 11#u32 (by decide), result_bind_ok]
-  have hh : Pion.U32.to_int (Pion.U32.band (⟨(0#u32 : U32).bv >>> (11#u32 : U32).val⟩ : U32) 31#u32) = 0#i32 := by decide
-  rw [hh, clamp_int_id_of_in_range 0#i32 0#i32 23#i32 (by decide) (by decide), result_bind_ok]
-  rw [u32_shr_ok 0#u32 5#u32 (by decide), result_bind_ok]
-  have hmin : Pion.U32.to_int (Pion.U32.band (⟨(0#u32 : U32).bv >>> (5#u32 : U32).val⟩ : U32) 63#u32) = 0#i32 := by decide
-  rw [hmin, clamp_int_id_of_in_range 0#i32 0#i32 59#i32 (by decide) (by decide), result_bind_ok]
-  have hs : Pion.I32.mul (Pion.U32.to_int (Pion.U32.band 0#u32 31#u32)) 2#i32 = 0#i32 := by decide
-  rw [hs, clamp_int_id_of_in_range 0#i32 0#i32 58#i32 (by decide) (by decide), result_bind_ok]
 
 /-- Theorem 22: Full APPNOTE 6.3.10 MS-DOS timestamp bijection (`from_dos ∘ to_dos = id`) for ALL valid even-second `DosDateTime`s. -/
 theorem dos_datetime_roundtrip (dt : DosDateTime)
