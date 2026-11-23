@@ -1,0 +1,1023 @@
+///| Memory-bounded Hybrid Lazy DFA for O(1)-per-byte linear-time matching.
+///| Supports:
+///| - Leftmost-first single-regex forward search (with priority-ordered break-on-match).
+///| - Reverse anchored search (to locate exact leftmost match start).
+///| - Multi-pattern `RegexSet` all-matches search in a single O(N) pass.
+///| - Full support for `^`, `$`, `\A`, `\z`, `(?m)^`, `(?m)$` anchors.
+///| - Automatic bounded cache flush (~16 MiB cap) so memory never blows up.
+
+///| Lazy DFA mode.
+pub enum DfaMode {
+  LeftmostFirst // single regex forward: break-on-match in priority order
+  Reverse // single regex reverse: keep all states to find leftmost start
+  SetAll // RegexSet: collect all matching pattern IDs
+}
+
+///| On-demand Lazy DFA cache attached to an `Nfa`.
+pub struct LazyDfa {
+  nfa : Nfa
+  mode : DfaMode
+  stride : Int
+  nl_cls : Int // byte class of '\n' (10)
+  // Cache state:
+  // row 0 = unused; rows 1.. = valid states
+  // trans[sid * stride + cls]: 0 = uncomputed, -1 = dead, > 0 = next_sid * stride
+  trans : Array[Int]
+  sets : Array[Array[Int]] // sid -> NFA state list (ordered for LeftmostFirst, sorted for Reverse/SetAll)
+  has_match : Array[Bool] // sid -> unconditional match at current pos
+  match_at_nl : Array[Bool] // sid -> match if next byte is '\n' (EndLine)
+  match_at_eoi : Array[Bool] // sid -> match at end-of-input (EndText / EndLine)
+  match_pids : Array[Array[Int]] // for SetAll: unconditional pids
+  match_pids_nl : Array[Array[Int]] // for SetAll: EndLine pids
+  match_pids_eoi : Array[Array[Int]] // for SetAll: EOI pids
+  mut total_set_ints : Int
+  // Start state offsets (sid * stride), -1 = dead, 0 = not initialized
+  mut start_anch_0 : Int
+  mut start_anch_nl : Int
+  mut start_anch_mid : Int
+  mut start_unanch_0 : Int
+  mut start_unanch_nl : Int
+  mut start_unanch_mid : Int
+  mut ready : Bool
+  // Open-addressing hash table: state set -> sid
+  mut tbl_mask : Int
+  mut tbl_buckets : Array[Int]
+  mut tbl_hashes : Array[Int64]
+  mut tbl_count : Int
+  // Reusable epsilon-closure scratch
+  eps_vis : Array[Int]
+  mut eps_gen : Int
+  eps_stack : Array[Int]
+  // Reusable RegexSet hit-dedup scratch (zero allocation per matches_into call)
+  set_hit_gen : Array[Int]
+  mut set_gen : Int
+}
+
+///| Create a new Lazy DFA wrapper for `nfa` (cache allocated lazily on first use).
+pub fn LazyDfa::new(nfa : Nfa, mode : DfaMode) -> LazyDfa {
+  let nl_cls = nfa.byte_classes[10]
+  LazyDfa::{
+    nfa,
+    mode,
+    stride: nfa.stride,
+    nl_cls,
+    trans: Array::new(),
+    sets: Array::new(),
+    has_match: Array::new(),
+    match_at_nl: Array::new(),
+    match_at_eoi: Array::new(),
+    match_pids: Array::new(),
+    match_pids_nl: Array::new(),
+    match_pids_eoi: Array::new(),
+    total_set_ints: 0,
+    start_anch_0: 0,
+    start_anch_nl: 0,
+    start_anch_mid: 0,
+    start_unanch_0: 0,
+    start_unanch_nl: 0,
+    start_unanch_mid: 0,
+    ready: false,
+    tbl_mask: 0,
+    tbl_buckets: Array::new(),
+    tbl_hashes: Array::new(),
+    tbl_count: 0,
+    eps_vis: Array::new(),
+    eps_gen: 0,
+    eps_stack: Array::new(),
+    set_hit_gen: Array::new(),
+    set_gen: 0,
+  }
+}
+
+fn dfa_hash_set(arr : Array[Int]) -> Int64 {
+  let mut h : Int64 = -3750763034362895579L
+  let mut i = 0
+  let n = arr.length()
+  while i < n {
+    h = (h ^ arr[i].to_int64()) * 1099511628211L
+    i = i + 1
+  }
+  h
+}
+
+fn dfa_eq_set(a : Array[Int], b : Array[Int]) -> Bool {
+  let n = a.length()
+  if n != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn dfa_is_leftmost(mode : DfaMode) -> Bool {
+  match mode {
+    DfaMode::LeftmostFirst => true
+    _ => false
+  }
+}
+
+fn dfa_is_set_all(mode : DfaMode) -> Bool {
+  match mode {
+    DfaMode::SetAll => true
+    _ => false
+  }
+}
+
+fn dfa_push_unique(arr : Array[Int], v : Int) -> Unit {
+  let mut i = 0
+  let n = arr.length()
+  while i < n {
+    if arr[i] == v {
+      return
+    }
+    i = i + 1
+  }
+  arr.push(v)
+}
+
+///| Compute epsilon closure from `seed_states` given `(at_start_text, at_start_line)`.
+///| Returns `(nfa_set, has_match, match_at_nl, match_at_eoi, pids, pids_nl, pids_eoi)`.
+fn LazyDfa::eps_closure(
+  self : LazyDfa,
+  seeds : Array[Int],
+  at_start_text : Bool,
+  at_start_line : Bool,
+) -> (Array[Int], Bool, Bool, Bool, Array[Int], Array[Int], Array[Int]) {
+  self.eps_gen = self.eps_gen + 1
+  let gen = self.eps_gen
+  let vis = self.eps_vis
+  let states = self.nfa.states
+  let stack = self.eps_stack
+  stack.clear()
+
+  // Push seeds in reverse so seeds[0] is popped first (preserving priority order)
+  let mut k = seeds.length() - 1
+  while k >= 0 {
+    stack.push(seeds[k])
+    k = k - 1
+  }
+
+  let leftmost = dfa_is_leftmost(self.mode)
+  let set_all = dfa_is_set_all(self.mode)
+  let out : Array[Int] = Array::new()
+  let mut m_now = false
+  let mut m_nl = false
+  let mut m_eoi = false
+  let pids : Array[Int] = Array::new()
+  let pids_nl : Array[Int] = Array::new()
+  let pids_eoi : Array[Int] = Array::new()
+
+  // Collect states behind EndLine / EndText for secondary conditional match check
+  let end_line_targets : Array[Int] = Array::new()
+  let end_text_targets : Array[Int] = Array::new()
+
+  while stack.length() > 0 {
+    let cur = match stack.pop() {
+      Some(v) => v
+      None => break
+    }
+    if vis[cur] == gen {
+      continue
+    }
+    vis[cur] = gen
+    let st = states[cur]
+    match st.kind {
+      NfaKind::Split => {
+        if st.out2 >= 0 && vis[st.out2] != gen {
+          stack.push(st.out2)
+        }
+        if st.out1 >= 0 && vis[st.out1] != gen {
+          stack.push(st.out1)
+        }
+      }
+      NfaKind::Capture(_) =>
+      if st.out1 >= 0 && vis[st.out1] != gen {
+        stack.push(st.out1)
+      }
+      NfaKind::Look(lk) =>
+      match lk {
+        LookKind::StartText =>
+        if at_start_text && st.out1 >= 0 && vis[st.out1] != gen {
+          stack.push(st.out1)
+        }
+        LookKind::StartLine =>
+        if at_start_line && st.out1 >= 0 && vis[st.out1] != gen {
+          stack.push(st.out1)
+        }
+        LookKind::EndLine => {
+          // Keep EndLine state in `out` so step_lazy on '\n' can follow it,
+          // AND check if it reaches Match at '\n' or EOI!
+          out.push(cur)
+          if st.out1 >= 0 {
+            end_line_targets.push(st.out1)
+          }
+        }
+        LookKind::EndText =>
+        if st.out1 >= 0 {
+          end_text_targets.push(st.out1)
+        }
+        _ => ()
+      }
+      NfaKind::Match(pid) => {
+        m_now = true
+        if set_all {
+          dfa_push_unique(pids, pid)
+        }
+        if leftmost {
+          // Break-on-match: drop all lower-priority NFA states!
+          break
+        }
+      }
+      _ => out.push(cur)
+    }
+  }
+
+  // Secondary check: do any EndLine targets reach Match?
+  if end_line_targets.length() > 0 {
+    self.eps_gen = self.eps_gen + 1
+    let g2 = self.eps_gen
+    stack.clear()
+    let mut i = end_line_targets.length() - 1
+    while i >= 0 {
+      stack.push(end_line_targets[i])
+      i = i - 1
+    }
+    while stack.length() > 0 {
+      let cur = match stack.pop() {
+        Some(v) => v
+        None => break
+      }
+      if vis[cur] == g2 {
+        continue
+      }
+      vis[cur] = g2
+      let st = states[cur]
+      match st.kind {
+        NfaKind::Split => {
+          if st.out2 >= 0 {
+            stack.push(st.out2)
+          }
+          if st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+        }
+        NfaKind::Capture(_) =>
+        if st.out1 >= 0 {
+          stack.push(st.out1)
+        }
+        NfaKind::Look(lk) =>
+        match lk {
+          LookKind::EndLine | LookKind::EndText =>
+          if st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+          LookKind::StartText =>
+          if at_start_text && st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+          LookKind::StartLine =>
+          if at_start_line && st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+          _ => ()
+        }
+        NfaKind::Match(pid) => {
+          m_nl = true
+          m_eoi = true
+          if set_all {
+            dfa_push_unique(pids_nl, pid)
+            dfa_push_unique(pids_eoi, pid)
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+
+  // Secondary check: do any EndText targets reach Match at EOI?
+  if end_text_targets.length() > 0 {
+    self.eps_gen = self.eps_gen + 1
+    let g3 = self.eps_gen
+    stack.clear()
+    let mut i = end_text_targets.length() - 1
+    while i >= 0 {
+      stack.push(end_text_targets[i])
+      i = i - 1
+    }
+    while stack.length() > 0 {
+      let cur = match stack.pop() {
+        Some(v) => v
+        None => break
+      }
+      if vis[cur] == g3 {
+        continue
+      }
+      vis[cur] = g3
+      let st = states[cur]
+      match st.kind {
+        NfaKind::Split => {
+          if st.out2 >= 0 {
+            stack.push(st.out2)
+          }
+          if st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+        }
+        NfaKind::Capture(_) =>
+        if st.out1 >= 0 {
+          stack.push(st.out1)
+        }
+        NfaKind::Look(lk) =>
+        match lk {
+          LookKind::EndText | LookKind::EndLine =>
+          if st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+          LookKind::StartText =>
+          if at_start_text && st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+          LookKind::StartLine =>
+          if at_start_line && st.out1 >= 0 {
+            stack.push(st.out1)
+          }
+          _ => ()
+        }
+        NfaKind::Match(pid) => {
+          m_eoi = true
+          if set_all {
+            dfa_push_unique(pids_eoi, pid)
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+
+  // Include flags in the state key when has_match/m_nl/m_eoi differ for identical consuming sets
+  // Append sentinel negative markers so two states with different match flags never collide!
+  let mut tag = 0
+  if m_now {
+    tag = tag | 1
+  }
+  if m_nl {
+    tag = tag | 2
+  }
+  if m_eoi {
+    tag = tag | 4
+  }
+  if tag != 0 {
+    out.push(-10 - tag)
+  }
+  if set_all {
+    // Also encode pids in key if non-empty
+    let mut p = 0
+    while p < pids.length() {
+      out.push(-1000 - pids[p])
+      p = p + 1
+    }
+    p = 0
+    while p < pids_nl.length() {
+      out.push(-100000 - pids_nl[p])
+      p = p + 1
+    }
+    p = 0
+    while p < pids_eoi.length() {
+      out.push(-10000000 - pids_eoi[p])
+      p = p + 1
+    }
+  }
+
+  (out, m_now, m_nl, m_eoi, pids, pids_nl, pids_eoi)
+}
+
+fn LazyDfa::rehash(self : LazyDfa, new_cap : Int) -> Unit {
+  let mask = new_cap - 1
+  let buckets : Array[Int] = Array::new()
+  let hashes : Array[Int64] = Array::new()
+  let mut i = 0
+  while i < new_cap {
+    buckets.push(-1)
+    hashes.push(0L)
+    i = i + 1
+  }
+  let old_b = self.tbl_buckets
+  let old_h = self.tbl_hashes
+  let mut k = 0
+  while k < old_b.length() {
+    let sid = old_b[k]
+    if sid >= 0 {
+      let h = old_h[k]
+      let mut slot = h.to_int() & mask
+      while buckets[slot] >= 0 {
+        slot = (slot + 1) & mask
+      }
+      buckets[slot] = sid
+      hashes[slot] = h
+    }
+    k = k + 1
+  }
+  self.tbl_mask = mask
+  self.tbl_buckets = buckets
+  self.tbl_hashes = hashes
+}
+
+fn LazyDfa::lookup(self : LazyDfa, set : Array[Int], h : Int64) -> Int {
+  let mask = self.tbl_mask
+  let buckets = self.tbl_buckets
+  let hashes = self.tbl_hashes
+  let mut slot = h.to_int() & mask
+  while true {
+    let sid = buckets[slot]
+    if sid < 0 {
+      return -1
+    }
+    if hashes[slot] == h && dfa_eq_set(self.sets[sid], set) {
+      return sid
+    }
+    slot = (slot + 1) & mask
+  }
+  -1
+}
+
+fn LazyDfa::insert(
+  self : LazyDfa,
+  set : Array[Int],
+  h : Int64,
+  m_now : Bool,
+  m_nl : Bool,
+  m_eoi : Bool,
+  pids : Array[Int],
+  pids_nl : Array[Int],
+  pids_eoi : Array[Int],
+) -> Int {
+  let sid = self.sets.length()
+  self.sets.push(set)
+  self.has_match.push(m_now)
+  self.match_at_nl.push(m_nl)
+  self.match_at_eoi.push(m_eoi)
+  self.match_pids.push(pids)
+  self.match_pids_nl.push(pids_nl)
+  self.match_pids_eoi.push(pids_eoi)
+  self.total_set_ints = self.total_set_ints + set.length()
+  let mut c = 0
+  while c < self.stride {
+    self.trans.push(0)
+    c = c + 1
+  }
+  if (self.tbl_count + 1) * 10 >= (self.tbl_mask + 1) * 7 {
+    self.rehash((self.tbl_mask + 1) * 2)
+  }
+  let mask = self.tbl_mask
+  let mut slot = h.to_int() & mask
+  while self.tbl_buckets[slot] >= 0 {
+    slot = (slot + 1) & mask
+  }
+  self.tbl_buckets[slot] = sid
+  self.tbl_hashes[slot] = h
+  self.tbl_count = self.tbl_count + 1
+  sid
+}
+
+fn LazyDfa::reset_cache(self : LazyDfa) -> Unit {
+  self.trans.clear()
+  self.sets.clear()
+  self.has_match.clear()
+  self.match_at_nl.clear()
+  self.match_at_eoi.clear()
+  self.match_pids.clear()
+  self.match_pids_nl.clear()
+  self.match_pids_eoi.clear()
+  self.total_set_ints = 0
+  // Row 0 = unused dummy row
+  self.sets.push([])
+  self.has_match.push(false)
+  self.match_at_nl.push(false)
+  self.match_at_eoi.push(false)
+  self.match_pids.push([])
+  self.match_pids_nl.push([])
+  self.match_pids_eoi.push([])
+  let mut i = 0
+  while i < self.stride {
+    self.trans.push(0)
+    i = i + 1
+  }
+  let init_cap = 64
+  let buckets : Array[Int] = Array::new()
+  let hashes : Array[Int64] = Array::new()
+  i = 0
+  while i < init_cap {
+    buckets.push(-1)
+    hashes.push(0L)
+    i = i + 1
+  }
+  self.tbl_mask = init_cap - 1
+  self.tbl_buckets = buckets
+  self.tbl_hashes = hashes
+  self.tbl_count = 0
+  self.start_anch_0 = 0
+  self.start_anch_nl = 0
+  self.start_anch_mid = 0
+  self.start_unanch_0 = 0
+  self.start_unanch_nl = 0
+  self.start_unanch_mid = 0
+}
+
+fn LazyDfa::ensure_ready(self : LazyDfa) -> Unit {
+  if self.ready {
+    return
+  }
+  let n = self.nfa.states.length()
+  while self.eps_vis.length() < n {
+    self.eps_vis.push(0)
+  }
+  self.reset_cache()
+  self.ready = true
+}
+
+fn LazyDfa::get_or_insert_closure(
+  self : LazyDfa,
+  seeds : Array[Int],
+  at_start_text : Bool,
+  at_start_line : Bool,
+) -> Int {
+  let (set, m_now, m_nl, m_eoi, pids, pids_nl, pids_eoi) = self.eps_closure(
+    seeds,
+    at_start_text,
+    at_start_line,
+  )
+  if set.length() == 0 {
+    return -1
+  }
+  let h = dfa_hash_set(set)
+  let existing = self.lookup(set, h)
+  if existing >= 0 {
+    return existing * self.stride
+  }
+  if self.sets.length() >= 8192 ||
+  self.total_set_ints + set.length() > 2000000 ||
+  self.trans.length() + self.stride > 2000000 {
+    self.reset_cache()
+    let after = self.lookup(set, h)
+    if after >= 0 {
+      return after * self.stride
+    }
+    let fresh = self.insert(set, h, m_now, m_nl, m_eoi, pids, pids_nl, pids_eoi)
+    return fresh * self.stride
+  }
+  let nid = self.insert(set, h, m_now, m_nl, m_eoi, pids, pids_nl, pids_eoi)
+  nid * self.stride
+}
+
+fn LazyDfa::get_start(
+  self : LazyDfa,
+  anchored : Bool,
+  at_start_text : Bool,
+  at_start_line : Bool,
+) -> Int {
+  self.ensure_ready()
+  if anchored {
+    if at_start_text {
+      if self.start_anch_0 == 0 {
+        self.start_anch_0 = self.get_or_insert_closure(
+          [self.nfa.start_anchored],
+          true,
+          true,
+        )
+      }
+      self.start_anch_0
+    } else if at_start_line {
+      if self.start_anch_nl == 0 {
+        self.start_anch_nl = self.get_or_insert_closure(
+          [self.nfa.start_anchored],
+          false,
+          true,
+        )
+      }
+      self.start_anch_nl
+    } else {
+      if self.start_anch_mid == 0 {
+        self.start_anch_mid = self.get_or_insert_closure(
+          [self.nfa.start_anchored],
+          false,
+          false,
+        )
+      }
+      self.start_anch_mid
+    }
+  } else if at_start_text {
+    if self.start_unanch_0 == 0 {
+      self.start_unanch_0 = self.get_or_insert_closure(
+        [self.nfa.start_unanchored],
+        true,
+        true,
+      )
+    }
+    self.start_unanch_0
+  } else if at_start_line {
+    if self.start_unanch_nl == 0 {
+      self.start_unanch_nl = self.get_or_insert_closure(
+        [self.nfa.start_unanchored],
+        false,
+        true,
+      )
+    }
+    self.start_unanch_nl
+  } else {
+    if self.start_unanch_mid == 0 {
+      self.start_unanch_mid = self.get_or_insert_closure(
+        [self.nfa.start_unanchored],
+        false,
+        false,
+      )
+    }
+    self.start_unanch_mid
+  }
+}
+
+///| Compute a missing transition `(cur_off, cls)` on demand.
+fn LazyDfa::step_lazy(self : LazyDfa, cur_off : Int, cls : Int) -> Int {
+  let stride = self.stride
+  let cur_id = cur_off / stride
+  let cur_set = self.sets[cur_id]
+  let rb = self.nfa.rep_bytes[cls]
+  let states = self.nfa.states
+  let is_nl = rb == 10
+
+  let seeds : Array[Int] = Array::new()
+  let mut i = 0
+  let ns = cur_set.length()
+  while i < ns {
+    let nid = cur_set[i]
+    if nid < 0 {
+      // Sentinel tag
+      i = i + 1
+      continue
+    }
+    let st = states[nid]
+    match st.kind {
+      NfaKind::Look(LookKind::EndLine) =>
+      if is_nl && st.out1 >= 0 {
+        // EndLine succeeded before '\n': follow epsilon to find consuming states for '\n'
+        let sub_stack : Array[Int] = [st.out1]
+        self.eps_gen = self.eps_gen + 1
+        let sg = self.eps_gen
+        while sub_stack.length() > 0 {
+          let sc = match sub_stack.pop() {
+            Some(v) => v
+            None => break
+          }
+          if self.eps_vis[sc] == sg {
+            continue
+          }
+          self.eps_vis[sc] = sg
+          let sst = states[sc]
+          match sst.kind {
+            NfaKind::Split => {
+              if sst.out2 >= 0 {
+                sub_stack.push(sst.out2)
+              }
+              if sst.out1 >= 0 {
+                sub_stack.push(sst.out1)
+              }
+            }
+            NfaKind::Capture(_) | NfaKind::Look(LookKind::EndLine) =>
+            if sst.out1 >= 0 {
+              sub_stack.push(sst.out1)
+            }
+            _ =>
+            if nfa_state_matches_byte(sst.kind, rb) && sst.out1 >= 0 {
+              seeds.push(sst.out1)
+            }
+          }
+        }
+      }
+      _ =>
+      if nfa_state_matches_byte(st.kind, rb) && st.out1 >= 0 {
+        seeds.push(st.out1)
+      }
+    }
+    i = i + 1
+  }
+
+  let before_sets_len = self.sets.length()
+  let next_off = self.get_or_insert_closure(seeds, false, is_nl)
+  // Only cache in trans[cur_off + cls] if cache was NOT flushed during get_or_insert_closure
+  if self.sets.length() >= before_sets_len {
+    self.trans[cur_off + cls] = next_off
+  }
+  next_off
+}
+
+///| Fast forward Lazy DFA search returning leftmost-first `match_end` (>= 0), or -1 if no match.
+pub fn LazyDfa::find_end(
+  self : LazyDfa,
+  text : String,
+  start_pos : Int,
+  end_pos : Int,
+  anchored : Bool,
+) -> Int {
+  let at_start_text = start_pos == 0
+  let at_start_line = at_start_text || text.code_unit_at(start_pos - 1) == 10
+  let mut st = self.get_start(anchored, at_start_text, at_start_line)
+  if st < 0 {
+    return -1
+  }
+  let stride = self.stride
+  let byte_classes = self.nfa.byte_classes
+  let has_line = self.nfa.has_line_anchor
+  let mut trans = self.trans
+  let mut hm = self.has_match
+  let mut mnl = self.match_at_nl
+  let mut last_match = -1
+
+  // Optional FirstBytes prefilter acceleration when in unanchored start state
+  let start_unanch_mid = if !anchored && !has_line {
+    match self.nfa.prefilter {
+      Prefilter::FirstBytes(_) => self.get_start(false, false, false)
+      _ => -1
+    }
+  } else {
+    -1
+  }
+
+  let mut pos = start_pos
+  while pos < end_pos {
+    let sid = st / stride
+    if hm[sid] {
+      last_match = pos
+    } else if has_line && mnl[sid] && text.code_unit_at(pos) == 10 {
+      last_match = pos
+    }
+    // Fast skip when in unanchored mid start state with FirstBytes prefilter
+    if st == start_unanch_mid && last_match < 0 {
+      match self.nfa.prefilter {
+        Prefilter::FirstBytes(tbl) => {
+          while pos < end_pos && tbl[text.code_unit_at(pos)] == 0 {
+            pos = pos + 1
+          }
+          if pos >= end_pos {
+            break
+          }
+        }
+        _ => ()
+      }
+    }
+    let cls = byte_classes[text.code_unit_at(pos)]
+    let nxt = trans[st + cls]
+    if nxt > 0 {
+      st = nxt
+    } else if nxt < 0 {
+      return last_match
+    } else {
+      st = self.step_lazy(st, cls)
+      if st < 0 {
+        return last_match
+      }
+      trans = self.trans
+      hm = self.has_match
+      mnl = self.match_at_nl
+    }
+    pos = pos + 1
+  }
+
+  // Check EOI match at end_pos
+  let sid = st / stride
+  if hm[sid] || (end_pos == text.length() && self.match_at_eoi[sid]) ||
+  (has_line && end_pos < text.length() && text.code_unit_at(end_pos) == 10 && mnl[sid]) {
+    last_match = end_pos
+  }
+  last_match
+}
+
+///| Fast `is_match` using Lazy DFA: returns `true` as soon as ANY match is reached!
+pub fn LazyDfa::is_match(
+  self : LazyDfa,
+  text : String,
+  start_pos : Int,
+  end_pos : Int,
+  anchored : Bool,
+) -> Bool {
+  let at_start_text = start_pos == 0
+  let at_start_line = at_start_text || text.code_unit_at(start_pos - 1) == 10
+  let mut st = self.get_start(anchored, at_start_text, at_start_line)
+  if st < 0 {
+    return false
+  }
+  let stride = self.stride
+  let byte_classes = self.nfa.byte_classes
+  let has_line = self.nfa.has_line_anchor
+  let mut trans = self.trans
+  let mut hm = self.has_match
+  let mut mnl = self.match_at_nl
+
+  let mut pos = start_pos
+  while pos < end_pos {
+    let sid = st / stride
+    if hm[sid] {
+      return true
+    }
+    if has_line && mnl[sid] && text.code_unit_at(pos) == 10 {
+      return true
+    }
+    let cls = byte_classes[text.code_unit_at(pos)]
+    let nxt = trans[st + cls]
+    if nxt > 0 {
+      st = nxt
+    } else if nxt < 0 {
+      return false
+    } else {
+      st = self.step_lazy(st, cls)
+      if st < 0 {
+        return false
+      }
+      trans = self.trans
+      hm = self.has_match
+      mnl = self.match_at_nl
+    }
+    pos = pos + 1
+  }
+
+  let sid = st / stride
+  hm[sid] || (end_pos == text.length() && self.match_at_eoi[sid]) ||
+  (has_line && end_pos < text.length() && text.code_unit_at(end_pos) == 10 && mnl[sid])
+}
+
+///| Reverse anchored Lazy DFA scan from `match_end` backwards down to `min_start`.
+///| Returns the leftmost (minimum) `match_start`, or -1 if none.
+pub fn LazyDfa::find_start_rev(
+  self : LazyDfa,
+  text : String,
+  min_start : Int,
+  match_end : Int,
+) -> Int {
+  let n = text.length()
+  // In reverse NFA, StartText = forward EndText (true iff match_end == n),
+  // StartLine = forward EndLine (true iff match_end == n || text[match_end] == '\n').
+  let at_start_text = match_end == n
+  let at_start_line = at_start_text || text.code_unit_at(match_end) == 10
+  let mut st = self.get_start(true, at_start_text, at_start_line)
+  if st < 0 {
+    return -1
+  }
+  let stride = self.stride
+  let byte_classes = self.nfa.byte_classes
+  let has_line = self.nfa.has_line_anchor
+  let mut trans = self.trans
+  let mut hm = self.has_match
+  let mut mnl = self.match_at_nl
+  let mut best_start = -1
+
+  let mut pos = match_end
+  while pos > min_start {
+    let sid = st / stride
+    if hm[sid] {
+      best_start = pos
+    } else if has_line && mnl[sid] && text.code_unit_at(pos - 1) == 10 {
+      best_start = pos
+    }
+    let b = text.code_unit_at(pos - 1)
+    let cls = byte_classes[b]
+    let nxt = trans[st + cls]
+    if nxt > 0 {
+      st = nxt
+    } else if nxt < 0 {
+      return best_start
+    } else {
+      st = self.step_lazy(st, cls)
+      if st < 0 {
+        return best_start
+      }
+      trans = self.trans
+      hm = self.has_match
+      mnl = self.match_at_nl
+    }
+    pos = pos - 1
+  }
+
+  let sid = st / stride
+  if hm[sid] || (min_start == 0 && self.match_at_eoi[sid]) ||
+  (has_line && min_start > 0 && text.code_unit_at(min_start - 1) == 10 && mnl[sid]) {
+    best_start = min_start
+  }
+  best_start
+}
+
+///| Single-pass `RegexSet` matching via Lazy DFA, writing sorted pattern IDs into `into`.
+pub fn LazyDfa::set_matches_into(
+  self : LazyDfa,
+  text : String,
+  start_pos : Int,
+  num_patterns : Int,
+  into : Array[Int],
+) -> Unit {
+  into.clear()
+  if num_patterns == 0 {
+    return
+  }
+  let at_start_text = start_pos == 0
+  let at_start_line = at_start_text || text.code_unit_at(start_pos - 1) == 10
+  let mut st = self.get_start(false, at_start_text, at_start_line)
+  if st < 0 {
+    return
+  }
+  while self.set_hit_gen.length() < num_patterns {
+    self.set_hit_gen.push(0)
+  }
+  self.set_gen = self.set_gen + 1
+  let hgen = self.set_gen
+  let hit = self.set_hit_gen
+  let mut hits_found = 0
+  let stride = self.stride
+  let byte_classes = self.nfa.byte_classes
+  let has_line = self.nfa.has_line_anchor
+  let mut trans = self.trans
+  let mut hm = self.has_match
+  let mut mnl = self.match_at_nl
+  let end_pos = text.length()
+  let mut pos = start_pos
+
+  while pos < end_pos {
+    let sid = st / stride
+    if hm[sid] {
+      let pids = self.match_pids[sid]
+      let mut k = 0
+      while k < pids.length() {
+        let p = pids[k]
+        if hit[p] != hgen {
+          hit[p] = hgen
+          hits_found = hits_found + 1
+        }
+        k = k + 1
+      }
+      if hits_found == num_patterns {
+        break
+      }
+    }
+    if has_line && mnl[sid] && text.code_unit_at(pos) == 10 {
+      let pids = self.match_pids_nl[sid]
+      let mut k = 0
+      while k < pids.length() {
+        let p = pids[k]
+        if hit[p] != hgen {
+          hit[p] = hgen
+          hits_found = hits_found + 1
+        }
+        k = k + 1
+      }
+      if hits_found == num_patterns {
+        break
+      }
+    }
+    let cls = byte_classes[text.code_unit_at(pos)]
+    let nxt = trans[st + cls]
+    if nxt > 0 {
+      st = nxt
+    } else if nxt < 0 {
+      break
+    } else {
+      st = self.step_lazy(st, cls)
+      if st < 0 {
+        break
+      }
+      trans = self.trans
+      hm = self.has_match
+      mnl = self.match_at_nl
+    }
+    pos = pos + 1
+  }
+
+  if st > 0 && pos == end_pos {
+    let sid = st / stride
+    if hm[sid] {
+      let pids = self.match_pids[sid]
+      let mut k = 0
+      while k < pids.length() {
+        hit[pids[k]] = hgen
+        k = k + 1
+      }
+    }
+    if self.match_at_eoi[sid] {
+      let pids = self.match_pids_eoi[sid]
+      let mut k = 0
+      while k < pids.length() {
+        hit[pids[k]] = hgen
+        k = k + 1
+      }
+    }
+  }
+
+  let mut i = 0
+  while i < num_patterns {
+    if hit[i] == hgen {
+      into.push(i)
+    }
+    i = i + 1
+  }
+}
