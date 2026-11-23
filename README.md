@@ -70,8 +70,9 @@ pionc add <package-name>
 | [`unicode_bidi`](packages/unicode_bidi) | `0.1.0` | Unicode 16.0.0 UAX #9 双向算法全流水线（P1–P3、X1–X10 隔离串、W1–W7、BD16 配对括号 N0–N2、I1–I2、L1–L4 重排与镜像），O(1) BMP 两级查表与可复用 `BidiScratch`、`Limits` 防栈炸弹，零依赖无 `World` | Rust [`unicode-bidi`](https://github.com/servo/unicode-bidi) `0.3.18` + Unicode 16.0.0 UCD 官方套件 | 11 / 11 | ✅ `wasm_smoke` | [Pure LTR 1.08× · Mixed 0.83× · Deep 0.91× · Reorder 0.70×（vs Rust）](BENCHMARKS.md#unicode_bidi) | `pionc add unicode_bidi --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`hyphenation`](packages/hyphenation) | `0.1.0` | Knuth-Liang 自动连字符引擎与紧凑 Double-Array Trie（DAT），内置完整 `hyph-en-us` 表（4,938 模式 + 1,441 例外）与可插拔 TeX 词典加载、`Limits` DoS 防护、全 Unicode 小写折叠与软连字符保留，零依赖无 `World` | Rust [`hyphenation`](https://github.com/tapeinos/hyphenation) `=0.8.4` + `hyph-utf8` 80 语种语料 | 11 / 11 | ✅ `wasm_smoke` | [bench100k 3.38× · 全词典 2.53× · 词典加载 1.02×（vs Rust）](BENCHMARKS.md#hyphenation) | `pionc add hyphenation --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`pdf`](packages/pdf) | `0.1.0` | ISO 32000-1 PDF 1.4 文档生成器与结构校验器：复用 `flate` 提供 `/FlateDecode`、PackBits `/RunLengthDecode`、14 种标准 Type 1 字体（WinAnsi）、2D 矢量绘图、RGB/RGBA（`BlendWhite`/`SoftMask`）/JPEG 图像与 `Limits` 预算，零 `World` | Rust [`pdf-writer`](https://github.com/typst/pdf-writer) `0.12.1` + `flate2 1.1` / `lopdf 0.35.0` | 8 / 8 | ✅ `wasm_smoke` | [RGBA Flate 0.98× · 100 页文本 0.64× · RLE 0.58×（vs Rust）](BENCHMARKS.md#pdf) | `pionc add pdf --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`fts`](packages/fts) | `0.1.0` | 多语言 + 代码感知全文检索：CJK 二元组 + 单字、与 SQLite FTS5 `unicode61`（`remove_diacritics 1`）一致的 Unicode 折叠、`CamelCase` / `snake_case` / `#PR` / 十六进制 SHA 分词，内存 Okapi BM25 倒排索引（与 FTS5 `bm25()` 排序与分值逐位一致）、短语 / 前缀 / `NOT` / 标签过滤与 UTF-8 安全的高亮摘要，零依赖无 `World` | SQLite [FTS5](https://www.sqlite.org/fts5.html) `3.54.0`（`unicode61 tokenchars '_'`，C + Python `sqlite3`） | 23 / 23 | ✅ `wasm_smoke` | [10k 文档 + 30 查询 0.71× · 10k 文档 + 600 查询 0.87×（vs C FTS5）](BENCHMARKS.md#fts) | `pionc add fts --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 39 个包合计 **4,423 / 4,423** 单测通过（`sh scripts/verify.sh`）。
+全仓 40 个包合计 **4,446 / 4,446** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -119,6 +120,10 @@ Wave 8 新增的 4 个包按 Red → Green → 红队审计 → 修复流程交�
 - **`pdf` `v0.1.0`**：8 / 8 单测（复用 `flate` 20 / 20），`audit` 30 / 30（2 P0 + 9 P1 + 14 P2 清零，`v_quadratic_40k` 提速 2,380×，全部生成文档通过 Rust `lopdf 0.35.0` 解析）；`images_flate` 达 Rust `pdf-writer 0.12.1` 的 **0.98×** 且峰值 RSS 更低（24.62 vs 27.61 MiB），`report100` 为 0.64×（4.11 vs 6.36 MiB），`images_rle` 为 0.58×。
 
 详见 [`BENCHMARKS.md`](BENCHMARKS.md#brotli)。
+
+### `fts` `v0.1.0`：第 40 个包
+
+`fts` 由兄弟团队（`group` IM 线）交付，经独立红队审计（[`packages/fts/audit/REDTEAM_AUDIT.md`](packages/fts/audit/REDTEAM_AUDIT.md)，无 P0；RT-1 / RT-2 两个 P1（Unicode 折叠与 FTS5 `unicode61` 不一致、假名浊点与 `・` 被当作 CJK 字母）与 RT-3–RT-6 四个 P2（摘要 `max_chars` 整数溢出、CJK 短语与 `#PR` 高亮不全、`bm25_score` 参数未净化产生 `NaN`、短语搜索逐短语重复分词）全部修复）后合入：23 / 23 单测（含 11 个红队测试）通过；`audit/difftest.py` 对 Python `sqlite3`（SQLite 3.54.0）FTS5 在 9 个种子、约 34,000 次查询与 21,600 次摘要上做 token / `MATCH` 表达式 / 结果排序与 BM25 分值（±1e-12）/ 摘要安全性差分，修复后 0 差异；`wasm_smoke` Native / Wasm32 × debug / `--release` 4 模式 stdout SHA-256 逐字节一致（`1ebc76fd…`）。头对头基准以 C SQLite FTS5（`-O3`，`:memory:`）为基线如实记录：10k 文档建索引 + 30 查询为 0.71×（快于 Python `sqlite3` 的 0.53×），10k 文档 + 600 查询为 0.87×（与 Python `sqlite3` 的 0.88× 基本持平）；峰值 RSS 25.41 MiB，高于 C 的 6.5 MiB。见 [`BENCHMARKS.md`](BENCHMARKS.md#fts)。
 
 ## 贡献与移植流程
 

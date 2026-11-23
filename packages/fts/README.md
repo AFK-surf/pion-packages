@@ -64,7 +64,7 @@ pionc build --release --target wasm32 -o "$W/release.wasm" packages/fts/wasm_smo
 node "$RT" "$W/debug.wasm" > "$W/wd.out"
 node "$RT" "$W/release.wasm" > "$W/wr.out"
 shasum -a 256 "$W"/*.out
-# 0beee5ef3a5922100e7b544d93fc8840af67fb8db1f32ccfb9bb226458623b40
+# 1ebc76fd113f109093c0d76af062b1300d6b6a5846920a24552ff45759715562
 ```
 
 ## Head-to-Head Benchmark

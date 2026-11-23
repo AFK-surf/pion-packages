@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 35 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 35 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–8 + `base64` + `effect` + `crypto` + Farview 沉淀波 1）
+## 基准总榜（v0.2.0 + Wave 4–8 + `base64` + `effect` + `crypto` + Farview 沉淀波 1 + `fts`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -194,6 +194,8 @@
 | `pdf` | 100 页矢量 + 文本报表（`/FlateDecode`） | 100 pages | 22.71 ms | 14.57 ms (`rust_pdf_writer`) | 0.64x | **4.11 MiB** | 6.36 MiB |
 | `pdf` | 10 页 800×600 RGBA 导出（`/FlateDecode`，14.4 MB RGB） | 14.4 MB | 75.77 ms | 74.52 ms (`rust_pdf_writer`) | 0.98x | **24.62 MiB** | 27.61 MiB |
 | `pdf` | 10 页 800×600 RGBA 导出（`/RunLengthDecode`，14.4 MB RGB） | 14.4 MB | 64.56 ms | 37.54 ms (`rust_pdf_writer`) | 0.58x | 55.41 MiB | 38.20 MiB |
+| `fts` | 10,000 文档建索引 + 30 查询（多语言 + 代码语料） | 620,254 B | 45.518 ms | 32.386 ms (`sqlite_fts5_c`) / 61.211 ms (`sqlite_fts5_py`) | 0.71x (vs C) · **1.34x** (vs Python) | 25.41 MiB | 6.53 / 16.44 MiB |
+| `fts` | 10,000 文档建索引 + 600 查询（30 × 20） | 600 queries | 226.551 ms | 196.257 ms (`sqlite_fts5_c`) / 223.737 ms (`sqlite_fts5_py`) | 0.87x (vs C) · 0.99x (vs Python) | 25.41 MiB | 6.58 / 16.58 MiB |
 
 ## 各包明细
 
@@ -1477,3 +1479,25 @@ _SHA-256: `bd519a5b90095c9523b1d7ca8d114f327f4b87d62b2eec8f11c1560c84c5ca6b`._
 | 10-Page 800×600 RGBA Image Export (`/RunLengthDecode`, 14.4 MB RGB) | 64.56 ms | 37.54 ms | 223.05 MB/s | 55.41 MiB | 38.20 MiB | 0.58x |
 
 红队：8 / 8 单测（复用 `flate` 20 / 20），`audit` 30 / 30（2 P0 + 9 P1 + 14 P2 清零，`v_quadratic_40k` 提速 2,380× 至 6 ms）。领先项：`images_flate` 与 Rust `--release` 基本持平（0.98x）且峰值 RSS 更低（24.62 vs 27.61 MiB）；`report100` 峰值 RSS 同样更低（4.11 vs 6.36 MiB），输出体积更小（93 KB vs 97 KB）。落后项：`report100` 为 0.64x（每流 `flate` 状态初始化占 22.7 ms 中约 11 ms）；`images_rle` 为 0.58x 且峰值 RSS 较高（55.41 vs 38.20 MiB，标量 PackBits 扫描与逐字节拷贝对比 LLVM 自动向量化 Rust）。
+
+### fts
+
+参考实现：SQLite [FTS5](https://www.sqlite.org/fts5.html)（C `-O3 -lsqlite3` 与 Python `sqlite3`，均为 `:memory:`，`tokenize="unicode61 tokenchars '_'"`）。`sh packages/fts/bench/run_bench.sh 10000` 在确定性的 10,000 文档多语言 + 代码语料（英文、中文、日文、韩文、`CamelCase`、`snake_case`、`#PR`、十六进制 SHA）上跑 30 个查询（精确、CJK、代码词、短语、前缀、`NOT`），调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，三方 stdout SHA-256 逐字节一致。Pion 在建索引时现场分词，SQLite FTS5 摄入同源 `fts5_index_text` 产出的 token。编译器 `AFK-surf/pion@8d110a3`。详见 [`packages/fts/README.md`](packages/fts/README.md)。
+
+**1. 10,000 文档建索引 + 30 查询（620,254 B 原文，`sha256:1d044d63afdb2ecb...`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `sqlite_fts5_c`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 45.518 | 43.582 | 46.837 | 13.63 | 25.41 MiB | 0.71x |
+| `sqlite_fts5_c` | 32.386 | 31.103 | 33.194 | 19.15 | 6.53 MiB | 1.00x (baseline) |
+| `sqlite_fts5_py` | 61.211 | 60.792 | 62.303 | 10.13 | 16.44 MiB | 0.53x |
+
+**2. 10,000 文档建索引 + 600 查询（30 查询 × 20 次，`sha256:742eb42a94d684ec...`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `sqlite_fts5_c`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 226.551 | 217.275 | 265.433 | 377585.42 | 25.41 MiB | 0.87x |
+| `sqlite_fts5_c` | 196.257 | 192.415 | 204.213 | 327095.42 | 6.58 MiB | 1.00x (baseline) |
+| `sqlite_fts5_py` | 223.737 | 222.254 | 226.689 | 372895.07 | 16.58 MiB | 0.88x |
+
+红队：23 / 23 单测（含 11 个红队测试），`audit/difftest.py` 对 SQLite 3.54.0 FTS5 9 个种子约 34,000 次查询与 21,600 次摘要 0 差异（token、`MATCH` 表达式、结果顺序与 BM25 分值 ±1e-12、摘要 UTF-8 安全）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `1ebc76fd113f109093c0d76af062b1300d6b6a5846920a24552ff45759715562`。领先项：30 查询负载快于 Python `sqlite3`（45.5 vs 61.2 ms）。落后项：两个负载均慢于 C SQLite FTS5（0.71x / 0.87x）；600 查询负载与 Python `sqlite3` 基本持平（226.6 vs 223.7 ms）；峰值 RSS 25.41 MiB，约为 C 的 3.9×、Python `sqlite3` 的 1.5×。
