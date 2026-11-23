@@ -99,3 +99,11 @@ Input: `1,742,279 B` (`2,000` icons, `1,720,290 B` icon payload)
 - Against Rust `--release` running the exact same algorithm (SHA-256 verified), pure-Pion achieves **0.47x** on W1a (`65.9 ms` vs `31.1 ms`), **0.55x** on W2 (`34.1 ms` vs `18.7 ms`, where Pion also performs style cascade resolution), and **0.65x** on W3a (`30.6 ms` vs `19.7 ms`), with low peak RSS (`5.9–9.1 MiB`), while providing 0-ULP IEEE-754 number parsing, Payne-Hanek deterministic trigonometry, and full XML 1.0 well-formedness.
 - Against idiomatic upstream Rust (`svgtypes::SimplifyingPathParser` + `kurbo::BezPath::bounding_box`, W1b), pure-Pion (`65.9 ms`) is **0.66x** (`43.4 ms`).
 - W3b (`node_svgo@3.3.2`) is reported as a **non-equivalent reference** (no speedup headline claimed): `svgo`'s default ~30-plugin preset achieves deeper size reduction (`-48.5%` vs `-33.4%`) via additional passes (`removeUselessDefs`, `convertStyleToAttrs`, relative/absolute path conversion), and its wall-clock time (`671.6 ms`) includes ~100 ms of Node + ESM import startup cost (~571 ms steady-state optimization, `176.8 MiB` RSS).
+
+## Formal Verification (Lean 4)
+
+The SVG resource limits, RGBA/hex color encoding & clamping kernels, and W3C SVG/XML lexical & path command kernels (`SvgLimits`, `SvgColor`, `hex_nibble_code`, `clamp_u8_int`, `is_valid_hex_color_len`, `hex3_channel_expand`, `hex_pair_to_byte`, `is_svg_ws`, `is_xml_ws`, `is_ascii_digit`, `hex_val`, `is_number_start`, `is_path_moveto`, `is_path_closepath`, `is_ident_char`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (24 `0-sorry` theorems, standard axioms only, 44-case native-vs-Lean differential cross-check):
+
+```bash
+bash packages/svg/proofs/run_proofs.sh
+```
