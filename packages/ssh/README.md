@@ -45,6 +45,14 @@ Built directly on `packages/base64` and `packages/crypto` `v0.2.0` (Ed25519, NIS
     `ssh_wasm_smoke: OK fp=SHA256:/qjJWRy8QUCo3C4H7pEmjFSVrY+SrgXh6CrKUeBL39Q serial=42 kh=1 pkt=16/4`
     (`sha256: c4d2b3d187844bbd814f0869d1f813c489b4279e6cf7bd8b5b057c9343e12599`).
 
+## Formal Verification (Lean 4)
+
+The core RFC 4253 binary packet framing/padding, OpenSSH certificate type & validity window checks, and CIDR prefix bit-masking kernels in `packages/ssh/src/` (`is_ssh_version_char`, `ssh_packet_padding_len`, `ssh_packet_header_err_code`, `Limits`, `Limits::default`, `CertType`, `cert_type_code`, `cert_type_from_code`, `cert_time_valid_code`, `cidr_rem_mask`, `cidr_byte_match`) are annotated with `#verify`, extracted directly into Lean 4 via `pionc extract-lean`, and mechanically proved in `packages/ssh/proofs/` (**20 theorems, 0 `sorry` / `admit` / `bv_decide` / `native_decide`, standard axioms only**):
+
+- **`SshProofs/TransportFraming.lean` (10 theorems)**: RFC 4253 §4.2 version-string printable US-ASCII set and control-byte rejection (`NUL`/`LF`/`CR`/`DEL`/`0x80`); RFC 4253 §6 minimal packet padding length (`≥ max(4, min_padding)`, 8-byte & `block_size` alignment, single-byte `≤ 255` bound); complete `ssh_packet_header_err_code` validity characterization (oversize & short-padding rejection); end-to-end encode→decode framing round-trip proving every padded packet is accepted and recovers exact payload length; and strictly positive `Limits::default` DoS bounds.
+- **`SshProofs/CertAndCidr.lean` (10 theorems)**: Lossless `CertType` (`User`/`Host`) wire encode/decode round-trip and injectivity; exact OpenSSH `PROTOCOL.certkeys` `[valid_after, valid_before)` validity window classification (including `UINT64_MAX` forever semantics and half-open boundary); exact CIDR partial-byte masks `0x80..0xFE`; and equivalence-relation proof (reflexivity, symmetry, transitivity) for `cidr_byte_match`.
+- **Differential Cross-Check**: `packages/ssh/proofs/EvalDiff.lean` cross-checks 29 cases between Native Pion execution and Lean 4 `#eval` (`diff -u` exit `0`). Run `sh packages/ssh/proofs/run_proofs.sh` to reproduce end-to-end.
+
 ## Head-to-Head Benchmarks
 
 Measured on `Darwin arm64` via `sh packages/ssh/bench/run_bench.sh` and `sh packages/ssh/audit/run_audit.sh bench` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved) against Go `golang.org/x/crypto/ssh v0.38.0` (`go1.27.3 darwin/arm64`). All 6 workloads verified **byte-identical stdout SHA-256** across both implementations and all rounds.
