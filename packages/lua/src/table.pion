@@ -1,0 +1,378 @@
+///| Hybrid Lua 5.4 Table: 1-based contiguous array segment + open-addressing hash segment
+///| with deterministic insertion-ordered traversal (`next`/`pairs`) and integer/float key normalization.
+
+///|
+struct HashEntry {
+  key : LuaValue
+  mut entry_val : LuaValue
+  mut alive : Bool
+}
+
+///|
+pub struct LuaTable {
+  pub arr : Array[LuaValue]
+  entries : Array[HashEntry]
+  mut buckets : Array[Int] // 0 = empty, -1 = tombstone, >0 = entry_idx + 1
+  mut used_buckets : Int
+  mut alive_count : Int
+  pub mut metatable : Int // -1 if none
+}
+
+///|
+pub fn LuaTable::new() -> LuaTable {
+  LuaTable::{
+    arr: [],
+    entries: [],
+    buckets: [],
+    used_buckets: 0,
+    alive_count: 0,
+    metatable: -1,
+  }
+}
+
+///| Normalize a table key per Lua 5.4: float with exact integer value becomes `Int`.
+fn normalize_key(key : LuaValue) -> LuaValue {
+  match key {
+    LuaValue::Float(f) => {
+      match f64_to_exact_i64(f) {
+        Some(n) => LuaValue::Int(n)
+        None => LuaValue::Float(f)
+      }
+    }
+    _ => key
+  }
+}
+
+///| Key equality for normalized table keys.
+fn key_eq(a : LuaValue, b : LuaValue) -> Bool {
+  match (a, b) {
+    (LuaValue::Int(x), LuaValue::Int(y)) => x == y
+    (LuaValue::Str(x), LuaValue::Str(y)) => x == y
+    (LuaValue::Bool(x), LuaValue::Bool(y)) => x == y
+    (LuaValue::Float(x), LuaValue::Float(y)) => x == y
+    (LuaValue::Table(x), LuaValue::Table(y)) => x == y
+    (LuaValue::Closure(x), LuaValue::Closure(y)) => x == y
+    (LuaValue::NativeFn(x), LuaValue::NativeFn(y)) => x == y
+    (LuaValue::Thread(x), LuaValue::Thread(y)) => x == y
+    _ => false
+  }
+}
+
+///| FNV-1a / splitmix64 hash for normalized `LuaValue` keys.
+fn hash_key(k : LuaValue) -> Int {
+  match k {
+    LuaValue::Int(n) => {
+      let mut x = n.reinterpret_as_uint64()
+      x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9UL
+      x = (x ^ (x >> 27)) * 0x94d049bb133111ebUL
+      x = x ^ (x >> 31)
+      (x & 0x7FFFFFFFUL).reinterpret_as_int64().to_int()
+    }
+    LuaValue::Str(s) => {
+      let n = s.length()
+      let mut h : UInt64 = 14695981039346656037UL ^ n.to_int64().reinterpret_as_uint64()
+      let step = (n >> 5) + 1
+      let mut i = 0
+      while i < n {
+        h = (h ^ s.code_unit_at(i).to_int().to_int64().reinterpret_as_uint64()) * 1099511628211UL
+        i = i + step
+      }
+      (h & 0x7FFFFFFFUL).reinterpret_as_int64().to_int()
+    }
+    LuaValue::Bool(b) => if b { 1337 } else { 1331 }
+    LuaValue::Float(f) => {
+      let bits = f.to_bits().reinterpret_as_uint64()
+      let h = (bits ^ (bits >> 32)) * 0x94d049bb133111ebUL
+      (h & 0x7FFFFFFFUL).reinterpret_as_int64().to_int()
+    }
+    LuaValue::Table(id) => (id * 2654435761) & 0x7FFFFFFF
+    LuaValue::Closure(id) => ((id * 2246822519) ^ 0x55AA55) & 0x7FFFFFFF
+    LuaValue::NativeFn(id) => ((id * 3266489917) ^ 0xAA55AA) & 0x7FFFFFFF
+    LuaValue::Thread(id) => ((id * 1103515245) ^ 0x33CC33) & 0x7FFFFFFF
+    LuaValue::Nil => 0
+  }
+}
+
+///|
+fn LuaTable::rehash(self : LuaTable, min_cap : Int) -> Unit {
+  let mut cap = 8
+  while cap < min_cap {
+    cap = cap * 2
+  }
+  let nb : Array[Int] = []
+  let mut i = 0
+  while i < cap {
+    nb.push(0)
+    i = i + 1
+  }
+  let mask = cap - 1
+  let mut used = 0
+  let mut ei = 0
+  let elen = self.entries.length()
+  while ei < elen {
+    let e = self.entries[ei]
+    if e.alive {
+      let mut slot = hash_key(e.key) & mask
+      while nb[slot] != 0 {
+        slot = (slot + 1) & mask
+      }
+      nb[slot] = ei + 1
+      used = used + 1
+    }
+    ei = ei + 1
+  }
+  self.buckets = nb
+  self.used_buckets = used
+}
+
+///|
+fn LuaTable::hash_find(self : LuaTable, key : LuaValue) -> Int {
+  let cap = self.buckets.length()
+  if cap == 0 {
+    return -1
+  }
+  let mask = cap - 1
+  let mut slot = hash_key(key) & mask
+  while true {
+    let b = self.buckets[slot]
+    if b == 0 {
+      return -1
+    }
+    if b > 0 {
+      let ei = b - 1
+      if key_eq(self.entries[ei].key, key) {
+        return ei
+      }
+    }
+    slot = (slot + 1) & mask
+  }
+  -1
+}
+
+///|
+pub fn LuaTable::raw_get(self : LuaTable, key : LuaValue) -> LuaValue {
+  match key {
+    LuaValue::Nil => return LuaValue::Nil
+    LuaValue::Int(n) => {
+      if n >= 1L && n <= self.arr.length().to_int64() {
+        return self.arr[n.to_int() - 1]
+      }
+    }
+    LuaValue::Float(f) => {
+      if f != f {
+        return LuaValue::Nil
+      }
+      match f64_to_exact_i64(f) {
+        Some(n) => {
+          if n >= 1L && n <= self.arr.length().to_int64() {
+            return self.arr[n.to_int() - 1]
+          }
+          let ei = self.hash_find(LuaValue::Int(n))
+          return if ei >= 0 { self.entries[ei].entry_val } else { LuaValue::Nil }
+        }
+        None => ()
+      }
+    }
+    _ => ()
+  }
+  let nk = normalize_key(key)
+  let ei = self.hash_find(nk)
+  if ei >= 0 {
+    self.entries[ei].entry_val
+  } else {
+    LuaValue::Nil
+  }
+}
+
+///| Fast path for string field lookup.
+pub fn LuaTable::raw_get_str(self : LuaTable, key : String) -> LuaValue {
+  let ei = self.hash_find(LuaValue::Str(key))
+  if ei >= 0 {
+    self.entries[ei].entry_val
+  } else {
+    LuaValue::Nil
+  }
+}
+
+///| Raw-set key/value. Returns estimated newly allocated bytes (for sandbox memory accounting).
+pub fn LuaTable::raw_set(self : LuaTable, key : LuaValue, v : LuaValue) -> Result[Int, LuaError] {
+  match key {
+    LuaValue::Nil => return Err(LuaError::new(LuaErrorKind::RuntimeError, "table index is nil", 0))
+    LuaValue::Float(f) => {
+      if f != f {
+        return Err(LuaError::new(LuaErrorKind::RuntimeError, "table index is NaN", 0))
+      }
+    }
+    _ => ()
+  }
+  let nk = normalize_key(key)
+  // Fast array path for 1-based contiguous integer keys
+  match nk {
+    LuaValue::Int(n) => {
+      let alen = self.arr.length().to_int64()
+      if n >= 1L && n <= alen {
+        self.arr[n.to_int() - 1] = v
+        return Ok(0)
+      }
+      if n > alen && n <= alen + 4L {
+        match v {
+          LuaValue::Nil => return Ok(0)
+          _ => {
+            let mut pad = alen + 1L
+            while pad < n {
+              self.arr.push(LuaValue::Nil)
+              pad = pad + 1L
+            }
+            self.arr.push(v)
+            // Absorb any consecutive integer keys already in hash part
+            let mut next_idx = n + 1L
+            while true {
+              let ei = self.hash_find(LuaValue::Int(next_idx))
+              if ei >= 0 && self.entries[ei].alive {
+                let hv = self.entries[ei].entry_val
+                self.entries[ei].alive = false
+                self.entries[ei].entry_val = LuaValue::Nil
+                self.alive_count = self.alive_count - 1
+                self.arr.push(hv)
+                next_idx = next_idx + 1L
+              } else {
+                break
+              }
+            }
+            return Ok(24)
+          }
+        }
+      }
+    }
+    _ => ()
+  }
+
+  // Hash part
+  let ei = self.hash_find(nk)
+  if ei >= 0 {
+    match v {
+      LuaValue::Nil => {
+        if self.entries[ei].alive {
+          self.entries[ei].alive = false
+          self.entries[ei].entry_val = LuaValue::Nil
+          self.alive_count = self.alive_count - 1
+          // Keep bucket pointing to ei+1 so `next(t, k)` can advance past cleared keys (P1-4)!
+        }
+      }
+      _ => {
+        if !self.entries[ei].alive {
+          self.alive_count = self.alive_count + 1
+        }
+        self.entries[ei].entry_val = v
+        self.entries[ei].alive = true
+      }
+    }
+    return Ok(0)
+  }
+
+  match v {
+    LuaValue::Nil => return Ok(0)
+    _ => ()
+  }
+
+  if self.buckets.length() == 0 || (self.used_buckets + 1) * 10 >= self.buckets.length() * 7 {
+    let target = if self.alive_count * 2 + 8 > self.buckets.length() {
+      self.alive_count * 2 + 8
+    } else {
+      self.buckets.length() * 2
+    }
+    self.rehash(target)
+  }
+  let new_ei = self.entries.length()
+  self.entries.push(HashEntry::{ key: nk, entry_val: v, alive: true })
+  self.alive_count = self.alive_count + 1
+  let mask = self.buckets.length() - 1
+  let mut slot = hash_key(nk) & mask
+  while self.buckets[slot] > 0 {
+    slot = (slot + 1) & mask
+  }
+  if self.buckets[slot] == 0 {
+    self.used_buckets = self.used_buckets + 1
+  }
+  self.buckets[slot] = new_ei + 1
+  Ok(48)
+}
+
+///| Lua 5.4 `#t` border length.
+pub fn LuaTable::raw_len(self : LuaTable) -> Int {
+  let mut n = self.arr.length()
+  while n > 0 && self.arr[n - 1].is_nil() {
+    n = n - 1
+  }
+  if n < self.arr.length() {
+    // Check if there's an earlier nil hole (binary search border if needed, or contiguous prefix)
+    return n
+  }
+  // Check if hash part continues past arr.length()
+  let mut k = n.to_int64() + 1L
+  while true {
+    let ei = self.hash_find(LuaValue::Int(k))
+    if ei >= 0 && !self.entries[ei].entry_val.is_nil() {
+      n = n + 1
+      k = k + 1L
+    } else {
+      break
+    }
+  }
+  n
+}
+
+///| Deterministic `next(t, key)` traversal: array part (1..arr.len) then hash entries in insertion order.
+pub fn LuaTable::next_entry(self : LuaTable, key : LuaValue) -> Result[(LuaValue, LuaValue), LuaError] {
+  let alen = self.arr.length()
+  let elen = self.entries.length()
+  let mut start_arr = 0
+  let mut start_hash = -1
+
+  match key {
+    LuaValue::Nil => {
+      start_arr = 0
+      start_hash = 0
+    }
+    _ => {
+      let nk = normalize_key(key)
+      let mut found_in_arr = false
+      match nk {
+        LuaValue::Int(n) => {
+          if n >= 1L && n <= alen.to_int64() {
+            start_arr = n.to_int()
+            start_hash = 0
+            found_in_arr = true
+          }
+        }
+        _ => ()
+      }
+      if !found_in_arr {
+        let ei = self.hash_find(nk)
+        if ei < 0 {
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid key to 'next'", 0))
+        }
+        start_arr = alen
+        start_hash = ei + 1
+      }
+    }
+  }
+
+  let mut i = start_arr
+  while i < alen {
+    let v = self.arr[i]
+    if !v.is_nil() {
+      return Ok((LuaValue::Int((i + 1).to_int64()), v))
+    }
+    i = i + 1
+  }
+  let mut j = start_hash
+  while j < elen {
+    let e = self.entries[j]
+    if e.alive && !e.entry_val.is_nil() {
+      return Ok((e.key, e.entry_val))
+    }
+    j = j + 1
+  }
+  Ok((LuaValue::Nil, LuaValue::Nil))
+}

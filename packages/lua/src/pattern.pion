@@ -1,0 +1,614 @@
+///| Pure-Pion Lua 5.4 Pattern Matching Engine (`string.find`, `string.match`,
+///| `string.gmatch`, `string.gsub`) with deterministic fuel accounting to block
+///| catastrophic backtracking / ReDoS bombs.
+
+///|
+struct PatCapture {
+  mut start : Int
+  mut len : Int // -1 = unfinished, -2 = position capture
+}
+
+///|
+struct MatchState {
+  src : Bytes
+  src_str : String
+  pat : Bytes
+  pat_str : String
+  vm : LuaVm
+  captures : Array[PatCapture]
+  mut depth : Int
+}
+
+///|
+fn pat_is_alpha(c : Int) -> Bool {
+  (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+///|
+fn pat_is_digit(c : Int) -> Bool {
+  c >= 48 && c <= 57
+}
+
+///|
+fn pat_is_lower(c : Int) -> Bool {
+  c >= 97 && c <= 122
+}
+
+///|
+fn pat_is_upper(c : Int) -> Bool {
+  c >= 65 && c <= 90
+}
+
+///|
+fn pat_is_alnum(c : Int) -> Bool {
+  pat_is_alpha(c) || pat_is_digit(c)
+}
+
+///|
+fn pat_is_xdigit(c : Int) -> Bool {
+  pat_is_digit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+}
+
+///|
+fn pat_is_space(c : Int) -> Bool {
+  c == 32 || (c >= 9 && c <= 13)
+}
+
+///|
+fn pat_is_cntrl(c : Int) -> Bool {
+  (c >= 0 && c <= 31) || c == 127
+}
+
+///|
+fn pat_is_graph(c : Int) -> Bool {
+  c >= 33 && c <= 126
+}
+
+///|
+fn pat_is_punct(c : Int) -> Bool {
+  pat_is_graph(c) && !pat_is_alnum(c)
+}
+
+///|
+fn pat_match_class(c : Int, cl : Int) -> Bool {
+  let lower_cl = if cl >= 65 && cl <= 90 { cl + 32 } else { cl }
+  let res = if lower_cl == 97 {
+    pat_is_alpha(c)
+  } else if lower_cl == 99 {
+    pat_is_cntrl(c)
+  } else if lower_cl == 100 {
+    pat_is_digit(c)
+  } else if lower_cl == 103 {
+    pat_is_graph(c)
+  } else if lower_cl == 108 {
+    pat_is_lower(c)
+  } else if lower_cl == 112 {
+    pat_is_punct(c)
+  } else if lower_cl == 115 {
+    pat_is_space(c)
+  } else if lower_cl == 117 {
+    pat_is_upper(c)
+  } else if lower_cl == 119 {
+    pat_is_alnum(c)
+  } else if lower_cl == 120 {
+    pat_is_xdigit(c)
+  } else if lower_cl == 122 {
+    c == 0
+  } else {
+    return c == cl
+  }
+  if cl >= 65 && cl <= 90 {
+    !res
+  } else {
+    res
+  }
+}
+
+///| Find end index (position of `]`) of a `[...]` class starting at `p` (where `pat[p] == '['`).
+fn pat_class_end(pat : Bytes, p : Int) -> Result[Int, LuaError] {
+  let n = pat.length()
+  let mut i = p + 1
+  if i < n && pat[i].to_int() == 94 {
+    i = i + 1
+  }
+  // `]` immediately after `[` or `[^` is a literal character in the set
+  if i < n && pat[i].to_int() == 93 {
+    i = i + 1
+  }
+  while i < n && pat[i].to_int() != 93 {
+    if pat[i].to_int() == 37 && i + 1 < n {
+      i = i + 2
+    } else {
+      i = i + 1
+    }
+  }
+  if i >= n {
+    return Err(LuaError::new(LuaErrorKind::RuntimeError, "malformed pattern (missing ']')", 0))
+  }
+  Ok(i)
+}
+
+///| Match byte `c` against bracket class `pat[p..end_idx]` (inclusive of `[` and `]`).
+fn pat_match_bracket(c : Int, pat : Bytes, p : Int, end_idx : Int) -> Bool {
+  let mut i = p + 1
+  let mut neg = false
+  if i < end_idx && pat[i].to_int() == 94 {
+    neg = true
+    i = i + 1
+  }
+  let mut matched = false
+  while i < end_idx {
+    if pat[i].to_int() == 37 && i + 1 < end_idx {
+      if pat_match_class(c, pat[i + 1].to_int()) {
+        matched = true
+        break
+      }
+      i = i + 2
+    } else if i + 2 < end_idx && pat[i + 1].to_int() == 45 {
+      let lo = pat[i].to_int()
+      let hi = pat[i + 2].to_int()
+      if c >= lo && c <= hi {
+        matched = true
+        break
+      }
+      i = i + 3
+    } else {
+      if c == pat[i].to_int() {
+        matched = true
+        break
+      }
+      i = i + 1
+    }
+  }
+  if neg {
+    !matched
+  } else {
+    matched
+  }
+}
+
+///| Find end of one pattern item starting at `p`.
+fn pat_item_end(pat : Bytes, p : Int) -> Result[Int, LuaError] {
+  let n = pat.length()
+  let c = pat[p].to_int()
+  if c == 37 {
+    if p + 1 >= n {
+      return Err(LuaError::new(LuaErrorKind::RuntimeError, "malformed pattern (ends with '%')", 0))
+    }
+    Ok(p + 2)
+  } else if c == 91 {
+    match pat_class_end(pat, p) {
+      Ok(e) => Ok(e + 1)
+      Err(err) => Err(err)
+    }
+  } else {
+    Ok(p + 1)
+  }
+}
+
+///| Check whether byte `c` matches the single pattern item `pat[p..ep)`.
+fn pat_single_match(c : Int, pat : Bytes, p : Int, ep : Int) -> Bool {
+  let pc = pat[p].to_int()
+  if pc == 46 {
+    true
+  } else if pc == 37 {
+    pat_match_class(c, pat[p + 1].to_int())
+  } else if pc == 91 {
+    pat_match_bracket(c, pat, p, ep - 1)
+  } else {
+    c == pc
+  }
+}
+
+///| Core recursive Lua pattern matcher. Returns `Ok(Some(end_pos))` on match, `Ok(None)` on mismatch.
+fn MatchState::match_at(self : MatchState, s_in : Int, p_in : Int) -> Result[Option[Int], LuaError] {
+  match self.vm.charge_fuel(1L) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  self.depth = self.depth + 1
+  if self.depth > 200 {
+    self.depth = self.depth - 1
+    return Err(LuaError::new(LuaErrorKind::RuntimeError, "pattern too complex", 0))
+  }
+
+  let mut s = s_in
+  let mut p = p_in
+  let slen = self.src.length()
+  let plen = self.pat.length()
+
+  while p < plen {
+    let pc = self.pat[p].to_int()
+    if pc == 40 {
+      // '(' start capture
+      let cap_idx = self.captures.length()
+      if cap_idx >= 32 {
+        self.depth = self.depth - 1
+        return Err(LuaError::new(LuaErrorKind::RuntimeError, "too many captures", 0))
+      }
+      if p + 1 < plen && self.pat[p + 1].to_int() == 41 {
+        // Position capture `()`
+        self.captures.push(PatCapture::{ start: s, len: -2 })
+        let r = self.match_at(s, p + 2)
+        self.depth = self.depth - 1
+        match r {
+          Ok(Some(pos)) => return Ok(Some(pos))
+          Ok(None) => {
+            let _ = self.captures.pop()
+            return Ok(None)
+          }
+          Err(e) => return Err(e)
+        }
+      } else {
+        self.captures.push(PatCapture::{ start: s, len: -1 })
+        let r = self.match_at(s, p + 1)
+        self.depth = self.depth - 1
+        match r {
+          Ok(Some(pos)) => return Ok(Some(pos))
+          Ok(None) => {
+            while self.captures.length() > cap_idx {
+              let _ = self.captures.pop()
+            }
+            return Ok(None)
+          }
+          Err(e) => return Err(e)
+        }
+      }
+    } else if pc == 41 {
+      // ')' end capture
+      let mut idx = self.captures.length() - 1
+      while idx >= 0 && self.captures[idx].len != -1 {
+        idx = idx - 1
+      }
+      if idx < 0 {
+        self.depth = self.depth - 1
+        return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid pattern capture", 0))
+      }
+      self.captures[idx].len = s - self.captures[idx].start
+      let r = self.match_at(s, p + 1)
+      self.depth = self.depth - 1
+      match r {
+        Ok(Some(pos)) => return Ok(Some(pos))
+        Ok(None) => {
+          self.captures[idx].len = -1
+          return Ok(None)
+        }
+        Err(e) => return Err(e)
+      }
+    } else if pc == 36 && p + 1 == plen {
+      // '$' end anchor
+      self.depth = self.depth - 1
+      return if s == slen { Ok(Some(s)) } else { Ok(None) }
+    } else if pc == 37 && p + 1 < plen {
+      let next_c = self.pat[p + 1].to_int()
+      if next_c == 98 {
+        // '%bxy' balanced match
+        if p + 3 >= plen {
+          self.depth = self.depth - 1
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "malformed pattern (missing arguments to '%b')", 0))
+        }
+        let open_c = self.pat[p + 2].to_int()
+        let close_c = self.pat[p + 3].to_int()
+        if s >= slen || self.src[s].to_int() != open_c {
+          self.depth = self.depth - 1
+          return Ok(None)
+        }
+        let mut count = 1
+        let mut j = s + 1
+        let mut steps = 0L
+        while j < slen && count > 0 {
+          steps = steps + 1L
+          if (steps & 63L) == 0L {
+            match self.vm.charge_fuel(64L) {
+              Ok(_) => ()
+              Err(e) => {
+                self.depth = self.depth - 1
+                return Err(e)
+              }
+            }
+          }
+          let ch = self.src[j].to_int()
+          if ch == close_c {
+            count = count - 1
+          } else if ch == open_c {
+            count = count + 1
+          }
+          j = j + 1
+        }
+        let rem_steps = steps & 63L
+        if rem_steps > 0L {
+          match self.vm.charge_fuel(rem_steps) {
+            Ok(_) => ()
+            Err(e) => {
+              self.depth = self.depth - 1
+              return Err(e)
+            }
+          }
+        }
+        if count != 0 {
+          self.depth = self.depth - 1
+          return Ok(None)
+        }
+        s = j
+        p = p + 4
+        continue
+      } else if next_c == 102 {
+        // '%f[set]' frontier pattern
+        if p + 2 >= plen || self.pat[p + 2].to_int() != 91 {
+          self.depth = self.depth - 1
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "missing '[' after '%f' in pattern", 0))
+        }
+        let cend = match pat_class_end(self.pat, p + 2) {
+          Ok(e) => e
+          Err(err) => {
+            self.depth = self.depth - 1
+            return Err(err)
+          }
+        }
+        let prev_b = if s == 0 { 0 } else { self.src[s - 1].to_int() }
+        let cur_b = if s == slen { 0 } else { self.src[s].to_int() }
+        let prev_in = pat_match_bracket(prev_b, self.pat, p + 2, cend)
+        let cur_in = pat_match_bracket(cur_b, self.pat, p + 2, cend)
+        if prev_in || !cur_in {
+          self.depth = self.depth - 1
+          return Ok(None)
+        }
+        p = cend + 1
+        continue
+      } else if next_c >= 49 && next_c <= 57 {
+        // '%1'..'%'9 backreference
+        let cap_i = next_c - 49
+        if cap_i >= self.captures.length() || self.captures[cap_i].len < 0 {
+          self.depth = self.depth - 1
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid capture index", 0))
+        }
+        let cstart = self.captures[cap_i].start
+        let clen = self.captures[cap_i].len
+        if s + clen > slen {
+          self.depth = self.depth - 1
+          return Ok(None)
+        }
+        let mut k = 0
+        while k < clen {
+          if self.src[s + k].to_int() != self.src[cstart + k].to_int() {
+            self.depth = self.depth - 1
+            return Ok(None)
+          }
+          k = k + 1
+        }
+        s = s + clen
+        p = p + 2
+        continue
+      }
+    }
+
+    // Regular item + optional quantifier (`*`, `+`, `-`, `?`)
+    let ep = match pat_item_end(self.pat, p) {
+      Ok(e) => e
+      Err(err) => {
+        self.depth = self.depth - 1
+        return Err(err)
+      }
+    }
+    let m = s < slen && pat_single_match(self.src[s].to_int(), self.pat, p, ep)
+    let quant = if ep < plen { self.pat[ep].to_int() } else { 0 }
+
+    if quant == 63 {
+      // '?' optional (greedy)
+      if m {
+        match self.match_at(s + 1, ep + 1) {
+          Ok(Some(pos)) => {
+            self.depth = self.depth - 1
+            return Ok(Some(pos))
+          }
+          Ok(None) => ()
+          Err(e) => {
+            self.depth = self.depth - 1
+            return Err(e)
+          }
+        }
+      }
+      p = ep + 1
+      continue
+    } else if quant == 42 || quant == 43 {
+      // '*' or '+' greedy repetition
+      if quant == 43 && !m {
+        self.depth = self.depth - 1
+        return Ok(None)
+      }
+      let min_i = if quant == 43 { 1 } else { 0 }
+      let mut i = min_i
+      while s + i < slen && pat_single_match(self.src[s + i].to_int(), self.pat, p, ep) {
+        i = i + 1
+        if (i & 255) == 0 {
+          match self.vm.charge_fuel(256L) {
+            Ok(_) => ()
+            Err(e) => {
+              self.depth = self.depth - 1
+              return Err(e)
+            }
+          }
+        }
+      }
+      while i >= min_i {
+        match self.match_at(s + i, ep + 1) {
+          Ok(Some(pos)) => {
+            self.depth = self.depth - 1
+            return Ok(Some(pos))
+          }
+          Ok(None) => i = i - 1
+          Err(e) => {
+            self.depth = self.depth - 1
+            return Err(e)
+          }
+        }
+      }
+      self.depth = self.depth - 1
+      return Ok(None)
+    } else if quant == 45 {
+      // '-' lazy repetition (0 or more)
+      let mut cur_s = s
+      while true {
+        match self.match_at(cur_s, ep + 1) {
+          Ok(Some(pos)) => {
+            self.depth = self.depth - 1
+            return Ok(Some(pos))
+          }
+          Ok(None) => {
+            if cur_s < slen && pat_single_match(self.src[cur_s].to_int(), self.pat, p, ep) {
+              cur_s = cur_s + 1
+            } else {
+              self.depth = self.depth - 1
+              return Ok(None)
+            }
+          }
+          Err(e) => {
+            self.depth = self.depth - 1
+            return Err(e)
+          }
+        }
+      }
+    } else {
+      if !m {
+        self.depth = self.depth - 1
+        return Ok(None)
+      }
+      s = s + 1
+      p = ep
+    }
+  }
+
+  self.depth = self.depth - 1
+  Ok(Some(s))
+}
+
+///| Extract captured values from a successful `MatchState`.
+fn MatchState::get_captures(self : MatchState, match_start : Int, match_end : Int, return_whole_if_none : Bool) -> Result[Array[LuaValue], LuaError] {
+  let out : Array[LuaValue] = []
+  if self.captures.length() == 0 {
+    if return_whole_if_none {
+      out.push(LuaValue::Str(self.src_str.slice(match_start, match_end)))
+    }
+    return Ok(out)
+  }
+  let mut i = 0
+  while i < self.captures.length() {
+    let cap = self.captures[i]
+    if cap.len == -1 {
+      return Err(LuaError::new(LuaErrorKind::RuntimeError, "unfinished capture", 0))
+    } else if cap.len == -2 {
+      out.push(LuaValue::Int((cap.start + 1).to_int64()))
+    } else {
+      out.push(LuaValue::Str(self.src_str.slice(cap.start, cap.start + cap.len)))
+    }
+    i = i + 1
+  }
+  Ok(out)
+}
+
+///| Search `src_str` for `pat_str` starting at 0-based `init_pos`.
+///| If `allow_anchor` is true, leading `^` anchors to `init_pos` (false for `gmatch` per Lua 5.4).
+///| Returns `Ok(Some((start, end, captures)))` or `Ok(None)`.
+fn pat_search_ex(
+  vm : LuaVm,
+  src_str : String,
+  pat_str : String,
+  init_pos : Int,
+  allow_anchor : Bool,
+) -> Result[Option[(Int, Int, Array[LuaValue])], LuaError] {
+  let src = string_to_bytes(src_str)
+  let pat = string_to_bytes(pat_str)
+  let slen = src.length()
+  let mut start = init_pos
+  if start < 0 {
+    start = 0
+  }
+  if start > slen {
+    return Ok(None)
+  }
+  let anchored = allow_anchor && pat.length() > 0 && pat[0].to_int() == 94
+  let pat_start = if anchored { 1 } else { 0 }
+  let mut s = start
+  while true {
+    let ms = MatchState::{
+      src: src,
+      src_str: src_str,
+      pat: pat,
+      pat_str: pat_str,
+      vm: vm,
+      captures: [],
+      depth: 0,
+    }
+    match ms.match_at(s, pat_start) {
+      Ok(Some(end_pos)) => {
+        match ms.get_captures(s, end_pos, false) {
+          Ok(caps) => return Ok(Some((s, end_pos, caps)))
+          Err(e) => return Err(e)
+        }
+      }
+      Ok(None) => {
+        if anchored || s >= slen {
+          return Ok(None)
+        }
+        s = s + 1
+      }
+      Err(e) => return Err(e)
+    }
+  }
+  Ok(None)
+}
+
+///| Search `src_str` for `pat_str` starting at 0-based `init_pos`.
+fn pat_search(
+  vm : LuaVm,
+  src_str : String,
+  pat_str : String,
+  init_pos : Int,
+) -> Result[Option[(Int, Int, Array[LuaValue])], LuaError] {
+  pat_search_ex(vm, src_str, pat_str, init_pos, true)
+}
+
+///| Expand a `string.gsub` replacement template string (`%0`, `%1..%9`, `%%`).
+fn pat_expand_repl(
+  repl : String,
+  src_str : String,
+  m_start : Int,
+  m_end : Int,
+  caps : Array[LuaValue],
+) -> Result[String, LuaError] {
+  let bs = string_to_bytes(repl)
+  let n = bs.length()
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    let b = bs[i].to_int()
+    if b == 37 {
+      i = i + 1
+      if i >= n {
+        return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid use of '%' in replacement string", 0))
+      }
+      let c = bs[i].to_int()
+      if c == 37 {
+        sb.write_string("%")
+      } else if c == 48 {
+        sb.write_string(src_str.slice(m_start, m_end))
+      } else if c >= 49 && c <= 57 {
+        let idx = c - 49
+        if idx >= caps.length() {
+          return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid capture index in replacement", 0))
+        }
+        sb.write_string(lua_value_to_string_raw(caps[idx]))
+      } else {
+        return Err(LuaError::new(LuaErrorKind::RuntimeError, "invalid use of '%' in replacement string", 0))
+      }
+      i = i + 1
+    } else {
+      let start = i
+      while i < n && bs[i].to_int() != 37 {
+        i = i + 1
+      }
+      sb.write_string(repl.slice(start, i))
+    }
+  }
+  Ok(sb.to_string())
+}
