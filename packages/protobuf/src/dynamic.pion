@@ -1,0 +1,1784 @@
+///| Dynamic reflection message decode/encode and accessors (100% iterative, O(1) linked dispatch).
+
+///| Hard upper bound on dynamic nesting depth to prevent runtime RC-drop stack overflow on native & wasm32.
+let hard_max_depth : Int = 400
+
+///| O(1) field descriptor lookup by field number.
+fn find_field_desc_by_num(desc : MessageDescriptor, field_number : Int) -> Option[FieldDescriptor] {
+  match desc.field_by_num.get(field_number) {
+    Some(idx) => Option::Some(desc.fields[idx])
+    None => Option::None
+  }
+}
+
+///|
+fn find_field_desc_by_name(desc : MessageDescriptor, name : String) -> Option[FieldDescriptor] {
+  let mut i = 0
+  while i < desc.fields.length() {
+    if desc.fields[i].name == name {
+      return Option::Some(desc.fields[i])
+    }
+    i = i + 1
+  }
+  Option::None
+}
+
+///|
+fn is_field_enum(fd : FieldDescriptor) -> Bool {
+  fd.resolved_kind == 2 || fd.resolved_kind == 3 || fd.resolved_kind == 5
+}
+
+///|
+fn is_field_message(fd : FieldDescriptor) -> Bool {
+  fd.resolved_kind == 1 || fd.resolved_kind == 4
+}
+
+///|
+fn is_packable_scalar_fd(fd : FieldDescriptor) -> Bool {
+  match fd.field_type {
+    Double | Float | Int32 | Int64 | UInt32 | UInt64 | SInt32 | SInt64 | Fixed32 | Fixed64 | SFixed32 | SFixed64 | Bool =>
+    true
+    Named(_) => is_field_enum(fd)
+    _ => false
+  }
+}
+
+///|
+fn default_value_for_field_type(ft : FieldType, is_enum : Bool) -> ProtoValue {
+  match ft {
+    Double => ProtoValue::Double(0.0)
+    Float => ProtoValue::Float(0.0)
+    Int32 | SInt32 | SFixed32 => ProtoValue::Int32(0)
+    Int64 | SInt64 | SFixed64 => ProtoValue::Int64(0L)
+    UInt32 | Fixed32 => ProtoValue::UInt32(0L)
+    UInt64 | Fixed64 => ProtoValue::UInt64(0UL)
+    Bool => ProtoValue::Bool(false)
+    String => ProtoValue::String("")
+    Bytes => ProtoValue::Bytes(Bytes::new(0))
+    Named(name) =>
+    if is_enum {
+      ProtoValue::Enum(0)
+    } else {
+      ProtoValue::Message(DynamicMessage::new(name))
+    }
+    Map(_, _) => ProtoValue::Map([])
+  }
+}
+
+///|
+fn is_default_proto3_value(v : ProtoValue) -> Bool {
+  match v {
+    Bool(b) => !b
+    Int32(n) => n == 0
+    Int64(n) => n == 0L
+    UInt32(n) => n == 0L
+    UInt64(n) => n == 0UL
+    Float(d) => d.to_bits() == 0L
+    Double(d) => d.to_bits() == 0L
+    String(s) => s.length() == 0
+    Bytes(b) => b.length() == 0
+    Enum(n) => n == 0
+    Message(_) => false
+    List(xs) => xs.length() == 0
+    Map(pairs) => pairs.length() == 0
+  }
+}
+
+///| Mutable decode state shared across a dynamic decode invocation.
+struct DecodeState {
+  opts : DecodeOptions
+  max_depth : Int
+  strict_utf8 : Bool
+  mut field_count : Int
+}
+
+///| Read a single unknown field (including nested groups up to `max_depth`), preserving exact raw bytes.
+fn read_unknown_field(
+  r : WireReader,
+  data : Bytes,
+  tag_start : Int,
+  tag : Tag,
+  depth : Int,
+  state : DecodeState,
+) -> Result[UnknownField, ProtoError] {
+  match tag.wire_type {
+    Varint =>
+    match r.read_varint64() {
+      Ok(v) =>
+      Ok(UnknownField::{
+        field_number: tag.field_number,
+        wire_type: WireType::Varint,
+        value: UnknownValue::Varint(v),
+        raw_bytes: data.slice(tag_start, r.pos()),
+      })
+      Err(e) => Err(e)
+    }
+    Fixed32 =>
+    match r.read_fixed32() {
+      Ok(v) =>
+      Ok(UnknownField::{
+        field_number: tag.field_number,
+        wire_type: WireType::Fixed32,
+        value: UnknownValue::Fixed32(v),
+        raw_bytes: data.slice(tag_start, r.pos()),
+      })
+      Err(e) => Err(e)
+    }
+    Fixed64 =>
+    match r.read_fixed64() {
+      Ok(v) =>
+      Ok(UnknownField::{
+        field_number: tag.field_number,
+        wire_type: WireType::Fixed64,
+        value: UnknownValue::Fixed64(v),
+        raw_bytes: data.slice(tag_start, r.pos()),
+      })
+      Err(e) => Err(e)
+    }
+    LengthDelimited =>
+    match r.read_bytes() {
+      Ok(b) =>
+      Ok(UnknownField::{
+        field_number: tag.field_number,
+        wire_type: WireType::LengthDelimited,
+        value: UnknownValue::LengthDelimited(b),
+        raw_bytes: data.slice(tag_start, r.pos()),
+      })
+      Err(e) => Err(e)
+    }
+    EndGroup => Err(ProtoError::UnmatchedGroup(tag.field_number, r.pos()))
+    StartGroup => {
+      if depth >= state.max_depth {
+        return Err(ProtoError::MaxDepthExceeded(state.max_depth))
+      }
+      let num_stack : Array[Int] = [tag.field_number]
+      let start_stack : Array[Int] = [tag_start]
+      let fields_stack : Array[Array[UnknownField]] = [[]]
+      while num_stack.length() > 0 {
+        if r.is_eof() {
+          return Err(ProtoError::UnexpectedEof(r.pos()))
+        }
+        let tpos = r.pos()
+        let inner = match r.read_tag() {
+          Ok(t) => t
+          Err(e) => return Err(e)
+        }
+        state.field_count = state.field_count + 1
+        if state.field_count > state.opts.max_fields {
+          return Err(ProtoError::MaxFieldsExceeded(state.opts.max_fields))
+        }
+        match inner.wire_type {
+          StartGroup => {
+            if depth + num_stack.length() >= state.max_depth {
+              return Err(ProtoError::MaxDepthExceeded(state.max_depth))
+            }
+            num_stack.push(inner.field_number)
+            start_stack.push(tpos)
+            fields_stack.push([])
+          }
+          EndGroup => {
+            let expected_num = match num_stack.pop() {
+              Some(n) => n
+              None => return Err(ProtoError::UnmatchedGroup(inner.field_number, tpos))
+            }
+            let gstart = match start_stack.pop() {
+              Some(s) => s
+              None => tpos
+            }
+            if expected_num != inner.field_number {
+              return Err(ProtoError::UnmatchedGroup(inner.field_number, tpos))
+            }
+            let finished = match fields_stack.pop() {
+              Some(fs) => fs
+              None => []
+            }
+            let uf = UnknownField::{
+              field_number: expected_num,
+              wire_type: WireType::StartGroup,
+              value: UnknownValue::Group(finished),
+              raw_bytes: data.slice(gstart, r.pos()),
+            }
+            if fields_stack.length() == 0 {
+              return Ok(uf)
+            }
+            fields_stack[fields_stack.length() - 1].push(uf)
+          }
+          Varint =>
+          match r.read_varint64() {
+            Ok(v) =>
+            fields_stack[fields_stack.length() - 1].push(UnknownField::{
+              field_number: inner.field_number,
+              wire_type: WireType::Varint,
+              value: UnknownValue::Varint(v),
+              raw_bytes: data.slice(tpos, r.pos()),
+            })
+            Err(e) => return Err(e)
+          }
+          Fixed32 =>
+          match r.read_fixed32() {
+            Ok(v) =>
+            fields_stack[fields_stack.length() - 1].push(UnknownField::{
+              field_number: inner.field_number,
+              wire_type: WireType::Fixed32,
+              value: UnknownValue::Fixed32(v),
+              raw_bytes: data.slice(tpos, r.pos()),
+            })
+            Err(e) => return Err(e)
+          }
+          Fixed64 =>
+          match r.read_fixed64() {
+            Ok(v) =>
+            fields_stack[fields_stack.length() - 1].push(UnknownField::{
+              field_number: inner.field_number,
+              wire_type: WireType::Fixed64,
+              value: UnknownValue::Fixed64(v),
+              raw_bytes: data.slice(tpos, r.pos()),
+            })
+            Err(e) => return Err(e)
+          }
+          LengthDelimited =>
+          match r.read_bytes() {
+            Ok(b) =>
+            fields_stack[fields_stack.length() - 1].push(UnknownField::{
+              field_number: inner.field_number,
+              wire_type: WireType::LengthDelimited,
+              value: UnknownValue::LengthDelimited(b),
+              raw_bytes: data.slice(tpos, r.pos()),
+            })
+            Err(e) => return Err(e)
+          }
+        }
+      }
+      Err(ProtoError::UnexpectedEof(r.pos()))
+    }
+  }
+}
+
+///| Read a single scalar or enum value according to `ft` and wire type.
+fn read_scalar_value(
+  r : WireReader,
+  field_num : Int,
+  ft : FieldType,
+  is_enum : Bool,
+  wt : WireType,
+) -> Result[ProtoValue, ProtoError] {
+  match ft {
+    Double => {
+      if !wire_type_eq(wt, WireType::Fixed64) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_double() {
+        Ok(v) => Ok(ProtoValue::Double(v))
+        Err(e) => Err(e)
+      }
+    }
+    Float => {
+      if !wire_type_eq(wt, WireType::Fixed32) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_float() {
+        Ok(v) => Ok(ProtoValue::Float(v))
+        Err(e) => Err(e)
+      }
+    }
+    Int32 => {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_int32() {
+        Ok(v) => Ok(ProtoValue::Int32(v))
+        Err(e) => Err(e)
+      }
+    }
+    Int64 => {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_int64() {
+        Ok(v) => Ok(ProtoValue::Int64(v))
+        Err(e) => Err(e)
+      }
+    }
+    UInt32 => {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_uint32() {
+        Ok(v) => Ok(ProtoValue::UInt32(v))
+        Err(e) => Err(e)
+      }
+    }
+    UInt64 => {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_uint64() {
+        Ok(v) => Ok(ProtoValue::UInt64(v))
+        Err(e) => Err(e)
+      }
+    }
+    SInt32 => {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_sint32() {
+        Ok(v) => Ok(ProtoValue::Int32(v))
+        Err(e) => Err(e)
+      }
+    }
+    SInt64 => {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_sint64() {
+        Ok(v) => Ok(ProtoValue::Int64(v))
+        Err(e) => Err(e)
+      }
+    }
+    Fixed32 => {
+      if !wire_type_eq(wt, WireType::Fixed32) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_fixed32() {
+        Ok(v) => Ok(ProtoValue::UInt32(v))
+        Err(e) => Err(e)
+      }
+    }
+    Fixed64 => {
+      if !wire_type_eq(wt, WireType::Fixed64) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_fixed64() {
+        Ok(v) => Ok(ProtoValue::UInt64(v))
+        Err(e) => Err(e)
+      }
+    }
+    SFixed32 => {
+      if !wire_type_eq(wt, WireType::Fixed32) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_sfixed32() {
+        Ok(v) => Ok(ProtoValue::Int32(v))
+        Err(e) => Err(e)
+      }
+    }
+    SFixed64 => {
+      if !wire_type_eq(wt, WireType::Fixed64) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_sfixed64() {
+        Ok(v) => Ok(ProtoValue::Int64(v))
+        Err(e) => Err(e)
+      }
+    }
+    Bool => {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_bool() {
+        Ok(v) => Ok(ProtoValue::Bool(v))
+        Err(e) => Err(e)
+      }
+    }
+    String => {
+      if !wire_type_eq(wt, WireType::LengthDelimited) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_string() {
+        Ok(v) => Ok(ProtoValue::String(v))
+        Err(e) => Err(e)
+      }
+    }
+    Bytes => {
+      if !wire_type_eq(wt, WireType::LengthDelimited) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_bytes() {
+        Ok(v) => Ok(ProtoValue::Bytes(v))
+        Err(e) => Err(e)
+      }
+    }
+    Named(name) =>
+    if is_enum {
+      if !wire_type_eq(wt, WireType::Varint) {
+        return Err(ProtoError::WireTypeMismatch(field_num, wire_type_code(wt)))
+      }
+      match r.read_int32() {
+        Ok(v) => Ok(ProtoValue::Enum(v))
+        Err(e) => Err(e)
+      }
+    } else {
+      Err(ProtoError::MessageNotFound(name))
+    }
+    Map(_, _) => Err(ProtoError::InvalidValue("unexpected map in read_scalar_value"))
+  }
+}
+
+///| Expected wire type for a packed scalar element or map key/scalar value.
+fn scalar_wire_type(ft : FieldType, is_enum : Bool) -> WireType {
+  match ft {
+    Double | Fixed64 | SFixed64 => WireType::Fixed64
+    Float | Fixed32 | SFixed32 => WireType::Fixed32
+    String | Bytes => WireType::LengthDelimited
+    Named(_) => if is_enum { WireType::Varint } else { WireType::LengthDelimited }
+    _ => WireType::Varint
+  }
+}
+
+///| Expected wire type for a non-packed field descriptor (O(1)).
+fn expected_field_wire_type_fd(fd : FieldDescriptor) -> WireType {
+  if fd.is_group {
+    return WireType::StartGroup
+  }
+  match fd.field_type {
+    Double | Fixed64 | SFixed64 => WireType::Fixed64
+    Float | Fixed32 | SFixed32 => WireType::Fixed32
+    String | Bytes | Map(_, _) => WireType::LengthDelimited
+    Named(_) => if is_field_enum(fd) { WireType::Varint } else { WireType::LengthDelimited }
+    _ => WireType::Varint
+  }
+}
+
+///| Replace or insert `(field_number, value)` in a mutable fields array.
+fn upsert_field_mut(fields : Array[(Int, ProtoValue)], field_number : Int, value : ProtoValue) -> Unit {
+  let mut i = 0
+  while i < fields.length() {
+    let (num, _) = fields[i]
+    if num == field_number {
+      fields[i] = (field_number, value)
+      return
+    }
+    i = i + 1
+  }
+  fields.push((field_number, value))
+}
+
+///| Clear all fields belonging to the same oneof group except `keep_num`, mutating `fields` in place.
+fn clear_oneof_siblings_inplace(
+  fields : Array[(Int, ProtoValue)],
+  desc : MessageDescriptor,
+  oneof_idx : Int,
+  keep_num : Int,
+) -> Unit {
+  if oneof_idx < 0 || oneof_idx >= desc.oneofs.length() {
+    return
+  }
+  let group = desc.oneofs[oneof_idx].field_numbers
+  let mut w = 0
+  let mut i = 0
+  while i < fields.length() {
+    let (num, _) = fields[i]
+    let mut drop = false
+    if num != keep_num {
+      let mut j = 0
+      while j < group.length() {
+        if group[j] == num {
+          drop = true
+          break
+        }
+        j = j + 1
+      }
+    }
+    if !drop {
+      if w != i {
+        fields[w] = fields[i]
+      }
+      w = w + 1
+    }
+    i = i + 1
+  }
+  while fields.length() > w {
+    let _ = fields.pop()
+  }
+}
+
+///| Clear all fields belonging to the same oneof group except `keep_num`, returning a new array.
+fn clear_oneof_siblings_mut(
+  fields : Array[(Int, ProtoValue)],
+  desc : MessageDescriptor,
+  oneof_idx : Int,
+  keep_num : Int,
+) -> Array[(Int, ProtoValue)] {
+  if oneof_idx < 0 || oneof_idx >= desc.oneofs.length() {
+    return fields
+  }
+  let group = desc.oneofs[oneof_idx].field_numbers
+  let out : Array[(Int, ProtoValue)] = []
+  let mut i = 0
+  while i < fields.length() {
+    let (num, v) = fields[i]
+    let mut drop = false
+    if num != keep_num {
+      let mut j = 0
+      while j < group.length() {
+        if group[j] == num {
+          drop = true
+          break
+        }
+        j = j + 1
+      }
+    }
+    if !drop {
+      out.push((num, v))
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Canonical string key for O(1) last-wins map deduplication.
+fn map_key_str(k : ProtoValue) -> String {
+  match k {
+    ProtoValue::String(s) => s
+    ProtoValue::Int32(n) => n.to_string()
+    ProtoValue::Int64(n) => n.to_string()
+    ProtoValue::UInt32(n) => n.to_string()
+    ProtoValue::UInt64(n) => n.to_string()
+    ProtoValue::Bool(b) => if b { "true" } else { "false" }
+    _ => ""
+  }
+}
+
+///| Upsert `(key_val, val_val)` into a map field with O(1) last-wins deduplication.
+fn upsert_map_entry(
+  fields : Array[(Int, ProtoValue)],
+  map_indices : Map[Int, Map[String, Int]],
+  field_number : Int,
+  key_val : ProtoValue,
+  val_val : ProtoValue,
+) -> Unit {
+  let kstr = map_key_str(key_val)
+  match map_indices.get(field_number) {
+    Some(kmap) => {
+      let mut i = 0
+      while i < fields.length() {
+        let (num, v) = fields[i]
+        if num == field_number {
+          match v {
+            ProtoValue::Map(pairs) => {
+              match kmap.get(kstr) {
+                Some(pidx) => pairs[pidx] = (key_val, val_val)
+                None => {
+                  kmap.set(kstr, pairs.length())
+                  pairs.push((key_val, val_val))
+                }
+              }
+              return
+            }
+            _ => ()
+          }
+        }
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+  // Check if map field already exists (e.g. from a merged submessage)
+  let mut i = 0
+  while i < fields.length() {
+    let (num, v) = fields[i]
+    if num == field_number {
+      match v {
+        ProtoValue::Map(pairs) => {
+          let kmap : Map[String, Int] = Map::new()
+          let mut p = 0
+          while p < pairs.length() {
+            let (pk, _) = pairs[p]
+            kmap.set(map_key_str(pk), p)
+            p = p + 1
+          }
+          match kmap.get(kstr) {
+            Some(pidx) => pairs[pidx] = (key_val, val_val)
+            None => {
+              kmap.set(kstr, pairs.length())
+              pairs.push((key_val, val_val))
+            }
+          }
+          map_indices.set(field_number, kmap)
+          return
+        }
+        _ => ()
+      }
+    }
+    i = i + 1
+  }
+  let kmap : Map[String, Int] = Map::new()
+  kmap.set(kstr, 0)
+  map_indices.set(field_number, kmap)
+  fields.push((field_number, ProtoValue::Map([(key_val, val_val)])))
+}
+
+///| Check all proto2 `required` fields on a decoded message.
+fn check_required_fields(desc : MessageDescriptor, msg : DynamicMessage) -> Result[Unit, ProtoError] {
+  if !desc.has_required {
+    return Ok(())
+  }
+  let mut i = 0
+  while i < desc.fields.length() {
+    let fd = desc.fields[i]
+    match fd.label {
+      FieldLabel::Required =>
+      if !has_field(msg, fd.number) {
+        return Err(ProtoError::InvalidValue("required field " + desc.full_name + "." + fd.name + " not set"))
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+///| Explicit stack frame for 100% iterative `decode_dynamic`.
+struct DecodeFrame {
+  desc : MessageDescriptor
+  mut r : WireReader
+  msg : DynamicMessage
+  map_indices : Map[Int, Map[String, Int]]
+  // Target attachment when this frame completes:
+  //   0 = root
+  //   1 = singular new submessage (upsert into parent.msg.fields)
+  //   2 = singular existing submessage (mutated in place, nothing to attach)
+  //   3 = repeated submessage (push to target_list)
+  //   4 = map entry message value (upsert into parent map)
+  target_kind : Int
+  target_field_num : Int
+  target_list : Array[ProtoValue]
+  map_key : ProtoValue
+  // Additional byte slices to merge into `msg` (for repeated field 2 inside one map entry)
+  extra_ranges : Array[(Int, Int)]
+  mut extra_idx : Int
+  // Proto2 group framing
+  is_group : Bool
+  group_field_num : Int
+}
+
+///| Handle decoding a map field entry inside `decode_dynamic`.
+fn decode_step_map(
+  schema : Schema,
+  data : Bytes,
+  frame : DecodeFrame,
+  frames : Array[DecodeFrame],
+  fdesc : FieldDescriptor,
+  kt : FieldType,
+  vt : FieldType,
+  depth : Int,
+  state : DecodeState,
+) -> Result[Unit, ProtoError] {
+  let (es, ee) = match frame.r.read_bytes_range() {
+    Ok(rng) => rng
+    Err(e) => return Err(e)
+  }
+  let entry_r = WireReader::{
+    data: data,
+    data_str: "",
+    has_data_str: false,
+    pos: es,
+    end: ee,
+    reject_reserved: state.opts.reject_reserved_field_numbers,
+    strict_utf8: state.strict_utf8,
+  }
+  let vt_is_msg = is_field_message(fdesc)
+  let vt_is_enum = is_field_enum(fdesc)
+  let kt_wt = scalar_wire_type(kt, false)
+  let vt_wt = scalar_wire_type(vt, vt_is_enum)
+  let mut key_val = default_value_for_field_type(kt, false)
+  let mut val_val = default_value_for_field_type(vt, vt_is_enum)
+  let val_ranges : Array[(Int, Int)] = []
+  while !entry_r.is_eof() {
+    let etag = match entry_r.read_tag() {
+      Ok(t) => t
+      Err(e) => return Err(e)
+    }
+    if etag.field_number == 1 {
+      if !wire_type_eq(etag.wire_type, kt_wt) {
+        match entry_r.skip_field(etag, state.max_depth - depth) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      } else {
+        key_val = match read_scalar_value(entry_r, 1, kt, false, etag.wire_type) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+      }
+    } else if etag.field_number == 2 {
+      if !wire_type_eq(etag.wire_type, vt_wt) {
+        match entry_r.skip_field(etag, state.max_depth - depth) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      } else if vt_is_msg {
+        let rng = match entry_r.read_bytes_range() {
+          Ok(rg) => rg
+          Err(e) => return Err(e)
+        }
+        val_ranges.push(rng)
+      } else {
+        val_val = match read_scalar_value(entry_r, 2, vt, vt_is_enum, etag.wire_type) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+      }
+    } else {
+      match entry_r.skip_field(etag, state.max_depth - depth) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+  if vt_is_msg {
+    let sub_desc = match resolve_field_message(schema, fdesc) {
+      Some(d) => d
+      None => return Err(ProtoError::MessageNotFound(fdesc.name))
+    }
+    if val_ranges.length() == 0 {
+      let empty_sub = DynamicMessage::new(sub_desc.full_name)
+      match check_required_fields(sub_desc, empty_sub) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      upsert_map_entry(
+        frame.msg.fields,
+        frame.map_indices,
+        fdesc.number,
+        key_val,
+        ProtoValue::Message(empty_sub),
+      )
+      return Ok(())
+    }
+    if depth + 1 > state.max_depth {
+      return Err(ProtoError::MaxDepthExceeded(state.max_depth))
+    }
+    let (ms, me) = val_ranges[0]
+    let sub_r = WireReader::{
+      data: data,
+      data_str: "",
+      has_data_str: false,
+      pos: ms,
+      end: me,
+      reject_reserved: state.opts.reject_reserved_field_numbers,
+      strict_utf8: state.strict_utf8,
+    }
+    frames.push(DecodeFrame::{
+      desc: sub_desc,
+      r: sub_r,
+      msg: DynamicMessage::new(sub_desc.full_name),
+      map_indices: Map::new(),
+      target_kind: 4,
+      target_field_num: fdesc.number,
+      target_list: [],
+      map_key: key_val,
+      extra_ranges: val_ranges,
+      extra_idx: 1,
+      is_group: false,
+      group_field_num: 0,
+    })
+  } else {
+    upsert_map_entry(frame.msg.fields, frame.map_indices, fdesc.number, key_val, val_val)
+  }
+  Ok(())
+}
+
+///| Handle decoding a repeated field inside `decode_dynamic`.
+fn decode_step_repeated(
+  schema : Schema,
+  data : Bytes,
+  frame : DecodeFrame,
+  frames : Array[DecodeFrame],
+  fdesc : FieldDescriptor,
+  tag : Tag,
+  depth : Int,
+  state : DecodeState,
+) -> Result[Unit, ProtoError] {
+  let r = frame.r
+  let mut list_ref : Array[ProtoValue] = []
+  let mut found_list = false
+  let mut idx = 0
+  while idx < frame.msg.fields.length() {
+    let (num, v) = frame.msg.fields[idx]
+    if num == fdesc.number {
+      match v {
+        ProtoValue::List(xs) => {
+          list_ref = xs
+          found_list = true
+          break
+        }
+        _ => ()
+      }
+    }
+    idx = idx + 1
+  }
+  if !found_list {
+    frame.msg.fields.push((fdesc.number, ProtoValue::List(list_ref)))
+  }
+  if wire_type_eq(tag.wire_type, WireType::LengthDelimited) && is_packable_scalar_fd(fdesc) {
+    let (ps, pe) = match r.read_bytes_range() {
+      Ok(rng) => rng
+      Err(e) => return Err(e)
+    }
+    let pr = WireReader::{
+      data: data,
+      data_str: "",
+      has_data_str: false,
+      pos: ps,
+      end: pe,
+      reject_reserved: state.opts.reject_reserved_field_numbers,
+      strict_utf8: state.strict_utf8,
+    }
+    let f_is_enum = is_field_enum(fdesc)
+    let elem_wt = scalar_wire_type(fdesc.field_type, f_is_enum)
+    while !pr.is_eof() {
+      let elem = match read_scalar_value(pr, fdesc.number, fdesc.field_type, f_is_enum, elem_wt) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      list_ref.push(elem)
+    }
+    return Ok(())
+  }
+  if is_field_message(fdesc) {
+    let sub_desc = match resolve_field_message(schema, fdesc) {
+      Some(d) => d
+      None => return Err(ProtoError::MessageNotFound(fdesc.name))
+    }
+    if depth + 1 > state.max_depth {
+      return Err(ProtoError::MaxDepthExceeded(state.max_depth))
+    }
+    let (ms, me) = if fdesc.is_group {
+      (r.pos(), r.end)
+    } else {
+      match r.read_bytes_range() {
+        Ok(rng) => rng
+        Err(e) => return Err(e)
+      }
+    }
+    let sub_r = WireReader::{
+      data: data,
+      data_str: "",
+      has_data_str: false,
+      pos: ms,
+      end: me,
+      reject_reserved: state.opts.reject_reserved_field_numbers,
+      strict_utf8: state.strict_utf8,
+    }
+    frames.push(DecodeFrame::{
+      desc: sub_desc,
+      r: sub_r,
+      msg: DynamicMessage::new(sub_desc.full_name),
+      map_indices: Map::new(),
+      target_kind: 3,
+      target_field_num: fdesc.number,
+      target_list: list_ref,
+      map_key: ProtoValue::Bool(false),
+      extra_ranges: [],
+      extra_idx: 0,
+      is_group: fdesc.is_group,
+      group_field_num: if fdesc.is_group { tag.field_number } else { 0 },
+    })
+    return Ok(())
+  }
+  let elem = match read_scalar_value(r, fdesc.number, fdesc.field_type, is_field_enum(fdesc), tag.wire_type) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  list_ref.push(elem)
+  Ok(())
+}
+
+///| Handle decoding a singular field inside `decode_dynamic`.
+fn decode_step_singular(
+  schema : Schema,
+  data : Bytes,
+  frame : DecodeFrame,
+  frames : Array[DecodeFrame],
+  fdesc : FieldDescriptor,
+  tag : Tag,
+  depth : Int,
+  state : DecodeState,
+) -> Result[Unit, ProtoError] {
+  let r = frame.r
+  if fdesc.oneof_index >= 0 {
+    clear_oneof_siblings_inplace(frame.msg.fields, frame.desc, fdesc.oneof_index, fdesc.number)
+  }
+  if is_field_message(fdesc) {
+    let sub_desc = match resolve_field_message(schema, fdesc) {
+      Some(d) => d
+      None => return Err(ProtoError::MessageNotFound(fdesc.name))
+    }
+    if depth + 1 > state.max_depth {
+      return Err(ProtoError::MaxDepthExceeded(state.max_depth))
+    }
+    // In-place merge if submessage already present (O(1), fixes F-3!)
+    let mut target_msg = DynamicMessage::new(sub_desc.full_name)
+    let mut tkind = 1
+    let mut k = 0
+    while k < frame.msg.fields.length() {
+      let (num, v) = frame.msg.fields[k]
+      if num == fdesc.number {
+        match v {
+          ProtoValue::Message(pm) => {
+            target_msg = pm
+            tkind = 2
+          }
+          _ => ()
+        }
+        break
+      }
+      k = k + 1
+    }
+    let (ms, me) = if fdesc.is_group {
+      (r.pos(), r.end)
+    } else {
+      match r.read_bytes_range() {
+        Ok(rng) => rng
+        Err(e) => return Err(e)
+      }
+    }
+    let sub_r = WireReader::{
+      data: data,
+      data_str: "",
+      has_data_str: false,
+      pos: ms,
+      end: me,
+      reject_reserved: state.opts.reject_reserved_field_numbers,
+      strict_utf8: state.strict_utf8,
+    }
+    frames.push(DecodeFrame::{
+      desc: sub_desc,
+      r: sub_r,
+      msg: target_msg,
+      map_indices: Map::new(),
+      target_kind: tkind,
+      target_field_num: fdesc.number,
+      target_list: [],
+      map_key: ProtoValue::Bool(false),
+      extra_ranges: [],
+      extra_idx: 0,
+      is_group: fdesc.is_group,
+      group_field_num: if fdesc.is_group { tag.field_number } else { 0 },
+    })
+    return Ok(())
+  }
+  let sv = match read_scalar_value(r, fdesc.number, fdesc.field_type, is_field_enum(fdesc), tag.wire_type) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  upsert_field_mut(frame.msg.fields, fdesc.number, sv)
+  Ok(())
+}
+
+///| Decode a binary Protobuf message dynamically using a parsed `Schema` (100% iterative).
+pub fn decode_dynamic(
+  schema : Schema,
+  msg_name : String,
+  data : Bytes,
+  opts : DecodeOptions,
+) -> Result[DynamicMessage, ProtoError] {
+  if data.length() > opts.max_bytes {
+    return Err(ProtoError::MaxBytesExceeded(opts.max_bytes))
+  }
+  let root_desc = match schema_find_message(schema, msg_name) {
+    Some(d) => d
+    None => return Err(ProtoError::MessageNotFound(msg_name))
+  }
+  let eff_max_depth = if opts.max_depth > hard_max_depth {
+    hard_max_depth
+  } else if opts.max_depth < 0 {
+    0
+  } else {
+    opts.max_depth
+  }
+  let strict_utf8 = match schema.syntax {
+    Syntax::Proto2 => false
+    Syntax::Proto3 => opts.strict_utf8
+  }
+  let state = DecodeState::{
+    opts: opts,
+    max_depth: eff_max_depth,
+    strict_utf8: strict_utf8,
+    field_count: 0,
+  }
+  let root_reader = WireReader::{
+    data: data,
+    data_str: "",
+    has_data_str: false,
+    pos: 0,
+    end: data.length(),
+    reject_reserved: opts.reject_reserved_field_numbers,
+    strict_utf8: strict_utf8,
+  }
+  let frames : Array[DecodeFrame] = [
+    DecodeFrame::{
+      desc: root_desc,
+      r: root_reader,
+      msg: DynamicMessage::new(root_desc.full_name),
+      map_indices: Map::new(),
+      target_kind: 0,
+      target_field_num: 0,
+      target_list: [],
+      map_key: ProtoValue::Bool(false),
+      extra_ranges: [],
+      extra_idx: 0,
+      is_group: false,
+      group_field_num: 0,
+    },
+  ]
+
+  while frames.length() > 0 {
+    let top_idx = frames.length() - 1
+    let frame = frames[top_idx]
+    let r = frame.r
+    if r.is_eof() {
+      if frame.is_group {
+        return Err(ProtoError::UnexpectedEof(r.pos()))
+      }
+      if frame.extra_idx < frame.extra_ranges.length() {
+        let (ns, ne) = frame.extra_ranges[frame.extra_idx]
+        frame.extra_idx = frame.extra_idx + 1
+        frame.r = WireReader::{
+          data: data,
+          data_str: "",
+          has_data_str: false,
+          pos: ns,
+          end: ne,
+          reject_reserved: opts.reject_reserved_field_numbers,
+          strict_utf8: strict_utf8,
+        }
+        continue
+      }
+      match check_required_fields(frame.desc, frame.msg) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let _ = frames.pop()
+      if frames.length() == 0 {
+        return Ok(frame.msg)
+      }
+      let parent = frames[frames.length() - 1]
+      if frame.target_kind == 1 {
+        upsert_field_mut(parent.msg.fields, frame.target_field_num, ProtoValue::Message(frame.msg))
+      } else if frame.target_kind == 3 {
+        frame.target_list.push(ProtoValue::Message(frame.msg))
+      } else if frame.target_kind == 4 {
+        upsert_map_entry(
+          parent.msg.fields,
+          parent.map_indices,
+          frame.target_field_num,
+          frame.map_key,
+          ProtoValue::Message(frame.msg),
+        )
+      }
+      continue
+    }
+
+    let tpos = r.pos()
+    let tag = match r.read_tag() {
+      Ok(t) => t
+      Err(e) => return Err(e)
+    }
+    if wire_type_eq(tag.wire_type, WireType::EndGroup) {
+      if frame.is_group && tag.field_number == frame.group_field_num {
+        match check_required_fields(frame.desc, frame.msg) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let end_pos = r.pos()
+        let _ = frames.pop()
+        if frames.length() == 0 {
+          return Ok(frame.msg)
+        }
+        let parent = frames[frames.length() - 1]
+        parent.r.pos = end_pos
+        if frame.target_kind == 1 {
+          upsert_field_mut(parent.msg.fields, frame.target_field_num, ProtoValue::Message(frame.msg))
+        } else if frame.target_kind == 3 {
+          frame.target_list.push(ProtoValue::Message(frame.msg))
+        }
+        continue
+      }
+      return Err(ProtoError::UnmatchedGroup(tag.field_number, tpos))
+    }
+    state.field_count = state.field_count + 1
+    if state.field_count > state.opts.max_fields {
+      return Err(ProtoError::MaxFieldsExceeded(state.opts.max_fields))
+    }
+    let fdesc = match find_field_desc_by_num(frame.desc, tag.field_number) {
+      Some(fd) => fd
+      None => {
+        let uf = match read_unknown_field(r, data, tpos, tag, top_idx, state) {
+          Ok(u) => u
+          Err(e) => return Err(e)
+        }
+        frame.msg.unknown_fields.push(uf)
+        continue
+      }
+    }
+    let expected_wt = expected_field_wire_type_fd(fdesc)
+    let is_packed_match = match fdesc.label {
+      FieldLabel::Repeated => wire_type_eq(tag.wire_type, WireType::LengthDelimited) && is_packable_scalar_fd(fdesc)
+      _ => false
+    }
+    if !wire_type_eq(tag.wire_type, expected_wt) && !is_packed_match {
+      let uf = match read_unknown_field(r, data, tpos, tag, top_idx, state) {
+        Ok(u) => u
+        Err(e) => return Err(e)
+      }
+      frame.msg.unknown_fields.push(uf)
+      continue
+    }
+
+    let step_res = match fdesc.field_type {
+      FieldType::Map(kt, vt) => decode_step_map(schema, data, frame, frames, fdesc, kt, vt, top_idx, state)
+      _ =>
+      match fdesc.label {
+        FieldLabel::Repeated => decode_step_repeated(schema, data, frame, frames, fdesc, tag, top_idx, state)
+        _ => decode_step_singular(schema, data, frame, frames, fdesc, tag, top_idx, state)
+      }
+    }
+    match step_res {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  Err(ProtoError::InvalidValue("decode_dynamic empty frame stack"))
+}
+
+///| Decode a binary Protobuf message dynamically using default `DecodeOptions`.
+pub fn decode_dynamic_default(
+  schema : Schema,
+  msg_name : String,
+  data : Bytes,
+) -> Result[DynamicMessage, ProtoError] {
+  decode_dynamic(schema, msg_name, data, DecodeOptions::default())
+}
+
+///| Write a single scalar value without tag (for packed repeated).
+fn write_scalar_untagged(w : WireWriter, ft : FieldType, v : ProtoValue) -> Result[Unit, ProtoError] {
+  match (ft, v) {
+    (FieldType::Double, ProtoValue::Double(d)) => {
+      w.write_fixed64(d.to_bits().to_uint64())
+      Ok(())
+    }
+    (FieldType::Float, ProtoValue::Float(d)) => {
+      w.write_fixed32(double_to_float32_bits(d))
+      Ok(())
+    }
+    (FieldType::Int32, ProtoValue::Int32(n)) => {
+      w.write_varint64(((n.to_int64() << 32) >> 32).to_uint64())
+      Ok(())
+    }
+    (FieldType::Int64, ProtoValue::Int64(n)) => {
+      w.write_varint64(n.to_uint64())
+      Ok(())
+    }
+    (FieldType::UInt32, ProtoValue::UInt32(n)) => {
+      w.write_varint64((n & 0xFFFFFFFFL).to_uint64())
+      Ok(())
+    }
+    (FieldType::UInt64, ProtoValue::UInt64(n)) => {
+      w.write_varint64(n)
+      Ok(())
+    }
+    (FieldType::SInt32, ProtoValue::Int32(n)) => {
+      w.write_varint64(zigzag_encode_i32(n).to_uint64())
+      Ok(())
+    }
+    (FieldType::SInt64, ProtoValue::Int64(n)) => {
+      w.write_varint64(zigzag_encode_i64(n))
+      Ok(())
+    }
+    (FieldType::Fixed32, ProtoValue::UInt32(n)) => {
+      w.write_fixed32(n)
+      Ok(())
+    }
+    (FieldType::Fixed64, ProtoValue::UInt64(n)) => {
+      w.write_fixed64(n)
+      Ok(())
+    }
+    (FieldType::SFixed32, ProtoValue::Int32(n)) => {
+      w.write_fixed32(n.to_int64() & 0xFFFFFFFFL)
+      Ok(())
+    }
+    (FieldType::SFixed64, ProtoValue::Int64(n)) => {
+      w.write_fixed64(n.to_uint64())
+      Ok(())
+    }
+    (FieldType::Bool, ProtoValue::Bool(b)) => {
+      w.write_varint64(if b { 1UL } else { 0UL })
+      Ok(())
+    }
+    (FieldType::Named(_), ProtoValue::Enum(n)) => {
+      w.write_varint64(((n.to_int64() << 32) >> 32).to_uint64())
+      Ok(())
+    }
+    _ => Err(ProtoError::InvalidValue("type mismatch in packed scalar encode"))
+  }
+}
+
+///| Write a single tagged field value.
+fn write_scalar_field(w : WireWriter, field_number : Int, ft : FieldType, v : ProtoValue) -> Result[Unit, ProtoError] {
+  match (ft, v) {
+    (FieldType::Double, ProtoValue::Double(d)) => {
+      w.write_double_field(field_number, d)
+      Ok(())
+    }
+    (FieldType::Float, ProtoValue::Float(d)) => {
+      w.write_float_field(field_number, d)
+      Ok(())
+    }
+    (FieldType::Int32, ProtoValue::Int32(n)) => {
+      w.write_int32_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::Int64, ProtoValue::Int64(n)) => {
+      w.write_int64_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::UInt32, ProtoValue::UInt32(n)) => {
+      w.write_uint32_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::UInt64, ProtoValue::UInt64(n)) => {
+      w.write_uint64_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::SInt32, ProtoValue::Int32(n)) => {
+      w.write_sint32_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::SInt64, ProtoValue::Int64(n)) => {
+      w.write_sint64_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::Fixed32, ProtoValue::UInt32(n)) => {
+      w.write_fixed32_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::Fixed64, ProtoValue::UInt64(n)) => {
+      w.write_fixed64_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::SFixed32, ProtoValue::Int32(n)) => {
+      w.write_sfixed32_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::SFixed64, ProtoValue::Int64(n)) => {
+      w.write_sfixed64_field(field_number, n)
+      Ok(())
+    }
+    (FieldType::Bool, ProtoValue::Bool(b)) => {
+      w.write_bool_field(field_number, b)
+      Ok(())
+    }
+    (FieldType::String, ProtoValue::String(s)) => {
+      w.write_string_field(field_number, s)
+      Ok(())
+    }
+    (FieldType::Bytes, ProtoValue::Bytes(b)) => {
+      w.write_bytes_field(field_number, b)
+      Ok(())
+    }
+    (FieldType::Named(_), ProtoValue::Enum(n)) => {
+      w.write_int32_field(field_number, n)
+      Ok(())
+    }
+    _ => Err(ProtoError::InvalidValue("value type mismatch for field " + field_number.to_string()))
+  }
+}
+
+///| Write an unknown field back to wire format iteratively (using raw_bytes when available for 100% lossless roundtrip).
+fn write_unknown_field_iter(w : WireWriter, root_uf : UnknownField) -> Unit {
+  if root_uf.raw_bytes.length() > 0 {
+    w.write_raw_bytes(root_uf.raw_bytes)
+    return
+  }
+  let list_stack : Array[Array[UnknownField]] = [[root_uf]]
+  let idx_stack : Array[Int] = [0]
+  let end_num_stack : Array[Int] = [-1]
+  while list_stack.length() > 0 {
+    let top = list_stack.length() - 1
+    let cur_list = list_stack[top]
+    let cur_idx = idx_stack[top]
+    if cur_idx >= cur_list.length() {
+      let _ = list_stack.pop()
+      let _ = idx_stack.pop()
+      let end_num = match end_num_stack.pop() {
+        Some(n) => n
+        None => -1
+      }
+      if end_num > 0 {
+        w.write_tag(end_num, WireType::EndGroup)
+      }
+      continue
+    }
+    idx_stack[top] = cur_idx + 1
+    let uf = cur_list[cur_idx]
+    if uf.raw_bytes.length() > 0 {
+      w.write_raw_bytes(uf.raw_bytes)
+      continue
+    }
+    match uf.value {
+      UnknownValue::Varint(v) => {
+        w.write_tag(uf.field_number, WireType::Varint)
+        w.write_varint64(v)
+      }
+      UnknownValue::Fixed32(v) => w.write_fixed32_field(uf.field_number, v)
+      UnknownValue::Fixed64(v) => w.write_fixed64_field(uf.field_number, v)
+      UnknownValue::LengthDelimited(b) => w.write_bytes_field(uf.field_number, b)
+      UnknownValue::Group(inner) => {
+        w.write_tag(uf.field_number, WireType::StartGroup)
+        list_stack.push(inner)
+        idx_stack.push(0)
+        end_num_stack.push(uf.field_number)
+      }
+    }
+  }
+}
+
+///| Explicit stack frame for 100% iterative `encode_dynamic`.
+struct EncodeFrame {
+  desc : MessageDescriptor
+  msg : DynamicMessage
+  mut field_idx : Int
+  mut sub_idx : Int
+  w : WireWriter
+  // How to emit `w` into parent when popped:
+  //   0 = root
+  //   1 = length-delimited field `target_field_num` on parent.w
+  //   2 = map value: write `w` as field 2 on `map_entry_w`, then write `map_entry_w` as `target_field_num` on parent.w
+  //   3 = proto2 group field `target_field_num` on parent.w
+  emit_kind : Int
+  target_field_num : Int
+  map_entry_w : WireWriter
+}
+
+///| Encode a `DynamicMessage` back to binary Protobuf wire format using `Schema` (100% iterative).
+pub fn encode_dynamic(schema : Schema, msg : DynamicMessage) -> Result[Bytes, ProtoError] {
+  let root_desc = match schema_find_message(schema, msg.message_name) {
+    Some(d) => d
+    None => return Err(ProtoError::MessageNotFound(msg.message_name))
+  }
+  let is_proto3 = match schema.syntax {
+    Syntax::Proto3 => true
+    Syntax::Proto2 => false
+  }
+  let dummy_w = WireWriter::with_capacity(16)
+  let frames : Array[EncodeFrame] = [
+    EncodeFrame::{
+      desc: root_desc,
+      msg: msg,
+      field_idx: 0,
+      sub_idx: 0,
+      w: WireWriter::new(),
+      emit_kind: 0,
+      target_field_num: 0,
+      map_entry_w: dummy_w,
+    },
+  ]
+
+  while frames.length() > 0 {
+    let top_idx = frames.length() - 1
+    let frame = frames[top_idx]
+    if frame.field_idx >= frame.msg.fields.length() {
+      // Losslessly re-emit unknown fields
+      let mut u = 0
+      while u < frame.msg.unknown_fields.length() {
+        write_unknown_field_iter(frame.w, frame.msg.unknown_fields[u])
+        u = u + 1
+      }
+      let _ = frames.pop()
+      if frames.length() == 0 {
+        return Ok(frame.w.to_bytes())
+      }
+      let parent = frames[frames.length() - 1]
+      if frame.emit_kind == 1 {
+        parent.w.write_subwriter_field(frame.target_field_num, frame.w)
+      } else if frame.emit_kind == 2 {
+        frame.map_entry_w.write_subwriter_field(2, frame.w)
+        parent.w.write_subwriter_field(frame.target_field_num, frame.map_entry_w)
+      } else if frame.emit_kind == 3 {
+        parent.w.write_tag(frame.target_field_num, WireType::StartGroup)
+        parent.w.write_raw_slice(frame.w.buf, 0, frame.w.len)
+        parent.w.write_tag(frame.target_field_num, WireType::EndGroup)
+      }
+      continue
+    }
+
+    let (fnum, fval) = frame.msg.fields[frame.field_idx]
+    let fdesc = match find_field_desc_by_num(frame.desc, fnum) {
+      Some(fd) => fd
+      None => return Err(ProtoError::FieldNotFound(fnum.to_string()))
+    }
+    match fdesc.field_type {
+      FieldType::Map(kt, vt) =>
+      match fval {
+        ProtoValue::Map(pairs) => {
+          if frame.sub_idx >= pairs.length() {
+            frame.field_idx = frame.field_idx + 1
+            frame.sub_idx = 0
+            continue
+          }
+          let (k, v) = pairs[frame.sub_idx]
+          frame.sub_idx = frame.sub_idx + 1
+          let ew = WireWriter::new()
+          match write_scalar_field(ew, 1, kt, k) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          if is_field_message(fdesc) {
+            match v {
+              ProtoValue::Message(sub_msg) => {
+                let sub_desc = match resolve_field_message(schema, fdesc) {
+                  Some(d) => d
+                  None => return Err(ProtoError::MessageNotFound(fdesc.name))
+                }
+                frames.push(EncodeFrame::{
+                  desc: sub_desc,
+                  msg: sub_msg,
+                  field_idx: 0,
+                  sub_idx: 0,
+                  w: WireWriter::new(),
+                  emit_kind: 2,
+                  target_field_num: fnum,
+                  map_entry_w: ew,
+                })
+                continue
+              }
+              _ => return Err(ProtoError::InvalidValue("expected Message for map value " + fdesc.name))
+            }
+          } else {
+            match write_scalar_field(ew, 2, vt, v) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            frame.w.write_subwriter_field(fnum, ew)
+          }
+        }
+        _ => return Err(ProtoError::InvalidValue("expected Map for field " + fdesc.name))
+      }
+      _ =>
+      match fdesc.label {
+        FieldLabel::Repeated =>
+        match fval {
+          ProtoValue::List(items) => {
+            if items.length() == 0 {
+              frame.field_idx = frame.field_idx + 1
+              frame.sub_idx = 0
+              continue
+            }
+            let use_packed = match fdesc.packed {
+              Some(p) => p && is_packable_scalar_fd(fdesc)
+              None => is_proto3 && is_packable_scalar_fd(fdesc)
+            }
+            if use_packed {
+              let pw = WireWriter::new()
+              let mut j = 0
+              while j < items.length() {
+                match write_scalar_untagged(pw, fdesc.field_type, items[j]) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+                j = j + 1
+              }
+              frame.w.write_subwriter_field(fnum, pw)
+              frame.field_idx = frame.field_idx + 1
+              frame.sub_idx = 0
+            } else {
+              if frame.sub_idx >= items.length() {
+                frame.field_idx = frame.field_idx + 1
+                frame.sub_idx = 0
+                continue
+              }
+              let item = items[frame.sub_idx]
+              frame.sub_idx = frame.sub_idx + 1
+              if is_field_message(fdesc) {
+                match item {
+                  ProtoValue::Message(sub_msg) => {
+                    let sub_desc = match resolve_field_message(schema, fdesc) {
+                      Some(d) => d
+                      None => return Err(ProtoError::MessageNotFound(fdesc.name))
+                    }
+                    frames.push(EncodeFrame::{
+                      desc: sub_desc,
+                      msg: sub_msg,
+                      field_idx: 0,
+                      sub_idx: 0,
+                      w: WireWriter::new(),
+                      emit_kind: if fdesc.is_group { 3 } else { 1 },
+                      target_field_num: fnum,
+                      map_entry_w: dummy_w,
+                    })
+                    continue
+                  }
+                  _ => return Err(ProtoError::InvalidValue("expected Message for repeated field " + fdesc.name))
+                }
+              } else {
+                match write_scalar_field(frame.w, fnum, fdesc.field_type, item) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+              }
+            }
+          }
+          _ => return Err(ProtoError::InvalidValue("expected List for repeated field " + fdesc.name))
+        }
+        _ => {
+          frame.field_idx = frame.field_idx + 1
+          frame.sub_idx = 0
+          let omit_default = is_proto3 && fdesc.oneof_index < 0 && match fdesc.label {
+            FieldLabel::Implicit => true
+            _ => false
+          }
+          if omit_default && is_default_proto3_value(fval) {
+            continue
+          }
+          if is_field_message(fdesc) {
+            match fval {
+              ProtoValue::Message(sub_msg) => {
+                let sub_desc = match resolve_field_message(schema, fdesc) {
+                  Some(d) => d
+                  None => return Err(ProtoError::MessageNotFound(fdesc.name))
+                }
+                frames.push(EncodeFrame::{
+                  desc: sub_desc,
+                  msg: sub_msg,
+                  field_idx: 0,
+                  sub_idx: 0,
+                  w: WireWriter::new(),
+                  emit_kind: if fdesc.is_group { 3 } else { 1 },
+                  target_field_num: fnum,
+                  map_entry_w: dummy_w,
+                })
+                continue
+              }
+              _ => return Err(ProtoError::InvalidValue("value type mismatch for field " + fnum.to_string()))
+            }
+          } else {
+            match write_scalar_field(frame.w, fnum, fdesc.field_type, fval) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+      }
+    }
+  }
+  Err(ProtoError::InvalidValue("encode_dynamic empty frame stack"))
+}
+
+///| Check if a field number is present in `DynamicMessage`.
+pub fn has_field(msg : DynamicMessage, field_number : Int) -> Bool {
+  let mut i = 0
+  while i < msg.fields.length() {
+    let (num, _) = msg.fields[i]
+    if num == field_number {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Get raw `ProtoValue` by field number.
+pub fn get_field(msg : DynamicMessage, field_number : Int) -> Option[ProtoValue] {
+  let mut i = 0
+  while i < msg.fields.length() {
+    let (num, v) = msg.fields[i]
+    if num == field_number {
+      return Option::Some(v)
+    }
+    i = i + 1
+  }
+  Option::None
+}
+
+///| Get raw `ProtoValue` by field name.
+pub fn get_field_by_name(schema : Schema, msg : DynamicMessage, name : String) -> Option[ProtoValue] {
+  let desc = match schema_find_message(schema, msg.message_name) {
+    Some(d) => d
+    None => return Option::None
+  }
+  match find_field_desc_by_name(desc, name) {
+    Some(fd) => get_field(msg, fd.number)
+    None => Option::None
+  }
+}
+
+///| Return a new `DynamicMessage` with `field_number` set to `value`.
+pub fn set_field(msg : DynamicMessage, field_number : Int, value : ProtoValue) -> DynamicMessage {
+  let next_fields : Array[(Int, ProtoValue)] = []
+  let mut replaced = false
+  let mut i = 0
+  while i < msg.fields.length() {
+    let (num, v) = msg.fields[i]
+    if num == field_number {
+      next_fields.push((field_number, value))
+      replaced = true
+    } else {
+      next_fields.push((num, v))
+    }
+    i = i + 1
+  }
+  if !replaced {
+    next_fields.push((field_number, value))
+  }
+  DynamicMessage::{
+    message_name: msg.message_name,
+    fields: next_fields,
+    unknown_fields: msg.unknown_fields,
+  }
+}
+
+///| Return a new `DynamicMessage` with field named `name` set to `value` (enforcing oneof exclusivity).
+pub fn set_field_by_name(
+  schema : Schema,
+  msg : DynamicMessage,
+  name : String,
+  value : ProtoValue,
+) -> Result[DynamicMessage, ProtoError] {
+  let desc = match schema_find_message(schema, msg.message_name) {
+    Some(d) => d
+    None => return Err(ProtoError::MessageNotFound(msg.message_name))
+  }
+  let fd = match find_field_desc_by_name(desc, name) {
+    Some(f) => f
+    None => return Err(ProtoError::FieldNotFound(name))
+  }
+  let mut next_fields : Array[(Int, ProtoValue)] = []
+  let mut i = 0
+  while i < msg.fields.length() {
+    next_fields.push(msg.fields[i])
+    i = i + 1
+  }
+  if fd.oneof_index >= 0 {
+    next_fields = clear_oneof_siblings_mut(next_fields, desc, fd.oneof_index, fd.number)
+  }
+  upsert_field_mut(next_fields, fd.number, value)
+  Ok(DynamicMessage::{
+    message_name: msg.message_name,
+    fields: next_fields,
+    unknown_fields: msg.unknown_fields,
+  })
+}
+
+///| Return a new `DynamicMessage` with `field_number` cleared.
+pub fn clear_field(msg : DynamicMessage, field_number : Int) -> DynamicMessage {
+  let next_fields : Array[(Int, ProtoValue)] = []
+  let mut i = 0
+  while i < msg.fields.length() {
+    let (num, v) = msg.fields[i]
+    if num != field_number {
+      next_fields.push((num, v))
+    }
+    i = i + 1
+  }
+  DynamicMessage::{
+    message_name: msg.message_name,
+    fields: next_fields,
+    unknown_fields: msg.unknown_fields,
+  }
+}
+
+///| Typed getters by field number.
+pub fn get_int32(msg : DynamicMessage, field_number : Int) -> Option[Int] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Int32(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_int64(msg : DynamicMessage, field_number : Int) -> Option[Int64] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Int64(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_uint32(msg : DynamicMessage, field_number : Int) -> Option[Int64] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::UInt32(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_uint64(msg : DynamicMessage, field_number : Int) -> Option[UInt64] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::UInt64(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_bool(msg : DynamicMessage, field_number : Int) -> Option[Bool] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Bool(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_float(msg : DynamicMessage, field_number : Int) -> Option[Double] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Float(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_double(msg : DynamicMessage, field_number : Int) -> Option[Double] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Double(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_string(msg : DynamicMessage, field_number : Int) -> Option[String] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::String(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_bytes(msg : DynamicMessage, field_number : Int) -> Option[Bytes] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Bytes(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_enum(msg : DynamicMessage, field_number : Int) -> Option[Int] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Enum(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_message(msg : DynamicMessage, field_number : Int) -> Option[DynamicMessage] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Message(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_list(msg : DynamicMessage, field_number : Int) -> Option[Array[ProtoValue]] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::List(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}
+
+///|
+pub fn get_map(msg : DynamicMessage, field_number : Int) -> Option[Array[(ProtoValue, ProtoValue)]] {
+  match get_field(msg, field_number) {
+    Some(ProtoValue::Map(v)) => Option::Some(v)
+    _ => Option::None
+  }
+}

@@ -1,0 +1,252 @@
+///| Day-1 Red-Team security & robustness test suite for `packages/protobuf`.
+
+///|
+fn make_deep_nested_message(depth : Int) -> Bytes {
+  // Each nesting layer is field 1 (wire type 2 = tag 0x0a) wrapping the inner payload.
+  // Innermost payload is empty (0 bytes): layer 1 = [0x0a, 0x00] (len 2).
+  // Build iteratively from inside out so test generation itself is stack-safe.
+  let mut payload = Bytes::new(0)
+  let mut d = 0
+  while d < depth {
+    let w = WireWriter::with_capacity(payload.length() + 12)
+    w.write_bytes_field(1, payload)
+    payload = w.to_bytes()
+    d = d + 1
+  }
+  payload
+}
+
+///|
+fn make_deep_nested_groups(depth : Int) -> Bytes {
+  // depth StartGroup (0x0b) followed by depth EndGroup (0x0c)
+  let out = Bytes::new(depth * 2)
+  let mut i = 0
+  while i < depth {
+    out[i] = (0x0b).to_byte()
+    out[depth + i] = (0x0c).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+test "redteam: 50,000-level nested StartGroup rejected without stack overflow" {
+  let raw = make_deep_nested_groups(50000)
+  let r = WireReader::new(raw)
+  let t = match r.read_tag() {
+    Ok(tag) => tag
+    Err(e) => {
+      debug_assert(false, "first tag should parse: " + error_message(e))
+      return
+    }
+  }
+  match r.skip_field(t, 100) {
+    Err(ProtoError::MaxDepthExceeded(100)) => ()
+    Ok(_) => debug_assert(false, "50,000-level StartGroup must fail with MaxDepthExceeded")
+    Err(e) => debug_assert(false, "expected MaxDepthExceeded(100), got: " + error_message(e))
+  }
+}
+
+///|
+test "redteam: 50,000-level nested message rejected cleanly with MaxDepthExceeded" {
+  let schema = match parse_schema("syntax = \"proto3\"; message Node { Node child = 1; }") {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, error_message(e))
+      return
+    }
+  }
+  // Build 150-level nested message (exceeds default max_depth=100) and a 50,000-byte deep group payload
+  let deep_msg = make_deep_nested_message(150)
+  match decode_dynamic_default(schema, "Node", deep_msg) {
+    Err(ProtoError::MaxDepthExceeded(100)) => ()
+    Ok(_) => debug_assert(false, "150-level nested message must fail default max_depth=100")
+    Err(e) => debug_assert(false, "expected MaxDepthExceeded(100), got: " + error_message(e))
+  }
+
+  let deep_groups = make_deep_nested_groups(50000)
+  match decode_dynamic_default(schema, "Node", deep_groups) {
+    Err(ProtoError::MaxDepthExceeded(100)) => ()
+    Ok(_) => debug_assert(false, "50,000-level nested StartGroup in dynamic decode must fail")
+    Err(e) => debug_assert(false, "expected MaxDepthExceeded(100), got: " + error_message(e))
+  }
+}
+
+///|
+test "redteam: malicious huge length-delimited (0x7FFFFFFF on 10B input) zero-OOM immediate Err" {
+  // field 2 LengthDelimited (0x12), len = 0x7FFFFFFF (ff ff ff ff 07), only 4 bytes follow
+  let crafted = hex_to_bytes("12ffffffff0701020304")
+  let r = WireReader::new(crafted)
+  match r.read_tag() {
+    Ok(t) => debug_assert(t.field_number == 2 && wire_type_eq(t.wire_type, WireType::LengthDelimited), "tag")
+    Err(e) => debug_assert(false, error_message(e))
+  }
+  match r.read_bytes() {
+    Err(ProtoError::UnexpectedEof(_)) => ()
+    Ok(_) => debug_assert(false, "huge length must not succeed")
+    Err(e) => debug_assert(false, "expected UnexpectedEof, got: " + error_message(e))
+  }
+
+  // Also test len = UINT64_MAX (10-byte varint)
+  let crafted_u64max = hex_to_bytes("12ffffffffffffffffff0100")
+  let r2 = WireReader::new(crafted_u64max)
+  match r2.read_tag() {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, error_message(e))
+  }
+  match r2.read_bytes() {
+    Err(ProtoError::UnexpectedEof(_)) => ()
+    Ok(_) => debug_assert(false, "u64::MAX length must not succeed")
+    Err(e) => debug_assert(false, "expected UnexpectedEof, got: " + error_message(e))
+  }
+}
+
+///|
+test "redteam: invalid UTF-8 string fields strictly rejected" {
+  let bad_utf8 : Array[String] = [
+    "120180", // lone continuation byte
+    "1202c0af", // overlong 2-byte '/'
+    "1203e080af", // overlong 3-byte '/'
+    "1203eda080", // UTF-16 high surrogate U+D800
+    "1204f4908080", // > U+10FFFF
+    "1202e282", // truncated 3-byte sequence
+  ]
+  let mut i = 0
+  while i < bad_utf8.length() {
+    let raw = hex_to_bytes(bad_utf8[i])
+    let r = WireReader::new(raw)
+    match r.read_tag() {
+      Ok(_) => ()
+      Err(e) => debug_assert(false, error_message(e))
+    }
+    match r.read_string() {
+      Err(ProtoError::InvalidUtf8(_)) => ()
+      Ok(_) => debug_assert(false, "invalid UTF-8 case " + i.to_string() + " must be rejected")
+      Err(e) => debug_assert(false, "expected InvalidUtf8, got: " + error_message(e))
+    }
+    i = i + 1
+  }
+}
+
+///|
+test "redteam: overlong 11-byte varint and 10th byte > 0x01 rejected" {
+  // 11-byte varint
+  let v11 = hex_to_bytes("8080808080808080808000")
+  match WireReader::new(v11).read_varint64() {
+    Err(ProtoError::VarintOverflow(_)) => ()
+    _ => debug_assert(false, "11-byte varint must fail with VarintOverflow")
+  }
+  // 10th byte = 0x02 (> 0x01)
+  let v10_bad = hex_to_bytes("80808080808080808002")
+  match WireReader::new(v10_bad).read_varint64() {
+    Err(ProtoError::VarintOverflow(_)) => ()
+    _ => debug_assert(false, "10th byte 0x02 must fail with VarintOverflow")
+  }
+  // 10th byte = 0x7f
+  let v10_7f = hex_to_bytes("ffffffffffffffffff7f")
+  match WireReader::new(v10_7f).read_varint64() {
+    Err(ProtoError::VarintOverflow(_)) => ()
+    _ => debug_assert(false, "10th byte 0x7f must fail with VarintOverflow")
+  }
+}
+
+///|
+test "redteam: truncated varint, fixed32, fixed64 rejected" {
+  match WireReader::new(hex_to_bytes("80")).read_varint64() {
+    Err(ProtoError::UnexpectedEof(_)) => ()
+    _ => debug_assert(false, "truncated varint must fail")
+  }
+  match WireReader::new(hex_to_bytes("010203")).read_fixed32() {
+    Err(ProtoError::UnexpectedEof(_)) => ()
+    _ => debug_assert(false, "truncated fixed32 must fail")
+  }
+  match WireReader::new(hex_to_bytes("01020304050607")).read_fixed64() {
+    Err(ProtoError::UnexpectedEof(_)) => ()
+    _ => debug_assert(false, "truncated fixed64 must fail")
+  }
+}
+
+///|
+test "redteam: orphan EndGroup, unclosed StartGroup, mismatched group number rejected" {
+  let schema = match parse_schema("syntax = \"proto3\"; message Empty {}") {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, error_message(e))
+      return
+    }
+  }
+  // Orphan EndGroup (field 1, wire type 4 -> 0x0c)
+  match decode_dynamic_default(schema, "Empty", hex_to_bytes("0c")) {
+    Err(ProtoError::UnmatchedGroup(_, _)) => ()
+    _ => debug_assert(false, "orphan EndGroup must fail with UnmatchedGroup")
+  }
+  // Unclosed StartGroup (field 1, wire type 3 -> 0x0b, then field 1 varint 1)
+  match decode_dynamic_default(schema, "Empty", hex_to_bytes("0b0801")) {
+    Err(ProtoError::UnexpectedEof(_)) | Err(ProtoError::UnmatchedGroup(_, _)) => ()
+    _ => debug_assert(false, "unclosed StartGroup must fail")
+  }
+  // Mismatched group number: StartGroup field 1 (0x0b), EndGroup field 2 (0x14)
+  match decode_dynamic_default(schema, "Empty", hex_to_bytes("0b14")) {
+    Err(ProtoError::UnmatchedGroup(_, _)) => ()
+    _ => debug_assert(false, "mismatched EndGroup must fail with UnmatchedGroup")
+  }
+}
+
+///|
+test "redteam: unknown wire types 6 and 7, field number 0, and max_fields/max_bytes limits" {
+  match WireReader::new(hex_to_bytes("0e")).read_tag() {
+    Err(ProtoError::InvalidWireType(6, _)) => ()
+    _ => debug_assert(false, "wire type 6 must fail")
+  }
+  match WireReader::new(hex_to_bytes("0f")).read_tag() {
+    Err(ProtoError::InvalidWireType(7, _)) => ()
+    _ => debug_assert(false, "wire type 7 must fail")
+  }
+  match WireReader::new(hex_to_bytes("00")).read_tag() {
+    Err(ProtoError::InvalidFieldNumber(0, _)) => ()
+    _ => debug_assert(false, "field number 0 must fail")
+  }
+  // Tag with field number = 536870912 (2^29) -> tag = 2^32 = 0x100000000 -> 80 80 80 80 10
+  match WireReader::new(hex_to_bytes("8080808010")).read_tag() {
+    Err(ProtoError::InvalidFieldNumber(_, _)) => ()
+    _ => debug_assert(false, "field number > 536870911 must fail")
+  }
+
+  // max_bytes and max_fields enforcement in decode_dynamic
+  let schema = match parse_schema("syntax = \"proto3\"; message M { repeated int32 a = 1; }") {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, error_message(e))
+      return
+    }
+  }
+  let w = WireWriter::new()
+  let mut k = 0
+  while k < 20 {
+    w.write_int32_field(1, k)
+    k = k + 1
+  }
+  let raw = w.to_bytes()
+  let small_bytes_opts = DecodeOptions::{
+    max_depth: 100,
+    max_fields: 1000,
+    max_bytes: 10,
+    strict_utf8: true,
+    reject_reserved_field_numbers: false,
+  }
+  match decode_dynamic(schema, "M", raw, small_bytes_opts) {
+    Err(ProtoError::MaxBytesExceeded(10)) => ()
+    _ => debug_assert(false, "max_bytes limit must trigger")
+  }
+  let small_fields_opts = DecodeOptions::{
+    max_depth: 100,
+    max_fields: 5,
+    max_bytes: 65536,
+    strict_utf8: true,
+    reject_reserved_field_numbers: false,
+  }
+  match decode_dynamic(schema, "M", raw, small_fields_opts) {
+    Err(ProtoError::MaxFieldsExceeded(5)) => ()
+    _ => debug_assert(false, "max_fields limit must trigger")
+  }
+}
