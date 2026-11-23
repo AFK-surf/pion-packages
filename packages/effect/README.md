@@ -37,3 +37,14 @@ sh packages/effect/bench/run_bench.sh
 | W3: Structured Fan-Out & Join (2,500 × 4 = 10k fibers) | 19.481 ms / 1.84 MiB | 18.090 ms / 5.42 MiB | 51.110 ms / 45.16 MiB | 0.93x |
 
 _Note on W2: Pion spawns 20,000 full structured fibers (`Task` + `Fiber` + `sleep_k` timer + scope watcher) concurrently, while the Go and Node.js baselines push bare `{at, seq, idx}` structs into a min-heap._
+
+## Formal Verification (Lean 4)
+
+24 machine-checked, 0-`sorry` Lean 4 theorems (standard axioms only: `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 20 production `#verify` kernels in `packages/effect/src/`:
+- **Runtime, PRNG & RingDeque (`proofs/EffectProofs/RuntimeAndDeque.lean`, 12 theorems)**: xorshift32 non-zero 32-bit state seeding (`[1, 2^32-1]`), transition closure & `0` fixed point, `rng_below_val` range safety, `RingDeque` capacity growth, wraparound slot index bounds `[0, cap)`, `push_front`/`pop_front` index inverse, and `TimerHeap` `(at, seq)` strict partial order (irreflexive, asymmetric, transitive).
+- **Heap, Queue, Scheduler & Fiber (`proofs/EffectProofs/SchedulerAndSync.lean`, 12 theorems)**: binary min-heap `heap_parent` strict descent & left/right child inverse, unbounded/bounded `Queue` room & shutdown rejection, 6-tier priority strict hierarchy, `Scheduler` urgent-room admission, background serialization & idle yielding, non-idle preemption immunity, and `uninterruptible_k` shield cut immunity.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion harness (`diff -u` 44/44 cases identical).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/effect/proofs/run_proofs.sh
+```
