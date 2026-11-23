@@ -1,0 +1,2133 @@
+///| AST evaluator for Jinja2/MiniJinja templates with Day-1 security limits.
+
+struct LoopFrame {
+  index0 : Int
+  length : Int
+  depth : Int
+  previtem : Value
+  nextitem : Value
+}
+
+struct EvalState {
+  env : Environment
+  mut template_name : Option[String]
+  scopes : Array[Array[(String, Value)]]
+  macros : Array[(String, MacroDef)]
+  modules : Array[(String, Array[MacroDef])]
+  block_chains : Map[String, Array[(String, Array[Stmt])]]
+  active_blocks : Array[(String, Int)]
+  include_stack : Array[String]
+  caller_stack : Array[Option[(Array[String], Array[Stmt])]]
+  loop_stack : Array[LoopFrame]
+  mut auto_escape : AutoEscape
+  mut depth : Int
+  mut has_fuel : Bool
+  mut fuel_left : Int64
+  max_output_bytes : Int
+  mut out : StringBuilder
+  mut out_bytes : Int
+}
+
+fn EvalState::new(
+  env : Environment,
+  template_name : Option[String],
+  auto_escape : AutoEscape,
+  out : StringBuilder,
+) -> EvalState {
+  let (has_fuel, fuel_left) = match env.fuel {
+    Some(f) => (true, f)
+    None => (false, 0L)
+  }
+  EvalState::{
+    env: env,
+    template_name: template_name,
+    scopes: [],
+    macros: [],
+    modules: [],
+    block_chains: Map::new(),
+    active_blocks: [],
+    include_stack: [],
+    caller_stack: [],
+    loop_stack: [],
+    auto_escape: auto_escape,
+    depth: 0,
+    has_fuel: has_fuel,
+    fuel_left: fuel_left,
+    max_output_bytes: env.max_output_bytes,
+    out: out,
+    out_bytes: 0,
+  }
+}
+
+fn EvalState::err(
+  self : EvalState,
+  kind : ErrorKind,
+  msg : String,
+  line : Int,
+  col : Int,
+) -> TemplateError {
+  TemplateError::new(kind, msg, self.template_name, line, col)
+}
+
+fn EvalState::consume_fuel(
+  self : EvalState,
+  cost : Int64,
+  line : Int,
+  col : Int,
+) -> Result[Unit, TemplateError] {
+  if self.has_fuel {
+    self.fuel_left = self.fuel_left - cost
+    if self.fuel_left < 0L {
+      return Err(
+        self.err(
+          ErrorKind::FuelExhausted,
+          "template execution fuel exhausted",
+          line,
+          col,
+        ),
+      )
+    }
+  }
+  Ok(())
+}
+
+fn EvalState::enter_depth(
+  self : EvalState,
+  line : Int,
+  col : Int,
+) -> Result[Unit, TemplateError] {
+  self.depth = self.depth + 1
+  if self.depth > self.env.max_depth {
+    return Err(
+      self.err(
+        ErrorKind::RecursionLimit,
+        "maximum recursion depth exceeded",
+        line,
+        col,
+      ),
+    )
+  }
+  Ok(())
+}
+
+fn EvalState::leave_depth(self : EvalState) -> Unit {
+  if self.depth > 0 {
+    self.depth = self.depth - 1
+  }
+}
+
+fn EvalState::check_output_add(
+  self : EvalState,
+  add_bytes : Int,
+  line : Int,
+  col : Int,
+) -> Result[Unit, TemplateError] {
+  if self.max_output_bytes > 0 &&
+  (add_bytes > self.max_output_bytes ||
+    self.out_bytes + add_bytes > self.max_output_bytes) {
+    return Err(
+      self.err(
+        ErrorKind::OutputLimitExceeded,
+        "template output size limit exceeded",
+        line,
+        col,
+      ),
+    )
+  }
+  self.out_bytes = self.out_bytes + add_bytes
+  Ok(())
+}
+
+fn EvalState::write_raw(
+  self : EvalState,
+  s : String,
+  line : Int,
+  col : Int,
+) -> Result[Unit, TemplateError] {
+  match self.check_output_add(s.length(), line, col) {
+    Ok(()) => {
+      self.out.write_string(s)
+      Ok(())
+    }
+    Err(e) => Err(e)
+  }
+}
+
+fn EvalState::write_value_escaped(
+  self : EvalState,
+  v : Value,
+  line : Int,
+  col : Int,
+) -> Result[Unit, TemplateError] {
+  if v.is_undefined() {
+    match self.env.undefined_behavior {
+      UndefinedBehavior::Strict =>
+      return Err(
+        self.err(
+          ErrorKind::UndefinedError,
+          "undefined value cannot be rendered in strict mode",
+          line,
+          col,
+        ),
+      )
+      UndefinedBehavior::Lenient => return Ok(())
+    }
+  }
+  match self.auto_escape {
+    AutoEscape::None => {
+      let s = v.to_display_string()
+      self.write_raw(s, line, col)
+    }
+    AutoEscape::Html => {
+      match v.kind {
+        ValueKind::SafeString(s) => self.write_raw(s, line, col)
+        _ => {
+          let s = v.to_display_string()
+          let elen = escaped_html_len(s)
+          match self.check_output_add(elen, line, col) {
+            Ok(()) => {
+              write_escaped_html(self.out, s)
+              Ok(())
+            }
+            Err(e) => Err(e)
+          }
+        }
+      }
+    }
+    AutoEscape::Json => {
+      let sb = StringBuilder::new()
+      match write_json_value(sb, v, 0, 0) {
+        Ok(()) => self.write_raw(sb.to_string(), line, col)
+        Err(e) => Err(e)
+      }
+    }
+  }
+}
+
+fn EvalState::push_scope(self : EvalState) -> Unit {
+  self.scopes.push([])
+}
+
+fn EvalState::pop_scope(self : EvalState) -> Unit {
+  if self.scopes.length() > 0 {
+    let _ = self.scopes.pop()
+  }
+}
+
+fn EvalState::set_local(self : EvalState, name : String, item_val : Value) -> Unit {
+  let n = self.scopes.length()
+  if n == 0 {
+    self.scopes.push([(name, item_val)])
+    return
+  }
+  let top = self.scopes[n - 1]
+  let mut i = 0
+  while i < top.length() {
+    let (k, _) = top[i]
+    if k == name {
+      top[i] = (name, item_val)
+      return
+    }
+    i = i + 1
+  }
+  top.push((name, item_val))
+}
+
+fn EvalState::lookup_var(self : EvalState, name : String) -> Value {
+  // Check `loop` magic variable if inside a loop
+  if name == "loop" && self.loop_stack.length() > 0 {
+    let lf = self.loop_stack[self.loop_stack.length() - 1]
+    return Value::from_map([
+      ("index", Value::from_int(lf.index0 + 1)),
+      ("index0", Value::from_int(lf.index0)),
+      ("revindex", Value::from_int(lf.length - lf.index0)),
+      ("revindex0", Value::from_int(lf.length - lf.index0 - 1)),
+      ("first", Value::from_bool(lf.index0 == 0)),
+      ("last", Value::from_bool(lf.index0 + 1 == lf.length)),
+      ("length", Value::from_int(lf.length)),
+      ("depth", Value::from_int(lf.depth)),
+      ("depth0", Value::from_int(lf.depth - 1)),
+      ("previtem", lf.previtem),
+      ("nextitem", lf.nextitem),
+    ])
+  }
+  // Lexical scopes top-down
+  let mut si = self.scopes.length() - 1
+  while si >= 0 {
+    let frame = self.scopes[si]
+    let mut i = 0
+    while i < frame.length() {
+      let (k, v) = frame[i]
+      if k == name {
+        return v
+      }
+      i = i + 1
+    }
+    si = si - 1
+  }
+  // Environment globals
+  let mut gi = 0
+  while gi < self.env.globals.length() {
+    let (k, v) = self.env.globals[gi]
+    if k == name {
+      return v
+    }
+    gi = gi + 1
+  }
+  Value::undefined()
+}
+
+fn EvalState::find_macro(self : EvalState, name : String) -> Option[MacroDef] {
+  let mut i = self.macros.length() - 1
+  while i >= 0 {
+    let (mn, md) = self.macros[i]
+    if mn == name {
+      return Some(md)
+    }
+    i = i - 1
+  }
+  None
+}
+
+fn EvalState::find_module_macro(
+  self : EvalState,
+  mod_name : String,
+  macro_name : String,
+) -> Option[MacroDef] {
+  let mut i = self.modules.length() - 1
+  while i >= 0 {
+    let (mn, defs) = self.modules[i]
+    if mn == mod_name {
+      let mut j = 0
+      while j < defs.length() {
+        if defs[j].name == macro_name {
+          return Some(defs[j])
+        }
+        j = j + 1
+      }
+      return None
+    }
+    i = i - 1
+  }
+  None
+}
+
+fn EvalState::check_truthy(
+  self : EvalState,
+  v : Value,
+  line : Int,
+  col : Int,
+) -> Result[Bool, TemplateError] {
+  if v.is_undefined() {
+    match self.env.undefined_behavior {
+      UndefinedBehavior::Strict =>
+      return Err(
+        self.err(
+          ErrorKind::UndefinedError,
+          "undefined value used in boolean context",
+          line,
+          col,
+        ),
+      )
+      UndefinedBehavior::Lenient => return Ok(false)
+    }
+  }
+  Ok(v.is_truthy())
+}
+
+fn EvalState::eval_call_args(
+  self : EvalState,
+  args : Array[CallArg],
+) -> Result[(Array[Value], Array[(String, Value)]), TemplateError] {
+  let pos : Array[Value] = []
+  let kw : Array[(String, Value)] = []
+  let mut i = 0
+  while i < args.length() {
+    let v = match self.eval_expr(args[i].expr) {
+      Ok(item_val) => item_val
+      Err(e) => return Err(e)
+    }
+    match args[i].name {
+      Some(k) => kw.push((k, v))
+      None => pos.push(v)
+    }
+    i = i + 1
+  }
+  Ok((pos, kw))
+}
+
+fn EvalState::invoke_macro(
+  self : EvalState,
+  md : MacroDef,
+  pos_args : Array[Value],
+  kwargs : Array[(String, Value)],
+  caller_opt : Option[(Array[String], Array[Stmt])],
+  line : Int,
+  col : Int,
+) -> Result[Value, TemplateError] {
+  match self.enter_depth(line, col) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+  match self.consume_fuel(1L, line, col) {
+    Ok(()) => ()
+    Err(e) => {
+      self.leave_depth()
+      return Err(e)
+    }
+  }
+  self.push_scope()
+  self.caller_stack.push(caller_opt)
+  let mut pi = 0
+  while pi < md.params.length() {
+    let (pname, def_opt) = md.params[pi]
+    let item_val = if pi < pos_args.length() {
+      pos_args[pi]
+    } else {
+      match get_kwarg(kwargs, pname) {
+        Some(kv) => kv
+        None =>
+        match def_opt {
+          Some(def_expr) =>
+          match self.eval_expr(def_expr) {
+            Ok(dv) => dv
+            Err(e) => {
+              let _ = self.caller_stack.pop()
+              self.pop_scope()
+              self.leave_depth()
+              return Err(e)
+            }
+          }
+          None => Value::undefined()
+        }
+      }
+    }
+    self.set_local(pname, item_val)
+    pi = pi + 1
+  }
+  let saved_out = self.out
+  let saved_bytes = self.out_bytes
+  let cap_sb = StringBuilder::new()
+  self.out = cap_sb
+  let res = self.exec_stmts(md.body)
+  let captured = self.out.to_string()
+  self.out = saved_out
+  self.out_bytes = saved_bytes
+  let _ = self.caller_stack.pop()
+  self.pop_scope()
+  self.leave_depth()
+  match res {
+    Ok(()) =>
+    match self.auto_escape {
+      AutoEscape::Html => Ok(Value::safe(captured))
+      _ => Ok(Value::from_string(captured))
+    }
+    Err(e) => Err(e)
+  }
+}
+
+fn EvalState::eval_expr(
+  self : EvalState,
+  expr : Expr,
+) -> Result[Value, TemplateError] {
+  match expr {
+    Expr::Const(v, _, _) => Ok(v)
+    Expr::Var(name, _, _) => Ok(self.lookup_var(name))
+    Expr::List(items, _, _) => {
+      let out : Array[Value] = []
+      let mut i = 0
+      while i < items.length() {
+        match self.eval_expr(items[i]) {
+          Ok(v) => out.push(v)
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(Value::from_seq(out))
+    }
+    Expr::Map(pairs, _, _) => {
+      let entries : Array[(String, Value)] = []
+      let mut i = 0
+      while i < pairs.length() {
+        let (ke, ve) = pairs[i]
+        let kv = match self.eval_expr(ke) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let vv = match self.eval_expr(ve) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        entries.push((kv.to_display_string(), vv))
+        i = i + 1
+      }
+      Ok(Value::from_map(entries))
+    }
+    Expr::Unary(op, sub, line, col) => {
+      let v = match self.eval_expr(sub) {
+        Ok(item_val) => item_val
+        Err(e) => return Err(e)
+      }
+      match op {
+        UnaryOp::Not => {
+          match self.check_truthy(v, line, col) {
+            Ok(b) => Ok(Value::from_bool(!b))
+            Err(e) => Err(e)
+          }
+        }
+        UnaryOp::Neg =>
+        match v.kind {
+          ValueKind::Int(n) => Ok(Value::from_i64(0L - n))
+          ValueKind::Float(f) => Ok(Value::from_float(0.0 - f))
+          _ =>
+          Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "cannot negate non-number",
+              line,
+              col,
+            ),
+          )
+        }
+        UnaryOp::Pos =>
+        match v.kind {
+          ValueKind::Int(_) => Ok(v)
+          ValueKind::Float(_) => Ok(v)
+          _ =>
+          Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "unary + requires a number",
+              line,
+              col,
+            ),
+          )
+        }
+      }
+    }
+    Expr::IfExpr(cond, then_e, else_opt, line, col) => {
+      let cv = match self.eval_expr(cond) {
+        Ok(item_val) => item_val
+        Err(e) => return Err(e)
+      }
+      let truthy = match self.check_truthy(cv, line, col) {
+        Ok(b) => b
+        Err(e) => return Err(e)
+      }
+      if truthy {
+        self.eval_expr(then_e)
+      } else {
+        match else_opt {
+          Some(ee) => self.eval_expr(ee)
+          None => Ok(Value::undefined())
+        }
+      }
+    }
+    Expr::Bin(op, lhs_e, rhs_e, line, col) => {
+      // Short-circuit logical operators
+      match op {
+        BinOp::And => {
+          let lv = match self.eval_expr(lhs_e) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          let lt = match self.check_truthy(lv, line, col) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          if !lt {
+            return Ok(lv)
+          }
+          return self.eval_expr(rhs_e)
+        }
+        BinOp::Or => {
+          let lv = match self.eval_expr(lhs_e) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          let lt = match self.check_truthy(lv, line, col) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          if lt {
+            return Ok(lv)
+          }
+          return self.eval_expr(rhs_e)
+        }
+        _ => ()
+      }
+      let lv = match self.eval_expr(lhs_e) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let rv = match self.eval_expr(rhs_e) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      self.eval_binop(op, lv, rv, line, col)
+    }
+    Expr::GetAttr(obj_e, attr, line, col) => {
+      let obj = match self.eval_expr(obj_e) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if obj.is_undefined() {
+        match self.env.undefined_behavior {
+          UndefinedBehavior::Strict =>
+          return Err(
+            self.err(
+              ErrorKind::UndefinedError,
+              "cannot access attribute '" + attr + "' on undefined",
+              line,
+              col,
+            ),
+          )
+          UndefinedBehavior::Lenient => return Ok(Value::undefined())
+        }
+      }
+      Ok(obj.get_attr(attr))
+    }
+    Expr::GetItem(obj_e, idx_e, line, col) => {
+      let obj = match self.eval_expr(obj_e) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let idx = match self.eval_expr(idx_e) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if obj.is_undefined() {
+        match self.env.undefined_behavior {
+          UndefinedBehavior::Strict =>
+          return Err(
+            self.err(
+              ErrorKind::UndefinedError,
+              "cannot subscript undefined",
+              line,
+              col,
+            ),
+          )
+          UndefinedBehavior::Lenient => return Ok(Value::undefined())
+        }
+      }
+      match idx.as_i64() {
+        Some(n) => Ok(obj.get_index(n.to_int()))
+        None => Ok(obj.get_attr(idx.to_display_string()))
+      }
+    }
+    Expr::Slice(obj_e, start_opt, stop_opt, step_opt, line, col) => {
+      let obj = match self.eval_expr(obj_e) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let start_v : Option[Int] = match start_opt {
+        Some(e) =>
+        match self.eval_expr(e) {
+          Ok(v) =>
+          match v.as_i64() {
+            Some(n) => Some(n.to_int())
+            None => None
+          }
+          Err(er) => return Err(er)
+        }
+        None => None
+      }
+      let stop_v : Option[Int] = match stop_opt {
+        Some(e) =>
+        match self.eval_expr(e) {
+          Ok(v) =>
+          match v.as_i64() {
+            Some(n) => Some(n.to_int())
+            None => None
+          }
+          Err(er) => return Err(er)
+        }
+        None => None
+      }
+      let step = match step_opt {
+        Some(e) =>
+        match self.eval_expr(e) {
+          Ok(v) =>
+          match v.as_i64() {
+            Some(n) => n.to_int()
+            None => 1
+          }
+          Err(er) => return Err(er)
+        }
+        None => 1
+      }
+      if step == 0 {
+        return Err(
+          self.err(
+            ErrorKind::InvalidOperation,
+            "slice step cannot be zero",
+            line,
+            col,
+          ),
+        )
+      }
+      self.eval_slice(obj, start_v, stop_v, step, line, col)
+    }
+    Expr::Filter(target_e, fname, args, line, col) => {
+      let v = match self.eval_expr(target_e) {
+        Ok(item_val) => item_val
+        Err(e) => return Err(e)
+      }
+      let (pos, kw) = match self.eval_call_args(args) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      eval_filter(self.env, fname, v, pos, kw, self.template_name, line, col)
+    }
+    Expr::Test(target_e, tname, args, negated, line, col) => {
+      let v = match self.eval_expr(target_e) {
+        Ok(item_val) => item_val
+        Err(e) => return Err(e)
+      }
+      let (pos, _) = match self.eval_call_args(args) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      match eval_test(self.env, tname, v, pos, self.template_name, line, col) {
+        Ok(b) => Ok(Value::from_bool(if negated { !b } else { b }))
+        Err(e) => Err(e)
+      }
+    }
+    Expr::Call(callee, args, line, col) => {
+      let (pos, kw) = match self.eval_call_args(args) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      self.eval_call(callee, pos, kw, None, line, col)
+    }
+  }
+}
+
+fn EvalState::eval_slice(
+  self : EvalState,
+  obj : Value,
+  start_opt : Option[Int],
+  stop_opt : Option[Int],
+  step : Int,
+  line : Int,
+  col : Int,
+) -> Result[Value, TemplateError] {
+  match obj.kind {
+    ValueKind::Seq(items) => {
+      let n = items.length()
+      let out : Array[Value] = []
+      if step > 0 {
+        let mut s = match start_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => 0
+        }
+        let mut e = match stop_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => n
+        }
+        if s < 0 { s = 0 }
+        if s > n { s = n }
+        if e < 0 { e = 0 }
+        if e > n { e = n }
+        let mut i = s
+        while i < e {
+          out.push(items[i])
+          i = i + step
+        }
+      } else {
+        let mut s = match start_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => n - 1
+        }
+        let mut e = match stop_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => -1
+        }
+        if s >= n { s = n - 1 }
+        if s < -1 { s = -1 }
+        if e >= n { e = n - 1 }
+        if e < -1 { e = -1 }
+        let mut i = s
+        while i > e {
+          out.push(items[i])
+          i = i + step
+        }
+      }
+      Ok(Value::from_seq(out))
+    }
+    ValueKind::String(str_val) => {
+      let n = str_val.length()
+      let sb = StringBuilder::new()
+      if step > 0 {
+        let mut s = match start_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => 0
+        }
+        let mut e = match stop_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => n
+        }
+        if s < 0 { s = 0 }
+        if s > n { s = n }
+        if e < 0 { e = 0 }
+        if e > n { e = n }
+        let mut i = s
+        while i < e {
+          sb.write_byte(str_val.code_unit_at(i).to_byte())
+          i = i + step
+        }
+      } else {
+        let mut s = match start_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => n - 1
+        }
+        let mut e = match stop_opt {
+          Some(x) => if x < 0 { n + x } else { x }
+          None => -1
+        }
+        if s >= n { s = n - 1 }
+        if s < -1 { s = -1 }
+        if e >= n { e = n - 1 }
+        if e < -1 { e = -1 }
+        let mut i = s
+        while i > e {
+          sb.write_byte(str_val.code_unit_at(i).to_byte())
+          i = i + step
+        }
+      }
+      Ok(Value::from_string(sb.to_string()))
+    }
+    _ =>
+    Err(
+      self.err(
+        ErrorKind::InvalidOperation,
+        "value is not sliceable",
+        line,
+        col,
+      ),
+    )
+  }
+}
+
+fn EvalState::eval_binop(
+  self : EvalState,
+  op : BinOp,
+  lv : Value,
+  rv : Value,
+  line : Int,
+  col : Int,
+) -> Result[Value, TemplateError] {
+  match op {
+    BinOp::Concat => {
+      let ls = lv.to_display_string()
+      let rs = rv.to_display_string()
+      if self.max_output_bytes > 0 &&
+      ls.length() + rs.length() > self.max_output_bytes {
+        return Err(
+          self.err(
+            ErrorKind::OutputLimitExceeded,
+            "string concatenation exceeds output limit",
+            line,
+            col,
+          ),
+        )
+      }
+      Ok(Value::from_string(ls + rs))
+    }
+    BinOp::Eq => Ok(Value::from_bool(lv.equals(rv)))
+    BinOp::Ne => Ok(Value::from_bool(!lv.equals(rv)))
+    BinOp::Lt =>
+    match value_compare(lv, rv) {
+      Some(c) => Ok(Value::from_bool(c < 0))
+      None => Ok(Value::from_bool(false))
+    }
+    BinOp::Le =>
+    match value_compare(lv, rv) {
+      Some(c) => Ok(Value::from_bool(c <= 0))
+      None => Ok(Value::from_bool(false))
+    }
+    BinOp::Gt =>
+    match value_compare(lv, rv) {
+      Some(c) => Ok(Value::from_bool(c > 0))
+      None => Ok(Value::from_bool(false))
+    }
+    BinOp::Ge =>
+    match value_compare(lv, rv) {
+      Some(c) => Ok(Value::from_bool(c >= 0))
+      None => Ok(Value::from_bool(false))
+    }
+    BinOp::In => Ok(Value::from_bool(eval_in(lv, rv)))
+    BinOp::NotIn => Ok(Value::from_bool(!eval_in(lv, rv)))
+    BinOp::Add =>
+    match (lv.kind, rv.kind) {
+      (ValueKind::Int(a), ValueKind::Int(b)) => Ok(Value::from_i64(a + b))
+      (ValueKind::Float(a), ValueKind::Float(b)) => Ok(Value::from_float(a + b))
+      (ValueKind::Int(a), ValueKind::Float(b)) =>
+      Ok(Value::from_float(a.to_double() + b))
+      (ValueKind::Float(a), ValueKind::Int(b)) =>
+      Ok(Value::from_float(a + b.to_double()))
+      (ValueKind::String(a), ValueKind::String(b)) => {
+        if self.max_output_bytes > 0 &&
+        a.length() + b.length() > self.max_output_bytes {
+          return Err(
+            self.err(
+              ErrorKind::OutputLimitExceeded,
+              "string concat exceeds output limit",
+              line,
+              col,
+            ),
+          )
+        }
+        Ok(Value::from_string(a + b))
+      }
+      (ValueKind::Seq(a), ValueKind::Seq(b)) => {
+        let out : Array[Value] = []
+        let mut i = 0
+        while i < a.length() {
+          out.push(a[i])
+          i = i + 1
+        }
+        i = 0
+        while i < b.length() {
+          out.push(b[i])
+          i = i + 1
+        }
+        Ok(Value::from_seq(out))
+      }
+      _ =>
+      Err(
+        self.err(
+          ErrorKind::InvalidOperation,
+          "invalid operands for '+'",
+          line,
+          col,
+        ),
+      )
+    }
+    BinOp::Sub =>
+    match (lv.kind, rv.kind) {
+      (ValueKind::Int(a), ValueKind::Int(b)) => Ok(Value::from_i64(a - b))
+      (ValueKind::Float(a), ValueKind::Float(b)) => Ok(Value::from_float(a - b))
+      (ValueKind::Int(a), ValueKind::Float(b)) =>
+      Ok(Value::from_float(a.to_double() - b))
+      (ValueKind::Float(a), ValueKind::Int(b)) =>
+      Ok(Value::from_float(a - b.to_double()))
+      _ =>
+      Err(
+        self.err(
+          ErrorKind::InvalidOperation,
+          "invalid operands for '-'",
+          line,
+          col,
+        ),
+      )
+    }
+    BinOp::Mul => {
+      // String repeat or list repeat with output limit protection!
+      match (lv.kind, rv.kind) {
+        (ValueKind::Int(a), ValueKind::Int(b)) => Ok(Value::from_i64(a * b))
+        (ValueKind::Float(a), ValueKind::Float(b)) => Ok(Value::from_float(a * b))
+        (ValueKind::Int(a), ValueKind::Float(b)) =>
+        Ok(Value::from_float(a.to_double() * b))
+        (ValueKind::Float(a), ValueKind::Int(b)) =>
+        Ok(Value::from_float(a * b.to_double()))
+        (ValueKind::String(s), ValueKind::Int(n)) => self.repeat_string(s, n, line, col)
+        (ValueKind::Int(n), ValueKind::String(s)) => self.repeat_string(s, n, line, col)
+        (ValueKind::SafeString(s), ValueKind::Int(n)) => self.repeat_string(s, n, line, col)
+        (ValueKind::Int(n), ValueKind::SafeString(s)) => self.repeat_string(s, n, line, col)
+        (ValueKind::Seq(items), ValueKind::Int(n)) => self.repeat_seq(items, n, line, col)
+        (ValueKind::Int(n), ValueKind::Seq(items)) => self.repeat_seq(items, n, line, col)
+        _ =>
+        Err(
+          self.err(
+            ErrorKind::InvalidOperation,
+            "invalid operands for '*'",
+            line,
+            col,
+          ),
+        )
+      }
+    }
+    BinOp::Div =>
+    match (lv.as_f64(), rv.as_f64()) {
+      (Some(a), Some(b)) => {
+        if b == 0.0 {
+          return Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "division by zero",
+              line,
+              col,
+            ),
+          )
+        }
+        Ok(Value::from_float(a / b))
+      }
+      _ =>
+      Err(
+        self.err(
+          ErrorKind::InvalidOperation,
+          "invalid operands for '/'",
+          line,
+          col,
+        ),
+      )
+    }
+    BinOp::FloorDiv =>
+    match (lv.kind, rv.kind) {
+      (ValueKind::Int(a), ValueKind::Int(b)) => {
+        if b == 0L {
+          return Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "integer division by zero",
+              line,
+              col,
+            ),
+          )
+        }
+        let q = a / b
+        let r = a % b
+        let adj = if r != 0L && ((r < 0L) != (b < 0L)) { q - 1L } else { q }
+        Ok(Value::from_i64(adj))
+      }
+      _ =>
+      match (lv.as_f64(), rv.as_f64()) {
+        (Some(a), Some(b)) => {
+          if b == 0.0 {
+            return Err(
+              self.err(
+                ErrorKind::InvalidOperation,
+                "division by zero",
+                line,
+                col,
+              ),
+            )
+          }
+          let q = a / b
+          let qi = q.to_int64()
+          let qf = if q < qi.to_double() { (qi - 1L).to_double() } else { qi.to_double() }
+          Ok(Value::from_float(qf))
+        }
+        _ =>
+        Err(
+          self.err(
+            ErrorKind::InvalidOperation,
+            "invalid operands for '//'",
+            line,
+            col,
+          ),
+        )
+      }
+    }
+    BinOp::Rem =>
+    match (lv.kind, rv.kind) {
+      (ValueKind::Int(a), ValueKind::Int(b)) => {
+        if b == 0L {
+          return Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "modulo by zero",
+              line,
+              col,
+            ),
+          )
+        }
+        let r = a % b
+        let adj = if r != 0L && ((r < 0L) != (b < 0L)) { r + b } else { r }
+        Ok(Value::from_i64(adj))
+      }
+      _ =>
+      Err(
+        self.err(
+          ErrorKind::InvalidOperation,
+          "invalid operands for '%'",
+          line,
+          col,
+        ),
+      )
+    }
+    BinOp::Pow =>
+    match (lv.kind, rv.kind) {
+      (ValueKind::Int(base), ValueKind::Int(exp)) => {
+        if exp < 0L {
+          let mut acc = 1.0
+          let mut e = 0L - exp
+          let mut b = base.to_double()
+          while e > 0L {
+            if (e & 1L) != 0L {
+              acc = acc * b
+            }
+            b = b * b
+            e = e >> 1
+          }
+          return Ok(Value::from_float(1.0 / acc))
+        }
+        if exp > 62L && (base > 1L || base < -1L) {
+          return Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "integer exponent overflow",
+              line,
+              col,
+            ),
+          )
+        }
+        let mut acc = 1L
+        let mut b = base
+        let mut e = exp
+        while e > 0L {
+          if (e & 1L) != 0L {
+            acc = acc * b
+          }
+          b = b * b
+          e = e >> 1
+        }
+        Ok(Value::from_i64(acc))
+      }
+      _ =>
+      Err(
+        self.err(
+          ErrorKind::InvalidOperation,
+          "invalid operands for '**'",
+          line,
+          col,
+        ),
+      )
+    }
+    _ => Ok(Value::undefined())
+  }
+}
+
+fn EvalState::repeat_string(
+  self : EvalState,
+  s : String,
+  n : Int64,
+  line : Int,
+  col : Int,
+) -> Result[Value, TemplateError] {
+  if n <= 0L || s.length() == 0 {
+    return Ok(Value::from_string(""))
+  }
+  let limit = if self.max_output_bytes > 0 {
+    self.max_output_bytes.to_int64()
+  } else {
+    16777216L
+  }
+  let slen = s.length().to_int64()
+  if n > limit / slen + 1L || slen * n > limit {
+    return Err(
+      self.err(
+        ErrorKind::OutputLimitExceeded,
+        "string repetition exceeds output size limit",
+        line,
+        col,
+      ),
+    )
+  }
+  let count = n.to_int()
+  let sb = StringBuilder::with_capacity(s.length() * count)
+  let mut i = 0
+  while i < count {
+    sb.write_string(s)
+    i = i + 1
+  }
+  Ok(Value::from_string(sb.to_string()))
+}
+
+fn EvalState::repeat_seq(
+  self : EvalState,
+  items : Array[Value],
+  n : Int64,
+  line : Int,
+  col : Int,
+) -> Result[Value, TemplateError] {
+  if n <= 0L || items.length() == 0 {
+    return Ok(Value::from_seq([]))
+  }
+  let limit = 100000L
+  let ilen = items.length().to_int64()
+  if n > limit || ilen * n > limit {
+    return Err(
+      self.err(
+        ErrorKind::OutputLimitExceeded,
+        "list repetition exceeds size limit",
+        line,
+        col,
+      ),
+    )
+  }
+  let out : Array[Value] = []
+  let count = n.to_int()
+  let mut i = 0
+  while i < count {
+    let mut j = 0
+    while j < items.length() {
+      out.push(items[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  Ok(Value::from_seq(out))
+}
+
+fn EvalState::eval_call(
+  self : EvalState,
+  callee : Expr,
+  pos_args : Array[Value],
+  kwargs : Array[(String, Value)],
+  caller_opt : Option[(Array[String], Array[Stmt])],
+  line : Int,
+  col : Int,
+) -> Result[Value, TemplateError] {
+  match callee {
+    Expr::Var(name, _, _) => {
+      // Built-in functions
+      if name == "range" {
+        if pos_args.length() == 1 {
+          match pos_args[0].as_i64() {
+            Some(stop) => return Ok(Value::from_range(0L, stop, 1L))
+            None =>
+            return Err(
+              self.err(ErrorKind::InvalidOperation, "range expects int", line, col),
+            )
+          }
+        }
+        if pos_args.length() == 2 {
+          match (pos_args[0].as_i64(), pos_args[1].as_i64()) {
+            (Some(a), Some(b)) => return Ok(Value::from_range(a, b, 1L))
+            _ =>
+            return Err(
+              self.err(ErrorKind::InvalidOperation, "range expects ints", line, col),
+            )
+          }
+        }
+        if pos_args.length() == 3 {
+          match (pos_args[0].as_i64(), pos_args[1].as_i64(), pos_args[2].as_i64()) {
+            (Some(a), Some(b), Some(s)) => {
+              if s == 0L {
+                return Err(
+                  self.err(
+                    ErrorKind::InvalidOperation,
+                    "range step cannot be 0",
+                    line,
+                    col,
+                  ),
+                )
+              }
+              return Ok(Value::from_range(a, b, s))
+            }
+            _ =>
+            return Err(
+              self.err(ErrorKind::InvalidOperation, "range expects ints", line, col),
+            )
+          }
+        }
+        return Err(
+          self.err(
+            ErrorKind::InvalidOperation,
+            "range expects 1 to 3 arguments",
+            line,
+            col,
+          ),
+        )
+      }
+      if name == "dict" || name == "namespace" {
+        let entries : Array[(String, Value)] = []
+        let mut i = 0
+        while i < kwargs.length() {
+          entries.push(kwargs[i])
+          i = i + 1
+        }
+        return Ok(Value::from_map(entries))
+      }
+      if name == "super" {
+        if self.active_blocks.length() == 0 {
+          return Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "super() called outside of a block",
+              line,
+              col,
+            ),
+          )
+        }
+        let (bname, bidx) = self.active_blocks[self.active_blocks.length() - 1]
+        match self.block_chains.get(bname) {
+          Some(chain) => {
+            if bidx + 1 >= chain.length() {
+              return Err(
+                self.err(
+                  ErrorKind::InvalidOperation,
+                  "no parent block for super()",
+                  line,
+                  col,
+                ),
+              )
+            }
+            let (_, parent_body) = chain[bidx + 1]
+            self.active_blocks.push((bname, bidx + 1))
+            let saved_out = self.out
+            let saved_bytes = self.out_bytes
+            self.out = StringBuilder::new()
+            let res = self.exec_stmts(parent_body)
+            let captured = self.out.to_string()
+            self.out = saved_out
+            self.out_bytes = saved_bytes
+            let _ = self.active_blocks.pop()
+            match res {
+              Ok(()) => return Ok(Value::safe(captured))
+              Err(e) => return Err(e)
+            }
+          }
+          None =>
+          return Err(
+            self.err(ErrorKind::UnknownBlock, "unknown block", line, col),
+          )
+        }
+      }
+      if name == "caller" {
+        if self.caller_stack.length() == 0 {
+          return Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "caller() called outside of {% call %}",
+              line,
+              col,
+            ),
+          )
+        }
+        match self.caller_stack[self.caller_stack.length() - 1] {
+          Some((cparams, cbody)) => {
+            self.push_scope()
+            let mut ci = 0
+            while ci < cparams.length() {
+              let v = if ci < pos_args.length() {
+                pos_args[ci]
+              } else {
+                Value::undefined()
+              }
+              self.set_local(cparams[ci], v)
+              ci = ci + 1
+            }
+            let saved_out = self.out
+            let saved_bytes = self.out_bytes
+            self.out = StringBuilder::new()
+            let res = self.exec_stmts(cbody)
+            let captured = self.out.to_string()
+            self.out = saved_out
+            self.out_bytes = saved_bytes
+            self.pop_scope()
+            match res {
+              Ok(()) =>
+              return match self.auto_escape {
+                AutoEscape::Html => Ok(Value::safe(captured))
+                _ => Ok(Value::from_string(captured))
+              }
+              Err(e) => return Err(e)
+            }
+          }
+          None =>
+          return Err(
+            self.err(
+              ErrorKind::InvalidOperation,
+              "macro was not invoked via {% call %}",
+              line,
+              col,
+            ),
+          )
+        }
+      }
+      // Local macro
+      match self.find_macro(name) {
+        Some(md) =>
+        return self.invoke_macro(md, pos_args, kwargs, caller_opt, line, col)
+        None => ()
+      }
+      // Custom environment function
+      let mut fi = 0
+      while fi < self.env.functions.length() {
+        let (fnm, ff) = self.env.functions[fi]
+        if fnm == name {
+          return ff(pos_args)
+        }
+        fi = fi + 1
+      }
+      Err(
+        self.err(
+          ErrorKind::UnknownFunction,
+          "unknown function or macro '" + name + "'",
+          line,
+          col,
+        ),
+      )
+    }
+    Expr::GetAttr(obj_e, method_name, _, _) => {
+      // Check `loop.cycle(...)`
+      match obj_e {
+        Expr::Var(vname, _, _) => {
+          if vname == "loop" && method_name == "cycle" && self.loop_stack.length() > 0 {
+            if pos_args.length() == 0 {
+              return Ok(Value::undefined())
+            }
+            let lf = self.loop_stack[self.loop_stack.length() - 1]
+            return Ok(pos_args[lf.index0 % pos_args.length()])
+          }
+          // Check imported module macro call `m.foo(...)`
+          match self.find_module_macro(vname, method_name) {
+            Some(md) =>
+            return self.invoke_macro(md, pos_args, kwargs, caller_opt, line, col)
+            None => ()
+          }
+        }
+        _ => ()
+      }
+      Err(
+        self.err(
+          ErrorKind::InvalidOperation,
+          "method '" + method_name + "' is not callable",
+          line,
+          col,
+        ),
+      )
+    }
+    _ =>
+    Err(
+      self.err(
+        ErrorKind::InvalidOperation,
+        "expression is not callable",
+        line,
+        col,
+      ),
+    )
+  }
+}
+
+fn EvalState::exec_stmts(
+  self : EvalState,
+  stmts : Array[Stmt],
+) -> Result[Unit, TemplateError] {
+  let mut i = 0
+  while i < stmts.length() {
+    match self.exec_stmt(stmts[i]) {
+      Ok(()) => ()
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+fn EvalState::exec_stmt(
+  self : EvalState,
+  stmt : Stmt,
+) -> Result[Unit, TemplateError] {
+  match stmt {
+    Stmt::EmitRaw(s) => self.write_raw(s, 0, 0)
+    Stmt::EmitExpr(e, line, col) => {
+      match self.consume_fuel(1L, line, col) {
+        Ok(()) => ()
+        Err(er) => return Err(er)
+      }
+      let v = match self.eval_expr(e) {
+        Ok(item_val) => item_val
+        Err(er) => return Err(er)
+      }
+      self.write_value_escaped(v, line, col)
+    }
+    Stmt::If(branches, else_body, line, col) => {
+      match self.consume_fuel(1L, line, col) {
+        Ok(()) => ()
+        Err(er) => return Err(er)
+      }
+      let mut bi = 0
+      while bi < branches.length() {
+        let (cond, body) = branches[bi]
+        let cv = match self.eval_expr(cond) {
+          Ok(v) => v
+          Err(er) => return Err(er)
+        }
+        let truthy = match self.check_truthy(cv, line, col) {
+          Ok(b) => b
+          Err(er) => return Err(er)
+        }
+        if truthy {
+          return self.exec_stmts(body)
+        }
+        bi = bi + 1
+      }
+      self.exec_stmts(else_body)
+    }
+    Stmt::For(targets, iter_expr, filter_opt, body, else_body, line, col) => {
+      match self.consume_fuel(1L, line, col) {
+        Ok(()) => ()
+        Err(er) => return Err(er)
+      }
+      let iter_v = match self.eval_expr(iter_expr) {
+        Ok(v) => v
+        Err(er) => return Err(er)
+      }
+      if iter_v.is_undefined() {
+        match self.env.undefined_behavior {
+          UndefinedBehavior::Strict =>
+          return Err(
+            self.err(
+              ErrorKind::UndefinedError,
+              "cannot iterate over undefined in strict mode",
+              line,
+              col,
+            ),
+          )
+          UndefinedBehavior::Lenient => return self.exec_stmts(else_body)
+        }
+      }
+      // Lazy fast-path for `Range` (avoids OOM on `range(100000000)` and respects fuel!)
+      match iter_v.kind {
+        ValueKind::Range(start, stop, step) => {
+          let total = range_len(start, stop, step)
+          if total == 0L {
+            return self.exec_stmts(else_body)
+          }
+          let depth = self.loop_stack.length() + 1
+          let mut ran_any = false
+          let mut idx = 0L
+          while idx < total {
+            match self.consume_fuel(1L, line, col) {
+              Ok(()) => ()
+              Err(er) => return Err(er)
+            }
+            let cur = Value::from_i64(start + idx * step)
+            let prev = if idx > 0L {
+              Value::from_i64(start + (idx - 1L) * step)
+            } else {
+              Value::undefined()
+            }
+            let next_v = if idx + 1L < total {
+              Value::from_i64(start + (idx + 1L) * step)
+            } else {
+              Value::undefined()
+            }
+            self.push_scope()
+            self.set_local(targets[0], cur)
+            let keep = match filter_opt {
+              Some(fe) => {
+                let fv = match self.eval_expr(fe) {
+                  Ok(v) => v
+                  Err(er) => {
+                    self.pop_scope()
+                    return Err(er)
+                  }
+                }
+                match self.check_truthy(fv, line, col) {
+                  Ok(b) => b
+                  Err(er) => {
+                    self.pop_scope()
+                    return Err(er)
+                  }
+                }
+              }
+              None => true
+            }
+            if keep {
+              ran_any = true
+              self.loop_stack.push(
+                LoopFrame::{
+                  index0: idx.to_int(),
+                  length: total.to_int(),
+                  depth: depth,
+                  previtem: prev,
+                  nextitem: next_v,
+                },
+              )
+              let res = self.exec_stmts(body)
+              let _ = self.loop_stack.pop()
+              self.pop_scope()
+              match res {
+                Ok(()) => ()
+                Err(er) => return Err(er)
+              }
+            } else {
+              self.pop_scope()
+            }
+            idx = idx + 1L
+          }
+          if !ran_any {
+            return self.exec_stmts(else_body)
+          }
+          return Ok(())
+        }
+        _ => ()
+      }
+
+      let raw_items = match value_to_items(iter_v, 100000) {
+        Ok(it) => it
+        Err(er) => return Err(er)
+      }
+      // Apply optional `if` filter before computing `loop.length` / `loop.last`
+      let items : Array[Value] = match filter_opt {
+        None => raw_items
+        Some(fe) => {
+          let filtered : Array[Value] = []
+          let mut ri = 0
+          while ri < raw_items.length() {
+            match self.consume_fuel(1L, line, col) {
+              Ok(()) => ()
+              Err(er) => return Err(er)
+            }
+            self.push_scope()
+            self.bind_for_targets(targets, raw_items[ri])
+            let fv = match self.eval_expr(fe) {
+              Ok(v) => v
+              Err(er) => {
+                self.pop_scope()
+                return Err(er)
+              }
+            }
+            let keep = match self.check_truthy(fv, line, col) {
+              Ok(b) => b
+              Err(er) => {
+                self.pop_scope()
+                return Err(er)
+              }
+            }
+            self.pop_scope()
+            if keep {
+              filtered.push(raw_items[ri])
+            }
+            ri = ri + 1
+          }
+          filtered
+        }
+      }
+      if items.length() == 0 {
+        return self.exec_stmts(else_body)
+      }
+      let depth = self.loop_stack.length() + 1
+      let len = items.length()
+      let mut idx = 0
+      while idx < len {
+        match self.consume_fuel(1L, line, col) {
+          Ok(()) => ()
+          Err(er) => return Err(er)
+        }
+        let prev = if idx > 0 { items[idx - 1] } else { Value::undefined() }
+        let next_v = if idx + 1 < len { items[idx + 1] } else { Value::undefined() }
+        self.push_scope()
+        self.bind_for_targets(targets, items[idx])
+        self.loop_stack.push(
+          LoopFrame::{
+            index0: idx,
+            length: len,
+            depth: depth,
+            previtem: prev,
+            nextitem: next_v,
+          },
+        )
+        let res = self.exec_stmts(body)
+        let _ = self.loop_stack.pop()
+        self.pop_scope()
+        match res {
+          Ok(()) => ()
+          Err(er) => return Err(er)
+        }
+        idx = idx + 1
+      }
+      Ok(())
+    }
+    Stmt::Set(target, val_expr, line, col) => {
+      let v = match self.eval_expr(val_expr) {
+        Ok(item_val) => item_val
+        Err(er) => return Err(er)
+      }
+      match target {
+        SetTarget::Var(name) => self.set_local(name, v)
+        SetTarget::Attr(obj_name, attr) => {
+          let obj = self.lookup_var(obj_name)
+          match obj.kind {
+            ValueKind::Map(entries) => {
+              let mut found = false
+              let mut i = 0
+              while i < entries.length() {
+                let (k, _) = entries[i]
+                if k == attr {
+                  entries[i] = (attr, v)
+                  found = true
+                  break
+                }
+                i = i + 1
+              }
+              if !found {
+                entries.push((attr, v))
+              }
+            }
+            _ =>
+            return Err(
+              self.err(
+                ErrorKind::InvalidOperation,
+                "cannot set attribute on non-namespace/map",
+                line,
+                col,
+              ),
+            )
+          }
+        }
+      }
+      Ok(())
+    }
+    Stmt::SetBlock(name, filter_opt, body, line, col) => {
+      let saved_out = self.out
+      let saved_bytes = self.out_bytes
+      self.out = StringBuilder::new()
+      let res = self.exec_stmts(body)
+      let captured = self.out.to_string()
+      self.out = saved_out
+      self.out_bytes = saved_bytes
+      match res {
+        Ok(()) => ()
+        Err(er) => return Err(er)
+      }
+      let mut item_val = match self.auto_escape {
+        AutoEscape::Html => Value::safe(captured)
+        _ => Value::from_string(captured)
+      }
+      match filter_opt {
+        Some((fname, fargs)) => {
+          let (pos, kw) = match self.eval_call_args(fargs) {
+            Ok(p) => p
+            Err(er) => return Err(er)
+          }
+          item_val = match eval_filter(
+            self.env,
+            fname,
+            item_val,
+            pos,
+            kw,
+            self.template_name,
+            line,
+            col,
+          ) {
+            Ok(fv) => fv
+            Err(er) => return Err(er)
+          }
+        }
+        None => ()
+      }
+      self.set_local(name, item_val)
+      Ok(())
+    }
+    Stmt::With(bindings, body, _, _) => {
+      let evaled : Array[(String, Value)] = []
+      let mut i = 0
+      while i < bindings.length() {
+        let (k, expr) = bindings[i]
+        let v = match self.eval_expr(expr) {
+          Ok(item_val) => item_val
+          Err(er) => return Err(er)
+        }
+        evaled.push((k, v))
+        i = i + 1
+      }
+      self.push_scope()
+      i = 0
+      while i < evaled.length() {
+        let (k, v) = evaled[i]
+        self.set_local(k, v)
+        i = i + 1
+      }
+      let res = self.exec_stmts(body)
+      self.pop_scope()
+      res
+    }
+    Stmt::FilterBlock(fname, fargs, body, line, col) => {
+      let saved_out = self.out
+      let saved_bytes = self.out_bytes
+      self.out = StringBuilder::new()
+      let res = self.exec_stmts(body)
+      let captured = self.out.to_string()
+      self.out = saved_out
+      self.out_bytes = saved_bytes
+      match res {
+        Ok(()) => ()
+        Err(er) => return Err(er)
+      }
+      let (pos, kw) = match self.eval_call_args(fargs) {
+        Ok(p) => p
+        Err(er) => return Err(er)
+      }
+      let fv = match eval_filter(
+        self.env,
+        fname,
+        Value::from_string(captured),
+        pos,
+        kw,
+        self.template_name,
+        line,
+        col,
+      ) {
+        Ok(v) => v
+        Err(er) => return Err(er)
+      }
+      self.write_value_escaped(fv, line, col)
+    }
+    Stmt::Block(bname, body, _, _) => {
+      match self.block_chains.get(bname) {
+        Some(chain) => {
+          if chain.length() > 0 {
+            let (_, top_body) = chain[0]
+            self.active_blocks.push((bname, 0))
+            let res = self.exec_stmts(top_body)
+            let _ = self.active_blocks.pop()
+            return res
+          }
+          self.exec_stmts(body)
+        }
+        None => self.exec_stmts(body)
+      }
+    }
+    Stmt::Extends(_, _, _) => Ok(())
+    Stmt::Include(tpl_expr, ignore_missing, line, col) => {
+      let name_v = match self.eval_expr(tpl_expr) {
+        Ok(v) => v
+        Err(er) => return Err(er)
+      }
+      let inc_name = name_v.to_display_string()
+      // Cycle check
+      let mut si = 0
+      while si < self.include_stack.length() {
+        if self.include_stack[si] == inc_name {
+          return Err(
+            self.err(
+              ErrorKind::RecursionLimit,
+              "include cycle detected: '" + inc_name + "'",
+              line,
+              col,
+            ),
+          )
+        }
+        si = si + 1
+      }
+      match self.env.find_compiled(inc_name) {
+        None =>
+        if ignore_missing {
+          Ok(())
+        } else {
+          Err(
+            self.err(
+              ErrorKind::TemplateNotFound,
+              "included template not found: '" + inc_name + "'",
+              line,
+              col,
+            ),
+          )
+        }
+        Some(ct) => {
+          match self.enter_depth(line, col) {
+            Ok(()) => ()
+            Err(er) => return Err(er)
+          }
+          self.include_stack.push(inc_name)
+          let prev_name = self.template_name
+          self.template_name = Some(inc_name)
+          let res = self.exec_stmts(ct.body)
+          self.template_name = prev_name
+          let _ = self.include_stack.pop()
+          self.leave_depth()
+          res
+        }
+      }
+    }
+    Stmt::Macro(md) => {
+      self.macros.push((md.name, md))
+      Ok(())
+    }
+    Stmt::CallBlock(callee, args, caller_params, body, line, col) => {
+      let (pos, kw) = match self.eval_call_args(args) {
+        Ok(p) => p
+        Err(er) => return Err(er)
+      }
+      let v = match self.eval_call(
+        callee,
+        pos,
+        kw,
+        Some((caller_params, body)),
+        line,
+        col,
+      ) {
+        Ok(item_val) => item_val
+        Err(er) => return Err(er)
+      }
+      self.write_value_escaped(v, line, col)
+    }
+    Stmt::Import(tpl_expr, alias, line, col) => {
+      let name_v = match self.eval_expr(tpl_expr) {
+        Ok(v) => v
+        Err(er) => return Err(er)
+      }
+      let mod_tpl_name = name_v.to_display_string()
+      match self.env.find_compiled(mod_tpl_name) {
+        None =>
+        Err(
+          self.err(
+            ErrorKind::TemplateNotFound,
+            "imported template not found: '" + mod_tpl_name + "'",
+            line,
+            col,
+          ),
+        )
+        Some(ct) => {
+          let defs = collect_macros(ct.body)
+          self.modules.push((alias, defs))
+          Ok(())
+        }
+      }
+    }
+    Stmt::FromImport(tpl_expr, names, line, col) => {
+      let name_v = match self.eval_expr(tpl_expr) {
+        Ok(v) => v
+        Err(er) => return Err(er)
+      }
+      let mod_tpl_name = name_v.to_display_string()
+      match self.env.find_compiled(mod_tpl_name) {
+        None =>
+        Err(
+          self.err(
+            ErrorKind::TemplateNotFound,
+            "imported template not found: '" + mod_tpl_name + "'",
+            line,
+            col,
+          ),
+        )
+        Some(ct) => {
+          let defs = collect_macros(ct.body)
+          let mut ni = 0
+          while ni < names.length() {
+            let (orig, alias) = names[ni]
+            let mut found = false
+            let mut di = 0
+            while di < defs.length() {
+              if defs[di].name == orig {
+                self.macros.push((alias, defs[di]))
+                found = true
+                break
+              }
+              di = di + 1
+            }
+            if !found {
+              return Err(
+                self.err(
+                  ErrorKind::UndefinedError,
+                  "macro '" + orig + "' not found in '" + mod_tpl_name + "'",
+                  line,
+                  col,
+                ),
+              )
+            }
+            ni = ni + 1
+          }
+          Ok(())
+        }
+      }
+    }
+    Stmt::AutoEscapeBlock(flag_expr, body, line, col) => {
+      let fv = match self.eval_expr(flag_expr) {
+        Ok(v) => v
+        Err(er) => return Err(er)
+      }
+      let prev = self.auto_escape
+      self.auto_escape = match fv.kind {
+        ValueKind::Bool(b) => if b { AutoEscape::Html } else { AutoEscape::None }
+        ValueKind::String(s) =>
+        if s == "html" || s == "xml" {
+          AutoEscape::Html
+        } else if s == "json" {
+          AutoEscape::Json
+        } else {
+          AutoEscape::None
+        }
+        _ =>
+        match self.check_truthy(fv, line, col) {
+          Ok(b) => if b { AutoEscape::Html } else { AutoEscape::None }
+          Err(er) => return Err(er)
+        }
+      }
+      let res = self.exec_stmts(body)
+      self.auto_escape = prev
+      res
+    }
+    Stmt::Do(e, _, _) => {
+      match self.eval_expr(e) {
+        Ok(_) => Ok(())
+        Err(er) => Err(er)
+      }
+    }
+  }
+}
+
+fn EvalState::bind_for_targets(
+  self : EvalState,
+  targets : Array[String],
+  item : Value,
+) -> Unit {
+  if targets.length() == 1 {
+    self.set_local(targets[0], item)
+    return
+  }
+  match item.kind {
+    ValueKind::Seq(elems) => {
+      let mut i = 0
+      while i < targets.length() {
+        let v = if i < elems.length() { elems[i] } else { Value::undefined() }
+        self.set_local(targets[i], v)
+        i = i + 1
+      }
+    }
+    _ => {
+      self.set_local(targets[0], item)
+      let mut i = 1
+      while i < targets.length() {
+        self.set_local(targets[i], Value::undefined())
+        i = i + 1
+      }
+    }
+  }
+}
+
+fn collect_macros(stmts : Array[Stmt]) -> Array[MacroDef] {
+  let out : Array[MacroDef] = []
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      Stmt::Macro(md) => out.push(md)
+      _ => ()
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn find_extends_stmt(stmts : Array[Stmt]) -> Option[(Expr, Int, Int)] {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      Stmt::Extends(e, l, c) => return Some((e, l, c))
+      _ => ()
+    }
+    i = i + 1
+  }
+  None
+}
+
+///| Render a compiled template (handling `extends` inheritance chains + cycle detection).
+fn render_compiled(
+  env : Environment,
+  ct : CompiledTemplate,
+  ctx : Value,
+  out : StringBuilder,
+) -> Result[Unit, TemplateError] {
+  let esc = env.resolve_auto_escape(ct.name)
+  let opt_name = if ct.name.length() > 0 { Some(ct.name) } else { None }
+  let state = EvalState::new(env, opt_name, esc, out)
+
+  // Seed root scope from `ctx` map
+  state.push_scope()
+  match ctx.kind {
+    ValueKind::Map(entries) => {
+      let mut i = 0
+      while i < entries.length() {
+        let (k, v) = entries[i]
+        state.set_local(k, v)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+  if ct.name.length() > 0 {
+    state.include_stack.push(ct.name)
+  }
+
+  if !ct.has_extends {
+    return state.exec_stmts(ct.body)
+  }
+
+  // Build inheritance chain [leaf, ..., root_base] with cycle detection!
+  let chain : Array[CompiledTemplate] = [ct]
+  let visited : Array[String] = []
+  if ct.name.length() > 0 {
+    visited.push(ct.name)
+  }
+  let mut cur = ct
+  while cur.has_extends {
+    match find_extends_stmt(cur.body) {
+      None => break
+      Some((parent_expr, line, col)) => {
+        let pv = match state.eval_expr(parent_expr) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let pname = pv.to_display_string()
+        let mut vi = 0
+        while vi < visited.length() {
+          if visited[vi] == pname {
+            return Err(
+              state.err(
+                ErrorKind::RecursionLimit,
+                "extends cycle detected: '" + pname + "'",
+                line,
+                col,
+              ),
+            )
+          }
+          vi = vi + 1
+        }
+        if chain.length() >= env.max_depth {
+          return Err(
+            state.err(
+              ErrorKind::RecursionLimit,
+              "extends depth limit exceeded",
+              line,
+              col,
+            ),
+          )
+        }
+        match env.find_compiled(pname) {
+          None =>
+          return Err(
+            state.err(
+              ErrorKind::TemplateNotFound,
+              "parent template not found: '" + pname + "'",
+              line,
+              col,
+            ),
+          )
+          Some(parent_ct) => {
+            visited.push(pname)
+            chain.push(parent_ct)
+            cur = parent_ct
+          }
+        }
+      }
+    }
+  }
+
+  // Populate block_chains from leaf -> root so index 0 is most-derived override,
+  // and `super()` walks index + 1 toward root!
+  let mut ci = 0
+  while ci < chain.length() {
+    let tpl = chain[ci]
+    // Also register any top-level macros/imports/sets from child templates
+    let mut bi = 0
+    while bi < tpl.blocks.length() {
+      let (bname, bbody) = tpl.blocks[bi]
+      match state.block_chains.get(bname) {
+        Some(arr) => arr.push((tpl.name, bbody))
+        None => state.block_chains.set(bname, [(tpl.name, bbody)])
+      }
+      bi = bi + 1
+    }
+    ci = ci + 1
+  }
+
+  // Execute root base template
+  let root = chain[chain.length() - 1]
+  state.exec_stmts(root.body)
+}
