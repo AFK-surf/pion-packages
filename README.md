@@ -83,8 +83,9 @@ pionc add <package-name>
 | [`mime`](packages/mime) | `0.1.0` | MIME 媒体类型与参数（RFC 2045 / 2231 / 5987 / 9110）、Content-Disposition（RFC 6266）与 `safe_filename`、HTTP `Accept` 协商、O(N) 最坏情况流式 `multipart/*` 读写（RFC 7578 / 2046）、Quoted-Printable 与 RFC 2047 编码字、40+ 格式魔数嗅探（从不嗅探为 `image/svg+xml`），零依赖无 `World` | Go 1.27 `mime` / `mime/multipart` / `mime/quotedprintable` + Rust [`mime`](https://github.com/hyperium/mime) `0.3.18` / [`infer`](https://github.com/bojand/infer) `0.16.0` | 24 / 24 | ✅ `wasm_smoke` | [QP 解码 **1.72×** · 50 MB multipart 0.89× · 混合头部 0.60×（vs Go）· Content-Type 0.39×（vs Rust `mime`）· 嗅探 0.83×（vs Rust `infer`）](BENCHMARKS.md#mime) | `pionc add mime --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`asn1`](packages/asn1) | `0.1.0` | 严格 ITU-T X.690 DER（`DerReader` / `DerWriter`、迭代树编解码、任意精度 OID）、RFC 7468 PEM（复用 `base64`）、RFC 5280 X.509 v1/v3 与 v3 扩展、RFC 6125 / 9525 主机名与 IP 校验、SPKI / RFC 5958 PKCS#8 密钥封装，无 `World` | Go `encoding/asn1` + `encoding/pem` + `crypto/x509` + Rust [`der`](https://crates.io/crates/der) `0.7.10` / [`x509-parser`](https://crates.io/crates/x509-parser) `0.16.0` | 21 / 21 | ✅ `wasm_smoke` | [DER TLV 往返 **1.48×**（vs Go `encoding/asn1`）· PEM 证书链 0.89× · DER X.509 + SAN 0.85×（vs Go `crypto/x509`）](BENCHMARKS.md#asn1) | `pionc add asn1 --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`sdp`](packages/sdp) | `0.1.0` | RFC 8866（SDP）/ RFC 8829（JSEP）/ RFC 8843（BUNDLE）/ RFC 8839（ICE）/ RFC 8851·8853（RID & Simulcast）WebRTC 会话描述解析、无损 CRLF 序列化、结构化 `extract_webrtc_summary` 与 `ParseLimits` 放大炸弹防护，零依赖无 `World` | Rust [`webrtc-rs/sdp`](https://github.com/webrtc-rs/sdp) `0.9.0` + Mozilla `webrtc-sdp 0.3.17` | 10 / 10 | ✅ `wasm_smoke` | [Meet Offer 解析 **1.95×** · Offer 往返 **1.46×** · SFU Answer 往返 **1.66×**（vs Rust `webrtc-rs/sdp`）](BENCHMARKS.md#sdp) | `pionc add sdp --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`stun`](packages/stun) | `0.1.0` | RFC 8489 STUN 线格式编解码与 `MESSAGE-INTEGRITY` / `MESSAGE-INTEGRITY-SHA256` / `FINGERPRINT`（复用 `crypto`，内置 RFC 2104 HMAC-SHA1 / CRC-32 / MD5）、RFC 5769 全 4 组官方向量、RFC 7983 Demux 与 RFC 8445 Sans-IO ICE 状态机（`IceAgent`、角色冲突 `487`、多网卡 `handle_inbound_on`、有界 checklist），零 C 依赖无 `World` | Rust [`webrtc-rs/stun`](https://github.com/webrtc-rs/stun) `v0.8.0`（`ring` ASM SHA-1）+ RFC 5769 / RFC 8489 / RFC 8445 | 12 / 12（另复用 `crypto` 69 / 69） | ✅ `wasm_smoke` | [编码签名 0.60× · 解码验签 0.39×（vs Rust `ring` ASM SHA-1）· 峰值 RSS 更低（1.86–1.89 MiB）](BENCHMARKS.md#stun) | `pionc add stun --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 52 个包合计 **4,716 / 4,716** 单测通过（`sh scripts/verify.sh`）。
+全仓 53 个包合计 **4,728 / 4,728** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -175,6 +176,10 @@ Wave 10 发布验证在 `AFK-surf/pion@c375cee` 上完成：`sh scripts/verify.s
 ### Farview 生态沉淀波 5：`sdp` `v0.1.0`
 
 - **`sdp` `v0.1.0`**：零依赖纯 Pion WebRTC SDP / JSEP 解析与无损 CRLF 序列化库，经独立红队审计与全量修复后合入（10 / 10 单测，`audit` 31 / 31 全绿，全部 1 P0 + 4 P1 + 18 P2 清零：P0-1 放大炸弹 RSS 从 4.95 GB 降至 3.72 MiB、Wasm32 零 OOM、18k × 2 Native/Wasm32 fuzz 0 崩溃 / 0 分歧）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`99d3745c…`）。头对头基准对照 Rust `webrtc-rs/sdp 0.9.0` 全面领先：Google Meet Offer 解析 **1.95×**（412.06 MB/s）、Offer 往返 **1.46×**、SFU Answer 往返 **1.66×**，峰值 RSS 均更低（2.08–2.31 vs 2.53–2.67 MiB），详见 [`BENCHMARKS.md`](BENCHMARKS.md#sdp)。
+
+### Farview 生态沉淀波 6：`stun` `v0.1.0`
+
+- **`stun` `v0.1.0`**：复用 `crypto` 的纯 Pion RFC 8489 STUN / RFC 7983 Demux / RFC 8445 Sans-IO ICE 状态机，经独立红队审计与全量修复后合入（12 / 12 单测，`audit unit` **30 / 30** 全绿，5 P1 + 12 P2 清零：DoS 36.1 s → 0.01 s、fuzz 60k × 4 0 崩 0 diff、compare 30,126 条 0 安全差异）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`b2aac32b…`）。头对头基准对照 Rust `webrtc-rs/stun v0.8.0`（`ring` ARM64 汇编 SHA-1）：编码签名 0.60×、解码验签 0.39×（纯标量 Pion SHA-1 vs 汇编），峰值 RSS 均更低（1.86 / 1.89 vs 2.08 / 2.11 MiB），详见 [`BENCHMARKS.md`](BENCHMARKS.md#stun)。
 
 ## 贡献与移植流程
 
