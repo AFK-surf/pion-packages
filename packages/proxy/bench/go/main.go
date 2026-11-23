@@ -30,7 +30,7 @@ func hashStr(h int64, s string) int64 {
 	return acc
 }
 
-// --- W1: Proxy URL parse + redaction + NO_PROXY matching (Go 1.27 stdlib) ---
+// --- W1: Proxy URL parse + redaction + NO_PROXY matching (Go hand-written reference) ---
 
 type noProxyRule struct {
 	kind       int // 0=wildcard, 1=domain, 2=ip, 3=prefix
@@ -173,8 +173,12 @@ func parseAndRedactProxyURL(raw string) (string, bool, error) {
 		if _, hasPass := u.User.Password(); hasPass {
 			sb.WriteString("***@")
 		} else if uname := u.User.Username(); uname != "" {
-			sb.WriteString(uname)
-			sb.WriteByte('@')
+			if scheme == "ssh" {
+				sb.WriteString(url.PathEscape(uname))
+				sb.WriteByte('@')
+			} else {
+				sb.WriteString("***@")
+			}
 		}
 	}
 	if strings.Contains(host, ":") {
@@ -226,7 +230,7 @@ func benchURL() int {
 	return 0
 }
 
-// --- W2: SOCKS5 full bidirectional handshake (200,000 rounds) ---
+// --- W2: SOCKS5 full bidirectional handshake (hand-inlined Go byte reference, 500,000 rounds) ---
 
 func benchSocks5() int {
 	domains := [4]string{
@@ -328,7 +332,7 @@ func benchSocks5() int {
 	return 0
 }
 
-// --- W3: HTTP CONNECT + plaintext forward-proxy sanitization (Go 1.27 net/http) ---
+// --- W3: HTTP CONNECT + plaintext forward-proxy sanitization (Go net/http.ReadRequest/ReadResponse + fixed header re-emit) ---
 
 var staticHop = map[string]bool{
 	"connection":          true,
