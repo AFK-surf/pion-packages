@@ -10,3 +10,11 @@ import EffectProofs
 #print axioms EffectProofs.timer_before_trans
 #print axioms EffectProofs.heap_parent_lt
 #print axioms EffectProofs.heap_left_parent_inv
+#print axioms EffectProofs.heap_sift_down_pick_is_min
+#print axioms EffectProofs.heap_sift_up_preserves_min_order
+#print axioms EffectProofs.heap_right_parent_inv
+#print axioms EffectProofs.rng_step_u32_bijection
+#print axioms EffectProofs.rng_step_u32_nonzero_orbit
+#print axioms EffectProofs.ring_slot_add_injective_window
+#print axioms EffectProofs.ring_slot_add_bijective_mod_cap
+#print axioms EffectProofs.ring_push_pop_full_consistency

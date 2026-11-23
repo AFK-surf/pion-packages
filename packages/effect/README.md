@@ -40,11 +40,26 @@ _Note on W2: Pion spawns 20,000 full structured fibers (`Task` + `Fiber` + `slee
 
 ## Formal Verification (Lean 4)
 
-**10** machine-checked, `0-sorry` Lean 4 theorems (strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 8 production `#verify` kernels in `packages/effect/src/`:
-- **Runtime, PRNG & RingDeque (`proofs/EffectProofs/RuntimeAndDeque.lean`, 8 theorems)**: xorshift32 non-zero 32-bit state seeding (`[1, 2^32-1]`), `rng_below_val` range safety, `RingDeque` capacity growth, wraparound slot index bounds `[0, cap)`, `push_front`/`pop_front` index inverse, and `TimerHeap` `(at, seq)` strict partial order (irreflexive, transitive).
-- **Binary Heap (`proofs/EffectProofs/SchedulerAndSync.lean`, 2 theorems)**: `heap_parent` strict descent & `heap_left` child-parent inverse.
-- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (`diff -u`, including `INT_MIN`/`INT_MAX` extremes and div-by-zero `TRAP` checks).
+**18** machine-checked, `0-sorry` Lean 4 theorems (**8 A-grade** core invariant theorems + **10 B-grade** primitive theorems; strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, `FunsExternal.lean` 0 axioms, verified via `pionc extract-lean` + Aeneas) cover 12 production `#verify` kernels in `packages/effect/src/`:
+
+### Stage 2 A-Grade Core Theorems (`proofs/EffectProofs/CoreInvariants.lean`)
+
+| Theorem | Production Kernel | Property Proved |
+| --- | --- | --- |
+| `heap_sift_down_pick_is_min` | `heap_sift_down_pick` | Exact minimum selection among `{parent, left, optional right}` in `TimerHeap::pop` (soundness, completeness, no early stop, right-child dominance) |
+| `heap_sift_up_preserves_min_order` | `heap_sift_up_should_swap` | Exact swap predicate in `TimerHeap::push` guaranteeing `parent ≤ child` after conditional swap |
+| `heap_right_parent_inv` | `heap_right`, `heap_parent` | Exact right-child parent inverse `heap_parent (heap_right i) = i` and `heap_left i + 1 = heap_right i` |
+| `rng_step_u32_bijection` | `rng_step_u32` | Full-domain bijection (explicit left/right inverse on `BitVec 32`) on `[0, 2^32 - 1]` matching Marsaglia `(13, 17, 5)` |
+| `rng_step_u32_nonzero_orbit` | `rng_step_u32` | Non-zero orbit closure: `∀ s ∈ [1, 2^32 - 1], rng_step_u32 s ∈ [1, 2^32 - 1]` (never enters the `0` deadlock fixed point) |
+| `ring_slot_add_injective_window` | `ring_slot_add` | Logical offsets `0..len-1` map injectively to distinct physical slots (no aliasing/overwrite; exact `RingDeque::grow` order) |
+| `ring_slot_add_bijective_mod_cap` | `ring_slot_add` | Full bijection between logical offsets `[0, cap)` and physical buffer slots `[0, cap)` |
+| `ring_push_pop_full_consistency` | `ring_slot_add`, `ring_slot_prev` | 4-way `push_front`/`pop_front`/`push_back`/`pop_back` inverse, slot-preservation across `push_front`, and non-aliasing of newly pushed slots |
+
+- **Existing B-Grade Theorems (`RuntimeAndDeque.lean` & `SchedulerAndSync.lean`, 10 theorems)**: xorshift32 non-zero seeding, `rng_below_val` bounds, `RingDeque` capacity growth & wraparound bounds, `TimerHeap` `(at, seq)` strict partial order, `heap_parent` descent & `heap_left` inverse.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (**34** cases identical via `diff -u`, including `INT_MIN`/`INT_MAX` extremes and 2 verified native+Lean `TRAP` checks).
+- **Semantic Mutation Kill Gate (`proofs/mutation_check.sh`)**: **10 / 10 killed (100% ≥ 90%)** across `TimerHeap` sift-down/sift-up/index faults (including the `RT-lean-proofs` flipped sift-down comparison), `xorshift32` shift/mask corruptions, and `RingDeque` wraparound/offset faults.
 
 ```sh
 LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/effect/proofs/run_proofs.sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/effect/proofs/mutation_check.sh
 ```

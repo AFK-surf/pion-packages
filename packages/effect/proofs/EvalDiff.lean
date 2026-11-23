@@ -47,6 +47,17 @@ def runAll : List String :=
   , showI32 "heap_parent_max" (heap_parent (i32 2147483647))
   , showI32 "heap_left_0" (heap_left 0#i32)
   , showI32 "heap_left_10" (heap_left 10#i32)
+  , showI32 "heap_right_0" (heap_right 0#i32)
+  , showI32 "heap_right_10" (heap_right 10#i32)
+  , showI64 "rng_step_0" (rng_step_u32 0#i64)
+  , showI64 "rng_step_1" (rng_step_u32 1#i64)
+  , showI64 "rng_step_max" (rng_step_u32 (i64 4294967295))
+  , showBool "sift_up_yes" (heap_sift_up_should_swap 10#i64 1#i32 20#i64 0#i32)
+  , showBool "sift_up_no" (heap_sift_up_should_swap 20#i64 2#i32 20#i64 1#i32)
+  , showI32 "sift_down_cur" (heap_sift_down_pick 10#i64 1#i32 20#i64 2#i32 true 30#i64 3#i32)
+  , showI32 "sift_down_left" (heap_sift_down_pick 20#i64 1#i32 10#i64 2#i32 true 10#i64 3#i32)
+  , showI32 "sift_down_right" (heap_sift_down_pick 20#i64 1#i32 15#i64 2#i32 true 10#i64 3#i32)
+  , showI32 "sift_down_noright" (heap_sift_down_pick 20#i64 1#i32 25#i64 2#i32 false 5#i64 3#i32)
   ]
 
 #eval IO.println (String.intercalate "\n" runAll)

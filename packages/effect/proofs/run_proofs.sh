@@ -169,6 +169,17 @@ pub fn main(world : World) -> Int {
   io_println(world, "heap_parent_max=" + effect::heap_parent(2147483647).to_string())
   io_println(world, "heap_left_0=" + effect::heap_left(0).to_string())
   io_println(world, "heap_left_10=" + effect::heap_left(10).to_string())
+  io_println(world, "heap_right_0=" + effect::heap_right(0).to_string())
+  io_println(world, "heap_right_10=" + effect::heap_right(10).to_string())
+  io_println(world, "rng_step_0=" + effect::rng_step_u32(0L).to_string())
+  io_println(world, "rng_step_1=" + effect::rng_step_u32(1L).to_string())
+  io_println(world, "rng_step_max=" + effect::rng_step_u32(4294967295L).to_string())
+  io_println(world, "sift_up_yes=" + fb(effect::heap_sift_up_should_swap(10L, 1, 20L, 0)))
+  io_println(world, "sift_up_no=" + fb(effect::heap_sift_up_should_swap(20L, 2, 20L, 1)))
+  io_println(world, "sift_down_cur=" + effect::heap_sift_down_pick(10L, 1, 20L, 2, true, 30L, 3).to_string())
+  io_println(world, "sift_down_left=" + effect::heap_sift_down_pick(20L, 1, 10L, 2, true, 10L, 3).to_string())
+  io_println(world, "sift_down_right=" + effect::heap_sift_down_pick(20L, 1, 15L, 2, true, 10L, 3).to_string())
+  io_println(world, "sift_down_noright=" + effect::heap_sift_down_pick(20L, 1, 25L, 2, false, 5L, 3).to_string())
   0
 }
 EOF
