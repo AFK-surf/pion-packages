@@ -4,6 +4,12 @@
 pub struct PackIndex {
   data : Bytes
   count : Int
+  fanout : FixedArray[Int]
+  oids_off : Int
+  crcs_off : Int
+  off32_off : Int
+  off64_off : Int
+  off64_count : Int
   pack_checksum : Oid
   idx_checksum : Oid
 }
@@ -13,7 +19,86 @@ pub fn PackIndex::parse(
   data : Bytes,
   limits : GitLimits,
 ) -> Result[PackIndex, GitError] {
-  Err(GitError::InvalidPackIndex("unimplemented"))
+  match limits.validate() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let n = data.length()
+  // Minimum size: 8B header + 1024B fanout + 40B checksums = 1072B
+  if n < 1072 {
+    return Err(GitError::Truncated("pack index shorter than 1072 bytes"))
+  }
+  if data[0].to_int() != 0xFF ||
+  data[1].to_int() != 0x74 ||
+  data[2].to_int() != 0x4F ||
+  data[3].to_int() != 0x63 {
+    return Err(GitError::InvalidPackIndex("invalid .idx magic"))
+  }
+  let version = read_u32_be(data, 4).to_int()
+  if version != 2 {
+    return Err(GitError::UnsupportedVersion(version))
+  }
+
+  // Verify trailing 20-byte SHA-1 checksum over data[0..n-20]
+  let hasher = crypto::Sha1::new()
+  hasher.update_slice(data, 0, n - 20)
+  let actual_idx_csum = hasher.finalize()
+  let expected_idx_csum = data.slice(n - 20, n)
+  if !bytes_eq(actual_idx_csum, expected_idx_csum) {
+    return Err(GitError::ChecksumMismatch(".idx trailer SHA-1 mismatch"))
+  }
+
+  // Parse 256-entry monotonic fanout table
+  let fanout : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut prev = 0
+  let mut i = 0
+  while i < 256 {
+    let v_u = read_u32_be(data, 8 + i * 4)
+    if v_u > 0x7FFFFFFFU {
+      return Err(GitError::LimitExceeded(".idx fanout overflow"))
+    }
+    let v = v_u.to_int()
+    if v < prev {
+      return Err(GitError::InvalidPackIndex("non-monotonic fanout table"))
+    }
+    fanout[i] = v
+    prev = v
+    i = i + 1
+  }
+  let count = fanout[255]
+  if count > limits.max_pack_entries {
+    return Err(GitError::LimitExceeded(".idx exceeds max_pack_entries"))
+  }
+
+  let oids_off = 1032
+  let crcs_off = oids_off + count * 20
+  let off32_off = crcs_off + count * 4
+  let off64_off = off32_off + count * 4
+  if off64_off + 40 > n {
+    return Err(GitError::Truncated("truncated .idx tables"))
+  }
+  let rem_bytes = (n - 40) - off64_off
+  if (rem_bytes & 7) != 0 {
+    return Err(GitError::InvalidPackIndex("misaligned 64-bit offset table"))
+  }
+  let off64_count = rem_bytes >> 3
+
+  let pack_checksum = Oid::{ kind: HashKind::Sha1, bytes: data.slice(n - 40, n - 20) }
+  let idx_checksum = Oid::{ kind: HashKind::Sha1, bytes: expected_idx_csum }
+  Ok(
+    PackIndex::{
+      data: data,
+      count: count,
+      fanout: fanout,
+      oids_off: oids_off,
+      crcs_off: crcs_off,
+      off32_off: off32_off,
+      off64_off: off64_off,
+      off64_count: off64_count,
+      pack_checksum: pack_checksum,
+      idx_checksum: idx_checksum,
+    },
+  )
 }
 
 ///|
@@ -32,7 +117,44 @@ pub fn PackIndex::idx_checksum(self : PackIndex) -> Oid {
 }
 
 ///|
+fn PackIndex::read_offset_at(self : PackIndex, idx : Int) -> Option[Int64] {
+  let raw32 = read_u32_be(self.data, self.off32_off + idx * 4)
+  if (raw32 & 0x80000000U) == 0U {
+    Some(raw32.to_int64() & 0xFFFFFFFFL)
+  } else {
+    let idx64 = (raw32 & 0x7FFFFFFFU).to_int()
+    if idx64 < 0 || idx64 >= self.off64_count {
+      None
+    } else {
+      Some(read_u64_be(self.data, self.off64_off + idx64 * 8))
+    }
+  }
+}
+
+///| O(log N) binary search using the 256-entry fanout table, zero allocations.
 pub fn PackIndex::lookup(self : PackIndex, oid : Oid) -> Option[(Int64, UInt)] {
+  if oid.byte_len() != 20 || self.count == 0 {
+    return None
+  }
+  let target = oid.raw_bytes()
+  let b0 = target[0].to_int()
+  let mut lo = if b0 == 0 { 0 } else { self.fanout[b0 - 1] }
+  let mut hi = self.fanout[b0]
+  while lo < hi {
+    let mid = lo + ((hi - lo) >> 1)
+    let cmp = bytes_cmp_slice(self.data, self.oids_off + mid * 20, target, 0, 20)
+    if cmp == 0 {
+      let crc = read_u32_be(self.data, self.crcs_off + mid * 4)
+      match self.read_offset_at(mid) {
+        Some(off) => return Some((off, crc))
+        None => return None
+      }
+    } else if cmp < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
   None
 }
 
@@ -41,7 +163,61 @@ pub fn PackIndex::entry_at(
   self : PackIndex,
   idx : Int,
 ) -> Option[(Oid, Int64, UInt)] {
-  None
+  if idx < 0 || idx >= self.count {
+    return None
+  }
+  let off_s = self.oids_off + idx * 20
+  let oid = Oid::{ kind: HashKind::Sha1, bytes: self.data.slice(off_s, off_s + 20) }
+  let crc = read_u32_be(self.data, self.crcs_off + idx * 4)
+  match self.read_offset_at(idx) {
+    Some(off) => Some((oid, off, crc))
+    None => None
+  }
+}
+
+///|
+fn merge_sort_idx_entries(
+  arr : Array[(Oid, Int64, UInt)],
+  tmp : Array[(Oid, Int64, UInt)],
+  lo : Int,
+  hi : Int,
+) -> Unit {
+  if hi - lo <= 1 {
+    return
+  }
+  let mid = lo + (hi - lo) / 2
+  merge_sort_idx_entries(arr, tmp, lo, mid)
+  merge_sort_idx_entries(arr, tmp, mid, hi)
+  let mut i = lo
+  let mut j = mid
+  let mut k = lo
+  while i < mid && j < hi {
+    let (oi, _, _) = arr[i]
+    let (oj, _, _) = arr[j]
+    if oi.compare(oj) <= 0 {
+      tmp[k] = arr[i]
+      i = i + 1
+    } else {
+      tmp[k] = arr[j]
+      j = j + 1
+    }
+    k = k + 1
+  }
+  while i < mid {
+    tmp[k] = arr[i]
+    i = i + 1
+    k = k + 1
+  }
+  while j < hi {
+    tmp[k] = arr[j]
+    j = j + 1
+    k = k + 1
+  }
+  let mut m = lo
+  while m < hi {
+    arr[m] = tmp[m]
+    m = m + 1
+  }
 }
 
 ///|
@@ -49,5 +225,100 @@ pub fn PackIndex::build(
   entries : Array[(Oid, Int64, UInt)],
   pack_checksum : Oid,
 ) -> Result[Bytes, GitError] {
-  Err(GitError::InvalidPackIndex("unimplemented"))
+  if pack_checksum.byte_len() != 20 {
+    return Err(GitError::InvalidPackIndex("pack_checksum must be 20 bytes"))
+  }
+  let count = entries.length()
+  let sorted : Array[(Oid, Int64, UInt)] = Array::new()
+  let tmp : Array[(Oid, Int64, UInt)] = Array::new()
+  let mut i = 0
+  while i < count {
+    let (o, off, crc) = entries[i]
+    if o.byte_len() != 20 {
+      return Err(GitError::InvalidPackIndex("entry OID must be 20 bytes"))
+    }
+    sorted.push((o, off, crc))
+    tmp.push((o, off, crc))
+    i = i + 1
+  }
+  if count > 1 {
+    merge_sort_idx_entries(sorted, tmp, 0, count)
+  }
+
+  let fanout : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut j = 0
+  while j < count {
+    let (o, _, _) = sorted[j]
+    let b0 = o.raw_bytes()[0].to_int()
+    fanout[b0] = fanout[b0] + 1
+    j = j + 1
+  }
+  let mut acc = 0
+  let mut f = 0
+  while f < 256 {
+    acc = acc + fanout[f]
+    fanout[f] = acc
+    f = f + 1
+  }
+
+  let bb = ByteBuf::new(1072 + count * 28)
+  // Header: \xfftOc + version 2
+  bb.push_byte(0xFF)
+  bb.push_byte(0x74)
+  bb.push_byte(0x4F)
+  bb.push_byte(0x63)
+  bb.push_u32_be(2U)
+
+  // Fanout table
+  f = 0
+  while f < 256 {
+    bb.push_u32_be(fanout[f].to_uint())
+    f = f + 1
+  }
+
+  // OID table
+  j = 0
+  while j < count {
+    let (o, _, _) = sorted[j]
+    bb.push_bytes(o.raw_bytes())
+    j = j + 1
+  }
+
+  // CRC32 table
+  j = 0
+  while j < count {
+    let (_, _, crc) = sorted[j]
+    bb.push_u32_be(crc)
+    j = j + 1
+  }
+
+  // 32-bit offset table (+ collect 64-bit offsets)
+  let off64 : Array[Int64] = Array::new()
+  j = 0
+  while j < count {
+    let (_, off, _) = sorted[j]
+    if off >= 0L && off < 0x80000000L {
+      bb.push_u32_be(off.to_int().to_uint())
+    } else {
+      let idx64 = off64.length()
+      off64.push(off)
+      bb.push_u32_be(0x80000000U | idx64.to_uint())
+    }
+    j = j + 1
+  }
+
+  // 64-bit offset table
+  let mut k = 0
+  while k < off64.length() {
+    bb.push_u64_be(off64[k])
+    k = k + 1
+  }
+
+  // Pack checksum
+  bb.push_bytes(pack_checksum.raw_bytes())
+
+  // Index checksum
+  let body = bb.to_bytes()
+  let idx_csum = crypto::sha1(body)
+  Ok(body.concat(idx_csum))
 }
