@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7 + Wave 8 + `base64` + `effect` + `crypto`）
+## 基准总榜（v0.2.0 + Wave 4–8 + `base64` + `effect` + `crypto` + Farview 沉淀波 1）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -181,6 +181,19 @@
 | `crypto` | SHA-512 流式哈希 | 16 MiB | 55.985 ms | 18.779 ms (Go stdlib) | 0.34x | **1.80 MiB** | 4.72 MiB |
 | `crypto` | HMAC-SHA256 | 50,000 × 256 B | 122.492 ms | 27.119 ms (Go stdlib) | 0.22x | **1.75 MiB** | 11.16 MiB |
 | `crypto` | Ed25519 签名 + 验签 | 200 + 200 ops | 44.075 ms | 16.478 ms (Go stdlib) | 0.37x | **1.83 MiB** | 4.78 MiB |
+| `brotli` | Web HTML/CSS/JS/JSON 解压（2 MiB q6 × 10） | 20 MiB | 34.820 ms | 25.524 ms (`rust_brotli`) / 24.281 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.70x (vs C) | — | — |
+| `brotli` | WOFF2 字体载荷解压（1 MiB q11 × 10） | 10 MiB | 33.678 ms | 24.419 ms (`rust_brotli`) / 25.004 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.74x (vs C) | — | — |
+| `brotli` | 小包批量解压（512 pkts q5 × 10） | 5,120 pkts | 43.355 ms | 69.620 ms (`rust_brotli`) / 35.054 ms (`c_brotlidec`) | **1.61x** (vs Rust) · 0.81x (vs C) | — | — |
+| `unicode_bidi` | Pure LTR 快路径（40k ops） | 3.98 MB | 63.711 ms | 68.927 ms (`rust_unicode_bidi`) | **1.08x** | — | — |
+| `unicode_bidi` | Mixed 阿/希/英双向混排（10k ops） | 900 KB | 46.083 ms | 38.388 ms (`rust_unicode_bidi`) | 0.83x | — | — |
+| `unicode_bidi` | Deep 嵌套隔离与配对括号（5k ops） | 383 KB | 30.637 ms | 27.972 ms (`rust_unicode_bidi`) | 0.91x | — | — |
+| `unicode_bidi` | 逐行 `visual_runs` + `reorder_line`（10k ops） | 900 KB | 69.079 ms | 48.495 ms (`rust_unicode_bidi`) | 0.70x | — | — |
+| `hyphenation` | `bench100k` 批量断词（100k × 10，`opportunities_into`） | 10.28 MB（1M ops） | 144.435 ms | 487.704 ms (`rust_hyphenation`) | **3.38x** | 10.02 MiB | 9.06 MiB |
+| `hyphenation` | 全量去重词典（235,915 词 × 10，`opportunities_into`） | 22.57 MB（2.36M ops） | 457.358 ms | 1,154.906 ms (`rust_hyphenation`) | **2.53x** | 18.58 MiB | 15.56 MiB |
+| `hyphenation` | 词典文本建树（4,938 模式 + 1,441 例外 × 20） | 20 loads | 33.691 ms | 34.398 ms (`rust_from_text`) / 10.458 ms (`rust_bincode`) | **1.02x** (vs 文本建树) · 0.31x (vs 预编译 bincode) | 4.72 MiB | 4.48 / 2.23 MiB |
+| `pdf` | 100 页矢量 + 文本报表（`/FlateDecode`） | 100 pages | 22.71 ms | 14.57 ms (`rust_pdf_writer`) | 0.64x | **4.11 MiB** | 6.36 MiB |
+| `pdf` | 10 页 800×600 RGBA 导出（`/FlateDecode`，14.4 MB RGB） | 14.4 MB | 75.77 ms | 74.52 ms (`rust_pdf_writer`) | 0.98x | **24.62 MiB** | 27.61 MiB |
+| `pdf` | 10 页 800×600 RGBA 导出（`/RunLengthDecode`，14.4 MB RGB） | 14.4 MB | 64.56 ms | 37.54 ms (`rust_pdf_writer`) | 0.58x | 55.41 MiB | 38.20 MiB |
 
 ## 各包明细
 
@@ -1389,3 +1402,78 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 | Ed25519（200 签名 + 200 验签） | 44.075 ms / 1.83 MiB | 16.478 ms / 4.78 MiB | 110.19 µs/op（约 9.1k ops/s） | 0.37x |
 
 41 / 41 单测（含 27 个红队测试）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `259b374d007b191c2415407d487ff639131c8625f8766e3104714fd48c2f8fa6`。领先项：峰值 RSS 1.75–1.83 MiB，比 Go 的 4.66–11.16 MiB 低 2.6×–6.4×。落后项：四个负载全部慢于 Go（0.17x–0.37x）。两侧实现手段不对等：Go 在 `darwin/arm64` 上用 ARMv8 加密扩展（`SHA256H` / `SHA512H` 指令）加速 SHA-256 / SHA-512，Ed25519 用手写 ARM64 汇编与预计算基点表；本包是零 C FFI、零汇编的纯标量 Pion 代码，Native 与 `wasm32` 共用同一实现，签名路径额外付出无分支常量时间查表的开销。
+
+### brotli
+
+参考实现：Rust [`brotli`](https://github.com/dropbox/rust-brotli) `7.0.0`（`--release`）与 Google C [`libbrotlidec`](https://github.com/google/brotli) `1.2.1`（`-O3`）。通过 `sh packages/brotli/bench/run_bench.sh` 在 `Darwin arm64` 上调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，三方 stdout SHA-256 逐字节一致。详见 [`packages/brotli/README.md`](packages/brotli/README.md)。
+
+| Workload | `pion` Median (Throughput) | `rust_brotli` Median (Throughput) | `c_brotlidec` Median (Throughput) | `pion` vs `rust_brotli` |
+| --- | ---: | ---: | ---: | ---: |
+| Web HTML/CSS/JS/JSON (2 MiB q6 × 10 = 20 MiB) | 34.820 ms (602.28 MB/s) | 25.524 ms (821.63 MB/s) | 24.281 ms (863.71 MB/s) | 0.73x |
+| WOFF2 Binary Font Payload (1 MiB q11 × 10 = 10 MiB) | 33.678 ms (311.35 MB/s) | 24.419 ms (429.41 MB/s) | 25.004 ms (419.36 MB/s) | 0.73x |
+| Small Packet Batch (512 pkts q5 × 10 = 5,120 pkts) | 43.355 ms (62.80 MB/s) | 69.620 ms (39.11 MB/s) | 35.054 ms (77.67 MB/s) | **1.61x** |
+
+红队：10 / 10 单测，`audit` 6 / 6，226,218 例差分与 Google C `libbrotlidec 1.2.1` 0 差异；IMTF 修复后提速 10.5×，`hp_literals` 达 C 的 0.85×；`wasm_smoke` 4 模式 stdout SHA-256 均为 `027a31d9b0e0094c6dc068938bfd187f8561d338945e1b828ecd6cb3cd71e23e`。领先项：小包批量解压反超 Rust `brotli` 至 **1.61x**（无每包大型状态结构分配开销）。落后项：Web 与 WOFF2 大流解压为 Rust 的 0.73x（C 的 0.70x–0.74x），受纯标量热循环与边界检查数组访问限制；小包批量仍为 C 的 0.81x。
+
+### unicode_bidi
+
+参考实现：Rust [`unicode-bidi`](https://github.com/servo/unicode-bidi) `0.3.18`（`--release`）。通过 `sh packages/unicode_bidi/bench/run_bench.sh` 在 `Darwin arm64` 上调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，所有轮次 stdout SHA-256 逐字节一致。详见 [`packages/unicode_bidi/README.md`](packages/unicode_bidi/README.md)。
+
+| Benchmark | Pion Median (ms) | Rust Median (ms) | Pion Throughput (MB/s) | Rust Throughput (MB/s) | Speedup vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pure LTR fast path (`40k ops`, `3.98 MB`) | 63.711 | 68.927 | 62.43 | 57.71 | **1.08x** |
+| Mixed Arabic/Hebrew/English (`10k ops`, `900 KB`) | 46.083 | 38.388 | 19.54 | 23.46 | 0.83x |
+| Deep nested isolates & brackets (`5k ops`, `383 KB`) | 30.637 | 27.972 | 12.52 | 13.71 | 0.91x |
+| Per-line `visual_runs` + `reorder_line` (`10k ops`, `900 KB`) | 69.079 | 48.495 | 13.04 | 18.57 | 0.70x |
+
+红队：11 / 11 单测，`audit` 18 / 18，Unicode 16.0.0 全码点表 0 / 1,112,064 偏差，`BidiCharacterTest` 91,707 / 91,707 + `BidiTest` 770,241 / 770,241 零失败。领先项：Pure LTR 快路径反超 Rust 至 **1.08x**。落后项：Mixed 0.83x、Deep 嵌套隔离与配对括号 0.91x、逐行 `visual_runs` + `reorder_line` 0.70x。
+
+### hyphenation
+
+参考实现：Rust [`hyphenation`](https://github.com/tapeinos/hyphenation) `=0.8.4`（`--release`, `lto = true`），双方执行完全相同的 `hyph-en-us` 4,938 模式 + 1,441 例外表。通过 `packages/hyphenation/audit/scripts/bench_fair.py`（底层调用 `scripts/bench_compare.py --warmup 1 --rounds 5`）严格交替采样，stdout SHA-256 逐字节一致。详见 [`packages/hyphenation/README.md`](packages/hyphenation/README.md)。
+
+**1. Batch Hyphenation — `bench100k`（100,000 draws × 10 = 1,000,000 ops，10.28 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_hyph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_into` | **144.435** | 142.740 | 155.014 | **71.21** | **144.44** | 10.02 MiB | **3.38x** |
+| `pion_alloc` | 145.391 | 143.380 | 149.541 | 70.74 | 145.39 | 10.02 MiB | **3.35x** |
+| `rust_hyph` | 487.704 | 472.676 | 509.784 | 21.09 | 487.70 | 9.06 MiB | 1.00x (baseline) |
+| `rust_opp` | 475.928 | 448.806 | 499.748 | 21.61 | 475.93 | 12.94 MiB | 1.02x |
+
+_SHA-256: `569e94245a2ebfa02b5152c63d86f731704a7cc8b5cadbe4a0cf98f0f34254c5`._
+
+**2. Batch Hyphenation — Full Distinct Dictionary（235,915 distinct words × 10 = 2,359,150 ops，22.57 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_hyph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_into` | **457.358** | 450.269 | 729.512 | **49.36** | **193.87** | 18.58 MiB | **2.53x** |
+| `pion_alloc` | 466.959 | 464.261 | 633.838 | 48.34 | 197.94 | 18.58 MiB | **2.47x** |
+| `rust_hyph` | 1,154.906 | 1,126.700 | 1,227.287 | 19.55 | 489.54 | 15.56 MiB | 1.00x (baseline) |
+| `rust_opp` | 1,156.373 | 1,093.154 | 2,045.208 | 19.52 | 490.17 | 21.98 MiB | 1.00x |
+
+_SHA-256: `9a65ebd3301a0401dfa90968e96d0a34ad36bc8ed6a15952b2a0476fc2f78b26`._
+
+**3. Dictionary Load（4,938 patterns + 1,441 exceptions × 20 loads）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_from_text`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_from_tex` | **33.691** | 32.945 | 34.960 | **1,684,545.80** | 4.72 MiB | **1.02x** |
+| `rust_from_text` | 34.398 | 32.425 | 40.342 | 1,719,883.35 | 4.48 MiB | 1.00x (baseline) |
+| `rust_bincode` (pre-compiled) | 10.458 | 10.082 | 11.593 | 522,904.20 | 2.23 MiB | 3.29x |
+
+_SHA-256: `bd519a5b90095c9523b1d7ca8d114f327f4b87d62b2eec8f11c1560c84c5ca6b`._
+
+红队：11 / 11 单测，`audit` 21 / 21，80 语种 99.995% 一致。领先项：三项公平对比全部领先 Rust `hyphenation =0.8.4`（`bench100k` **3.38x**、全词典 **2.53x**、文本词典建树 **1.02x**）。落后项：相比 Rust 预编译 `bincode` 反序列化（10.458 ms，2.23 MiB），从文本现场建树为 0.31x；各负载峰值 RSS 略高于 Rust `rust_hyph`（10.02 vs 9.06 MiB、18.58 vs 15.56 MiB、4.72 vs 4.48 MiB）。
+
+### pdf
+
+参考实现：Rust [`pdf-writer`](https://github.com/typst/pdf-writer) `0.12.1` + `flate2 1.1`（`rust_backend`, `--release`）。通过 `sh packages/pdf/bench/run_bench.sh` 在 `Darwin arm64` 上调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，stdout SHA-256 逐字节一致，且全部产出 PDF 通过 Rust `lopdf 0.35.0` 第三方解析校验。详见 [`packages/pdf/README.md`](packages/pdf/README.md)。
+
+| Workload | Pion Median | Rust `pdf-writer` Median | Pion Throughput / ns/op | Pion Peak RSS | Rust Peak RSS | Speedup vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100-Page Vector + Text Report (`/FlateDecode`) | 22.71 ms | 14.57 ms | 227.1 us/page | **4.11 MiB** | 6.36 MiB | 0.64x |
+| 10-Page 800×600 RGBA Image Export (`/FlateDecode`, 14.4 MB RGB) | 75.77 ms | 74.52 ms | 190.06 MB/s | **24.62 MiB** | 27.61 MiB | 0.98x |
+| 10-Page 800×600 RGBA Image Export (`/RunLengthDecode`, 14.4 MB RGB) | 64.56 ms | 37.54 ms | 223.05 MB/s | 55.41 MiB | 38.20 MiB | 0.58x |
+
+红队：8 / 8 单测（复用 `flate` 20 / 20），`audit` 30 / 30（2 P0 + 9 P1 + 14 P2 清零，`v_quadratic_40k` 提速 2,380× 至 6 ms）。领先项：`images_flate` 与 Rust `--release` 基本持平（0.98x）且峰值 RSS 更低（24.62 vs 27.61 MiB）；`report100` 峰值 RSS 同样更低（4.11 vs 6.36 MiB），输出体积更小（93 KB vs 97 KB）。落后项：`report100` 为 0.64x（每流 `flate` 状态初始化占 22.7 ms 中约 11 ms）；`images_rle` 为 0.58x 且峰值 RSS 较高（55.41 vs 38.20 MiB，标量 PackBits 扫描与逐字节拷贝对比 LLVM 自动向量化 Rust）。
