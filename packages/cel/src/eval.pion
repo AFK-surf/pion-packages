@@ -8,9 +8,10 @@ struct EvalCtx {
   nodes : Array[ExprNode]
   regex_cache : Array[Option[regex::Regex]]
   activation : Activation
-  locals : Array[(String, Value)]
+  mut locals : Option[Array[(String, Value)]]
   limits : EvalLimits
   mut cost : Int64
+  mut alloc_bytes : Int64
   mut depth : Int
 }
 
@@ -31,7 +32,7 @@ pub fn build_regex_cache(nodes : Array[ExprNode]) -> Array[Option[regex::Regex]]
             Some(pid) => {
               match nodes[pid] {
                 ExprNode::LitString(pat) => {
-                  match regex::compile(pat) {
+                  match compile_cel_re2(pat) {
                     Ok(re) => compiled = Some(re)
                     Err(_) => ()
                   }
@@ -65,14 +66,214 @@ fn EvalCtx::charge(self : EvalCtx, amount : Int64, pos : Int) -> Result[Unit, Ce
   Ok(())
 }
 
-fn EvalCtx::lookup_var(self : EvalCtx, name : String, pos : Int) -> Result[Value, CelError] {
-  let mut i = self.locals.length() - 1
-  while i >= 0 {
-    let (k, v) = self.locals[i]
-    if k == name {
-      return Ok(v)
+fn EvalCtx::charge_alloc(self : EvalCtx, bytes : Int64, pos : Int) -> Result[Unit, CelError] {
+  self.alloc_bytes = self.alloc_bytes + bytes
+  if self.alloc_bytes > self.limits.max_output_bytes.to_int64() {
+    return Err(
+      CelError::new(
+        CelErrorKind::LimitExceeded,
+        "cumulative output bytes exceeds limit (" + self.limits.max_output_bytes.to_string() + ")",
+        pos,
+      ),
+    )
+  }
+  Ok(())
+}
+
+fn is_valid_map_key_val(v : Value) -> Bool {
+  match v.kind {
+    ValueKind::Bool(_) | ValueKind::Int64(_) | ValueKind::UInt64(_) | ValueKind::String(_) => true
+    _ => false
+  }
+}
+
+fn map_lookup_val(tv : Value, entries : Array[(Value, Value)], key : Value) -> Int {
+  match tv.map_idx {
+    Some(idx) => idx.lookup(entries, key)
+    None => {
+      let mut i = 0
+      while i < entries.length() {
+        let (k, _) = entries[i]
+        if cel_values_equal(k, key) {
+          return i
+        }
+        i = i + 1
+      }
+      -1
     }
-    i = i - 1
+  }
+}
+
+fn map_lookup_str(tv : Value, entries : Array[(Value, Value)], field : String) -> Int {
+  match tv.map_idx {
+    Some(idx) => idx.lookup_str(entries, field)
+    None => {
+      let mut i = 0
+      while i < entries.length() {
+        let (k, _) = entries[i]
+        match k.kind {
+          ValueKind::String(ks) => {
+            if ks == field {
+              return i
+            }
+          }
+          _ => ()
+        }
+        i = i + 1
+      }
+      -1
+    }
+  }
+}
+
+///| Cost-accounted CEL equality check (prevents O(n) equality DoS).
+fn EvalCtx::eval_values_equal(self : EvalCtx, a : Value, b : Value, pos : Int) -> Result[Bool, CelError] {
+  match (a.kind, b.kind) {
+    (ValueKind::Null, ValueKind::Null) => Ok(true)
+    (ValueKind::Bool(x), ValueKind::Bool(y)) => Ok(x == y)
+    (ValueKind::Int64(x), ValueKind::Int64(y)) => Ok(x == y)
+    (ValueKind::UInt64(x), ValueKind::UInt64(y)) => Ok(x == y)
+    (ValueKind::Double(x), ValueKind::Double(y)) => Ok(x == y)
+    (ValueKind::Int64(x), ValueKind::UInt64(y)) => Ok(cmp_i64_u64(x, y) == 0)
+    (ValueKind::UInt64(x), ValueKind::Int64(y)) => Ok(cmp_i64_u64(y, x) == 0)
+    (ValueKind::Int64(x), ValueKind::Double(y)) => {
+      match cmp_i64_f64(x, y) {
+        Some(c) => Ok(c == 0)
+        None => Ok(false)
+      }
+    }
+    (ValueKind::Double(x), ValueKind::Int64(y)) => {
+      match cmp_i64_f64(y, x) {
+        Some(c) => Ok(c == 0)
+        None => Ok(false)
+      }
+    }
+    (ValueKind::UInt64(x), ValueKind::Double(y)) => {
+      match cmp_u64_f64(x, y) {
+        Some(c) => Ok(c == 0)
+        None => Ok(false)
+      }
+    }
+    (ValueKind::Double(x), ValueKind::UInt64(y)) => {
+      match cmp_u64_f64(y, x) {
+        Some(c) => Ok(c == 0)
+        None => Ok(false)
+      }
+    }
+    (ValueKind::String(x), ValueKind::String(y)) => {
+      if x.length() != y.length() {
+        return Ok(false)
+      }
+      if x.length() > 16 {
+        match self.charge((x.length() / 8 + 1).to_int64(), pos) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      Ok(x == y)
+    }
+    (ValueKind::Bytes(x), ValueKind::Bytes(y)) => {
+      if x.length() != y.length() {
+        return Ok(false)
+      }
+      if x.length() > 16 {
+        match self.charge((x.length() / 8 + 1).to_int64(), pos) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      let mut i = 0
+      while i < x.length() {
+        if x[i] != y[i] {
+          return Ok(false)
+        }
+        i = i + 1
+      }
+      Ok(true)
+    }
+    (ValueKind::Timestamp(x), ValueKind::Timestamp(y)) => Ok(x.eq(y))
+    (ValueKind::Duration(x), ValueKind::Duration(y)) => Ok(x.eq(y))
+    (ValueKind::Type(x), ValueKind::Type(y)) => Ok(x == y)
+    (ValueKind::List(xs), ValueKind::List(ys)) => {
+      if xs.length() != ys.length() {
+        return Ok(false)
+      }
+      let mut i = 0
+      while i < xs.length() {
+        match self.charge(1L, pos) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        match self.eval_values_equal(xs[i], ys[i], pos) {
+          Ok(true) => ()
+          Ok(false) => return Ok(false)
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(true)
+    }
+    (ValueKind::Map(xs), ValueKind::Map(ys)) => {
+      if xs.length() != ys.length() {
+        return Ok(false)
+      }
+      let mut i = 0
+      while i < xs.length() {
+        match self.charge(1L, pos) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let (kx, vx) = xs[i]
+        let slot = map_lookup_val(b, ys, kx)
+        if slot < 0 {
+          return Ok(false)
+        }
+        let (_, vy) = ys[slot]
+        match self.eval_values_equal(vx, vy, pos) {
+          Ok(true) => ()
+          Ok(false) => return Ok(false)
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(true)
+    }
+    _ => Ok(false)
+  }
+}
+
+fn EvalCtx::push_local(self : EvalCtx, name : String, v : Value) -> Unit {
+  match self.locals {
+    Some(ls) => ls.push((name, v))
+    None => {
+      let ls : Array[(String, Value)] = [(name, v)]
+      self.locals = Some(ls)
+    }
+  }
+}
+
+fn EvalCtx::pop_local(self : EvalCtx) -> Unit {
+  match self.locals {
+    Some(ls) => {
+      let _ = ls.pop()
+    }
+    None => ()
+  }
+}
+
+fn EvalCtx::lookup_var(self : EvalCtx, name : String, pos : Int) -> Result[Value, CelError] {
+  match self.locals {
+    Some(ls) => {
+      let mut i = ls.length() - 1
+      while i >= 0 {
+        let (k, v) = ls[i]
+        if k == name {
+          return Ok(v)
+        }
+        i = i - 1
+      }
+    }
+    None => ()
   }
   match self.activation.lookup(name) {
     Some(v) => return Ok(v)
@@ -241,6 +442,28 @@ fn cel_compare(a : Value, b : Value, pos : Int) -> Result[Option[Int], CelError]
 }
 
 fn EvalCtx::eval_node(self : EvalCtx, id : Int) -> Result[Value, CelError] {
+  self.cost = self.cost + 1L
+  if self.cost > self.limits.max_cost {
+    return Err(
+      CelError::new(
+        CelErrorKind::LimitExceeded,
+        "evaluation cost exceeds limit (" + self.limits.max_cost.to_string() + ")",
+        -1,
+      ),
+    )
+  }
+  // Fast path for leaf nodes: no depth mutation or extra function frame
+  match self.nodes[id] {
+    ExprNode::Ident(name, pos) => return self.lookup_var(name, pos)
+    ExprNode::LitNull => return Ok(VAL_NULL)
+    ExprNode::LitBool(b) => return Ok(if b { VAL_TRUE } else { VAL_FALSE })
+    ExprNode::LitInt(n) => return Ok(Value::int(n))
+    ExprNode::LitUInt(u) => return Ok(Value::uint(u))
+    ExprNode::LitDouble(d) => return Ok(Value::double(d))
+    ExprNode::LitString(s) => return Ok(Value::string(s))
+    ExprNode::LitBytes(bs) => return Ok(Value::bytes(bs))
+    _ => ()
+  }
   self.depth = self.depth + 1
   if self.depth > self.limits.max_depth {
     self.depth = self.depth - 1
@@ -248,17 +471,6 @@ fn EvalCtx::eval_node(self : EvalCtx, id : Int) -> Result[Value, CelError] {
       CelError::new(
         CelErrorKind::LimitExceeded,
         "evaluation depth exceeds limit (" + self.limits.max_depth.to_string() + ")",
-        -1,
-      ),
-    )
-  }
-  self.cost = self.cost + 1L
-  if self.cost > self.limits.max_cost {
-    self.depth = self.depth - 1
-    return Err(
-      CelError::new(
-        CelErrorKind::LimitExceeded,
-        "evaluation cost exceeds limit (" + self.limits.max_cost.to_string() + ")",
         -1,
       ),
     )
@@ -298,29 +510,91 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
                 Err(e) => Err(e)
               }
             }
-            ValueKind::Double(d) => Ok(Value::double(0.0 - d))
-            ValueKind::Duration(dur) => {
-              match dur.checked_neg() {
-                Ok(r) => Ok(Value::duration(r))
-                Err(_) => Err(CelError::new(CelErrorKind::Overflow, "duration negation overflow", pos))
-              }
-            }
+            ValueKind::Double(d) => Ok(Value::double(neg_f64_bits(d)))
             _ => Err(CelError::new(CelErrorKind::NoMatchingOverload, "unary '-' not supported for " + value_type_name(v), pos))
           }
         }
+      }
+    }
+    ExprNode::OrChain(items, pos) => {
+      let mut saved_err : Option[CelError] = None
+      let mut i = 0
+      while i < items.length() {
+        match self.eval_node(items[i]) {
+          Ok(v) => {
+            match v.kind {
+              ValueKind::Bool(true) => return Ok(Value::bool(true))
+              ValueKind::Bool(false) => ()
+              _ => {
+                match saved_err {
+                  None => saved_err = Some(CelError::new(CelErrorKind::NoMatchingOverload, "'||' requires bool", pos))
+                  Some(_) => ()
+                }
+              }
+            }
+          }
+          Err(e) => {
+            if e.is_kind(CelErrorKind::LimitExceeded) {
+              return Err(e)
+            }
+            match saved_err {
+              None => saved_err = Some(e)
+              Some(_) => ()
+            }
+          }
+        }
+        i = i + 1
+      }
+      match saved_err {
+        Some(e) => Err(e)
+        None => Ok(Value::bool(false))
+      }
+    }
+    ExprNode::AndChain(items, pos) => {
+      let mut saved_err : Option[CelError] = None
+      let mut i = 0
+      while i < items.length() {
+        match self.eval_node(items[i]) {
+          Ok(v) => {
+            match v.kind {
+              ValueKind::Bool(false) => return Ok(Value::bool(false))
+              ValueKind::Bool(true) => ()
+              _ => {
+                match saved_err {
+                  None => saved_err = Some(CelError::new(CelErrorKind::NoMatchingOverload, "'&&' requires bool", pos))
+                  Some(_) => ()
+                }
+              }
+            }
+          }
+          Err(e) => {
+            if e.is_kind(CelErrorKind::LimitExceeded) {
+              return Err(e)
+            }
+            match saved_err {
+              None => saved_err = Some(e)
+              Some(_) => ()
+            }
+          }
+        }
+        i = i + 1
+      }
+      match saved_err {
+        Some(e) => Err(e)
+        None => Ok(Value::bool(true))
       }
     }
     ExprNode::Binary(op, lhs_id, rhs_id, pos) => {
       match op {
         BinOp::Or => {
           let lres = self.eval_node(lhs_id)
+          let mut lerr : Option[CelError] = None
           match lres {
             Ok(lv) => {
               match lv.kind {
                 ValueKind::Bool(true) => return Ok(Value::bool(true))
                 ValueKind::Bool(false) => {
-                  let rres = self.eval_node(rhs_id)
-                  match rres {
+                  match self.eval_node(rhs_id) {
                     Ok(rv) => {
                       match rv.kind {
                         ValueKind::Bool(b) => return Ok(Value::bool(b))
@@ -330,39 +604,44 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
                     Err(e) => return Err(e)
                   }
                 }
-                _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "'||' requires bool", pos))
+                _ => lerr = Some(CelError::new(CelErrorKind::NoMatchingOverload, "'||' requires bool", pos))
               }
             }
             Err(le) => {
               if le.is_kind(CelErrorKind::LimitExceeded) {
                 return Err(le)
               }
-              match self.eval_node(rhs_id) {
-                Ok(rv) => {
-                  match rv.kind {
-                    ValueKind::Bool(true) => return Ok(Value::bool(true))
-                    _ => return Err(le)
-                  }
-                }
-                Err(re) => {
-                  if re.is_kind(CelErrorKind::LimitExceeded) {
-                    return Err(re)
-                  }
-                  return Err(le)
-                }
+              lerr = Some(le)
+            }
+          }
+          let le = match lerr {
+            Some(e) => e
+            None => CelError::new(CelErrorKind::NoMatchingOverload, "'||' requires bool", pos)
+          }
+          match self.eval_node(rhs_id) {
+            Ok(rv) => {
+              match rv.kind {
+                ValueKind::Bool(true) => return Ok(Value::bool(true))
+                _ => return Err(le)
               }
+            }
+            Err(re) => {
+              if re.is_kind(CelErrorKind::LimitExceeded) {
+                return Err(re)
+              }
+              return Err(le)
             }
           }
         }
         BinOp::And => {
           let lres = self.eval_node(lhs_id)
+          let mut lerr : Option[CelError] = None
           match lres {
             Ok(lv) => {
               match lv.kind {
                 ValueKind::Bool(false) => return Ok(Value::bool(false))
                 ValueKind::Bool(true) => {
-                  let rres = self.eval_node(rhs_id)
-                  match rres {
+                  match self.eval_node(rhs_id) {
                     Ok(rv) => {
                       match rv.kind {
                         ValueKind::Bool(b) => return Ok(Value::bool(b))
@@ -372,28 +651,85 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
                     Err(e) => return Err(e)
                   }
                 }
-                _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "'&&' requires bool", pos))
+                _ => lerr = Some(CelError::new(CelErrorKind::NoMatchingOverload, "'&&' requires bool", pos))
               }
             }
             Err(le) => {
               if le.is_kind(CelErrorKind::LimitExceeded) {
                 return Err(le)
               }
-              match self.eval_node(rhs_id) {
-                Ok(rv) => {
-                  match rv.kind {
-                    ValueKind::Bool(false) => return Ok(Value::bool(false))
-                    _ => return Err(le)
-                  }
-                }
-                Err(re) => {
-                  if re.is_kind(CelErrorKind::LimitExceeded) {
-                    return Err(re)
-                  }
-                  return Err(le)
-                }
+              lerr = Some(le)
+            }
+          }
+          let le = match lerr {
+            Some(e) => e
+            None => CelError::new(CelErrorKind::NoMatchingOverload, "'&&' requires bool", pos)
+          }
+          match self.eval_node(rhs_id) {
+            Ok(rv) => {
+              match rv.kind {
+                ValueKind::Bool(false) => return Ok(Value::bool(false))
+                _ => return Err(le)
               }
             }
+            Err(re) => {
+              if re.is_kind(CelErrorKind::LimitExceeded) {
+                return Err(re)
+              }
+              return Err(le)
+            }
+          }
+        }
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+          // Check if left child is also an arithmetic binary op; if so, unroll iteratively to avoid false depth rejections on flat chains like 1+1+...+1 (70 terms)
+          let is_chain = match self.nodes[lhs_id] {
+            ExprNode::Binary(cop, _, _, _) => {
+              match cop {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true
+                _ => false
+              }
+            }
+            _ => false
+          }
+          if is_chain {
+            let steps : Array[(BinOp, Int, Int)] = [(op, rhs_id, pos)]
+            let mut cur = lhs_id
+            while true {
+              match self.nodes[cur] {
+                ExprNode::Binary(cop, cl, cr, cpos) => {
+                  match cop {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                      steps.push((cop, cr, cpos))
+                      cur = cl
+                    }
+                    _ => break
+                  }
+                }
+                _ => break
+              }
+            }
+            let mut acc = match self.eval_node(cur) {
+              Ok(x) => x
+              Err(e) => return Err(e)
+            }
+            let mut k = steps.length() - 1
+            while k >= 0 {
+              let (sop, srhs, spos) = steps[k]
+              match self.charge(1L, spos) {
+                Ok(_) => ()
+                Err(e) => return Err(e)
+              }
+              let rv = match self.eval_node(srhs) {
+                Ok(x) => x
+                Err(e) => return Err(e)
+              }
+              acc = match self.eval_binary_strict(sop, acc, rv, spos) {
+                Ok(x) => x
+                Err(e) => return Err(e)
+              }
+              k = k - 1
+            }
+            return Ok(acc)
           }
         }
         _ => ()
@@ -439,7 +775,17 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
               }
               u.reinterpret_as_int64()
             }
-            _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "list index must be int or uint", pos))
+            ValueKind::Double(d) => {
+              if is_nan_f64(d) || is_inf_f64(d) || d < 0.0 || d >= CEL_TWO_63_F {
+                return Err(CelError::new(CelErrorKind::IndexOutOfBounds, "list index out of bounds", pos))
+              }
+              let di = d.to_int64()
+              if di.to_double() != d {
+                return Err(CelError::new(CelErrorKind::InvalidArgument, "fractional list index", pos))
+              }
+              di
+            }
+            _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "list index must be int, uint, or double", pos))
           }
           if idx_i64 < 0L || idx_i64 >= items.length().to_int64() {
             return Err(CelError::new(CelErrorKind::IndexOutOfBounds, "list index out of bounds", pos))
@@ -447,13 +793,10 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
           Ok(items[idx_i64.to_int()])
         }
         ValueKind::Map(entries) => {
-          let mut i = 0
-          while i < entries.length() {
-            let (k, v) = entries[i]
-            if cel_values_equal(k, iv) {
-              return Ok(v)
-            }
-            i = i + 1
+          let slot = map_lookup_val(tv, entries, iv)
+          if slot >= 0 {
+            let (_, v) = entries[slot]
+            return Ok(v)
           }
           Err(CelError::new(CelErrorKind::NoSuchKey, "no such key in map", pos))
         }
@@ -467,18 +810,10 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
       }
       match tv.kind {
         ValueKind::Map(entries) => {
-          let mut i = 0
-          while i < entries.length() {
-            let (k, v) = entries[i]
-            match k.kind {
-              ValueKind::String(ks) => {
-                if ks == field {
-                  return Ok(if test_only { Value::bool(true) } else { v })
-                }
-              }
-              _ => ()
-            }
-            i = i + 1
+          let slot = map_lookup_str(tv, entries, field)
+          if slot >= 0 {
+            let (_, v) = entries[slot]
+            return Ok(if test_only { Value::bool(true) } else { v })
           }
           if test_only {
             Ok(Value::bool(false))
@@ -490,8 +825,9 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
       }
     }
     ExprNode::ListLit(elems, pos) => {
-      if elems.length() * 8 > self.limits.max_output_bytes {
-        return Err(CelError::new(CelErrorKind::LimitExceeded, "list literal exceeds output limit", pos))
+      match self.charge_alloc((elems.length() * 8).to_int64(), pos) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
       }
       let out : Array[Value] = []
       let mut i = 0
@@ -505,8 +841,9 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
       Ok(Value::list(out))
     }
     ExprNode::MapLit(entries, pos) => {
-      if entries.length() * 16 > self.limits.max_output_bytes {
-        return Err(CelError::new(CelErrorKind::LimitExceeded, "map literal exceeds output limit", pos))
+      match self.charge_alloc((entries.length() * 16).to_int64(), pos) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
       }
       let out : Array[(Value, Value)] = []
       let mut i = 0
@@ -516,11 +853,28 @@ fn EvalCtx::eval_node_inner(self : EvalCtx, id : Int) -> Result[Value, CelError]
           Ok(v) => v
           Err(e) => return Err(e)
         }
+        if !is_valid_map_key_val(kv) {
+          return Err(CelError::new(CelErrorKind::InvalidArgument, "invalid map key type: " + value_type_name(kv), pos))
+        }
         let vv = match self.eval_node(vid) {
           Ok(v) => v
           Err(e) => return Err(e)
         }
-        out.push((kv, vv))
+        // Last-wins deduplication matching cel-go
+        let mut replaced = false
+        let mut j = 0
+        while j < out.length() {
+          let (ek, _) = out[j]
+          if cel_values_equal(ek, kv) {
+            out[j] = (kv, vv)
+            replaced = true
+            break
+          }
+          j = j + 1
+        }
+        if !replaced {
+          out.push((kv, vv))
+        }
         i = i + 1
       }
       Ok(Value::map(out))
@@ -542,33 +896,127 @@ fn EvalCtx::eval_binary_strict(
   pos : Int,
 ) -> Result[Value, CelError] {
   match op {
-    BinOp::Eq => Ok(Value::bool(cel_values_equal(lv, rv)))
-    BinOp::Ne => Ok(Value::bool(!cel_values_equal(lv, rv)))
+    BinOp::Eq => {
+      match self.eval_values_equal(lv, rv, pos) {
+        Ok(b) => Ok(Value::bool(b))
+        Err(e) => Err(e)
+      }
+    }
+    BinOp::Ne => {
+      match self.eval_values_equal(lv, rv, pos) {
+        Ok(b) => Ok(Value::bool(!b))
+        Err(e) => Err(e)
+      }
+    }
     BinOp::Lt => {
+      match (lv.kind, rv.kind) {
+        (ValueKind::String(x), ValueKind::String(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        (ValueKind::Bytes(x), ValueKind::Bytes(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        _ => ()
+      }
       match cel_compare(lv, rv, pos) {
         Ok(Some(c)) => Ok(Value::bool(c < 0))
-        Ok(None) => Ok(Value::bool(false))
+        Ok(None) => Err(CelError::new(CelErrorKind::EvalError, "NaN values cannot be ordered", pos))
         Err(e) => Err(e)
       }
     }
     BinOp::Le => {
+      match (lv.kind, rv.kind) {
+        (ValueKind::String(x), ValueKind::String(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        (ValueKind::Bytes(x), ValueKind::Bytes(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        _ => ()
+      }
       match cel_compare(lv, rv, pos) {
         Ok(Some(c)) => Ok(Value::bool(c <= 0))
-        Ok(None) => Ok(Value::bool(false))
+        Ok(None) => Err(CelError::new(CelErrorKind::EvalError, "NaN values cannot be ordered", pos))
         Err(e) => Err(e)
       }
     }
     BinOp::Gt => {
+      match (lv.kind, rv.kind) {
+        (ValueKind::String(x), ValueKind::String(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        (ValueKind::Bytes(x), ValueKind::Bytes(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        _ => ()
+      }
       match cel_compare(lv, rv, pos) {
         Ok(Some(c)) => Ok(Value::bool(c > 0))
-        Ok(None) => Ok(Value::bool(false))
+        Ok(None) => Err(CelError::new(CelErrorKind::EvalError, "NaN values cannot be ordered", pos))
         Err(e) => Err(e)
       }
     }
     BinOp::Ge => {
+      match (lv.kind, rv.kind) {
+        (ValueKind::String(x), ValueKind::String(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        (ValueKind::Bytes(x), ValueKind::Bytes(y)) => {
+          let m = if x.length() < y.length() { x.length() } else { y.length() }
+          if m > 16 {
+            match self.charge((m / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+        }
+        _ => ()
+      }
       match cel_compare(lv, rv, pos) {
         Ok(Some(c)) => Ok(Value::bool(c >= 0))
-        Ok(None) => Ok(Value::bool(false))
+        Ok(None) => Err(CelError::new(CelErrorKind::EvalError, "NaN values cannot be ordered", pos))
         Err(e) => Err(e)
       }
     }
@@ -577,23 +1025,21 @@ fn EvalCtx::eval_binary_strict(
         ValueKind::List(items) => {
           let mut i = 0
           while i < items.length() {
-            if cel_values_equal(lv, items[i]) {
-              return Ok(Value::bool(true))
+            match self.charge(1L, pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            match self.eval_values_equal(lv, items[i], pos) {
+              Ok(true) => return Ok(Value::bool(true))
+              Ok(false) => ()
+              Err(e) => return Err(e)
             }
             i = i + 1
           }
           Ok(Value::bool(false))
         }
         ValueKind::Map(entries) => {
-          let mut i = 0
-          while i < entries.length() {
-            let (k, _) = entries[i]
-            if cel_values_equal(lv, k) {
-              return Ok(Value::bool(true))
-            }
-            i = i + 1
-          }
-          Ok(Value::bool(false))
+          Ok(Value::bool(map_lookup_val(rv, entries, lv) >= 0))
         }
         _ => Err(CelError::new(CelErrorKind::NoMatchingOverload, "'in' requires list or map", pos))
       }
@@ -615,15 +1061,29 @@ fn EvalCtx::eval_binary_strict(
         (ValueKind::Double(a), ValueKind::Double(b)) => Ok(Value::double(a + b))
         (ValueKind::String(a), ValueKind::String(b)) => {
           let total_len = a.length() + b.length()
-          if total_len > self.limits.max_output_bytes {
-            return Err(CelError::new(CelErrorKind::LimitExceeded, "string concat exceeds output limit", pos))
+          match self.charge_alloc(total_len.to_int64(), pos) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          if total_len > 16 {
+            match self.charge((total_len / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
           }
           Ok(Value::string(a + b))
         }
         (ValueKind::Bytes(a), ValueKind::Bytes(b)) => {
           let total_len = a.length() + b.length()
-          if total_len > self.limits.max_output_bytes {
-            return Err(CelError::new(CelErrorKind::LimitExceeded, "bytes concat exceeds output limit", pos))
+          match self.charge_alloc(total_len.to_int64(), pos) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          if total_len > 16 {
+            match self.charge((total_len / 8 + 1).to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
           }
           let out = Bytes::new(total_len)
           let mut i = 0
@@ -639,8 +1099,14 @@ fn EvalCtx::eval_binary_strict(
           Ok(Value::bytes(out))
         }
         (ValueKind::List(a), ValueKind::List(b)) => {
-          if (a.length() + b.length()) * 8 > self.limits.max_output_bytes {
-            return Err(CelError::new(CelErrorKind::LimitExceeded, "list concat exceeds output limit", pos))
+          let total = a.length() + b.length()
+          match self.charge_alloc((total * 8).to_int64(), pos) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          match self.charge(total.to_int64(), pos) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
           }
           let out : Array[Value] = []
           let mut i = 0
@@ -656,21 +1122,21 @@ fn EvalCtx::eval_binary_strict(
           Ok(Value::list(out))
         }
         (ValueKind::Timestamp(ts), ValueKind::Duration(dur)) => {
-          match ts.checked_add(dur) {
+          match checked_ts_add_dur(ts, dur, pos) {
             Ok(r) => Ok(Value::timestamp(r))
-            Err(_) => Err(CelError::new(CelErrorKind::Overflow, "timestamp addition overflow", pos))
+            Err(e) => Err(e)
           }
         }
         (ValueKind::Duration(dur), ValueKind::Timestamp(ts)) => {
-          match ts.checked_add(dur) {
+          match checked_ts_add_dur(ts, dur, pos) {
             Ok(r) => Ok(Value::timestamp(r))
-            Err(_) => Err(CelError::new(CelErrorKind::Overflow, "timestamp addition overflow", pos))
+            Err(e) => Err(e)
           }
         }
         (ValueKind::Duration(a), ValueKind::Duration(b)) => {
-          match a.checked_add(b) {
+          match checked_add_cel_duration(a, b, pos) {
             Ok(r) => Ok(Value::duration(r))
-            Err(_) => Err(CelError::new(CelErrorKind::Overflow, "duration addition overflow", pos))
+            Err(e) => Err(e)
           }
         }
         _ =>
@@ -699,16 +1165,21 @@ fn EvalCtx::eval_binary_strict(
         }
         (ValueKind::Double(a), ValueKind::Double(b)) => Ok(Value::double(a - b))
         (ValueKind::Timestamp(ts), ValueKind::Duration(dur)) => {
-          match ts.checked_sub(dur) {
+          match checked_ts_sub_dur(ts, dur, pos) {
             Ok(r) => Ok(Value::timestamp(r))
-            Err(_) => Err(CelError::new(CelErrorKind::Overflow, "timestamp subtraction overflow", pos))
+            Err(e) => Err(e)
           }
         }
-        (ValueKind::Timestamp(a), ValueKind::Timestamp(b)) => Ok(Value::duration(a.since(b)))
-        (ValueKind::Duration(a), ValueKind::Duration(b)) => {
-          match a.checked_sub(b) {
+        (ValueKind::Timestamp(a), ValueKind::Timestamp(b)) => {
+          match checked_ts_sub_ts(a, b, pos) {
             Ok(r) => Ok(Value::duration(r))
-            Err(_) => Err(CelError::new(CelErrorKind::Overflow, "duration subtraction overflow", pos))
+            Err(e) => Err(e)
+          }
+        }
+        (ValueKind::Duration(a), ValueKind::Duration(b)) => {
+          match checked_sub_cel_duration(a, b, pos) {
+            Ok(r) => Ok(Value::duration(r))
+            Err(e) => Err(e)
           }
         }
         _ =>
@@ -815,9 +1286,9 @@ fn EvalCtx::eval_comprehension(
           Ok(_) => ()
           Err(e) => return Err(e)
         }
-        self.locals.push((iter_var, items[i]))
+        self.push_local(iter_var, items[i])
         let r = self.eval_node(body_id)
-        let _ = self.locals.pop()
+        self.pop_local()
         match r {
           Ok(v) => {
             match v.kind {
@@ -851,9 +1322,9 @@ fn EvalCtx::eval_comprehension(
           Ok(_) => ()
           Err(e) => return Err(e)
         }
-        self.locals.push((iter_var, items[i]))
+        self.push_local(iter_var, items[i])
         let r = self.eval_node(body_id)
-        let _ = self.locals.pop()
+        self.pop_local()
         match r {
           Ok(v) => {
             match v.kind {
@@ -887,9 +1358,9 @@ fn EvalCtx::eval_comprehension(
           Ok(_) => ()
           Err(e) => return Err(e)
         }
-        self.locals.push((iter_var, items[i]))
+        self.push_local(iter_var, items[i])
         let r = self.eval_node(body_id)
-        let _ = self.locals.pop()
+        self.pop_local()
         match r {
           Ok(v) => {
             match v.kind {
@@ -912,13 +1383,19 @@ fn EvalCtx::eval_comprehension(
           Ok(_) => ()
           Err(e) => return Err(e)
         }
-        self.locals.push((iter_var, items[i]))
+        self.push_local(iter_var, items[i])
         let r = self.eval_node(filter_id)
-        let _ = self.locals.pop()
+        self.pop_local()
         match r {
           Ok(v) => {
             match v.kind {
-              ValueKind::Bool(true) => out.push(items[i])
+              ValueKind::Bool(true) => {
+                match self.charge_alloc(8L, pos) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+                out.push(items[i])
+              }
               ValueKind::Bool(false) => ()
               _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "filter() predicate must return bool", pos))
             }
@@ -937,11 +1414,17 @@ fn EvalCtx::eval_comprehension(
           Ok(_) => ()
           Err(e) => return Err(e)
         }
-        self.locals.push((iter_var, items[i]))
+        self.push_local(iter_var, items[i])
         let r = self.eval_node(body_id)
-        let _ = self.locals.pop()
+        self.pop_local()
         match r {
-          Ok(v) => out.push(v)
+          Ok(v) => {
+            match self.charge_alloc(8L, pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            out.push(v)
+          }
           Err(e) => return Err(e)
         }
         i = i + 1
@@ -956,30 +1439,36 @@ fn EvalCtx::eval_comprehension(
           Ok(_) => ()
           Err(e) => return Err(e)
         }
-        self.locals.push((iter_var, items[i]))
+        self.push_local(iter_var, items[i])
         let fr = self.eval_node(filter_id)
         match fr {
           Ok(fv) => {
             match fv.kind {
               ValueKind::Bool(true) => {
                 let br = self.eval_node(body_id)
-                let _ = self.locals.pop()
+                self.pop_local()
                 match br {
-                  Ok(v) => out.push(v)
+                  Ok(v) => {
+                    match self.charge_alloc(8L, pos) {
+                      Ok(_) => ()
+                      Err(e) => return Err(e)
+                    }
+                    out.push(v)
+                  }
                   Err(e) => return Err(e)
                 }
               }
               ValueKind::Bool(false) => {
-                let _ = self.locals.pop()
+                self.pop_local()
               }
               _ => {
-                let _ = self.locals.pop()
+                self.pop_local()
                 return Err(CelError::new(CelErrorKind::NoMatchingOverload, "map() filter predicate must return bool", pos))
               }
             }
           }
           Err(e) => {
-            let _ = self.locals.pop()
+            self.pop_local()
             return Err(e)
           }
         }
@@ -990,9 +1479,17 @@ fn EvalCtx::eval_comprehension(
   }
 }
 
-fn eval_size(v : Value, pos : Int) -> Result[Value, CelError] {
+fn EvalCtx::eval_size(self : EvalCtx, v : Value, pos : Int) -> Result[Value, CelError] {
   match v.kind {
-    ValueKind::String(s) => Ok(Value::int(utf8_codepoint_len(s).to_int64()))
+    ValueKind::String(s) => {
+      if s.length() > 16 {
+        match self.charge((s.length() / 8 + 1).to_int64(), pos) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      Ok(Value::int(utf8_codepoint_len(s).to_int64()))
+    }
     ValueKind::Bytes(bs) => Ok(Value::int(bs.length().to_int64()))
     ValueKind::List(xs) => Ok(Value::int(xs.length().to_int64()))
     ValueKind::Map(xs) => Ok(Value::int(xs.length().to_int64()))
@@ -1007,13 +1504,22 @@ fn EvalCtx::eval_matches(
   pattern : String,
   pos : Int,
 ) -> Result[Value, CelError] {
+  let scan_cost = ((text.length() + pattern.length()) / 8 + 1).to_int64()
+  match self.charge(scan_cost, pos) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
   if node_id >= 0 && node_id < self.regex_cache.length() {
     match self.regex_cache[node_id] {
       Some(re) => return Ok(Value::bool(re.is_match(text)))
       None => ()
     }
   }
-  match regex::compile(pattern) {
+  match self.charge((pattern.length() + 10).to_int64(), pos) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match compile_cel_re2(pattern) {
     Ok(re) => Ok(Value::bool(re.is_match(text)))
     Err(_) => Err(CelError::new(CelErrorKind::InvalidArgument, "invalid regular expression: " + pattern, pos))
   }
@@ -1043,7 +1549,7 @@ fn EvalCtx::eval_call(
         i = i + 1
       }
       if name == "size" && arg_vals.length() == 0 {
-        return eval_size(recv, pos)
+        return self.eval_size(recv, pos)
       }
       match recv.kind {
         ValueKind::String(s) => {
@@ -1051,12 +1557,30 @@ fn EvalCtx::eval_call(
             match arg_vals[0].kind {
               ValueKind::String(arg) => {
                 if name == "contains" {
+                  if s.length() + arg.length() > 16 {
+                    match self.charge(((s.length() + arg.length()) / 8 + 1).to_int64(), pos) {
+                      Ok(_) => ()
+                      Err(e) => return Err(e)
+                    }
+                  }
                   return Ok(Value::bool(s.contains(arg)))
                 }
                 if name == "startsWith" {
+                  if arg.length() > 16 {
+                    match self.charge((arg.length() / 8 + 1).to_int64(), pos) {
+                      Ok(_) => ()
+                      Err(e) => return Err(e)
+                    }
+                  }
                   return Ok(Value::bool(s.starts_with(arg)))
                 }
                 if name == "endsWith" {
+                  if arg.length() > 16 {
+                    match self.charge((arg.length() / 8 + 1).to_int64(), pos) {
+                      Ok(_) => ()
+                      Err(e) => return Err(e)
+                    }
+                  }
                   return Ok(Value::bool(s.ends_with(arg)))
                 }
                 if name == "matches" {
@@ -1074,7 +1598,7 @@ fn EvalCtx::eval_call(
           } else if arg_vals.length() == 1 {
             match arg_vals[0].kind {
               ValueKind::String(tz) => {
-                match parse_cel_tz_offset(tz, pos) {
+                match resolve_cel_tz_offset(tz, ts, pos) {
                   Ok(o) => o
                   Err(e) => return Err(e)
                 }
@@ -1131,7 +1655,7 @@ fn EvalCtx::eval_call(
             return Ok(Value::int(dur.as_secs()))
           }
           if name == "getMilliseconds" {
-            return Ok(Value::int((dur.subsec_nanos() / 1000000).to_int64()))
+            return Ok(Value::int(dur.as_secs() * 1000L + (dur.subsec_nanos() / 1000000).to_int64()))
           }
           Err(CelError::new(CelErrorKind::NoMatchingOverload, "unknown duration method '" + name + "'", pos))
         }
@@ -1149,7 +1673,7 @@ fn EvalCtx::eval_call(
         i = i + 1
       }
       if name == "size" && arg_vals.length() == 1 {
-        return eval_size(arg_vals[0], pos)
+        return self.eval_size(arg_vals[0], pos)
       }
       if name == "matches" && arg_vals.length() == 2 {
         match (arg_vals[0].kind, arg_vals[1].kind) {
@@ -1188,7 +1712,7 @@ fn EvalCtx::eval_call(
             return Ok(Value::int(u.reinterpret_as_int64()))
           }
           ValueKind::Double(d) => {
-            if is_nan_f64(d) || is_inf_f64(d) || d < CEL_NEG_TWO_63_F || d >= CEL_TWO_63_F {
+            if is_nan_f64(d) || is_inf_f64(d) || d <= CEL_NEG_TWO_63_F || d >= CEL_TWO_63_F {
               return Err(CelError::new(CelErrorKind::Overflow, "double out of int64 range", pos))
             }
             return Ok(Value::int(d.to_int64()))
@@ -1200,6 +1724,12 @@ fn EvalCtx::eval_call(
             }
           }
           ValueKind::Timestamp(ts) => return Ok(Value::int(ts.as_second()))
+          ValueKind::Duration(dur) => {
+            match duration_to_i64_nanos(dur) {
+              Some(ns) => return Ok(Value::int(ns))
+              None => return Err(CelError::new(CelErrorKind::Overflow, "duration overflows int64", pos))
+            }
+          }
           _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "cannot convert to int", pos))
         }
       }
@@ -1237,7 +1767,7 @@ fn EvalCtx::eval_call(
           ValueKind::Int64(n) => return Ok(Value::double(n.to_double()))
           ValueKind::UInt64(u) => return Ok(Value::double(u64_to_double(u)))
           ValueKind::String(s) => {
-            match parse_double_str(s) {
+            match parse_cel_double_conv(s) {
               Some(d) => return Ok(Value::double(d))
               None => return Err(CelError::new(CelErrorKind::InvalidArgument, "invalid double string: " + s, pos))
             }
@@ -1248,41 +1778,80 @@ fn EvalCtx::eval_call(
       if name == "string" && arg_vals.length() == 1 {
         match arg_vals[0].kind {
           ValueKind::String(s) => return Ok(Value::string(s))
-          ValueKind::Int64(n) => return Ok(Value::string(n.to_string()))
-          ValueKind::UInt64(u) => return Ok(Value::string(u.to_string()))
-          ValueKind::Double(d) => return Ok(Value::string(d.to_string()))
+          ValueKind::Int64(n) => {
+            let out = n.to_string()
+            match self.charge_alloc(out.length().to_int64(), pos) {
+              Ok(_) => return Ok(Value::string(out))
+              Err(e) => return Err(e)
+            }
+          }
+          ValueKind::UInt64(u) => {
+            let out = u.to_string()
+            match self.charge_alloc(out.length().to_int64(), pos) {
+              Ok(_) => return Ok(Value::string(out))
+              Err(e) => return Err(e)
+            }
+          }
+          ValueKind::Double(d) => {
+            let out = format_cel_double(d)
+            match self.charge_alloc(out.length().to_int64(), pos) {
+              Ok(_) => return Ok(Value::string(out))
+              Err(e) => return Err(e)
+            }
+          }
           ValueKind::Bool(b) => return Ok(Value::string(if b { "true" } else { "false" }))
           ValueKind::Bytes(bs) => {
+            match self.charge_alloc(bs.length().to_int64(), pos) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
             match utf8_bytes_to_string(bs) {
               Some(s) => return Ok(Value::string(s))
               None => return Err(CelError::new(CelErrorKind::InvalidArgument, "invalid UTF-8 bytes", pos))
             }
           }
-          ValueKind::Timestamp(ts) => return Ok(Value::string(ts.to_rfc3339()))
-          ValueKind::Duration(dur) => return Ok(Value::string(format_cel_duration(dur)))
+          ValueKind::Timestamp(ts) => {
+            let out = format_cel_timestamp(ts, arg_vals[0].ts_offset)
+            match self.charge_alloc(out.length().to_int64(), pos) {
+              Ok(_) => return Ok(Value::string(out))
+              Err(e) => return Err(e)
+            }
+          }
+          ValueKind::Duration(dur) => {
+            let out = format_cel_duration(dur)
+            match self.charge_alloc(out.length().to_int64(), pos) {
+              Ok(_) => return Ok(Value::string(out))
+              Err(e) => return Err(e)
+            }
+          }
           _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "cannot convert to string", pos))
         }
       }
       if name == "bytes" && arg_vals.length() == 1 {
         match arg_vals[0].kind {
           ValueKind::Bytes(bs) => return Ok(Value::bytes(bs))
-          ValueKind::String(s) => return Ok(Value::bytes(string_to_bytes(s)))
+          ValueKind::String(s) => {
+            match self.charge_alloc(s.length().to_int64(), pos) {
+              Ok(_) => return Ok(Value::bytes(string_to_bytes(s)))
+              Err(e) => return Err(e)
+            }
+          }
           _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "cannot convert to bytes", pos))
         }
       }
       if name == "timestamp" && arg_vals.length() == 1 {
         match arg_vals[0].kind {
-          ValueKind::Timestamp(ts) => return Ok(Value::timestamp(ts))
+          ValueKind::Timestamp(_) => return Ok(arg_vals[0])
           ValueKind::String(s) => {
-            match time::Timestamp::parse_rfc3339(s) {
-              Ok(ts) => return Ok(Value::timestamp(ts))
-              Err(_) => return Err(CelError::new(CelErrorKind::InvalidArgument, "invalid RFC 3339 timestamp: " + s, pos))
+            match parse_cel_rfc3339(s, pos) {
+              Ok((ts, off)) => return Ok(Value::timestamp_with_offset(ts, off))
+              Err(e) => return Err(e)
             }
           }
           ValueKind::Int64(secs) => {
-            match time::Timestamp::from_second(secs) {
+            match cel_timestamp_from_second(secs, pos) {
               Ok(ts) => return Ok(Value::timestamp(ts))
-              Err(_) => return Err(CelError::new(CelErrorKind::Overflow, "timestamp seconds out of range", pos))
+              Err(e) => return Err(e)
             }
           }
           _ => return Err(CelError::new(CelErrorKind::NoMatchingOverload, "cannot convert to timestamp", pos))
@@ -1317,9 +1886,10 @@ pub fn eval_ast_with_cache(
     nodes: nodes,
     regex_cache: regex_cache,
     activation: activation,
-    locals: [],
+    locals: None,
     limits: limits,
     cost: 0L,
+    alloc_bytes: 0L,
     depth: 0,
   }
   ctx.eval_node(root)

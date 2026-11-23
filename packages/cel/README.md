@@ -65,15 +65,15 @@ sh packages/cel/bench/run_bench.sh
 
 Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification across all rounds and implementations):
 
-### W1: Compiled IAM / K8s Admission Batch Eval (`80,000` ops)
+### W1: Compiled IAM / K8s Admission Batch Eval (`1,000,000` ops, steady-state)
 
-4 compiled admission/IAM rules evaluated across 20,000 request contexts.
-SHA-256: `498de4922d90154685f14f7b684226753e498d7dc6893fece00a7404445b4ad6`
+4 compiled admission/IAM rules evaluated across 250,000 request contexts (amortizing process startup and `Env` construction).
+SHA-256: `593c1a054b2154395a3a27e582ea772c9b6b71b758f48eb35750fb5f1c55132b`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_cel`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 49.032 | 42.373 | 73.006 | 612.91 | 2.62 MiB | **1.11x** |
-| `go_cel` | 54.412 | 32.954 | 62.618 | 680.15 | 13.69 MiB | 1.00x (baseline) |
+| `pion` | 366.844 | 345.430 | 466.154 | 366.84 | 2.95 MiB | **0.39x** |
+| `go_cel` | 144.705 | 131.740 | 150.039 | 144.70 | 17.66 MiB | 1.00x (baseline) |
 
 ### W2: Macros + Regex `matches` + Timestamp Batch Eval (`20,000` ops)
 
@@ -82,8 +82,8 @@ SHA-256: `8e806c8d63c22d1ada9bb33ec83a9f8dfd6e808b2a02c938f2ce29d6bdf77843`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_cel`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 47.052 | 23.161 | 57.390 | 2352.58 | 3.05 MiB | **2.50x** |
-| `go_cel` | 117.495 | 104.578 | 131.388 | 5874.76 | 17.80 MiB | 1.00x (baseline) |
+| `pion` | 32.911 | 29.035 | 34.086 | 1645.58 | 3.36 MiB | **4.43x** |
+| `go_cel` | 145.960 | 117.004 | 148.032 | 7297.99 | 19.20 MiB | 1.00x (baseline) |
 
 ### W3: End-to-End Compile + Eval (`2,000` ops)
 
@@ -92,12 +92,12 @@ SHA-256: `c32a199ce35392357704573f60522fa4622d48e8f7b5233158a7730a62a58030`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_cel`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 29.883 | 21.148 | 40.546 | 14941.25 | 3.02 MiB | **5.14x** |
-| `go_cel` | 153.618 | 133.295 | 160.798 | 76809.06 | 18.34 MiB | 1.00x (baseline) |
+| `pion` | 22.450 | 16.331 | 24.091 | 11224.79 | 3.34 MiB | **6.77x** |
+| `go_cel` | 152.088 | 145.405 | 188.257 | 76043.96 | 17.69 MiB | 1.00x (baseline) |
 
 ### Objective Performance Analysis
 
-- **End-to-End Compile + Eval (W3, 5.14x faster)**: `google/cel-go` uses an ANTLR4-generated parser, protobuf `CheckedExpr` construction, and reflection-heavy type checking. `packages/cel` uses a single-pass hand-written lexer + recursive-descent parser writing into a flat `Array[ExprNode]` arena with zero protobuf overhead.
-- **Macros + Regex + Timestamp (W2, 2.50x faster)**: `packages/cel` evaluates `all`/`exists`/`filter`/`map` via dedicated `Comprehension` AST nodes (avoiding Go `ref.Val` interface boxing and GC pressure) and caches pre-compiled `packages/regex` automata per constant `matches()` call site.
-- **Tiny Compiled Rules (W1, 1.11x median, higher min than Go)**: On very short steady-state rules, Go's `cel-go` planner compiles expressions into specialized closure trees with Go hash-map lookup (giving `go_cel` a lower min of `32.954 ms` vs `pion`'s `42.373 ms`). `packages/cel` currently walks the `ExprNode` arena with linear `Activation` lookup (`Array[(String, Value)]`). For activations with many (>20) variables, replacing linear lookup with indexed variable slots at compile time would further improve W1.
-- **Memory Footprint**: `pion` runs in **2.62–3.05 MiB** Peak RSS vs Go's **13.69–18.34 MiB** (~5–6x lower memory, zero GC overhead, Wasm32-ready).
+- **End-to-End Compile + Eval (W3, 6.77x faster)**: `google/cel-go` uses an ANTLR4-generated parser, protobuf `CheckedExpr` construction, and reflection-heavy type checking. `packages/cel` uses a single-pass hand-written lexer + recursive-descent parser writing into a flat `Array[ExprNode]` arena with zero protobuf overhead.
+- **Macros + Regex + Timestamp (W2, 4.43x faster)**: `packages/cel` evaluates `all`/`exists`/`filter`/`map` via dedicated `Comprehension` AST nodes (avoiding Go `ref.Val` interface boxing and GC pressure) and caches pre-compiled RE2-compatible `packages/regex` automata per constant `matches()` call site.
+- **Tiny Steady-State Compiled Rules (W1, 0.39x — Pion weakness)**: At 1,000,000 ops where process startup and `Env` construction are amortized, Go's `cel-go` planner compiles expressions into specialized closure trees with zero-cost budget tracking (by default) and outperforms Pion's AST-walking evaluator (`144.7 ns/op` vs `366.8 ns/op`). `packages/cel` enforces `EvalLimits` (depth, cost, and cumulative output-bytes budgets) on every evaluation and uses seeded O(1) hash indices for `Activation` and `Value::Map` lookups (eliminating O(n^2) cliffs on large maps and large variable sets).
+- **Memory Footprint**: `pion` runs in **2.95–3.36 MiB** Peak RSS vs Go's **17.66–19.20 MiB** (~5.5–6x lower memory, zero GC overhead, Wasm32-ready).

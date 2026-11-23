@@ -9,7 +9,7 @@ ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
 OUT_DIR="/tmp/bench-cel-out"
 BIN_DIR="$OUT_DIR/bin"
 
-W1_ITERS="${CEL_W1_ITERS:-20000}"
+W1_ITERS="${CEL_W1_ITERS:-250000}"
 W2_ITERS="${CEL_W2_ITERS:-10000}"
 W3_ITERS="${CEL_W3_ITERS:-200}"
 
