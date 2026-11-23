@@ -1,9 +1,27 @@
-///| Streaming WHATWG HTML §9.2 Server-Sent Events parser (Red-phase stub).
+///| High-performance streaming WHATWG HTML §9.2 Server-Sent Events parser.
+///| Zero-copy fast path for complete lines inside a single chunk, 4-byte unrolled newline
+///| scanning, fast valid-UTF-8 zero-copy slice check, and strict DoS bounds enforcement.
 
-///| Streaming incremental SSE parser.
+///| Streaming incremental WHATWG SSE parser.
 pub struct SseParser {
   pub limits : SseLimits
   pub utf8_mode : Utf8Mode
+  mut bom_state : Int // 0=start, 1=saw 0xEF, 2=saw 0xEF 0xBB, 3=done
+  mut skip_next_lf : Bool
+  mut line_buf : Bytes
+  mut line_len : Int
+  mut event_type : String
+  mut first_data : String
+  mut multi_data : Bool
+  mut data_sb : StringBuilder
+  mut has_data : Bool
+  mut data_lines : Int
+  mut data_bytes : Int64
+  mut id_buf : String
+  mut last_id : String
+  mut event_retry_ms : Option[Int64]
+  mut stream_retry_ms : Option[Int64]
+  mut total_bytes_seen : Int
 }
 
 ///| Create a new `SseParser` with default limits and WHATWG U+FFFD replacement UTF-8 mode.
@@ -21,7 +39,528 @@ pub fn SseParser::with_options(
   limits : SseLimits,
   utf8_mode : Utf8Mode,
 ) -> SseParser {
-  SseParser::{ limits: limits, utf8_mode: utf8_mode }
+  SseParser::{
+    limits: limits,
+    utf8_mode: utf8_mode,
+    bom_state: 0,
+    skip_next_lf: false,
+    line_buf: Bytes::new(256),
+    line_len: 0,
+    event_type: "",
+    first_data: "",
+    multi_data: false,
+    data_sb: StringBuilder::new(),
+    has_data: false,
+    data_lines: 0,
+    data_bytes: 0L,
+    id_buf: "",
+    last_id: "",
+    event_retry_ms: None,
+    stream_retry_ms: None,
+    total_bytes_seen: 0,
+  }
+}
+
+///| Return the last committed event ID string.
+pub fn SseParser::last_event_id(self : SseParser) -> String {
+  self.last_id
+}
+
+///| Return the stream's latest valid server-specified reconnection time in milliseconds.
+pub fn SseParser::retry_ms(self : SseParser) -> Option[Int64] {
+  self.stream_retry_ms
+}
+
+///| Reset parser state to initial stream start.
+pub fn SseParser::reset(self : SseParser) -> Unit {
+  self.bom_state = 0
+  self.skip_next_lf = false
+  self.line_len = 0
+  self.event_type = ""
+  self.first_data = ""
+  if self.multi_data {
+    self.data_sb = StringBuilder::new()
+    self.multi_data = false
+  }
+  self.has_data = false
+  self.data_lines = 0
+  self.data_bytes = 0L
+  self.id_buf = ""
+  self.last_id = ""
+  self.event_retry_ms = None
+  self.stream_retry_ms = None
+  self.total_bytes_seen = 0
+}
+
+///| Check whether `buf[start..end]` contains any NUL (`0x00`) byte.
+fn bytes_has_nul(buf : Bytes, start : Int, end : Int) -> Bool {
+  let mut i = start
+  while i <= end - 4 {
+    if buf[i].to_int() == 0 ||
+    buf[i + 1].to_int() == 0 ||
+    buf[i + 2].to_int() == 0 ||
+    buf[i + 3].to_int() == 0 {
+      return true
+    }
+    i = i + 4
+  }
+  while i < end {
+    if buf[i].to_int() == 0 {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Parse a non-empty strict ASCII decimal integer into a non-negative `Int64`.
+///| Returns `None` on empty input, any non-digit byte, or 64-bit signed overflow.
+fn parse_strict_retry_ms(buf : Bytes, start : Int, end : Int) -> Option[Int64] {
+  if start >= end {
+    return None
+  }
+  let max_i64 = 9223372036854775807L
+  let mut acc = 0L
+  let mut i = start
+  while i < end {
+    let b = buf[i].to_int()
+    if b < 48 || b > 57 {
+      return None
+    }
+    let d = (b - 48).to_int64()
+    if acc > (max_i64 - d) / 10L {
+      return None
+    }
+    acc = acc * 10L + d
+    i = i + 1
+  }
+  Some(acc)
+}
+
+///| Validate UTF-8 in `buf[start..end]`. Returns `-1` if valid, or the first invalid byte index.
+fn find_invalid_utf8(buf : Bytes, start : Int, end : Int) -> Int {
+  let mut p = start
+  while p < end {
+    // Fast 4-byte ASCII skip
+    while p <= end - 4 {
+      if (buf[p].to_int() |
+        buf[p + 1].to_int() |
+        buf[p + 2].to_int() |
+        buf[p + 3].to_int()) <
+      128 {
+        p = p + 4
+      } else {
+        break
+      }
+    }
+    if p >= end {
+      break
+    }
+    let b0 = buf[p].to_int()
+    if b0 < 0x80 {
+      p = p + 1
+    } else if b0 >= 0xC2 && b0 <= 0xDF {
+      if p + 1 >= end {
+        return p
+      }
+      let b1 = buf[p + 1].to_int()
+      if b1 < 0x80 || b1 > 0xBF {
+        return p
+      }
+      p = p + 2
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+      if p + 2 >= end {
+        return p
+      }
+      let lo1 = if b0 == 0xE0 { 0xA0 } else { 0x80 }
+      let hi1 = if b0 == 0xED { 0x9F } else { 0xBF }
+      let b1 = buf[p + 1].to_int()
+      let b2 = buf[p + 2].to_int()
+      if b1 < lo1 || b1 > hi1 || b2 < 0x80 || b2 > 0xBF {
+        return p
+      }
+      p = p + 3
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+      if p + 3 >= end {
+        return p
+      }
+      let lo1 = if b0 == 0xF0 { 0x90 } else { 0x80 }
+      let hi1 = if b0 == 0xF4 { 0x8F } else { 0xBF }
+      let b1 = buf[p + 1].to_int()
+      let b2 = buf[p + 2].to_int()
+      let b3 = buf[p + 3].to_int()
+      if b1 < lo1 ||
+      b1 > hi1 ||
+      b2 < 0x80 ||
+      b2 > 0xBF ||
+      b3 < 0x80 ||
+      b3 > 0xBF {
+        return p
+      }
+      p = p + 4
+    } else {
+      return p
+    }
+  }
+  -1
+}
+
+///| WHATWG Encoding Standard UTF-8 decode with U+FFFD maximal-subpart replacement.
+///| Zero-copy fast path when the slice is already valid UTF-8 (ASCII or valid multi-byte).
+fn decode_utf8_lossy(buf : Bytes, start : Int, end : Int) -> String {
+  if start >= end {
+    return ""
+  }
+  if find_invalid_utf8(buf, start, end) < 0 {
+    return buf.slice(start, end).to_string()
+  }
+  // Slow path: replace ill-formed maximal subparts with U+FFFD (EF BF BD)
+  let mut out = Bytes::new((end - start) * 3)
+  let mut o = 0
+  let mut p = start
+  while p < end {
+    let b0 = buf[p].to_int()
+    if b0 < 0x80 {
+      out[o] = buf[p]
+      o = o + 1
+      p = p + 1
+    } else if b0 >= 0xC2 && b0 <= 0xDF {
+      if p + 1 < end {
+        let b1 = buf[p + 1].to_int()
+        if b1 >= 0x80 && b1 <= 0xBF {
+          out[o] = buf[p]
+          out[o + 1] = buf[p + 1]
+          o = o + 2
+          p = p + 2
+          continue
+        }
+      }
+      out[o] = (0xEF).to_byte()
+      out[o + 1] = (0xBF).to_byte()
+      out[o + 2] = (0xBD).to_byte()
+      o = o + 3
+      p = p + 1
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+      let lo1 = if b0 == 0xE0 { 0xA0 } else { 0x80 }
+      let hi1 = if b0 == 0xED { 0x9F } else { 0xBF }
+      if p + 1 < end {
+        let b1 = buf[p + 1].to_int()
+        if b1 >= lo1 && b1 <= hi1 {
+          if p + 2 < end {
+            let b2 = buf[p + 2].to_int()
+            if b2 >= 0x80 && b2 <= 0xBF {
+              out[o] = buf[p]
+              out[o + 1] = buf[p + 1]
+              out[o + 2] = buf[p + 2]
+              o = o + 3
+              p = p + 3
+              continue
+            }
+          }
+          out[o] = (0xEF).to_byte()
+          out[o + 1] = (0xBF).to_byte()
+          out[o + 2] = (0xBD).to_byte()
+          o = o + 3
+          p = p + 2
+          continue
+        }
+      }
+      out[o] = (0xEF).to_byte()
+      out[o + 1] = (0xBF).to_byte()
+      out[o + 2] = (0xBD).to_byte()
+      o = o + 3
+      p = p + 1
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+      let lo1 = if b0 == 0xF0 { 0x90 } else { 0x80 }
+      let hi1 = if b0 == 0xF4 { 0x8F } else { 0xBF }
+      if p + 1 < end {
+        let b1 = buf[p + 1].to_int()
+        if b1 >= lo1 && b1 <= hi1 {
+          if p + 2 < end {
+            let b2 = buf[p + 2].to_int()
+            if b2 >= 0x80 && b2 <= 0xBF {
+              if p + 3 < end {
+                let b3 = buf[p + 3].to_int()
+                if b3 >= 0x80 && b3 <= 0xBF {
+                  out[o] = buf[p]
+                  out[o + 1] = buf[p + 1]
+                  out[o + 2] = buf[p + 2]
+                  out[o + 3] = buf[p + 3]
+                  o = o + 4
+                  p = p + 4
+                  continue
+                }
+              }
+              out[o] = (0xEF).to_byte()
+              out[o + 1] = (0xBF).to_byte()
+              out[o + 2] = (0xBD).to_byte()
+              o = o + 3
+              p = p + 3
+              continue
+            }
+          }
+          out[o] = (0xEF).to_byte()
+          out[o + 1] = (0xBF).to_byte()
+          out[o + 2] = (0xBD).to_byte()
+          o = o + 3
+          p = p + 2
+          continue
+        }
+      }
+      out[o] = (0xEF).to_byte()
+      out[o + 1] = (0xBF).to_byte()
+      out[o + 2] = (0xBD).to_byte()
+      o = o + 3
+      p = p + 1
+    } else {
+      out[o] = (0xEF).to_byte()
+      out[o + 1] = (0xBF).to_byte()
+      out[o + 2] = (0xBD).to_byte()
+      o = o + 3
+      p = p + 1
+    }
+  }
+  out.slice(0, o).to_string()
+}
+
+///| Push a single byte into `self.line_buf` with strict `max_line_bytes` enforcement.
+fn SseParser::push_line_byte(self : SseParser, b : Byte) -> Result[Unit, SseError] {
+  let next_len = (self.line_len + 1).to_int64()
+  if next_len > self.limits.max_line_bytes {
+    return Err(SseError::LineTooLarge(next_len, self.limits.max_line_bytes))
+  }
+  let cap = self.line_buf.length()
+  if self.line_len >= cap {
+    let new_cap = if cap < 256 { 256 } else { cap * 2 }
+    let mut nb = Bytes::new(new_cap)
+    let mut i = 0
+    while i < self.line_len {
+      nb[i] = self.line_buf[i]
+      i = i + 1
+    }
+    self.line_buf = nb
+  }
+  self.line_buf[self.line_len] = b
+  self.line_len = self.line_len + 1
+  Ok(())
+}
+
+///| Append `src[start..end]` to `self.line_buf` with strict `max_line_bytes` enforcement.
+fn SseParser::append_line_slice(
+  self : SseParser,
+  src : Bytes,
+  start : Int,
+  end : Int,
+) -> Result[Unit, SseError] {
+  let add = end - start
+  if add <= 0 {
+    return Ok(())
+  }
+  let needed = self.line_len + add
+  if needed.to_int64() > self.limits.max_line_bytes {
+    return Err(
+      SseError::LineTooLarge(needed.to_int64(), self.limits.max_line_bytes),
+    )
+  }
+  let mut cap = self.line_buf.length()
+  if needed > cap {
+    while cap < needed {
+      cap = if cap < 256 { 256 } else { cap * 2 }
+    }
+    let mut nb = Bytes::new(cap)
+    let mut i = 0
+    while i < self.line_len {
+      nb[i] = self.line_buf[i]
+      i = i + 1
+    }
+    self.line_buf = nb
+  }
+  let dst = self.line_buf
+  let off = self.line_len
+  let mut j = 0
+  while j <= add - 4 {
+    dst[off + j] = src[start + j]
+    dst[off + j + 1] = src[start + j + 1]
+    dst[off + j + 2] = src[start + j + 2]
+    dst[off + j + 3] = src[start + j + 3]
+    j = j + 4
+  }
+  while j < add {
+    dst[off + j] = src[start + j]
+    j = j + 1
+  }
+  self.line_len = needed
+  Ok(())
+}
+
+///| Process one complete SSE line `buf[start..end]` (line terminator already stripped).
+fn SseParser::process_line(
+  self : SseParser,
+  buf : Bytes,
+  start : Int,
+  end : Int,
+  out : Array[SseEvent],
+) -> Result[Unit, SseError] {
+  let len = end - start
+  if len.to_int64() > self.limits.max_line_bytes {
+    return Err(
+      SseError::LineTooLarge(len.to_int64(), self.limits.max_line_bytes),
+    )
+  }
+  // Empty line -> WHATWG §9.2.6 dispatch
+  if len == 0 {
+    // Step 1: commit last_event_id_buffer to last_event_id unconditionally
+    self.last_id = self.id_buf
+    if self.has_data {
+      let etype = if self.event_type.length() == 0 {
+        "message"
+      } else {
+        self.event_type
+      }
+      let data_str = if self.multi_data {
+        let s = self.data_sb.to_string()
+        self.data_sb = StringBuilder::new()
+        self.multi_data = false
+        s
+      } else {
+        self.first_data
+      }
+      out.push(
+        SseEvent::{
+          event_type: etype,
+          data: data_str,
+          id: self.last_id,
+          retry: self.event_retry_ms,
+        },
+      )
+      self.first_data = ""
+      self.has_data = false
+      self.data_lines = 0
+      self.data_bytes = 0L
+      self.event_type = ""
+      self.event_retry_ms = None
+    } else {
+      self.event_type = ""
+      self.event_retry_ms = None
+    }
+    return Ok(())
+  }
+  // In Strict UTF-8 mode, validate the entire line before interpreting fields/comments.
+  match self.utf8_mode {
+    Utf8Mode::Strict => {
+      let bad_idx = find_invalid_utf8(buf, start, end)
+      if bad_idx >= 0 {
+        return Err(SseError::InvalidUtf8(bad_idx - start))
+      }
+    }
+    Utf8Mode::Replace => ()
+  }
+  // Comment line starting with ':'
+  if buf[start].to_int() == 58 {
+    return Ok(())
+  }
+  // Find first ':'
+  let mut colon = -1
+  let mut i = start
+  while i < end {
+    if buf[i].to_int() == 58 {
+      colon = i
+      break
+    }
+    i = i + 1
+  }
+  let name_end = if colon >= 0 { colon } else { end }
+  let val_start = if colon >= 0 {
+    let vs = colon + 1
+    if vs < end && buf[vs].to_int() == 32 {
+      vs + 1
+    } else {
+      vs
+    }
+  } else {
+    end
+  }
+  let nlen = name_end - start
+  if nlen == 4 &&
+  buf[start].to_int() == 100 &&
+  buf[start + 1].to_int() == 97 &&
+  buf[start + 2].to_int() == 116 &&
+  buf[start + 3].to_int() == 97 {
+    // "data"
+    let next_lines = self.data_lines + 1
+    if next_lines > self.limits.max_data_lines {
+      return Err(
+        SseError::TooManyDataLines(next_lines, self.limits.max_data_lines),
+      )
+    }
+    let vlen = end - val_start
+    let add_bytes = vlen.to_int64() + (if self.has_data { 1L } else { 0L })
+    let next_bytes = self.data_bytes + add_bytes
+    if next_bytes > self.limits.max_event_bytes {
+      return Err(
+        SseError::EventTooLarge(next_bytes, self.limits.max_event_bytes),
+      )
+    }
+    let piece = if vlen > 0 {
+      decode_utf8_lossy(buf, val_start, end)
+    } else {
+      ""
+    }
+    if !self.has_data {
+      self.first_data = piece
+      self.has_data = true
+    } else {
+      if !self.multi_data {
+        self.data_sb.write_string(self.first_data)
+        self.first_data = ""
+        self.multi_data = true
+      }
+      self.data_sb.write_string("\n")
+      if vlen > 0 {
+        self.data_sb.write_string(piece)
+      }
+    }
+    self.data_lines = next_lines
+    self.data_bytes = next_bytes
+  } else if nlen == 5 &&
+  buf[start].to_int() == 101 &&
+  buf[start + 1].to_int() == 118 &&
+  buf[start + 2].to_int() == 101 &&
+  buf[start + 3].to_int() == 110 &&
+  buf[start + 4].to_int() == 116 {
+    // "event"
+    self.event_type = if end > val_start {
+      decode_utf8_lossy(buf, val_start, end)
+    } else {
+      ""
+    }
+  } else if nlen == 2 &&
+  buf[start].to_int() == 105 &&
+  buf[start + 1].to_int() == 100 {
+    // "id": ignore if value contains U+0000 (NUL)
+    if !bytes_has_nul(buf, val_start, end) {
+      self.id_buf = if end > val_start {
+        decode_utf8_lossy(buf, val_start, end)
+      } else {
+        ""
+      }
+    }
+  } else if nlen == 5 &&
+  buf[start].to_int() == 114 &&
+  buf[start + 1].to_int() == 101 &&
+  buf[start + 2].to_int() == 116 &&
+  buf[start + 3].to_int() == 114 &&
+  buf[start + 4].to_int() == 121 {
+    // "retry": strict ASCII digits only
+    match parse_strict_retry_ms(buf, val_start, end) {
+      Some(ms) => {
+        self.event_retry_ms = Some(ms)
+        self.stream_retry_ms = Some(ms)
+      }
+      None => ()
+    }
+  }
+  Ok(())
 }
 
 ///| Feed a chunk of raw bytes into the streaming parser.
@@ -29,9 +568,130 @@ pub fn SseParser::feed_bytes(
   self : SseParser,
   chunk : Bytes,
 ) -> Result[Array[SseEvent], SseError] {
-  let _ = self
-  let _ = chunk
-  Err(SseError::Unimplemented)
+  match self.limits.validate() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let out : Array[SseEvent] = []
+  let clen = chunk.length()
+  if clen == 0 {
+    return Ok(out)
+  }
+  let mut pos = 0
+  // Handle optional leading UTF-8 BOM (EF BB BF) across arbitrary chunk splits
+  while pos < clen && self.bom_state < 3 {
+    let b = chunk[pos].to_int()
+    if self.bom_state == 0 {
+      if b == 0xEF {
+        self.bom_state = 1
+        pos = pos + 1
+      } else {
+        self.bom_state = 3
+      }
+    } else if self.bom_state == 1 {
+      if b == 0xBB {
+        self.bom_state = 2
+        pos = pos + 1
+      } else {
+        self.bom_state = 3
+        match self.push_line_byte((0xEF).to_byte()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+    } else if self.bom_state == 2 {
+      if b == 0xBF {
+        self.bom_state = 3
+        pos = pos + 1
+      } else {
+        self.bom_state = 3
+        match self.push_line_byte((0xEF).to_byte()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        match self.push_line_byte((0xBB).to_byte()) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+    }
+  }
+  // Main scanning loop with 4-byte unrolled newline search
+  while pos < clen {
+    if self.skip_next_lf {
+      self.skip_next_lf = false
+      if chunk[pos].to_int() == 10 {
+        pos = pos + 1
+        continue
+      }
+    }
+    let seg_start = pos
+    while pos <= clen - 4 {
+      let b0 = chunk[pos].to_int()
+      let b1 = chunk[pos + 1].to_int()
+      let b2 = chunk[pos + 2].to_int()
+      let b3 = chunk[pos + 3].to_int()
+      if b0 != 10 &&
+      b0 != 13 &&
+      b1 != 10 &&
+      b1 != 13 &&
+      b2 != 10 &&
+      b2 != 13 &&
+      b3 != 10 &&
+      b3 != 13 {
+        pos = pos + 4
+      } else {
+        break
+      }
+    }
+    while pos < clen {
+      let b = chunk[pos].to_int()
+      if b == 10 || b == 13 {
+        break
+      }
+      pos = pos + 1
+    }
+    if pos < clen {
+      let nl = chunk[pos].to_int()
+      if self.line_len == 0 {
+        // Zero-copy fast path directly on `chunk[seg_start..pos]`
+        match self.process_line(chunk, seg_start, pos, out) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      } else {
+        match self.append_line_slice(chunk, seg_start, pos) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let llen = self.line_len
+        self.line_len = 0
+        match self.process_line(self.line_buf, 0, llen, out) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      if nl == 13 {
+        if pos + 1 < clen && chunk[pos + 1].to_int() == 10 {
+          pos = pos + 2
+        } else if pos + 1 >= clen {
+          self.skip_next_lf = true
+          pos = pos + 1
+        } else {
+          pos = pos + 1
+        }
+      } else {
+        pos = pos + 1
+      }
+    } else {
+      match self.append_line_slice(chunk, seg_start, clen) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+  self.total_bytes_seen = self.total_bytes_seen + clen
+  Ok(out)
 }
 
 ///| Feed a UTF-8 string chunk into the streaming parser.
@@ -39,44 +699,57 @@ pub fn SseParser::feed_str(
   self : SseParser,
   chunk : String,
 ) -> Result[Array[SseEvent], SseError] {
-  let _ = self
-  let _ = chunk
-  Err(SseError::Unimplemented)
+  self.feed_bytes(chunk.to_bytes())
 }
 
 ///| Signal end-of-stream and discard any incomplete trailing event per WHATWG §9.2.6.
 pub fn SseParser::finish(self : SseParser) -> Result[Array[SseEvent], SseError] {
-  let _ = self
-  Err(SseError::Unimplemented)
-}
-
-///| Return the last committed event ID string.
-pub fn SseParser::last_event_id(self : SseParser) -> String {
-  let _ = self
-  ""
-}
-
-///| Return the stream's latest valid server-specified reconnection time in milliseconds.
-pub fn SseParser::retry_ms(self : SseParser) -> Option[Int64] {
-  let _ = self
-  None
-}
-
-///| Reset parser state to initial stream start.
-pub fn SseParser::reset(self : SseParser) -> Unit {
-  let _ = self
+  match self.limits.validate() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match self.utf8_mode {
+    Utf8Mode::Strict => {
+      if self.line_len > 0 {
+        let bad = find_invalid_utf8(self.line_buf, 0, self.line_len)
+        if bad >= 0 {
+          self.line_len = 0
+          return Err(SseError::InvalidUtf8(bad))
+        }
+      }
+    }
+    Utf8Mode::Replace => ()
+  }
+  self.line_len = 0
+  self.event_type = ""
+  self.first_data = ""
+  if self.multi_data {
+    self.data_sb = StringBuilder::new()
+    self.multi_data = false
+  }
+  self.has_data = false
+  self.data_lines = 0
+  self.data_bytes = 0L
+  self.event_retry_ms = None
+  self.skip_next_lf = false
+  Ok([])
 }
 
 ///| Convenience one-shot parser for a complete byte buffer.
 pub fn parse_bytes(input : Bytes) -> Result[Array[SseEvent], SseError] {
   let p = SseParser::new()
-  let _ = p
-  let _ = input
-  Err(SseError::Unimplemented)
+  match p.feed_bytes(input) {
+    Ok(evts) => {
+      match p.finish() {
+        Ok(_) => Ok(evts)
+        Err(e) => Err(e)
+      }
+    }
+    Err(e) => Err(e)
+  }
 }
 
 ///| Convenience one-shot parser for a complete UTF-8 string.
 pub fn parse_str(input : String) -> Result[Array[SseEvent], SseError] {
-  let _ = input
-  Err(SseError::Unimplemented)
+  parse_bytes(input.to_bytes())
 }
