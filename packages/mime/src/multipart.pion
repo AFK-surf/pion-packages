@@ -1,12 +1,78 @@
-///| RFC 7578 / 2046 Multipart streaming reader and writer (stub).
+///| RFC 7578 / 2046 Multipart streaming reader and writer.
+///| Uses Boyer-Moore-Horspool (BMH) linear-time boundary search and zero-copy `Bytes::slice` part bodies.
+
+///| Validate an RFC 2046 §5.1.1 multipart boundary (1..=70 chars, valid bchars, no trailing space).
+fn is_valid_boundary(boundary : String) -> Bool {
+  let b = boundary.to_bytes()
+  let len = b.length()
+  if len == 0 || len > 70 {
+    return false
+  }
+  // Trailing space is forbidden by RFC 2046 §5.1.1
+  if b[len - 1].to_int() == 32 {
+    return false
+  }
+  let blut = bchar_nospace_lut
+  let mut i = 0
+  while i < len {
+    let c = b[i].to_int()
+    if c != 32 && blut[c] == 0 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Build a 256-entry Boyer-Moore-Horspool bad-character skip table for `pat`.
+fn build_bmh_skip(pat : Bytes) -> FixedArray[Int] {
+  let plen = pat.length()
+  let skip : FixedArray[Int] = FixedArray::make(256, plen)
+  let last = plen - 1
+  let mut i = 0
+  while i < last {
+    skip[pat[i].to_int()] = last - i
+    i = i + 1
+  }
+  skip
+}
+
+///| Boyer-Moore-Horspool search for `pat` in `buf[start..end)`. Returns match index or -1.
+fn bmh_find(buf : Bytes, start : Int, end : Int, pat : Bytes, skip : FixedArray[Int]) -> Int {
+  let plen = pat.length()
+  if plen == 0 {
+    return start
+  }
+  let last = plen - 1
+  let limit = end - plen
+  let last_b = pat[last]
+  let mut i = start
+  while i <= limit {
+    let cur = buf[i + last]
+    if cur == last_b {
+      let mut j = last - 1
+      while j >= 0 && buf[i + j] == pat[j] {
+        j = j - 1
+      }
+      if j < 0 {
+        return i
+      }
+    }
+    i = i + skip[cur.to_int()]
+  }
+  -1
+}
 
 ///|
 pub struct MultipartReader {
   data : Bytes
   boundary : String
+  dash_boundary : Bytes
+  skip_table : FixedArray[Int]
   limits : MultipartLimits
   mut pos : Int
   mut parts_read : Int
+  mut started : Bool
   mut done : Bool
   mut preamble_end : Int
   mut epilogue_start : Int
@@ -23,34 +89,270 @@ pub fn MultipartReader::with_limits(
   boundary : String,
   limits : MultipartLimits,
 ) -> Result[MultipartReader, MimeError] {
-  let _ = data
-  let _ = boundary
-  let _ = limits
-  Err(MimeError::InvalidBoundary)
+  if !is_valid_boundary(boundary) {
+    return Err(MimeError::InvalidBoundary)
+  }
+  let dash_b = ("--" + boundary).to_bytes()
+  let skip = build_bmh_skip(dash_b)
+  Ok(MultipartReader::{
+    data: data,
+    boundary: boundary,
+    dash_boundary: dash_b,
+    skip_table: skip,
+    limits: limits,
+    pos: 0,
+    parts_read: 0,
+    started: false,
+    done: false,
+    preamble_end: 0,
+    epilogue_start: data.length(),
+  })
 }
 
-///|
+///| Inspect bytes immediately after `--boundary` at `after`.
+///| Returns:
+///| - `-1` if NOT a valid boundary delimiter (false match inside text)
+///| - `-2` if closing delimiter `--boundary--`
+///| - `next_pos >= after` (position after EOL) if opening/intermediate part delimiter
+fn check_boundary_suffix(buf : Bytes, after : Int, end : Int) -> Int {
+  if after + 2 <= end && buf[after].to_int() == 45 && buf[after + 1].to_int() == 45 {
+    return -2
+  }
+  // Skip optional transport padding (SP / HTAB)
+  let mut p = after
+  while p < end {
+    let c = buf[p].to_int()
+    if c == 32 || c == 9 {
+      p = p + 1
+    } else {
+      break
+    }
+  }
+  if p >= end {
+    return -1
+  }
+  let c = buf[p].to_int()
+  if c == 10 {
+    return p + 1
+  }
+  if c == 13 && p + 1 < end && buf[p + 1].to_int() == 10 {
+    return p + 2
+  }
+  -1
+}
+
+///| Parse part headers starting at `start`. Returns `(headers, body_start)`.
+fn parse_part_headers(
+  buf : Bytes,
+  start : Int,
+  end : Int,
+  limits : MultipartLimits,
+) -> Result[(Array[PartHeader], Int), MimeError] {
+  let headers : Array[PartHeader] = []
+  let max_h = limits.max_headers_per_part
+  let max_bytes = limits.max_header_bytes
+  let tlut = tchar_lut
+  let mut pos = start
+
+  while true {
+    if pos >= end {
+      return Err(MimeError::UnexpectedEof)
+    }
+    // Check blank line terminating header block
+    let c0 = buf[pos].to_int()
+    if c0 == 10 {
+      return Ok((headers, pos + 1))
+    }
+    if c0 == 13 && pos + 1 < end && buf[pos + 1].to_int() == 10 {
+      return Ok((headers, pos + 2))
+    }
+
+    // Find end of line (\r\n or \n)
+    let line_start = pos
+    let mut line_end = -1
+    let mut next_pos = pos
+    while pos < end {
+      if pos - start > max_bytes {
+        return Err(MimeError::HeaderTooLarge)
+      }
+      let c = buf[pos].to_int()
+      if c == 10 {
+        line_end = pos
+        next_pos = pos + 1
+        break
+      } else if c == 13 && pos + 1 < end && buf[pos + 1].to_int() == 10 {
+        line_end = pos
+        next_pos = pos + 2
+        break
+      }
+      pos = pos + 1
+    }
+    if line_end < 0 {
+      return Err(MimeError::UnexpectedEof)
+    }
+    if next_pos - start > max_bytes {
+      return Err(MimeError::HeaderTooLarge)
+    }
+    if headers.length() >= max_h {
+      return Err(MimeError::TooManyHeaders)
+    }
+
+    // Parse "Name: Value"
+    let mut colon = -1
+    let mut j = line_start
+    while j < line_end {
+      if buf[j].to_int() == 58 {
+        colon = j
+        break
+      }
+      if tlut[buf[j].to_int()] == 0 {
+        return Err(MimeError::InvalidPartHeader)
+      }
+      j = j + 1
+    }
+    if colon <= line_start {
+      return Err(MimeError::InvalidPartHeader)
+    }
+    let name = bytes_slice_to_string(buf, line_start, colon)
+    let mut vs = colon + 1
+    while vs < line_end && (buf[vs].to_int() == 32 || buf[vs].to_int() == 9) {
+      vs = vs + 1
+    }
+    let mut ve = line_end
+    while ve > vs && (buf[ve - 1].to_int() == 32 || buf[ve - 1].to_int() == 9) {
+      ve = ve - 1
+    }
+    let value = bytes_slice_to_string(buf, vs, ve)
+    headers.push(PartHeader::new(name, value))
+    pos = next_pos
+  }
+  Err(MimeError::UnexpectedEof)
+}
+
+///| Read the next part from the multipart stream (zero-copy `Bytes::slice` body).
 pub fn MultipartReader::next_part(self : MultipartReader) -> Result[Option[Part], MimeError] {
-  let _ = self
-  Err(MimeError::InvalidMultipart)
+  if self.done {
+    return Ok(None)
+  }
+  let buf = self.data
+  let end = buf.length()
+  let pat = self.dash_boundary
+  let plen = pat.length()
+  let skip = self.skip_table
+
+  // On first call, locate the initial boundary
+  if !self.started {
+    self.started = true
+    let mut search_from = 0
+    let mut found_next = -1
+    while search_from < end {
+      let m = bmh_find(buf, search_from, end, pat, skip)
+      if m < 0 {
+        return Err(MimeError::InvalidMultipart)
+      }
+      // Must be at offset 0 or preceded by \n (or \r\n)
+      let valid_start = if m == 0 {
+        self.preamble_end = 0
+        true
+      } else if buf[m - 1].to_int() == 10 {
+        if m >= 2 && buf[m - 2].to_int() == 13 {
+          self.preamble_end = m - 2
+        } else {
+          self.preamble_end = m - 1
+        }
+        true
+      } else {
+        false
+      }
+      if valid_start {
+        let suf = check_boundary_suffix(buf, m + plen, end)
+        if suf == -2 {
+          self.epilogue_start = m + plen + 2
+          self.done = true
+          return Ok(None)
+        } else if suf >= 0 {
+          found_next = suf
+          break
+        }
+      }
+      search_from = m + 1
+    }
+    if found_next < 0 {
+      return Err(MimeError::InvalidMultipart)
+    }
+    self.pos = found_next
+  }
+
+  if self.parts_read >= self.limits.max_parts {
+    return Err(MimeError::TooManyParts)
+  }
+
+  let (headers, body_start) = match parse_part_headers(buf, self.pos, end, self.limits) {
+    Ok(res) => res
+    Err(e) => return Err(e)
+  }
+
+  // Locate the next boundary terminating this part's body
+  let mut search_from = body_start
+  while search_from <= end - plen {
+    let m = bmh_find(buf, search_from, end, pat, skip)
+    if m < 0 {
+      return Err(MimeError::UnexpectedEof)
+    }
+    // Check if boundary is immediately at body_start (empty body) or preceded by \r\n or \n
+    let mut body_end = -1
+    if m == body_start {
+      body_end = body_start
+    } else if buf[m - 1].to_int() == 10 {
+      if m >= body_start + 2 && buf[m - 2].to_int() == 13 {
+        body_end = m - 2
+      } else {
+        body_end = m - 1
+      }
+    }
+    if body_end >= 0 {
+      let suf = check_boundary_suffix(buf, m + plen, end)
+      if suf == -2 || suf >= 0 {
+        if body_end - body_start > self.limits.max_part_bytes {
+          return Err(MimeError::PartTooLarge)
+        }
+        let body = buf.slice(body_start, body_end)
+        self.parts_read = self.parts_read + 1
+        if suf == -2 {
+          self.epilogue_start = m + plen + 2
+          self.done = true
+        } else {
+          self.pos = suf
+        }
+        return Ok(Some(Part::{ headers: headers, body: body }))
+      }
+    }
+    search_from = m + 1
+  }
+  Err(MimeError::UnexpectedEof)
 }
 
-///|
+///| Read all remaining parts into an Array.
 pub fn MultipartReader::read_all(self : MultipartReader) -> Result[Array[Part], MimeError] {
-  let _ = self
-  Err(MimeError::InvalidMultipart)
+  let parts : Array[Part] = []
+  while true {
+    match self.next_part() {
+      Ok(Some(p)) => parts.push(p)
+      Ok(None) => return Ok(parts)
+      Err(e) => return Err(e)
+    }
+  }
+  Ok(parts)
 }
 
-///|
+///| Return the preamble bytes before the first boundary (zero-copy slice).
 pub fn MultipartReader::preamble(self : MultipartReader) -> Bytes {
-  let _ = self
-  Bytes::new(0)
+  self.data.slice(0, self.preamble_end)
 }
 
-///|
+///| Return the epilogue bytes after the closing `--boundary--` (zero-copy slice).
 pub fn MultipartReader::epilogue(self : MultipartReader) -> Bytes {
-  let _ = self
-  Bytes::new(0)
+  self.data.slice(self.epilogue_start, self.data.length())
 }
 
 ///|
@@ -61,8 +363,10 @@ pub struct MultipartWriter {
 
 ///|
 pub fn MultipartWriter::new(boundary : String) -> Result[MultipartWriter, MimeError] {
-  let _ = boundary
-  Err(MimeError::InvalidBoundary)
+  if !is_valid_boundary(boundary) {
+    return Err(MimeError::InvalidBoundary)
+  }
+  Ok(MultipartWriter::{ boundary: boundary, chunks: [] })
 }
 
 ///|
@@ -75,31 +379,73 @@ pub fn MultipartWriter::form_data_content_type(self : MultipartWriter) -> String
   "multipart/form-data; boundary=" + self.boundary
 }
 
-///|
+///| Escape quotes and backslashes in form-data header parameter values.
+fn escape_quoted_param(s : String) -> String {
+  let b = s.to_bytes()
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int()
+    if c == 34 || c == 92 {
+      sb.write_byte(b'\\')
+    }
+    sb.write_byte(b[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Write a part with arbitrary headers and body, rejecting CRLF injection.
 pub fn MultipartWriter::write_part(
   self : MultipartWriter,
   headers : Array[PartHeader],
   body : Bytes,
 ) -> Result[Unit, MimeError] {
-  let _ = self
-  let _ = headers
-  let _ = body
-  Err(MimeError::InvalidMultipart)
+  let sb = StringBuilder::new()
+  if self.chunks.length() > 0 {
+    sb.write_string("\r\n")
+  }
+  sb.write_string("--")
+  sb.write_string(self.boundary)
+  sb.write_string("\r\n")
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    if has_crlf_or_nul(h.name) || has_crlf_or_nul(h.value) {
+      return Err(MimeError::CrlfInjection)
+    }
+    let nb = h.name.to_bytes()
+    if !is_valid_token_bytes(nb, 0, nb.length()) {
+      return Err(MimeError::InvalidPartHeader)
+    }
+    sb.write_string(h.name)
+    sb.write_string(": ")
+    sb.write_string(h.value)
+    sb.write_string("\r\n")
+    i = i + 1
+  }
+  sb.write_string("\r\n")
+  self.chunks.push(sb.to_string().to_bytes())
+  if body.length() > 0 {
+    self.chunks.push(body)
+  }
+  Ok(())
 }
 
-///|
+///| Write a form-data text field.
 pub fn MultipartWriter::write_field(
   self : MultipartWriter,
   name : String,
   value : String,
 ) -> Result[Unit, MimeError] {
-  let _ = self
-  let _ = name
-  let _ = value
-  Err(MimeError::InvalidMultipart)
+  if has_crlf_or_nul(name) {
+    return Err(MimeError::CrlfInjection)
+  }
+  let cd = "form-data; name=\"" + escape_quoted_param(name) + "\""
+  self.write_part([PartHeader::new("Content-Disposition", cd)], value.to_bytes())
 }
 
-///|
+///| Write a form-data file upload part.
 pub fn MultipartWriter::write_file(
   self : MultipartWriter,
   field_name : String,
@@ -107,16 +453,48 @@ pub fn MultipartWriter::write_file(
   content_type : String,
   data : Bytes,
 ) -> Result[Unit, MimeError] {
-  let _ = self
-  let _ = field_name
-  let _ = filename
-  let _ = content_type
-  let _ = data
-  Err(MimeError::InvalidMultipart)
+  if has_crlf_or_nul(field_name) || has_crlf_or_nul(filename) || has_crlf_or_nul(content_type) {
+    return Err(MimeError::CrlfInjection)
+  }
+  let cd = "form-data; name=\"" + escape_quoted_param(field_name) + "\"; filename=\"" + escape_quoted_param(filename) + "\""
+  self.write_part(
+    [PartHeader::new("Content-Disposition", cd), PartHeader::new("Content-Type", content_type)],
+    data,
+  )
 }
 
-///|
+///| Finalize the multipart payload with the closing `--boundary--\r\n`.
 pub fn MultipartWriter::finish(self : MultipartWriter) -> Bytes {
-  let _ = self
-  Bytes::new(0)
+  let closing = if self.chunks.length() > 0 {
+    ("\r\n--" + self.boundary + "--\r\n").to_bytes()
+  } else {
+    ("--" + self.boundary + "--\r\n").to_bytes()
+  }
+  let mut total = closing.length()
+  let mut i = 0
+  while i < self.chunks.length() {
+    total = total + self.chunks[i].length()
+    i = i + 1
+  }
+  let mut out = Bytes::new(total)
+  let mut pos = 0
+  i = 0
+  while i < self.chunks.length() {
+    let ch = self.chunks[i]
+    let clen = ch.length()
+    let mut j = 0
+    while j < clen {
+      out[pos] = ch[j]
+      pos = pos + 1
+      j = j + 1
+    }
+    i = i + 1
+  }
+  let mut k = 0
+  while k < closing.length() {
+    out[pos] = closing[k]
+    pos = pos + 1
+    k = k + 1
+  }
+  out
 }
