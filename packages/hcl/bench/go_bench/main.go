@@ -209,8 +209,8 @@ bounds    = [min(10, replicas, 2), max(10, replicas, 2)]
 func runW3(iters int) int {
 	raw := `# Cluster configuration
 resource   "aws_s3_bucket"   "logs"{
-bucket="my-prod-logs"
-acl ="private"
+bucket="my-prod-logs" # primary bucket
+acl ="private" // access control
 force_destroy=true
 
 versioning {
@@ -222,10 +222,28 @@ resource "aws_instance" "web" {
 ami="ami-0c55b159"
 instance_type ="t3.large"
 count=1+2*3
+tags = {
+Name="web-prod"
+Environment="production"
+Owner="platform-team"
+}
+vpc_security_group_ids = [
+"sg-0123456789abcdef0",
+"sg-fedcba9876543210",
+]
 user_data=<<EOF
   #!/bin/sh
   echo hello
 EOF
+
+lifecycle {
+create_before_destroy=true
+}
+}
+
+locals {
+env = "prod"
+ports = [for p in [80,443,8080]: p+1000 if p!=80]
 }
 `
 	rawBytes := []byte(raw)

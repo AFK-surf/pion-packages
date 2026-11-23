@@ -6,6 +6,7 @@ struct Evaluator {
   nodes : Array[ExprNode]
   ctx : EvalContext
   locals : Array[(String, HclValue)]
+  eff_max_depth : Int
   mut steps : Int64
   mut depth : Int
   mut output_bytes : Int
@@ -16,6 +17,7 @@ fn Evaluator::new(nodes : Array[ExprNode], ctx : EvalContext) -> Evaluator {
     nodes: nodes,
     ctx: ctx,
     locals: [],
+    eff_max_depth: hcl_effective_max_depth(ctx.limits.max_depth),
     steps: 0L,
     depth: 0,
     output_bytes: 0,
@@ -52,7 +54,7 @@ fn Evaluator::charge_output(self : Evaluator, bytes : Int, span : Span) -> Resul
 
 fn Evaluator::enter(self : Evaluator, span : Span) -> Result[Unit, HclError] {
   self.depth = self.depth + 1
-  if self.depth > self.ctx.limits.max_depth {
+  if self.depth > self.eff_max_depth {
     return Err(
       HclError::new(
         HclErrorKind::LimitExceeded,
@@ -127,11 +129,104 @@ fn node_span(node : ExprNode) -> Span {
   }
 }
 
+enum StaticType {
+  StDynamic
+  StNull
+  StBool
+  StNumber
+  StStr(Option[String])
+  StTuple
+  StObject
+}
+
+fn static_type_of(nodes : Array[ExprNode], id : Int, depth : Int) -> StaticType {
+  if depth > 32 {
+    return StaticType::StDynamic
+  }
+  match nodes[id] {
+    ExprNode::LitNull(_) => StaticType::StNull
+    ExprNode::LitBool(_, _) => StaticType::StBool
+    ExprNode::LitNumber(_, _, _) => StaticType::StNumber
+    ExprNode::LitString(s, _) => StaticType::StStr(Some(s))
+    ExprNode::Template(parts, allow_unwrap, _) => {
+      if allow_unwrap && parts.length() == 1 {
+        match parts[0] {
+          TemplatePart::Interp(eid, _, _, _) => static_type_of(nodes, eid, depth + 1)
+          _ => StaticType::StStr(None)
+        }
+      } else {
+        StaticType::StStr(None)
+      }
+    }
+    ExprNode::Parentheses(inner, _) => static_type_of(nodes, inner, depth + 1)
+    ExprNode::Unary(op, _, _) => {
+      match op {
+        UnaryOp::Neg => StaticType::StNumber
+        UnaryOp::Not => StaticType::StBool
+      }
+    }
+    ExprNode::Binary(op, _, _, _) => {
+      match op {
+        BinOp::Or | BinOp::And | BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge =>
+        StaticType::StBool
+        _ => StaticType::StNumber
+      }
+    }
+    ExprNode::TupleCons(_, _) | ExprNode::ForTuple(_, _, _, _, _, _) => StaticType::StTuple
+    ExprNode::ObjectCons(_, _) | ExprNode::ForObject(_, _, _, _, _, _, _, _) => StaticType::StObject
+    _ => StaticType::StDynamic
+  }
+}
+
+fn check_static_bool_compat(st : StaticType, sp : Span) -> Result[Unit, HclError] {
+  match st {
+    StaticType::StDynamic | StaticType::StBool => Ok(())
+    StaticType::StStr(Some(s)) => {
+      if s == "true" || s == "false" {
+        Ok(())
+      } else {
+        Err(HclError::new(HclErrorKind::TypeError, "expected bool", sp))
+      }
+    }
+    StaticType::StStr(None) => Ok(())
+    _ => Err(HclError::new(HclErrorKind::TypeError, "expected bool", sp))
+  }
+}
+
+fn unify_cond_result(chosen : HclValue, other_st : StaticType, sp : Span) -> Result[HclValue, HclError] {
+  match (chosen, other_st) {
+    (_, StaticType::StDynamic) | (_, StaticType::StNull) | (HclValue::Null, _) => Ok(chosen)
+    (HclValue::Bool(_), StaticType::StBool) => Ok(chosen)
+    (HclValue::Number(_), StaticType::StNumber) | (HclValue::Decimal(_), StaticType::StNumber) => Ok(chosen)
+    (HclValue::Str(_), StaticType::StStr(_)) => Ok(chosen)
+    (HclValue::Tuple(_), StaticType::StTuple) => Ok(chosen)
+    (HclValue::Object(_), StaticType::StObject) => Ok(chosen)
+    // Primitive-to-string unification (`t ? 1 : "x"` -> `"1"`, `t ? true : "x"` -> `"true"`)
+    (HclValue::Number(_), StaticType::StStr(_))
+    | (HclValue::Decimal(_), StaticType::StStr(_))
+    | (HclValue::Bool(_), StaticType::StStr(_)) => {
+      match hcl_to_string(chosen, sp) {
+        Ok(s) => Ok(HclValue::Str(s))
+        Err(e) => Err(e)
+      }
+    }
+    (HclValue::Str(_), StaticType::StNumber) | (HclValue::Str(_), StaticType::StBool) => Ok(chosen)
+    _ =>
+    Err(
+      HclError::new(
+        HclErrorKind::TypeError,
+        "inconsistent conditional result types",
+        sp,
+      ),
+    )
+  }
+}
+
 fn Evaluator::eval_node_inner(self : Evaluator, node : ExprNode) -> Result[HclValue, HclError] {
   match node {
     ExprNode::LitNull(_) => Ok(HclValue::Null)
     ExprNode::LitBool(b, _) => Ok(HclValue::Bool(b))
-    ExprNode::LitNumber(d, _, _) => Ok(HclValue::Number(d))
+    ExprNode::LitNumber(v, _, _) => Ok(v)
     ExprNode::LitString(s, _) => Ok(HclValue::Str(s))
     ExprNode::ScopeVar(name, sp) => self.lookup_var(name, sp)
     ExprNode::Parentheses(inner, _) => self.eval_node(inner)
@@ -143,9 +238,15 @@ fn Evaluator::eval_node_inner(self : Evaluator, node : ExprNode) -> Result[HclVa
       }
       match op {
         UnaryOp::Neg => {
-          match hcl_to_number(v, sp) {
-            Ok(d) => Ok(HclValue::Number(-d))
-            Err(e) => Err(e)
+          match v {
+            HclValue::Number(d) => Ok(HclValue::Number(-d))
+            HclValue::Decimal(bd) => Ok(HclValue::Decimal(bd.negate()))
+            _ => {
+              match hcl_to_bigdec(v, sp) {
+                Ok(bd) => Ok(HclValue::Decimal(bd.negate()))
+                Err(e) => Err(e)
+              }
+            }
           }
         }
         UnaryOp::Not => {
@@ -166,11 +267,14 @@ fn Evaluator::eval_node_inner(self : Evaluator, node : ExprNode) -> Result[HclVa
         Ok(b) => b
         Err(e) => return Err(e)
       }
-      if cond {
-        self.eval_node(tid)
-      } else {
-        self.eval_node(fid)
+      let chosen_id = if cond { tid } else { fid }
+      let other_id = if cond { fid } else { tid }
+      let chosen_val = match self.eval_node(chosen_id) {
+        Ok(x) => x
+        Err(e) => return Err(e)
       }
+      let other_st = static_type_of(self.nodes, other_id, 0)
+      unify_cond_result(chosen_val, other_st, sp)
     }
     ExprNode::TupleCons(ids, _) => {
       let out : Array[HclValue] = []
@@ -254,7 +358,10 @@ fn Evaluator::eval_binary(
         Err(e) => return Err(e)
       }
       if !lb {
-        return Ok(HclValue::Bool(false))
+        match check_static_bool_compat(static_type_of(self.nodes, rid, 0), sp) {
+          Ok(_) => return Ok(HclValue::Bool(false))
+          Err(e) => return Err(e)
+        }
       }
       let rv = match self.eval_node(rid) {
         Ok(x) => x
@@ -276,7 +383,10 @@ fn Evaluator::eval_binary(
         Err(e) => return Err(e)
       }
       if lb {
-        return Ok(HclValue::Bool(true))
+        match check_static_bool_compat(static_type_of(self.nodes, rid, 0), sp) {
+          Ok(_) => return Ok(HclValue::Bool(true))
+          Err(e) => return Err(e)
+        }
       }
       let rv = match self.eval_node(rid) {
         Ok(x) => x
@@ -304,36 +414,69 @@ fn Evaluator::eval_binary(
     BinOp::Eq => Ok(HclValue::Bool(value_eq(lv, rv)))
     BinOp::Ne => Ok(HclValue::Bool(!value_eq(lv, rv)))
     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-      let a = match hcl_to_number(lv, sp) {
+      // Fast exact integer Double path for common small integers (keeps W2 fast without precision loss)
+      match (lv, rv) {
+        (HclValue::Number(a), HclValue::Number(b)) => {
+          match op {
+            BinOp::Lt => return Ok(HclValue::Bool(a < b))
+            BinOp::Le => return Ok(HclValue::Bool(a <= b))
+            BinOp::Gt => return Ok(HclValue::Bool(a > b))
+            BinOp::Ge => return Ok(HclValue::Bool(a >= b))
+            BinOp::Add => {
+              if a >= -100000000000000.0 && a <= 100000000000000.0 && b >= -100000000000000.0 && b <= 100000000000000.0 {
+                let ia = a.to_int64()
+                let ib = b.to_int64()
+                if ia.to_double() == a && ib.to_double() == b {
+                  return Ok(HclValue::Number((ia + ib).to_double()))
+                }
+              }
+            }
+            BinOp::Sub => {
+              if a >= -100000000000000.0 && a <= 100000000000000.0 && b >= -100000000000000.0 && b <= 100000000000000.0 {
+                let ia = a.to_int64()
+                let ib = b.to_int64()
+                if ia.to_double() == a && ib.to_double() == b {
+                  return Ok(HclValue::Number((ia - ib).to_double()))
+                }
+              }
+            }
+            BinOp::Mul => {
+              if a >= -10000000.0 && a <= 10000000.0 && b >= -10000000.0 && b <= 10000000.0 {
+                let ia = a.to_int64()
+                let ib = b.to_int64()
+                if ia.to_double() == a && ib.to_double() == b {
+                  return Ok(HclValue::Number((ia * ib).to_double()))
+                }
+              }
+            }
+            _ => ()
+          }
+        }
+        _ => ()
+      }
+      let a = match hcl_to_bigdec(lv, sp) {
         Ok(x) => x
         Err(e) => return Err(e)
       }
-      let b = match hcl_to_number(rv, sp) {
+      let b = match hcl_to_bigdec(rv, sp) {
         Ok(x) => x
         Err(e) => return Err(e)
       }
       match op {
-        BinOp::Lt => Ok(HclValue::Bool(a < b))
-        BinOp::Le => Ok(HclValue::Bool(a <= b))
-        BinOp::Gt => Ok(HclValue::Bool(a > b))
-        BinOp::Ge => Ok(HclValue::Bool(a >= b))
-        BinOp::Add => Ok(HclValue::Number(a + b))
-        BinOp::Sub => Ok(HclValue::Number(a - b))
-        BinOp::Mul => Ok(HclValue::Number(a * b))
+        BinOp::Lt => Ok(HclValue::Bool(BigDec::cmp(a, b) < 0))
+        BinOp::Le => Ok(HclValue::Bool(BigDec::cmp(a, b) <= 0))
+        BinOp::Gt => Ok(HclValue::Bool(BigDec::cmp(a, b) > 0))
+        BinOp::Ge => Ok(HclValue::Bool(BigDec::cmp(a, b) >= 0))
+        BinOp::Add => Ok(HclValue::Decimal(BigDec::add(a, b)))
+        BinOp::Sub => Ok(HclValue::Decimal(BigDec::sub(a, b)))
+        BinOp::Mul => Ok(HclValue::Decimal(BigDec::mul(a, b)))
         BinOp::Div => {
-          if b == 0.0 {
-            Err(HclError::new(HclErrorKind::DivisionByZero, "division by zero", sp))
-          } else {
-            Ok(HclValue::Number(a / b))
+          match BigDec::div(a, b) {
+            Some(q) => Ok(HclValue::Decimal(q))
+            None => Err(HclError::new(HclErrorKind::DivisionByZero, "division by zero", sp))
           }
         }
-        BinOp::Mod => {
-          if b == 0.0 {
-            Err(HclError::new(HclErrorKind::DivisionByZero, "modulo by zero", sp))
-          } else {
-            Ok(HclValue::Number(a - floor_double(a / b) * b))
-          }
-        }
+        BinOp::Mod => Ok(HclValue::Decimal(BigDec::rem(a, b)))
         _ => Err(HclError::new(HclErrorKind::EvalError, "unreachable binary op", sp))
       }
     }
@@ -485,9 +628,29 @@ fn Evaluator::apply_traversal_steps(
         }
         match cur {
           HclValue::Tuple(xs) => {
-            let n = match hcl_to_number(kv, sp) {
-              Ok(d) => d.to_int()
+            let bd = match hcl_to_bigdec(kv, sp) {
+              Ok(d) => d
               Err(e) => return Err(e)
+            }
+            if !bd.is_integer() {
+              return Err(
+                HclError::new(
+                  HclErrorKind::InvalidArgument,
+                  "tuple index must be a whole number",
+                  sp,
+                ),
+              )
+            }
+            let n = match bd.to_int_exact() {
+              Some(i_val) => i_val
+              None =>
+              return Err(
+                HclError::new(
+                  HclErrorKind::IndexOutOfBounds,
+                  "index out of bounds",
+                  sp,
+                ),
+              )
             }
             if n < 0 || n >= xs.length() {
               return Err(
@@ -830,19 +993,62 @@ fn Evaluator::eval_for_object(
   Ok(HclValue::Object(out))
 }
 
-fn trim_trailing_ws(s : String) -> String {
-  let mut end = s.length()
-  while end > 0 && is_ws_byte(s.code_unit_at(end - 1)) {
-    end = end - 1
+///| Trim trailing whitespace from ONLY the last line segment of `s` (matching hcl/v2 line-split lexer + TrimRightFunc).
+fn trim_right_one_line(s : String) -> String {
+  let n = s.length()
+  if n == 0 {
+    return s
   }
-  s.slice(0, end)
+  // Find start of last line token:
+  // If `s` ends with `\n`, that `\n` closes the last line token, so search before `n - 1`.
+  let search_end = if s.code_unit_at(n - 1) == 10 { n - 1 } else { n }
+  let mut line_start = 0
+  let mut i = search_end - 1
+  while i >= 0 {
+    if s.code_unit_at(i) == 10 {
+      line_start = i + 1
+      break
+    }
+    i = i - 1
+  }
+  // Trim trailing Unicode spaces within [line_start, n)
+  let mut last_non_ws = line_start
+  let mut k = line_start
+  while k < n {
+    let (cp, next_k) = utf8_decode_at(s, k)
+    if !is_unicode_space(cp) {
+      last_non_ws = next_k
+    }
+    k = next_k
+  }
+  s.slice(0, last_non_ws)
 }
 
-fn trim_leading_ws(s : String) -> String {
+///| Trim leading whitespace from ONLY the first line segment of `s` (matching hcl/v2 line-split lexer + TrimLeftFunc).
+fn trim_left_one_line(s : String) -> String {
   let n = s.length()
+  if n == 0 {
+    return s
+  }
+  // First line token extends up to and including the first `\n` (or end of string)
+  let mut line_end = n
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i) == 10 {
+      line_end = i + 1
+      break
+    }
+    i = i + 1
+  }
+  // Trim leading Unicode spaces within [0, line_end)
   let mut start = 0
-  while start < n && is_ws_byte(s.code_unit_at(start)) {
-    start = start + 1
+  while start < line_end {
+    let (cp, next_s) = utf8_decode_at(s, start)
+    if is_unicode_space(cp) {
+      start = next_s
+    } else {
+      break
+    }
   }
   s.slice(start, n)
 }
@@ -853,14 +1059,10 @@ fn Evaluator::eval_template_expr(
   allow_unwrap : Bool,
   sp : Span,
 ) -> Result[HclValue, HclError] {
-  // HCL2 single-interpolation unwrap rule: `"${expr}"` (no strip markers) returns raw typed value
+  // HCL2 single-interpolation unwrap rule: `"${expr}"` (including `"${~ expr ~}"`) returns raw typed value
   if allow_unwrap && parts.length() == 1 {
     match parts[0] {
-      TemplatePart::Interp(eid, strip_l, strip_r, _) => {
-        if !strip_l && !strip_r {
-          return self.eval_node(eid)
-        }
-      }
+      TemplatePart::Interp(eid, _, _, _) => return self.eval_node(eid)
       _ => ()
     }
   }
@@ -891,19 +1093,6 @@ fn Evaluator::eval_template_expr(
   }
 }
 
-fn strip_trailing_from_chunks(chunks : Array[String]) -> Unit {
-  while chunks.length() > 0 {
-    let last_idx = chunks.length() - 1
-    let trimmed = trim_trailing_ws(chunks[last_idx])
-    if trimmed.length() > 0 {
-      chunks[last_idx] = trimmed
-      break
-    } else {
-      let _ = chunks.pop()
-    }
-  }
-}
-
 fn Evaluator::eval_template_parts_into(
   self : Evaluator,
   parts : Array[TemplatePart],
@@ -918,7 +1107,7 @@ fn Evaluator::eval_template_parts_into(
       TemplatePart::Literal(s, _) => {
         let piece = if trim_next {
           trim_next = false
-          trim_leading_ws(s)
+          trim_left_one_line(s)
         } else {
           s
         }
@@ -928,7 +1117,7 @@ fn Evaluator::eval_template_parts_into(
       TemplatePart::Interp(eid, strip_l, strip_r, sp) => {
         if strip_l && last_was_literal && chunks.length() > 0 {
           let last_idx = chunks.length() - 1
-          chunks[last_idx] = trim_trailing_ws(chunks[last_idx])
+          chunks[last_idx] = trim_right_one_line(chunks[last_idx])
         }
         trim_next = false
         last_was_literal = false
@@ -947,10 +1136,10 @@ fn Evaluator::eval_template_parts_into(
           trim_next = true
         }
       }
-      TemplatePart::If(cid, true_parts, false_parts, sl, osr, esl, esr, sp) => {
-        if sl && last_was_literal && chunks.length() > 0 {
+      TemplatePart::If(cid, true_parts, false_parts, if_sl, if_sr, true_end_sl, else_sr, false_end_sl, end_sr, sp) => {
+        if if_sl && last_was_literal && chunks.length() > 0 {
           let last_idx = chunks.length() - 1
-          chunks[last_idx] = trim_trailing_ws(chunks[last_idx])
+          chunks[last_idx] = trim_right_one_line(chunks[last_idx])
         }
         trim_next = false
         last_was_literal = false
@@ -963,20 +1152,22 @@ fn Evaluator::eval_template_parts_into(
           Err(e) => return Err(e)
         }
         let branch = if cond { true_parts } else { false_parts }
-        let branch_ended_lit = match self.eval_template_parts_into(branch, chunks, osr) {
+        let branch_lead_trim = if cond { if_sr } else { else_sr }
+        let branch_trail_trim = if cond { true_end_sl } else { false_end_sl }
+        let branch_ended_lit = match self.eval_template_parts_into(branch, chunks, branch_lead_trim) {
           Ok(ended_lit) => ended_lit
           Err(e) => return Err(e)
         }
-        if esl && branch_ended_lit && chunks.length() > 0 {
+        if branch_trail_trim && branch_ended_lit && chunks.length() > 0 {
           let last_idx = chunks.length() - 1
-          chunks[last_idx] = trim_trailing_ws(chunks[last_idx])
+          chunks[last_idx] = trim_right_one_line(chunks[last_idx])
         }
-        trim_next = esr
+        trim_next = end_sr
       }
       TemplatePart::For(kv, vv, col_id, body_parts, sl, osr, esl, esr, sp) => {
         if sl && last_was_literal && chunks.length() > 0 {
           let last_idx = chunks.length() - 1
-          chunks[last_idx] = trim_trailing_ws(chunks[last_idx])
+          chunks[last_idx] = trim_right_one_line(chunks[last_idx])
         }
         trim_next = false
         last_was_literal = false
@@ -1015,7 +1206,7 @@ fn Evaluator::eval_template_parts_into(
           }
           if esl && body_ended_lit && chunks.length() > 0 {
             let last_idx = chunks.length() - 1
-            chunks[last_idx] = trim_trailing_ws(chunks[last_idx])
+            chunks[last_idx] = trim_right_one_line(chunks[last_idx])
           }
           p = p + 1
         }

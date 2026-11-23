@@ -8,6 +8,7 @@ pub fn hcl_to_json5_sorted(v : HclValue) -> json5::Json5Value {
     HclValue::Null => json5::Json5Value::Null
     HclValue::Bool(b) => json5::Json5Value::Bool(b)
     HclValue::Number(d) => json5::Json5Value::Number(d)
+    HclValue::Decimal(bd) => json5::Json5Value::Number(bd.to_double())
     HclValue::Str(s) => json5::Json5Value::Str(s)
     HclValue::Tuple(xs) => {
       let out : Array[json5::Json5Value] = []
@@ -63,11 +64,7 @@ pub fn json5_to_hcl(v : json5::Json5Value) -> HclValue {
 
 ///| Deterministic canonical JSON serialization (keys sorted lexicographically).
 pub fn value_to_json_impl(v : HclValue) -> Result[String, HclError] {
-  let jv = hcl_to_json5_sorted(v)
-  match json5::to_json_string(jv) {
-    Ok(s) => Ok(s)
-    Err(e) => Err(HclError::new(HclErrorKind::EvalError, "JSON encode error: " + e.message, Span::zero()))
-  }
+  value_to_json_budgeted(v, HclLimits::default().max_output_bytes, false)
 }
 
 ///| Lexicographical string comparison (`a < b`).
@@ -205,19 +202,18 @@ fn sort_strings(xs : Array[String]) -> Array[String] {
   out
 }
 
-///| Format an HCL number as string (integers without `.0`, floats cleanly via json5).
+///| Format an HCL `Double` as string safely without out-of-range integer traps.
 pub fn hcl_number_to_string(d : Double) -> String {
   if d == 0.0 {
     return "0"
   }
-  let i64 = d.to_int64()
-  if i64.to_double() == d && d >= -9007199254740992.0 && d <= 9007199254740992.0 {
-    return i64.to_string()
+  if d >= -9007199254740992.0 && d <= 9007199254740992.0 {
+    let i64 = d.to_int64()
+    if i64.to_double() == d {
+      return i64.to_string()
+    }
   }
-  match json5::to_json_string(json5::Json5Value::Number(d)) {
-    Ok(s) => s
-    Err(_) => d.to_string()
-  }
+  BigDec::from_double(d).to_string()
 }
 
 ///| Coerce an HCL primitive value to string (for templates and string functions).
@@ -226,6 +222,7 @@ pub fn hcl_to_string(v : HclValue, span : Span) -> Result[String, HclError] {
     HclValue::Str(s) => Ok(s)
     HclValue::Bool(b) => Ok(if b { "true" } else { "false" })
     HclValue::Number(d) => Ok(hcl_number_to_string(d))
+    HclValue::Decimal(bd) => Ok(bd.to_string())
     HclValue::Null =>
     Err(HclError::new(HclErrorKind::TypeError, "cannot convert null to string", span))
     _ =>
@@ -239,10 +236,17 @@ pub fn hcl_to_string(v : HclValue, span : Span) -> Result[String, HclError] {
   }
 }
 
-fn hcl_to_number(v : HclValue, span : Span) -> Result[Double, HclError] {
+///| Coerce an HCL value to an exact `BigDec`.
+pub fn hcl_to_bigdec(v : HclValue, span : Span) -> Result[BigDec, HclError] {
   match v {
-    HclValue::Number(d) => Ok(d)
-    HclValue::Str(s) => parse_number_double(s, span)
+    HclValue::Decimal(bd) => Ok(bd)
+    HclValue::Number(d) => Ok(BigDec::from_double(d))
+    HclValue::Str(s) => {
+      match BigDec::parse(s) {
+        Some(bd) => Ok(bd)
+        None => Err(HclError::new(HclErrorKind::TypeError, "cannot convert string to number: " + s, span))
+      }
+    }
     _ => Err(HclError::new(HclErrorKind::TypeError, "expected number", span))
   }
 }
@@ -455,15 +459,20 @@ fn str_replace(s : String, old_s : String, new_s : String) -> String {
   sb.to_string()
 }
 
-fn fn_format(fmt : String, args : Array[HclValue], span : Span) -> Result[String, HclError] {
+fn fn_format(fmt : String, args : Array[HclValue], max_bytes : Int, span : Span) -> Result[String, HclError] {
   let sb = StringBuilder::new()
   let n = fmt.length()
   let mut i = 0
   let mut arg_idx = 0
+  let mut written = 0
   while i < n {
     let b = fmt.code_unit_at(i)
     if b != 37 {
       sb.write_byte(b.to_byte())
+      written = written + 1
+      if written > max_bytes {
+        return Err(HclError::new(HclErrorKind::LimitExceeded, "format() output exceeds limit", span))
+      }
       i = i + 1
       continue
     }
@@ -473,24 +482,44 @@ fn fn_format(fmt : String, args : Array[HclValue], span : Span) -> Result[String
     let next = fmt.code_unit_at(i + 1)
     if next == 37 {
       sb.write_byte((37).to_byte())
+      written = written + 1
       i = i + 2
       continue
     }
-    // Parse optional width/flags (minimal: digits, -, 0, .)
+    // Parse optional flags (-, 0, +, space), width, and .precision
     let mut j = i + 1
+    let mut left_align = false
     let mut zero_pad = false
+    while j < n {
+      let fc = fmt.code_unit_at(j)
+      if fc == 45 {
+        left_align = true
+        j = j + 1
+      } else if fc == 48 {
+        zero_pad = true
+        j = j + 1
+      } else if fc == 43 || fc == 32 {
+        j = j + 1
+      } else {
+        break
+      }
+    }
     let mut width = 0
-    if j < n && fmt.code_unit_at(j) == 48 {
-      zero_pad = true
-      j = j + 1
-    }
     while j < n && is_hcl_digit(fmt.code_unit_at(j)) {
-      width = width * 10 + (fmt.code_unit_at(j) - 48)
+      if width < 100000 {
+        width = width * 10 + (fmt.code_unit_at(j) - 48)
+      }
       j = j + 1
     }
+    let mut has_prec = false
+    let mut prec = 0
     if j < n && fmt.code_unit_at(j) == 46 {
+      has_prec = true
       j = j + 1
       while j < n && is_hcl_digit(fmt.code_unit_at(j)) {
+        if prec < 1000 {
+          prec = prec * 10 + (fmt.code_unit_at(j) - 48)
+        }
         j = j + 1
       }
     }
@@ -509,26 +538,33 @@ fn fn_format(fmt : String, args : Array[HclValue], span : Span) -> Result[String
       match hcl_to_string(v, span) {
         Ok(s) => s
         Err(_) => {
-          match value_to_json_impl(v) {
+          match value_to_json_budgeted(v, max_bytes, false) {
             Ok(js) => js
             Err(e) => return Err(e)
           }
         }
       }
     } else if verb == 100 {
-      // %d
-      let d = match hcl_to_number(v, span) {
+      // %d: requires whole integer (no fractional part)
+      let bd = match hcl_to_bigdec(v, span) {
         Ok(x) => x
         Err(e) => return Err(e)
       }
-      d.to_int64().to_string()
+      if !bd.is_integer() {
+        return Err(HclError::new(HclErrorKind::InvalidArgument, "%d requires an integer value", span))
+      }
+      bd.to_string()
     } else if verb == 102 {
       // %f
-      let d = match hcl_to_number(v, span) {
+      let bd = match hcl_to_bigdec(v, span) {
         Ok(x) => x
         Err(e) => return Err(e)
       }
-      hcl_number_to_string(d)
+      if has_prec {
+        bd.to_fixed_string(prec)
+      } else {
+        bd.to_string()
+      }
     } else if verb == 116 {
       // %t
       let bv = match hcl_to_bool(v, span) {
@@ -542,28 +578,40 @@ fn fn_format(fmt : String, args : Array[HclValue], span : Span) -> Result[String
         Ok(x) => x
         Err(e) => return Err(e)
       }
-      match json5::to_json_string(json5::Json5Value::Str(sv)) {
+      match value_to_json_budgeted(HclValue::Str(sv), max_bytes, false) {
         Ok(js) => js
         Err(_) => "\"" + sv + "\""
       }
     } else {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "unsupported format verb", span))
     }
-    if width > piece.length() {
+    let pad_len = if width > piece.length() { width - piece.length() } else { 0 }
+    written = written + piece.length() + pad_len
+    if written > max_bytes {
+      return Err(HclError::new(HclErrorKind::LimitExceeded, "format() output exceeds limit", span))
+    }
+    if left_align {
+      sb.write_string(piece)
+      let mut p = 0
+      while p < pad_len {
+        sb.write_byte((32).to_byte())
+        p = p + 1
+      }
+    } else {
       let pad_ch = if zero_pad { (48).to_byte() } else { (32).to_byte() }
       let mut p = 0
-      while p < width - piece.length() {
+      while p < pad_len {
         sb.write_byte(pad_ch)
         p = p + 1
       }
+      sb.write_string(piece)
     }
-    sb.write_string(piece)
   }
   Ok(sb.to_string())
 }
 
 fn flatten_into(xs : Array[HclValue], out : Array[HclValue], max_depth : Int, depth : Int, span : Span) -> Result[Unit, HclError] {
-  if depth > max_depth {
+  if depth > hcl_effective_max_depth(max_depth) {
     return Err(HclError::new(HclErrorKind::LimitExceeded, "flatten depth limit exceeded", span))
   }
   let mut i = 0
@@ -582,26 +630,6 @@ fn flatten_into(xs : Array[HclValue], out : Array[HclValue], max_depth : Int, de
   Ok(())
 }
 
-fn floor_double(d : Double) -> Double {
-  let i = d.to_int64()
-  let di = i.to_double()
-  if d < di {
-    (i - 1L).to_double()
-  } else {
-    di
-  }
-}
-
-fn ceil_double(d : Double) -> Double {
-  let i = d.to_int64()
-  let di = i.to_double()
-  if d > di {
-    (i + 1L).to_double()
-  } else {
-    di
-  }
-}
-
 ///| Dispatch all standard HCL2 / Terraform built-in functions (except lazy `try`/`can`).
 pub fn call_builtin_func(
   name : String,
@@ -617,7 +645,7 @@ pub fn call_builtin_func(
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    return Ok(Some(HclValue::Str(ascii_lower(s))))
+    return Ok(Some(HclValue::Str(unicode_lower(s))))
   }
   if name == "upper" {
     if args.length() != 1 {
@@ -627,7 +655,7 @@ pub fn call_builtin_func(
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    return Ok(Some(HclValue::Str(ascii_upper(s))))
+    return Ok(Some(HclValue::Str(unicode_upper(s))))
   }
   if name == "trim" {
     if args.length() != 2 {
@@ -651,7 +679,7 @@ pub fn call_builtin_func(
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    return Ok(Some(HclValue::Str(str_trimspace(s))))
+    return Ok(Some(HclValue::Str(unicode_trimspace(s))))
   }
   if name == "trimprefix" {
     if args.length() != 2 {
@@ -808,12 +836,9 @@ pub fn call_builtin_func(
       rest.push(args[i])
       i = i + 1
     }
-    let out = match fn_format(fmt, rest, span) {
+    let out = match fn_format(fmt, rest, limits.max_output_bytes, span) {
       Ok(v) => v
       Err(e) => return Err(e)
-    }
-    if out.length() > limits.max_output_bytes {
-      return Err(HclError::new(HclErrorKind::LimitExceeded, "format() output exceeds limit", span))
     }
     return Ok(Some(HclValue::Str(out)))
   }
@@ -825,38 +850,34 @@ pub fn call_builtin_func(
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    let off = match hcl_to_number(args[1], span) {
-      Ok(v) => v.to_int()
+    let off_bd = match hcl_to_bigdec(args[1], span) {
+      Ok(v) => v
       Err(e) => return Err(e)
     }
-    let length = match hcl_to_number(args[2], span) {
-      Ok(v) => v.to_int()
+    let len_bd = match hcl_to_bigdec(args[2], span) {
+      Ok(v) => v
       Err(e) => return Err(e)
     }
-    let n = s.length()
-    let start = if off < 0 {
-      let x = n + off
-      if x < 0 { 0 } else { x }
-    } else if off > n {
-      n
-    } else {
-      off
+    if !off_bd.is_integer() || !len_bd.is_integer() {
+      return Err(HclError::new(HclErrorKind::InvalidArgument, "substr() offset and length must be whole numbers", span))
     }
-    let end = if length < 0 {
-      n
-    } else if start + length > n {
-      n
-    } else {
-      start + length
+    let slen = s.length().to_int64()
+    let off : Int64 = match off_bd.to_int64_exact() {
+      Some(v) => v
+      None => if off_bd.neg { -slen - 1L } else { slen + 1L }
     }
-    return Ok(Some(HclValue::Str(s.slice(start, end))))
+    let length : Int64 = match len_bd.to_int64_exact() {
+      Some(v) => v
+      None => if len_bd.neg { -1L } else { slen + 1L }
+    }
+    return Ok(Some(HclValue::Str(utf8_substr(s, off, length))))
   }
   if name == "length" {
     if args.length() != 1 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "length() expects 1 argument", span))
     }
     match args[0] {
-      HclValue::Str(s) => return Ok(Some(HclValue::int(utf8_codepoint_len(s))))
+      HclValue::Str(s) => return Ok(Some(HclValue::int(utf8_grapheme_len(s))))
       HclValue::Tuple(xs) => return Ok(Some(HclValue::int(xs.length())))
       HclValue::Object(entries) => return Ok(Some(HclValue::int(entries.length())))
       _ => return Err(HclError::new(HclErrorKind::TypeError, "length() expects string, list, or map", span))
@@ -998,6 +1019,7 @@ pub fn call_builtin_func(
     let mut a = 0
     while a < args.length() {
       match args[a] {
+        HclValue::Null => ()
         HclValue::Object(entries) => {
           let mut i = 0
           while i < entries.length() {
@@ -1086,6 +1108,19 @@ pub fn call_builtin_func(
     }
   }
   if name == "coalesce" {
+    // Check if any non-null argument is a string (cty unifies primitive args to string)
+    let mut has_str = false
+    let mut j = 0
+    while j < args.length() {
+      match args[j] {
+        HclValue::Str(_) => {
+          has_str = true
+          break
+        }
+        _ => ()
+      }
+      j = j + 1
+    }
     let mut i = 0
     while i < args.length() {
       match args[i] {
@@ -1095,7 +1130,15 @@ pub fn call_builtin_func(
             return Ok(Some(HclValue::Str(s)))
           }
         }
-        other => return Ok(Some(other))
+        other => {
+          if has_str {
+            match hcl_to_string(other, span) {
+              Ok(s) => return Ok(Some(HclValue::Str(s)))
+              Err(_) => return Ok(Some(other))
+            }
+          }
+          return Ok(Some(other))
+        }
       }
       i = i + 1
     }
@@ -1120,124 +1163,125 @@ pub fn call_builtin_func(
     if args.length() == 0 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "min() expects at least 1 argument", span))
     }
-    let mut best = match hcl_to_number(args[0], span) {
+    let mut best = match hcl_to_bigdec(args[0], span) {
       Ok(v) => v
       Err(e) => return Err(e)
     }
     let mut i = 1
     while i < args.length() {
-      let cur = match hcl_to_number(args[i], span) {
+      let cur = match hcl_to_bigdec(args[i], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      if cur < best {
+      if BigDec::cmp(cur, best) < 0 {
         best = cur
       }
       i = i + 1
     }
-    return Ok(Some(HclValue::Number(best)))
+    return Ok(Some(HclValue::Decimal(best)))
   }
   if name == "max" {
     if args.length() == 0 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "max() expects at least 1 argument", span))
     }
-    let mut best = match hcl_to_number(args[0], span) {
+    let mut best = match hcl_to_bigdec(args[0], span) {
       Ok(v) => v
       Err(e) => return Err(e)
     }
     let mut i = 1
     while i < args.length() {
-      let cur = match hcl_to_number(args[i], span) {
+      let cur = match hcl_to_bigdec(args[i], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      if cur > best {
+      if BigDec::cmp(cur, best) > 0 {
         best = cur
       }
       i = i + 1
     }
-    return Ok(Some(HclValue::Number(best)))
+    return Ok(Some(HclValue::Decimal(best)))
   }
   if name == "abs" {
     if args.length() != 1 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "abs() expects 1 argument", span))
     }
-    let d = match hcl_to_number(args[0], span) {
+    let bd = match hcl_to_bigdec(args[0], span) {
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    return Ok(Some(HclValue::Number(if d < 0.0 { -d } else { d })))
+    return Ok(Some(HclValue::Decimal(bd.abs())))
   }
   if name == "ceil" {
     if args.length() != 1 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "ceil() expects 1 argument", span))
     }
-    let d = match hcl_to_number(args[0], span) {
+    let bd = match hcl_to_bigdec(args[0], span) {
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    return Ok(Some(HclValue::Number(ceil_double(d))))
+    return Ok(Some(HclValue::Decimal(bd.ceil())))
   }
   if name == "floor" {
     if args.length() != 1 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "floor() expects 1 argument", span))
     }
-    let d = match hcl_to_number(args[0], span) {
+    let bd = match hcl_to_bigdec(args[0], span) {
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    return Ok(Some(HclValue::Number(floor_double(d))))
+    return Ok(Some(HclValue::Decimal(bd.floor())))
   }
   if name == "range" {
     if args.length() < 1 || args.length() > 3 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "range() expects 1 to 3 arguments", span))
     }
-    let mut start = 0.0
-    let mut limit = 0.0
-    let mut step = 1.0
+    let mut start = BigDec::zero()
+    let mut limit = BigDec::zero()
+    let mut step = BigDec::one()
     if args.length() == 1 {
-      limit = match hcl_to_number(args[0], span) {
+      limit = match hcl_to_bigdec(args[0], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
     } else if args.length() == 2 {
-      start = match hcl_to_number(args[0], span) {
+      start = match hcl_to_bigdec(args[0], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      limit = match hcl_to_number(args[1], span) {
+      limit = match hcl_to_bigdec(args[1], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      if start > limit {
-        step = -1.0
+      if BigDec::cmp(start, limit) > 0 {
+        step = BigDec::one().negate()
       }
     } else {
-      start = match hcl_to_number(args[0], span) {
+      start = match hcl_to_bigdec(args[0], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      limit = match hcl_to_number(args[1], span) {
+      limit = match hcl_to_bigdec(args[1], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      step = match hcl_to_number(args[2], span) {
+      step = match hcl_to_bigdec(args[2], span) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
     }
-    if step == 0.0 {
+    if step.is_zero() {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "range() step cannot be 0", span))
     }
     let out : Array[HclValue] = []
     let mut cur = start
     let max_items = if limits.max_steps < 100000L { limits.max_steps.to_int() } else { 100000 }
-    while (step > 0.0 && cur < limit) || (step < 0.0 && cur > limit) {
+    let step_pos = !step.neg
+    while (step_pos && BigDec::cmp(cur, limit) < 0) || (!step_pos && BigDec::cmp(cur, limit) > 0) {
       if out.length() >= max_items {
         return Err(HclError::new(HclErrorKind::LimitExceeded, "range() size exceeds safety limit", span))
       }
-      out.push(HclValue::Number(cur))
-      cur = cur + step
+      out.push(HclValue::Decimal(cur))
+      cur = BigDec::add(cur, step)
     }
     return Ok(Some(HclValue::Tuple(out)))
   }
@@ -1299,21 +1343,25 @@ pub fn call_builtin_func(
     if args.length() != 2 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "element() expects 2 arguments", span))
     }
-    let idx = match hcl_to_number(args[1], span) {
-      Ok(v) => v.to_int()
+    let idx_bd = match hcl_to_bigdec(args[1], span) {
+      Ok(v) => v
       Err(e) => return Err(e)
+    }
+    let idx = match idx_bd.to_int64_exact() {
+      Some(v) => v
+      None => return Err(HclError::new(HclErrorKind::InvalidArgument, "element() index must be a 64-bit integer", span))
     }
     match args[0] {
       HclValue::Tuple(xs) => {
         if xs.length() == 0 {
           return Err(HclError::new(HclErrorKind::InvalidArgument, "element() cannot index empty list", span))
         }
-        let n = xs.length()
+        let n = xs.length().to_int64()
         let mut m = idx % n
-        if m < 0 {
+        if m < 0L {
           m = m + n
         }
-        return Ok(Some(xs[m]))
+        return Ok(Some(xs[m.to_int()]))
       }
       _ => return Err(HclError::new(HclErrorKind::TypeError, "element() expects a list", span))
     }
@@ -1340,13 +1388,21 @@ pub fn call_builtin_func(
     if args.length() != 3 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "slice() expects 3 arguments", span))
     }
-    let start = match hcl_to_number(args[1], span) {
-      Ok(v) => v.to_int()
+    let start_bd = match hcl_to_bigdec(args[1], span) {
+      Ok(v) => v
       Err(e) => return Err(e)
     }
-    let end = match hcl_to_number(args[2], span) {
-      Ok(v) => v.to_int()
+    let end_bd = match hcl_to_bigdec(args[2], span) {
+      Ok(v) => v
       Err(e) => return Err(e)
+    }
+    let start = match start_bd.to_int_exact() {
+      Some(v) => v
+      None => return Err(HclError::new(HclErrorKind::IndexOutOfBounds, "slice() start index out of range", span))
+    }
+    let end = match end_bd.to_int_exact() {
+      Some(v) => v
+      None => return Err(HclError::new(HclErrorKind::IndexOutOfBounds, "slice() end index out of range", span))
     }
     match args[0] {
       HclValue::Tuple(xs) => {
@@ -1368,12 +1424,9 @@ pub fn call_builtin_func(
     if args.length() != 1 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "jsonencode() expects 1 argument", span))
     }
-    let js = match value_to_json_impl(args[0]) {
+    let js = match value_to_json_budgeted(args[0], limits.max_output_bytes, true) {
       Ok(s) => s
       Err(e) => return Err(e)
-    }
-    if js.length() > limits.max_output_bytes {
-      return Err(HclError::new(HclErrorKind::LimitExceeded, "jsonencode() output exceeds limit", span))
     }
     return Ok(Some(HclValue::Str(js)))
   }
@@ -1385,23 +1438,18 @@ pub fn call_builtin_func(
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    let opts = json5::ParseOptions::{
-      max_depth: limits.max_depth,
-      max_nodes: 1000000,
-      duplicate_keys: json5::DuplicateKeyPolicy::LastWins,
-      allow_json5: false,
-      allow_comments: false,
-      allow_trailing_commas: false,
-      reject_overflow: true,
-    }
-    match json5::parse_with_options(s, opts) {
-      Ok(jv) => return Ok(Some(json5_to_hcl(jv)))
+    match parse_strict_json_value(s, limits.max_depth, false) {
+      Ok(v) => return Ok(Some(v))
       Err(e) => return Err(HclError::new(HclErrorKind::InvalidArgument, "jsondecode() failed: " + e.message, span))
     }
   }
   if name == "tostring" {
     if args.length() != 1 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "tostring() expects 1 argument", span))
+    }
+    match args[0] {
+      HclValue::Null => return Ok(Some(HclValue::Null))
+      _ => ()
     }
     let s = match hcl_to_string(args[0], span) {
       Ok(v) => v
@@ -1413,11 +1461,15 @@ pub fn call_builtin_func(
     if args.length() != 1 {
       return Err(HclError::new(HclErrorKind::InvalidArgument, "tonumber() expects 1 argument", span))
     }
-    let d = match hcl_to_number(args[0], span) {
+    match args[0] {
+      HclValue::Null => return Ok(Some(HclValue::Null))
+      _ => ()
+    }
+    let bd = match hcl_to_bigdec(args[0], span) {
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    return Ok(Some(HclValue::Number(d)))
+    return Ok(Some(HclValue::Decimal(bd)))
   }
   if name == "tobool" {
     if args.length() != 1 {
