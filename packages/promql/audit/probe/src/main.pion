@@ -1,0 +1,598 @@
+///| Red-team differential / DoS probe for `packages/promql`.
+///
+/// usage:
+///   promql_audit_probe parse <file>   lines "<id>\t<hex query>"
+///       -> "<id>\tERR" | "<id>\tOK\t<type>\t<hex format_expr>\t<rt>\t<pr>\t<hex prettify_expr>"
+///          rt = 1 when parse(format_expr(e)) re-formats to the same string,
+///          pr = 1 when parse(prettify_expr(e)) re-formats to the same string.
+///   promql_audit_probe eval <file>    eval case script (see audit/cases/eval_cases.txt)
+///   promql_audit_probe dos <scenario> one adversarial scenario -> "RESULT <ok|err:<kind>>"
+///   promql_audit_probe smoke          4-mode consistency fingerprint
+
+import "promql"
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+///|
+fn hex_val(b : Int) -> Int {
+  if b >= 48 && b <= 57 {
+    b - 48
+  } else if b >= 97 && b <= 102 {
+    b - 87
+  } else if b >= 65 && b <= 70 {
+    b - 55
+  } else {
+    0
+  }
+}
+
+///|
+fn hex_decode(s : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i + 1 < s.length() {
+    sb.write_byte(((hex_val(s.code_unit_at(i)) << 4) | hex_val(s.code_unit_at(i + 1))).to_byte())
+    i = i + 2
+  }
+  sb.to_string()
+}
+
+///|
+fn hex_encode(s : String) -> String {
+  let digits = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let b = s.code_unit_at(i)
+    sb.write_byte(digits.code_unit_at((b >> 4) & 15).to_byte())
+    sb.write_byte(digits.code_unit_at(b & 15).to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn split_on(line : String, sep : Int) -> Array[String] {
+  let out : Array[String] = []
+  let mut pos = 0
+  let mut i = 0
+  while i < line.length() {
+    if line.code_unit_at(i) == sep {
+      out.push(line.slice(pos, i))
+      pos = i + 1
+    }
+    i = i + 1
+  }
+  out.push(line.slice(pos, line.length()))
+  out
+}
+
+///|
+fn read_lines(world : World, path : String) -> Array[String] {
+  let content = match fs_read(world, path) {
+    Ok(s) => s
+    Err(_) => return []
+  }
+  let lines : Array[String] = []
+  let n = content.length()
+  let mut pos = 0
+  while pos < n {
+    let mut end = pos
+    while end < n && content.code_unit_at(end) != 10 {
+      end = end + 1
+    }
+    lines.push(content.slice(pos, end))
+    pos = end + 1
+  }
+  lines
+}
+
+///|
+fn parse_i64(s : String) -> Int64 {
+  let mut i = 0
+  let mut neg = false
+  if s.length() > 0 && s.code_unit_at(0) == 45 {
+    neg = true
+    i = 1
+  }
+  let mut acc = 0L
+  while i < s.length() {
+    acc = acc * 10L + (s.code_unit_at(i) - 48).to_int64()
+    i = i + 1
+  }
+  if neg {
+    0L - acc
+  } else {
+    acc
+  }
+}
+
+///|
+fn parse_num(s : String) -> Double {
+  match promql::parse_f64_str(s) {
+    Ok(v) => v
+    Err(_) => 0.0 / 0.0
+  }
+}
+
+///| Deterministic float rendering shared with the Go oracle's comparator (python parses both).
+fn fmt_f(v : Double) -> String {
+  if v != v {
+    return "NaN"
+  }
+  if v == 1.0 / 0.0 {
+    return "+Inf"
+  }
+  if v == -1.0 / 0.0 {
+    return "-Inf"
+  }
+  v.to_string()
+}
+
+///|
+fn sort_strings(xs : Array[String]) -> Unit {
+  let mut k = 1
+  while k < xs.length() {
+    let cur = xs[k]
+    let mut j = k - 1
+    while j >= 0 && xs[j] > cur {
+      xs[j + 1] = xs[j]
+      j = j - 1
+    }
+    xs[j + 1] = cur
+    k = k + 1
+  }
+}
+
+///| Escape `\\`, `"` and newline so a label value stays on one output line.
+fn escape_value(v : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < v.length() {
+    let b = v.code_unit_at(i)
+    if b == 92 {
+      sb.write_string("\\\\")
+    } else if b == 34 {
+      sb.write_string("\\\"")
+    } else if b == 10 {
+      sb.write_string("\\n")
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn fmt_labels(labels : Array[promql::Label]) -> String {
+  let sorted = promql::sort_labels(labels)
+  let sb = StringBuilder::new()
+  sb.write_string("{")
+  let mut i = 0
+  while i < sorted.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(sorted[i].name)
+    sb.write_string("=\"")
+    sb.write_string(escape_value(sorted[i].value))
+    sb.write_string("\"")
+    i = i + 1
+  }
+  sb.write_string("}")
+  sb.to_string()
+}
+
+///|
+fn kind_name(e : promql::PromqlError) -> String {
+  match e.kind {
+    promql::PromqlErrorKind::SyntaxError => "syntax"
+    promql::PromqlErrorKind::SemanticError => "semantic"
+    promql::PromqlErrorKind::EvalError => "eval"
+    promql::PromqlErrorKind::LimitExceeded => "limit"
+    promql::PromqlErrorKind::InvalidLimits => "invalid_limits"
+    promql::PromqlErrorKind::Unimplemented => "unimplemented"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// parse mode
+// ---------------------------------------------------------------------------
+
+///|
+fn reformat_same(text : String, expected : String) -> Bool {
+  match promql::parse_expr(text) {
+    Ok(e2) => promql::format_expr(e2) == expected
+    Err(_) => false
+  }
+}
+
+///|
+fn run_parse(world : World, path : String) -> Int {
+  let lines = read_lines(world, path)
+  let mut i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    i = i + 1
+    if line.length() == 0 {
+      continue
+    }
+    let cols = split_on(line, 9)
+    if cols.length() < 2 {
+      continue
+    }
+    let id = cols[0]
+    let q = hex_decode(cols[1])
+    match promql::parse_expr(q) {
+      Ok(e) => {
+        let f = promql::format_expr(e)
+        let rt = if reformat_same(f, f) { "1" } else { "0" }
+        let pretty = promql::prettify_expr(e)
+        let pr = if reformat_same(pretty, f) { "1" } else { "0" }
+        io_println(
+          world,
+          id + "\tOK\t" + promql::value_type_name(e.root_type()) + "\t" + hex_encode(f) + "\t" + rt + "\t" + pr + "\t" +
+          hex_encode(pretty),
+        )
+      }
+      Err(_) => io_println(world, id + "\tERR")
+    }
+  }
+  0
+}
+
+// ---------------------------------------------------------------------------
+// eval mode
+// ---------------------------------------------------------------------------
+
+///|
+fn parse_labels(spec : String) -> Array[promql::Label] {
+  let out : Array[promql::Label] = []
+  if spec.length() == 0 {
+    return out
+  }
+  let parts = split_on(spec, 44)
+  let mut i = 0
+  while i < parts.length() {
+    let kv = parts[i]
+    let mut eq = -1
+    let mut j = 0
+    while j < kv.length() {
+      if kv.code_unit_at(j) == 61 {
+        eq = j
+        break
+      }
+      j = j + 1
+    }
+    if eq > 0 {
+      out.push(promql::Label::new(kv.slice(0, eq), hex_decode(kv.slice(eq + 1, kv.length()))))
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn parse_samples(spec : String) -> Array[promql::Sample] {
+  let out : Array[promql::Sample] = []
+  let parts = split_on(spec, 32)
+  let mut i = 0
+  while i < parts.length() {
+    let p = parts[i]
+    let cols = split_on(p, 58)
+    if cols.length() == 2 {
+      out.push(promql::Sample::new(parse_i64(cols[0]), parse_num(cols[1])))
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn print_value(world : World, id : String, v : promql::EvalValue) -> Unit {
+  match v {
+    promql::EvalValue::Scalar(x) => io_println(world, id + "\tscalar\t" + fmt_f(x))
+    promql::EvalValue::StringVal(s) => io_println(world, id + "\tstring\t" + hex_encode(s))
+    promql::EvalValue::Vector(vs) => {
+      let rows : Array[String] = []
+      let mut i = 0
+      while i < vs.length() {
+        rows.push(fmt_labels(vs[i].labels) + "\t" + fmt_f(vs[i].value))
+        i = i + 1
+      }
+      sort_strings(rows)
+      io_println(world, id + "\tvector\t" + rows.length().to_string())
+      let mut j = 0
+      while j < rows.length() {
+        io_println(world, id + "\t\t" + rows[j])
+        j = j + 1
+      }
+    }
+    promql::EvalValue::Matrix(ms) => print_matrix(world, id, ms)
+  }
+}
+
+///|
+fn print_matrix(world : World, id : String, ms : Array[promql::RangeSeries]) -> Unit {
+  let rows : Array[String] = []
+  let mut i = 0
+  while i < ms.length() {
+    let sb = StringBuilder::new()
+    sb.write_string(fmt_labels(ms[i].labels))
+    sb.write_string("\t")
+    let mut j = 0
+    while j < ms[i].samples.length() {
+      if j > 0 {
+        sb.write_string(" ")
+      }
+      sb.write_string(ms[i].samples[j].timestamp_ms.to_string())
+      sb.write_string(":")
+      sb.write_string(fmt_f(ms[i].samples[j].value))
+      j = j + 1
+    }
+    rows.push(sb.to_string())
+    i = i + 1
+  }
+  sort_strings(rows)
+  io_println(world, id + "\tmatrix\t" + rows.length().to_string())
+  let mut k = 0
+  while k < rows.length() {
+    io_println(world, id + "\t\t" + rows[k])
+    k = k + 1
+  }
+}
+
+///|
+fn run_eval(world : World, path : String) -> Int {
+  let lines = read_lines(world, path)
+  let mut store = promql::SeriesStore::new()
+  let mut i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    i = i + 1
+    if line.length() == 0 || line.code_unit_at(0) == 35 {
+      continue
+    }
+    let cols = split_on(line, 9)
+    let cmd = cols[0]
+    if cmd == "clear" {
+      store = promql::SeriesStore::new()
+    } else if cmd == "series" && cols.length() >= 3 {
+      store.add_series(promql::Series::new(parse_labels(cols[1]), parse_samples(cols[2])))
+    } else if cmd == "instant" && cols.length() >= 4 {
+      let id = cols[1]
+      match promql::parse_expr(hex_decode(cols[3])) {
+        Ok(e) =>
+        match promql::eval_instant(e, store, parse_i64(cols[2])) {
+          Ok(v) => print_value(world, id, v)
+          Err(_) => io_println(world, id + "\tERR")
+        }
+        Err(_) => io_println(world, id + "\tPARSE_ERR")
+      }
+    } else if cmd == "range" && cols.length() >= 6 {
+      let id = cols[1]
+      match promql::parse_expr(hex_decode(cols[5])) {
+        Ok(e) =>
+        match promql::eval_range(e, store, parse_i64(cols[2]), parse_i64(cols[3]), parse_i64(cols[4])) {
+          Ok(m) => print_matrix(world, id, m.series)
+          Err(_) => io_println(world, id + "\tERR")
+        }
+        Err(_) => io_println(world, id + "\tPARSE_ERR")
+      }
+    }
+  }
+  0
+}
+
+// ---------------------------------------------------------------------------
+// dos mode
+// ---------------------------------------------------------------------------
+
+///|
+fn repeat_str(s : String, n : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    sb.write_string(s)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn limits_depth(d : Int) -> promql::PromqlLimits {
+  promql::PromqlLimits::new(d, 1000000, 1000000, 10000, 1000000)
+}
+
+///|
+fn small_store() -> promql::SeriesStore {
+  let store = promql::SeriesStore::new()
+  store.add_metric("foo", [("job", "a")], [(0L, 1.0), (60000L, 2.0)])
+  store.add_metric("foo", [("job", "b")], [(0L, 3.0), (60000L, 4.0)])
+  store
+}
+
+///| Parse, format, prettify and evaluate `q`; every stage must return, never trap.
+fn full_pipeline(q : String, limits : promql::PromqlLimits) -> String {
+  match promql::parse_expr_with_limits(q, limits) {
+    Ok(e) => {
+      let f = promql::format_expr(e)
+      let p = promql::prettify_expr(e)
+      let _ = promql::inspect_selectors(e)
+      match promql::eval_instant_with_limits(e, small_store(), 60000L, limits) {
+        Ok(_) => "ok fmt_len=" + f.length().to_string() + " pretty_len=" + p.length().to_string()
+        Err(err) => "err:" + kind_name(err)
+      }
+    }
+    Err(err) => "err:" + kind_name(err)
+  }
+}
+
+///|
+fn run_dos(world : World, name : String, n : Int, d : Int) -> Int {
+  let dl = promql::PromqlLimits::default()
+  let r = if name == "paren" {
+    full_pipeline(repeat_str("(", n) + "1" + repeat_str(")", n), limits_depth(d))
+  } else if name == "sumnest" {
+    full_pipeline(repeat_str("sum(", n) + "foo" + repeat_str(")", n), limits_depth(d))
+  } else if name == "chain" {
+    full_pipeline("1" + repeat_str("+1", n - 1), limits_depth(d))
+  } else if name == "chain_parse_only" {
+    match promql::parse_expr_with_limits("1" + repeat_str("+1", n - 1), limits_depth(d)) {
+      Ok(e) => "ok nodes=" + e.node_count().to_string()
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "chain_format_only" {
+    match promql::parse_expr_with_limits("1" + repeat_str("+1", n - 1), limits_depth(d)) {
+      Ok(e) => "ok fmt_len=" + promql::format_expr(e).length().to_string()
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "chain_pretty_only" {
+    match promql::parse_expr_with_limits("1" + repeat_str("+1", n - 1), limits_depth(d)) {
+      Ok(e) => "ok pretty_len=" + promql::prettify_expr(e).length().to_string()
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "chain_eval_only" {
+    match promql::parse_expr_with_limits("1" + repeat_str("+1", n - 1), limits_depth(d)) {
+      Ok(e) =>
+      match promql::eval_instant(e, promql::SeriesStore::new(), 0L) {
+        Ok(promql::EvalValue::Scalar(v)) => "ok value=" + fmt_f(v)
+        Ok(_) => "ok"
+        Err(err) => "err:" + kind_name(err)
+      }
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "agg_scale" {
+    // n distinct series; grouping and 1:1 matching should be ~linear (Go uses hash maps).
+    let store = promql::SeriesStore::new()
+    let mut k = 0
+    while k < n {
+      store.add_metric("foo", [("i", k.to_string())], [(0L, k.to_double())])
+      k = k + 1
+    }
+    let q = if d == 1 { "count by (i) (foo)" } else { "foo * on(i) foo" }
+    match promql::parse_expr(q) {
+      Ok(e) =>
+      match promql::eval_instant(e, store, 0L) {
+        Ok(promql::EvalValue::Vector(vs)) => "ok n=" + vs.length().to_string()
+        Ok(_) => "ok"
+        Err(err) => "err:" + kind_name(err)
+      }
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "chain_add_30000" {
+    // 30,000-term left-associative chain: 59,999 tokens < default max_tokens.
+    full_pipeline("1" + repeat_str("+1", 29999), dl)
+  } else if name == "chain_and_20000" {
+    full_pipeline("foo" + repeat_str(" and foo", 19999), dl)
+  } else if name == "chain_pow_30000" {
+    // Right-associative `^` must hit max_depth instead of recursing natively.
+    full_pipeline("1" + repeat_str("^1", 29999), dl)
+  } else if name == "paren_200_default" {
+    full_pipeline(repeat_str("(", 200) + "1" + repeat_str(")", 200), dl)
+  } else if name == "paren_1000_depth1000" {
+    full_pipeline(repeat_str("(", 1000) + "1" + repeat_str(")", 1000), limits_depth(1000))
+  } else if name == "paren_20000_depth20000" {
+    full_pipeline(repeat_str("(", 20000) + "1" + repeat_str(")", 20000), limits_depth(20000))
+  } else if name == "sum_1000_depth1000" {
+    full_pipeline(repeat_str("sum(", 1000) + "foo" + repeat_str(")", 1000), limits_depth(1000))
+  } else if name == "sum_20000_depth20000" {
+    full_pipeline(repeat_str("sum(", 20000) + "foo" + repeat_str(")", 20000), limits_depth(20000))
+  } else if name == "unary_20000_depth20000" {
+    full_pipeline(repeat_str("-", 20000) + "1", limits_depth(20000))
+  } else if name == "number_1e300" {
+    full_pipeline("1e300", dl)
+  } else if name == "number_1e19_vector" {
+    full_pipeline("foo * 1e19", dl)
+  } else if name == "count_values_1e300" {
+    full_pipeline("count_values(\"v\", foo * 1e300)", dl)
+  } else if name == "at_1e300" {
+    full_pipeline("foo @ 1e300", dl)
+  } else if name == "at_neg_1e300" {
+    full_pipeline("foo @ -1e300", dl)
+  } else if name == "topk_1e300" {
+    full_pipeline("topk(1e300, foo)", dl)
+  } else if name == "topk_nan" {
+    full_pipeline("topk(NaN, foo)", dl)
+  } else if name == "topk_int_max" {
+    full_pipeline("topk(2147483647, foo)", dl)
+  } else if name == "bottomk_neg_inf" {
+    full_pipeline("bottomk(-Inf, foo)", dl)
+  } else if name == "limitk_1e300" {
+    full_pipeline("limitk(1e300, foo)", dl)
+  } else if name == "limit_ratio_nan" {
+    full_pipeline("limit_ratio(NaN, foo)", dl)
+  } else if name == "quantile_nan" {
+    full_pipeline("quantile(NaN, foo)", dl)
+  } else if name == "duration_overflow" {
+    full_pipeline("rate(foo[99999999999y])", dl)
+  } else if name == "regex_repeat_bomb" {
+    full_pipeline("foo{job=~\"(?:(?:x{1000}){1000}){1000}\"}", dl)
+  } else if name == "regex_nested_star" {
+    let store = promql::SeriesStore::new()
+    store.add_metric("foo", [("job", repeat_str("a", 50000))], [(0L, 1.0)])
+    match promql::parse_expr("foo{job=~\"(a*)*(a|aa)*b\"}") {
+      Ok(e) =>
+      match promql::eval_instant(e, store, 0L) {
+        Ok(_) => "ok"
+        Err(err) => "err:" + kind_name(err)
+      }
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "range_1e12_steps" {
+    match promql::parse_expr("foo") {
+      Ok(e) =>
+      match promql::eval_range(e, promql::SeriesStore::new(), 0L, 1000000000000L, 1L) {
+        Ok(_) => "ok"
+        Err(err) => "err:" + kind_name(err)
+      }
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "range_int64_wrap" {
+    match promql::parse_expr("foo") {
+      Ok(e) =>
+      match promql::eval_range(e, promql::SeriesStore::new(), 9223372036854775000L, 9223372036854775807L, 600L) {
+        Ok(m) => "ok series=" + m.series.length().to_string()
+        Err(err) => "err:" + kind_name(err)
+      }
+      Err(err) => "err:" + kind_name(err)
+    }
+  } else if name == "subquery_100y_1ms" {
+    full_pipeline("max_over_time(foo[100y:1ms])", dl)
+  } else if name == "subquery_nested_steps" {
+    full_pipeline("max_over_time(max_over_time(foo[1d:1s])[1d:1s])", dl)
+  } else {
+    "unknown-scenario"
+  }
+  io_println(world, "RESULT " + r)
+  0
+}
+
+// ---------------------------------------------------------------------------
+// entry
+// ---------------------------------------------------------------------------
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 3 {
+    io_println(world, "usage: promql_audit_probe parse|eval <file> | dos <scenario>")
+    return 2
+  }
+  let mode = args[1]
+  if mode == "parse" {
+    run_parse(world, args[2])
+  } else if mode == "eval" {
+    run_eval(world, args[2])
+  } else if mode == "dos" {
+    let n = if args.length() >= 4 { parse_i64(args[3]).to_int() } else { 0 }
+    let d = if args.length() >= 5 { parse_i64(args[4]).to_int() } else { 128 }
+    run_dos(world, args[2], n, d)
+  } else {
+    io_println(world, "unknown mode: " + mode)
+    2
+  }
+}

@@ -1,0 +1,792 @@
+///| Canonical PromQL formatter (`format_expr`), multi-line prettifier (`prettify_expr`),
+///| and AST inspection utilities (`extract_metric_names`, `inspect_selectors`).
+///|
+///| All tree traversals are iterative (explicit heap stacks) so deep left-associative
+///| chains never overflow Native or Wasm32 call stacks.
+
+fn quote_promql_string(s : String) -> String {
+  let digits = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  sb.write_byte(34.to_byte()) // '"'
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b == 92 {
+      sb.write_string("\\\\")
+    } else if b == 34 {
+      sb.write_string("\\\"")
+    } else if b == 7 {
+      sb.write_string("\\a")
+    } else if b == 8 {
+      sb.write_string("\\b")
+    } else if b == 12 {
+      sb.write_string("\\f")
+    } else if b == 10 {
+      sb.write_string("\\n")
+    } else if b == 13 {
+      sb.write_string("\\r")
+    } else if b == 9 {
+      sb.write_string("\\t")
+    } else if b == 11 {
+      sb.write_string("\\v")
+    } else if b < 32 || b == 127 {
+      sb.write_string("\\x")
+      sb.write_byte(digits.code_unit_at((b >> 4) & 15).to_byte())
+      sb.write_byte(digits.code_unit_at(b & 15).to_byte())
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    i = i + 1
+  }
+  sb.write_byte(34.to_byte())
+  sb.to_string()
+}
+
+fn format_at_ts(ms : Int64) -> String {
+  let neg = ms < 0L
+  let abs_ms = if neg { -ms } else { ms }
+  let secs = abs_ms / 1000L
+  let rem = abs_ms % 1000L
+  let sb = StringBuilder::new()
+  if neg {
+    sb.write_string("-")
+  }
+  sb.write_string(secs.to_string())
+  sb.write_string(".")
+  if rem < 10L {
+    sb.write_string("00")
+  } else if rem < 100L {
+    sb.write_string("0")
+  }
+  sb.write_string(rem.to_string())
+  sb.to_string()
+}
+
+///| Decompose a finite non-zero Double's shortest decimal string into `(neg, digits, exp10)`
+///| where `|v| = digits[0].digits[1:] * 10^exp10` and `digits` has no leading or trailing zeros.
+fn decompose_f64_str(raw : String) -> (Bool, String, Int) {
+  let n = raw.length()
+  let mut i = 0
+  let mut neg = false
+  if i < n && raw.code_unit_at(i) == 45 {
+    neg = true
+    i = i + 1
+  }
+  let sb = StringBuilder::new()
+  let mut seen_dot = false
+  let mut seen_nonzero = false
+  let mut dp = 0
+  while i < n {
+    let b = raw.code_unit_at(i)
+    if b == 101 || b == 69 {
+      break
+    }
+    if b == 46 {
+      seen_dot = true
+      i = i + 1
+      continue
+    }
+    if b >= 48 && b <= 57 {
+      if b != 48 {
+        seen_nonzero = true
+      }
+      if seen_nonzero {
+        sb.write_byte(b.to_byte())
+        if !seen_dot {
+          dp = dp + 1
+        }
+      } else if seen_dot {
+        dp = dp - 1
+      }
+    }
+    i = i + 1
+  }
+  let mut exp_part = 0
+  if i < n && (raw.code_unit_at(i) == 101 || raw.code_unit_at(i) == 69) {
+    i = i + 1
+    let mut eneg = false
+    if i < n && raw.code_unit_at(i) == 45 {
+      eneg = true
+      i = i + 1
+    } else if i < n && raw.code_unit_at(i) == 43 {
+      i = i + 1
+    }
+    while i < n && raw.code_unit_at(i) >= 48 && raw.code_unit_at(i) <= 57 {
+      exp_part = exp_part * 10 + (raw.code_unit_at(i) - 48)
+      i = i + 1
+    }
+    if eneg {
+      exp_part = -exp_part
+    }
+  }
+  let mut ds = sb.to_string()
+  let mut end = ds.length()
+  while end > 1 && ds.code_unit_at(end - 1) == 48 {
+    end = end - 1
+  }
+  if end < ds.length() {
+    ds = ds.slice(0, end)
+  }
+  if ds.length() == 0 {
+    return (neg, "0", 0)
+  }
+  // dp is position of decimal point relative to first nonzero digit; exp10 = dp + exp_part - 1
+  (neg, ds, dp + exp_part - 1)
+}
+
+///| Format a Double matching Go `strconv.FormatFloat(v, 'g', -1, 64)` (`fmt.Sprint(v)`).
+pub fn format_number_lit(v : Double) -> String {
+  if v != v {
+    return "NaN"
+  }
+  if v == 1.0 / 0.0 {
+    return "+Inf"
+  }
+  if v == -1.0 / 0.0 {
+    return "-Inf"
+  }
+  if v == 0.0 {
+    if 1.0 / v < 0.0 {
+      return "-0"
+    }
+    return "0"
+  }
+  let av = if v < 0.0 { -v } else { v }
+  if av > 0.0 && av * 0.5 == 0.0 {
+    return if v < 0.0 { "-5e-324" } else { "5e-324" }
+  }
+  let (neg, digits, exp10) = decompose_f64_str(v.to_string())
+  let sb = StringBuilder::new()
+  if neg {
+    sb.write_string("-")
+  }
+  let nd = digits.length()
+  if exp10 < -4 || exp10 >= 6 {
+    // Scientific notation: d[.ddd]e[+|-]dd
+    sb.write_byte(digits.code_unit_at(0).to_byte())
+    if nd > 1 {
+      sb.write_string(".")
+      sb.write_string(digits.slice(1, nd))
+    }
+    sb.write_string("e")
+    let abs_e = if exp10 < 0 {
+      sb.write_string("-")
+      -exp10
+    } else {
+      sb.write_string("+")
+      exp10
+    }
+    if abs_e < 10 {
+      sb.write_string("0")
+    }
+    sb.write_string(abs_e.to_string())
+  } else if exp10 < 0 {
+    // 0.00...digits
+    sb.write_string("0.")
+    let mut z = -exp10 - 1
+    while z > 0 {
+      sb.write_string("0")
+      z = z - 1
+    }
+    sb.write_string(digits)
+  } else if exp10 + 1 >= nd {
+    // Integer: digits00...
+    sb.write_string(digits)
+    let mut z = exp10 + 1 - nd
+    while z > 0 {
+      sb.write_string("0")
+      z = z - 1
+    }
+  } else {
+    // Fixed with decimal point
+    sb.write_string(digits.slice(0, exp10 + 1))
+    sb.write_string(".")
+    sb.write_string(digits.slice(exp10 + 1, nd))
+  }
+  sb.to_string()
+}
+
+///| Format a Double matching Go `strconv.FormatFloat(v, 'f', -1, 64)` (used by `count_values`).
+pub fn format_f64_fixed(v : Double) -> String {
+  if v != v {
+    return "NaN"
+  }
+  if v == 1.0 / 0.0 {
+    return "+Inf"
+  }
+  if v == -1.0 / 0.0 {
+    return "-Inf"
+  }
+  if v == 0.0 {
+    if 1.0 / v < 0.0 {
+      return "-0"
+    }
+    return "0"
+  }
+  let av = if v < 0.0 { -v } else { v }
+  if av > 0.0 && av * 0.5 == 0.0 {
+    return if v < 0.0 { "-5e-324" } else { "5e-324" }
+  }
+  let (neg, digits, exp10) = decompose_f64_str(v.to_string())
+  let sb = StringBuilder::new()
+  if neg {
+    sb.write_string("-")
+  }
+  let nd = digits.length()
+  if exp10 < 0 {
+    sb.write_string("0.")
+    let mut z = -exp10 - 1
+    while z > 0 {
+      sb.write_string("0")
+      z = z - 1
+    }
+    sb.write_string(digits)
+  } else if exp10 + 1 >= nd {
+    sb.write_string(digits)
+    let mut z = exp10 + 1 - nd
+    while z > 0 {
+      sb.write_string("0")
+      z = z - 1
+    }
+  } else {
+    sb.write_string(digits.slice(0, exp10 + 1))
+    sb.write_string(".")
+    sb.write_string(digits.slice(exp10 + 1, nd))
+  }
+  sb.to_string()
+}
+
+fn write_at_and_offset(sb : StringBuilder, at_mod : AtModifier, offset_ms : Int64) -> Unit {
+  match at_mod {
+    AtModifier::None => ()
+    AtModifier::Timestamp(ms) => {
+      sb.write_string(" @ ")
+      sb.write_string(format_at_ts(ms))
+    }
+    AtModifier::Start => sb.write_string(" @ start()")
+    AtModifier::End => sb.write_string(" @ end()")
+  }
+  if offset_ms != 0L {
+    sb.write_string(" offset ")
+    sb.write_string(format_duration_ms_impl(offset_ms))
+  }
+}
+
+fn write_label_list(sb : StringBuilder, labels : Array[String]) -> Unit {
+  sb.write_string("(")
+  let mut i = 0
+  while i < labels.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    if is_valid_label_name(labels[i]) {
+      sb.write_string(labels[i])
+    } else {
+      sb.write_string(quote_promql_string(labels[i]))
+    }
+    i = i + 1
+  }
+  sb.write_string(")")
+}
+
+fn sort_strings_in_place(xs : Array[String]) -> Unit {
+  let mut k = 1
+  while k < xs.length() {
+    let cur = xs[k]
+    let mut j = k - 1
+    while j >= 0 && xs[j] > cur {
+      xs[j + 1] = xs[j]
+      j = j - 1
+    }
+    xs[j + 1] = cur
+    k = k + 1
+  }
+}
+
+fn write_vector_selector_core(sb : StringBuilder, name : String, matchers : Array[LabelMatcher]) -> Unit {
+  let has_bare_name = name.length() > 0
+  if has_bare_name {
+    sb.write_string(name)
+  }
+  let parts : Array[String] = []
+  let mut i = 0
+  while i < matchers.length() {
+    let m = matchers[i]
+    let skip = has_bare_name && m.name == "__name__" && match_op_eq(m.op, MatchOp::Equal) && m.value == name
+    if !skip {
+      let msb = StringBuilder::new()
+      if is_valid_label_name(m.name) {
+        msb.write_string(m.name)
+      } else {
+        msb.write_string(quote_promql_string(m.name))
+      }
+      msb.write_string(match_op_str(m.op))
+      msb.write_string(quote_promql_string(m.value))
+      parts.push(msb.to_string())
+    }
+    i = i + 1
+  }
+  if parts.length() > 0 || !has_bare_name {
+    sort_strings_in_place(parts)
+    sb.write_string("{")
+    let mut j = 0
+    while j < parts.length() {
+      if j > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string(parts[j])
+      j = j + 1
+    }
+    sb.write_string("}")
+  }
+}
+
+fn format_bin_op_header(op : BinOp, return_bool : Bool, vm : VectorMatching) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string(bin_op_str(op))
+  if return_bool {
+    sb.write_string(" bool")
+  }
+  if vm.matching_labels.length() > 0 || vm.on {
+    if vm.on {
+      sb.write_string(" on ")
+    } else {
+      sb.write_string(" ignoring ")
+    }
+    write_label_list(sb, vm.matching_labels)
+    match vm.card {
+      VectorMatchCardinality::ManyToOne => {
+        sb.write_string(" group_left ")
+        write_label_list(sb, vm.include_labels)
+      }
+      VectorMatchCardinality::OneToMany => {
+        sb.write_string(" group_right ")
+        write_label_list(sb, vm.include_labels)
+      }
+      _ => ()
+    }
+  }
+  sb.to_string()
+}
+
+fn format_agg_header(op : AggOp, grouping : Array[String], without : Bool) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string(agg_op_str(op))
+  if without {
+    sb.write_string(" without ")
+    write_label_list(sb, grouping)
+    sb.write_string(" ")
+  } else if grouping.length() > 0 {
+    sb.write_string(" by ")
+    write_label_list(sb, grouping)
+    sb.write_string(" ")
+  }
+  sb.to_string()
+}
+
+fn format_subquery_suffix(range_ms : Int64, step_ms : Int64, offset_ms : Int64, at_mod : AtModifier) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("[")
+  sb.write_string(format_duration_ms_impl(range_ms))
+  sb.write_string(":")
+  if step_ms > 0L {
+    sb.write_string(format_duration_ms_impl(step_ms))
+  }
+  sb.write_string("]")
+  write_at_and_offset(sb, at_mod, offset_ms)
+  sb.to_string()
+}
+
+enum FmtTask {
+  Node(Int)
+  Literal(String)
+}
+
+///| Iterative single-line AST formatter.
+fn write_expr_node(sb : StringBuilder, nodes : Array[ExprNode], root_id : Int) -> Unit {
+  let stack : Array[FmtTask] = [FmtTask::Node(root_id)]
+  while stack.length() > 0 {
+    let task = stack.pop()
+    match task {
+      None => break
+      Some(FmtTask::Literal(s)) => sb.write_string(s)
+      Some(FmtTask::Node(id)) =>
+      match nodes[id] {
+        ExprNode::NumberLiteral(v) => sb.write_string(format_number_lit(v))
+        ExprNode::StringLiteral(s) => sb.write_string(quote_promql_string(s))
+        ExprNode::VectorSelector(name, matchers, offset_ms, at_mod) => {
+          write_vector_selector_core(sb, name, matchers)
+          write_at_and_offset(sb, at_mod, offset_ms)
+        }
+        ExprNode::MatrixSelector(vs_id, range_ms) =>
+        match nodes[vs_id] {
+          ExprNode::VectorSelector(name, matchers, offset_ms, at_mod) => {
+            write_vector_selector_core(sb, name, matchers)
+            sb.write_string("[")
+            sb.write_string(format_duration_ms_impl(range_ms))
+            sb.write_string("]")
+            write_at_and_offset(sb, at_mod, offset_ms)
+          }
+          _ => ()
+        }
+        ExprNode::SubqueryExpr(inner, range_ms, step_ms, offset_ms, at_mod) => {
+          stack.push(FmtTask::Literal(format_subquery_suffix(range_ms, step_ms, offset_ms, at_mod)))
+          stack.push(FmtTask::Node(inner))
+        }
+        ExprNode::UnaryExpr(op, inner) => {
+          match op {
+            UnaryOp::Plus => sb.write_string("+")
+            UnaryOp::Minus => sb.write_string("-")
+          }
+          stack.push(FmtTask::Node(inner))
+        }
+        ExprNode::BinaryExpr(op, lhs, rhs, return_bool, vm) => {
+          stack.push(FmtTask::Node(rhs))
+          stack.push(FmtTask::Literal(" " + format_bin_op_header(op, return_bool, vm) + " "))
+          stack.push(FmtTask::Node(lhs))
+        }
+        ExprNode::ParenExpr(inner) => {
+          sb.write_string("(")
+          stack.push(FmtTask::Literal(")"))
+          stack.push(FmtTask::Node(inner))
+        }
+        ExprNode::AggregateExpr(op, inner, param_id, grouping, without, _) => {
+          sb.write_string(format_agg_header(op, grouping, without))
+          sb.write_string("(")
+          stack.push(FmtTask::Literal(")"))
+          stack.push(FmtTask::Node(inner))
+          if param_id >= 0 {
+            stack.push(FmtTask::Literal(", "))
+            stack.push(FmtTask::Node(param_id))
+          }
+        }
+        ExprNode::Call(name, args, _) => {
+          sb.write_string(name)
+          sb.write_string("(")
+          stack.push(FmtTask::Literal(")"))
+          let mut i = args.length() - 1
+          while i >= 0 {
+            stack.push(FmtTask::Node(args[i]))
+            if i > 0 {
+              stack.push(FmtTask::Literal(", "))
+            }
+            i = i - 1
+          }
+        }
+      }
+    }
+  }
+}
+
+///| Canonical single-line PromQL formatting (aligned with Go `parser.Expr.String()`).
+pub fn format_expr_impl(expr : ParsedExpr) -> String {
+  if expr.root < 0 || expr.root >= expr.nodes.length() {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  write_expr_node(sb, expr.nodes, expr.root)
+  sb.to_string()
+}
+
+fn write_indent(sb : StringBuilder, level : Int) -> Unit {
+  // Cap visual indent level at 64 so pathological 30,000-term chains stay O(N) instead of O(N^2).
+  let eff = if level > 64 { 64 } else { level }
+  let mut i = 0
+  while i < eff {
+    sb.write_string("  ")
+    i = i + 1
+  }
+}
+
+///| Compute exact single-line `format_expr` byte length of every AST node in O(N) bottom-up order.
+///| Since children are always pushed into the arena before parents, `0..nodes.length()` is topological!
+fn compute_node_str_lens(nodes : Array[ExprNode]) -> Array[Int] {
+  let n = nodes.length()
+  let lens : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let l = match nodes[i] {
+      ExprNode::NumberLiteral(v) => format_number_lit(v).length()
+      ExprNode::StringLiteral(s) => quote_promql_string(s).length()
+      ExprNode::VectorSelector(name, matchers, offset_ms, at_mod) => {
+        let sb = StringBuilder::new()
+        write_vector_selector_core(sb, name, matchers)
+        write_at_and_offset(sb, at_mod, offset_ms)
+        sb.to_string().length()
+      }
+      ExprNode::MatrixSelector(vs_id, range_ms) =>
+      match nodes[vs_id] {
+        ExprNode::VectorSelector(name, matchers, offset_ms, at_mod) => {
+          let sb = StringBuilder::new()
+          write_vector_selector_core(sb, name, matchers)
+          sb.write_string("[")
+          sb.write_string(format_duration_ms_impl(range_ms))
+          sb.write_string("]")
+          write_at_and_offset(sb, at_mod, offset_ms)
+          sb.to_string().length()
+        }
+        _ => 0
+      }
+      ExprNode::SubqueryExpr(inner, range_ms, step_ms, offset_ms, at_mod) =>
+      lens[inner] + format_subquery_suffix(range_ms, step_ms, offset_ms, at_mod).length()
+      ExprNode::UnaryExpr(_, inner) => 1 + lens[inner]
+      ExprNode::BinaryExpr(op, lhs, rhs, return_bool, vm) =>
+      lens[lhs] + 2 + format_bin_op_header(op, return_bool, vm).length() + lens[rhs]
+      ExprNode::ParenExpr(inner) => 2 + lens[inner]
+      ExprNode::AggregateExpr(op, inner, param_id, grouping, without, _) => {
+        let base = format_agg_header(op, grouping, without).length() + 2 + lens[inner]
+        if param_id >= 0 { base + lens[param_id] + 2 } else { base }
+      }
+      ExprNode::Call(name, args, _) => {
+        let mut total = name.length() + 2
+        let mut k = 0
+        while k < args.length() {
+          if k > 0 {
+            total = total + 2
+          }
+          total = total + lens[args[k]]
+          k = k + 1
+        }
+        total
+      }
+    }
+    lens.push(l)
+    i = i + 1
+  }
+  lens
+}
+
+enum PrettyTask {
+  Node(Int, Int, Bool) // (node_id, level, suppress_leading_indent)
+  Literal(String)
+  Indent(Int)
+}
+
+///| Multi-line indented PromQL prettifier matching Go `parser.Prettify()` (100-column threshold).
+pub fn prettify_expr_impl(expr : ParsedExpr) -> String {
+  if expr.root < 0 || expr.root >= expr.nodes.length() {
+    return ""
+  }
+  let lens = compute_node_str_lens(expr.nodes)
+  let sb = StringBuilder::new()
+  let stack : Array[PrettyTask] = [PrettyTask::Node(expr.root, 0, false)]
+  while stack.length() > 0 {
+    match stack.pop() {
+      None => break
+      Some(PrettyTask::Literal(s)) => sb.write_string(s)
+      Some(PrettyTask::Indent(lvl)) => write_indent(sb, lvl)
+      Some(PrettyTask::Node(id, level, suppress_indent)) => {
+        let needs_split = lens[id] > 100
+        match expr.nodes[id] {
+          ExprNode::BinaryExpr(op, lhs, rhs, return_bool, vm) =>
+          if !needs_split {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            write_expr_node(sb, expr.nodes, id)
+          } else {
+            let hdr = format_bin_op_header(op, return_bool, vm)
+            stack.push(PrettyTask::Node(rhs, level + 1, false))
+            stack.push(PrettyTask::Literal(hdr + "\n"))
+            stack.push(PrettyTask::Indent(level))
+            stack.push(PrettyTask::Literal("\n"))
+            stack.push(PrettyTask::Node(lhs, level + 1, suppress_indent))
+          }
+          ExprNode::AggregateExpr(op, inner, param_id, grouping, without, _) =>
+          if !needs_split {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            write_expr_node(sb, expr.nodes, id)
+          } else {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            sb.write_string(format_agg_header(op, grouping, without))
+            sb.write_string("(\n")
+            stack.push(PrettyTask::Literal(")"))
+            stack.push(PrettyTask::Indent(level))
+            stack.push(PrettyTask::Literal("\n"))
+            stack.push(PrettyTask::Node(inner, level + 1, false))
+            if param_id >= 0 {
+              stack.push(PrettyTask::Literal(",\n"))
+              stack.push(PrettyTask::Node(param_id, level + 1, false))
+            }
+          }
+          ExprNode::Call(name, args, _) =>
+          if !needs_split {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            write_expr_node(sb, expr.nodes, id)
+          } else {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            sb.write_string(name)
+            sb.write_string("(\n")
+            stack.push(PrettyTask::Literal(")"))
+            stack.push(PrettyTask::Indent(level))
+            stack.push(PrettyTask::Literal("\n"))
+            let mut k = args.length() - 1
+            while k >= 0 {
+              stack.push(PrettyTask::Node(args[k], level + 1, false))
+              if k > 0 {
+                stack.push(PrettyTask::Literal(",\n"))
+              }
+              k = k - 1
+            }
+          }
+          ExprNode::ParenExpr(inner) =>
+          if !needs_split {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            write_expr_node(sb, expr.nodes, id)
+          } else {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            sb.write_string("(\n")
+            stack.push(PrettyTask::Literal(")"))
+            stack.push(PrettyTask::Indent(level))
+            stack.push(PrettyTask::Literal("\n"))
+            stack.push(PrettyTask::Node(inner, level + 1, false))
+          }
+          ExprNode::SubqueryExpr(inner, range_ms, step_ms, offset_ms, at_mod) =>
+          if !needs_split {
+            // Go `SubqueryExpr.Pretty` omits leading indent when not split.
+            write_expr_node(sb, expr.nodes, id)
+          } else {
+            stack.push(PrettyTask::Literal(format_subquery_suffix(range_ms, step_ms, offset_ms, at_mod)))
+            stack.push(PrettyTask::Node(inner, level, suppress_indent))
+          }
+          ExprNode::UnaryExpr(op, inner) => {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            match op {
+              UnaryOp::Plus => sb.write_string("+")
+              UnaryOp::Minus => sb.write_string("-")
+            }
+            // Child omits leading indent since UnaryExpr already wrote indent + op
+            stack.push(PrettyTask::Node(inner, level, true))
+          }
+          _ => {
+            if !suppress_indent {
+              write_indent(sb, level)
+            }
+            write_expr_node(sb, expr.nodes, id)
+          }
+        }
+      }
+    }
+  }
+  sb.to_string()
+}
+
+fn sort_unique_strings(xs : Array[String]) -> Array[String] {
+  let out : Array[String] = []
+  let mut i = 0
+  while i < xs.length() {
+    let s = xs[i]
+    let mut dup = false
+    let mut j = 0
+    while j < out.length() {
+      if out[j] == s {
+        dup = true
+        break
+      }
+      j = j + 1
+    }
+    if !dup {
+      out.push(s)
+    }
+    i = i + 1
+  }
+  sort_strings_in_place(out)
+  out
+}
+
+///| Extract all distinct metric names from an expression, sorted ascending.
+pub fn extract_metric_names_impl(expr : ParsedExpr) -> Array[String] {
+  let names : Array[String] = []
+  let mut i = 0
+  while i < expr.nodes.length() {
+    match expr.nodes[i] {
+      ExprNode::VectorSelector(name, matchers, _, _) => {
+        if name.length() > 0 {
+          names.push(name)
+        } else {
+          let mut j = 0
+          while j < matchers.length() {
+            if matchers[j].name == "__name__" && match_op_eq(matchers[j].op, MatchOp::Equal) && matchers[j].value.length() > 0 {
+              names.push(matchers[j].value)
+            }
+            j = j + 1
+          }
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  sort_unique_strings(names)
+}
+
+///| Iterative AST selector collector (stack-safe on deep left-associative trees).
+fn collect_selectors(nodes : Array[ExprNode], root_id : Int, out : Array[SelectorInfo]) -> Unit {
+  if root_id < 0 || root_id >= nodes.length() {
+    return ()
+  }
+  let stack : Array[Int] = [root_id]
+  while stack.length() > 0 {
+    match stack.pop() {
+      None => break
+      Some(id) => {
+        if id < 0 || id >= nodes.length() {
+          continue
+        }
+        match nodes[id] {
+          ExprNode::VectorSelector(name, matchers, offset_ms, at_mod) =>
+          out.push(SelectorInfo::{ metric_name: name, matchers, range_ms: 0L, offset_ms, at_mod })
+          ExprNode::MatrixSelector(vs_id, range_ms) =>
+          match nodes[vs_id] {
+            ExprNode::VectorSelector(name, matchers, offset_ms, at_mod) =>
+            out.push(SelectorInfo::{ metric_name: name, matchers, range_ms, offset_ms, at_mod })
+            _ => ()
+          }
+          ExprNode::SubqueryExpr(inner, _, _, _, _) => stack.push(inner)
+          ExprNode::UnaryExpr(_, inner) => stack.push(inner)
+          ExprNode::BinaryExpr(_, lhs, rhs, _, _) => {
+            stack.push(rhs)
+            stack.push(lhs)
+          }
+          ExprNode::ParenExpr(inner) => stack.push(inner)
+          ExprNode::AggregateExpr(_, inner, param_id, _, _, _) => {
+            stack.push(inner)
+            if param_id >= 0 {
+              stack.push(param_id)
+            }
+          }
+          ExprNode::Call(_, args, _) => {
+            let mut i = args.length() - 1
+            while i >= 0 {
+              stack.push(args[i])
+              i = i - 1
+            }
+          }
+          _ => ()
+        }
+      }
+    }
+  }
+}
+
+///| Inspect all vector and matrix selectors in AST traversal order.
+pub fn inspect_selectors_impl(expr : ParsedExpr) -> Array[SelectorInfo] {
+  let out : Array[SelectorInfo] = []
+  collect_selectors(expr.nodes, expr.root, out)
+  out
+}

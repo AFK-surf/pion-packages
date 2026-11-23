@@ -1,0 +1,185 @@
+///| Regression tests for Wave 14 red-team findings F01–F18 against Prometheus v0.302.1.
+
+///|
+test "promql_rt_f01_f02_stack_safety_and_depth_ceiling" {
+  // F01: deep left-associative chain under default limits evaluates without stack overflow
+  let sb = StringBuilder::new()
+  sb.write_string("1")
+  let mut i = 1
+  while i < 1000 {
+    sb.write_string("+1")
+    i = i + 1
+  }
+  let q = sb.to_string()
+  let expr = match parse_expr(q) {
+    Ok(e) => e
+    Err(err) => {
+      debug_assert(false, "F01 parse failed: " + err.to_string())
+      return ()
+    }
+  }
+  let formatted = format_expr(expr)
+  debug_assert(formatted.length() > 1000, "F01 format_expr")
+  let pretty = prettify_expr(expr)
+  debug_assert(pretty.length() > 1000, "F01 prettify_expr")
+  let _ = inspect_selectors(expr)
+  match eval_instant(expr, SeriesStore::new(), 0L) {
+    Ok(EvalValue::Scalar(v)) => debug_assert(v == 1000.0, "F01 eval 1000 terms == 1000.0")
+    _ => debug_assert(false, "F01 eval failed")
+  }
+
+  // F02: max_depth above safe ceiling returns InvalidLimits
+  let bad_limits = PromqlLimits::new(1000, 100000, 100000, 1000, 100000)
+  match parse_expr_with_limits("((((1))))", bad_limits) {
+    Ok(_) => debug_assert(false, "F02 expected InvalidLimits")
+    Err(e) => debug_assert(e.is_kind(PromqlErrorKind::InvalidLimits), "F02 expected InvalidLimits")
+  }
+}
+
+///|
+test "promql_rt_f03_range_and_subquery_budgets" {
+  let e_foo = match parse_expr("foo") {
+    Ok(e) => e
+    Err(_) => return ()
+  }
+  // F03.a: > 11,000 range steps rejected
+  match eval_range(e_foo, SeriesStore::new(), 0L, 1000000000000L, 1L) {
+    Ok(_) => debug_assert(false, "F03.a should reject >11000 steps")
+    Err(e) => debug_assert(e.is_kind(PromqlErrorKind::LimitExceeded), "F03.a LimitExceeded")
+  }
+  // F03.b: Int64::MAX wrap-around terminates cleanly
+  match eval_range(e_foo, SeriesStore::new(), 9223372036854775000L, 9223372036854775807L, 600L) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "F03.b should succeed: " + e.to_string())
+  }
+  // F03.c: huge subquery step count rejected
+  let e_sub = match parse_expr("max_over_time(foo[100y:1ms])") {
+    Ok(e) => e
+    Err(_) => return ()
+  }
+  match eval_instant(e_sub, SeriesStore::new(), 60000L) {
+    Ok(_) => debug_assert(false, "F03.c should reject huge subquery")
+    Err(e) => debug_assert(e.is_kind(PromqlErrorKind::LimitExceeded), "F03.c LimitExceeded")
+  }
+}
+
+///|
+test "promql_rt_f04_f05_f06_f07_f08_f09_eval_semantics" {
+  // F04: Prometheus 3.x rate/increase extrapolation order
+  let store = SeriesStore::new()
+  store.add_metric("req", [("job", "web")], [(150000L, 10.0), (200000L, 20.0), (250000L, 30.0), (300000L, 40.0)])
+  match parse_expr("increase(req{job=\"web\"}[5m])") {
+    Ok(e) =>
+    match eval_instant(e, store, 300000L) {
+      Ok(EvalValue::Vector(vs)) => {
+        debug_assert(vs.length() == 1, "F04 1 series")
+        let diff = if vs[0].value > 35.0 { vs[0].value - 35.0 } else { 35.0 - vs[0].value }
+        debug_assert(diff < 1e-6, "F04 increase == 35.0, got " + vs[0].value.to_string())
+      }
+      _ => debug_assert(false, "F04 eval failed")
+    }
+    Err(_) => debug_assert(false, "F04 parse failed")
+  }
+
+  // F05: left-open lookback (t - 5m, t] and F09: timestamp() returns sample timestamp
+  let s2 = SeriesStore::new()
+  s2.add_metric("old", [("job", "a")], [(0L, 42.0)])
+  match parse_expr("old") {
+    Ok(e) =>
+    match eval_instant(e, s2, 300000L) {
+      Ok(EvalValue::Vector(vs)) => debug_assert(vs.length() == 0, "F05 sample at exact 5m boundary is stale")
+      _ => debug_assert(false, "F05 eval failed")
+    }
+    Err(_) => debug_assert(false, "F05 parse failed")
+  }
+  match parse_expr("timestamp(old)") {
+    Ok(e) =>
+    match eval_instant(e, s2, 60000L) {
+      Ok(EvalValue::Vector(vs)) => debug_assert(vs.length() == 1 && vs[0].value == 0.0, "F09 timestamp() == 0.0")
+      _ => debug_assert(false, "F09 eval failed")
+    }
+    Err(_) => debug_assert(false, "F09 parse failed")
+  }
+
+  // F06: many-to-one without group_left returns EvalError
+  let s3 = SeriesStore::new()
+  s3.add_metric("a", [("job", "x"), ("i", "1")], [(0L, 1.0)])
+  s3.add_metric("a", [("job", "x"), ("i", "2")], [(0L, 2.0)])
+  s3.add_metric("b", [("job", "x")], [(0L, 10.0)])
+  match parse_expr("a * on(job) b") {
+    Ok(e) =>
+    match eval_instant(e, s3, 0L) {
+      Ok(_) => debug_assert(false, "F06 should error on many-to-one without group_left")
+      Err(err) => debug_assert(err.is_kind(PromqlErrorKind::EvalError), "F06 EvalError")
+    }
+    Err(_) => debug_assert(false, "F06 parse failed")
+  }
+
+  // F07: topk/bottomk rank NaN last
+  let s4 = SeriesStore::new()
+  s4.add_metric("n", [("k", "nan")], [(0L, 0.0 / 0.0)])
+  s4.add_metric("n", [("k", "five")], [(0L, 5.0)])
+  s4.add_metric("n", [("k", "one")], [(0L, 1.0)])
+  match parse_expr("topk(1, n)") {
+    Ok(e) =>
+    match eval_instant(e, s4, 0L) {
+      Ok(EvalValue::Vector(vs)) => debug_assert(vs.length() == 1 && vs[0].value == 5.0, "F07 topk skips NaN")
+      _ => debug_assert(false, "F07 topk failed")
+    }
+    Err(_) => debug_assert(false, "F07 parse failed")
+  }
+
+  // F08: (?s) multiline regex matching
+  let s5 = SeriesStore::new()
+  s5.add_metric("ml", [("v", "line1\nline2")], [(0L, 1.0)])
+  match parse_expr("ml{v=~\"line1.*\"}") {
+    Ok(e) =>
+    match eval_instant(e, s5, 0L) {
+      Ok(EvalValue::Vector(vs)) => debug_assert(vs.length() == 1, "F08 dot matches newline")
+      _ => debug_assert(false, "F08 eval failed")
+    }
+    Err(_) => debug_assert(false, "F08 parse failed")
+  }
+}
+
+///|
+test "promql_rt_f10_f11_f12_f13_f14_parse_format_parity" {
+  // F10: exact IEEE-754 parsing + unary folding round-trip
+  let rt_cases : Array[(String, String)] = [
+    ("1e300", "1e+300"),
+    ("1e-300", "1e-300"),
+    ("5e-324", "5e-324"),
+    ("2.2250738585072014e-308", "2.2250738585072014e-308"),
+    ("+Inf", "+Inf"),
+    ("-Inf", "-Inf"),
+    ("-NaN", "NaN"),
+    ("1_000_000", "1e+06"),
+    ("0700", "448"),
+    ("foo @ 1.0005", "foo @ 1.001"),
+    ("{__name__=\"foo\"}", "{__name__=\"foo\"}"),
+    ("sum by () (foo)", "sum(foo)"),
+    ("foo * ignoring() bar", "foo * bar"),
+  ]
+  let mut i = 0
+  while i < rt_cases.length() {
+    let (inp, exp) = rt_cases[i]
+    match parse_expr(inp) {
+      Ok(e) => {
+        let got = format_expr(e)
+        debug_assert(got == exp, "F10/F13 format mismatch for " + inp + ": got " + got + ", expected " + exp)
+        match parse_expr(got) {
+          Ok(e2) => debug_assert(format_expr(e2) == got, "F10 roundtrip failed for " + inp)
+          Err(err) => debug_assert(false, "F10 reparse failed for " + inp + ": " + err.to_string())
+        }
+      }
+      Err(err) => debug_assert(false, "F10 parse failed for " + inp + ": " + err.to_string())
+    }
+    i = i + 1
+  }
+
+  // F14: prettify_expr keeps <= 100-col expressions on one line
+  match parse_expr("sum by (a) (foo)") {
+    Ok(e) => debug_assert(prettify_expr(e) == "sum by (a) (foo)", "F14 short expr single line")
+    Err(_) => debug_assert(false, "F14 parse failed")
+  }
+}
