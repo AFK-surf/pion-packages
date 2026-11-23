@@ -69,6 +69,14 @@ match b.encode() {
 - **Dual-Target Wasm32 Smoke (`packages/wasm/wasm_smoke`)**: All 4 build modes (Native debug/release + Wasm32 debug/release) exit `0` with byte-identical stdout (`sha256:317ffbc8f75a2ad22c2fe64217674c198a7b9d3a4a20efa7cd432856e77514e5`).
 - **Formatting & Typecheck**: `sh scripts/verify.sh packages/wasm` passes with 0 diagnostics and a clean worktree.
 
+## Formal Verification (Lean 4)
+
+The core WebAssembly 2.0 type codec, canonical section ordering, polymorphic stack type matcher, limits validator, and strict LEB128 terminal-byte checks in `packages/wasm/src/` (`ValType`, `val_type_code`, `val_type_from_code`, `val_type_equals`, `RefType`, `ref_type_code`, `ref_type_from_code`, `ref_type_to_val_type`, `ExportKind`, `export_kind_code`, `Limits`, `Limits::new`, `section_order_rank`, `val_type_to_id`, `ref_type_to_id`, `is_ref_id`, `stack_type_compat`, `limits_err_code`, `leb128_i32_single_byte`, `leb128_u32_5th_valid`, `leb128_u64_10th_valid`, `leb128_i32_5th_valid`, `leb128_i64_10th_valid`, `leb128_s33_5th_valid`) are annotated with `#verify`, extracted directly into Lean 4 via `pionc extract-lean`, and mechanically proved in `packages/wasm/proofs/` (**24 theorems, 0 `sorry` / `admit` / `bv_decide` / `native_decide`, standard axioms only**):
+
+- **`WasmProofs/CodecAndTypes.lean` (12 theorems)**: Exact lossless encode/decode round-trip and injectivity for `ValType` and `RefType`, reference-to-value type embedding compatibility, `ExportKind` injectivity, abstract stack ID range `[0, 6]` & reference-type equivalence, and WebAssembly 2.0 canonical section ordering (`DataCount = 12` ranked `10` strictly between `Element = 9` and `Code = 10` / `Data = 11`, injective on all 12 standard sections).
+- **`WasmProofs/ValidateAndLeb128.lean` (12 theorems)**: Polymorphic stack type compatibility (reflexive, symmetric, universal `vt_unknown = -1`, exact equality on concrete types), complete WebAssembly 2.0 §3.2.5 `Limits` validity characterization (`limits_err_code` and `Limits::new`), single-byte signed LEB128 range `[-64, 63]`, and exact Wasm 2.0 §5.2.2 terminal-byte acceptance sets for `u32`, `u64`, `i32` (`0x00..0x07 ∪ 0x78..0x7F`), `i64` (`{0x00, 0x7F}`), and `s33` (`0x00..0x0F ∪ 0x70..0x7F`).
+- **Differential Cross-Check**: `packages/wasm/proofs/EvalDiff.lean` cross-checks 44 cases between Native Pion execution and Lean 4 `#eval` (`diff -u` exit `0`). Run `sh packages/wasm/proofs/run_proofs.sh` to reproduce end-to-end.
+
 ## Head-to-Head Benchmarks
 
 Measured on `Darwin arm64` via `sh packages/wasm/bench/run_bench.sh` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) on a real **395,839 B (387 KiB)** compiler-generated `.wasm` corpus (`wasm_smoke` compiled with `pionc --target wasm32 --release`), comparing:
