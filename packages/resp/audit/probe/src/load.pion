@@ -1,0 +1,286 @@
+import "resp"
+
+///| Long-running streaming (RSS / buffer growth), complexity and fuzz probes.
+
+///|
+fn stress_templates() -> Array[String] {
+  [
+    "+OK\r\n", ":-123456789\r\n", "$11\r\nhello world\r\n", "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
+    "%2\r\n+a\r\n:1\r\n+b\r\n,2.5\r\n", "|1\r\n+ttl\r\n:5\r\n$3\r\nabc\r\n", "$?\r\n;3\r\nabc\r\n;2\r\nde\r\n;0\r\n",
+    "*?\r\n:1\r\n~2\r\n#t\r\n_\r\n.\r\n", ">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$1\r\nx\r\n", "(12345678901234567890\r\n",
+    "=8\r\ntxt:abcd\r\n", "-ERR wrong type\r\n",
+  ]
+}
+
+///| Stream `n` mixed frames through one StreamDecoder in LCG-random 1..4096-byte chunks,
+///| including one 1 KiB bulk every 12 frames; report counts and buffer capacity high-water mark.
+fn run_stress(world : World, n : Int) -> Int {
+  let tpl = stress_templates()
+  let big = concat_bytes(["$1024\r\n".to_bytes(), repeat_bytes("x", 1024, "\r\n")])
+  let parts : Array[Bytes] = []
+  let expect : Array[resp::RespFrame] = []
+  let mut c = 0
+  while c < 8 {
+    let mut k = 0
+    while k < tpl.length() {
+      let w = if k == 2 && c % 2 == 0 { big } else { tpl[k].to_bytes() }
+      parts.push(w)
+      match resp::decode_default(w) {
+        Ok(f) => expect.push(f)
+        Err(_) => {
+          io_println(world, "stress template decode failed")
+          return 2
+        }
+      }
+      k = k + 1
+    }
+    c = c + 1
+  }
+  let block = concat_bytes(parts)
+  let per_block = expect.length()
+  let blocks = (n + per_block - 1) / per_block
+  let total_frames = blocks * per_block
+  let total_bytes = block.length().to_int64() * blocks.to_int64()
+  let dec = resp::StreamDecoder::default()
+  dec.set_allow_inline(false)
+  let rng = Lcg::{ s: 7 }
+  let tmp = Bytes::new(4096)
+  let mut sent : Int64 = 0L
+  let mut boff = 0
+  let mut got = 0
+  let mut bad = 0
+  let mut maxcap = 0
+  while sent < total_bytes {
+    let mut step = 1 + rng.next(4096)
+    if (total_bytes - sent) < step.to_int64() {
+      step = (total_bytes - sent).to_int()
+    }
+    let mut i = 0
+    while i < step {
+      tmp[i] = block[boff]
+      boff = boff + 1
+      if boff == block.length() {
+        boff = 0
+      }
+      i = i + 1
+    }
+    match dec.feed(tmp.slice(0, step)) {
+      Ok(_) => ()
+      Err(e) => {
+        io_println(world, "stress feed error " + err_name(e))
+        return 3
+      }
+    }
+    sent = sent + step.to_int64()
+    if dec.buffer_capacity() > maxcap {
+      maxcap = dec.buffer_capacity()
+    }
+    let mut more = true
+    while more {
+      match dec.next_frame() {
+        Ok(Some(f)) => {
+          if !resp::resp_equals(f, expect[got % per_block]) {
+            bad = bad + 1
+          }
+          got = got + 1
+        }
+        Ok(None) => more = false
+        Err(e) => {
+          io_println(world, "stress decode error " + err_name(e))
+          return 4
+        }
+      }
+    }
+  }
+  io_println(
+    world,
+    "frames=" +
+    got.to_string() +
+    "/" +
+    total_frames.to_string() +
+    " mismatched=" +
+    bad.to_string() +
+    " bytes=" +
+    total_bytes.to_string() +
+    " maxcap=" +
+    maxcap.to_string() +
+    " finalcap=" +
+    dec.buffer_capacity().to_string() +
+    " buffered=" +
+    dec.buffered_len().to_string(),
+  )
+  0
+}
+
+///|
+fn cx_wire(id : String) -> Bytes {
+  if id == "cx_agg" {
+    concat_bytes(["*100000\r\n".to_bytes(), repeat_bytes(":1\r\n", 100000, "")])
+  } else if id == "cx_smap" {
+    concat_bytes(["%?\r\n".to_bytes(), repeat_bytes("+k\r\n:1\r\n", 50000, ".\r\n")])
+  } else if id == "cx_sbulk" {
+    concat_bytes(["$?\r\n".to_bytes(), repeat_bytes(";8\r\nxxxxxxxx\r\n", 50000, ";0\r\n")])
+  } else if id == "cx_inline" {
+    repeat_bytes("a", 4194304, "\r\n")
+  } else if id == "cx_pipeline" {
+    repeat_bytes("+OK\r\n", 200000, "")
+  } else if id == "cx_bulk" {
+    concat_bytes(["$8388608\r\n".to_bytes(), repeat_bytes("x", 8388608, "\r\n")])
+  } else {
+    Bytes::new(0)
+  }
+}
+
+///| Feed `w` in `chunk`-byte pieces (0 = whole), pulling frames after each feed.
+fn cx_feed(w : Bytes, chunk : Int, inline : Bool) -> String {
+  let dec = resp::StreamDecoder::default()
+  dec.set_allow_inline(inline)
+  let n = w.length()
+  let step = if chunk <= 0 { n } else { chunk }
+  let mut off = 0
+  let mut frames = 0
+  while off < n {
+    let end = if off + step < n { off + step } else { n }
+    match dec.feed(w.slice(off, end)) {
+      Ok(_) => ()
+      Err(e) => return "ERR " + err_name(e)
+    }
+    off = end
+    let mut more = true
+    while more {
+      match dec.next_frame() {
+        Ok(Some(_)) => frames = frames + 1
+        Ok(None) => more = false
+        Err(e) => return "ERR " + err_name(e)
+      }
+    }
+  }
+  "frames=" + frames.to_string()
+}
+
+///|
+fn run_cx(world : World, id : String) -> Int {
+  let w = cx_wire(id)
+  let inline = id == "cx_inline"
+  let t0 = clock_now_ms(world)
+  let r1 = cx_feed(w, 0, inline)
+  let t1 = clock_now_ms(world)
+  let r2 = cx_feed(w, 1024, inline)
+  let t2 = clock_now_ms(world)
+  io_println(
+    world,
+    id + "\twhole_ms=" + (t1 - t0).to_string() + " chunk_ms=" + (t2 - t1).to_string() + " whole=" + r1 + " chunked=" + r2,
+  )
+  0
+}
+
+///| Mutation fuzzer over the decode corpus: no panic/trap, and split-fed StreamDecoder must agree
+///| with repeated decode_prefix() on every mutant.
+fn run_fuzz(world : World, seeds : Array[HexCase], seed : Int, iters : Int) -> Int {
+  let rng = Lcg::{ s: seed }
+  let tokens = ["\r\n", "*?\r\n", ".\r\n", "|1\r\n", "%?\r\n", "$?\r\n", ";0\r\n", "*1\r\n", ":1\r\n", "+a\r\n", "_\r\n"]
+  let mut mism = 0
+  let mut decoded_ok = 0
+  let mut total_len = 0
+  let mut shown = 0
+  let mut it = 0
+  while it < iters {
+    let base = seeds[rng.next(seeds.length())].data
+    let parts : Array[Bytes] = [base]
+    let ops = 1 + rng.next(4)
+    let mut cur = base
+    let mut o = 0
+    while o < ops {
+      let n = cur.length()
+      let op = rng.next(5)
+      if op == 0 && n > 0 {
+        let p = rng.next(n)
+        let c = cur.slice(0, n)
+        c[p] = rng.next(256).to_byte()
+        cur = c
+      } else if op == 1 && n > 0 {
+        let p = rng.next(n)
+        cur = concat_bytes([cur.slice(0, p), cur.slice(p + 1, n)])
+      } else if op == 2 {
+        let p = if n > 0 { rng.next(n + 1) } else { 0 }
+        cur = concat_bytes([cur.slice(0, p), tokens[rng.next(tokens.length())].to_bytes(), cur.slice(p, n)])
+      } else if op == 3 {
+        let other = seeds[rng.next(seeds.length())].data
+        cur = concat_bytes([cur, other])
+      } else if n > 1 {
+        let p = rng.next(n)
+        cur = concat_bytes([cur.slice(0, p), cur.slice(p, n), cur.slice(p, n)])
+      }
+      o = o + 1
+    }
+    let _ = parts
+    total_len = total_len + cur.length()
+    match resp::decode_default(cur) {
+      Ok(_) => decoded_ok = decoded_ok + 1
+      Err(_) => ()
+    }
+    let want = ref_events(cur)
+    let got = stream_events(cur, -rng.next(1000), false)
+    if want != got {
+      mism = mism + 1
+      if shown < 5 {
+        io_println(world, "fuzz_mismatch\t" + esc_hex(cur) + "\twant=" + want + "\tgot=" + got)
+        shown = shown + 1
+      }
+    }
+    it = it + 1
+  }
+  io_println(
+    world,
+    "fuzz\titers=" +
+    iters.to_string() +
+    " seed=" +
+    seed.to_string() + " decoded_ok=" +
+    decoded_ok.to_string() +
+    " bytes=" +
+    total_len.to_string() +
+    " split_mismatch=" +
+    mism.to_string(),
+  )
+  0
+}
+
+///| Informational: split README W3 into its halves to locate the 0.31x gap (see REPORT.md §5).
+fn run_w3split(world : World) -> Int {
+  let keys : Array[Bytes] = [
+    "foo".to_bytes(),
+    "{user1000}.following".to_bytes(),
+    "foo{bar}{zap}".to_bytes(),
+    "rate:{ip-10.0.0.1}:minute".to_bytes(),
+  ]
+  let redirects : Array[String] = ["MOVED 3999 127.0.0.1:6381", "MOVED 5061 [::1]:7002"]
+  let t0 = clock_now_ms(world)
+  let mut acc = 0
+  let mut i = 0
+  while i < 2000000 {
+    acc = acc + resp::key_slot(keys[i & 3])
+    i = i + 1
+  }
+  let t1 = clock_now_ms(world)
+  let mut acc2 = 0
+  i = 0
+  while i < 500000 {
+    match resp::parse_cluster_redirect(redirects[i & 1]) {
+      Some(Moved(s, _, p)) => acc2 = acc2 + s + p
+      _ => ()
+    }
+    i = i + 1
+  }
+  let t2 = clock_now_ms(world)
+  let mut acc3 = 0
+  i = 0
+  while i < 500000 {
+    acc3 = acc3 + redirects[i & 1].to_bytes().length()
+    i = i + 1
+  }
+  let t3 = clock_now_ms(world)
+  io_println(world, "pion_keyslot_2m\tms=" + (t1 - t0).to_string() + " acc=" + acc.to_string())
+  io_println(world, "pion_moved_500k\tms=" + (t2 - t1).to_string() + " acc=" + acc2.to_string())
+  io_println(world, "pion_string_to_bytes_500k\tms=" + (t3 - t2).to_string() + " acc=" + acc3.to_string())
+  0
+}
