@@ -1,6 +1,8 @@
 ///| ZIP archive reader (`ZipReader`) supporting APPNOTE 6.3.10, ZIP64, Data Descriptors,
 ///| zero-copy Store slicing, raw DEFLATE via `flate`, O(1) name lookup, and Day-1 security limits.
 
+import "flate"
+
 ///| Random-access ZIP archive reader over an immutable `Bytes` buffer.
 pub struct ZipReader {
   data : Bytes
@@ -13,6 +15,220 @@ pub struct ZipReader {
   cd_size : Int64
 }
 
+///| Locate the End of Central Directory (EOCD) record, scanning backwards up to 65535B comment.
+fn find_eocd(data : Bytes) -> Result[Int, ZipError] {
+  let n = data.length()
+  if n < 22 {
+    return Err(ZipError::Truncated("archive smaller than 22-byte EOCD"))
+  }
+  let min_pos = if n > 22 + 65535 { n - 22 - 65535 } else { 0 }
+  let mut pos = n - 22
+  while pos >= min_pos {
+    // Fast first-byte check ('P' = 0x50) before reading full u32
+    if data[pos].to_int() == 0x50 && read_u32_le(data, pos) == sig_eocd {
+      let comment_len = read_u16_le(data, pos + 20).to_int()
+      if pos + 22 + comment_len == n {
+        return Ok(pos)
+      }
+    }
+    pos = pos - 1
+  }
+  Err(ZipError::InvalidArchive("end of central directory signature not found"))
+}
+
+///| Parse ZIP64 Extra Field (`0x0001`) from `data[extra_start..extra_end]`.
+///| Updates only the fields whose 32-bit/16-bit header values are sentinels (`0xFFFFFFFF` / `0xFFFF`),
+///| in strict APPNOTE 6.3.10 §4.5.3 order: uncompressed_size, compressed_size, local_header_offset, disk_start.
+fn parse_zip64_extra(
+  data : Bytes,
+  extra_start : Int,
+  extra_end : Int,
+  need_uncomp : Bool,
+  need_comp : Bool,
+  need_offset : Bool,
+  need_disk : Bool,
+  uncomp_in : Int64,
+  comp_in : Int64,
+  offset_in : Int64,
+  disk_in : UInt,
+) -> Result[(Int64, Int64, Int64, UInt, Bool), ZipError] {
+  let mut uncomp = uncomp_in
+  let mut comp = comp_in
+  let mut offset = offset_in
+  let mut disk = disk_in
+  let mut found = false
+  let mut pos = extra_start
+  while pos + 4 <= extra_end {
+    let header_id = read_u16_le(data, pos)
+    let field_len = read_u16_le(data, pos + 2).to_int()
+    pos = pos + 4
+    if pos + field_len > extra_end {
+      return Err(ZipError::Truncated("extra field extends past header boundary"))
+    }
+    if header_id == extra_id_zip64 {
+      found = true
+      let mut fpos = pos
+      let fend = pos + field_len
+      if need_uncomp {
+        if fpos + 8 > fend {
+          return Err(ZipError::Truncated("ZIP64 extra missing uncompressed_size"))
+        }
+        uncomp = read_i64_le(data, fpos)
+        fpos = fpos + 8
+      }
+      if need_comp {
+        if fpos + 8 > fend {
+          return Err(ZipError::Truncated("ZIP64 extra missing compressed_size"))
+        }
+        comp = read_i64_le(data, fpos)
+        fpos = fpos + 8
+      }
+      if need_offset {
+        if fpos + 8 > fend {
+          return Err(ZipError::Truncated("ZIP64 extra missing local_header_offset"))
+        }
+        offset = read_i64_le(data, fpos)
+        fpos = fpos + 8
+      }
+      if need_disk {
+        if fpos + 4 > fend {
+          return Err(ZipError::Truncated("ZIP64 extra missing disk_start"))
+        }
+        disk = read_u32_le(data, fpos)
+      }
+      break
+    }
+    pos = pos + field_len
+  }
+  if (need_uncomp || need_comp || need_offset || need_disk) && !found {
+    return Err(ZipError::InvalidArchive("ZIP64 sentinel set without 0x0001 extra field"))
+  }
+  Ok((uncomp, comp, offset, disk, found))
+}
+
+///| Bottom-up mergesort of entry indices by `starts[idx]` (O(N log N), zero recursion).
+fn sort_indices_by_start(indices : FixedArray[Int], starts : FixedArray[Int64]) -> Unit {
+  let n = indices.length()
+  if n <= 1 {
+    return
+  }
+  let tmp : FixedArray[Int] = FixedArray::make(n, 0)
+  let mut width = 1
+  while width < n {
+    let mut i = 0
+    while i < n {
+      let left = i
+      let mid = if i + width < n { i + width } else { n }
+      let right = if i + 2 * width < n { i + 2 * width } else { n }
+      let mut l = left
+      let mut r = mid
+      let mut k = left
+      while l < mid && r < right {
+        if starts[indices[l]] <= starts[indices[r]] {
+          tmp[k] = indices[l]
+          l = l + 1
+        } else {
+          tmp[k] = indices[r]
+          r = r + 1
+        }
+        k = k + 1
+      }
+      while l < mid {
+        tmp[k] = indices[l]
+        l = l + 1
+        k = k + 1
+      }
+      while r < right {
+        tmp[k] = indices[r]
+        r = r + 1
+        k = k + 1
+      }
+      let mut j = left
+      while j < right {
+        indices[j] = tmp[j]
+        j = j + 1
+      }
+      i = i + 2 * width
+    }
+    width = width * 2
+  }
+}
+
+///| Verify no two entries have overlapping Local File Header + compressed payload byte ranges.
+///| O(N) fast path when entries are already in ascending offset order; O(N log N) fallback otherwise.
+fn check_no_overlaps(
+  data : Bytes,
+  entries : Array[ZipEntry],
+  cd_offset : Int64,
+) -> Result[Unit, ZipError] {
+  let n = entries.length()
+  if n <= 1 {
+    return Ok(())
+  }
+  let starts : FixedArray[Int64] = FixedArray::make(n, 0L)
+  let ends : FixedArray[Int64] = FixedArray::make(n, 0L)
+  let mut sorted = true
+  let mut i = 0
+  while i < n {
+    let e = entries[i]
+    let lh = e.local_header_offset
+    if lh < 0L || lh + 30L > cd_offset {
+      return Err(ZipError::Truncated("local header offset out of bounds"))
+    }
+    let lh_i = lh.to_int()
+    if read_u32_le(data, lh_i) != sig_local_file_header {
+      return Err(ZipError::InvalidArchive("bad local file header signature"))
+    }
+    let lfh_name_len = read_u16_le(data, lh_i + 26).to_int64()
+    let lfh_extra_len = read_u16_le(data, lh_i + 28).to_int64()
+    let end = lh + 30L + lfh_name_len + lfh_extra_len + e.compressed_size
+    if end < lh || end > cd_offset {
+      return Err(ZipError::Truncated("entry payload extends past central directory"))
+    }
+    starts[i] = lh
+    ends[i] = end
+    if i > 0 && lh < starts[i - 1] {
+      sorted = false
+    }
+    i = i + 1
+  }
+  if sorted {
+    i = 1
+    while i < n {
+      if starts[i] < ends[i - 1] {
+        return Err(
+          ZipError::OverlappingEntries(
+            entries[i - 1].name + " overlaps " + entries[i].name,
+          ),
+        )
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  let indices : FixedArray[Int] = FixedArray::make(n, 0)
+  i = 0
+  while i < n {
+    indices[i] = i
+    i = i + 1
+  }
+  sort_indices_by_start(indices, starts)
+  i = 1
+  while i < n {
+    let prev = indices[i - 1]
+    let cur = indices[i]
+    if starts[cur] < ends[prev] {
+      return Err(
+        ZipError::OverlappingEntries(
+          entries[prev].name + " overlaps " + entries[cur].name,
+        ),
+      )
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
 ///| Open a ZIP archive with default hardened security limits.
 pub fn ZipReader::open(data : Bytes) -> Result[ZipReader, ZipError] {
   ZipReader::open_with_limits(data, Limits::default())
@@ -23,9 +239,239 @@ pub fn ZipReader::open_with_limits(
   data : Bytes,
   limits : Limits,
 ) -> Result[ZipReader, ZipError] {
-  let _ = data
-  let _ = limits
-  Err(ZipError::InvalidArchive("not implemented"))
+  let eocd_pos = match find_eocd(data) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  let disk_num = read_u16_le(data, eocd_pos + 4)
+  let cd_disk = read_u16_le(data, eocd_pos + 6)
+  let mut total_entries = read_u16_le(data, eocd_pos + 10).to_int64()
+  let mut cd_size = read_u32_le(data, eocd_pos + 12).to_int64() & 0xFFFFFFFFL
+  let mut cd_offset = read_u32_le(data, eocd_pos + 16).to_int64() & 0xFFFFFFFFL
+  let comment_len = read_u16_le(data, eocd_pos + 20).to_int()
+  let comment = if comment_len > 0 {
+    data.slice(eocd_pos + 22, eocd_pos + 22 + comment_len).to_string()
+  } else {
+    ""
+  }
+
+  let has_sentinel = disk_num == 0xFFFFU ||
+  cd_disk == 0xFFFFU ||
+  total_entries == 0xFFFFL ||
+  cd_size == 0xFFFFFFFFL ||
+  cd_offset == 0xFFFFFFFFL
+
+  let mut archive_is_zip64 = false
+  let mut eocd_start = eocd_pos.to_int64()
+
+  // Check for ZIP64 EOCD Locator immediately before EOCD
+  if eocd_pos >= 20 && read_u32_le(data, eocd_pos - 20) == sig_zip64_locator {
+    archive_is_zip64 = true
+    let loc_pos = eocd_pos - 20
+    let z64_disk = read_u32_le(data, loc_pos + 4)
+    let z64_eocd_off = read_i64_le(data, loc_pos + 8)
+    let total_disks = read_u32_le(data, loc_pos + 16)
+    if z64_disk != 0U || total_disks > 1U {
+      return Err(ZipError::UnsupportedFeature("multi-disk ZIP64 archives are not supported"))
+    }
+    if z64_eocd_off < 0L || z64_eocd_off + 56L > loc_pos.to_int64() {
+      return Err(ZipError::InvalidArchive("ZIP64 EOCD offset out of bounds"))
+    }
+    let zoff = z64_eocd_off.to_int()
+    if read_u32_le(data, zoff) != sig_zip64_eocd {
+      return Err(ZipError::InvalidArchive("bad ZIP64 EOCD signature"))
+    }
+    let rec_size = read_i64_le(data, zoff + 4)
+    if rec_size < 44L || z64_eocd_off + 12L + rec_size > loc_pos.to_int64() {
+      return Err(ZipError::InvalidArchive("invalid ZIP64 EOCD record size"))
+    }
+    let z_disk_num = read_u32_le(data, zoff + 16)
+    let z_cd_disk = read_u32_le(data, zoff + 20)
+    if z_disk_num != 0U || z_cd_disk != 0U {
+      return Err(ZipError::UnsupportedFeature("multi-disk ZIP64 archives are not supported"))
+    }
+    total_entries = read_i64_le(data, zoff + 32)
+    cd_size = read_i64_le(data, zoff + 40)
+    cd_offset = read_i64_le(data, zoff + 48)
+    eocd_start = z64_eocd_off
+  } else {
+    if has_sentinel {
+      return Err(ZipError::InvalidArchive("EOCD has ZIP64 sentinel without ZIP64 locator"))
+    }
+    if disk_num != 0U || cd_disk != 0U {
+      return Err(ZipError::UnsupportedFeature("multi-disk archives are not supported"))
+    }
+  }
+
+  if total_entries < 0L || cd_size < 0L || cd_offset < 0L {
+    return Err(ZipError::InvalidArchive("negative central directory count, size, or offset"))
+  }
+  if cd_offset + cd_size > eocd_start {
+    return Err(ZipError::Truncated("central directory extends past EOCD"))
+  }
+  if limits.max_entries > 0 && total_entries > limits.max_entries.to_int64() {
+    return Err(
+      ZipError::LimitExceeded(
+        "entry count " +
+        total_entries.to_string() +
+        " exceeds max_entries " +
+        limits.max_entries.to_string(),
+      ),
+    )
+  }
+
+  let entry_count = total_entries.to_int()
+  let entries : Array[ZipEntry] = []
+  let name_index : Map[String, Int] = Map::new()
+  let mut pos = cd_offset.to_int()
+  let cd_end = (cd_offset + cd_size).to_int()
+  let mut i = 0
+  while i < entry_count {
+    if pos + 46 > cd_end {
+      return Err(ZipError::Truncated("truncated central directory entry"))
+    }
+    if read_u32_le(data, pos) != sig_central_dir {
+      return Err(ZipError::InvalidArchive("bad central directory header signature"))
+    }
+    let version_made_by = read_u16_le(data, pos + 4)
+    let version_needed = read_u16_le(data, pos + 6)
+    let flags = read_u16_le(data, pos + 8)
+    let method = read_u16_le(data, pos + 10)
+    let dos_time = read_u16_le(data, pos + 12)
+    let dos_date = read_u16_le(data, pos + 14)
+    let crc = read_u32_le(data, pos + 16)
+    let comp32 = read_u32_le(data, pos + 20)
+    let uncomp32 = read_u32_le(data, pos + 24)
+    let name_len = read_u16_le(data, pos + 28).to_int()
+    let extra_len = read_u16_le(data, pos + 30).to_int()
+    let cmt_len = read_u16_le(data, pos + 32).to_int()
+    let disk_start16 = read_u16_le(data, pos + 34)
+    let external_attr = read_u32_le(data, pos + 38)
+    let lh_off32 = read_u32_le(data, pos + 42)
+
+    let var_start = pos + 46
+    let extra_start = var_start + name_len
+    let cmt_start = extra_start + extra_len
+    let next_pos = cmt_start + cmt_len
+    if next_pos > cd_end {
+      return Err(ZipError::Truncated("central directory variable fields out of bounds"))
+    }
+
+    let name = data.slice(var_start, extra_start).to_string()
+    let extra = if extra_len > 0 {
+      data.slice(extra_start, cmt_start)
+    } else {
+      Bytes::new(0)
+    }
+    let entry_comment = if cmt_len > 0 {
+      data.slice(cmt_start, next_pos).to_string()
+    } else {
+      ""
+    }
+
+    let need_uncomp = uncomp32 == 0xFFFFFFFFU
+    let need_comp = comp32 == 0xFFFFFFFFU
+    let need_off = lh_off32 == 0xFFFFFFFFU
+    let need_disk = disk_start16 == 0xFFFFU
+
+    let mut comp_size = comp32.to_int64() & 0xFFFFFFFFL
+    let mut uncomp_size = uncomp32.to_int64() & 0xFFFFFFFFL
+    let mut lh_off = lh_off32.to_int64() & 0xFFFFFFFFL
+    let mut disk_start = disk_start16
+    let mut entry_z64 = false
+
+    if extra_len > 0 && (need_uncomp || need_comp || need_off || need_disk) {
+      match
+      parse_zip64_extra(
+        data,
+        extra_start,
+        cmt_start,
+        need_uncomp,
+        need_comp,
+        need_off,
+        need_disk,
+        uncomp_size,
+        comp_size,
+        lh_off,
+        disk_start,
+      )
+      {
+        Ok((u, c, o, d, found)) => {
+          uncomp_size = u
+          comp_size = c
+          lh_off = o
+          disk_start = d
+          entry_z64 = found
+        }
+        Err(e) => return Err(e)
+      }
+    } else if need_uncomp || need_comp || need_off || need_disk {
+      return Err(ZipError::InvalidArchive("entry has ZIP64 sentinel without extra field"))
+    }
+
+    if entry_z64 {
+      archive_is_zip64 = true
+    }
+    if disk_start != 0U {
+      return Err(ZipError::UnsupportedFeature("multi-disk entry is not supported"))
+    }
+    if comp_size < 0L || uncomp_size < 0L || lh_off < 0L {
+      return Err(ZipError::InvalidArchive("negative entry size or offset"))
+    }
+    if lh_off + 30L > cd_offset || lh_off + 30L + comp_size > cd_offset {
+      return Err(ZipError::Truncated("entry local header or data out of bounds"))
+    }
+
+    match name_index.get(name) {
+      Some(_) => {
+        if limits.reject_duplicates {
+          return Err(ZipError::DuplicateEntry(name))
+        }
+      }
+      None => name_index.set(name, i)
+    }
+
+    entries.push(
+      ZipEntry::{
+        name: name,
+        comment: entry_comment,
+        method: method,
+        flags: flags,
+        crc32: crc,
+        compressed_size: comp_size,
+        uncompressed_size: uncomp_size,
+        modified: DosDateTime::from_dos(dos_date, dos_time),
+        version_made_by: version_made_by,
+        version_needed: version_needed,
+        external_attr: external_attr,
+        local_header_offset: lh_off,
+        extra: extra,
+        is_zip64: entry_z64,
+      },
+    )
+    pos = next_pos
+    i = i + 1
+  }
+
+  if limits.reject_overlaps {
+    match check_no_overlaps(data, entries, cd_offset) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+
+  Ok(
+    ZipReader::{
+      data: data,
+      entries: entries,
+      name_index: name_index,
+      comment: comment,
+      is_zip64: archive_is_zip64,
+      limits: limits,
+      cd_offset: cd_offset,
+      cd_size: cd_size,
+    },
+  )
 }
 
 ///| Number of entries in the archive.
@@ -69,8 +515,10 @@ pub fn ZipReader::find_index(self : ZipReader, name : String) -> Option[Int] {
 
 ///| Read, decompress, and CRC-32 verify an entry by exact name in O(1) lookup time.
 pub fn ZipReader::open_by_name(self : ZipReader, name : String) -> Result[Bytes, ZipError] {
-  let _ = self
-  Err(ZipError::EntryNotFound(name))
+  match self.name_index.get(name) {
+    Some(idx) => self.read_entry(idx)
+    None => Err(ZipError::EntryNotFound(name))
+  }
 }
 
 ///| Read, decompress, and CRC-32 verify the entry at `index` using reader limits.
@@ -84,10 +532,171 @@ pub fn ZipReader::read_entry_with_limits(
   index : Int,
   limits : Limits,
 ) -> Result[Bytes, ZipError] {
-  let _ = self
-  let _ = index
-  let _ = limits
-  Err(ZipError::InvalidArchive("not implemented"))
+  if index < 0 || index >= self.entries.length() {
+    return Err(ZipError::EntryNotFound("index " + index.to_string()))
+  }
+  let entry = self.entries[index]
+  if (entry.flags & flag_encrypted) != 0U {
+    return Err(ZipError::UnsupportedFeature("encrypted entries are not supported"))
+  }
+  if entry.method != method_store() && entry.method != method_deflate() {
+    return Err(ZipError::UnsupportedMethod(entry.method))
+  }
+  if limits.max_entry_size > 0L && entry.uncompressed_size > limits.max_entry_size {
+    return Err(
+      ZipError::LimitExceeded(
+        "entry " +
+        entry.name +
+        " uncompressed size " +
+        entry.uncompressed_size.to_string() +
+        " exceeds max_entry_size " +
+        limits.max_entry_size.to_string(),
+      ),
+    )
+  }
+  if limits.max_compression_ratio > 0 && entry.uncompressed_size > 1024L {
+    let ratio = limits.max_compression_ratio.to_int64()
+    if entry.compressed_size <= 0L ||
+    entry.uncompressed_size > entry.compressed_size * ratio {
+      return Err(
+        ZipError::LimitExceeded(
+          "entry " + entry.name + " exceeds max_compression_ratio",
+        ),
+      )
+    }
+  }
+
+  // Validate Local File Header
+  let lh_off = entry.local_header_offset
+  if lh_off < 0L || lh_off + 30L > self.cd_offset {
+    return Err(ZipError::Truncated("local file header out of bounds"))
+  }
+  let lh = lh_off.to_int()
+  if read_u32_le(self.data, lh) != sig_local_file_header {
+    return Err(ZipError::InvalidArchive("bad local file header signature"))
+  }
+  let lfh_flags = read_u16_le(self.data, lh + 6)
+  let lfh_method = read_u16_le(self.data, lh + 8)
+  if lfh_method != entry.method {
+    return Err(ZipError::InvalidArchive("LFH compression method disagrees with CD"))
+  }
+  let has_dd = (lfh_flags & flag_data_descriptor) != 0U
+  if !has_dd {
+    let lfh_crc = read_u32_le(self.data, lh + 14)
+    let lfh_comp = read_u32_le(self.data, lh + 18)
+    if lfh_crc != 0U && entry.crc32 != 0U && lfh_crc != entry.crc32 {
+      return Err(ZipError::InvalidArchive("LFH CRC-32 disagrees with CD"))
+    }
+    if lfh_comp != 0xFFFFFFFFU && (lfh_comp.to_int64() & 0xFFFFFFFFL) != entry.compressed_size {
+      return Err(ZipError::InvalidArchive("LFH compressed size disagrees with CD"))
+    }
+  }
+
+  let lfh_name_len = read_u16_le(self.data, lh + 26).to_int64()
+  let lfh_extra_len = read_u16_le(self.data, lh + 28).to_int64()
+  let data_start64 = lh_off + 30L + lfh_name_len + lfh_extra_len
+  let data_end64 = data_start64 + entry.compressed_size
+  if data_start64 < 0L || data_end64 < data_start64 || data_end64 > self.cd_offset {
+    return Err(ZipError::Truncated("entry compressed data extends past central directory"))
+  }
+
+  // If Data Descriptor bit 3 is set, validate trailing descriptor bounds & consistency
+  if has_dd {
+    let dd_off = data_end64.to_int()
+    let avail = (self.cd_offset - data_end64).to_int()
+    if avail < 12 {
+      return Err(ZipError::Truncated("missing data descriptor"))
+    }
+    let has_sig = read_u32_le(self.data, dd_off) == sig_data_descriptor
+    let body_off = if has_sig { dd_off + 4 } else { dd_off }
+    let body_avail = if has_sig { avail - 4 } else { avail }
+    if entry.is_zip64 {
+      if body_avail < 20 {
+        return Err(ZipError::Truncated("truncated ZIP64 data descriptor"))
+      }
+      let dd_crc = read_u32_le(self.data, body_off)
+      let dd_comp = read_i64_le(self.data, body_off + 4)
+      let dd_uncomp = read_i64_le(self.data, body_off + 12)
+      if dd_crc != entry.crc32 ||
+      dd_comp != entry.compressed_size ||
+      dd_uncomp != entry.uncompressed_size {
+        return Err(ZipError::InvalidArchive("ZIP64 data descriptor mismatch"))
+      }
+    } else {
+      if body_avail < 12 {
+        return Err(ZipError::Truncated("truncated data descriptor"))
+      }
+      let dd_crc = read_u32_le(self.data, body_off)
+      let dd_comp = read_u32_le(self.data, body_off + 4).to_int64() & 0xFFFFFFFFL
+      let dd_uncomp = read_u32_le(self.data, body_off + 8).to_int64() & 0xFFFFFFFFL
+      if dd_crc != entry.crc32 ||
+      dd_comp != entry.compressed_size ||
+      dd_uncomp != entry.uncompressed_size {
+        return Err(ZipError::InvalidArchive("data descriptor mismatch"))
+      }
+    }
+  }
+
+  let data_start = data_start64.to_int()
+  let data_end = data_end64.to_int()
+
+  let out = if entry.method == method_store() {
+    if entry.compressed_size != entry.uncompressed_size {
+      return Err(ZipError::InvalidArchive("stored entry compressed_size != uncompressed_size"))
+    }
+    self.data.slice(data_start, data_end)
+  } else {
+    // Compute strict byte cap for DEFLATE so lying headers CANNOT bypass limits or OOM.
+    let mut cap64 = entry.uncompressed_size
+    if limits.max_entry_size > 0L && limits.max_entry_size < cap64 {
+      cap64 = limits.max_entry_size
+    }
+    if limits.max_compression_ratio > 0 {
+      let ratio_cap = if entry.compressed_size <= 0L {
+        1024L
+      } else {
+        let rc = entry.compressed_size * limits.max_compression_ratio.to_int64()
+        if rc < 1024L { 1024L } else { rc }
+      }
+      if ratio_cap < cap64 {
+        cap64 = ratio_cap
+      }
+    }
+    if cap64 > 2147483647L {
+      return Err(ZipError::LimitExceeded("entry exceeds 2 GiB single-buffer limit"))
+    }
+    let comp_slice = self.data.slice(data_start, data_end)
+    // CRITICAL: `flate::deflate_decompress_with_limit(_, 0)` means UNLIMITED!
+    // When cap64 == 0, pass 1 and explicitly verify output length == 0.
+    let flate_limit = if cap64 == 0L { 1 } else { cap64.to_int() }
+    match flate::deflate_decompress_with_limit(comp_slice, flate_limit) {
+      Ok(b) => {
+        if cap64 == 0L && b.length() > 0 {
+          return Err(ZipError::LimitExceeded("decompressed output exceeded declared 0 bytes"))
+        }
+        if b.length().to_int64() != entry.uncompressed_size {
+          return Err(
+            ZipError::DecompressError(
+              "decompressed size " +
+              b.length().to_string() +
+              " != declared " +
+              entry.uncompressed_size.to_string(),
+            ),
+          )
+        }
+        b
+      }
+      Err(FlateError::OutputLimitExceeded(_)) =>
+      return Err(ZipError::LimitExceeded("decompressed stream exceeded output limit"))
+      Err(e) => return Err(ZipError::DecompressError(flate::flate_error_message(e)))
+    }
+  }
+
+  let actual_crc = flate::crc32(out)
+  if actual_crc != entry.crc32 {
+    return Err(ZipError::ChecksumMismatch(entry.crc32, actual_crc))
+  }
+  Ok(out)
 }
 
 ///| Read and verify all entries in the archive, enforcing cumulative `max_total_size`.
@@ -100,7 +709,34 @@ pub fn ZipReader::read_all_with_limits(
   self : ZipReader,
   limits : Limits,
 ) -> Result[Array[(ZipEntry, Bytes)], ZipError] {
-  let _ = self
-  let _ = limits
-  Err(ZipError::InvalidArchive("not implemented"))
+  let out : Array[(ZipEntry, Bytes)] = []
+  let mut total : Int64 = 0L
+  let mut i = 0
+  while i < self.entries.length() {
+    let e = self.entries[i]
+    if limits.max_total_size > 0L {
+      if total + e.uncompressed_size > limits.max_total_size {
+        return Err(ZipError::LimitExceeded("cumulative extracted size exceeds max_total_size"))
+      }
+    }
+    let rem_cap = if limits.max_total_size > 0L {
+      let rem = limits.max_total_size - total
+      if limits.max_entry_size > 0L && limits.max_entry_size < rem {
+        limits.max_entry_size
+      } else {
+        rem
+      }
+    } else {
+      limits.max_entry_size
+    }
+    let eff_limits = Limits::{ ..limits, max_entry_size: rem_cap }
+    let data = match self.read_entry_with_limits(i, eff_limits) {
+      Ok(b) => b
+      Err(err) => return Err(err)
+    }
+    total = total + data.length().to_int64()
+    out.push((e, data))
+    i = i + 1
+  }
+  Ok(out)
 }
