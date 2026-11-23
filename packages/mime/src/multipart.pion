@@ -1,5 +1,6 @@
 ///| RFC 7578 / 2046 Multipart streaming reader and writer.
-///| Uses Boyer-Moore-Horspool (BMH) linear-time boundary search and zero-copy `Bytes::slice` part bodies.
+///| Uses Two-Way (Crochemore-Perrin) + Horspool bad-character fast-skip linear-time O(N) boundary search
+///| and zero-copy `Bytes::slice` part bodies.
 
 ///| Validate an RFC 2046 §5.1.1 multipart boundary (1..=70 chars, valid bchars, no trailing space).
 fn is_valid_boundary(boundary : String) -> Bool {
@@ -37,28 +38,146 @@ fn build_bmh_skip(pat : Bytes) -> FixedArray[Int] {
   skip
 }
 
-///| Boyer-Moore-Horspool search for `pat` in `buf[start..end)`. Returns match index or -1.
-fn bmh_find(buf : Bytes, start : Int, end : Int, pat : Bytes, skip : FixedArray[Int]) -> Int {
-  let plen = pat.length()
-  if plen == 0 {
+///| Compute maximal suffix `(ms, period)` for Crochemore-Perrin Two-Way factorization.
+fn twoway_max_suffix(pat : Bytes, rev : Bool) -> (Int, Int) {
+  let m = pat.length()
+  let mut ms = -1
+  let mut j = 0
+  let mut k = 1
+  let mut p = 1
+  while j + k < m {
+    let a = pat[j + k].to_int()
+    let b = pat[ms + k].to_int()
+    let lt = if rev { a > b } else { a < b }
+    if lt {
+      j = j + k
+      k = 1
+      p = j - ms
+    } else if a == b {
+      if k != p {
+        k = k + 1
+      } else {
+        j = j + p
+        k = 1
+      }
+    } else {
+      ms = j
+      j = ms + 1
+      k = 1
+      p = 1
+    }
+  }
+  (ms, p)
+}
+
+///| Preprocessed Two-Way + Horspool fast-skip searcher (strictly O(N) worst-case, O(N/M) typical).
+struct TwoWaySearcher {
+  ell : Int
+  period : Int
+  is_periodic : Bool
+  skip : FixedArray[Int]
+}
+
+///|
+fn TwoWaySearcher::new(pat : Bytes) -> TwoWaySearcher {
+  let m = pat.length()
+  let skip = build_bmh_skip(pat)
+  let (ms1, p1) = twoway_max_suffix(pat, false)
+  let (ms2, p2) = twoway_max_suffix(pat, true)
+  let (ell, p) = if ms1 > ms2 { (ms1, p1) } else { (ms2, p2) }
+  // Check whether pat[0..=ell] matches pat[p..=p+ell]
+  let mut periodic = ell + 1 <= m - p
+  if periodic {
+    let mut k = 0
+    while k <= ell {
+      if pat[k] != pat[k + p] {
+        periodic = false
+        break
+      }
+      k = k + 1
+    }
+  }
+  let period = if periodic {
+    p
+  } else {
+    let left_len = ell + 1
+    let right_len = m - ell - 1
+    (if left_len > right_len { left_len } else { right_len }) + 1
+  }
+  TwoWaySearcher::{ ell: ell, period: period, is_periodic: periodic, skip: skip }
+}
+
+///| Strictly linear-time O(N) search for `pat` in `buf[start..end)` using Two-Way + Horspool skip.
+fn twoway_find(buf : Bytes, start : Int, end : Int, pat : Bytes, s : TwoWaySearcher) -> Int {
+  let m = pat.length()
+  if m == 0 {
     return start
   }
-  let last = plen - 1
-  let limit = end - plen
+  let limit = end - m
+  if start > limit {
+    return -1
+  }
+  let last = m - 1
   let last_b = pat[last]
-  let mut i = start
-  while i <= limit {
-    let cur = buf[i + last]
-    if cur == last_b {
-      let mut j = last - 1
-      while j >= 0 && buf[i + j] == pat[j] {
-        j = j - 1
+  let ell = s.ell
+  let period = s.period
+  let skip = s.skip
+
+  if s.is_periodic {
+    let mut i = start
+    let mut mem = -1
+    while i <= limit {
+      if mem < 0 {
+        let cur = buf[i + last]
+        if cur != last_b {
+          i = i + skip[cur.to_int()]
+          continue
+        }
       }
-      if j < 0 {
-        return i
+      let mut j = (if ell > mem { ell } else { mem }) + 1
+      while j < m && pat[j] == buf[i + j] {
+        j = j + 1
+      }
+      if j < m {
+        i = i + (j - ell)
+        mem = -1
+      } else {
+        let mut k = ell
+        while k > mem && pat[k] == buf[i + k] {
+          k = k - 1
+        }
+        if k <= mem {
+          return i
+        }
+        i = i + period
+        mem = m - period - 1
       }
     }
-    i = i + skip[cur.to_int()]
+  } else {
+    let mut i = start
+    while i <= limit {
+      let cur = buf[i + last]
+      if cur != last_b {
+        i = i + skip[cur.to_int()]
+        continue
+      }
+      let mut j = ell + 1
+      while j < m && pat[j] == buf[i + j] {
+        j = j + 1
+      }
+      if j < m {
+        i = i + (j - ell)
+      } else {
+        let mut k = ell
+        while k >= 0 && pat[k] == buf[i + k] {
+          k = k - 1
+        }
+        if k < 0 {
+          return i
+        }
+        i = i + period
+      }
+    }
   }
   -1
 }
@@ -68,12 +187,13 @@ pub struct MultipartReader {
   data : Bytes
   boundary : String
   dash_boundary : Bytes
-  skip_table : FixedArray[Int]
+  searcher : TwoWaySearcher
   limits : MultipartLimits
   mut pos : Int
   mut parts_read : Int
   mut started : Bool
   mut done : Bool
+  mut nl_is_crlf : Bool
   mut preamble_end : Int
   mut epilogue_start : Int
 }
@@ -93,17 +213,18 @@ pub fn MultipartReader::with_limits(
     return Err(MimeError::InvalidBoundary)
   }
   let dash_b = ("--" + boundary).to_bytes()
-  let skip = build_bmh_skip(dash_b)
+  let searcher = TwoWaySearcher::new(dash_b)
   Ok(MultipartReader::{
     data: data,
     boundary: boundary,
     dash_boundary: dash_b,
-    skip_table: skip,
+    searcher: searcher,
     limits: limits,
     pos: 0,
     parts_read: 0,
     started: false,
     done: false,
+    nl_is_crlf: true,
     preamble_end: 0,
     epilogue_start: data.length(),
   })
@@ -112,11 +233,29 @@ pub fn MultipartReader::with_limits(
 ///| Inspect bytes immediately after `--boundary` at `after`.
 ///| Returns:
 ///| - `-1` if NOT a valid boundary delimiter (false match inside text)
-///| - `-2` if closing delimiter `--boundary--`
+///| - `-2` if valid closing delimiter `--boundary--` followed only by optional SP/HTAB then EOL/EOF
+///| - `-3` if malformed closing delimiter `--boundary--<non-ws garbage>` (RFC 2046 / Go error)
 ///| - `next_pos >= after` (position after EOL) if opening/intermediate part delimiter
 fn check_boundary_suffix(buf : Bytes, after : Int, end : Int) -> Int {
   if after + 2 <= end && buf[after].to_int() == 45 && buf[after + 1].to_int() == 45 {
-    return -2
+    // Closing delimiter: allow only optional transport padding (SP/HTAB) then EOF or EOL
+    let mut p = after + 2
+    while p < end {
+      let c = buf[p].to_int()
+      if c == 32 || c == 9 {
+        p = p + 1
+      } else {
+        break
+      }
+    }
+    if p >= end {
+      return -2
+    }
+    let c = buf[p].to_int()
+    if c == 10 || (c == 13 && p + 1 < end && buf[p + 1].to_int() == 10) {
+      return -2
+    }
+    return -3
   }
   // Skip optional transport padding (SP / HTAB)
   let mut p = after
@@ -151,6 +290,7 @@ fn parse_part_headers(
   let headers : Array[PartHeader] = []
   let max_h = limits.max_headers_per_part
   let max_bytes = limits.max_header_bytes
+  let max_params = limits.max_params_per_header
   let tlut = tchar_lut
   let mut pos = start
 
@@ -213,6 +353,22 @@ fn parse_part_headers(
     if colon <= line_start {
       return Err(MimeError::InvalidPartHeader)
     }
+    // Validate header value bytes: reject NUL and CTLs (except HTAB) + enforce max_params_per_header
+    let mut semi_count = 0
+    j = colon + 1
+    while j < line_end {
+      let vc = buf[j].to_int()
+      if (vc < 0x20 && vc != 9) || vc == 0x7F {
+        return Err(MimeError::InvalidPartHeader)
+      }
+      if vc == 59 {
+        semi_count = semi_count + 1
+        if max_params > 0 && semi_count > max_params {
+          return Err(MimeError::HeaderTooLarge)
+        }
+      }
+      j = j + 1
+    }
     let name = bytes_slice_to_string(buf, line_start, colon)
     let mut vs = colon + 1
     while vs < line_end && (buf[vs].to_int() == 32 || buf[vs].to_int() == 9) {
@@ -238,15 +394,15 @@ pub fn MultipartReader::next_part(self : MultipartReader) -> Result[Option[Part]
   let end = buf.length()
   let pat = self.dash_boundary
   let plen = pat.length()
-  let skip = self.skip_table
+  let searcher = self.searcher
 
-  // On first call, locate the initial boundary
+  // On first call, locate the initial boundary and lock line-ending mode (CRLF vs LF)
   if !self.started {
     self.started = true
     let mut search_from = 0
     let mut found_next = -1
     while search_from < end {
-      let m = bmh_find(buf, search_from, end, pat, skip)
+      let m = twoway_find(buf, search_from, end, pat, searcher)
       if m < 0 {
         return Err(MimeError::InvalidMultipart)
       }
@@ -266,11 +422,15 @@ pub fn MultipartReader::next_part(self : MultipartReader) -> Result[Option[Part]
       }
       if valid_start {
         let suf = check_boundary_suffix(buf, m + plen, end)
-        if suf == -2 {
+        if suf == -3 {
+          return Err(MimeError::InvalidMultipart)
+        } else if suf == -2 {
           self.epilogue_start = m + plen + 2
           self.done = true
           return Ok(None)
         } else if suf >= 0 {
+          // Determine message EOL mode from the first delimiter line (RFC 2046 / Go parity)
+          self.nl_is_crlf = suf >= 2 && buf[suf - 2].to_int() == 13 && buf[suf - 1].to_int() == 10
           found_next = suf
           break
         }
@@ -293,17 +453,24 @@ pub fn MultipartReader::next_part(self : MultipartReader) -> Result[Option[Part]
   }
 
   // Locate the next boundary terminating this part's body
+  let crlf_mode = self.nl_is_crlf
   let mut search_from = body_start
   while search_from <= end - plen {
-    let m = bmh_find(buf, search_from, end, pat, skip)
+    let m = twoway_find(buf, search_from, end, pat, searcher)
     if m < 0 {
       return Err(MimeError::UnexpectedEof)
     }
-    // Check if boundary is immediately at body_start (empty body) or preceded by \r\n or \n
+    // Check if boundary is immediately at body_start (empty body) or preceded by required EOL
     let mut body_end = -1
     if m == body_start {
       body_end = body_start
+    } else if crlf_mode {
+      // CRLF mode: ONLY \r\n--boundary terminates a part (never bare \n--boundary)
+      if m >= body_start + 2 && buf[m - 1].to_int() == 10 && buf[m - 2].to_int() == 13 {
+        body_end = m - 2
+      }
     } else if buf[m - 1].to_int() == 10 {
+      // LF mode: accept \n--boundary (and \r\n--boundary)
       if m >= body_start + 2 && buf[m - 2].to_int() == 13 {
         body_end = m - 2
       } else {
@@ -312,6 +479,9 @@ pub fn MultipartReader::next_part(self : MultipartReader) -> Result[Option[Part]
     }
     if body_end >= 0 {
       let suf = check_boundary_suffix(buf, m + plen, end)
+      if suf == -3 {
+        return Err(MimeError::InvalidMultipart)
+      }
       if suf == -2 || suf >= 0 {
         if body_end - body_start > self.limits.max_part_bytes {
           return Err(MimeError::PartTooLarge)
@@ -358,6 +528,8 @@ pub fn MultipartReader::epilogue(self : MultipartReader) -> Bytes {
 ///|
 pub struct MultipartWriter {
   boundary : String
+  dash_boundary : Bytes
+  searcher : TwoWaySearcher
   chunks : Array[Bytes]
 }
 
@@ -366,7 +538,34 @@ pub fn MultipartWriter::new(boundary : String) -> Result[MultipartWriter, MimeEr
   if !is_valid_boundary(boundary) {
     return Err(MimeError::InvalidBoundary)
   }
-  Ok(MultipartWriter::{ boundary: boundary, chunks: [] })
+  let dash_b = ("--" + boundary).to_bytes()
+  Ok(MultipartWriter::{
+    boundary: boundary,
+    dash_boundary: dash_b,
+    searcher: TwoWaySearcher::new(dash_b),
+    chunks: [],
+  })
+}
+
+///| Construct a `MultipartWriter` with a hex-encoded random boundary derived from caller-supplied
+///| entropy (`random_bytes`, at least 16 bytes; up to 30 bytes are used, producing <= 60 hex chars).
+///| Remains `World`-free and deterministic for callers providing CSPRNG bytes.
+pub fn MultipartWriter::from_random_bytes(random_bytes : Bytes) -> Result[MultipartWriter, MimeError] {
+  let len = random_bytes.length()
+  if len < 16 {
+    return Err(MimeError::InvalidBoundary)
+  }
+  let take = if len > 30 { 30 } else { len }
+  let hbytes = hex_upper_bytes
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < take {
+    let c = random_bytes[i].to_int()
+    sb.write_byte(hbytes[(c >> 4) & 0x0F])
+    sb.write_byte(hbytes[c & 0x0F])
+    i = i + 1
+  }
+  MultipartWriter::new(sb.to_string())
 }
 
 ///|
@@ -395,12 +594,36 @@ fn escape_quoted_param(s : String) -> String {
   sb.to_string()
 }
 
-///| Write a part with arbitrary headers and body, rejecting CRLF injection.
+///| Check whether `body` contains `--boundary` at offset 0 or preceded by `\n`, which would inject a part.
+fn body_contains_delimiter(body : Bytes, dash_b : Bytes, searcher : TwoWaySearcher) -> Bool {
+  let blen = body.length()
+  let plen = dash_b.length()
+  if blen < plen {
+    return false
+  }
+  let mut pos = 0
+  while pos <= blen - plen {
+    let m = twoway_find(body, pos, blen, dash_b, searcher)
+    if m < 0 {
+      return false
+    }
+    if m == 0 || body[m - 1].to_int() == 10 {
+      return true
+    }
+    pos = m + 1
+  }
+  false
+}
+
+///| Write a part with arbitrary headers and body, rejecting CRLF injection and boundary injection.
 pub fn MultipartWriter::write_part(
   self : MultipartWriter,
   headers : Array[PartHeader],
   body : Bytes,
 ) -> Result[Unit, MimeError] {
+  if body_contains_delimiter(body, self.dash_boundary, self.searcher) {
+    return Err(MimeError::InvalidMultipart)
+  }
   let sb = StringBuilder::new()
   if self.chunks.length() > 0 {
     sb.write_string("\r\n")

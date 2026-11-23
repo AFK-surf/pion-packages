@@ -105,6 +105,7 @@ test "redteam_multipart_100k_empty_parts_and_header_bombs" {
     max_headers_per_part: 4,
     max_header_bytes: 128,
     max_part_bytes: 64,
+    max_params_per_header: 16384,
   }
   let sb = StringBuilder::new()
   sb.write_string("--b\r\nX-Big: ")
@@ -201,38 +202,55 @@ test "redteam_crlf_injection_and_illegal_boundaries" {
 
 ///|
 test "redteam_malformed_percent_qp_rfc2047_and_path_traversal" {
-  // Malformed filename* percent-encoding
+  // Malformed filename* percent-encoding / format: RFC 6266 §4.3 drops bad filename* and keeps fallback
   let bad_pct = [
-    "attachment; filename*=UTF-8''abc%",
-    "attachment; filename*=UTF-8''abc%A",
-    "attachment; filename*=UTF-8''abc%ZZ",
-    "attachment; filename*=noquotes",
-    "attachment; filename*=''onlylang",
+    "attachment; filename=\"fb.txt\"; filename*=UTF-8''abc%",
+    "attachment; filename=\"fb.txt\"; filename*=UTF-8''abc%A",
+    "attachment; filename=\"fb.txt\"; filename*=UTF-8''abc%ZZ",
+    "attachment; filename=\"fb.txt\"; filename*=noquotes",
   ]
   let mut i = 0
   while i < bad_pct.length() {
     match parse_content_disposition(bad_pct[i]) {
-      Err(_) => ()
-      Ok(_) => debug_assert(false, "malformed filename* should fail: " + bad_pct[i])
+      Ok(cd) =>
+      match cd.filename() {
+        Some(f) => debug_assert(f == "fb.txt", "fallback filename preserved: " + bad_pct[i])
+        None => debug_assert(false, "fallback filename lost: " + bad_pct[i])
+      }
+      Err(_) => debug_assert(false, "bad filename* must not kill whole header: " + bad_pct[i])
     }
     i = i + 1
   }
-
-  // QP truncated / invalid hex / unescaped NUL
-  let bad_qp = [
-    "=",
-    "foo=A",
-    "foo=ZZ",
-    "foo=\rbar",
-    "foo\x00bar",
-  ]
-  i = 0
-  while i < bad_qp.length() {
-    match qp_decode_str(bad_qp[i]) {
-      Err(MimeError::InvalidQuotedPrintable) => ()
-      _ => debug_assert(false, "invalid QP must fail: case " + i.to_string())
+  // Empty charset in RFC 2231 (`filename*=''onlylang`) is valid per RFC 2231
+  match parse_content_disposition("attachment; filename*=''onlylang") {
+    Ok(cd) =>
+    match cd.filename() {
+      Some(f) => debug_assert(f == "onlylang", "empty charset RFC 2231")
+      None => debug_assert(false, "expected onlylang")
     }
-    i = i + 1
+    Err(_) => debug_assert(false, "empty charset RFC 2231 should succeed")
+  }
+
+  // QP RFC 2045 §6.7 / Go parity: invalid `=` escapes pass through literally; trailing `=` is soft break; NUL fails
+  match qp_decode_str("=") {
+    Ok(b) => debug_assert(b.to_string() == "", "trailing = at EOF is soft break")
+    Err(_) => debug_assert(false, "trailing = at EOF should succeed")
+  }
+  match qp_decode_str("foo=A") {
+    Ok(b) => debug_assert(b.to_string() == "foo=A", "truncated =A passes through")
+    Err(_) => debug_assert(false, "foo=A should pass through")
+  }
+  match qp_decode_str("foo=ZZ") {
+    Ok(b) => debug_assert(b.to_string() == "foo=ZZ", "invalid =ZZ passes through")
+    Err(_) => debug_assert(false, "foo=ZZ should pass through")
+  }
+  match qp_decode_str("foo=\rbar") {
+    Ok(b) => debug_assert(b.to_string() == "foo=\rbar", "=CR without LF passes through")
+    Err(_) => debug_assert(false, "foo=\\rbar should pass through")
+  }
+  match qp_decode_str("foo\x00bar") {
+    Err(MimeError::InvalidQuotedPrintable) => ()
+    _ => debug_assert(false, "unescaped NUL in QP must fail")
   }
 
   // RFC 2047 strict single-word errors
@@ -301,4 +319,187 @@ test "redteam_sniff_zero_panic_truncated_and_all_zero" {
   trunc_png[1] = b'P'
   trunc_png[2] = b'N'
   debug_assert(sniff_mime(trunc_png) == "application/octet-stream", "truncated PNG")
+}
+
+///|
+test "redteam_w10_regression_all_p0_p1_p2_fixes" {
+  // P0-1: large param count & RFC 2231 continuation bases parse in linear time
+  let sb_p = StringBuilder::new()
+  sb_p.write_string("text/plain")
+  let mut i = 0
+  while i < 2000 {
+    sb_p.write_string("; p")
+    sb_p.write_string(i.to_string())
+    sb_p.write_string("=x")
+    i = i + 1
+  }
+  match parse_media_type(sb_p.to_string()) {
+    Ok(mt) => debug_assert(mt.params.length() == 2000, "2000 plain params")
+    Err(_) => debug_assert(false, "2000 plain params failed")
+  }
+
+  // P0-1: max_params_per_header limit in MultipartLimits
+  let tight_limits = MultipartLimits::{
+    max_parts: 10,
+    max_headers_per_part: 10,
+    max_header_bytes: 65536,
+    max_part_bytes: 1024,
+    max_params_per_header: 3,
+  }
+  let many_params_mp = "--b\r\nContent-Disposition: form-data; name=\"f\"; a=1; b=2; c=3; d=4\r\n\r\nv\r\n--b--\r\n"
+  match MultipartReader::with_limits(many_params_mp.to_bytes(), "b", tight_limits) {
+    Ok(r) =>
+    match r.read_all() {
+      Err(MimeError::HeaderTooLarge) => ()
+      _ => debug_assert(false, "max_params_per_header must reject >3 params")
+    }
+    Err(_) => debug_assert(false, "tight limits init failed")
+  }
+
+  // P1-1: bare LF inside CRLF multipart body does not smuggle a part
+  let smuggle = "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nhi\n--b\r\nContent-Disposition: form-data; name=\"admin\"\r\n\r\ntrue\r\n--b--\r\n"
+  match MultipartReader::new(smuggle.to_bytes(), "b") {
+    Ok(r) =>
+    match r.read_all() {
+      Ok(ps) => {
+        debug_assert(ps.length() == 1, "CRLF mode ignores bare LF delimiter")
+        debug_assert(
+          ps[0].body_string() == "hi\n--b\r\nContent-Disposition: form-data; name=\"admin\"\r\n\r\ntrue",
+          "body intact",
+        )
+      }
+      Err(_) => debug_assert(false, "CRLF smuggle read_all failed")
+    }
+    Err(_) => debug_assert(false, "CRLF smuggle init failed")
+  }
+
+  // P1-3: safe_filename Windows/SMB & UI spoofing defenses
+  let bad_names = [
+    "CON", "nul", "COM1", "LPT9.log", "aux.txt", " ", "a:b:$DATA", "C:evil", ".htaccess",
+  ]
+  i = 0
+  while i < bad_names.length() {
+    let cd = ContentDisposition::{ disposition: "attachment", params: [Param::new("filename", bad_names[i])] }
+    debug_assert(cd.safe_filename() is None, "must reject: " + bad_names[i])
+    i = i + 1
+  }
+  let cd_dot = ContentDisposition::{ disposition: "attachment", params: [Param::new("filename", "evil.exe. ")] }
+  match cd_dot.safe_filename() {
+    Some(s) => debug_assert(s == "evil.exe", "trailing dot/space stripped")
+    None => debug_assert(false, "expected evil.exe")
+  }
+  let cd_bidi = ContentDisposition::{ disposition: "attachment", params: [Param::new("filename", "\u{202E}gnp.exe")] }
+  match cd_bidi.safe_filename() {
+    Some(s) => debug_assert(s == "gnp.exe", "bidi control stripped")
+    None => debug_assert(false, "expected gnp.exe")
+  }
+
+  // P1-4: Two-Way periodic boundary worst-case (a*70 boundary on all-'a' body)
+  let b70 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  let mut body_a = Bytes::new(65536)
+  i = 0
+  while i < 65536 {
+    body_a[i] = b'a'
+    i = i + 1
+  }
+  let w_p = match MultipartWriter::new(b70) {
+    Ok(x) => x
+    Err(_) => {
+      debug_assert(false, "a*70 writer init")
+      return
+    }
+  }
+  debug_assert(w_p.write_part([PartHeader::new("Content-Disposition", "form-data; name=\"f\"")], body_a) is Ok(_), "write a*70")
+  match MultipartReader::new(w_p.finish(), b70) {
+    Ok(r) =>
+    match r.read_all() {
+      Ok(ps) => {
+        debug_assert(ps.length() == 1, "1 part")
+        debug_assert(ps[0].body.length() == 65536, "exact body len")
+      }
+      Err(_) => debug_assert(false, "a*70 read_all failed")
+    }
+    Err(_) => debug_assert(false, "a*70 reader init failed")
+  }
+
+  // P1-5: MultipartWriter rejects boundary injection + from_random_bytes constructor
+  let w_inj = match MultipartWriter::new("fixed-b") {
+    Ok(x) => x
+    Err(_) => {
+      debug_assert(false, "writer init")
+      return
+    }
+  }
+  debug_assert(
+    w_inj.write_field("k", "v\r\n--fixed-b\r\nContent-Disposition: form-data; name=\"evil\"\r\n\r\n1") is Err(_),
+    "boundary injection must be rejected",
+  )
+  debug_assert(MultipartWriter::from_random_bytes(Bytes::new(8)) is Err(_), "<16 random bytes rejected")
+  let mut entropy = Bytes::new(24)
+  i = 0
+  while i < 24 {
+    entropy[i] = (i * 11 + 3).to_byte()
+    i = i + 1
+  }
+  match MultipartWriter::from_random_bytes(entropy) {
+    Ok(wr) => debug_assert(wr.boundary().length() == 48, "24 random bytes -> 48 hex chars")
+    Err(_) => debug_assert(false, "from_random_bytes failed")
+  }
+
+  // P2-1/P2-2/P2-12: sniff Java class, WHATWG HTML, UTF-16 BOM, PostScript, bz2/xz/7z/RAR/AVI
+  let mut jcls = Bytes::new(8)
+  jcls[0] = (0xCA).to_byte()
+  jcls[1] = (0xFE).to_byte()
+  jcls[2] = (0xBA).to_byte()
+  jcls[3] = (0xBE).to_byte()
+  jcls[7] = (0x34).to_byte()
+  debug_assert(sniff_mime(jcls) == "application/java", "Java class")
+  debug_assert(sniff_mime("<htmlfoo>".to_bytes()) == "text/plain; charset=utf-8", "<htmlfoo> not HTML")
+  debug_assert(sniff_mime("<br>".to_bytes()) == "text/html; charset=utf-8", "<br> is HTML")
+  debug_assert(sniff_mime("%!PS-Adobe-3.0".to_bytes()) == "application/postscript", "PostScript")
+  debug_assert(sniff_mime("BZh91AY&SY".to_bytes()) == "application/x-bzip2", "bz2")
+  debug_assert(sniff_mime("RIFF\x24\x00\x00\x00AVI LIST".to_bytes()) == "video/x-msvideo", "AVI")
+
+  // P2-3: Accept fault-tolerant negotiation
+  match negotiate_media_type("text/html;q=0.5555, application/json", ["application/json"]) {
+    Ok(Some(s)) => debug_assert(s == "application/json", "skip bad Accept item")
+    _ => debug_assert(false, "Accept skip failed")
+  }
+
+  // P2-4/P2-5/P2-6/P2-11: RFC 2231 fault tolerance, benign dupes, MSIE backslash, format_media_type star rejection
+  match parse_media_type("text/plain; charset=utf-8; charset=utf-8; a*1=orphan; a*01=bad") {
+    Ok(mt) =>
+    match mt.param("charset") {
+      Some(v) => debug_assert(v == "utf-8", "benign dup & bad sections")
+      None => debug_assert(false, "charset missing")
+    }
+    Err(_) => debug_assert(false, "benign dup / bad sections failed")
+  }
+  match parse_content_disposition("attachment; filename=\"C:\\dev\\x.txt\"") {
+    Ok(cd) =>
+    match cd.filename() {
+      Some(f) => debug_assert(f == "C:\\dev\\x.txt", "MSIE backslash preserved")
+      None => debug_assert(false, "filename missing")
+    }
+    Err(_) => debug_assert(false, "MSIE path failed")
+  }
+  debug_assert(format_media_type("text/plain", [Param::new("title*", "x")]) is Err(_), "format rejects * in param name")
+
+  // P2-7/P2-8: close delimiter garbage & NUL in part header
+  let close_garbage = "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n--b--garbage\r\n--b--\r\n"
+  match MultipartReader::new(close_garbage.to_bytes(), "b") {
+    Ok(r) => debug_assert(r.read_all() is Err(_), "--b--garbage must fail")
+    Err(_) => ()
+  }
+  let nul_hdr = "--b\r\nContent-Disposition: form-data; name=\"a\u{0}b\"\r\n\r\nx\r\n--b--\r\n"
+  match MultipartReader::new(nul_hdr.to_bytes(), "b") {
+    Ok(r) => debug_assert(r.read_all() is Err(_), "NUL in part header must fail")
+    Err(_) => ()
+  }
+
+  // P2-10: RFC 2047 split multi-byte UTF-8 across adjacent encoded-words
+  match decode_rfc2047("=?utf-8?Q?=E2=82?= =?utf-8?Q?=AC?=") {
+    Ok(s) => debug_assert(s == "\u{20AC}", "split UTF-8 euro sign")
+    Err(_) => debug_assert(false, "split UTF-8 decode failed")
+  }
 }

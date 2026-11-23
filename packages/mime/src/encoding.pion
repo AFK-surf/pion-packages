@@ -45,10 +45,10 @@ pub fn qp_decode(input : Bytes) -> Result[Bytes, MimeError] {
       }
     }
 
-    // Check for soft line break: '=' at trimmed_end - 1 followed by EOL (not EOF alone unless trailing)
+    // Check for soft line break: '=' at trimmed_end - 1 followed by EOL or EOF (Go / RFC 2045 §6.7)
     let mut soft_break = false
     let mut body_end = trimmed_end
-    if trimmed_end > line_start && input[trimmed_end - 1].to_int() == 61 && eol_kind != 0 {
+    if trimmed_end > line_start && input[trimmed_end - 1].to_int() == 61 {
       soft_break = true
       body_end = trimmed_end - 1
     }
@@ -57,17 +57,20 @@ pub fn qp_decode(input : Bytes) -> Result[Bytes, MimeError] {
     while i < body_end {
       let c = input[i].to_int()
       if c == 61 {
-        if i + 2 >= body_end {
-          return Err(MimeError::InvalidQuotedPrintable)
+        if i + 2 < body_end {
+          let hi = hlut[input[i + 1].to_int()]
+          let lo = hlut[input[i + 2].to_int()]
+          if hi >= 0 && lo >= 0 {
+            out[opos] = ((hi << 4) | lo).to_byte()
+            opos = opos + 1
+            i = i + 3
+            continue
+          }
         }
-        let hi = hlut[input[i + 1].to_int()]
-        let lo = hlut[input[i + 2].to_int()]
-        if hi < 0 || lo < 0 {
-          return Err(MimeError::InvalidQuotedPrintable)
-        }
-        out[opos] = ((hi << 4) | lo).to_byte()
+        // RFC 2045 §6.7 note (2) & Go parity: pass malformed '=' through literally
+        out[opos] = input[i]
         opos = opos + 1
-        i = i + 3
+        i = i + 1
       } else if c == 9 || (c >= 32 && c <= 126) || c == 13 || c >= 128 {
         out[opos] = input[i]
         opos = opos + 1
@@ -317,8 +320,21 @@ fn q_decode_word_payload(buf : Bytes, start : Int, end : Int) -> Result[Bytes, M
   Ok(out.slice(0, opos))
 }
 
-///| Decode a single RFC 2047 encoded-word `=?charset?B/Q?text?=`.
-fn decode_rfc2047_word_bytes(buf : Bytes, start : Int, end : Int) -> Result[String, MimeError] {
+///| Normalize supported RFC 2047 charset names to canonical lowercase identifiers.
+fn canonical_rfc2047_charset(cs : String) -> Option[String] {
+  if cs == "utf-8" || cs == "utf8" {
+    Some("utf-8")
+  } else if cs == "us-ascii" || cs == "ascii" {
+    Some("us-ascii")
+  } else if cs == "iso-8859-1" || cs == "latin1" || cs == "latin-1" {
+    Some("iso-8859-1")
+  } else {
+    None
+  }
+}
+
+///| Decode a single RFC 2047 encoded-word into `(canonical_charset, raw_bytes)` without charset validation yet.
+fn decode_rfc2047_word_raw(buf : Bytes, start : Int, end : Int) -> Result[(String, Bytes), MimeError] {
   if end - start < 8 {
     return Err(MimeError::InvalidRfc2047)
   }
@@ -359,7 +375,11 @@ fn decode_rfc2047_word_bytes(buf : Bytes, start : Int, end : Int) -> Result[Stri
   if cs_end <= start + 2 {
     return Err(MimeError::InvalidRfc2047)
   }
-  let charset = bytes_slice_to_lower_string(buf, start + 2, cs_end)
+  let raw_cs = bytes_slice_to_lower_string(buf, start + 2, cs_end)
+  let charset = match canonical_rfc2047_charset(raw_cs) {
+    Some(c) => c
+    None => return Err(MimeError::InvalidCharset)
+  }
   let text_start = q1 + 3
   let text_end = end - 2
 
@@ -376,6 +396,15 @@ fn decode_rfc2047_word_bytes(buf : Bytes, start : Int, end : Int) -> Result[Stri
   } else {
     return Err(MimeError::InvalidRfc2047)
   }
+  Ok((charset, raw_bytes))
+}
+
+///| Decode a single RFC 2047 encoded-word `=?charset?B/Q?text?=`.
+fn decode_rfc2047_word_bytes(buf : Bytes, start : Int, end : Int) -> Result[String, MimeError] {
+  let (charset, raw_bytes) = match decode_rfc2047_word_raw(buf, start, end) {
+    Ok(pair) => pair
+    Err(e) => return Err(e)
+  }
   decode_charset_bytes(charset, raw_bytes)
 }
 
@@ -385,8 +414,99 @@ pub fn decode_rfc2047_word(word : String) -> Result[String, MimeError] {
   decode_rfc2047_word_bytes(b, 0, b.length())
 }
 
+///| Buffered consecutive same-charset encoded-word item for P2-10 multi-byte UTF-8 joining.
+struct PendingEw {
+  raw : Bytes
+  word_start : Int
+  word_end : Int
+  pre_ws_start : Int
+  pre_ws_end : Int
+}
+
+///| Flush a run of consecutive same-charset encoded-words into `sb`.
+///| Returns `true` if the last emitted item was a decoded encoded-word.
+fn flush_pending_ew(
+  buf : Bytes,
+  cs : String,
+  run : Array[PendingEw],
+  sb : StringBuilder,
+) -> Bool {
+  let n = run.length()
+  if n == 0 {
+    return false
+  }
+  if n == 1 {
+    match decode_charset_bytes(cs, run[0].raw) {
+      Ok(s) => {
+        sb.write_string(s)
+        return true
+      }
+      Err(_) => {
+        if run[0].pre_ws_start >= 0 {
+          sb.write_string(bytes_slice_to_string(buf, run[0].pre_ws_start, run[0].pre_ws_end))
+        }
+        sb.write_string(bytes_slice_to_string(buf, run[0].word_start, run[0].word_end))
+        return false
+      }
+    }
+  }
+  // Concatenate raw bytes of all adjacent same-charset words and decode together
+  let mut total = 0
+  let mut i = 0
+  while i < n {
+    total = total + run[i].raw.length()
+    i = i + 1
+  }
+  let mut combined = Bytes::new(total)
+  let mut off = 0
+  i = 0
+  while i < n {
+    let rb = run[i].raw
+    let mut j = 0
+    while j < rb.length() {
+      combined[off] = rb[j]
+      off = off + 1
+      j = j + 1
+    }
+    i = i + 1
+  }
+  match decode_charset_bytes(cs, combined) {
+    Ok(s) => {
+      sb.write_string(s)
+      true
+    }
+    Err(_) => {
+      // Combined decode failed (e.g. one word contains invalid UTF-8): decode individually
+      let mut last_ok = false
+      i = 0
+      while i < n {
+        let item = run[i]
+        match decode_charset_bytes(cs, item.raw) {
+          Ok(s) => {
+            if !last_ok && item.pre_ws_start >= 0 {
+              sb.write_string(bytes_slice_to_string(buf, item.pre_ws_start, item.pre_ws_end))
+            }
+            sb.write_string(s)
+            last_ok = true
+          }
+          Err(_) => {
+            if item.pre_ws_start >= 0 {
+              sb.write_string(bytes_slice_to_string(buf, item.pre_ws_start, item.pre_ws_end))
+            }
+            sb.write_string(bytes_slice_to_string(buf, item.word_start, item.word_end))
+            last_ok = false
+          }
+        }
+        i = i + 1
+      }
+      last_ok
+    }
+  }
+}
+
 ///| Decode an RFC 2047 header value, folding whitespace between adjacent encoded-words
-///| (RFC 2047 §6.2) and leaving undecodable/incomplete words literal (Go `DecodeHeader` parity).
+///| (RFC 2047 §6.2), joining octets of adjacent same-charset words before charset decoding,
+///| and leaving undecodable/incomplete words literal (Go `DecodeHeader` parity).
 pub fn decode_rfc2047(input : String) -> Result[String, MimeError] {
   let buf = input.to_bytes()
   let len = buf.length()
@@ -409,6 +529,8 @@ pub fn decode_rfc2047(input : String) -> Result[String, MimeError] {
   let mut prev_was_ew = false
   let mut pending_ws_start = -1
   let mut pending_ws_end = -1
+  let mut run_cs = ""
+  let mut run : Array[PendingEw] = []
 
   while pos < len {
     // Check if we are at `=?`
@@ -432,12 +554,32 @@ pub fn decode_rfc2047(input : String) -> Result[String, MimeError] {
         j = j + 1
       }
       if word_end > 0 {
-        match decode_rfc2047_word_bytes(buf, pos, word_end) {
-          Ok(decoded) => {
-            // If previous token was also an encoded-word, drop pending whitespace (RFC 2047 §6.2)
+        match decode_rfc2047_word_raw(buf, pos, word_end) {
+          Ok((cs, raw_bytes)) => {
+            if run.length() > 0 && run_cs == cs {
+              run.push(PendingEw::{
+                raw: raw_bytes,
+                word_start: pos,
+                word_end: word_end,
+                pre_ws_start: pending_ws_start,
+                pre_ws_end: pending_ws_end,
+              })
+            } else {
+              if run.length() > 0 {
+                let _ = flush_pending_ew(buf, run_cs, run, sb)
+                run = []
+              }
+              run_cs = cs
+              run.push(PendingEw::{
+                raw: raw_bytes,
+                word_start: pos,
+                word_end: word_end,
+                pre_ws_start: pending_ws_start,
+                pre_ws_end: pending_ws_end,
+              })
+            }
             pending_ws_start = -1
             pending_ws_end = -1
-            sb.write_string(decoded)
             prev_was_ew = true
             pos = word_end
             continue
@@ -445,7 +587,12 @@ pub fn decode_rfc2047(input : String) -> Result[String, MimeError] {
           Err(_) => ()
         }
       }
-      // Failed to decode: flush any pending whitespace, emit "=?" literally
+      // Failed to decode: flush any pending run & whitespace, emit "=?" literally
+      if run.length() > 0 {
+        let _ = flush_pending_ew(buf, run_cs, run, sb)
+        run = []
+        run_cs = ""
+      }
       if pending_ws_start >= 0 {
         sb.write_string(bytes_slice_to_string(buf, pending_ws_start, pending_ws_end))
         pending_ws_start = -1
@@ -474,7 +621,12 @@ pub fn decode_rfc2047(input : String) -> Result[String, MimeError] {
       continue
     }
 
-    // Literal byte: flush any pending whitespace first
+    // Literal byte: flush any pending run & whitespace first
+    if run.length() > 0 {
+      let _ = flush_pending_ew(buf, run_cs, run, sb)
+      run = []
+      run_cs = ""
+    }
     if pending_ws_start >= 0 {
       sb.write_string(bytes_slice_to_string(buf, pending_ws_start, pending_ws_end))
       pending_ws_start = -1
@@ -485,6 +637,9 @@ pub fn decode_rfc2047(input : String) -> Result[String, MimeError] {
     pos = pos + 1
   }
 
+  if run.length() > 0 {
+    let _ = flush_pending_ew(buf, run_cs, run, sb)
+  }
   if pending_ws_start >= 0 {
     sb.write_string(bytes_slice_to_string(buf, pending_ws_start, pending_ws_end))
   }
