@@ -51,8 +51,12 @@ pionc add <package-name>
 | [`jwt`](packages/jwt) | `0.1.0` | RFC 7515 JWS / RFC 7519 JWT / RFC 7517 JWK（HS256 / HS384 / HS512），内置 FIPS 180-4 SHA-2、RFC 4231 HMAC、严格 Base64URL 与常量时间比较，默认强制 `exp` / `aud` 校验并拒绝 `alg: none` | Rust [`jsonwebtoken`](https://github.com/Keats/jsonwebtoken) `12.0.0` + Go [`golang-jwt/jwt/v5`](https://github.com/golang-jwt/jwt) `v5.3.1` | 19 / 19 | ✅ `wasm_smoke` | [签发 0.39× · 验签 0.34×（vs Rust，纯软件 SHA-2 vs 硬件 SHA-2）· 签发 RSS 1.95 MiB](BENCHMARKS.md#jwt) | `pionc add jwt --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`xml`](packages/xml) | `0.1.0` | XML 1.0（第五版）+ Namespaces 1.0 流式拉取解析器、扁平数组只读 DOM 与严格原子 `Writer`；默认禁用 DTD，XXE / Billion Laughs 免疫，全程零递归 | Rust [`roxmltree`](https://github.com/RazrFalcon/roxmltree) `0.21.2` + [`quick-xml`](https://github.com/tafia/quick-xml) `0.42.0` | 38 / 38 | ✅ `wasm_smoke` | [DOM indexed 0.81× · 公开 `Node` API 0.58× · 流式 0.67× · 写 0.87× · 对抗最高 129.32×](BENCHMARKS.md#xml) | `pionc add xml --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`csv`](packages/csv) | `0.1.0` | RFC 4180 + 灵活方言流式 CSV 读写（`Trim` / 注释 / 转义 / `QuoteStyle` / `Terminator`），O(N) 确定性扫描、可选 `Limits` 与严格 RFC 3629 UTF-8 校验 | Rust [`BurntSushi/rust-csv`](https://github.com/BurntSushi/rust-csv) `=1.4.0` + Go `encoding/csv` | 27 / 27 | ✅ `wasm_smoke` | [读 0.95× · 写 1.26×（vs Go，写与 Rust 持平）](BENCHMARKS.md#csv) | `pionc add csv --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`regex`](packages/regex) | `0.1.0` | 线性时间正则引擎（Hybrid Lazy DFA / One-Pass DFA / PikeVM，结构上不可能 ReDoS），对齐 Rust `regex` / RE2 语法语义，Unicode 16.0.0、命名捕获、`replace` / `split` 与多模式 `RegexSet`；编译期拒绝反向引用与环视 | Rust [`regex`](https://github.com/rust-lang/regex) `=1.11.1` + Go `regexp`（`go1.27.3`） | 23 / 23 | ✅ `wasm_smoke` | [`find_iter` 0.43× · `captures_iter` 0.50× · `RegexSet` 0.64× · ReDoS 0.88×（vs Rust；vs Go 2.0–16.2×）](BENCHMARKS.md#regex) | `pionc add regex --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`flate`](packages/flate) | `0.1.0` | Sans-IO RFC 1951 DEFLATE（0–9 级，Package-Merge 限长 Huffman）/ RFC 1950 zlib（含 `FDICT`）/ RFC 1952 gzip（全可选头、多 member）与 CRC-32 / Adler-32，默认 256 MiB 输出上限防 Zip Bomb；一次性 `Bytes -> Bytes` API | Rust [`flate2`](https://github.com/rust-lang/flate2-rs) `1.1.11`（`miniz_oxide`）+ Go `compress/{flate,zlib,gzip}`（`go1.27.3`） | 20 / 20 | ✅ `wasm_smoke` | [gzip 解压 1.03–1.09×（vs Go）/ 0.71–0.78×（vs `miniz_oxide`）· `big16` L6 压缩 1.04× · CRC-32 0.40–0.49×](BENCHMARKS.md#flate) | `pionc add flate --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`decimal`](packages/decimal) | `0.1.0` | 128-bit 精确十进制定点数（96-bit 尾数、scale `0..=28`），checked 四则 / 取余、7 种舍入策略（含银行家舍入）、科学计数法与任意进制解析、与 `rust_decimal` 逐位互通的 16 字节序列化，Introsort 排序 | [`paupino/rust-decimal`](https://github.com/paupino/rust-decimal) `=1.37.2` (Rust, MIT) | 15 / 15 | ✅ `wasm_smoke` | [解析格式化 0.81× · 账单算术 0.60× · 排序聚合 0.36×](BENCHMARKS.md#decimal) | `pionc add decimal --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`template`](packages/template) | `0.1.0` | Jinja2 / MiniJinja 兼容模板引擎：`extends` / `block` / `include` / `macro` / `import`、41+ 过滤器与 27+ 测试、HTML / JSON 自动转义与 HTML 安全 `\|tojson`，`max_depth` / `fuel` / `max_output_bytes` 防 DoS | [`mitsuhiko/minijinja`](https://github.com/mitsuhiko/minijinja) `=3.1.0` (Rust, Apache-2.0) | 45 / 45 | ✅ `wasm_smoke` | [HTML SSR 0.77× · Prompt 渲染 1.39× · 编译 + 渲染 1.52×](BENCHMARKS.md#template) | `pionc add template --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 20 个包合计 **3,754 / 3,754** 单测通过（`sh scripts/verify.sh`）。
+全仓 24 个包合计 **3,857 / 3,857** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -65,6 +69,10 @@ Wave 4 新增的 4 个包同样按 Red → Green → 红队审计 → 修复流�
 ### Wave 5：`http1` / `jwt` / `xml` / `csv` `v0.1.0`
 
 Wave 5 新增的 4 个包按 Red → Green → 红队审计 → 修复流程交付，首发即为红队修复后的版本，各自随附 `packages/<name>/audit/` 套件（`http1` 33 / 33 + 200,000 例变异 fuzz 0 分歧；`jwt` 270,128 个 SHA-2 / HMAC / Base64URL 差分向量 0 差异；`xml` 44 / 44，W3C XML Conformance 1,458 / 1,662；`csv` 18 / 18 对 Rust `csv =1.4.0` 差分）。各包对比口径与落后项见 [`BENCHMARKS.md`](BENCHMARKS.md)。
+
+### Wave 6：`regex` / `flate` / `decimal` / `template` `v0.1.0`
+
+Wave 6 新增的 4 个包按 Red → Green → 红队审计 → 修复流程交付，首发即为红队修复后的版本，各自随附 `packages/<name>/audit/` 套件（`regex` 对 Rust `regex =1.11.1` 差分 51,805 例 0 崩溃 / 0 挂起，`sets` 3,022 / 3,022、`curated` 8,742 / 8,783 完全一致；`flate` 审计 11 / 11、81 / 81 RFC 边界向量、24,000 例变异 fuzz 对 Go / Rust / CPython 0 分歧；`decimal` 对 `rust_decimal =1.37.2` 167,139 次运算差分，33 类运算中 27 类逐位一致，审计 16 / 16；`template` 红队审计 29 / 29、对 `minijinja =3.1.0` 差分 251 / 283 逐字节一致、62 / 62 DoS 矩阵 0 崩溃）。全部 24 个包的 `wasm_smoke` 已在 `AFK-surf/pion@bee7628` 上通过 Native / Wasm32 × debug / `--release` 共 96 / 96 次运行。各包对比口径、落后项与已知差异见 [`BENCHMARKS.md`](BENCHMARKS.md)。
 
 ## 贡献与移植流程
 

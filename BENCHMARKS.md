@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 四个包的数据取自各包 README，未记录 pion commit） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4 + Wave 5）
+## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -97,6 +97,28 @@
 | `csv` | `mixed_1m.csv`，`from_string` vs Rust `ByteRecord`（同口径：均不逐记录校验 UTF-8） | 77 MB | 236.8 ms | 139.2 ms (`rust_byte`) | 1.70x slower | 149.2 MiB | 75.6 MiB |
 | `csv` | `mixed_1m.csv`，`from_bytes` vs Rust `StringRecord`（同口径：均严格校验 UTF-8） | 77 MB | 303.5 ms | 160.8 ms (`rust_str`) | 1.89x slower | 149.2 MiB | — |
 | `csv` | `trim_comment.csv`（`Trim::All` + `#`） | 64 MB | 168.0 ms | 202.7 ms (`rust_byte`) / 298.7 ms (`rust_str`) | **1.21x faster**（vs `ByteRecord`）/ **1.78x faster**（vs `StringRecord`） | 124.0 MiB | 63.1 MiB |
+| `regex` | `find_iter` 混合日志多模式搜索（20,000 行 × 10） | 26.89 MB | 43.756 ms | 18.969 ms (`rust_regex`) / 709.004 ms (`go_regexp`) | 0.43x（vs Rust）/ **16.2x**（vs Go） | 7.42 MiB | 5.61 / 16.52 MiB |
+| `regex` | `captures_iter` 结构化日志捕获（20,000 行 × 6 组 × 5） | 13.45 MB | 113.792 ms | 56.727 ms (`rust_regex`) / 383.411 ms (`go_regexp`) | 0.50x（vs Rust）/ **3.4x**（vs Go） | 7.42 MiB | 6.38 / 17.66 MiB |
+| `regex` | `RegexSet` 16 规则并行匹配 | 100,000 ops | 55.119 ms | 35.282 ms (`rust_regex`) / 111.581 ms (`go_regexp`) | 0.64x（vs Rust）/ **2.0x**（vs Go） | 9.31 MiB | 6.55 / 11.30 MiB |
+| `regex` | ReDoS 线性时间（`a?^40 a^40` + 4,000 字节病态输入） | 250 ops | 11.109 ms | 9.788 ms (`rust_regex`) / 26.023 ms (`go_regexp`) | 0.88x（vs Rust）/ **2.3x**（vs Go） | 2.73 MiB | 3.28 / 5.50 MiB |
+| `regex` | 对抗：带 Unicode `\b` 的捕获 `\b(\w+)@?(\d*)\b`（2.8 MB） | 2.8 MB | 916.5 ms | 102.0 ms (Rust) | 8.99x slower | 7.0 MiB | 6.0 MiB |
+| `regex` | 对抗：尾锚定 `(?s).*1[01]{12}$`（DFA 抖动） | — | 114.6 ms | 6.7 ms (Rust) | 17.10x slower | 12.0 MiB | 4.1 MiB |
+| `flate` | gzip 解压 `big16`（16 MiB 混合语料；吞吐 MB/s） | 16 MiB | 290.7 MB/s | 412.3 MB/s (`miniz_oxide`) / 283.5 MB/s (Go) | 0.71x（vs `miniz`）/ **1.03x**（vs Go） | — | — |
+| `flate` | gzip 解压 `entropy`（4 MiB 随机） | 4 MiB | 639.6 MB/s | 1959.9 MB/s (`miniz_oxide`) / 1765.1 MB/s (Go) | 0.33x / 0.36x | — | — |
+| `flate` | 压缩 L6 `big16` | 16 MiB | 37.5 MB/s | 36.0 MB/s (`miniz_oxide`) / 110.3 MB/s (Go) | **1.04x** / 0.34x | — | — |
+| `flate` | 压缩 L9 `entropy` | 4 MiB | 410.4 MB/s | 64.8 MB/s (`miniz_oxide`) / 183.1 MB/s (Go) | **6.33x** / **2.24x** | — | — |
+| `flate` | CRC-32 + Adler-32（6 种语料） | — | 843–1007 MB/s | 1721–2450 MB/s (`miniz_oxide`) / 1175–1510 MB/s (Go) | 0.40–0.49x / 0.63–0.72x | — | — |
+| `flate` | 对抗：`bomb_1GiB.gz`（limit = 256 MiB） | — | 0.16 s | 0.04 s (`miniz_oxide`) / 0.12 s (Go) | — | 394.1 MiB | 293.1 / 580.2 MiB |
+| `decimal` | 混合十进制解析 + 格式化 | 6.56 MB（500,000 ops） | 54.734 ms | 44.605 ms (`rust_decimal`) | 0.81x | 5.36 MiB | 3.38 MiB |
+| `decimal` | 账单算术流（`checked_mul` / `add` / `sub` / `div` / `round_dp(2)`） | 2,000,000 ops | 67.804 ms | 40.552 ms (`rust_decimal`) | 0.60x | **1.72 MiB** | 1.81 MiB |
+| `decimal` | 排序 + 聚合 + 银行家舍入 | 500,000 ops | 126.927 ms | 45.269 ms (`rust_decimal`) | 0.36x | 7.91 MiB | 4.12 MiB |
+| `decimal` | 对抗：A1 McIlroy 快排杀手（红队修复前 2,872.7 ms） | 50,000 | 15.732 ms | 11.951 ms (`rust_decimal`) | 0.76x | 6.70 MiB | 3.14 MiB |
+| `decimal` | 对抗：A4 `checked_div`（32 / 64 / 96-bit 除数） | 2,000,000 | 213.339 ms | 97.042 ms (`rust_decimal`) | 0.45x | **1.75 MiB** | 1.84 MiB |
+| `template` | HTML 页面 SSR（10,000 次渲染） | 23.77 MB 输出 | 156.054 ms | 119.374 ms (`rust_minijinja`) | 0.77x | **2.50 MiB** | 3.08 MiB |
+| `template` | AI Agent Prompt 渲染（20,000 次） | 9.14 MB 输出 | 69.348 ms | 96.668 ms (`rust_minijinja`) | **1.39x** | **2.41 MiB** | 2.88 MiB |
+| `template` | 编译 + 渲染端到端（2,000 次） | 938 KB 输出 | 25.865 ms | 39.368 ms (`rust_minijinja`) | **1.52x** | **2.30 MiB** | 3.12 MiB |
+| `template` | 对抗：`bench_attr_lookup_100k` | — | 56.65 ms | 30.91 ms (`rust_minijinja`) | 0.55x | — | — |
+| `template` | 对抗：`bench_set_concat_20k` | — | 18.87 ms | 54.55 ms (`rust_minijinja`) | **2.89x** | — | — |
 
 ## 各包明细
 
@@ -675,3 +697,201 @@ SHA-256：`1ead353719fe54e5aea4d0c4818d61134d51f364cef4f4f8bd4beff1b5310c24`
 SHA-256：`ddc27c6360c7b492919a2ebe9e6421cf6adf7aec87566c2a2794c81592e69db5`
 
 红队：27/27 单测（`reader_test` 12/12、`writer_test` 6/6、`redteam_test` 9/9）；审计 18/18 对 Rust `csv =1.4.0`（`csv-core 0.1.13`）差分，另有 40,000 读 + 10,000 写差分 fuzz、6,400 次无损往返（0 有损）与 133,816 次 wasm32 / native 逐字节一致运行。领先项：写为 Go 的 **1.26x**、与 Rust 持平（73.909 vs 74.053 ms）；`trim_comment.csv` 快于 Rust `ByteRecord` 1.21x、`StringRecord` 1.78x；`Record::fields()` 分配模式快于 `StringRecord` 1.10x。落后项：读 Bench 1 为 Go 的 0.95x；同口径下 `from_string` 慢于 `ByteRecord` 1.53–2.15x（`escape.csv` 3.12x），`from_bytes` 慢于 `StringRecord` 1.89x；峰值 RSS 多数场景约为 Rust 的 1.8–2.0 倍（`narrow.csv` `read_all` 为 1.29 倍）。
+
+### regex
+
+参考实现：Rust [`regex`](https://github.com/rust-lang/regex) `1.11.1`（`--release`，基线）与 Go `go1.27.3` stdlib `regexp`（RE2）。`--warmup 1 --rounds 5`，`sh packages/regex/bench/run_bench.sh`。详见 [`packages/regex/README.md`](packages/regex/README.md)。
+
+**1. 混合日志多模式搜索（`find_iter`，20,000 行日志 × 10 iters，26.89 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_regex`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 43.756 | 41.373 | 92.132 | 614.61 | 7.42 MiB | 0.43x (**16.2× vs Go**) |
+| `rust_regex` | 18.969 | 17.993 | 20.177 | 1417.70 | 5.61 MiB | 1.00x (baseline) |
+| `go_regexp` | 709.004 | 688.301 | 760.101 | 37.93 | 16.52 MiB | 0.03x |
+
+_SHA-256 verified identical across all implementations and rounds: `16f877f2f550dcee8b3b644bec3df2cd1c489cdcf2617060714905b6ffcb24ab`._
+
+**2. 结构化日志捕获提取（`captures_iter`，20,000 行 × 6 组 × 5 iters，13.45 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_regex`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 113.792 | 109.889 | 115.274 | 118.17 | 7.42 MiB | 0.50x (**3.4× vs Go**) |
+| `rust_regex` | 56.727 | 55.498 | 57.115 | 237.04 | 6.38 MiB | 1.00x (baseline) |
+| `go_regexp` | 383.411 | 379.410 | 391.140 | 35.07 | 17.66 MiB | 0.15x |
+
+_SHA-256 verified identical across all implementations and rounds: `8c769e6c2061bea100886a29e886c793b6abcc3a50e8190cad21a812c03403da`._
+
+**3. `RegexSet` 多规则并行匹配（20,000 行 × 16 规则 × 5 iters = 100,000 ops，13.45 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_regex`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 55.119 | 54.412 | 58.088 | 243.95 | 551.19 | 9.31 MiB | 0.64x (**2.0× vs Go**) |
+| `rust_regex` | 35.282 | 34.192 | 36.363 | 381.11 | 352.82 | 6.55 MiB | 1.00x (baseline) |
+| `go_regexp` | 111.581 | 110.640 | 116.796 | 120.51 | 1115.81 | 11.30 MiB | 0.32x |
+
+_SHA-256 verified identical across all implementations and rounds: `a7e10eb653fdc30d7425bdfbe7d3d939ce4c6640f75fda1b09bc3b8a3446d48d`._
+
+**4. ReDoS 线性时间验证（`a?^40 a^40` + 4,000 字节病态输入 × 50 iters = 250 ops）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_regex`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 11.109 | 9.629 | 11.322 | 44436.00 | 2.73 MiB | 0.88x (**2.3× vs Go**) |
+| `rust_regex` | 9.788 | 8.958 | 15.514 | 39153.33 | 3.28 MiB | 1.00x (baseline) |
+| `go_regexp` | 26.023 | 24.664 | 27.858 | 104090.00 | 5.50 MiB | 0.38x |
+
+_SHA-256 verified identical across all implementations and rounds: `9f98f5bc3836fb96f47a290a7ceca716b26d89b668b1d60d532d91301c7a0e8d`._
+
+**5. 对抗与压力负载（`audit/stress/run_stress.py`，Pion `--release` vs Rust `regex =1.11.1`，stdout 逐字节一致；最后一列为耗时比 Pion / Rust，`> 1` 表示 Pion 更慢）**
+
+| Scenario | Pion (ms) | Pion RSS | Rust (ms) | Rust RSS | Pion / Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Compile `[a × 40,000]` (duplicate class items) | 9.5 | 5.5 MiB | 8.8 | 16.2 MiB | 1.09× |
+| Compile `[` × 200,000 (rejected by `nest_limit`) | 5.9 | 3.2 MiB | 44.1 | 102.6 MiB | **0.13×** |
+| `\bword\b` on 2.8 MB mixed Unicode/ASCII × 3 | 21.1 | 7.0 MiB | 21.3 | 5.4 MiB | **0.99×** |
+| `\b\w+\b` on 2.8 MB mixed Unicode/ASCII | 260.7 | 18.5 MiB | 65.9 | 6.2 MiB | 3.96× |
+| Non-one-pass captures `(\w+?)(o\|ox)( ?)` on 2.8 MB | 162.6 | 7.0 MiB | 24.4 | 6.0 MiB | 6.67× |
+| Captures with `\b`: `\b(\w+)@?(\d*)\b` on 2.8 MB | 916.5 | 7.0 MiB | 102.0 | 6.0 MiB | 8.99× |
+| `RegexSet` 16 rules (incl. `\b`) × 40k lines | 387.3 | 9.8 MiB | 107.2 | 7.3 MiB | 3.61× |
+| `RegexSet` 200 rules (incl. `\b`) × 40k lines | 3703.4 | 28.5 MiB | 2009.8 | 13.8 MiB | 1.84× |
+| `RegexSet` 500 rules (incl. `\b`) × 40k lines | 16987.0 | 47.9 MiB | 6809.3 | 23.4 MiB | 2.49× |
+| `(?s).*1[01]{12}$` (tail-anchored DFA thrash) | 114.6 | 12.0 MiB | 6.7 | 4.1 MiB | 17.10× |
+
+红队：23/23 单测；对 Rust `regex =1.11.1` 差分 51,805 例 0 崩溃 / 0 挂起（`sets` 3,022 / 3,022、`curated` 8,742 / 8,783、`fuzz` 19,986 / 20,000、`capfuzz` 19,892 / 20,000 完全一致），Native 与 Wasm32 debug / `--release` 100% 逐字节一致。领先项：4 项标准负载均快于 Go `regexp` **2.0×–16.2×** 且峰值 RSS 更低；`\bword\b` 与 Rust 持平（0.99×），`[` × 200,000 嵌套炸弹拒收耗时为 Rust 的 0.13×（RSS 3.2 vs 102.6 MiB）。落后项：对 Rust `find_iter` 0.43x、`captures_iter` 0.50x、`RegexSet` 0.64x（无 SIMD `memchr` / Teddy 预过滤，Pion 为标量扫描）；非 one-pass 捕获慢 6.67×、带 Unicode `\b` 的捕获慢 8.99×（无 bounded backtracker，走 PikeVM）；尾锚定 `(?s).*1[01]{12}$` 慢 17.10×（无 reverse-suffix 优化）；`RegexSet` 200 / 500 规则慢 1.84× / 2.49×。已知差异：`(a){0}` 报告 2 个捕获组（同 RE2，Rust 为 1）；约 0.24% 随机 fuzz / capfuzz 模式在深层可空捕获循环上子匹配取舍与 Rust 不同；解析器为递归下降，Wasm32 上把 `nest_limit` 调到约 400 以上可能溢出调用栈（默认 250 安全）。
+
+### flate
+
+参考实现：Rust [`flate2`](https://github.com/rust-lang/flate2-rs) `1.1.11`（`rust_backend` / `miniz_oxide`，`--release`）与 Go `go1.27.3` `compress/gzip` + `hash/{crc32,adler32}`。`sh packages/flate/audit/run_audit.sh bench`（`scripts/bench_compare.py`，`--warmup 1 --rounds 5`，严格交替；压缩模式会重新解压并输出长度 + CRC-32 参与 SHA-256 校验）。详见 [`packages/flate/README.md`](packages/flate/README.md)。
+
+**1. 6 种真实 / 病态语料吞吐（MB/s；`Pion Before` 为红队修复前）**
+
+| Corpus | Operation | Pion Before | **Pion After** | `miniz_oxide` | Go | Pion vs `miniz` | Pion vs Go |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `entropy` (4 MiB rand) | gzip decompress | 530.6 | **639.6** | 1959.9 | 1765.1 | 0.33× | 0.36× |
+| `entropy` | compress L1 | 37.0 | **538.5** | 277.2 | 1592.4 | **1.94×** | 0.34× |
+| `entropy` | compress L6 | 33.7 | **542.3** | 68.1 | 1470.6 | **7.96×** | 0.37× |
+| `entropy` | compress L9 | 34.1 | **410.4** | 64.8 | 183.1 | **6.33×** | **2.24×** |
+| `html` (4 MiB Go spec) | gzip decompress | 260.5 | **305.5** | 392.7 | 291.4 | 0.78× | **1.05×** |
+| `html` | compress L1 / L6 / L9 | 83.4 / 30.2 / 17.7 | **100.8 / 44.4 / 21.3** | 216.1 / 51.4 / 37.8 | 216.0 / 139.1 / 29.0 | 0.47 / 0.86 / 0.56× | 0.47 / 0.32 / 0.74× |
+| `json` (4 MiB records) | gzip decompress | 268.3 | **291.9** | 401.2 | 269.3 | 0.73× | **1.08×** |
+| `json` | compress L1 / L6 / L9 | 88.9 / 35.2 / 10.3 | **98.1 / 52.8 / 17.1** | 255.2 / 45.8 / 23.6 | 240.9 / 138.8 / 24.7 | 0.38 / **1.15** / 0.72× | 0.41 / 0.38 / 0.69× |
+| `source` (4 MiB Go src) | gzip decompress | 268.4 | **321.2** | 409.6 | 293.9 | 0.78× | **1.09×** |
+| `source` | compress L1 / L6 / L9 | 84.5 / 26.7 / 19.0 | **103.7 / 49.8 / 25.9** | 236.0 / 55.8 / 43.4 | 222.0 / 143.6 / 40.9 | 0.44 / 0.89 / 0.60× | 0.47 / 0.35 / 0.63× |
+| `text` (2.4 MiB words) | gzip decompress | 191.5 | **247.5** | 337.9 | 229.3 | 0.73× | **1.08×** |
+| `text` | compress L1 / L6 / L9 | 70.5 / 20.9 / 6.4 | **93.3 / 26.7 / 9.9** | 207.6 / 29.2 / 15.5 | 180.3 / 101.6 / 17.0 | 0.45 / 0.91 / 0.64× | 0.52 / 0.26 / 0.58× |
+| `big16` (16 MiB mix) | gzip decompress | 232.5 | **290.7** | 412.3 | 283.5 | 0.71× | **1.03×** |
+| `big16` | compress L1 / L6 / L9 | 64.0 / 23.1 / 11.4 | **87.2 / 37.5 / 15.4** | 182.2 / 36.0 / 24.8 | 167.9 / 110.3 / 23.5 | 0.48 / **1.04** / 0.62× | 0.52 / 0.34 / 0.65× |
+| All 6 corpora | CRC-32 + Adler-32 | 702–826 | **843–1007** | 1721–2450 | 1175–1510 | 0.40–0.49× | 0.63–0.72× |
+
+**2. 压缩后体积（Bytes）**
+
+| Corpus | Level 1 (Pion / `miniz` / Go) | Level 6 (Pion / `miniz` / Go) | Level 9 (Pion / `miniz` / Go) |
+| --- | ---: | ---: | ---: |
+| `entropy` (4,194,304 B) | 4,194,629 / 4,198,186 / 4,194,631 | 4,194,629 / 4,194,969 / 4,194,631 | 4,194,629 / 4,194,969 / 4,194,946 |
+| `html` (4,194,304 B) | 1,377,159 / 1,624,878 / 1,386,629 | 1,137,769 / 1,118,477 / 1,164,462 | 1,115,022 / 1,115,149 / 1,110,233 |
+| `json` (4,194,304 B) | 1,493,524 / 1,479,550 / 1,344,991 | 1,286,711 / 1,230,323 / 1,210,476 | 1,238,121 / 1,217,228 / 1,144,530 |
+| `source` (4,194,304 B) | 1,289,950 / 1,515,528 / 1,301,005 | 1,076,127 / 1,061,930 / 1,096,465 | 1,059,646 / 1,059,129 / 1,055,047 |
+| `text` (2,493,885 B) | 822,484 / 958,958 / 896,916 | 759,198 / 756,053 / 795,315 | 759,909 / 755,944 / 742,391 |
+| `big16` (16,777,216 B) | 6,272,725 / 6,873,194 / 6,187,274 | 5,512,700 / 5,383,712 / 5,489,706 | 5,418,442 / 5,368,321 / 5,270,229 |
+
+**3. DoS 与对抗病态输入（`run_audit.sh dos`）**
+
+| Workload | Pion Before | **Pion After** | `miniz_oxide` | Go |
+| --- | ---: | ---: | ---: | ---: |
+| `empty_members_100k.gz` (100k empty members) | 0.49 s | **0.00 s (5.8 MiB RSS)** | 0.16 s (4.0 MiB) | 0.02 s (6.4 MiB) |
+| `bomb_1GiB.gz` (limit = 1 MiB) | 0.00 s (5 MiB) | **0.00 s (6.0 MiB RSS)** | 0.00 s (5.1 MiB) | 0.00 s (8.4 MiB) |
+| `bomb_1GiB.gz` (limit = 256 MiB) | 0.13 s (391 MiB) | **0.16 s (394.1 MiB RSS)** | 0.04 s (293.1 MiB) | 0.12 s (580.2 MiB) |
+| `adv_ab_4M` compress L6 / L9 | — / 4.40 s | **0.22 s / 2.06 s** | 0.27 s / 1.08 s | 0.02 s / 37.35 s |
+| `adv_prefix3_4M` compress L6 / L9 | — / 1.61 s | **0.20 s / 0.46 s** | 0.23 s / 0.74 s | 0.02 s / 0.18 s |
+
+红队：20/20 单测 + 审计 11/11；81/81 RFC 边界差分向量（Pion Native / Wasm32、Go、Rust `miniz_oxide`、CPython `zlib`），100/100 压缩互操作流，24,000 例变异 fuzz 0 崩溃 / 挂起、0 Native vs Wasm32 差异、对 Go / Rust / Python 一致结果 0 分歧。领先项：gzip 解压在 5 个可压缩 / 混合语料上为 Go 的 **1.03–1.09×**；L6 压缩在 `big16` / `json` / `entropy` 上为 `miniz_oxide` 的 **1.04× / 1.15× / 7.96×**；随机数据 L9 为 Go 的 **2.24×**；100,000 个空 gzip member 0.00 s。落后项：gzip 解压为 `miniz_oxide` 的 0.71–0.78×（`entropy` 为 0.33×）；CRC-32 + Adler-32 为 `miniz_oxide` 的 0.40–0.49×、Go 的 0.63–0.72×（Rust `crc32fast` 与 Go 使用 ARMv8 硬件 `CRC32X` 指令，Pion 为标量 Slice-by-16）；可压缩数据 L1 压缩为 `miniz_oxide` 的 0.38–0.48×，L6 为 Go 的 0.26–0.38×。已知限制：所有入口均为一次性 `Bytes -> Bytes`，尚无流式 `Inflater` / `Deflater`，峰值 RSS 随 `O(input + output)` 增长（默认 256 MiB 上限下 1 GiB 炸弹 394.1 MiB RSS）；解码不可信数据时应显式设置较小的 `max_output_bytes`。
+
+### decimal
+
+参考实现：Rust [`rust_decimal`](https://github.com/paupino/rust-decimal) `=1.37.2`（`--release`，`rustc 1.100.0`）。`--warmup 1 --rounds 5`，标准负载 `sh packages/decimal/bench/run_bench.sh`，对抗负载 `sh packages/decimal/audit/run_audit.sh`。详见 [`packages/decimal/README.md`](packages/decimal/README.md)。
+
+**1. 混合十进制解析 + 格式化（500,000 ops，6.56 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_decimal`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 54.734 | 52.278 | 57.783 | 119.78 | 109.47 | 5.36 MiB | **0.81x** |
+| `rust_decimal` (`1.37.2`) | 44.605 | 42.538 | 46.936 | 146.98 | 89.21 | 3.38 MiB | 1.00x (baseline) |
+
+- Verified common stdout SHA-256: `6a0482dc3aee4ddc3a4c80783d683008c2445a1dccd3fd2ec58e8cbffef1ae48`
+
+**2. 账单算术流（400,000 笔交易 × 5 种运算 = 2,000,000 ops）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_decimal`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 67.804 | 65.193 | 70.656 | 33.90 | **1.72 MiB** | **0.60x** |
+| `rust_decimal` (`1.37.2`) | 40.552 | 40.441 | 41.076 | 20.28 | 1.81 MiB | 1.00x (baseline) |
+
+- Verified common stdout SHA-256: `3d0da5b89dfe19db270abada6e5ea031da0006e447090b5e4e684c4f1ba92f50`
+
+**3. 排序 + 聚合 + 银行家舍入（500,000 ops）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_decimal`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 126.927 | 120.636 | 129.210 | 253.85 | 7.91 MiB | **0.36x** |
+| `rust_decimal` (`1.37.2`) | 45.269 | 43.706 | 46.540 | 90.54 | 4.12 MiB | 1.00x (baseline) |
+
+- Verified common stdout SHA-256: `d83ad65315d2b3ccb76bcd83b313962ed82c2f7511163a437f3549806d38f7dd`
+
+**4. 对抗负载（各项 stdout SHA-256 与 `rust_decimal =1.37.2` 逐字节一致）**
+
+| Workload | Ops | Pion Median (ms) | Rust Median (ms) | Pion ns/op | Peak RSS (Pion / Rust) | Speedup (vs `rust_decimal`) | Verified SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | --- |
+| **A1** `Decimal::sort`: McIlroy killer (50k) | 50,000 | **15.732** | 11.951 | 314.65 | 6.70 / 3.14 MiB | **0.76x** | `c8ee2657…5ae0ec8cc` |
+| **A2** `Decimal::sort`: same values, random (50k) | 50,000 | 19.647 | 12.322 | 392.95 | 6.70 / 3.14 MiB | **0.63x** | `c8ee2657…5ae0ec8cc` |
+| **A3** Full-width 96×96 `checked_mul` | 2,000,000 | 151.264 | 82.603 | 75.63 | **1.75** / 1.84 MiB | **0.55x** | `7f2dffc2…08d3a8e7` |
+| **A4** `checked_div` (32/64/96-bit divisors) | 2,000,000 | 213.339 | 97.042 | 106.67 | **1.75** / 1.84 MiB | **0.45x** | `8967bce6…63c0a381a` |
+| **A5** `from_scientific` (50k × 10) | 500,000 | 48.237 | 28.138 | 96.47 | 5.69 / 3.47 MiB | **0.58x** | `2032d34f…23b77ce16` |
+| **A6** `sqrt` (100k random 96-bit) | 100,000 | 576.608 | 344.611 | 5,766.08 | **1.77** / 1.86 MiB | **0.60x** | `52e54afd…8478868df` |
+
+红队：15/15 单测；对 `rust_decimal =1.37.2` 167,139 次运算差分，33 类运算中 27 类 100% 逐位一致（0 不一致），`judge_exact.py` 0 精度回退，审计 16/16，Native / Wasm32 × debug / `--release` stdout SHA-256 一致；Introsort 把 50k McIlroy 快排杀手从 2,872.7 ms（0.004x）降到 15.732 ms（0.76x）。领先项：Bench 2、A3、A4、A6 峰值 RSS 低于 Rust（如 Bench 2 为 1.72 vs 1.81 MiB）。落后项：全部吞吐项均慢于 Rust——解析格式化 0.81x、账单算术 0.60x、排序聚合 0.36x（`Array[Decimal]` 元素装箱，RSS 7.91 vs 4.12 MiB）、96×96 乘法 0.55x、除法 0.45x、`from_scientific` 0.58x、`sqrt` 0.60x（`Result[Decimal, DecimalError]` 装箱开销，且尚无原生 `UInt128` / `umulh`，宽乘用 32-bit 分段乘法）。另：`round` / `round_dp` / `rescale` 经内部整数标签 `round_dp_code` 实现，以绕开 `pionc 69a0189d` `--release` 跨包内联无字段枚举变体的编译器 bug。
+
+### template
+
+参考实现：Rust [`minijinja`](https://github.com/mitsuhiko/minijinja) `=3.1.0`（`--release`，`opt-level = 3`，`lto = "thin"`，`codegen-units = 1`，features `["builtins", "json", "preserve_order"]`，未开启 `speedups` SIMD `v_htmlescape`）。`--warmup 1 --rounds 5`，`sh packages/template/bench/run_bench.sh`。详见 [`packages/template/README.md`](packages/template/README.md)。
+
+**1. HTML 页面 SSR（`extends` + `block` + `super()` + 20 行 `for` + HTML 自动转义 + 过滤器，10,000 次渲染，输出 23.77 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_minijinja`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 156.054 | 151.756 | 163.427 | 152.32 | 15605.36 | 2.50 MiB | **0.77x** |
+| `rust_minijinja` | 119.374 | 118.096 | 128.775 | 199.12 | 11937.37 | 3.08 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical: `e4fc33828ccace7ee949020a4217baa4ddde3f1f54a4c1d0e4085d3695ee1b39`._
+
+**2. AI Agent Prompt 渲染（条件 + 工具列表 + HTML 安全 `tojson(indent=2)` + `join` + `default`，20,000 次渲染，输出 9.14 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_minijinja`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 69.348 | 67.615 | 75.506 | 131.80 | 3467.40 | 2.41 MiB | **1.39x** |
+| `rust_minijinja` | 96.668 | 93.433 | 98.112 | 94.55 | 4833.41 | 2.88 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical: `ed6753c873c8a3aeace7d3ceb6df3ce580c9d238f3e45261441a2f6907135a0a`._
+
+**3. 编译 + 渲染端到端（3 个模板含 `extends` + `include` + `for` + HTML 转义，2,000 次迭代，输出 938 KB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_minijinja`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 25.865 | 23.871 | 26.727 | 36.27 | 12932.44 | 2.30 MiB | **1.52x** |
+| `rust_minijinja` | 39.368 | 37.992 | 40.312 | 23.83 | 19683.79 | 3.12 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical: `1561f2114958a0d8e74a73a6d50ccf3a69514b983377865297dfef8698fa5b63`._
+
+**4. 对抗负载（`sh packages/template/audit/run_audit.sh bench`，SHA-256 一致）**
+
+| Workload | `pion` median | `rust_minijinja` median | Speedup (vs `rust_minijinja`) |
+| --- | ---: | ---: | ---: |
+| `bench_set_concat_20k` (`ns.s ~ 'x'`) | 18.87 ms | 54.55 ms | **2.89x** |
+| `bench_unique_20k` (`range(20000)\|unique`) | 10.95 ms | 15.96 ms | **1.46x** (was 738.4 ms / 0.026x) |
+| `bench_macro_50k` | 29.98 ms | 30.71 ms | **1.02x** |
+| `bench_html_escape_50k` | 31.19 ms | 25.39 ms | **0.81x** |
+| `bench_filters_50k` | 54.00 ms | 43.52 ms | **0.81x** |
+| `bench_loop_200k` | 36.79 ms | 24.73 ms | **0.67x** |
+| `bench_sort_20k` (reversed `\|sort`) | 13.50 ms | 9.10 ms | **0.67x** (was 1757.8 ms / 0.005x) |
+| `bench_attr_lookup_100k` | 56.65 ms | 30.91 ms | **0.55x** |
+
+红队：45/45 单测；审计 29/29；对 `minijinja =3.1.0` 差分 251 / 283 逐字节一致，283 / 283 Native vs Wasm32 逐字节一致（0 Wasm32 trap）；62 / 62 DoS 矩阵 0 SIGSEGV / SIGABRT / OOM / 超时。领先项：Prompt 渲染 **1.39x**、编译 + 渲染 **1.52x**、`bench_set_concat_20k` **2.89x**、`bench_unique_20k` **1.46x**，标准负载峰值 RSS 均更低（2.30–2.50 vs 2.88–3.12 MiB）。落后项：HTML SSR 0.77x，渲染密集循环与属性查找 0.55x–0.81x（树遍历 AST 解释器 vs MiniJinja 字节码 VM 与哈希索引查找；且 Rust 基线未开 `speedups`）。已知差异（32 / 283 例，均为 P2）：未实现 `{% for ... recursive %}` / `loop(...)`、`loop.changed(...)`、`{% break %}` / `{% continue %}`、`self.<block>()`、`{%+` / `+%}`、`|format`、`|pprint`、`debug` 全局与宏 `.name` / `.arguments`；元组渲染为列表、极大 / 极小浮点用科学计数法、`-0.0` 部分路径输出 `0.0`；`-2 ** 2`、`2 ** 3 ** 2` 按 Python / Jinja2 优先级（`-4` / `512`）。
