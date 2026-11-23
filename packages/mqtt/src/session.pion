@@ -57,14 +57,54 @@ pub enum SessionEvent {
 }
 
 ///|
+enum OutboundInflight {
+  Qos1Publish(PublishPacket)
+  Qos2Publish(PublishPacket)
+  Qos2PubRel(Int)
+}
+
+///|
 pub struct Session {
   pub config : SessionConfig
   mut st : SessionState
+  decoder : StreamDecoder
+  tx_queue : Array[Bytes]
+  mut tx_bytes : Int
+  mut next_pid : Int
+  used_pids : Map[Int, Bool]
+  outbound_inflight : Map[Int, OutboundInflight]
+  outbound_order : Array[Int]
+  inbound_qos2 : Map[Int, Bool]
+  inbound_aliases : Map[Int, String]
+  outbound_aliases : Map[Int, String]
+  mut peer_receive_maximum : Int
+  mut peer_topic_alias_maximum : Int
+  mut last_tx_ms : Int64
+  mut last_ping_ms : Int64
+  mut ping_outstanding : Bool
 }
 
 ///|
 pub fn Session::new(config : SessionConfig) -> Session {
-  Session::{ config: config, st: SessionState::Disconnected }
+  Session::{
+    config: config,
+    st: SessionState::Disconnected,
+    decoder: StreamDecoder::new(config.version, config.limits),
+    tx_queue: [],
+    tx_bytes: 0,
+    next_pid: 1,
+    used_pids: Map::new(),
+    outbound_inflight: Map::new(),
+    outbound_order: [],
+    inbound_qos2: Map::new(),
+    inbound_aliases: Map::new(),
+    outbound_aliases: Map::new(),
+    peer_receive_maximum: 65535,
+    peer_topic_alias_maximum: 0,
+    last_tx_ms: 0L,
+    last_ping_ms: 0L,
+    ping_outstanding: false,
+  }
 }
 
 ///|
@@ -73,13 +113,76 @@ pub fn Session::state(self : Session) -> SessionState {
 }
 
 ///|
-pub fn Session::connect(self : Session, now_ms : Int64) -> Result[Unit, MqttError] {
-  let _ = self
-  let _ = now_ms
-  Err(MqttError::ProtocolViolation("stub"))
+pub fn Session::inflight_count(self : Session) -> Int {
+  self.outbound_inflight.length()
 }
 
 ///|
+pub fn Session::pending_tx_len(self : Session) -> Int {
+  self.tx_bytes
+}
+
+///|
+fn Session::enqueue_tx(self : Session, wire : Bytes, now_ms : Int64) -> Unit {
+  if wire.length() > 0 {
+    self.tx_queue.push(wire)
+    self.tx_bytes = self.tx_bytes + wire.length()
+    self.last_tx_ms = now_ms
+  }
+}
+
+///|
+fn Session::alloc_pid(self : Session) -> Result[Int, MqttError] {
+  let mut attempts = 0
+  while attempts < 65535 {
+    let pid = self.next_pid
+    self.next_pid = if pid >= 65535 { 1 } else { pid + 1 }
+    if !self.used_pids.contains(pid) {
+      self.used_pids.set(pid, true)
+      return Ok(pid)
+    }
+    attempts = attempts + 1
+  }
+  Err(MqttError::PacketIdExhausted)
+}
+
+///|
+fn Session::release_pid(self : Session, pid : Int) -> Unit {
+  let _ = self.used_pids.remove(pid)
+}
+
+///| Queue a `CONNECT` packet and transition to `Connecting`.
+pub fn Session::connect(self : Session, now_ms : Int64) -> Result[Unit, MqttError] {
+  let props = self.config.connect_properties
+  if self.config.version is ProtocolVersion::V5 {
+    if props.receive_maximum is None && self.config.receive_maximum < 65535 {
+      props.receive_maximum = Some(self.config.receive_maximum)
+    }
+    if props.topic_alias_maximum is None && self.config.topic_alias_maximum > 0 {
+      props.topic_alias_maximum = Some(self.config.topic_alias_maximum)
+    }
+  }
+  let pkt = Packet::Connect(ConnectPacket::{
+    protocol_version: self.config.version,
+    client_id: self.config.client_id,
+    clean_start: self.config.clean_start,
+    keep_alive: self.config.keep_alive_secs,
+    username: self.config.username,
+    password: self.config.password,
+    will: self.config.will,
+    properties: props,
+  })
+  let wire = match encode_packet(pkt, self.config.version) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  self.st = SessionState::Connecting
+  self.ping_outstanding = false
+  self.enqueue_tx(wire, now_ms)
+  Ok(())
+}
+
+///| Publish a message (QoS 0, 1, or 2), enforcing `Receive Maximum` flow control and Topic Alias rules.
 pub fn Session::publish(
   self : Session,
   topic : String,
@@ -89,95 +192,479 @@ pub fn Session::publish(
   props : Properties,
   now_ms : Int64,
 ) -> Result[Option[Int], MqttError] {
-  let _ = self
-  let _ = topic
-  let _ = payload
-  let _ = qos
-  let _ = retain
-  let _ = props
-  let _ = now_ms
-  Err(MqttError::ProtocolViolation("stub"))
+  if !(self.st is SessionState::Connected) {
+    return Err(MqttError::SessionNotConnected)
+  }
+  let q = qos_to_int(qos)
+  if q > 0 && self.outbound_inflight.length() >= self.peer_receive_maximum {
+    return Err(MqttError::FlowControlExceeded)
+  }
+  // Handle outbound topic alias mapping (MQTT 5.0)
+  let mut effective_topic = topic
+  match props.topic_alias {
+    Some(alias) => {
+      if self.peer_topic_alias_maximum > 0 && alias > self.peer_topic_alias_maximum {
+        return Err(MqttError::UnknownTopicAlias(alias))
+      }
+      if topic.length() > 0 {
+        self.outbound_aliases.set(alias, topic)
+      } else {
+        match self.outbound_aliases.get(alias) {
+          Some(_) => ()
+          None => return Err(MqttError::UnknownTopicAlias(alias))
+        }
+      }
+    }
+    None => ()
+  }
+  let pid_opt : Option[Int] = if q > 0 {
+    match self.alloc_pid() {
+      Ok(id) => Some(id)
+      Err(e) => return Err(e)
+    }
+  } else {
+    None
+  }
+  let pub_pkt = PublishPacket::{
+    dup: false,
+    qos: qos,
+    retain: retain,
+    topic: effective_topic,
+    packet_id: pid_opt,
+    properties: props,
+    payload: payload,
+  }
+  let wire = match encode_packet(Packet::Publish(pub_pkt), self.config.version) {
+    Ok(b) => b
+    Err(e) => {
+      match pid_opt {
+        Some(id) => self.release_pid(id)
+        None => ()
+      }
+      return Err(e)
+    }
+  }
+  match pid_opt {
+    Some(pid) => {
+      // Save full resolved topic for reconnect retransmission (aliases reset on disconnect)
+      let stored_topic = if effective_topic.length() > 0 {
+        effective_topic
+      } else {
+        match props.topic_alias {
+          Some(a) =>
+          match self.outbound_aliases.get(a) {
+            Some(t) => t
+            None => ""
+          }
+          None => ""
+        }
+      }
+      let stored_props = props
+      stored_props.topic_alias = None
+      let stored = PublishPacket::{
+        dup: true,
+        qos: qos,
+        retain: retain,
+        topic: stored_topic,
+        packet_id: Some(pid),
+        properties: stored_props,
+        payload: payload,
+      }
+      let entry = if q == 1 {
+        OutboundInflight::Qos1Publish(stored)
+      } else {
+        OutboundInflight::Qos2Publish(stored)
+      }
+      self.outbound_inflight.set(pid, entry)
+      self.outbound_order.push(pid)
+    }
+    None => ()
+  }
+  self.enqueue_tx(wire, now_ms)
+  Ok(pid_opt)
 }
 
-///|
+///| Queue a `SUBSCRIBE` packet and return its allocated Packet ID.
 pub fn Session::subscribe(
   self : Session,
   topics : Array[SubscribeTopic],
   props : Properties,
   now_ms : Int64,
 ) -> Result[Int, MqttError] {
-  let _ = self
-  let _ = topics
-  let _ = props
-  let _ = now_ms
-  Err(MqttError::ProtocolViolation("stub"))
+  if !(self.st is SessionState::Connected) {
+    return Err(MqttError::SessionNotConnected)
+  }
+  let pid = match self.alloc_pid() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  let wire = match encode_packet(
+    Packet::Subscribe(SubscribePacket::{
+      packet_id: pid,
+      properties: props,
+      topics: topics,
+    }),
+    self.config.version,
+  ) {
+    Ok(b) => b
+    Err(e) => {
+      self.release_pid(pid)
+      return Err(e)
+    }
+  }
+  self.enqueue_tx(wire, now_ms)
+  Ok(pid)
 }
 
-///|
+///| Queue an `UNSUBSCRIBE` packet and return its allocated Packet ID.
 pub fn Session::unsubscribe(
   self : Session,
   topics : Array[String],
   props : Properties,
   now_ms : Int64,
 ) -> Result[Int, MqttError] {
-  let _ = self
-  let _ = topics
-  let _ = props
-  let _ = now_ms
-  Err(MqttError::ProtocolViolation("stub"))
+  if !(self.st is SessionState::Connected) {
+    return Err(MqttError::SessionNotConnected)
+  }
+  let pid = match self.alloc_pid() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  let wire = match encode_packet(
+    Packet::Unsubscribe(UnsubscribePacket::{
+      packet_id: pid,
+      properties: props,
+      topics: topics,
+    }),
+    self.config.version,
+  ) {
+    Ok(b) => b
+    Err(e) => {
+      self.release_pid(pid)
+      return Err(e)
+    }
+  }
+  self.enqueue_tx(wire, now_ms)
+  Ok(pid)
 }
 
-///|
+///| Queue a `DISCONNECT` packet and transition to `Closed`.
 pub fn Session::disconnect(
   self : Session,
   reason_code : Int,
   props : Properties,
 ) -> Result[Unit, MqttError] {
-  let _ = self
-  let _ = reason_code
-  let _ = props
-  Err(MqttError::ProtocolViolation("stub"))
+  let wire = match encode_packet(
+    Packet::Disconnect(DisconnectPacket::{
+      reason_code: reason_code,
+      properties: props,
+    }),
+    self.config.version,
+  ) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  self.enqueue_tx(wire, self.last_tx_ms)
+  self.st = SessionState::Closed
+  Ok(())
 }
 
-///|
+///| Retransmit all in-flight QoS 1/2 PUBLISH (`DUP=1`) and PUBREL packets in original order.
+fn Session::retransmit_inflight(
+  self : Session,
+  now_ms : Int64,
+) -> Result[Unit, MqttError] {
+  let new_order : Array[Int] = []
+  let mut i = 0
+  while i < self.outbound_order.length() {
+    let pid = self.outbound_order[i]
+    match self.outbound_inflight.get(pid) {
+      Some(entry) => {
+        new_order.push(pid)
+        let pkt = match entry {
+          OutboundInflight::Qos1Publish(p) => Packet::Publish(p)
+          OutboundInflight::Qos2Publish(p) => Packet::Publish(p)
+          OutboundInflight::Qos2PubRel(id) =>
+          Packet::PubRel(PubRelPacket::{
+            packet_id: id,
+            reason_code: 0,
+            properties: Properties::empty(),
+          })
+        }
+        let wire = match encode_packet(pkt, self.config.version) {
+          Ok(b) => b
+          Err(e) => return Err(e)
+        }
+        self.enqueue_tx(wire, now_ms)
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+  self.outbound_order.clear()
+  let mut j = 0
+  while j < new_order.length() {
+    self.outbound_order.push(new_order[j])
+    j = j + 1
+  }
+  Ok(())
+}
+
+///| Feed raw incoming bytes from the transport and process all decoded packets.
 pub fn Session::feed(
   self : Session,
   data : Bytes,
   now_ms : Int64,
 ) -> Result[Array[SessionEvent], MqttError] {
-  let _ = self
-  let _ = data
-  let _ = now_ms
-  Err(MqttError::ProtocolViolation("stub"))
+  self.decoder.feed(data)
+  let pkts = match self.decoder.drain() {
+    Ok(ps) => ps
+    Err(e) => return Err(e)
+  }
+  let events : Array[SessionEvent] = []
+  let mut i = 0
+  while i < pkts.length() {
+    match pkts[i] {
+      Packet::ConnAck(ca) => {
+        if ca.reason_code == 0 {
+          self.st = SessionState::Connected
+          self.peer_receive_maximum = match ca.properties.receive_maximum {
+            Some(rm) => rm
+            None => 65535
+          }
+          self.peer_topic_alias_maximum = match ca.properties.topic_alias_maximum {
+            Some(tam) => tam
+            None => 0
+          }
+          if ca.session_present {
+            match self.retransmit_inflight(now_ms) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          } else {
+            self.outbound_inflight.clear()
+            self.outbound_order.clear()
+            self.inbound_qos2.clear()
+            self.used_pids.clear()
+          }
+        } else {
+          self.st = SessionState::Disconnected
+        }
+        events.push(SessionEvent::Connected(ca.session_present, ca.reason_code, ca.properties))
+      }
+      Packet::Publish(p) => {
+        // Resolve inbound Topic Alias (MQTT 5.0 §3.3.2.3.4)
+        let mut resolved_topic = p.topic
+        match p.properties.topic_alias {
+          Some(alias) =>
+          if p.topic.length() > 0 {
+            self.inbound_aliases.set(alias, p.topic)
+          } else {
+            match self.inbound_aliases.get(alias) {
+              Some(t) => resolved_topic = t
+              None => return Err(MqttError::UnknownTopicAlias(alias))
+            }
+          }
+          None => ()
+        }
+        let delivered = PublishPacket::{
+          dup: p.dup,
+          qos: p.qos,
+          retain: p.retain,
+          topic: resolved_topic,
+          packet_id: p.packet_id,
+          properties: p.properties,
+          payload: p.payload,
+        }
+        let q = qos_to_int(p.qos)
+        if q == 0 {
+          events.push(SessionEvent::PublishReceived(delivered))
+        } else if q == 1 {
+          let pid = match p.packet_id {
+            Some(id) => id
+            None => return Err(MqttError::InvalidPacketId)
+          }
+          let ack = match encode_packet(
+            Packet::PubAck(PubAckPacket::{
+              packet_id: pid,
+              reason_code: 0,
+              properties: Properties::empty(),
+            }),
+            self.config.version,
+          ) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          self.enqueue_tx(ack, now_ms)
+          events.push(SessionEvent::PublishReceived(delivered))
+        } else {
+          let pid = match p.packet_id {
+            Some(id) => id
+            None => return Err(MqttError::InvalidPacketId)
+          }
+          let rec = match encode_packet(
+            Packet::PubRec(PubRecPacket::{
+              packet_id: pid,
+              reason_code: 0,
+              properties: Properties::empty(),
+            }),
+            self.config.version,
+          ) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          self.enqueue_tx(rec, now_ms)
+          if !self.inbound_qos2.contains(pid) {
+            self.inbound_qos2.set(pid, true)
+            events.push(SessionEvent::PublishReceived(delivered))
+          }
+        }
+      }
+      Packet::PubAck(a) => {
+        let _ = self.outbound_inflight.remove(a.packet_id)
+        self.release_pid(a.packet_id)
+        events.push(SessionEvent::PublishAcked(a.packet_id, a.reason_code))
+      }
+      Packet::PubRec(r) => {
+        if r.reason_code >= 0x80 {
+          // Rejected by peer: terminate QoS 2 exchange
+          let _ = self.outbound_inflight.remove(r.packet_id)
+          self.release_pid(r.packet_id)
+          events.push(SessionEvent::PublishComplete(r.packet_id, r.reason_code))
+        } else {
+          self.outbound_inflight.set(r.packet_id, OutboundInflight::Qos2PubRel(r.packet_id))
+          let rel = match encode_packet(
+            Packet::PubRel(PubRelPacket::{
+              packet_id: r.packet_id,
+              reason_code: 0,
+              properties: Properties::empty(),
+            }),
+            self.config.version,
+          ) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          self.enqueue_tx(rel, now_ms)
+        }
+      }
+      Packet::PubRel(rel) => {
+        let existed = self.inbound_qos2.contains(rel.packet_id)
+        if existed {
+          let _ = self.inbound_qos2.remove(rel.packet_id)
+        }
+        let rc = if existed || self.config.version is ProtocolVersion::V311 {
+          0
+        } else {
+          0x92
+        }
+        let comp = match encode_packet(
+          Packet::PubComp(PubCompPacket::{
+            packet_id: rel.packet_id,
+            reason_code: rc,
+            properties: Properties::empty(),
+          }),
+          self.config.version,
+        ) {
+          Ok(b) => b
+          Err(e) => return Err(e)
+        }
+        self.enqueue_tx(comp, now_ms)
+      }
+      Packet::PubComp(c) => {
+        let _ = self.outbound_inflight.remove(c.packet_id)
+        self.release_pid(c.packet_id)
+        events.push(SessionEvent::PublishComplete(c.packet_id, c.reason_code))
+      }
+      Packet::SubAck(sa) => {
+        self.release_pid(sa.packet_id)
+        events.push(SessionEvent::SubAckReceived(sa.packet_id, sa.reason_codes))
+      }
+      Packet::UnsubAck(ua) => {
+        self.release_pid(ua.packet_id)
+        events.push(SessionEvent::UnsubAckReceived(ua.packet_id, ua.reason_codes))
+      }
+      Packet::PingReq => {
+        let resp = match encode_packet(Packet::PingResp, self.config.version) {
+          Ok(b) => b
+          Err(e) => return Err(e)
+        }
+        self.enqueue_tx(resp, now_ms)
+      }
+      Packet::PingResp => {
+        self.ping_outstanding = false
+        events.push(SessionEvent::PingRespReceived)
+      }
+      Packet::Disconnect(d) => {
+        self.st = SessionState::Disconnected
+        events.push(SessionEvent::Disconnected(d.reason_code, d.properties))
+      }
+      Packet::Auth(a) => events.push(SessionEvent::AuthReceived(a.reason_code, a.properties))
+      _ => return Err(MqttError::ProtocolViolation("unexpected server-to-client packet"))
+    }
+    i = i + 1
+  }
+  Ok(events)
 }
 
-///|
+///| Drain all queued outbound wire bytes ready to be written to the transport.
 pub fn Session::poll_transmit(self : Session) -> Bytes {
-  let _ = self
-  Bytes::new(0)
+  if self.tx_bytes == 0 {
+    return Bytes::new(0)
+  }
+  if self.tx_queue.length() == 1 {
+    let single = self.tx_queue[0]
+    self.tx_queue.clear()
+    self.tx_bytes = 0
+    return single
+  }
+  let out = Bytes::new(self.tx_bytes)
+  let mut pos = 0
+  let mut i = 0
+  while i < self.tx_queue.length() {
+    let chunk = self.tx_queue[i]
+    let n = chunk.length()
+    copy_bytes(out, pos, chunk, 0, n)
+    pos = pos + n
+    i = i + 1
+  }
+  self.tx_queue.clear()
+  self.tx_bytes = 0
+  out
 }
 
-///|
+///| Drive logical keepalive timer (`PINGREQ` generation and timeout detection).
 pub fn Session::tick(self : Session, now_ms : Int64) -> Result[Unit, MqttError] {
-  let _ = self
-  let _ = now_ms
-  Err(MqttError::ProtocolViolation("stub"))
+  if !(self.st is SessionState::Connected) || self.config.keep_alive_secs <= 0 {
+    return Ok(())
+  }
+  let ka_ms = self.config.keep_alive_secs.to_int64() * 1000L
+  if self.ping_outstanding {
+    if now_ms - self.last_ping_ms >= ka_ms {
+      self.st = SessionState::Disconnected
+      return Err(MqttError::ProtocolViolation("keepalive timeout"))
+    }
+    return Ok(())
+  }
+  if now_ms - self.last_tx_ms >= ka_ms {
+    let ping = match encode_packet(Packet::PingReq, self.config.version) {
+      Ok(b) => b
+      Err(e) => return Err(e)
+    }
+    self.ping_outstanding = true
+    self.last_ping_ms = now_ms
+    self.enqueue_tx(ping, now_ms)
+  }
+  Ok(())
 }
 
-///|
+///| Notify the state machine that the underlying transport disconnected.
+///| Resets the decoder and clears Topic Aliases while preserving in-flight QoS 1/2 state.
 pub fn Session::on_transport_disconnected(self : Session) -> Unit {
-  let _ = self
-  ()
-}
-
-///|
-pub fn Session::inflight_count(self : Session) -> Int {
-  let _ = self
-  0
-}
-
-///|
-pub fn Session::pending_tx_len(self : Session) -> Int {
-  let _ = self
-  0
+  self.st = SessionState::Disconnected
+  self.decoder.reset()
+  self.tx_queue.clear()
+  self.tx_bytes = 0
+  self.inbound_aliases.clear()
+  self.outbound_aliases.clear()
+  self.ping_outstanding = false
 }
