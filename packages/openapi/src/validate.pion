@@ -1,0 +1,384 @@
+///| Static structural validation of OpenAPI 3.0.x & 3.1.x documents.
+
+import "json5"
+
+///| Extract `{param}` names from a path template and compute its canonical
+///| ambiguity key (replacing every `{param}` with `{}`).
+fn parse_path_template_meta(
+  path : String,
+) -> Result[(Array[String], String), String] {
+  let n = path.length()
+  if n == 0 || path.code_unit_at(0) != 47 {
+    return Err("path template must start with '/'")
+  }
+  let params : Array[String] = []
+  let canon = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    let b = path.code_unit_at(i)
+    if b == 123 {
+      // '{'
+      let start = i + 1
+      let mut end = start
+      while end < n && path.code_unit_at(end) != 125 {
+        if path.code_unit_at(end) == 123 || path.code_unit_at(end) == 47 {
+          return Err("invalid '{' or '/' inside path parameter template")
+        }
+        end = end + 1
+      }
+      if end >= n {
+        return Err("unclosed '{' in path template")
+      }
+      let pname = path.slice(start, end)
+      if pname.length() == 0 {
+        return Err("empty path parameter '{}' in path template")
+      }
+      if str_arr_contains(params, pname) {
+        return Err("duplicate path parameter '{" + pname + "}' in path template")
+      }
+      params.push(pname)
+      canon.write_string("{}")
+      i = end + 1
+    } else if b == 125 {
+      return Err("unmatched '}' in path template")
+    } else {
+      canon.write_byte(b.to_byte())
+      i = i + 1
+    }
+  }
+  Ok((params, canon.to_string()))
+}
+
+fn is_valid_status_code(code : String) -> Bool {
+  if code == "default" {
+    return true
+  }
+  if code.length() != 3 {
+    return false
+  }
+  let c0 = code.code_unit_at(0)
+  let c1 = code.code_unit_at(1)
+  let c2 = code.code_unit_at(2)
+  if c0 < 49 || c0 > 53 {
+    return false
+  }
+  if (c1 == 88 || c1 == 120) && (c2 == 88 || c2 == 120) {
+    return true
+  }
+  c1 >= 48 && c1 <= 57 && c2 >= 48 && c2 <= 57
+}
+
+///| Walk raw JSON tree to verify every `$ref` resolves cleanly (no dangling refs or alias cycles).
+fn validate_refs_walk(
+  doc : OpenApiDoc,
+  v : json5::Json5Value,
+  loc : String,
+  depth : Int,
+  max_depth : Int,
+  checked : Array[String],
+  issues : Array[ValidationIssue],
+) -> Unit {
+  if depth > max_depth {
+    return
+  }
+  match v {
+    json5::Json5Value::Object(entries) => {
+      match get_ref_str(v) {
+        Some(r) => {
+          if !str_arr_contains(checked, r) {
+            checked.push(r)
+            match resolve_ref_raw(doc.raw, r, doc.openapi.is_31(), doc.limits.max_ref_depth) {
+              Ok(_) => ()
+              Err(e) => {
+                let code = match e.kind {
+                  OpenApiErrorKind::RefCycle => IssueCode::RefCycle
+                  OpenApiErrorKind::LimitExceeded => IssueCode::LimitExceeded
+                  _ => IssueCode::DanglingRef
+                }
+                issues.push(ValidationIssue::new(code, loc, e.message))
+              }
+            }
+          }
+        }
+        None => ()
+      }
+      let mut i = 0
+      while i < entries.length() {
+        let (k, sub) = entries[i]
+        if k != "$ref" {
+          validate_refs_walk(doc, sub, loc + "/" + k, depth + 1, max_depth, checked, issues)
+        }
+        i = i + 1
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      while i < items.length() {
+        validate_refs_walk(doc, items[i], loc + "/" + i.to_string(), depth + 1, max_depth, checked, issues)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+fn validate_doc_impl(doc : OpenApiDoc) -> Array[ValidationIssue] {
+  let issues : Array[ValidationIssue] = []
+
+  // 1. Info required fields
+  if doc.info.title.length() == 0 {
+    issues.push(
+      ValidationIssue::new(
+        IssueCode::MissingRequiredField,
+        "#/info/title",
+        "info.title must be a non-empty string",
+      ),
+    )
+  }
+  if doc.info.version.length() == 0 {
+    issues.push(
+      ValidationIssue::new(
+        IssueCode::MissingRequiredField,
+        "#/info/version",
+        "info.version must be a non-empty string",
+      ),
+    )
+  }
+
+  // 2. Top-level paths / webhooks / components requirement
+  if doc.openapi.is_30() {
+    if !doc.has_paths {
+      issues.push(
+        ValidationIssue::new(
+          IssueCode::MissingRequiredField,
+          "#/paths",
+          "OpenAPI 3.0 requires top-level 'paths' object",
+        ),
+      )
+    }
+  } else if !doc.has_paths && !doc.has_webhooks && !doc.has_components {
+    issues.push(
+      ValidationIssue::new(
+        IssueCode::MissingRequiredField,
+        "#",
+        "OpenAPI 3.1 requires at least one of 'paths', 'webhooks', or 'components'",
+      ),
+    )
+  }
+
+  // 3. Paths, operations, operationId uniqueness, path params, ambiguous templates
+  let seen_op_ids : Array[String] = []
+  let seen_canon_paths : Array[(String, String)] = []
+
+  let mut pi = 0
+  while pi < doc.paths.length() {
+    let (path_key, item) = doc.paths[pi]
+    let path_loc = "#/paths/" + path_key
+
+    // Check unknown / invalid HTTP methods on PathItem
+    let mut ui = 0
+    while ui < item.unknown_keys.length() {
+      let uk = item.unknown_keys[ui]
+      issues.push(
+        ValidationIssue::new(
+          IssueCode::InvalidHttpMethod,
+          path_loc + "/" + uk,
+          "invalid HTTP method or unknown PathItem key: " + uk,
+        ),
+      )
+      ui = ui + 1
+    }
+
+    // Parse path template & detect ambiguous path templates
+    let template_params = match parse_path_template_meta(path_key) {
+      Ok((tparams, canon)) => {
+        let mut ci = 0
+        while ci < seen_canon_paths.length() {
+          let (prev_canon, prev_path) = seen_canon_paths[ci]
+          if prev_canon == canon {
+            issues.push(
+              ValidationIssue::new(
+                IssueCode::AmbiguousPathTemplate,
+                path_loc,
+                "ambiguous path template '" + path_key + "' conflicts with '" + prev_path + "'",
+              ),
+            )
+            break
+          }
+          ci = ci + 1
+        }
+        seen_canon_paths.push((canon, path_key))
+        tparams
+      }
+      Err(msg) => {
+        issues.push(ValidationIssue::new(IssueCode::InvalidPathTemplate, path_loc, msg))
+        []
+      }
+    }
+
+    // Validate each operation on this path
+    let mut oi = 0
+    while oi < item.operations.length() {
+      let (method, op) = item.operations[oi]
+      let op_loc = path_loc + "/" + method.to_lower()
+
+      // Duplicate operationId check
+      match op.operation_id {
+        Some(op_id) => {
+          if op_id.length() > 0 {
+            if str_arr_contains(seen_op_ids, op_id) {
+              issues.push(
+                ValidationIssue::new(
+                  IssueCode::DuplicateOperationId,
+                  op_loc + "/operationId",
+                  "duplicate operationId: " + op_id,
+                ),
+              )
+            } else {
+              seen_op_ids.push(op_id)
+            }
+          }
+        }
+        None => ()
+      }
+
+      // Check duplicate parameters & path parameter validity
+      let mut p_idx = 0
+      while p_idx < op.parameters.length() {
+        let p = op.parameters[p_idx]
+        let mut p_idx2 = p_idx + 1
+        while p_idx2 < op.parameters.length() {
+          let p2 = op.parameters[p_idx2]
+          if p.name == p2.name && param_in_eq(p.location, p2.location) {
+            issues.push(
+              ValidationIssue::new(
+                IssueCode::DuplicateParameter,
+                op_loc + "/parameters/" + p.name,
+                "duplicate parameter '" + p.name + "' in " + p.location.to_string(),
+              ),
+            )
+          }
+          p_idx2 = p_idx2 + 1
+        }
+        if param_in_eq(p.location, ParamIn::Path) {
+          if !p.required {
+            issues.push(
+              ValidationIssue::new(
+                IssueCode::InvalidPathParameter,
+                op_loc + "/parameters/" + p.name,
+                "path parameter '" + p.name + "' must have required: true",
+              ),
+            )
+          }
+          if !str_arr_contains(template_params, p.name) {
+            issues.push(
+              ValidationIssue::new(
+                IssueCode::InvalidPathParameter,
+                op_loc + "/parameters/" + p.name,
+                "path parameter '" + p.name + "' is not present in template '" + path_key + "'",
+              ),
+            )
+          }
+        }
+        p_idx = p_idx + 1
+      }
+
+      // Check every template {param} is declared as in: path
+      let mut ti = 0
+      while ti < template_params.length() {
+        let tname = template_params[ti]
+        let mut declared = false
+        let mut k = 0
+        while k < op.parameters.length() {
+          let p = op.parameters[k]
+          if p.name == tname && param_in_eq(p.location, ParamIn::Path) {
+            declared = true
+            break
+          }
+          k = k + 1
+        }
+        if !declared {
+          issues.push(
+            ValidationIssue::new(
+              IssueCode::MissingPathParameter,
+              op_loc,
+              "path template parameter '{" + tname + "}' is not declared in parameters",
+            ),
+          )
+        }
+        ti = ti + 1
+      }
+
+      // Responses check
+      if doc.openapi.is_30() && op.responses.length() == 0 {
+        issues.push(
+          ValidationIssue::new(
+            IssueCode::MissingRequiredField,
+            op_loc + "/responses",
+            "OpenAPI 3.0 operation requires at least one response",
+          ),
+        )
+      }
+      let mut ri = 0
+      while ri < op.responses.length() {
+        let (code, _) = op.responses[ri]
+        if !is_valid_status_code(code) {
+          issues.push(
+            ValidationIssue::new(
+              IssueCode::InvalidStatusCode,
+              op_loc + "/responses/" + code,
+              "invalid HTTP response status code: " + code,
+            ),
+          )
+        }
+        ri = ri + 1
+      }
+      oi = oi + 1
+    }
+    pi = pi + 1
+  }
+
+  // 4. Check webhook operationIds for duplicates too
+  let mut wi = 0
+  while wi < doc.webhooks.length() {
+    let (wk, item) = doc.webhooks[wi]
+    let mut oi = 0
+    while oi < item.operations.length() {
+      let (method, op) = item.operations[oi]
+      match op.operation_id {
+        Some(op_id) => {
+          if op_id.length() > 0 {
+            if str_arr_contains(seen_op_ids, op_id) {
+              issues.push(
+                ValidationIssue::new(
+                  IssueCode::DuplicateOperationId,
+                  "#/webhooks/" + wk + "/" + method.to_lower() + "/operationId",
+                  "duplicate operationId: " + op_id,
+                ),
+              )
+            } else {
+              seen_op_ids.push(op_id)
+            }
+          }
+        }
+        None => ()
+      }
+      oi = oi + 1
+    }
+    wi = wi + 1
+  }
+
+  // 5. Verify all $ref pointers across the raw document
+  let checked_refs : Array[String] = []
+  validate_refs_walk(
+    doc,
+    doc.raw,
+    "#",
+    0,
+    clamp_safe_depth(doc.limits.max_depth),
+    checked_refs,
+    issues,
+  )
+
+  issues
+}

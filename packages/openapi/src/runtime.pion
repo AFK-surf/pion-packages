@@ -1,0 +1,708 @@
+///| Pre-compiled runtime HTTP request & response validator reusing `packages/jsonschema`.
+
+import "json5"
+import "jsonschema"
+
+fn compile_entry(
+  doc : OpenApiDoc,
+  schema_opt : Option[json5::Json5Value],
+  pool : Array[jsonschema::CompiledSchema],
+) -> Result[Option[CompiledSchemaEntry], OpenApiError] {
+  match schema_opt {
+    None => Ok(None)
+    Some(raw_schema) => {
+      let deref = match dereference_schema_impl(doc, raw_schema) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let compiled = match jsonschema::compile(deref) {
+        Ok(c) => c
+        Err(e) => {
+          return Err(
+            OpenApiError::new(
+              OpenApiErrorKind::SchemaError,
+              e.schema_path,
+              "failed to compile OpenAPI schema: " + e.message,
+            ),
+          )
+        }
+      }
+      let cid = pool.length()
+      pool.push(compiled)
+      Ok(Some(CompiledSchemaEntry::{ raw_schema: deref, compiled_id: cid }))
+    }
+  }
+}
+
+fn validator_from_doc_impl(doc : OpenApiDoc) -> Result[Validator, OpenApiError] {
+  let router = build_router_impl(doc)
+  let pool : Array[jsonschema::CompiledSchema] = []
+  let route_validators : Array[CompiledRouteValidator] = []
+
+  let mut ri = 0
+  while ri < router.routes.length() {
+    let op = router.routes[ri].operation
+    // Compile parameter schemas
+    let p_schemas : Array[Option[CompiledSchemaEntry]] = []
+    let mut pi = 0
+    while pi < op.parameters.length() {
+      match compile_entry(doc, op.parameters[pi].schema, pool) {
+        Ok(entry) => p_schemas.push(entry)
+        Err(e) => return Err(e)
+      }
+      pi = pi + 1
+    }
+
+    // Compile requestBody media type schemas
+    let b_schemas : Array[(String, Option[CompiledSchemaEntry])] = []
+    match op.request_body {
+      Some(rb) => {
+        let mut ci = 0
+        while ci < rb.content.length() {
+          let (ct, mt) = rb.content[ci]
+          match compile_entry(doc, mt.schema, pool) {
+            Ok(entry) => b_schemas.push((ascii_lower_str(ct), entry))
+            Err(e) => return Err(e)
+          }
+          ci = ci + 1
+        }
+      }
+      None => ()
+    }
+
+    // Compile response validators
+    let resp_vals : Array[(String, CompiledResponseValidator)] = []
+    let mut rpi = 0
+    while rpi < op.responses.length() {
+      let (code, resp) = op.responses[rpi]
+      let h_schemas : Array[(String, Bool, Option[CompiledSchemaEntry])] = []
+      let mut hi = 0
+      while hi < resp.headers.length() {
+        let (hname, hp) = resp.headers[hi]
+        match compile_entry(doc, hp.schema, pool) {
+          Ok(entry) => h_schemas.push((hname, hp.required, entry))
+          Err(e) => return Err(e)
+        }
+        hi = hi + 1
+      }
+      let rb_schemas : Array[(String, Option[CompiledSchemaEntry])] = []
+      let mut ci = 0
+      while ci < resp.content.length() {
+        let (ct, mt) = resp.content[ci]
+        match compile_entry(doc, mt.schema, pool) {
+          Ok(entry) => rb_schemas.push((ascii_lower_str(ct), entry))
+          Err(e) => return Err(e)
+        }
+        ci = ci + 1
+      }
+      resp_vals.push((
+        code,
+        CompiledResponseValidator::{
+          header_schemas: h_schemas,
+          body_schemas: rb_schemas,
+        },
+      ))
+      rpi = rpi + 1
+    }
+
+    route_validators.push(
+      CompiledRouteValidator::{
+        param_schemas: p_schemas,
+        body_schemas: b_schemas,
+        response_validators: resp_vals,
+      },
+    )
+    ri = ri + 1
+  }
+
+  Ok(
+    Validator::{
+      doc: doc,
+      router: router,
+      route_validators: route_validators,
+      compiled_schemas: pool,
+    },
+  )
+}
+
+///| Strip `; charset=...` parameters and trim whitespace from a Content-Type header.
+fn base_media_type(ct : String) -> String {
+  let n = ct.length()
+  let mut end = n
+  let mut i = 0
+  while i < n {
+    if ct.code_unit_at(i) == 59 {
+      end = i
+      break
+    }
+    i = i + 1
+  }
+  // Trim leading/trailing spaces
+  let mut start = 0
+  while start < end && (ct.code_unit_at(start) == 32 || ct.code_unit_at(start) == 9) {
+    start = start + 1
+  }
+  while end > start && (ct.code_unit_at(end - 1) == 32 || ct.code_unit_at(end - 1) == 9) {
+    end = end - 1
+  }
+  ascii_lower_str(ct.slice(start, end))
+}
+
+fn is_json_media_type(ct : String) -> Bool {
+  if ct == "application/json" || ct == "text/json" {
+    return true
+  }
+  let n = ct.length()
+  n >= 5 && ct.slice(n - 5, n) == "+json"
+}
+
+fn match_content_entry(
+  entries : Array[(String, Option[CompiledSchemaEntry])],
+  media_type : String,
+) -> Option[(String, Option[CompiledSchemaEntry])] {
+  // 1. Exact match
+  let mut i = 0
+  while i < entries.length() {
+    let (k, v) = entries[i]
+    if k == media_type {
+      return Some((k, v))
+    }
+    i = i + 1
+  }
+  // 2. type/* wildcard
+  let mut slash = -1
+  i = 0
+  while i < media_type.length() {
+    if media_type.code_unit_at(i) == 47 {
+      slash = i
+      break
+    }
+    i = i + 1
+  }
+  if slash > 0 {
+    let prefix = media_type.slice(0, slash + 1) + "*"
+    i = 0
+    while i < entries.length() {
+      let (k, v) = entries[i]
+      if k == prefix {
+        return Some((k, v))
+      }
+      i = i + 1
+    }
+  }
+  // 3. */* catch-all
+  i = 0
+  while i < entries.length() {
+    let (k, v) = entries[i]
+    if k == "*/*" {
+      return Some((k, v))
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn split_by_byte(s : String, sep : Int) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i) == sep {
+      out.push(s.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(s.slice(start, n))
+  out
+}
+
+fn default_param_style(loc : ParamIn) -> String {
+  match loc {
+    ParamIn::Path => "simple"
+    ParamIn::Header => "simple"
+    ParamIn::Query => "form"
+    ParamIn::Cookie => "form"
+  }
+}
+
+fn parse_param_values(
+  raw_vals : Array[String],
+  param : Parameter,
+  schema_opt : Option[json5::Json5Value],
+  loc : String,
+) -> Result[json5::Json5Value, RuntimeValidationError] {
+  let ptype = schema_primary_type(schema_opt)
+  let style = match param.style {
+    Some(s) => s
+    None => default_param_style(param.location)
+  }
+  let explode = match param.explode {
+    Some(b) => b
+    None => style == "form"
+  }
+
+  if ptype == "array" {
+    let item_schema = match schema_opt {
+      Some(sv) => json5::get(sv, "items")
+      None => None
+    }
+    let item_type = schema_primary_type(item_schema)
+    let raw_items : Array[String] = if explode && style == "form" {
+      raw_vals
+    } else {
+      let sep = if style == "pipeDelimited" {
+        124
+      } else if style == "spaceDelimited" {
+        32
+      } else {
+        44
+      }
+      let joined = if raw_vals.length() > 0 { raw_vals[0] } else { "" }
+      if joined.length() == 0 {
+        []
+      } else {
+        split_by_byte(joined, sep)
+      }
+    }
+    let arr : Array[json5::Json5Value] = []
+    let mut i = 0
+    while i < raw_items.length() {
+      match coerce_scalar_by_type(raw_items[i], item_type, loc + "[" + i.to_string() + "]") {
+        Ok(iv) => arr.push(iv)
+        Err(e) => return Err(e)
+      }
+      i = i + 1
+    }
+    Ok(json5::Json5Value::Array(arr))
+  } else {
+    let raw = if raw_vals.length() > 0 { raw_vals[0] } else { "" }
+    coerce_scalar_by_type(raw, ptype, loc)
+  }
+}
+
+fn validate_request_impl(
+  v : Validator,
+  req : HttpRequest,
+) -> Array[RuntimeValidationError] {
+  let errs : Array[RuntimeValidationError] = []
+  let route_match = match router_find_impl(v.router, req.method, req.path) {
+    Ok(m) => m
+    Err(RouteError::NotFound(p)) => {
+      errs.push(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::RouteNotFound,
+          p,
+          "no matching OpenAPI route for " + req.method.to_upper() + " " + p,
+        ),
+      )
+      return errs
+    }
+    Err(RouteError::MethodNotAllowed(p, _)) => {
+      errs.push(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::MethodNotAllowed,
+          p,
+          "method " + req.method.to_upper() + " not allowed for " + p,
+        ),
+      )
+      return errs
+    }
+  }
+
+  let op = route_match.operation
+  let rv = v.route_validators[route_match.route_id]
+
+  // 1. Validate parameters (path, query, header, cookie)
+  let mut pi = 0
+  while pi < op.parameters.length() {
+    let param = op.parameters[pi]
+    let loc_str = param.location.to_string() + "." + param.name
+    let raw_vals : Array[String] = []
+    match param.location {
+      ParamIn::Path => {
+        match route_match.param(param.name) {
+          Some(pv) => raw_vals.push(pv)
+          None => ()
+        }
+      }
+      ParamIn::Query => {
+        let mut qi = 0
+        while qi < req.query.length() {
+          let (qk, qv) = req.query[qi]
+          if qk == param.name {
+            raw_vals.push(qv)
+          }
+          qi = qi + 1
+        }
+      }
+      ParamIn::Header => {
+        let target_h = ascii_lower_str(param.name)
+        let mut hi = 0
+        while hi < req.headers.length() {
+          let (hk, hv) = req.headers[hi]
+          if ascii_lower_str(hk) == target_h {
+            raw_vals.push(hv)
+          }
+          hi = hi + 1
+        }
+      }
+      ParamIn::Cookie => {
+        let mut ci = 0
+        while ci < req.cookies.length() {
+          let (ck, cv) = req.cookies[ci]
+          if ck == param.name {
+            raw_vals.push(cv)
+          }
+          ci = ci + 1
+        }
+      }
+    }
+
+    if raw_vals.length() == 0 {
+      if param.required {
+        errs.push(
+          RuntimeValidationError::new(
+            RuntimeErrorKind::MissingParameter,
+            loc_str,
+            "missing required " + param.location.to_string() + " parameter: " + param.name,
+          ),
+        )
+      }
+    } else {
+      let schema_entry = rv.param_schemas[pi]
+      let schema_raw = match schema_entry {
+        Some(e) => Some(e.raw_schema)
+        None => param.schema
+      }
+      match parse_param_values(raw_vals, param, schema_raw, loc_str) {
+        Ok(coerced) => {
+          match schema_entry {
+            Some(entry) => {
+              let compiled = v.compiled_schemas[entry.compiled_id]
+              if !compiled.is_valid(coerced) {
+                let s_errs = compiled.validate(coerced)
+                let msg = if s_errs.length() > 0 { s_errs[0].message } else { "schema violation" }
+                errs.push(
+                  RuntimeValidationError::new(
+                    RuntimeErrorKind::InvalidParameter,
+                    loc_str,
+                    msg,
+                  ),
+                )
+              }
+            }
+            None => ()
+          }
+        }
+        Err(e) => errs.push(e)
+      }
+    }
+    pi = pi + 1
+  }
+
+  // 2. Validate requestBody
+  match op.request_body {
+    Some(rb) => {
+      match req.body {
+        None => {
+          if rb.required {
+            errs.push(
+              RuntimeValidationError::new(
+                RuntimeErrorKind::MissingRequestBody,
+                "body",
+                "missing required request body",
+              ),
+            )
+          }
+        }
+        Some(body_str) => {
+          let raw_ct = match req.content_type {
+            Some(ct) => ct
+            None => {
+              // Also check Content-Type header if content_type field omitted
+              let mut found_ct = ""
+              let mut hi = 0
+              while hi < req.headers.length() {
+                let (hk, hv) = req.headers[hi]
+                if ascii_lower_str(hk) == "content-type" {
+                  found_ct = hv
+                  break
+                }
+                hi = hi + 1
+              }
+              found_ct
+            }
+          }
+          let mt = base_media_type(raw_ct)
+          match match_content_entry(rv.body_schemas, mt) {
+            None => {
+              errs.push(
+                RuntimeValidationError::new(
+                  RuntimeErrorKind::UnsupportedMediaType,
+                  "body",
+                  "unsupported Content-Type: " + mt,
+                ),
+              )
+            }
+            Some((_, entry_opt)) => {
+              if is_json_media_type(mt) {
+                match json5::parse_with_options(body_str, json5::ParseOptions::strict_json()) {
+                  Err(pe) => {
+                    errs.push(
+                      RuntimeValidationError::new(
+                        RuntimeErrorKind::InvalidJson,
+                        "body",
+                        "invalid JSON body: " + pe.message,
+                      ),
+                    )
+                  }
+                  Ok(parsed_body) => {
+                    match entry_opt {
+                      Some(entry) => {
+                        let compiled = v.compiled_schemas[entry.compiled_id]
+                        if !compiled.is_valid(parsed_body) {
+                          let s_errs = compiled.validate(parsed_body)
+                          let mut si = 0
+                          while si < s_errs.length() {
+                            let se = s_errs[si]
+                            errs.push(
+                              RuntimeValidationError::new(
+                                RuntimeErrorKind::SchemaViolation,
+                                "body" + se.instance_path,
+                                se.message,
+                              ),
+                            )
+                            si = si + 1
+                          }
+                        }
+                      }
+                      None => ()
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    None => ()
+  }
+
+  errs
+}
+
+fn find_response_validator(
+  resp_vals : Array[(String, CompiledResponseValidator)],
+  status : Int,
+) -> Option[CompiledResponseValidator] {
+  let exact = status.to_string()
+  let mut i = 0
+  while i < resp_vals.length() {
+    let (k, v) = resp_vals[i]
+    if k == exact {
+      return Some(v)
+    }
+    i = i + 1
+  }
+  let class_digit = status / 100
+  if class_digit >= 1 && class_digit <= 5 {
+    let upper = class_digit.to_string() + "XX"
+    let lower = class_digit.to_string() + "xx"
+    i = 0
+    while i < resp_vals.length() {
+      let (k, v) = resp_vals[i]
+      if k == upper || k == lower {
+        return Some(v)
+      }
+      i = i + 1
+    }
+  }
+  i = 0
+  while i < resp_vals.length() {
+    let (k, v) = resp_vals[i]
+    if k == "default" {
+      return Some(v)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn validate_response_impl(
+  v : Validator,
+  method : HttpMethod,
+  path : String,
+  resp : HttpResponse,
+) -> Array[RuntimeValidationError] {
+  let errs : Array[RuntimeValidationError] = []
+  let route_match = match router_find_impl(v.router, method, path) {
+    Ok(m) => m
+    Err(RouteError::NotFound(p)) => {
+      errs.push(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::RouteNotFound,
+          p,
+          "no matching OpenAPI route for response validation",
+        ),
+      )
+      return errs
+    }
+    Err(RouteError::MethodNotAllowed(p, _)) => {
+      errs.push(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::MethodNotAllowed,
+          p,
+          "method not allowed for response validation",
+        ),
+      )
+      return errs
+    }
+  }
+
+  let rv = v.route_validators[route_match.route_id]
+  let resp_val = match find_response_validator(rv.response_validators, resp.status) {
+    Some(r) => r
+    None => {
+      errs.push(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::UndocumentedStatus,
+          "response." + resp.status.to_string(),
+          "undocumented HTTP response status code: " + resp.status.to_string(),
+        ),
+      )
+      return errs
+    }
+  }
+
+  // 1. Validate response headers
+  let mut hi = 0
+  while hi < resp_val.header_schemas.length() {
+    let (hname, hreq, hentry_opt) = resp_val.header_schemas[hi]
+    let target = ascii_lower_str(hname)
+    let mut found : Option[String] = None
+    let mut j = 0
+    while j < resp.headers.length() {
+      let (rk, rv_str) = resp.headers[j]
+      if ascii_lower_str(rk) == target {
+        found = Some(rv_str)
+        break
+      }
+      j = j + 1
+    }
+    match found {
+      None => {
+        if hreq {
+          errs.push(
+            RuntimeValidationError::new(
+              RuntimeErrorKind::MissingResponseHeader,
+              "response.header." + hname,
+              "missing required response header: " + hname,
+            ),
+          )
+        }
+      }
+      Some(hv) => {
+        match hentry_opt {
+          Some(entry) => {
+            let ty = schema_primary_type(Some(entry.raw_schema))
+            match coerce_scalar_by_type(hv, ty, "response.header." + hname) {
+              Ok(coerced) => {
+                let compiled = v.compiled_schemas[entry.compiled_id]
+                if !compiled.is_valid(coerced) {
+                  let s_errs = compiled.validate(coerced)
+                  let msg = if s_errs.length() > 0 { s_errs[0].message } else { "invalid header" }
+                  errs.push(
+                    RuntimeValidationError::new(
+                      RuntimeErrorKind::InvalidResponseHeader,
+                      "response.header." + hname,
+                      msg,
+                    ),
+                  )
+                }
+              }
+              Err(e) => {
+                errs.push(
+                  RuntimeValidationError::new(
+                    RuntimeErrorKind::InvalidResponseHeader,
+                    "response.header." + hname,
+                    e.message,
+                  ),
+                )
+              }
+            }
+          }
+          None => ()
+        }
+      }
+    }
+    hi = hi + 1
+  }
+
+  // 2. Validate response body
+  if resp_val.body_schemas.length() > 0 {
+    match resp.body {
+      Some(body_str) => {
+        let raw_ct = match resp.content_type {
+          Some(ct) => ct
+          None => "application/json"
+        }
+        let mt = base_media_type(raw_ct)
+        match match_content_entry(resp_val.body_schemas, mt) {
+          None => {
+            errs.push(
+              RuntimeValidationError::new(
+                RuntimeErrorKind::UnsupportedMediaType,
+                "response.body",
+                "undocumented response Content-Type: " + mt,
+              ),
+            )
+          }
+          Some((_, entry_opt)) => {
+            if is_json_media_type(mt) {
+              match json5::parse_with_options(body_str, json5::ParseOptions::strict_json()) {
+                Err(pe) => {
+                  errs.push(
+                    RuntimeValidationError::new(
+                      RuntimeErrorKind::InvalidJson,
+                      "response.body",
+                      "invalid JSON response body: " + pe.message,
+                    ),
+                  )
+                }
+                Ok(parsed) => {
+                  match entry_opt {
+                    Some(entry) => {
+                      let compiled = v.compiled_schemas[entry.compiled_id]
+                      if !compiled.is_valid(parsed) {
+                        let s_errs = compiled.validate(parsed)
+                        let mut si = 0
+                        while si < s_errs.length() {
+                          let se = s_errs[si]
+                          errs.push(
+                            RuntimeValidationError::new(
+                              RuntimeErrorKind::SchemaViolation,
+                              "response.body" + se.instance_path,
+                              se.message,
+                            ),
+                          )
+                          si = si + 1
+                        }
+                      }
+                    }
+                    None => ()
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      None => ()
+    }
+  }
+
+  errs
+}
