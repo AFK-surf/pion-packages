@@ -63,8 +63,9 @@ pionc add <package-name>
 | [`sql`](packages/sql) | `0.1.0` | SQLite / PostgreSQL / Generic 方言 SQL 词法与 Pratt 递归下降 AST 解析（DML / DDL / TCL、CTE、窗口函数、`ON CONFLICT`、`RETURNING`，对齐 PostgreSQL 运算符优先级）、防注释注入的规范化 `to_sql` 与结构化 `stmt_eq`、O(N) `extract_tables` / `extract_placeholders` 与方言感知语句切分，`max_depth` / `max_tokens` / `max_nodes` 资源预算 | Rust [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs) `=0.53.0` | 35 / 35 | ✅ `wasm_smoke` | [复杂 SQL 解析 8.72× · 大脚本分词 7.94× · 往返 7.28×（vs `sqlparser`，`mimalloc` 基线约 2.6×）](BENCHMARKS.md#sql) | `pionc add sql --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`graph`](packages/graph) | `0.1.0` | `DiGraph` / `UnGraph` 邻接表与不可变 `CsrGraph`，全迭代 BFS / DFS、Tarjan / Kosaraju SCC、桥与割点、二分图、拓扑排序与环检测，Cooper-Harvey-Kennedy 支配树与支配边界、传递规约 / 闭包，Dijkstra / A* / Bellman-Ford / Floyd-Warshall（128-bit 精确回退）、Kruskal / Prim MST、Dinic 最大流与 DOT 导出 | Rust [`petgraph`](https://github.com/petgraph/petgraph) `=0.8.3` | 29 / 29 | ✅ `wasm_smoke` | [Dijkstra CSR 1.34× · SCC + 拓扑 0.60× · Kruskal 1.27× · 支配树 1.68–1.92×（vs `petgraph`）](BENCHMARKS.md#graph) | `pionc add graph --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`css`](packages/css) | `0.1.0` | W3C CSS Syntax Level 3 分词、单遍流式样式表 / 声明块容错解析（保持 CSS Nesting 声明顺序）、Selectors Level 4 校验与优先级、Media Queries Level 4、CSS Color Level 4（148 命名色、`lab` / `lch` / `oklab` / `oklch` / `color()`），格式化与单遍流式压缩，全程零递归与 `max_depth` / `max_tokens` / `max_rules` 预算 | Rust [`cssparser`](https://github.com/servo/rust-cssparser) `=0.35.0` + [`lightningcss`](https://github.com/parcel-bundler/lightningcss) `=1.0.0-alpha.72`；另对照 Node `css-tree@3.1.0` | 32 / 32 | ✅ `wasm_smoke` | [`count_tokens` 1.28–1.63× · `parse` 0.79–1.18×（vs `cssparser`）· `minify` 1.26–4.55×（vs `lightningcss`）](BENCHMARKS.md#css) | `pionc add css --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`base64`](packages/base64) | `0.1.0` | RFC 4648 Base64 / Base64URL / Base32 / Base32hex / Hex（Base16）编解码：查表单缓冲编码、256 项表严格解码（拒绝非规范尾位、错误填充、异字母表与空白，错误带精确偏移）与 MIME 宽松 `decode_loose`，零依赖、无 `World` | Rust [`base64`](https://github.com/marshallpierce/rust-base64) `=0.22.1` + [`data-encoding`](https://github.com/ia0/data-encoding) `=2.11.1` + [`hex`](https://github.com/KokaKiwi/rust-hex) `=0.4.3`；Go `encoding/base64` / `base32` / `hex`（go1.27.3） | 23 / 23 | ✅ `wasm_smoke` | [hex 编解码 1.70× / 4.59×（vs Rust `hex`）· Base32 解码 2.54×（vs Go）· Base64 0.42–0.54×](BENCHMARKS.md#base64) | `pionc add base64 --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 32 个包合计 **4,287 / 4,287** 单测通过（`sh scripts/verify.sh`）。
+全仓 33 个包合计 **4,310 / 4,310** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -89,6 +90,10 @@ Wave 7 新增的 4 个包按 Red → Green → 红队审计 → 修复流程交�
 ### Wave 8：`cli` / `sql` / `graph` / `css` `v0.1.0`
 
 Wave 8 新增的 4 个包按 Red → Green → 红队审计 → 修复流程交付，首发即为红队修复后的版本，各自随附 `packages/<name>/audit/` 套件（`cli` 9 个 P0 补全脚本注入经真实 bash / zsh 复现后全部修复，审计 35 / 40，剩余 4 例为记录在案的有意语义差异、1 例为审计测试期望常量笔误；`sql` 审计 36 / 37，`to_sql` 注释注入、`extract_tables` 漏报与 SQLite 走私均已修复，剩余 1 例为不带方言的 `split_statements` 按 Generic 切分（SQLite 用 `split_statements_dialect`）；`graph` 审计 20 / 21（剩余 1 例为插入顺序迭代的有意设计），10 seeds × 1,000 随机图对 `petgraph =0.8.3` 与精确参考差分 0 正确性不一致；`css` 审计 34 / 34，17,904 例 token 差分 99.85% 与 `cssparser` 一致，2,114 例压缩 0 语义破坏、0 非幂等，20 / 20 DoS 探针线性）。全部 32 个包的 `wasm_smoke` 已在 `AFK-surf/pion@81b8fb0` 上通过 Native / Wasm32 × debug / `--release` 共 128 / 128 次运行（每包 4 模式 stdout SHA-256 逐字节一致）。各包对比口径、落后项与已知差异见 [`BENCHMARKS.md`](BENCHMARKS.md)。
+
+### `base64` `v0.1.0`
+
+`base64` 由 Monoid / Invar 团队交付，按 Red → Green → Bench 三段提交合入：RFC 4648 §10 全部五种编码测试向量、Go `encoding/base64` / `encoding/base32` 用例与错误偏移、4,096 个 2 符号与 262,144 个 3 符号 Base64 尾部及每种 Base32 尾长的规范性穷举（严格解码器仅接受编码器能产出的字符串），23 / 23 单测通过；`wasm_smoke` Native / Wasm32 × debug / `--release` 4 模式 stdout SHA-256 逐字节一致。头对头基准如实记录：hex 编码 / 解码为 Rust `hex` 的 1.70× / 4.59×，Base32 解码为 Go 的 2.54×；Base64 / Base64URL / Base32 其余模式为 Rust 与 Go 的 0.42–0.54×（参考实现按机器字批量解码，本包逐字节查表）。见 [`BENCHMARKS.md`](BENCHMARKS.md#base64)。
 
 ## 贡献与移植流程
 

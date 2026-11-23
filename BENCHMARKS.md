@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 的数据取自包 README，未记录 pion commit，发布验证使用 2026-11-23 安装的 `pionc 0.1.0`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7 + Wave 8）
+## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7 + Wave 8 + `base64`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0`。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -166,6 +166,14 @@
 | `css` | 单遍流式 `parse_stylesheet()` vs `lightningcss` 解析（5 语料） | 1.34–2.09 MB × 3 | 37.8–91.2 ms | 105.4–449.6 ms (`lightningcss`) | **1.62x–4.93x** | **8.2–41.2 MB** | 34.6–202.6 MB |
 | `css` | 单遍流式 `minify()` vs `lightningcss` 压缩器（5 语料；后者另做类型化属性优化） | 1.34–2.09 MB × 3 | 67.8–125.2 ms | 125.3–569.7 ms (`lightningcss`) | **1.26x–4.55x** | **5.7–7.6 MB** | 35.1–203.4 MB |
 | `css` | 单遍流式 `parse_stylesheet()` vs Node `css-tree` 解析（5 语料） | 1.34–2.09 MB × 3 | 37.8–91.2 ms | 442.8–1220.2 ms (`css-tree`) | **5.19x–19.86x** | **8.2–41.2 MB** | 164.1–448.6 MB |
+| `base64` | `b64_encode` Base64 编码 4 MiB × 64 | 268,435,456 B | 239.2 ms | 100.7 ms (Rust) / 122.6 ms (Go) | 0.42x (vs Rust) · 0.51x (vs Go) | 16.4 MiB | 11.1 / 31.7 MiB (Rust / Go) |
+| `base64` | `b64_decode` Base64 严格解码 4 MiB × 64 | 268,435,456 B | 228.9 ms | 99.0 ms (Rust) / 110.5 ms (Go) | 0.43x (vs Rust) · 0.48x (vs Go) | 20.5 MiB | 15.1 / 32.5 MiB (Rust / Go) |
+| `base64` | `url_encode` Base64URL 编码 4 MiB × 64 | 268,435,456 B | 228.6 ms | 99.3 ms (Rust) / 122.4 ms (Go) | 0.43x (vs Rust) · 0.54x (vs Go) | 16.5 MiB | 11.1 / 26.8 MiB (Rust / Go) |
+| `base64` | `url_decode` Base64URL 严格解码 4 MiB × 64 | 268,435,456 B | 226.5 ms | 94.6 ms (Rust) / 106.7 ms (Go) | 0.42x (vs Rust) · 0.47x (vs Go) | 20.5 MiB | 15.1 / 30.4 MiB (Rust / Go) |
+| `base64` | `b32_encode` Base32 编码 4 MiB × 64 | 268,435,456 B | 253.3 ms | 113.2 ms (Rust) / 118.6 ms (Go) | 0.45x (vs Rust) · 0.47x (vs Go) | 18.6 MiB | 12.2 / 29.9 MiB (Rust / Go) |
+| `base64` | `b32_decode` Base32 严格解码 4 MiB × 64 | 268,435,456 B | 253.1 ms | 110.9 ms (Rust) / 642.3 ms (Go) | 0.44x (vs Rust) · **2.54x** (vs Go) | 22.6 MiB | 16.2 / 49.1 MiB (Rust / Go) |
+| `base64` | `hex_encode` Hex 编码 4 MiB × 64 | 268,435,456 B | 300.7 ms | 511.6 ms (Rust) / 209.7 ms (Go) | **1.70x** (vs Rust) · 0.70x (vs Go) | 21.8 MiB | 13.8 / 66.3 MiB (Rust / Go) |
+| `base64` | `hex_decode` Hex 解码 4 MiB × 64 | 268,435,456 B | 315.7 ms | 1449.4 ms (Rust) / 185.1 ms (Go) | **4.59x** (vs Rust) · 0.59x (vs Go) | 25.8 MiB | 20.0 / 31.4 MiB (Rust / Go) |
 
 ## 各包明细
 
@@ -1330,3 +1338,22 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 | `custom_props` | 22.7 | **22.5** | 56.2 | **7.6** | 58.2 | 164.1 |
 
 红队：32/32 单测；红队审计 `pionc test -p css_audit packages/css/audit` 34/34，原 P0（CSS Nesting 声明顺序丢失、`:is()` / `:not()` / `:where()` / `:has()` 内后代组合器被压缩删除）与 P1 / P2 均已修复；`tok_diff.py` 17,904 例 + 2,014 例原始字节输入 99.85% 与 `cssparser` 一致（`tokenize_bytes` 2,014 / 2,014）；`minify_diff.py` 2,114 例 0 语义破坏、0 非幂等；`dos.py` 20 / 20 线性、0 崩溃；`wasm4.py` 12 语料 × 4 模式 SHA-256 逐字节一致。领先项：`count_tokens()` 1.28x–1.63x（vs `cssparser`），`parse_stylesheet()` 1.62x–4.93x（vs `lightningcss`），`minify()` 1.26x–4.55x 且内存低 4.9x–29.5x（vs `lightningcss`，后者另做简写合并、厂商前缀与颜色空间转换等深度优化）。落后项：全量物化 `tokenize()` 0.47x–0.52x，`parse_stylesheet()` 对 `cssparser` 自有 AST 在 `color_heavy` / `selector_heavy` / `custom_props` 上 0.79x–0.94x，`nesting_heavy` 峰值 RSS 41.2 MB 高于 `cssparser` 的 34.0 MB。
+
+### base64
+
+参考实现：Rust [`base64`](https://github.com/marshallpierce/rust-base64) `=0.22.1`（`STANDARD` / `URL_SAFE`）、[`data-encoding`](https://github.com/ia0/data-encoding) `=2.11.1`（Base32）、[`hex`](https://github.com/KokaKiwi/rust-hex) `=0.4.3`（`--release`，LTO）；Go `go1.27.3` 标准库 `encoding/base64`（`.Strict()`）/ `encoding/base32` / `encoding/hex`。`sh packages/base64/bench/run_bench.sh 4194304 64` 构建三方实现并按模式调用 `scripts/bench_compare.py --warmup 1 --rounds 5`：每次运行生成 4 MiB xorshift32 数据并编码（或解码）64 次，吞吐按 256 MiB 原始字节计，耗时含约 20 ms 的输入生成；每个模式三方 stdout（尺寸、逐轮采样和与末次结果 FNV-1a 64）SHA-256 逐字节一致。采样时机器负载约 16–18，小差距需谨慎解读。详见 [`packages/base64/README.md`](packages/base64/README.md)。
+
+**8-Mode Head-to-Head (median ms, MB/s)**
+
+| Mode | Pion | Go stdlib | Rust | Pion vs Rust | Pion vs Go | Peak RSS Pion / Go / Rust (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `b64_encode` | 239.2 (1122) | 122.6 (2189) | 100.7 (2667) | 0.42x | 0.51x | 16.4 / 31.7 / 11.1 |
+| `b64_decode` | 228.9 (1173) | 110.5 (2429) | 99.0 (2711) | 0.43x | 0.48x | 20.5 / 32.5 / 15.1 |
+| `url_encode` | 228.6 (1175) | 122.4 (2193) | 99.3 (2703) | 0.43x | 0.54x | 16.5 / 26.8 / 11.1 |
+| `url_decode` | 226.5 (1185) | 106.7 (2515) | 94.6 (2838) | 0.42x | 0.47x | 20.5 / 30.4 / 15.1 |
+| `b32_encode` | 253.3 (1060) | 118.6 (2263) | 113.2 (2371) | 0.45x | 0.47x | 18.6 / 29.9 / 12.2 |
+| `b32_decode` | 253.1 (1060) | 642.3 (418) | 110.9 (2421) | 0.44x | **2.54x** | 22.6 / 49.1 / 16.2 |
+| `hex_encode` | 300.7 (893) | 209.7 (1280) | 511.6 (525) | **1.70x** | 0.70x | 21.8 / 66.3 / 13.8 |
+| `hex_decode` | 315.7 (850) | 185.1 (1450) | 1449.4 (185) | **4.59x** | 0.59x | 25.8 / 31.4 / 20.0 |
+
+23/23 单测（RFC 4648 §10 五种编码向量、Go 用例与错误偏移、Base64 2 / 3 符号尾部与 Base32 各尾长规范性穷举、0–64 全长度与 64 KiB / 1 MiB 往返）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `b9babfa55084789669b9487724ff5d938cbc2517d10008490c09b9310df19539`。领先项：hex 编码 / 解码为 Rust `hex` 的 1.70x / 4.59x，Base32 解码为 Go 的 2.54x（Go 按组处理填充与换行）。落后项：Base64 / Base64URL 编解码与 Base32 编码为 Rust 与 Go 的 0.42x–0.54x，Base32 解码为 Rust `data-encoding` 的 0.44x，hex 为 Go 的 0.70x / 0.59x（参考实现按机器字批量处理，本包逐字节经边界检查 `Bytes` 索引查表；4,096 项双符号表与展开索引实测无收益）。峰值 RSS 每个模式都介于 Rust 与 Go 之间。

@@ -57,14 +57,14 @@ Tests: RFC 4648 §10 vectors for all five codecs, Go `encoding/base64` / `encodi
 
 ### Native + wasm32 (debug and release)
 
-`bench/wasm_smoke` prints vectors, strict verdicts and 64 KiB / 1 MiB round-trip digests. All four builds must print byte-identical stdout:
+`wasm_smoke` prints vectors, strict verdicts and 64 KiB / 1 MiB round-trip digests. All four builds must print byte-identical stdout:
 
 ```sh
 W=/tmp/base64-smoke; mkdir -p $W; RT="$HOME/.pion/share/pion/pion_wasm_rt.mjs"
-pionc build -o $W/native_debug packages/base64/bench/wasm_smoke
-pionc build --release -o $W/native_release packages/base64/bench/wasm_smoke
-pionc build --target wasm32 -o $W/debug.wasm packages/base64/bench/wasm_smoke
-pionc build --release --target wasm32 -o $W/release.wasm packages/base64/bench/wasm_smoke
+pionc build -o $W/native_debug packages/base64/wasm_smoke
+pionc build --release -o $W/native_release packages/base64/wasm_smoke
+pionc build --target wasm32 -o $W/debug.wasm packages/base64/wasm_smoke
+pionc build --release --target wasm32 -o $W/release.wasm packages/base64/wasm_smoke
 $W/native_debug > $W/nd.out; $W/native_release > $W/nr.out
 node $RT $W/debug.wasm > $W/wd.out; node $RT $W/release.wasm > $W/wr.out
 shasum -a 256 $W/*.out   # all b9babfa55084789669b9487724ff5d938cbc2517d10008490c09b9310df19539
