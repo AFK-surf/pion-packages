@@ -1,0 +1,118 @@
+# `decimal` — Pure Pion 128-bit Exact Decimal Arithmetic (`rust_decimal` Port)
+
+Zero-dependency, pure-Pion port of Rust's [`paupino/rust-decimal`](https://github.com/paupino/rust-decimal) (`rust_decimal =1.37.2`), providing **128-bit exact base-10 arithmetic** (`val struct Decimal` with a 96-bit unsigned mantissa `lo64` + `hi`, sign bit, and scale `0..=28`) with zero IEEE-754 floating-point drift. Designed for billing, token accounting, financial ledgers, quotas, and reporting on both **Native** and **WebAssembly (`wasm32`)** targets without `World` dependencies.
+
+## Features
+
+- **128-bit Value Representation (`pub val struct Decimal { pub lo64 : UInt64, pub hi : UInt, pub flags : UInt }`)**:
+  - Range: `±79,228,162,514,264,337,593,543,950,335` (`2^96 - 1`), scale `0..=28`.
+  - Storing the lower 64 bits directly in `lo64 : UInt64` eliminates 32-bit packing/unpacking on the 64-bit fast paths (common in currency/token billing).
+- **Parsing & Formatting (`src/parse.pion`, `src/fmt.pion`)**:
+  - `Decimal::from_str`: iterative O(1)-stack base-10 parser (`+`/`-`, `_` digit separators, automatic rounding past 28 fractional digits, negative-zero sign clearing, and strict rejection of `e`/`E` matching `rust_decimal::FromStr`).
+  - `Decimal::from_str_exact`: strict base-10 parser rejecting any precision loss with `Err(DecimalError::Underflow)`.
+  - `Decimal::from_scientific` (exact) & `Decimal::from_scientific_lossy` (rounds negative exponents within `|exp| <= 28`), using zero-copy `[start, end)` slice parsing and scalar power-of-10 scaling.
+  - `Decimal::from_str_radix`: radices `2..=36` with overflowing fractional digit rounding (without `rust_decimal` 1.37.2's `estimated_max_precision` truncation/panic bugs).
+  - `Decimal::to_string` & `Decimal::write_to(sb)`: **9-digit (`1_000_000_000`) chunking** (at most 4 divisions for a full 96-bit mantissa) and exact-size `Bytes` formatting, preserving trailing zeros per `scale`.
+  - `Decimal::serialize` / `Decimal::deserialize`: 16-byte little-endian wire format `[flags, lo, mid, hi]` bit-for-bit interoperable with `rust_decimal =1.37.2` (including `0x801F_0000` 5-bit scale masking and scale 29–31 carry rules).
+- **Zero-Allocation Exact Checked Arithmetic (`src/ops.pion`)**:
+  - `checked_add`, `checked_sub`, `checked_mul`, `checked_div`, `checked_rem`, `neg`, `abs`.
+  - 64-bit fast paths (`hi == 0` with same-scale `UInt64` ops and 128-bit widening multiply `u64_mul_wide` for cross-scale alignment up to `diff <= 19`).
+  - Full 96/128/192-bit scalar arithmetic (`checked_mul` / `finish_mul_192_scalar`, `checked_div` 32/64/96-bit Knuth long division + `unscale_div_scalar`) with **zero heap `FixedArray` allocations** on the multiply and division hot paths and bit-exact scale/rounding parity with `rust_decimal =1.37.2`.
+- **All 7 Rounding Strategies & Scale Operations (`src/round.pion`)**:
+  - `round`, `round_dp`, `round_dp_with_strategy`: `MidpointNearestEven` (Banker's rounding), `MidpointAwayFromZero`, `MidpointTowardZero`, `ToZero`, `AwayFromZero`, `ToNegativeInfinity`, `ToPositiveInfinity` — single-pass zero-allocation scalar 96-bit rounding with negative-zero sign clearing (matching `rust_decimal`).
+  - `normalize` (strips trailing zeros and converts `-0`/`-0.0` to `0`), `rescale` (safely caps scale at 28 without panicking), `set_scale`, `floor`, `ceil`, `trunc`, `trunc_with_scale` (pads zeros up to target scale capped at 28 without panicking), `fract`.
+- **Comparison, Worst-Case O(n log n) Sorting & Math (`src/cmp.pion`, `src/math.pion`)**:
+  - Total numerical ordering (`compare`, `eq`, `lt`, `le`, `gt`, `ge`, `min_val`, `max_val`) treating `-0.0 == 0.0` and `1.0 == 1.00`.
+  - In-place `Decimal::sort`: **Introsort** (interior-quartile median-of-three quicksort + `2 * log2(n)` **Heapsort** fallback + insertion-sort cutoff), immune to O(n²) McIlroy quicksort-killer sequences.
+  - `checked_powu`, `checked_powi` / `powi` (exact `rust_decimal` overflow, scale, and reciprocal parity), `sqrt` (Babylonian method with 2-cycle detection and residual selection), `to_i64`, `to_u64`, `to_f64` (exact integral/fractional split conversion matching `rust_decimal` bit-for-bit).
+- **Red-Team Verification (`redteam_test.pion` & `audit/`)**:
+  - 167,139-op differential audit vs `rust_decimal =1.37.2` (`sh packages/decimal/audit/run_audit.sh`): **27 / 33 operations 100% bit-for-bit identical (0 mismatches)**, 0 value accuracy regressions (`judge_exact.py`), 16 / 16 audit tests passing, and byte-identical stdout SHA-256 across Native debug/release and Wasm32 debug/release.
+  - Linear-time DoS resistance on 200k–1M-character hostile inputs, huge exponents (`1e±99999999999999999`), `powi(2, 1e9)`, `MAX % 1e-28`, and 50k McIlroy sort-killer permutations.
+
+## Verification
+
+```sh
+export PATH="$HOME/.pion/bin:$HOME/.cargo/bin:$PATH"
+
+pionc fmt --check packages/decimal/src packages/decimal/decimal_test.pion packages/decimal/redteam_test.pion
+pionc check --json packages/decimal
+pionc test --json packages/decimal
+(cd packages/decimal && pionc test --json audit)
+
+# Native debug & release smoke
+pionc build packages/decimal/wasm_smoke -o /private/tmp/pion-decimal-audit/smoke_dbg && /private/tmp/pion-decimal-audit/smoke_dbg
+pionc build --release packages/decimal/wasm_smoke -o /private/tmp/pion-decimal-audit/smoke_rel && /private/tmp/pion-decimal-audit/smoke_rel
+
+# Wasm32 debug & release smoke
+pionc build --target wasm32 packages/decimal/wasm_smoke -o /private/tmp/pion-decimal-audit/smoke_dbg.wasm
+pionc run --target wasm32 packages/decimal/wasm_smoke
+pionc build --release --target wasm32 packages/decimal/wasm_smoke -o /private/tmp/pion-decimal-audit/smoke_rel.wasm
+pionc run --release --target wasm32 packages/decimal/wasm_smoke
+
+# Full red-team differential + DoS + adversarial benchmarks
+sh packages/decimal/audit/run_audit.sh
+```
+
+## Head-to-Head Benchmarks (Pion Native `--release` vs Rust `rust_decimal =1.37.2` `--release`)
+
+Measured on `Darwin arm64` with `pionc 0.1.0 (arm64_apple, self-hosted)` and `rustc 1.100.0` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification).
+
+### Standard Workloads (`sh packages/decimal/bench/run_bench.sh`)
+
+#### Bench 1: Mixed Decimal Parse + Format (500,000 ops, 6.56 MB)
+
+50,000 mixed decimal strings (2dp currency, 6dp micro-billing, integers, 8dp FX rates, 96-bit ledger balances, 18dp high-precision fractions) × 10 steady-state rounds (`from_str` + `to_string` + FNV-1a over every output byte).
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_decimal`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 54.734 | 52.278 | 57.783 | 119.78 | 109.47 | 5.36 MiB | **0.81x** |
+| `rust_decimal` (`1.37.2`) | 44.605 | 42.538 | 46.936 | 146.98 | 89.21 | 3.38 MiB | 1.00x (baseline) |
+
+- Verified common stdout SHA-256: `6a0482dc3aee4ddc3a4c80783d683008c2445a1dccd3fd2ec58e8cbffef1ae48`
+
+#### Bench 2: Billing Arithmetic Stream (2,000,000 ops)
+
+400,000 transactions × 5 core idiomatic `Decimal` operations (`checked_mul`, `checked_add`, `checked_sub`, `checked_div`, `round_dp(2)`), accumulating an exact running `grand_total` and FNV-1a checksum.
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_decimal`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 67.804 | 65.193 | 70.656 | 33.90 | **1.72 MiB** | **0.60x** |
+| `rust_decimal` (`1.37.2`) | 40.552 | 40.441 | 41.076 | 20.28 | 1.81 MiB | 1.00x (baseline) |
+
+- Verified common stdout SHA-256: `3d0da5b89dfe19db270abada6e5ea031da0006e447090b5e4e684c4f1ba92f50`
+
+#### Bench 3: Sort + Aggregate + Banker's Rounding (500,000 ops)
+
+50,000 mixed-scale `Decimal` values × 10 rounds: in-place `Decimal::sort` (vs Rust `Vec::sort_unstable`), `round_dp(2)` Banker's rounding on every element, and exact sum/min/median/max aggregation.
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_decimal`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 126.927 | 120.636 | 129.210 | 253.85 | 7.91 MiB | **0.36x** |
+| `rust_decimal` (`1.37.2`) | 45.269 | 43.706 | 46.540 | 90.54 | 4.12 MiB | 1.00x (baseline) |
+
+- Verified common stdout SHA-256: `d83ad65315d2b3ccb76bcd83b313962ed82c2f7511163a437f3549806d38f7dd`
+
+### Adversarial Workloads (`sh packages/decimal/audit/run_audit.sh`)
+
+Every adversarial workload verifies stdout SHA-256 byte-for-byte against `rust_decimal =1.37.2`:
+
+| Workload | Ops | Pion Median (ms) | Rust Median (ms) | Pion ns/op | Peak RSS (Pion / Rust) | Speedup (vs `rust_decimal`) | Verified SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | --- |
+| **A1** `Decimal::sort`: McIlroy killer (50k) | 50,000 | **15.732** | 11.951 | 314.65 | 6.70 / 3.14 MiB | **0.76x** | `c8ee2657…5ae0ec8cc` |
+| **A2** `Decimal::sort`: same values, random (50k) | 50,000 | 19.647 | 12.322 | 392.95 | 6.70 / 3.14 MiB | **0.63x** | `c8ee2657…5ae0ec8cc` |
+| **A3** Full-width 96×96 `checked_mul` | 2,000,000 | 151.264 | 82.603 | 75.63 | **1.75** / 1.84 MiB | **0.55x** | `7f2dffc2…08d3a8e7` |
+| **A4** `checked_div` (32/64/96-bit divisors) | 2,000,000 | 213.339 | 97.042 | 106.67 | **1.75** / 1.84 MiB | **0.45x** | `8967bce6…63c0a381a` |
+| **A5** `from_scientific` (50k × 10) | 500,000 | 48.237 | 28.138 | 96.47 | 5.69 / 3.47 MiB | **0.58x** | `2032d34f…23b77ce16` |
+| **A6** `sqrt` (100k random 96-bit) | 100,000 | 576.608 | 344.611 | 5,766.08 | **1.77** / 1.86 MiB | **0.60x** | `52e54afd…8478868df` |
+
+### Performance & Compiler Analysis
+
+- **Strengths**:
+  - **Parse + Format reaches 0.81x of Rust `--release` (119.78 MB/s, 109.5 ns/op)** via the iterative `UInt64` 18-digit fast path in `parse_radix10_slice` and 9-digit chunking (`1_000_000_000`) into exact-size `Bytes`.
+  - **Zero-allocation scalar hot paths**: Eliminating heap `FixedArray[UInt]` buffers in `checked_div`, `checked_mul`, `round_dp_code`, `normalize`, and `from_scientific` keeps Peak RSS **lower than Rust** on Bench 2 (1.72 vs 1.81 MiB), A3 (1.75 vs 1.84 MiB), A4 (1.75 vs 1.84 MiB), and A6 (1.77 vs 1.86 MiB), lifting Bench 2 from 0.48x → **0.60x**, A3 from 0.44x → **0.55x**, A4 from 0.32x → **0.45x**, A5 from 0.38x → **0.58x**, and A6 from 0.41x → **0.60x**.
+  - **McIlroy killer eliminated**: Introsort drops A1 (50k McIlroy killer) from **2,872.7 ms (0.004x)** to **15.732 ms (0.76x)** — a **182.6× speedup**.
+- **Honest Remaining Bottlenecks**:
+  1. **`Result[Decimal, DecimalError]` & `Array[Decimal]` boxing overhead**: In `pionc 0.1.0`, returning `Result[Decimal, DecimalError]` wraps the 16-byte `val struct Decimal` in a tagged enum allocation, and `Array[Decimal]` stores boxed elements (visible in Bench 3 RSS: 7.91 MiB vs Rust's contiguous 16 B/elem `Vec<Decimal>` at 4.12 MiB), adding pointer indirection on every comparison during sort/aggregation.
+  2. **Software 64×64→128-bit multiply**: Pion does not yet expose a native `UInt128` / `arm64 umulh` intrinsic, so cross-scale widening (`u64_mul_wide`) and 96×96 multiplication use 32-bit schoolbook products instead of a single `mul` + `umulh` instruction pair.
+- **Compiler Workaround (`pionc 69a0189d` `--release`)**:
+  - `Decimal::round`, `Decimal::round_dp`, and `Decimal::rescale` route through an internal integer-tagged `round_dp_code(self, dp, code, clear_zero_sign)` helper rather than referencing fieldless `RoundingStrategy` variants directly, avoiding the `pionc 69a0189d` `--release` cross-package inlining bug for fieldless enum variants. Verified with `wasm_smoke` passing in Native debug, Native `--release`, Wasm32 debug, and Wasm32 `--release`.
