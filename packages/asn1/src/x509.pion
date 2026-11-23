@@ -1,0 +1,1486 @@
+///| RFC 5280 X.509 v1/v3 certificate parser, RFC 6125/9525 hostname verification,
+///| and SPKI / PKCS#8 encoder & decoder.
+
+fn bytes_slice_eq(data : Bytes, s1 : Int, e1 : Int, s2 : Int, e2 : Int) -> Bool {
+  let len = e1 - s1
+  if len != e2 - s2 {
+    return false
+  }
+  let mut i = 0
+  while i < len {
+    if data[s1 + i] != data[s2 + i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn fnv1a_slice(data : Bytes, start : Int, len : Int) -> Int {
+  let mut h : UInt64 = 14695981039346656037UL
+  let mut i = 0
+  while i < len {
+    h = h ^ data[start + i].to_int().to_int64().to_uint64()
+    h = h * 1099511628211UL
+    i = i + 1
+  }
+  (h & 0x7FFFFFFFUL).to_int64().to_int()
+}
+
+fn parse_algorithm_identifier(r : DerReader) -> Result[AlgorithmIdentifier, Asn1Error] {
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let oid = match seq.read_oid_str() {
+    Ok(o) => o
+    Err(e) => return Err(e)
+  }
+  let mut params : Option[Bytes] = None
+  let mut curve_oid : Option[String] = None
+  if !seq.is_eof() {
+    let h = match seq.read_header() {
+      Ok(hdr) => hdr
+      Err(e) => return Err(e)
+    }
+    if h.tag.equals(tag_oid) {
+      let c_oid = match decode_oid_str_slice(seq.data, h.content_start, h.content_len) {
+        Ok(o) => o
+        Err(e) => return Err(e)
+      }
+      curve_oid = Some(c_oid)
+    }
+    params = Some(seq.data.slice(h.tlv_start, h.tlv_end))
+    if !seq.is_eof() {
+      return Err(Asn1Error::TrailingBytes(seq.pos, seq.remaining()))
+    }
+  }
+  Ok(AlgorithmIdentifier::{ oid: oid, params: params, curve_oid: curve_oid })
+}
+
+fn write_algorithm_identifier(w : DerWriter, alg : AlgorithmIdentifier) -> Result[Unit, Asn1Error] {
+  let inner = DerWriter::with_capacity(32)
+  match inner.write_oid_str(alg.oid) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match alg.params {
+    Some(p) => {
+      // params is already a full DER TLV (e.g. NULL `05 00` or curve OID TLV)
+      let mut i = 0
+      inner.ensure(p.length())
+      while i < p.length() {
+        inner.buf[inner.len + i] = p[i]
+        i = i + 1
+      }
+      inner.len = inner.len + p.length()
+    }
+    None =>
+    match alg.curve_oid {
+      Some(c) =>
+      match inner.write_oid_str(c) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      None => ()
+    }
+  }
+  w.write_sequence(inner.to_bytes())
+  Ok(())
+}
+
+fn hex_digit_byte(n : Int) -> Byte {
+  (if n < 10 { 48 + n } else { 87 + n }).to_byte()
+}
+
+fn format_dn_raw_tlv_hex(data : Bytes, start : Int, end : Int) -> String {
+  let n = end - start
+  let out = Bytes::new(1 + n * 2)
+  out[0] = (35).to_byte() // '#'
+  let mut i = 0
+  while i < n {
+    let v = data[start + i].to_int()
+    out[1 + i * 2] = hex_digit_byte(v >> 4)
+    out[2 + i * 2] = hex_digit_byte(v & 15)
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn read_dn_attribute_value(r : DerReader) -> Result[String, Asn1Error] {
+  let h = match r.read_header() {
+    Ok(hdr) => hdr
+    Err(e) => return Err(e)
+  }
+  let is_univ_prim = match h.tag.tag_class {
+    TagClass::Universal => !h.tag.constructed
+    _ => false
+  }
+  if is_univ_prim {
+    let tn = h.tag.number
+    if tn == tag_num_utf8_string {
+      if !is_valid_utf8_slice(r.data, h.content_start, h.tlv_end) {
+        return Err(Asn1Error::InvalidUtf8(h.content_start))
+      }
+      return Ok(r.data.slice(h.content_start, h.tlv_end).to_string())
+    }
+    if tn == tag_num_printable_string {
+      // Go crypto/x509 compatibility: allow '*' and '&' in DN PrintableString (wildcard CNs, AT&T).
+      let mut i = h.content_start
+      while i < h.tlv_end {
+        let b = r.data[i].to_int()
+        if !is_printable_byte(b) && b != 42 && b != 38 {
+          return Err(Asn1Error::InvalidString(i, "invalid PrintableString character in DN"))
+        }
+        i = i + 1
+      }
+      return Ok(r.data.slice(h.content_start, h.tlv_end).to_string())
+    }
+    if tn == tag_num_ia5_string {
+      let mut i = h.content_start
+      while i < h.tlv_end {
+        if r.data[i].to_int() >= 0x80 {
+          return Err(Asn1Error::InvalidString(i, "non-ASCII byte in IA5String"))
+        }
+        i = i + 1
+      }
+      return Ok(r.data.slice(h.content_start, h.tlv_end).to_string())
+    }
+    if tn == tag_num_numeric_string {
+      let mut i = h.content_start
+      while i < h.tlv_end {
+        if !is_numeric_byte(r.data[i].to_int()) {
+          return Err(Asn1Error::InvalidString(i, "invalid NumericString character"))
+        }
+        i = i + 1
+      }
+      return Ok(r.data.slice(h.content_start, h.tlv_end).to_string())
+    }
+    if tn == tag_num_visible_string {
+      let mut i = h.content_start
+      while i < h.tlv_end {
+        let b = r.data[i].to_int()
+        if b < 0x20 || b > 0x7E {
+          return Err(Asn1Error::InvalidString(i, "invalid VisibleString byte"))
+        }
+        i = i + 1
+      }
+      return Ok(r.data.slice(h.content_start, h.tlv_end).to_string())
+    }
+    if tn == tag_num_bmp_string {
+      return decode_bmp_string_slice(r.data, h.content_start, h.tlv_end)
+    }
+    if tn == tag_num_universal_string {
+      return decode_universal_string_slice(r.data, h.content_start, h.tlv_end)
+    }
+    if tn == tag_num_t61_string {
+      let out : Array[Byte] = []
+      let mut i = h.content_start
+      while i < h.tlv_end {
+        let b = r.data[i].to_int()
+        if b < 0x80 {
+          out.push(b.to_byte())
+        } else {
+          out.push((0xC0 | (b >> 6)).to_byte())
+          out.push((0x80 | (b & 0x3F)).to_byte())
+        }
+        i = i + 1
+      }
+      let res = Bytes::new(out.length())
+      let mut k = 0
+      while k < out.length() {
+        res[k] = out[k]
+        k = k + 1
+      }
+      return Ok(res.to_string())
+    }
+  }
+  // RFC 5280 AttributeValue is ANY: preserve non-string values as RFC 4514 `#<hex>` instead of rejecting the cert.
+  Ok(format_dn_raw_tlv_hex(r.data, h.tlv_start, h.tlv_end))
+}
+
+fn parse_distinguished_name(r : DerReader) -> Result[DistinguishedName, Asn1Error] {
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let mut cn : Option[String] = None
+  let mut org : Option[String] = None
+  let mut ou : Option[String] = None
+  let mut country : Option[String] = None
+  let mut st : Option[String] = None
+  let mut loc : Option[String] = None
+  let attrs : Array[AttributeTypeAndValue] = []
+  while !seq.is_eof() {
+    let rdn = match seq.read_set() {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+    // RFC 5280 §4.1.2.4: RelativeDistinguishedName ::= SET SIZE (1..MAX) OF AttributeTypeAndValue
+    if rdn.is_eof() {
+      return Err(Asn1Error::InvalidX509("empty RDN SET in DistinguishedName"))
+    }
+    while !rdn.is_eof() {
+      let atv = match rdn.read_sequence() {
+        Ok(s) => s
+        Err(e) => return Err(e)
+      }
+      let oid = match atv.read_oid_str() {
+        Ok(o) => o
+        Err(e) => return Err(e)
+      }
+      let val_str = match read_dn_attribute_value(atv) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if !atv.is_eof() {
+        return Err(Asn1Error::TrailingBytes(atv.pos, atv.remaining()))
+      }
+      if oid == oid_cn {
+        cn = Some(val_str)
+      } else if oid == oid_o {
+        org = Some(val_str)
+      } else if oid == oid_ou {
+        ou = Some(val_str)
+      } else if oid == oid_c {
+        country = Some(val_str)
+      } else if oid == oid_st {
+        st = Some(val_str)
+      } else if oid == oid_l {
+        loc = Some(val_str)
+      }
+      attrs.push(AttributeTypeAndValue::{ oid: oid, value: val_str })
+    }
+  }
+  Ok(DistinguishedName::{
+    common_name: cn,
+    organization: org,
+    organizational_unit: ou,
+    country: country,
+    state_or_province: st,
+    locality: loc,
+    attributes: attrs,
+  })
+}
+
+fn parse_spki_from_reader(r : DerReader) -> Result[SubjectPublicKeyInfo, Asn1Error] {
+  let raw_start = r.pos
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let raw_end = r.pos
+  let alg = match parse_algorithm_identifier(seq) {
+    Ok(a) => a
+    Err(e) => return Err(e)
+  }
+  let pk = match seq.read_bit_string() {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  if !seq.is_eof() {
+    return Err(Asn1Error::TrailingBytes(seq.pos, seq.remaining()))
+  }
+  Ok(SubjectPublicKeyInfo::{
+    algorithm: alg,
+    public_key: pk.bytes,
+    unused_bits: pk.unused_bits,
+    raw: r.data.slice(raw_start, raw_end),
+  })
+}
+
+///| Parse a DER-encoded SubjectPublicKeyInfo (SPKI).
+pub fn parse_spki_der(der : Bytes) -> Result[SubjectPublicKeyInfo, Asn1Error] {
+  let r = DerReader::new(der)
+  let spki = match parse_spki_from_reader(r) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  Ok(spki)
+}
+
+///| Encode a `SubjectPublicKeyInfo` to DER bytes.
+pub fn encode_spki_der(spki : SubjectPublicKeyInfo) -> Result[Bytes, Asn1Error] {
+  let inner = DerWriter::with_capacity(spki.public_key.length() + 48)
+  match write_algorithm_identifier(inner, spki.algorithm) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match inner.write_bit_string(spki.unused_bits, spki.public_key) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let out = DerWriter::with_capacity(inner.len + 8)
+  out.write_sequence(inner.to_bytes())
+  Ok(out.to_bytes())
+}
+
+fn validate_implicit_bit_string_slice(data : Bytes, start : Int, len : Int) -> Result[BitString, Asn1Error] {
+  if len < 1 {
+    return Err(Asn1Error::NonCanonical(start, "BIT STRING must have at least 1 byte"))
+  }
+  let unused = data[start].to_int()
+  if unused > 7 {
+    return Err(Asn1Error::NonCanonical(start, "BIT STRING unused_bits > 7"))
+  }
+  if len == 1 {
+    if unused != 0 {
+      return Err(Asn1Error::NonCanonical(start, "empty BIT STRING must have unused_bits == 0"))
+    }
+    return Ok(BitString::{ unused_bits: 0, bytes: Bytes::new(0) })
+  }
+  if unused > 0 {
+    let last = data[start + len - 1].to_int()
+    let mask = (1 << unused) - 1
+    if (last & mask) != 0 {
+      return Err(Asn1Error::NonCanonical(start + len - 1, "BIT STRING has non-zero unused trailing bits"))
+    }
+  }
+  Ok(BitString::{ unused_bits: unused, bytes: data.slice(start + 1, start + len) })
+}
+
+///| Parse a DER-encoded PKCS#8 PrivateKeyInfo / OneAsymmetricKey (RFC 5958).
+pub fn parse_pkcs8_der(der : Bytes) -> Result[Pkcs8PrivateKeyInfo, Asn1Error] {
+  let r = DerReader::new(der)
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  let ver64 = match seq.read_int64() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if ver64 != 0L && ver64 != 1L {
+    return Err(Asn1Error::InvalidKey("unsupported PKCS#8 version"))
+  }
+  let version = ver64.to_int()
+  let alg = match parse_algorithm_identifier(seq) {
+    Ok(a) => a
+    Err(e) => return Err(e)
+  }
+  let priv_key = match seq.read_octet_string() {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  // Optional [0] IMPLICIT Attributes
+  let mut attributes : Option[Bytes] = None
+  if !seq.is_eof() {
+    let t = match seq.peek_tag() {
+      Ok(tag) => tag
+      Err(e) => return Err(e)
+    }
+    if t.equals(Tag::context(0, true)) {
+      let h = match seq.read_header() {
+        Ok(hdr) => hdr
+        Err(e) => return Err(e)
+      }
+      attributes = Some(seq.data.slice(h.content_start, h.tlv_end))
+    }
+  }
+  // Optional [1] IMPLICIT PublicKey (BIT STRING) — ONLY legal in RFC 5958 v2 (version == 1)
+  let mut public_key : Option[BitString] = None
+  if !seq.is_eof() {
+    let t = match seq.peek_tag() {
+      Ok(tag) => tag
+      Err(e) => return Err(e)
+    }
+    if t.equals(Tag::context(1, false)) {
+      if version < 1 {
+        return Err(Asn1Error::InvalidKey("PKCS#8 v1 must not contain [1] publicKey"))
+      }
+      let h = match seq.read_header() {
+        Ok(hdr) => hdr
+        Err(e) => return Err(e)
+      }
+      let pk_bs = match validate_implicit_bit_string_slice(seq.data, h.content_start, h.content_len) {
+        Ok(bs) => bs
+        Err(e) => return Err(e)
+      }
+      public_key = Some(pk_bs)
+    }
+  }
+  if !seq.is_eof() {
+    return Err(Asn1Error::TrailingBytes(seq.pos, seq.remaining()))
+  }
+  Ok(Pkcs8PrivateKeyInfo::{
+    version: version,
+    algorithm: alg,
+    private_key: priv_key,
+    attributes: attributes,
+    public_key: public_key,
+  })
+}
+
+///| Encode a `Pkcs8PrivateKeyInfo` to DER bytes (including RFC 5958 v2 `[0] attributes` and `[1] publicKey`).
+pub fn encode_pkcs8_der(info : Pkcs8PrivateKeyInfo) -> Result[Bytes, Asn1Error] {
+  if info.version != 0 && info.version != 1 {
+    return Err(Asn1Error::InvalidKey("unsupported PKCS#8 version"))
+  }
+  let inner = DerWriter::with_capacity(info.private_key.length() + 96)
+  inner.write_int64(info.version.to_int64())
+  match write_algorithm_identifier(inner, info.algorithm) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  inner.write_octet_string(info.private_key)
+  match info.attributes {
+    Some(attrs) => inner.write_tlv(Tag::context(0, true), attrs)
+    None => ()
+  }
+  match info.public_key {
+    Some(pk) => {
+      if info.version < 1 {
+        return Err(Asn1Error::InvalidKey("PKCS#8 v1 cannot encode [1] publicKey"))
+      }
+      if pk.unused_bits < 0 || pk.unused_bits > 7 {
+        return Err(Asn1Error::NonCanonical(0, "BIT STRING unused_bits must be 0..=7"))
+      }
+      let n = pk.bytes.length()
+      if n == 0 && pk.unused_bits != 0 {
+        return Err(Asn1Error::NonCanonical(0, "empty BIT STRING must have unused_bits == 0"))
+      }
+      if n > 0 && pk.unused_bits > 0 {
+        let mask = (1 << pk.unused_bits) - 1
+        if (pk.bytes[n - 1].to_int() & mask) != 0 {
+          return Err(Asn1Error::NonCanonical(n - 1, "BIT STRING unused trailing bits must be 0"))
+        }
+      }
+      inner.write_tag(Tag::context(1, false))
+      inner.write_length(n + 1)
+      inner.push_byte(pk.unused_bits.to_byte())
+      inner.push_bytes(pk.bytes)
+    }
+    None => ()
+  }
+  let out = DerWriter::with_capacity(inner.len + 8)
+  out.write_sequence(inner.to_bytes())
+  Ok(out.to_bytes())
+}
+
+fn is_valid_san_ia5(data : Bytes, start : Int, end : Int) -> Bool {
+  let mut i = start
+  while i < end {
+    let b = data[i].to_int()
+    if b < 0x20 || b >= 0x7F {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn parse_san_extension(ext_bytes : Bytes) -> Result[Array[GeneralName], Asn1Error] {
+  let r = DerReader::new(ext_bytes)
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  // RFC 5280 §4.2.1.6: GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
+  if seq.is_eof() {
+    return Err(Asn1Error::InvalidX509("empty SubjectAltName SEQUENCE"))
+  }
+  let out : Array[GeneralName] = []
+  let sdata = seq.data
+  let send = seq.end
+  while seq.pos < send {
+    // Fast path for primitive dNSName [2] (0x82) with short length (< 128)
+    let p = seq.pos
+    if sdata[p].to_int() == 0x82 && p + 1 < send {
+      let l0 = sdata[p + 1].to_int()
+      if l0 < 0x80 && p + 2 + l0 <= send {
+        let cs = p + 2
+        let ce = cs + l0
+        if !is_valid_san_ia5(sdata, cs, ce) {
+          return Err(Asn1Error::InvalidString(cs, "invalid IA5String byte in SAN dNSName"))
+        }
+        seq.pos = ce
+        out.push(GeneralName::DnsName(sdata.slice(cs, ce).to_string()))
+        continue
+      }
+    }
+    let h = match seq.read_header() {
+      Ok(hdr) => hdr
+      Err(e) => return Err(e)
+    }
+    let is_ctx = match h.tag.tag_class {
+      TagClass::ContextSpecific => true
+      _ => false
+    }
+    if !is_ctx {
+      return Err(Asn1Error::UnexpectedTag(h.tlv_start, "expected GeneralName context tag"))
+    }
+    let tn = h.tag.number
+    if tn == 1 {
+      // rfc822Name [1] IMPLICIT IA5String (must be primitive)
+      if h.tag.constructed {
+        return Err(Asn1Error::UnexpectedTag(h.tlv_start, "SAN rfc822Name must be primitive"))
+      }
+      if !is_valid_san_ia5(seq.data, h.content_start, h.tlv_end) {
+        return Err(Asn1Error::InvalidString(h.content_start, "invalid IA5String byte in SAN rfc822Name"))
+      }
+      out.push(GeneralName::Email(seq.data.slice(h.content_start, h.tlv_end).to_string()))
+    } else if tn == 2 {
+      // dNSName [2] IMPLICIT IA5String (must be primitive)
+      if h.tag.constructed {
+        return Err(Asn1Error::UnexpectedTag(h.tlv_start, "SAN dNSName must be primitive"))
+      }
+      if !is_valid_san_ia5(seq.data, h.content_start, h.tlv_end) {
+        return Err(Asn1Error::InvalidString(h.content_start, "invalid IA5String byte in SAN dNSName"))
+      }
+      out.push(GeneralName::DnsName(seq.data.slice(h.content_start, h.tlv_end).to_string()))
+    } else if tn == 6 {
+      // uniformResourceIdentifier [6] IMPLICIT IA5String (must be primitive)
+      if h.tag.constructed {
+        return Err(Asn1Error::UnexpectedTag(h.tlv_start, "SAN URI must be primitive"))
+      }
+      if !is_valid_san_ia5(seq.data, h.content_start, h.tlv_end) {
+        return Err(Asn1Error::InvalidString(h.content_start, "invalid IA5String byte in SAN URI"))
+      }
+      out.push(GeneralName::Uri(seq.data.slice(h.content_start, h.tlv_end).to_string()))
+    } else if tn == 7 {
+      // iPAddress [7] IMPLICIT OCTET STRING (must be primitive, 4 or 16 bytes)
+      if h.tag.constructed {
+        return Err(Asn1Error::UnexpectedTag(h.tlv_start, "SAN iPAddress must be primitive"))
+      }
+      if h.content_len != 4 && h.content_len != 16 {
+        return Err(Asn1Error::InvalidX509("SAN IPAddress must be 4 or 16 bytes"))
+      }
+      out.push(GeneralName::IpAddress(seq.data.slice(h.content_start, h.tlv_end)))
+    } else {
+      out.push(GeneralName::Other(tn, seq.data.slice(h.content_start, h.tlv_end)))
+    }
+  }
+  Ok(out)
+}
+
+fn parse_basic_constraints(ext_bytes : Bytes) -> Result[BasicConstraints, Asn1Error] {
+  let r = DerReader::new(ext_bytes)
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  let mut is_ca = false
+  let mut path_len : Option[Int] = None
+  if !seq.is_eof() {
+    let t = match seq.peek_tag() {
+      Ok(tag) => tag
+      Err(e) => return Err(e)
+    }
+    if t.equals(tag_boolean) {
+      let ca_off = seq.pos
+      is_ca = match seq.read_bool() {
+        Ok(b) => b
+        Err(e) => return Err(e)
+      }
+      // X.690 §11.5: cA BOOLEAN DEFAULT FALSE must not be encoded when FALSE in DER
+      if !is_ca {
+        return Err(Asn1Error::NonCanonical(ca_off, "explicit default BasicConstraints.cA=FALSE is forbidden in DER"))
+      }
+    }
+  }
+  if !seq.is_eof() {
+    let pl = match seq.read_int64() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if pl < 0L || pl > 2147483647L {
+      return Err(Asn1Error::InvalidX509("invalid pathLenConstraint"))
+    }
+    path_len = Some(pl.to_int())
+  }
+  if !seq.is_eof() {
+    return Err(Asn1Error::TrailingBytes(seq.pos, seq.remaining()))
+  }
+  Ok(BasicConstraints::{ is_ca: is_ca, path_len_constraint: path_len })
+}
+
+fn parse_key_usage(ext_bytes : Bytes) -> Result[KeyUsage, Asn1Error] {
+  let r = DerReader::new(ext_bytes)
+  let bs = match r.read_bit_string() {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  // X.690 §11.2.2: named bit list must be non-empty and drop all trailing zero bits.
+  let n = bs.bytes.length()
+  if n == 0 {
+    return Err(Asn1Error::NonCanonical(0, "empty KeyUsage BIT STRING"))
+  }
+  if (bs.bytes[n - 1].to_int() & (1 << bs.unused_bits)) == 0 {
+    return Err(Asn1Error::NonCanonical(n - 1, "KeyUsage BIT STRING has trailing zero bits"))
+  }
+  // X.509 KeyUsage bits are numbered MSB-first: bit 0 is 0x80 of byte 0, bit 8 is 0x80 of byte 1.
+  let mut mask = 0
+  let b0 = bs.bytes[0].to_int()
+  let mut bit = 0
+  while bit < 8 {
+    if (b0 & (1 << (7 - bit))) != 0 {
+      mask = mask | (1 << bit)
+    }
+    bit = bit + 1
+  }
+  if n >= 2 {
+    let b1 = bs.bytes[1].to_int()
+    if (b1 & 0x80) != 0 {
+      mask = mask | (1 << 8)
+    }
+  }
+  Ok(KeyUsage::{ bits: mask })
+}
+
+fn parse_ext_key_usage(ext_bytes : Bytes) -> Result[Array[String], Asn1Error] {
+  let r = DerReader::new(ext_bytes)
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  // RFC 5280 §4.2.1.12: ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId
+  if seq.is_eof() {
+    return Err(Asn1Error::InvalidX509("empty ExtKeyUsage SEQUENCE"))
+  }
+  let oids : Array[String] = []
+  while !seq.is_eof() {
+    let oid = match seq.read_oid_str() {
+      Ok(o) => o
+      Err(e) => return Err(e)
+    }
+    oids.push(oid)
+  }
+  Ok(oids)
+}
+
+fn parse_ski(ext_bytes : Bytes) -> Result[Bytes, Asn1Error] {
+  let r = DerReader::new(ext_bytes)
+  let b = match r.read_octet_string() {
+    Ok(os) => os
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  Ok(b)
+}
+
+fn parse_aki(ext_bytes : Bytes) -> Result[AuthorityKeyIdentifier, Asn1Error] {
+  let r = DerReader::new(ext_bytes)
+  let seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+  let mut key_id : Option[Bytes] = None
+  let mut serial : Option[Bytes] = None
+  while !seq.is_eof() {
+    let h = match seq.read_header() {
+      Ok(hdr) => hdr
+      Err(e) => return Err(e)
+    }
+    if tag_class_equals(h.tag.tag_class, TagClass::ContextSpecific) {
+      if h.tag.number == 0 && !h.tag.constructed {
+        key_id = Some(seq.data.slice(h.content_start, h.tlv_end))
+      } else if h.tag.number == 2 && !h.tag.constructed {
+        serial = Some(seq.data.slice(h.content_start, h.tlv_end))
+      }
+    }
+  }
+  Ok(AuthorityKeyIdentifier::{ key_id: key_id, serial_number: serial })
+}
+
+///| Parse a DER-encoded X.509 certificate with default `DecodeLimits`.
+pub fn parse_x509_der(der : Bytes) -> Result[X509Certificate, Asn1Error] {
+  parse_x509_der_with_limits(der, DecodeLimits::default())
+}
+
+///| Parse a DER-encoded X.509 certificate with explicit `DecodeLimits`.
+pub fn parse_x509_der_with_limits(der : Bytes, limits : DecodeLimits) -> Result[X509Certificate, Asn1Error] {
+  if der.length() > limits.max_bytes {
+    return Err(Asn1Error::SizeLimitExceeded(der.length()))
+  }
+  let r = DerReader::new(der)
+  let cert_seq = match r.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.is_eof() {
+    return Err(Asn1Error::TrailingBytes(r.pos, r.remaining()))
+  }
+
+  // 1. TBSCertificate
+  let tbs_start = cert_seq.pos
+  let tbs = match cert_seq.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let tbs_end = cert_seq.pos
+  let tbs_bytes = cert_seq.data.slice(tbs_start, tbs_end)
+
+  // version [0] EXPLICIT Version DEFAULT v1(0)
+  let mut version = 1
+  if !tbs.is_eof() {
+    let t = match tbs.peek_tag() {
+      Ok(tag) => tag
+      Err(e) => return Err(e)
+    }
+    if t.equals(Tag::context(0, true)) {
+      let ver_off = tbs.pos
+      let ver_ctx = match tbs.read_explicit_context(0) {
+        Ok(s) => s
+        Err(e) => return Err(e)
+      }
+      let v64 = match ver_ctx.read_int64() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if !ver_ctx.is_eof() {
+        return Err(Asn1Error::TrailingBytes(ver_ctx.pos, ver_ctx.remaining()))
+      }
+      // X.690 §11.5: version DEFAULT v1(0) must not be explicitly encoded in DER
+      if v64 == 0L {
+        return Err(Asn1Error::NonCanonical(ver_off, "explicit default X.509 version v1 is forbidden in DER"))
+      }
+      if v64 < 1L || v64 > 2L {
+        return Err(Asn1Error::InvalidX509("unsupported X.509 version"))
+      }
+      version = v64.to_int() + 1
+    }
+  }
+
+  let serial_number = match tbs.read_integer_bytes() {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  // RFC 5280 §4.1.2.2: serialNumber MUST be a positive integer (reject negative)
+  if serial_number.length() == 0 || (serial_number[0].to_int() & 0x80) != 0 {
+    return Err(Asn1Error::InvalidX509("certificate serialNumber must not be negative"))
+  }
+
+  let inner_sig_start = tbs.pos
+  let sig_alg = match parse_algorithm_identifier(tbs) {
+    Ok(a) => a
+    Err(e) => return Err(e)
+  }
+  let inner_sig_end = tbs.pos
+
+  let issuer = match parse_distinguished_name(tbs) {
+    Ok(dn) => dn
+    Err(e) => return Err(e)
+  }
+  let val_seq = match tbs.read_sequence() {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let not_before = match val_seq.read_time() {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let not_after = match val_seq.read_time() {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  if !val_seq.is_eof() {
+    return Err(Asn1Error::TrailingBytes(val_seq.pos, val_seq.remaining()))
+  }
+  let subject = match parse_distinguished_name(tbs) {
+    Ok(dn) => dn
+    Err(e) => return Err(e)
+  }
+  let spki = match parse_spki_from_reader(tbs) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+
+  // Optional fields in strict ASN.1 order: issuerUniqueID [1]?, subjectUniqueID [2]?, extensions [3]?
+  let extensions : Array[X509Extension] = []
+  let mut san : Array[GeneralName] = []
+  let mut basic_constraints : Option[BasicConstraints] = None
+  let mut key_usage : Option[KeyUsage] = None
+  let mut ext_key_usage : Array[String] = []
+  let mut ski : Option[Bytes] = None
+  let mut aki : Option[AuthorityKeyIdentifier] = None
+
+  // Optional issuerUniqueID [1] IMPLICIT BIT STRING (v2 or v3 only, primitive, at most once)
+  if !tbs.is_eof() {
+    let t = match tbs.peek_tag() {
+      Ok(tag) => tag
+      Err(e) => return Err(e)
+    }
+    let is_uid1 = match t.tag_class {
+      TagClass::ContextSpecific => t.number == 1
+      _ => false
+    }
+    if is_uid1 {
+      if t.constructed {
+        return Err(Asn1Error::UnexpectedTag(tbs.pos, "issuerUniqueID must be primitive IMPLICIT BIT STRING"))
+      }
+      if version < 2 {
+        return Err(Asn1Error::InvalidX509("uniqueIDs require X.509 v2 or v3"))
+      }
+      let h = match tbs.read_header() {
+        Ok(hdr) => hdr
+        Err(e) => return Err(e)
+      }
+      match validate_implicit_bit_string_slice(tbs.data, h.content_start, h.content_len) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+
+  // Optional subjectUniqueID [2] IMPLICIT BIT STRING (v2 or v3 only, primitive, at most once)
+  if !tbs.is_eof() {
+    let t = match tbs.peek_tag() {
+      Ok(tag) => tag
+      Err(e) => return Err(e)
+    }
+    let is_uid2 = match t.tag_class {
+      TagClass::ContextSpecific => t.number == 2
+      _ => false
+    }
+    if is_uid2 {
+      if t.constructed {
+        return Err(Asn1Error::UnexpectedTag(tbs.pos, "subjectUniqueID must be primitive IMPLICIT BIT STRING"))
+      }
+      if version < 2 {
+        return Err(Asn1Error::InvalidX509("uniqueIDs require X.509 v2 or v3"))
+      }
+      let h = match tbs.read_header() {
+        Ok(hdr) => hdr
+        Err(e) => return Err(e)
+      }
+      match validate_implicit_bit_string_slice(tbs.data, h.content_start, h.content_len) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+
+  // Optional extensions [3] EXPLICIT SEQUENCE SIZE (1..MAX) OF Extension (v3 only, at most once)
+  if !tbs.is_eof() {
+    let t = match tbs.peek_tag() {
+      Ok(tag) => tag
+      Err(e) => return Err(e)
+    }
+    if t.equals(Tag::context(3, true)) {
+      if version < 3 {
+        return Err(Asn1Error::InvalidX509("extensions require X.509 v3"))
+      }
+      let ext_ctx = match tbs.read_explicit_context(3) {
+        Ok(s) => s
+        Err(e) => return Err(e)
+      }
+      let ext_seq = match ext_ctx.read_sequence() {
+        Ok(s) => s
+        Err(e) => return Err(e)
+      }
+      if !ext_ctx.is_eof() {
+        return Err(Asn1Error::TrailingBytes(ext_ctx.pos, ext_ctx.remaining()))
+      }
+      // RFC 5280 §4.1: Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension
+      if ext_seq.is_eof() {
+        return Err(Asn1Error::InvalidX509("empty extensions SEQUENCE"))
+      }
+      // Hybrid O(1) duplicate-OID tracker over canonical DER OID content slices in `der`:
+      // linear scan for <= 16 extensions (zero extra allocation), open-addressing hash table beyond 16.
+      let oid_starts : Array[Int] = []
+      let oid_ends : Array[Int] = []
+      let mut oid_table : Array[Int] = []
+      let mut oid_table_mask = 0
+      while !ext_seq.is_eof() {
+        let one = match ext_seq.read_sequence() {
+          Ok(s) => s
+          Err(e) => return Err(e)
+        }
+        let oid_hdr = match one.read_header() {
+          Ok(hdr) => hdr
+          Err(e) => return Err(e)
+        }
+        if !oid_hdr.tag.equals(tag_oid) {
+          return Err(Asn1Error::UnexpectedTag(oid_hdr.tlv_start, "expected OBJECT IDENTIFIER"))
+        }
+        let os = oid_hdr.content_start
+        let oe = oid_hdr.tlv_end
+        let olen = oid_hdr.content_len
+        let oid = match decode_oid_str_slice(one.data, os, olen) {
+          Ok(o) => o
+          Err(e) => return Err(e)
+        }
+        // RFC 5280 §4.2: reject duplicate extension OIDs in O(1) amortized time
+        let idx = oid_starts.length()
+        if idx < 16 {
+          let mut ei = 0
+          while ei < idx {
+            if bytes_slice_eq(der, oid_starts[ei], oid_ends[ei], os, oe) {
+              return Err(Asn1Error::DuplicateExtension(oid))
+            }
+            ei = ei + 1
+          }
+          oid_starts.push(os)
+          oid_ends.push(oe)
+        } else {
+          if oid_table.length() == 0 {
+            let cap = 64
+            oid_table_mask = cap - 1
+            let mut k = 0
+            while k < cap {
+              oid_table.push(-1)
+              k = k + 1
+            }
+            let mut ei = 0
+            while ei < idx {
+              let mut slot = fnv1a_slice(der, oid_starts[ei], oid_ends[ei] - oid_starts[ei]) & oid_table_mask
+              while oid_table[slot] >= 0 {
+                slot = (slot + 1) & oid_table_mask
+              }
+              oid_table[slot] = ei
+              ei = ei + 1
+            }
+          } else if (idx + 1) * 2 >= oid_table.length() {
+            let new_cap = oid_table.length() * 2
+            let new_mask = new_cap - 1
+            let new_table : Array[Int] = []
+            let mut k = 0
+            while k < new_cap {
+              new_table.push(-1)
+              k = k + 1
+            }
+            let mut ei = 0
+            while ei < idx {
+              let mut slot = fnv1a_slice(der, oid_starts[ei], oid_ends[ei] - oid_starts[ei]) & new_mask
+              while new_table[slot] >= 0 {
+                slot = (slot + 1) & new_mask
+              }
+              new_table[slot] = ei
+              ei = ei + 1
+            }
+            oid_table = new_table
+            oid_table_mask = new_mask
+          }
+          let mut slot = fnv1a_slice(der, os, olen) & oid_table_mask
+          while oid_table[slot] >= 0 {
+            let existing = oid_table[slot]
+            if bytes_slice_eq(der, oid_starts[existing], oid_ends[existing], os, oe) {
+              return Err(Asn1Error::DuplicateExtension(oid))
+            }
+            slot = (slot + 1) & oid_table_mask
+          }
+          oid_starts.push(os)
+          oid_ends.push(oe)
+          oid_table[slot] = idx
+        }
+        let mut critical = false
+        if !one.is_eof() && one.data[one.pos].to_int() == 0x01 {
+          let crit_off = one.pos
+          critical = match one.read_bool() {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          // X.690 §11.5: critical BOOLEAN DEFAULT FALSE must not be encoded when FALSE in DER
+          if !critical {
+            return Err(Asn1Error::NonCanonical(crit_off, "explicit default Extension.critical=FALSE is forbidden in DER"))
+          }
+        }
+        let ext_val = match one.read_octet_string() {
+          Ok(b) => b
+          Err(e) => return Err(e)
+        }
+        if !one.is_eof() {
+          return Err(Asn1Error::TrailingBytes(one.pos, one.remaining()))
+        }
+        extensions.push(X509Extension::{ oid: oid, critical: critical, value: ext_val })
+        if oid == oid_ext_san {
+          san = match parse_san_extension(ext_val) {
+            Ok(s) => s
+            Err(e) => return Err(e)
+          }
+        } else if oid == oid_ext_basic_constraints {
+          let bc = match parse_basic_constraints(ext_val) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          basic_constraints = Some(bc)
+        } else if oid == oid_ext_key_usage {
+          let ku = match parse_key_usage(ext_val) {
+            Ok(k) => k
+            Err(e) => return Err(e)
+          }
+          key_usage = Some(ku)
+        } else if oid == oid_ext_ext_key_usage {
+          ext_key_usage = match parse_ext_key_usage(ext_val) {
+            Ok(e) => e
+            Err(e) => return Err(e)
+          }
+        } else if oid == oid_ext_ski {
+          let s = match parse_ski(ext_val) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          ski = Some(s)
+        } else if oid == oid_ext_aki {
+          let a = match parse_aki(ext_val) {
+            Ok(ak) => ak
+            Err(e) => return Err(e)
+          }
+          aki = Some(a)
+        }
+      }
+    }
+  }
+
+  if !tbs.is_eof() {
+    return Err(Asn1Error::UnexpectedTag(tbs.pos, "unexpected trailing element in TBSCertificate"))
+  }
+
+  // 2. signatureAlgorithm (RFC 5280 §4.1.1.2: MUST match TBSCertificate.signature byte-for-byte)
+  let outer_sig_start = cert_seq.pos
+  let outer_sig_alg = match parse_algorithm_identifier(cert_seq) {
+    Ok(a) => a
+    Err(e) => return Err(e)
+  }
+  let outer_sig_end = cert_seq.pos
+  if !bytes_slice_eq(der, inner_sig_start, inner_sig_end, outer_sig_start, outer_sig_end) {
+    return Err(Asn1Error::InvalidX509("inner and outer signature algorithm identifiers do not match"))
+  }
+
+  // 3. signatureValue (BIT STRING)
+  let sig_bs = match cert_seq.read_bit_string() {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  if sig_bs.unused_bits != 0 {
+    return Err(Asn1Error::InvalidX509("signatureValue BIT STRING must have unused_bits == 0"))
+  }
+  if !cert_seq.is_eof() {
+    return Err(Asn1Error::TrailingBytes(cert_seq.pos, cert_seq.remaining()))
+  }
+
+  Ok(X509Certificate::{
+    version: version,
+    serial_number: serial_number,
+    signature_algorithm: sig_alg,
+    issuer: issuer,
+    not_before: not_before,
+    not_after: not_after,
+    subject: subject,
+    subject_public_key_info: spki,
+    tbs_bytes: tbs_bytes,
+    outer_signature_algorithm: outer_sig_alg,
+    signature_bytes: sig_bs.bytes,
+    extensions: extensions,
+    san: san,
+    basic_constraints: basic_constraints,
+    key_usage: key_usage,
+    ext_key_usage: ext_key_usage,
+    subject_key_identifier: ski,
+    authority_key_identifier: aki,
+  })
+}
+
+///| Parse a PEM-encoded X.509 certificate (`CERTIFICATE` label).
+pub fn parse_x509_pem(pem : String) -> Result[X509Certificate, Asn1Error] {
+  let block = match parse_pem(pem) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  if block.label != "CERTIFICATE" {
+    return Err(Asn1Error::InvalidPem("expected CERTIFICATE label, got " + block.label))
+  }
+  parse_x509_der(block.data)
+}
+
+///| Parse a PEM certificate chain bundle (`CERTIFICATE` blocks).
+pub fn parse_x509_pem_chain(pem : String) -> Result[Array[X509Certificate], Asn1Error] {
+  let blocks = match parse_pem_all(pem) {
+    Ok(bs) => bs
+    Err(e) => return Err(e)
+  }
+  let certs : Array[X509Certificate] = []
+  let mut i = 0
+  while i < blocks.length() {
+    if blocks[i].label == "CERTIFICATE" {
+      let c = match parse_x509_der(blocks[i].data) {
+        Ok(cert) => cert
+        Err(e) => return Err(e)
+      }
+      certs.push(c)
+    }
+    i = i + 1
+  }
+  if certs.length() == 0 {
+    return Err(Asn1Error::InvalidPem("no CERTIFICATE blocks found"))
+  }
+  Ok(certs)
+}
+
+// ---------------------------------------------------------------------------
+// Hostname & IP verification (RFC 6125 / RFC 9525)
+// ---------------------------------------------------------------------------
+
+fn ascii_lower(c : Int) -> Int {
+  if c >= 65 && c <= 90 { c + 32 } else { c }
+}
+
+fn parse_ipv4_slice(s : String, start : Int, end : Int) -> Option[Bytes] {
+  let n = end - start
+  if n < 7 || n > 15 {
+    return None
+  }
+  let out = Bytes::new(4)
+  let mut part = 0
+  let mut i = start
+  while part < 4 {
+    if i >= end {
+      return None
+    }
+    let mut acc = 0
+    let mut digits = 0
+    while i < end && s.code_unit_at(i) != 46 {
+      let c = s.code_unit_at(i)
+      if c < 48 || c > 57 {
+        return None
+      }
+      if digits == 1 && acc == 0 {
+        return None
+      }
+      acc = acc * 10 + (c - 48)
+      if acc > 255 {
+        return None
+      }
+      digits = digits + 1
+      i = i + 1
+    }
+    if digits == 0 {
+      return None
+    }
+    out[part] = acc.to_byte()
+    part = part + 1
+    if part < 4 {
+      if i >= end || s.code_unit_at(i) != 46 {
+        return None
+      }
+      i = i + 1
+    }
+  }
+  if i != end {
+    return None
+  }
+  Some(out)
+}
+
+fn parse_ipv4(s : String) -> Option[Bytes] {
+  parse_ipv4_slice(s, 0, s.length())
+}
+
+fn hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 97 + 10
+  } else if c >= 65 && c <= 70 {
+    c - 65 + 10
+  } else {
+    -1
+  }
+}
+
+fn parse_ipv6(s : String) -> Option[Bytes] {
+  // Strip optional surrounding '[' ']'
+  let mut start = 0
+  let mut end = s.length()
+  if end >= 2 && s.code_unit_at(0) == 91 && s.code_unit_at(end - 1) == 93 {
+    start = 1
+    end = end - 1
+  }
+  if end - start < 2 {
+    return None
+  }
+  let left : Array[Int] = []
+  let right : Array[Int] = []
+  let mut saw_double = false
+  let mut i = start
+  if s.code_unit_at(i) == 58 {
+    if i + 1 >= end || s.code_unit_at(i + 1) != 58 {
+      return None
+    }
+    saw_double = true
+    i = i + 2
+  }
+  while i < end {
+    let grp_start = i
+    let mut acc = 0
+    let mut digits = 0
+    let mut saw_dot = false
+    while i < end && s.code_unit_at(i) != 58 {
+      let c = s.code_unit_at(i)
+      if c == 46 {
+        saw_dot = true
+        break
+      }
+      let hv = hex_val(c)
+      if hv < 0 {
+        return None
+      }
+      acc = (acc << 4) | hv
+      digits = digits + 1
+      if digits > 4 {
+        return None
+      }
+      i = i + 1
+    }
+    if saw_dot {
+      // RFC 4291 §2.2(3): embedded IPv4 suffix x:...:d.d.d.d occupies the final 2 groups.
+      let ip4 = match parse_ipv4_slice(s, grp_start, end) {
+        Some(b) => b
+        None => return None
+      }
+      let g0 = (ip4[0].to_int() << 8) | ip4[1].to_int()
+      let g1 = (ip4[2].to_int() << 8) | ip4[3].to_int()
+      if saw_double {
+        right.push(g0)
+        right.push(g1)
+      } else {
+        left.push(g0)
+        left.push(g1)
+      }
+      i = end
+      break
+    }
+    if digits == 0 {
+      return None
+    }
+    if saw_double {
+      right.push(acc)
+    } else {
+      left.push(acc)
+    }
+    if i < end {
+      // ':'
+      i = i + 1
+      if i >= end {
+        return None
+      }
+      if s.code_unit_at(i) == 58 {
+        if saw_double {
+          return None
+        }
+        saw_double = true
+        i = i + 1
+      }
+    }
+  }
+  let total_groups = left.length() + right.length()
+  if saw_double {
+    if total_groups > 7 {
+      return None
+    }
+  } else {
+    if total_groups != 8 {
+      return None
+    }
+  }
+  let out = Bytes::new(16)
+  let mut g = 0
+  let mut k = 0
+  while k < left.length() {
+    out[g * 2] = (left[k] >> 8).to_byte()
+    out[g * 2 + 1] = (left[k] & 0xFF).to_byte()
+    g = g + 1
+    k = k + 1
+  }
+  let zeros = 8 - total_groups
+  g = g + zeros
+  k = 0
+  while k < right.length() {
+    out[g * 2] = (right[k] >> 8).to_byte()
+    out[g * 2 + 1] = (right[k] & 0xFF).to_byte()
+    g = g + 1
+    k = k + 1
+  }
+  Some(out)
+}
+
+fn ip_bytes_eq(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn ascii_eq_ignore_case(a : String, a_start : Int, a_end : Int, b : String, b_start : Int, b_end : Int) -> Bool {
+  let len = a_end - a_start
+  if len != b_end - b_start {
+    return false
+  }
+  let mut i = 0
+  while i < len {
+    if ascii_lower(a.code_unit_at(a_start + i)) != ascii_lower(b.code_unit_at(b_start + i)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn is_dns_label_char(c : Int) -> Bool {
+  (c >= 97 && c <= 122) ||
+  (c >= 65 && c <= 90) ||
+  (c >= 48 && c <= 57) ||
+  c == 45 ||
+  c == 95
+}
+
+///| Validate a DNS hostname (without trailing dot) over `s[start..end)`:
+///| non-empty, <= 253 bytes, every label 1..=63 chars from `[a-zA-Z0-9_-]`.
+fn is_valid_dns_labels(s : String, start : Int, end : Int) -> Bool {
+  let len = end - start
+  if len <= 0 || len > 253 {
+    return false
+  }
+  let mut label_len = 0
+  let mut i = start
+  while i < end {
+    let c = s.code_unit_at(i)
+    if c == 46 {
+      if label_len == 0 || label_len > 63 {
+        return false
+      }
+      label_len = 0
+    } else if is_dns_label_char(c) {
+      label_len = label_len + 1
+      if label_len > 63 {
+        return false
+      }
+    } else {
+      return false
+    }
+    i = i + 1
+  }
+  label_len > 0 && label_len <= 63
+}
+
+fn match_dns_pattern(pattern : String, host : String, hend : Int) -> Bool {
+  let pend = pattern.length()
+  if pend == 0 || hend == 0 {
+    return false
+  }
+  // Wildcard check: RFC 6125 §6.4.3 / RFC 9525:
+  // Only `*.suffix` where `suffix` is a valid multi-label DNS name (>= 2 labels, no empty labels, no trailing dot).
+  if pattern.code_unit_at(0) == 42 {
+    if pend < 4 || pattern.code_unit_at(1) != 46 {
+      return false
+    }
+    if !is_valid_dns_labels(pattern, 2, pend) {
+      return false
+    }
+    let mut suffix_dots = 0
+    let mut i = 2
+    while i < pend {
+      if pattern.code_unit_at(i) == 46 {
+        suffix_dots = suffix_dots + 1
+      }
+      i = i + 1
+    }
+    if suffix_dots < 1 {
+      return false
+    }
+    // Host is already validated by `is_valid_dns_labels(host, 0, hend)`.
+    let mut first_dot = -1
+    i = 0
+    while i < hend {
+      if host.code_unit_at(i) == 46 {
+        first_dot = i
+        break
+      }
+      i = i + 1
+    }
+    if first_dot <= 0 {
+      return false
+    }
+    return ascii_eq_ignore_case(pattern, 2, pend, host, first_dot + 1, hend)
+  }
+  // Exact DNS pattern: must be a valid DNS name (no trailing dot, no empty labels, no '*').
+  if !is_valid_dns_labels(pattern, 0, pend) {
+    return false
+  }
+  ascii_eq_ignore_case(pattern, 0, pend, host, 0, hend)
+}
+
+///| Verify a hostname or IP address against an X.509 certificate's SAN (RFC 6125 / RFC 9525).
+pub fn verify_hostname(cert : X509Certificate, host : String) -> Bool {
+  if host.length() == 0 {
+    return false
+  }
+  // Check if host is an IPv4 or IPv6 literal
+  match parse_ipv4(host) {
+    Some(ip4) => {
+      let mut i = 0
+      while i < cert.san.length() {
+        match cert.san[i] {
+          GeneralName::IpAddress(b) => if ip_bytes_eq(b, ip4) { return true }
+          _ => ()
+        }
+        i = i + 1
+      }
+      return false
+    }
+    None => ()
+  }
+  match parse_ipv6(host) {
+    Some(ip6) => {
+      let mut i = 0
+      while i < cert.san.length() {
+        match cert.san[i] {
+          GeneralName::IpAddress(b) => if ip_bytes_eq(b, ip6) { return true }
+          _ => ()
+        }
+        i = i + 1
+      }
+      return false
+    }
+    None => ()
+  }
+  // Strip at most one trailing dot from the presented DNS host, then strictly validate host syntax
+  // (also ensures zoned IPv6 literals like `fe80::1%eth0` or invalid hosts never match DNS SANs).
+  let mut hend = host.length()
+  if hend > 0 && host.code_unit_at(hend - 1) == 46 {
+    hend = hend - 1
+  }
+  if !is_valid_dns_labels(host, 0, hend) {
+    return false
+  }
+  // Match against SAN dNSName entries
+  let mut i = 0
+  while i < cert.san.length() {
+    match cert.san[i] {
+      GeneralName::DnsName(dns) => if match_dns_pattern(dns, host, hend) { return true }
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}

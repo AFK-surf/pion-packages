@@ -1,0 +1,1500 @@
+///| ECMA-262 regular expression preprocessor for `packages/regex` (linear-time path)
+///| plus a lightweight, fuel-bounded backtracking sub-engine for lookaround and backreferences.
+
+import "regex"
+
+///| Decode one UTF-8 codepoint starting at `pos`, returning `(codepoint, next_pos)`.
+fn decode_utf8_cp(s : String, pos : Int) -> (Int, Int) {
+  let n = s.length()
+  if pos >= n {
+    return (0, n)
+  }
+  let b0 = s.code_unit_at(pos)
+  if b0 < 0x80 {
+    return (b0, pos + 1)
+  }
+  if (b0 & 0xE0) == 0xC0 && pos + 1 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+    return (cp, pos + 2)
+  }
+  if (b0 & 0xF0) == 0xE0 && pos + 2 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    let cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+    return (cp, pos + 3)
+  }
+  if (b0 & 0xF8) == 0xF0 && pos + 3 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    let b3 = s.code_unit_at(pos + 3)
+    let cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+    return (cp, pos + 4)
+  }
+  (b0, pos + 1)
+}
+
+fn is_ecma_ascii_digit(cp : Int) -> Bool {
+  cp >= 48 && cp <= 57
+}
+
+fn is_ecma_ascii_word(cp : Int) -> Bool {
+  (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || cp == 95
+}
+
+fn is_ecma_line_term(cp : Int) -> Bool {
+  cp == 0x0A || cp == 0x0D || cp == 0x2028 || cp == 0x2029
+}
+
+fn is_ecma_space(cp : Int) -> Bool {
+  cp == 0x09 || cp == 0x0A || cp == 0x0B || cp == 0x0C || cp == 0x0D || cp == 0x20 ||
+  cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+  cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000 || cp == 0xFEFF
+}
+
+fn write_hex_byte(sb : StringBuilder, v : Int) -> Unit {
+  let digits = "0123456789ABCDEF"
+  sb.write_byte(digits.code_unit_at((v >> 4) & 0xF).to_byte())
+  sb.write_byte(digits.code_unit_at(v & 0xF).to_byte())
+}
+
+fn write_hex_cp(sb : StringBuilder, cp : Int) -> Unit {
+  sb.write_string("\\x{")
+  let digits = "0123456789ABCDEF"
+  let mut started = false
+  let mut shift = 20
+  while shift >= 0 {
+    let nib = (cp >> shift) & 0xF
+    if nib != 0 || started || shift == 0 {
+      sb.write_byte(digits.code_unit_at(nib).to_byte())
+      started = true
+    }
+    shift = shift - 4
+  }
+  sb.write_string("}")
+}
+
+///| Count capturing groups in pattern (ignoring escaped parens and `[...]`).
+fn count_capture_groups(pat : String) -> Int {
+  let n = pat.length()
+  let mut i = 0
+  let mut in_class = false
+  let mut groups = 0
+  while i < n {
+    let b = pat.code_unit_at(i)
+    if b == 92 {
+      i = i + 2
+      continue
+    }
+    if in_class {
+      if b == 93 {
+        in_class = false
+      }
+      i = i + 1
+      continue
+    }
+    if b == 91 {
+      in_class = true
+      i = i + 1
+      continue
+    }
+    if b == 40 {
+      if i + 1 < n && pat.code_unit_at(i + 1) == 63 {
+        // Non-capturing (?:...), lookaround (?=...), (?!...), (?<=...), (?<!...), or named (?<name>...)
+        if i + 2 < n && pat.code_unit_at(i + 2) == 60 {
+          if i + 3 < n && pat.code_unit_at(i + 3) != 61 && pat.code_unit_at(i + 3) != 33 {
+            groups = groups + 1
+          }
+        }
+      } else {
+        groups = groups + 1
+      }
+    }
+    i = i + 1
+  }
+  groups
+}
+
+///| Translate an ECMA-262 regex pattern into a `packages/regex` compatible pattern.
+///| Returns:
+///| - `Ok((translated, needs_backtrack))`
+///| - `Err(msg)` on invalid ECMA-262 syntax / unsupported escapes (`\a`, `\A`, `\Z`, `\z`, etc.)
+fn preprocess_ecma_regex(pat : String) -> Result[(String, Bool), String] {
+  let n = pat.length()
+  let total_groups = count_capture_groups(pat)
+  let sb = StringBuilder::new()
+  let mut needs_bt = false
+  let mut in_class = false
+  let mut class_first = false
+  let mut i = 0
+
+  let ecma_s_inner = "\\x09\\x0A\\x0B\\x0C\\x0D\\x20\\x{00A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}\\x{FEFF}"
+  let ecma_S_inner = "\\x00-\\x08\\x0E-\\x1F\\x21-\\x{009F}\\x{00A1}-\\x{167F}\\x{1681}-\\x{1FFF}\\x{200B}-\\x{2027}\\x{202A}-\\x{202E}\\x{2030}-\\x{205E}\\x{2060}-\\x{2FFF}\\x{3001}-\\x{FEFE}\\x{FF00}-\\x{10FFFF}"
+
+  while i < n {
+    let b = pat.code_unit_at(i)
+    if in_class {
+      if b == 93 && !class_first {
+        in_class = false
+        sb.write_byte(93.to_byte())
+        i = i + 1
+        continue
+      }
+      class_first = false
+      if b == 92 {
+        if i + 1 >= n {
+          return Err("trailing backslash in character class")
+        }
+        let nxt = pat.code_unit_at(i + 1)
+        if nxt == 100 {
+          // \d
+          sb.write_string("0-9")
+          i = i + 2
+        } else if nxt == 68 {
+          // \D
+          sb.write_string("\\x00-\\x2F\\x3A-\\x{10FFFF}")
+          i = i + 2
+        } else if nxt == 119 {
+          // \w
+          sb.write_string("0-9A-Za-z_")
+          i = i + 2
+        } else if nxt == 87 {
+          // \W
+          sb.write_string("\\x00-\\x2F\\x3A-\\x40\\x5B-\\x5E\\x60\\x7B-\\x{10FFFF}")
+          i = i + 2
+        } else if nxt == 115 {
+          // \s
+          sb.write_string(ecma_s_inner)
+          i = i + 2
+        } else if nxt == 83 {
+          // \S
+          sb.write_string(ecma_S_inner)
+          i = i + 2
+        } else if nxt == 99 {
+          // \cA..\cZ or \ca..\cz
+          if i + 2 >= n || !is_ascii_alpha(pat.code_unit_at(i + 2)) {
+            return Err("invalid \\c control escape")
+          }
+          let cc = pat.code_unit_at(i + 2) % 32
+          sb.write_string("\\x")
+          write_hex_byte(sb, cc)
+          i = i + 3
+        } else if nxt == 117 {
+          // \uXXXX or \u{...}
+          match parse_ecma_u_escape(pat, i + 2) {
+            Ok((cp, next_i)) => {
+              write_hex_cp(sb, cp)
+              i = next_i
+            }
+            Err(e) => return Err(e)
+          }
+        } else if nxt == 120 {
+          // \xXX
+          if i + 3 >= n {
+            return Err("invalid \\x escape")
+          }
+          let h1 = hex_val(pat.code_unit_at(i + 2))
+          let h2 = hex_val(pat.code_unit_at(i + 3))
+          if h1 < 0 || h2 < 0 {
+            return Err("invalid \\x hex escape")
+          }
+          sb.write_string("\\x")
+          write_hex_byte(sb, h1 * 16 + h2)
+          i = i + 4
+        } else if nxt == 48 {
+          // \0 (in class: null char)
+          sb.write_string("\\x00")
+          i = i + 2
+        } else if nxt == 98 {
+          // \b inside [...] is backspace 0x08 in ECMA-262
+          sb.write_string("\\x08")
+          i = i + 2
+        } else if nxt == 116 || nxt == 110 || nxt == 114 || nxt == 102 || nxt == 118 {
+          // \t \n \r \f \v
+          sb.write_byte(92.to_byte())
+          sb.write_byte(nxt.to_byte())
+          i = i + 2
+        } else if nxt == 112 || nxt == 80 {
+          // \p{...} / \P{...}
+          match translate_unicode_prop(pat, i, sb) {
+            Ok(next_i) => i = next_i
+            Err(e) => return Err(e)
+          }
+        } else if nxt == 97 || nxt == 65 || nxt == 90 || nxt == 122 || nxt == 101 {
+          return Err("invalid ECMA-262 escape in class")
+        } else {
+          sb.write_byte(92.to_byte())
+          sb.write_byte(nxt.to_byte())
+          i = i + 2
+        }
+      } else {
+        sb.write_byte(b.to_byte())
+        i = i + 1
+      }
+      continue
+    }
+
+    // Outside character class
+    if b == 91 {
+      in_class = true
+      sb.write_byte(91.to_byte())
+      i = i + 1
+      if i < n && pat.code_unit_at(i) == 94 {
+        sb.write_byte(94.to_byte())
+        i = i + 1
+      }
+      class_first = true
+      continue
+    }
+
+    if b == 46 {
+      // ECMA-262 `.` excludes \n, \r, \u2028, \u2029
+      sb.write_string("[^\\n\\r\\x{2028}\\x{2029}]")
+      i = i + 1
+      continue
+    }
+
+    if b == 40 {
+      // Check for (?=...), (?!...), (?<=...), (?<!...)
+      if i + 2 < n && pat.code_unit_at(i + 1) == 63 {
+        let c2 = pat.code_unit_at(i + 2)
+        if c2 == 61 || c2 == 33 {
+          needs_bt = true
+        } else if c2 == 60 && i + 3 < n && (pat.code_unit_at(i + 3) == 61 || pat.code_unit_at(i + 3) == 33) {
+          needs_bt = true
+        } else if c2 != 58 && c2 != 60 {
+          // Inline flags like (?i) are not valid in ECMA-262 (outside ES2025 modifiers)
+          return Err("unsupported group syntax in ECMA-262 regex")
+        }
+      }
+      sb.write_byte(40.to_byte())
+      i = i + 1
+      continue
+    }
+
+    if b == 92 {
+      if i + 1 >= n {
+        return Err("trailing backslash in regex")
+      }
+      let nxt = pat.code_unit_at(i + 1)
+      if nxt == 100 {
+        // \d
+        sb.write_string("[0-9]")
+        i = i + 2
+      } else if nxt == 68 {
+        // \D
+        sb.write_string("[^0-9]")
+        i = i + 2
+      } else if nxt == 119 {
+        // \w
+        sb.write_string("[0-9A-Za-z_]")
+        i = i + 2
+      } else if nxt == 87 {
+        // \W
+        sb.write_string("[^0-9A-Za-z_]")
+        i = i + 2
+      } else if nxt == 115 {
+        // \s
+        sb.write_string("[" + ecma_s_inner + "]")
+        i = i + 2
+      } else if nxt == 83 {
+        // \S
+        sb.write_string("[^" + ecma_s_inner + "]")
+        i = i + 2
+      } else if nxt == 98 {
+        // \b -> ASCII word boundary
+        sb.write_string("(?-u:\\b)")
+        i = i + 2
+      } else if nxt == 66 {
+        // \B -> ASCII non-word boundary
+        sb.write_string("(?-u:\\B)")
+        i = i + 2
+      } else if nxt == 99 {
+        // \cA..\cZ or \ca..\cz
+        if i + 2 >= n || !is_ascii_alpha(pat.code_unit_at(i + 2)) {
+          return Err("invalid \\c control escape")
+        }
+        let cc = pat.code_unit_at(i + 2) % 32
+        sb.write_string("\\x")
+        write_hex_byte(sb, cc)
+        i = i + 3
+      } else if nxt == 117 {
+        match parse_ecma_u_escape(pat, i + 2) {
+          Ok((cp, next_i)) => {
+            write_hex_cp(sb, cp)
+            i = next_i
+          }
+          Err(e) => return Err(e)
+        }
+      } else if nxt == 120 {
+        if i + 3 >= n {
+          return Err("invalid \\x escape")
+        }
+        let h1 = hex_val(pat.code_unit_at(i + 2))
+        let h2 = hex_val(pat.code_unit_at(i + 3))
+        if h1 < 0 || h2 < 0 {
+          return Err("invalid \\x hex escape")
+        }
+        sb.write_string("\\x")
+        write_hex_byte(sb, h1 * 16 + h2)
+        i = i + 4
+      } else if nxt == 48 {
+        // \0 not followed by digit
+        if i + 2 < n && is_ascii_digit(pat.code_unit_at(i + 2)) {
+          return Err("octal escape not allowed in ECMA-262")
+        }
+        sb.write_string("\\x00")
+        i = i + 2
+      } else if nxt >= 49 && nxt <= 57 {
+        // Backreference \1..\9 (possibly multi-digit)
+        let mut num = nxt - 48
+        let mut j = i + 2
+        while j < n && is_ascii_digit(pat.code_unit_at(j)) {
+          num = num * 10 + (pat.code_unit_at(j) - 48)
+          j = j + 1
+        }
+        if num <= total_groups {
+          needs_bt = true
+          sb.write_string(pat.slice(i, j))
+          i = j
+        } else {
+          return Err("invalid backreference in ECMA-262 regex")
+        }
+      } else if nxt == 116 || nxt == 110 || nxt == 114 || nxt == 102 || nxt == 118 {
+        sb.write_byte(92.to_byte())
+        sb.write_byte(nxt.to_byte())
+        i = i + 2
+      } else if nxt == 112 || nxt == 80 {
+        match translate_unicode_prop(pat, i, sb) {
+          Ok(next_i) => i = next_i
+          Err(e) => return Err(e)
+        }
+      } else if nxt == 97 || nxt == 65 || nxt == 90 || nxt == 122 || nxt == 101 {
+        // \a, \A, \Z, \z, \e are NOT valid ECMA-262 escapes
+        return Err("invalid ECMA-262 escape: \\" + pat.slice(i + 1, i + 2))
+      } else if nxt == 107 {
+        // \k<name> named backreference
+        needs_bt = true
+        sb.write_byte(92.to_byte())
+        sb.write_byte(nxt.to_byte())
+        i = i + 2
+      } else if is_ascii_alpha(nxt) {
+        // Other letters like \g, \h, \q etc. are invalid in ECMA-262 u-mode
+        return Err("invalid ECMA-262 identity escape: \\" + pat.slice(i + 1, i + 2))
+      } else {
+        // Punctuation / syntax char escape (e.g. \$, \., \/, \-, \\, etc.)
+        sb.write_byte(92.to_byte())
+        sb.write_byte(nxt.to_byte())
+        i = i + 2
+      }
+      continue
+    }
+
+    sb.write_byte(b.to_byte())
+    i = i + 1
+  }
+
+  if in_class {
+    return Err("unclosed character class")
+  }
+  Ok((sb.to_string(), needs_bt))
+}
+
+fn parse_ecma_u_escape(pat : String, start : Int) -> Result[(Int, Int), String] {
+  let n = pat.length()
+  if start >= n {
+    return Err("incomplete \\u escape")
+  }
+  if pat.code_unit_at(start) == 123 {
+    // \u{XXXXX}
+    let mut j = start + 1
+    let mut cp_val = 0
+    let mut digits = 0
+    while j < n && pat.code_unit_at(j) != 125 {
+      let hv = hex_val(pat.code_unit_at(j))
+      if hv < 0 {
+        return Err("invalid hex in \\u{...}")
+      }
+      cp_val = cp_val * 16 + hv
+      digits = digits + 1
+      if cp_val > 0x10FFFF {
+        return Err("codepoint out of range in \\u{...}")
+      }
+      j = j + 1
+    }
+    if digits == 0 || j >= n || pat.code_unit_at(j) != 125 {
+      return Err("unclosed \\u{...}")
+    }
+    return Ok((cp_val, j + 1))
+  }
+  if start + 4 > n {
+    return Err("incomplete \\uXXXX escape")
+  }
+  let h0 = hex_val(pat.code_unit_at(start))
+  let h1 = hex_val(pat.code_unit_at(start + 1))
+  let h2 = hex_val(pat.code_unit_at(start + 2))
+  let h3 = hex_val(pat.code_unit_at(start + 3))
+  if h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0 {
+    return Err("invalid hex in \\uXXXX")
+  }
+  let cp = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3
+  // Check surrogate pair \uD800..\uDBFF followed by \uDC00..\uDFFF
+  if cp >= 0xD800 && cp <= 0xDBFF && start + 10 <= n &&
+  pat.code_unit_at(start + 4) == 92 && pat.code_unit_at(start + 5) == 117 {
+    let l0 = hex_val(pat.code_unit_at(start + 6))
+    let l1 = hex_val(pat.code_unit_at(start + 7))
+    let l2 = hex_val(pat.code_unit_at(start + 8))
+    let l3 = hex_val(pat.code_unit_at(start + 9))
+    if l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0 {
+      let lo = (l0 << 12) | (l1 << 8) | (l2 << 4) | l3
+      if lo >= 0xDC00 && lo <= 0xDFFF {
+        let full = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+        return Ok((full, start + 10))
+      }
+    }
+  }
+  Ok((cp, start + 4))
+}
+
+///| Translate `\p{...}` / `\P{...}` (maps ECMA/JSON-Schema aliases like `\p{digit}` -> `\p{Nd}`).
+fn translate_unicode_prop(pat : String, pos : Int, sb : StringBuilder) -> Result[Int, String] {
+  let n = pat.length()
+  let kind_b = pat.code_unit_at(pos + 1)
+  if pos + 2 >= n || pat.code_unit_at(pos + 2) != 123 {
+    return Err("expected '{' after \\p or \\P")
+  }
+  let mut j = pos + 3
+  while j < n && pat.code_unit_at(j) != 125 {
+    j = j + 1
+  }
+  if j >= n {
+    return Err("unclosed \\p{...}")
+  }
+  let name = pat.slice(pos + 3, j)
+  sb.write_byte(92.to_byte())
+  sb.write_byte(kind_b.to_byte())
+  sb.write_byte(123.to_byte())
+  if name == "digit" || name == "Decimal_Number" {
+    sb.write_string("Nd")
+  } else if name == "Letter" {
+    sb.write_string("L")
+  } else {
+    sb.write_string(name)
+  }
+  sb.write_byte(125.to_byte())
+  Ok(j + 1)
+}
+
+// ============================================================================
+// Lightweight fuel-bounded backtracking ECMA-262 sub-engine
+// Supports: literals, `.`, `[...]`/`[^...]`, `\d\D\w\W\s\S\b\B\cX\uXXXX\xXX`,
+// `^`, `$`, `(...)`, `(?:...)`, `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`,
+// `\1`..`\9`, `|`, `*`, `+`, `?`, `{m,n}` (greedy & lazy).
+// ============================================================================
+
+struct BtRange {
+  lo : Int
+  hi : Int
+}
+
+enum BtNode {
+  Empty
+  Lit(Int)
+  Dot
+  Class(Array[BtRange], Bool)
+  AnchorStart
+  AnchorEnd
+  WordBound(Bool)
+  Seq(Array[BtNode])
+  Alt(Array[BtNode])
+  Group(Int, BtNode)
+  Quant(BtNode, Int, Int, Bool)
+  Lookahead(BtNode, Bool)
+  Lookbehind(BtNode, Bool)
+  Backref(Int)
+}
+
+struct EcmaBtRegex {
+  root : BtNode
+  num_groups : Int
+}
+
+struct BtParser {
+  src : String
+  len : Int
+  mut pos : Int
+  mut groups : Int
+  mut depth : Int
+}
+
+fn BtParser::parse(pat : String) -> Result[EcmaBtRegex, String] {
+  let p = BtParser::{ src: pat, len: pat.length(), pos: 0, groups: 0, depth: 0 }
+  match p.parse_alt() {
+    Ok(node) => {
+      if p.pos != p.len {
+        return Err("unexpected ')' in regex")
+      }
+      Ok(EcmaBtRegex::{ root: node, num_groups: p.groups })
+    }
+    Err(e) => Err(e)
+  }
+}
+
+fn BtParser::parse_alt(self : BtParser) -> Result[BtNode, String] {
+  let branches : Array[BtNode] = []
+  match self.parse_seq() {
+    Ok(b) => branches.push(b)
+    Err(e) => return Err(e)
+  }
+  while self.pos < self.len && self.src.code_unit_at(self.pos) == 124 {
+    self.pos = self.pos + 1
+    match self.parse_seq() {
+      Ok(b) => branches.push(b)
+      Err(e) => return Err(e)
+    }
+  }
+  if branches.length() == 1 {
+    Ok(branches[0])
+  } else {
+    Ok(BtNode::Alt(branches))
+  }
+}
+
+fn BtParser::parse_seq(self : BtParser) -> Result[BtNode, String] {
+  let items : Array[BtNode] = []
+  while self.pos < self.len {
+    let b = self.src.code_unit_at(self.pos)
+    if b == 41 || b == 124 {
+      break
+    }
+    let atom = match self.parse_atom() {
+      Ok(a) => a
+      Err(e) => return Err(e)
+    }
+    let quantified = match self.parse_quant(atom) {
+      Ok(q) => q
+      Err(e) => return Err(e)
+    }
+    items.push(quantified)
+  }
+  if items.length() == 0 {
+    Ok(BtNode::Empty)
+  } else if items.length() == 1 {
+    Ok(items[0])
+  } else {
+    Ok(BtNode::Seq(items))
+  }
+}
+
+fn BtParser::parse_quant(self : BtParser, atom : BtNode) -> Result[BtNode, String] {
+  if self.pos >= self.len {
+    return Ok(atom)
+  }
+  let b = self.src.code_unit_at(self.pos)
+  let mut min_q = 0
+  let mut max_q = -1
+  let mut has_q = false
+  if b == 42 {
+    // *
+    min_q = 0
+    max_q = -1
+    has_q = true
+    self.pos = self.pos + 1
+  } else if b == 43 {
+    // +
+    min_q = 1
+    max_q = -1
+    has_q = true
+    self.pos = self.pos + 1
+  } else if b == 63 {
+    // ?
+    min_q = 0
+    max_q = 1
+    has_q = true
+    self.pos = self.pos + 1
+  } else if b == 123 {
+    // {m}, {m,}, {m,n}
+    let save = self.pos
+    self.pos = self.pos + 1
+    let m_start = self.pos
+    let mut m_val = 0
+    while self.pos < self.len && is_ascii_digit(self.src.code_unit_at(self.pos)) {
+      m_val = m_val * 10 + (self.src.code_unit_at(self.pos) - 48)
+      self.pos = self.pos + 1
+    }
+    if self.pos > m_start && self.pos < self.len {
+      let c = self.src.code_unit_at(self.pos)
+      if c == 125 {
+        min_q = m_val
+        max_q = m_val
+        has_q = true
+        self.pos = self.pos + 1
+      } else if c == 44 {
+        self.pos = self.pos + 1
+        if self.pos < self.len && self.src.code_unit_at(self.pos) == 125 {
+          min_q = m_val
+          max_q = -1
+          has_q = true
+          self.pos = self.pos + 1
+        } else {
+          let n_start = self.pos
+          let mut n_val = 0
+          while self.pos < self.len && is_ascii_digit(self.src.code_unit_at(self.pos)) {
+            n_val = n_val * 10 + (self.src.code_unit_at(self.pos) - 48)
+            self.pos = self.pos + 1
+          }
+          if self.pos > n_start && self.pos < self.len && self.src.code_unit_at(self.pos) == 125 {
+            if n_val < m_val {
+              return Err("invalid quantifier range")
+            }
+            min_q = m_val
+            max_q = n_val
+            has_q = true
+            self.pos = self.pos + 1
+          } else {
+            self.pos = save
+          }
+        }
+      } else {
+        self.pos = save
+      }
+    } else {
+      self.pos = save
+    }
+  }
+  if !has_q {
+    return Ok(atom)
+  }
+  let mut greedy = true
+  if self.pos < self.len && self.src.code_unit_at(self.pos) == 63 {
+    greedy = false
+    self.pos = self.pos + 1
+  }
+  Ok(BtNode::Quant(atom, min_q, max_q, greedy))
+}
+
+fn push_digit_ranges(out : Array[BtRange]) -> Unit {
+  out.push(BtRange::{ lo: 48, hi: 57 })
+}
+
+fn push_word_ranges(out : Array[BtRange]) -> Unit {
+  out.push(BtRange::{ lo: 48, hi: 57 })
+  out.push(BtRange::{ lo: 65, hi: 90 })
+  out.push(BtRange::{ lo: 95, hi: 95 })
+  out.push(BtRange::{ lo: 97, hi: 122 })
+}
+
+fn push_space_ranges(out : Array[BtRange]) -> Unit {
+  out.push(BtRange::{ lo: 0x09, hi: 0x0D })
+  out.push(BtRange::{ lo: 0x20, hi: 0x20 })
+  out.push(BtRange::{ lo: 0xA0, hi: 0xA0 })
+  out.push(BtRange::{ lo: 0x1680, hi: 0x1680 })
+  out.push(BtRange::{ lo: 0x2000, hi: 0x200A })
+  out.push(BtRange::{ lo: 0x2028, hi: 0x2029 })
+  out.push(BtRange::{ lo: 0x202F, hi: 0x202F })
+  out.push(BtRange::{ lo: 0x205F, hi: 0x205F })
+  out.push(BtRange::{ lo: 0x3000, hi: 0x3000 })
+  out.push(BtRange::{ lo: 0xFEFF, hi: 0xFEFF })
+}
+
+fn BtParser::parse_atom(self : BtParser) -> Result[BtNode, String] {
+  let b = self.src.code_unit_at(self.pos)
+  if b == 94 {
+    self.pos = self.pos + 1
+    return Ok(BtNode::AnchorStart)
+  }
+  if b == 36 {
+    self.pos = self.pos + 1
+    return Ok(BtNode::AnchorEnd)
+  }
+  if b == 46 {
+    self.pos = self.pos + 1
+    return Ok(BtNode::Dot)
+  }
+  if b == 40 {
+    if self.depth > 64 {
+      return Err("regex group nesting too deep")
+    }
+    self.depth = self.depth + 1
+    self.pos = self.pos + 1
+    let res = if self.pos < self.len && self.src.code_unit_at(self.pos) == 63 {
+      self.pos = self.pos + 1
+      if self.pos >= self.len {
+        Err("incomplete group")
+      } else {
+        let c = self.src.code_unit_at(self.pos)
+        if c == 58 {
+          // (?:...)
+          self.pos = self.pos + 1
+          self.parse_alt()
+        } else if c == 61 {
+          // (?=...)
+          self.pos = self.pos + 1
+          match self.parse_alt() {
+            Ok(inner) => Ok(BtNode::Lookahead(inner, true))
+            Err(e) => Err(e)
+          }
+        } else if c == 33 {
+          // (?!...)
+          self.pos = self.pos + 1
+          match self.parse_alt() {
+            Ok(inner) => Ok(BtNode::Lookahead(inner, false))
+            Err(e) => Err(e)
+          }
+        } else if c == 60 {
+          self.pos = self.pos + 1
+          if self.pos >= self.len {
+            Err("incomplete lookbehind")
+          } else {
+            let c2 = self.src.code_unit_at(self.pos)
+            if c2 == 61 {
+              self.pos = self.pos + 1
+              match self.parse_alt() {
+                Ok(inner) => Ok(BtNode::Lookbehind(inner, true))
+                Err(e) => Err(e)
+              }
+            } else if c2 == 33 {
+              self.pos = self.pos + 1
+              match self.parse_alt() {
+                Ok(inner) => Ok(BtNode::Lookbehind(inner, false))
+                Err(e) => Err(e)
+              }
+            } else {
+              // Named capturing group (?<name>...)
+              while self.pos < self.len && self.src.code_unit_at(self.pos) != 62 {
+                self.pos = self.pos + 1
+              }
+              if self.pos >= self.len {
+                Err("unclosed group name")
+              } else {
+                self.pos = self.pos + 1
+                self.groups = self.groups + 1
+                let gid = self.groups
+                match self.parse_alt() {
+                  Ok(inner) => Ok(BtNode::Group(gid, inner))
+                  Err(e) => Err(e)
+                }
+              }
+            }
+          }
+        } else {
+          Err("unsupported group prefix")
+        }
+      }
+    } else {
+      self.groups = self.groups + 1
+      let gid = self.groups
+      match self.parse_alt() {
+        Ok(inner) => Ok(BtNode::Group(gid, inner))
+        Err(e) => Err(e)
+      }
+    }
+    self.depth = self.depth - 1
+    match res {
+      Ok(inner) => {
+        if self.pos >= self.len || self.src.code_unit_at(self.pos) != 41 {
+          return Err("unclosed '('")
+        }
+        self.pos = self.pos + 1
+        Ok(inner)
+      }
+      Err(e) => Err(e)
+    }
+  } else if b == 91 {
+    self.parse_class()
+  } else if b == 92 {
+    self.parse_escape()
+  } else if b == 42 || b == 43 || b == 63 {
+    Err("nothing to repeat")
+  } else {
+    let (cp, next_p) = decode_utf8_cp(self.src, self.pos)
+    self.pos = next_p
+    Ok(BtNode::Lit(cp))
+  }
+}
+
+fn BtParser::parse_escape(self : BtParser) -> Result[BtNode, String] {
+  self.pos = self.pos + 1
+  if self.pos >= self.len {
+    return Err("trailing backslash")
+  }
+  let c = self.src.code_unit_at(self.pos)
+  self.pos = self.pos + 1
+  if c == 100 {
+    let rs : Array[BtRange] = []
+    push_digit_ranges(rs)
+    Ok(BtNode::Class(rs, false))
+  } else if c == 68 {
+    let rs : Array[BtRange] = []
+    push_digit_ranges(rs)
+    Ok(BtNode::Class(rs, true))
+  } else if c == 119 {
+    let rs : Array[BtRange] = []
+    push_word_ranges(rs)
+    Ok(BtNode::Class(rs, false))
+  } else if c == 87 {
+    let rs : Array[BtRange] = []
+    push_word_ranges(rs)
+    Ok(BtNode::Class(rs, true))
+  } else if c == 115 {
+    let rs : Array[BtRange] = []
+    push_space_ranges(rs)
+    Ok(BtNode::Class(rs, false))
+  } else if c == 83 {
+    let rs : Array[BtRange] = []
+    push_space_ranges(rs)
+    Ok(BtNode::Class(rs, true))
+  } else if c == 98 {
+    Ok(BtNode::WordBound(true))
+  } else if c == 66 {
+    Ok(BtNode::WordBound(false))
+  } else if c == 116 {
+    Ok(BtNode::Lit(9))
+  } else if c == 110 {
+    Ok(BtNode::Lit(10))
+  } else if c == 114 {
+    Ok(BtNode::Lit(13))
+  } else if c == 102 {
+    Ok(BtNode::Lit(12))
+  } else if c == 118 {
+    Ok(BtNode::Lit(11))
+  } else if c == 48 {
+    Ok(BtNode::Lit(0))
+  } else if c == 99 {
+    if self.pos >= self.len || !is_ascii_alpha(self.src.code_unit_at(self.pos)) {
+      return Err("invalid \\c escape")
+    }
+    let cc = self.src.code_unit_at(self.pos) % 32
+    self.pos = self.pos + 1
+    Ok(BtNode::Lit(cc))
+  } else if c == 120 {
+    if self.pos + 1 >= self.len {
+      return Err("invalid \\x escape")
+    }
+    let h1 = hex_val(self.src.code_unit_at(self.pos))
+    let h2 = hex_val(self.src.code_unit_at(self.pos + 1))
+    if h1 < 0 || h2 < 0 {
+      return Err("invalid \\x hex")
+    }
+    self.pos = self.pos + 2
+    Ok(BtNode::Lit(h1 * 16 + h2))
+  } else if c == 117 {
+    match parse_ecma_u_escape(self.src, self.pos) {
+      Ok((cp, next_i)) => {
+        self.pos = next_i
+        Ok(BtNode::Lit(cp))
+      }
+      Err(e) => Err(e)
+    }
+  } else if c >= 49 && c <= 57 {
+    let mut num = c - 48
+    while self.pos < self.len && is_ascii_digit(self.src.code_unit_at(self.pos)) {
+      num = num * 10 + (self.src.code_unit_at(self.pos) - 48)
+      self.pos = self.pos + 1
+    }
+    Ok(BtNode::Backref(num))
+  } else {
+    Ok(BtNode::Lit(c))
+  }
+}
+
+fn BtParser::parse_class_char(self : BtParser) -> Result[Int, String] {
+  let b = self.src.code_unit_at(self.pos)
+  if b == 92 {
+    self.pos = self.pos + 1
+    if self.pos >= self.len {
+      return Err("trailing backslash in class")
+    }
+    let c = self.src.code_unit_at(self.pos)
+    self.pos = self.pos + 1
+    if c == 116 {
+      Ok(9)
+    } else if c == 110 {
+      Ok(10)
+    } else if c == 114 {
+      Ok(13)
+    } else if c == 102 {
+      Ok(12)
+    } else if c == 118 {
+      Ok(11)
+    } else if c == 98 {
+      Ok(8)
+    } else if c == 48 {
+      Ok(0)
+    } else if c == 99 {
+      if self.pos >= self.len || !is_ascii_alpha(self.src.code_unit_at(self.pos)) {
+        return Err("invalid \\c escape")
+      }
+      let cc = self.src.code_unit_at(self.pos) % 32
+      self.pos = self.pos + 1
+      Ok(cc)
+    } else if c == 120 {
+      if self.pos + 1 >= self.len {
+        return Err("invalid \\x escape")
+      }
+      let h1 = hex_val(self.src.code_unit_at(self.pos))
+      let h2 = hex_val(self.src.code_unit_at(self.pos + 1))
+      if h1 < 0 || h2 < 0 {
+        return Err("invalid \\x hex")
+      }
+      self.pos = self.pos + 2
+      Ok(h1 * 16 + h2)
+    } else if c == 117 {
+      match parse_ecma_u_escape(self.src, self.pos) {
+        Ok((cp, next_i)) => {
+          self.pos = next_i
+          Ok(cp)
+        }
+        Err(e) => Err(e)
+      }
+    } else {
+      Ok(c)
+    }
+  } else {
+    let (cp, next_p) = decode_utf8_cp(self.src, self.pos)
+    self.pos = next_p
+    Ok(cp)
+  }
+}
+
+fn BtParser::parse_class(self : BtParser) -> Result[BtNode, String] {
+  self.pos = self.pos + 1
+  let mut neg = false
+  if self.pos < self.len && self.src.code_unit_at(self.pos) == 94 {
+    neg = true
+    self.pos = self.pos + 1
+  }
+  let rs : Array[BtRange] = []
+  let mut first = true
+  while self.pos < self.len {
+    if self.src.code_unit_at(self.pos) == 93 && !first {
+      self.pos = self.pos + 1
+      return Ok(BtNode::Class(rs, neg))
+    }
+    first = false
+    if self.src.code_unit_at(self.pos) == 92 && self.pos + 1 < self.len {
+      let nc = self.src.code_unit_at(self.pos + 1)
+      if nc == 100 {
+        push_digit_ranges(rs)
+        self.pos = self.pos + 2
+        continue
+      } else if nc == 119 {
+        push_word_ranges(rs)
+        self.pos = self.pos + 2
+        continue
+      } else if nc == 115 {
+        push_space_ranges(rs)
+        self.pos = self.pos + 2
+        continue
+      }
+    }
+    let lo = match self.parse_class_char() {
+      Ok(c) => c
+      Err(e) => return Err(e)
+    }
+    if self.pos + 1 < self.len && self.src.code_unit_at(self.pos) == 45 &&
+    self.src.code_unit_at(self.pos + 1) != 93 {
+      self.pos = self.pos + 1
+      let hi = match self.parse_class_char() {
+        Ok(c) => c
+        Err(e) => return Err(e)
+      }
+      if hi < lo {
+        return Err("invalid character range")
+      }
+      rs.push(BtRange::{ lo: lo, hi: hi })
+    } else {
+      rs.push(BtRange::{ lo: lo, hi: lo })
+    }
+  }
+  Err("unclosed '['")
+}
+
+///| Runtime state for fuel-bounded backtracking matcher (operates on decoded codepoints).
+struct BtExec {
+  cps : Array[Int]
+  len : Int
+  cap_start : FixedArray[Int]
+  cap_end : FixedArray[Int]
+  mut fuel : Int
+}
+
+fn bt_class_match(rs : Array[BtRange], neg : Bool, cp : Int) -> Bool {
+  let mut hit = false
+  let mut i = 0
+  let n = rs.length()
+  while i < n {
+    let r = rs[i]
+    if cp >= r.lo && cp <= r.hi {
+      hit = true
+      break
+    }
+    i = i + 1
+  }
+  if neg { !hit } else { hit }
+}
+
+///| Match `node` starting at codepoint index `pos`, invoking continuation via explicit suffix list.
+///| Returns `true` if `node` followed by `rest[rest_idx..]` matches.
+fn BtExec::match_seq(
+  self : BtExec,
+  seq : Array[BtNode],
+  idx : Int,
+  pos : Int,
+  cont_seq : Array[BtNode],
+  cont_idx : Int,
+) -> Bool {
+  if self.fuel <= 0 {
+    return false
+  }
+  self.fuel = self.fuel - 1
+  if idx >= seq.length() {
+    if cont_idx >= cont_seq.length() {
+      return true
+    }
+    return self.match_seq(cont_seq, cont_idx, pos, [], 0)
+  }
+  let node = seq[idx]
+  match node {
+    BtNode::Empty => self.match_seq(seq, idx + 1, pos, cont_seq, cont_idx)
+    BtNode::Lit(cp) => {
+      if pos < self.len && self.cps[pos] == cp {
+        self.match_seq(seq, idx + 1, pos + 1, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::Dot => {
+      if pos < self.len && !is_ecma_line_term(self.cps[pos]) {
+        self.match_seq(seq, idx + 1, pos + 1, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::Class(rs, neg) => {
+      if pos < self.len && bt_class_match(rs, neg, self.cps[pos]) {
+        self.match_seq(seq, idx + 1, pos + 1, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::AnchorStart => {
+      if pos == 0 {
+        self.match_seq(seq, idx + 1, pos, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::AnchorEnd => {
+      if pos == self.len {
+        self.match_seq(seq, idx + 1, pos, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::WordBound(want_bound) => {
+      let prev_w = pos > 0 && is_ecma_ascii_word(self.cps[pos - 1])
+      let next_w = pos < self.len && is_ecma_ascii_word(self.cps[pos])
+      let is_b = prev_w != next_w
+      if is_b == want_bound {
+        self.match_seq(seq, idx + 1, pos, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::Seq(sub) => {
+      // Flatten continuation: sub followed by seq[idx+1..] + cont_seq[cont_idx..]
+      let merged = bt_build_rest(seq, idx + 1, cont_seq, cont_idx)
+      self.match_seq(sub, 0, pos, merged, 0)
+    }
+    BtNode::Alt(branches) => {
+      let mut bi = 0
+      while bi < branches.length() {
+        if self.fuel <= 0 {
+          return false
+        }
+        let rest = bt_build_rest(seq, idx + 1, cont_seq, cont_idx)
+        if self.match_seq([branches[bi]], 0, pos, rest, 0) {
+          return true
+        }
+        bi = bi + 1
+      }
+      false
+    }
+    BtNode::Group(gid, inner) => {
+      let old_s = self.cap_start[gid]
+      let old_e = self.cap_end[gid]
+      self.cap_start[gid] = pos
+      // Find all positions where inner can end by using a wrapper continuation
+      let rest = bt_build_rest(seq, idx + 1, cont_seq, cont_idx)
+      let ok = self.match_group_inner(inner, gid, pos, rest)
+      if ok {
+        true
+      } else {
+        self.cap_start[gid] = old_s
+        self.cap_end[gid] = old_e
+        false
+      }
+    }
+    BtNode::Quant(atom, min_q, max_q, greedy) => {
+      let rest = bt_build_rest(seq, idx + 1, cont_seq, cont_idx)
+      self.match_quant(atom, min_q, max_q, greedy, 0, pos, rest)
+    }
+    BtNode::Lookahead(inner, positive) => {
+      let matched = self.match_seq([inner], 0, pos, [], 0)
+      if matched == positive {
+        self.match_seq(seq, idx + 1, pos, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::Lookbehind(inner, positive) => {
+      // Try starting positions s from pos down to 0 such that `inner` matches [s..pos]
+      let mut found = false
+      let mut s = pos
+      while s >= 0 {
+        if self.fuel <= 0 {
+          return false
+        }
+        if self.match_exact_end(inner, s, pos) {
+          found = true
+          break
+        }
+        s = s - 1
+      }
+      if found == positive {
+        self.match_seq(seq, idx + 1, pos, cont_seq, cont_idx)
+      } else {
+        false
+      }
+    }
+    BtNode::Backref(gid) => {
+      if gid <= 0 || gid >= self.cap_start.length() {
+        return false
+      }
+      let cs = self.cap_start[gid]
+      let ce = self.cap_end[gid]
+      if cs < 0 || ce < cs {
+        // Unmatched capture matches empty string in ECMA-262
+        return self.match_seq(seq, idx + 1, pos, cont_seq, cont_idx)
+      }
+      let clen = ce - cs
+      if pos + clen > self.len {
+        return false
+      }
+      let mut k = 0
+      while k < clen {
+        if self.cps[pos + k] != self.cps[cs + k] {
+          return false
+        }
+        k = k + 1
+      }
+      self.match_seq(seq, idx + 1, pos + clen, cont_seq, cont_idx)
+    }
+  }
+}
+
+fn bt_build_rest(
+  seq : Array[BtNode],
+  idx : Int,
+  cont_seq : Array[BtNode],
+  cont_idx : Int,
+) -> Array[BtNode] {
+  let out : Array[BtNode] = []
+  let mut i = idx
+  while i < seq.length() {
+    out.push(seq[i])
+    i = i + 1
+  }
+  i = cont_idx
+  while i < cont_seq.length() {
+    out.push(cont_seq[i])
+    i = i + 1
+  }
+  out
+}
+
+///| Collect candidate end positions for a sub-pattern (used for Group capture and Quant).
+fn BtExec::collect_ends(
+  self : BtExec,
+  node : BtNode,
+  pos : Int,
+  out : Array[Int],
+) -> Unit {
+  if self.fuel <= 0 {
+    return
+  }
+  self.fuel = self.fuel - 1
+  match node {
+    BtNode::Empty => out.push(pos)
+    BtNode::Lit(cp) => if pos < self.len && self.cps[pos] == cp { out.push(pos + 1) }
+    BtNode::Dot => if pos < self.len && !is_ecma_line_term(self.cps[pos]) { out.push(pos + 1) }
+    BtNode::Class(rs, neg) => if pos < self.len && bt_class_match(rs, neg, self.cps[pos]) { out.push(pos + 1) }
+    BtNode::AnchorStart => if pos == 0 { out.push(pos) }
+    BtNode::AnchorEnd => if pos == self.len { out.push(pos) }
+    BtNode::WordBound(want) => {
+      let prev_w = pos > 0 && is_ecma_ascii_word(self.cps[pos - 1])
+      let next_w = pos < self.len && is_ecma_ascii_word(self.cps[pos])
+      if (prev_w != next_w) == want { out.push(pos) }
+    }
+    BtNode::Seq(sub) => self.collect_seq_ends(sub, 0, pos, out)
+    BtNode::Alt(branches) => {
+      let mut i = 0
+      while i < branches.length() {
+        self.collect_ends(branches[i], pos, out)
+        i = i + 1
+      }
+    }
+    BtNode::Group(gid, inner) => {
+      let ends : Array[Int] = []
+      self.collect_ends(inner, pos, ends)
+      let mut i = 0
+      while i < ends.length() {
+        self.cap_start[gid] = pos
+        self.cap_end[gid] = ends[i]
+        out.push(ends[i])
+        i = i + 1
+      }
+    }
+    BtNode::Quant(atom, min_q, max_q, greedy) => {
+      self.collect_quant_ends(atom, min_q, max_q, greedy, 0, pos, out)
+    }
+    BtNode::Lookahead(inner, positive) => {
+      let m = self.match_seq([inner], 0, pos, [], 0)
+      if m == positive { out.push(pos) }
+    }
+    BtNode::Lookbehind(inner, positive) => {
+      let mut found = false
+      let mut s = pos
+      while s >= 0 {
+        if self.fuel <= 0 { break }
+        if self.match_exact_end(inner, s, pos) {
+          found = true
+          break
+        }
+        s = s - 1
+      }
+      if found == positive { out.push(pos) }
+    }
+    BtNode::Backref(gid) => {
+      if gid > 0 && gid < self.cap_start.length() {
+        let cs = self.cap_start[gid]
+        let ce = self.cap_end[gid]
+        if cs < 0 || ce < cs {
+          out.push(pos)
+        } else {
+          let clen = ce - cs
+          if pos + clen <= self.len {
+            let mut ok = true
+            let mut k = 0
+            while k < clen {
+              if self.cps[pos + k] != self.cps[cs + k] {
+                ok = false
+                break
+              }
+              k = k + 1
+            }
+            if ok { out.push(pos + clen) }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn BtExec::collect_seq_ends(
+  self : BtExec,
+  sub : Array[BtNode],
+  idx : Int,
+  pos : Int,
+  out : Array[Int],
+) -> Unit {
+  if self.fuel <= 0 {
+    return
+  }
+  if idx >= sub.length() {
+    out.push(pos)
+    return
+  }
+  let mid : Array[Int] = []
+  self.collect_ends(sub[idx], pos, mid)
+  let mut i = 0
+  while i < mid.length() {
+    self.collect_seq_ends(sub, idx + 1, mid[i], out)
+    i = i + 1
+  }
+}
+
+fn BtExec::collect_quant_ends(
+  self : BtExec,
+  atom : BtNode,
+  min_q : Int,
+  max_q : Int,
+  greedy : Bool,
+  count : Int,
+  pos : Int,
+  out : Array[Int],
+) -> Unit {
+  if self.fuel <= 0 {
+    return
+  }
+  if !greedy && count >= min_q {
+    out.push(pos)
+  }
+  if max_q < 0 || count < max_q {
+    let nexts : Array[Int] = []
+    self.collect_ends(atom, pos, nexts)
+    let mut i = 0
+    while i < nexts.length() {
+      let np = nexts[i]
+      if np != pos || count < min_q {
+        self.collect_quant_ends(atom, min_q, max_q, greedy, count + 1, np, out)
+      }
+      i = i + 1
+    }
+  }
+  if greedy && count >= min_q {
+    out.push(pos)
+  }
+}
+
+fn BtExec::match_group_inner(
+  self : BtExec,
+  inner : BtNode,
+  gid : Int,
+  pos : Int,
+  rest : Array[BtNode],
+) -> Bool {
+  let ends : Array[Int] = []
+  self.collect_ends(inner, pos, ends)
+  let mut i = 0
+  while i < ends.length() {
+    if self.fuel <= 0 {
+      return false
+    }
+    self.cap_start[gid] = pos
+    self.cap_end[gid] = ends[i]
+    if self.match_seq(rest, 0, ends[i], [], 0) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn BtExec::match_quant(
+  self : BtExec,
+  atom : BtNode,
+  min_q : Int,
+  max_q : Int,
+  greedy : Bool,
+  count : Int,
+  pos : Int,
+  rest : Array[BtNode],
+) -> Bool {
+  if self.fuel <= 0 {
+    return false
+  }
+  self.fuel = self.fuel - 1
+  if !greedy && count >= min_q {
+    if self.match_seq(rest, 0, pos, [], 0) {
+      return true
+    }
+  }
+  if max_q < 0 || count < max_q {
+    let nexts : Array[Int] = []
+    self.collect_ends(atom, pos, nexts)
+    let mut i = 0
+    while i < nexts.length() {
+      let np = nexts[i]
+      if np != pos || count < min_q {
+        if self.match_quant(atom, min_q, max_q, greedy, count + 1, np, rest) {
+          return true
+        }
+      }
+      i = i + 1
+    }
+  }
+  if greedy && count >= min_q {
+    if self.match_seq(rest, 0, pos, [], 0) {
+      return true
+    }
+  }
+  false
+}
+
+fn BtExec::match_exact_end(self : BtExec, node : BtNode, start : Int, target_end : Int) -> Bool {
+  let ends : Array[Int] = []
+  self.collect_ends(node, start, ends)
+  let mut i = 0
+  while i < ends.length() {
+    if ends[i] == target_end {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn EcmaBtRegex::is_match(self : EcmaBtRegex, s : String) -> Bool {
+  let cps : Array[Int] = []
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let (cp, nxt) = decode_utf8_cp(s, i)
+    cps.push(cp)
+    i = nxt
+  }
+  let clen = cps.length()
+  let mut start = 0
+  while start <= clen {
+    let exec = BtExec::{
+      cps: cps,
+      len: clen,
+      cap_start: FixedArray::make(self.num_groups + 1, -1),
+      cap_end: FixedArray::make(self.num_groups + 1, -1),
+      fuel: 100000,
+    }
+    if exec.match_seq([self.root], 0, start, [], 0) {
+      return true
+    }
+    start = start + 1
+  }
+  false
+}
+
+///| Compile an ECMA-262 regular expression into `CompiledRegex`.
+fn compile_ecma_regex(pattern : String) -> Result[CompiledRegex, String] {
+  match preprocess_ecma_regex(pattern) {
+    Ok((translated, needs_bt)) => {
+      if needs_bt {
+        match BtParser::parse(pattern) {
+          Ok(bt) => Ok(CompiledRegex::Backtrack(bt))
+          Err(e) => Err(e)
+        }
+      } else {
+        match regex::compile(translated) {
+          Ok(re) => Ok(CompiledRegex::Linear(re))
+          Err(e) => Err(e.message)
+        }
+      }
+    }
+    Err(e) => Err(e)
+  }
+}
+
+///| Test whether `s` matches this compiled ECMA-262 regex (unanchored substring match).
+fn ecma_regex_is_match(re : CompiledRegex, s : String) -> Bool {
+  match re {
+    CompiledRegex::Linear(r) => r.is_match(s)
+    CompiledRegex::Backtrack(bt) => bt.is_match(s)
+  }
+}
+
+///| Check whether `pattern` is a valid ECMA-262 regular expression (`format: "regex"`).
+fn is_valid_ecma_regex(pattern : String) -> Bool {
+  match compile_ecma_regex(pattern) {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
