@@ -1,6 +1,48 @@
 ///| RFC 9112 HTTP/1.1 Request & Response incremental Sans-IO parser with
 ///| Day-1 HTTP Request Smuggling defenses and 256B LUT + 4-byte window BCE hot loops.
 
+///| RFC 9112 §6.3 Transfer-Encoding single coding state transition:
+///| -1 = invalid, 0 = valid non-chunked coding, 1 = chunked seen (must be final).
+#verify
+pub fn te_coding_step(
+  prev_state : Int,
+  is_chunked : Bool,
+  is_known_non_chunked : Bool,
+) -> Int {
+  // If chunked was already seen, NO coding may follow it (neither duplicate chunked nor gzip).
+  if prev_state == 1 {
+    return -1
+  }
+  if is_chunked {
+    return 1
+  }
+  if is_known_non_chunked {
+    return 0
+  }
+  -1
+}
+
+///| RFC 9112 HTTP/1.x minor version digit parser (`0` = Http10, `1` = Http11, `-1` = InvalidVersion).
+#verify
+pub fn parse_http_minor(vminor : Int) -> Int {
+  if vminor == 48 {
+    0
+  } else if vminor >= 49 && vminor <= 57 {
+    1
+  } else {
+    -1
+  }
+}
+
+///| RFC 9112 3-digit HTTP status code decoder (`-1` = InvalidStatus, else `0..999`).
+#verify
+pub fn parse_status_digits(d0 : Int, d1 : Int, d2 : Int) -> Int {
+  if d0 < 48 || d0 > 57 || d1 < 48 || d1 > 57 || d2 < 48 || d2 > 57 {
+    return -1
+  }
+  (d0 - 48) * 100 + (d1 - 48) * 10 + (d2 - 48)
+}
+
 ///| Validate a Transfer-Encoding header value (comma-separated list of known RFC 9112 codings).
 ///| Updates `seen_chunked` and `last_was_chunked` via returned packed state:
 ///| -1 = invalid, 0 = valid no chunked yet, 1 = valid chunked is currently final.
@@ -41,21 +83,19 @@ fn validate_te_value(
     if tok_end <= tok_start {
       return -1
     }
-    // If chunked was already seen, NO coding may follow it (neither duplicate chunked nor gzip).
-    if state == 1 {
-      return -1
-    }
     let tlen = tok_end - tok_start
-    if tlen == 7 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "chunked") {
-      state = 1
-    } else if (tlen == 4 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "gzip")) ||
+    let is_chunked = tlen == 7 &&
+    bytes_eq_lower_ascii(buf, tok_start, tok_end, "chunked")
+    let is_known_non_chunked = (tlen == 4 &&
+      bytes_eq_lower_ascii(buf, tok_start, tok_end, "gzip")) ||
     (tlen == 6 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "x-gzip")) ||
     (tlen == 7 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "deflate")) ||
-    (tlen == 8 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "compress")) {
-      state = 0
-    } else {
+    (tlen == 8 && bytes_eq_lower_ascii(buf, tok_start, tok_end, "compress"))
+    let next_state = te_coding_step(state, is_chunked, is_known_non_chunked)
+    if next_state < 0 {
       return -1
     }
+    state = next_state
     count = count + 1
     if pos >= end {
       break
@@ -206,14 +246,18 @@ fn parse_headers_block(
       let nlen = name_end - name_start
       if nlen == 14 &&
       bytes_eq_lower_ascii(buf, name_start, name_end, "content-length") {
-        if has_te {
+        let rc0 = check_framing_cl(has_te, has_cl, 0L)
+        if rc0 == 1 {
           return Err(HttpError::AmbiguousFraming)
         }
-        if has_cl {
+        if rc0 == 2 {
           return Err(HttpError::InvalidContentLength)
         }
         match parse_strict_u63_decimal(buf, val_start, val_end) {
           Some(v) => {
+            if check_framing_cl(has_te, has_cl, v) != 0 {
+              return Err(HttpError::InvalidContentLength)
+            }
             has_cl = true
             cl_val = v
           }
@@ -221,27 +265,26 @@ fn parse_headers_block(
         }
       } else if nlen == 17 &&
       bytes_eq_lower_ascii(buf, name_start, name_end, "transfer-encoding") {
-        if has_cl {
+        let rc0 = check_framing_te(has_cl, version, 0)
+        if rc0 == 1 {
           return Err(HttpError::AmbiguousFraming)
         }
-        if version_eq(version, Version::Http10) {
+        if rc0 == 2 {
           return Err(HttpError::InvalidTransferEncoding)
         }
         let next_te = validate_te_value(buf, val_start, val_end, te_state)
-        if next_te < 0 {
+        if check_framing_te(has_cl, version, next_te) != 0 {
           return Err(HttpError::InvalidTransferEncoding)
         }
         has_te = true
         te_state = next_te
       } else if is_request && nlen == 4 &&
       bytes_eq_lower_ascii(buf, name_start, name_end, "host") {
+        let host_ok = validate_host_value(buf, val_start, val_end)
+        if check_framing_host(host_count, host_ok) != 0 {
+          return Err(HttpError::InvalidHost)
+        }
         host_count = host_count + 1
-        if host_count > 1 {
-          return Err(HttpError::InvalidHost)
-        }
-        if !validate_host_value(buf, val_start, val_end) {
-          return Err(HttpError::InvalidHost)
-        }
       }
       let hname = buf.slice(name_start, name_end).to_string()
       let hval = if val_end > val_start {
@@ -256,19 +299,23 @@ fn parse_headers_block(
       return Err(HttpError::InvalidHeaderValue)
     }
   }
-  if is_request && version_eq(version, Version::Http11) && host_count == 0 {
+  let fin_rc = check_framing_finalize(
+    has_cl,
+    has_te,
+    te_state,
+    host_count,
+    is_request,
+    version,
+  )
+  if fin_rc == -1 {
     return Err(HttpError::InvalidHost)
   }
-  let framing = if has_te {
-    if is_request && te_state != 1 {
-      return Err(HttpError::InvalidTransferEncoding)
-    }
-    if te_state == 1 {
-      Framing::Chunked
-    } else {
-      Framing::None
-    }
-  } else if has_cl {
+  if fin_rc == -2 {
+    return Err(HttpError::InvalidTransferEncoding)
+  }
+  let framing = if fin_rc == 2 {
+    Framing::Chunked
+  } else if fin_rc == 1 {
     Framing::ContentLength(cl_val)
   } else {
     Framing::None
@@ -409,10 +456,10 @@ pub fn parse_request_at(
   if rem < 8 {
     return Ok(ParseStatus::Partial)
   }
-  let vminor = buf[pos + 7].to_int()
-  let version = if vminor == 48 {
+  let vcode = parse_http_minor(buf[pos + 7].to_int())
+  let version = if vcode == 0 {
     Version::Http10
-  } else if vminor >= 49 && vminor <= 57 {
+  } else if vcode == 1 {
     Version::Http11
   } else {
     return Err(HttpError::InvalidVersion)
@@ -503,10 +550,10 @@ pub fn parse_response_at(
   if rem < 8 {
     return Ok(ParseStatus::Partial)
   }
-  let vminor = buf[pos + 7].to_int()
-  let version = if vminor == 48 {
+  let vcode = parse_http_minor(buf[pos + 7].to_int())
+  let version = if vcode == 0 {
     Version::Http10
-  } else if vminor >= 49 && vminor <= 57 {
+  } else if vcode == 1 {
     Version::Http11
   } else {
     return Err(HttpError::InvalidVersion)
@@ -541,9 +588,14 @@ pub fn parse_response_at(
   if srem < 3 {
     return Ok(ParseStatus::Partial)
   }
-  let status = (buf[pos].to_int() - 48) * 100 +
-  (buf[pos + 1].to_int() - 48) * 10 +
-  (buf[pos + 2].to_int() - 48)
+  let status = parse_status_digits(
+    buf[pos].to_int(),
+    buf[pos + 1].to_int(),
+    buf[pos + 2].to_int(),
+  )
+  if status < 0 {
+    return Err(HttpError::InvalidStatus)
+  }
   pos = pos + 3
   // 3. Optional SP + reason-phrase + CRLF
   if pos >= end {
@@ -610,11 +662,7 @@ pub fn parse_response_at(
       } else {
         ""
       }
-      let eff_framing = if status < 200 || status == 204 || status == 304 {
-        Framing::None
-      } else {
-        framing
-      }
+      let eff_framing = effective_response_framing(status, framing)
       let resp = Response::{
         version: version,
         status: status,
