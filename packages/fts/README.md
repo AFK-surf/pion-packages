@@ -86,3 +86,14 @@ shasum -a 256 "$W"/*.out
 | `pion` | 226.551 | 217.275 | 265.433 | 377585.42 | 25.41 MiB | 0.87x |
 | `sqlite_fts5_c` | 196.257 | 192.415 | 204.213 | 327095.42 | 6.58 MiB | 1.00x (baseline) |
 | `sqlite_fts5_py` | 223.737 | 222.254 | 226.689 | 372895.07 | 16.58 MiB | 0.88x |
+
+## Formal Verification (Lean 4)
+
+24 machine-checked, 0-`sorry` Lean 4 theorems (standard axioms only: `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 15 production `#verify` kernels in `packages/fts/src/`:
+- **UTF-8 & Tokenizer (`proofs/FtsProofs/Utf8AndTokenizer.lean`, 12 theorems)**: Unicode scalar sanitization validity & idempotence, `cp_utf8_len ∈ [1, 4]` & surrogate replacement to 3 bytes, ASCII/Greek/Cyrillic SQLite `unicode61` case-folding (final sigma `ς → σ`, unassigned `U+03A2`, Cyrillic idempotence), RT-2 Kana voicing/punctuation exclusion, ASCII-word vs CJK disjointness, and CamelCase split invariants.
+- **Snippet & Ranking (`proofs/FtsProofs/SnippetAndRanking.lean`, 12 theorems)**: whitespace normalization idempotence, leading context bounds, RT-3 overflow-proof window end (`snippet_win_end` safe even for `max_chars = Int::MAX`), highlight range strict partial order, and deterministic `hit_tiebreak_cmp` reflexivity, antisymmetry, zero-iff, `order_key` desc, and `doc_id` asc invariants.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion harness (`diff -u` 44/44 cases identical).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/fts/proofs/run_proofs.sh
+```
