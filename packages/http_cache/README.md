@@ -76,7 +76,7 @@ sh scripts/verify.sh packages/http_cache
 
 ### 4-Mode `wasm_smoke` Verification
 
-All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`) exit `0` with identical stdout SHA-256 (`aaa18543a78f9a4f90525e09dbebb536183ba091a3b50612aeb9fd2c8e30017d`):
+All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`) exit `0` with identical stdout SHA-256 (`9f4284d25788877adf8c93cdf4dc2fe3bc0f6f8f69fa522a102c8d2e8aa92271`):
 
 ```sh
 pionc run packages/http_cache/wasm_smoke
@@ -87,9 +87,9 @@ pionc run --target wasm32 --release packages/http_cache/wasm_smoke
 
 ## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=1`, `rounds=5`)
 
-Run via `sh packages/http_cache/bench/run_bench.sh` against pure-Rust **`http-cache-semantics 3.0.0` (`--release`)** on 12 realistic YouTube / Twitter(X) / Cloudflare CDN / GitHub API scenarios (`3,912 B × 5,000 = 60,000` policy + `Vary` + conditional revalidation + 304 merge evaluations). Both implementations verify **100% byte-for-byte SHA-256 identity** across the full canonical decision digest (`381d374237a9503d7bf37d00fce5073ac74741213a17cefb98a1264cc44f229e`):
+Run via `sh packages/http_cache/bench/run_bench.sh` against pure-Rust **`http-cache-semantics 3.0.0` (`--release`)** on 12 realistic YouTube / Twitter(X) / Cloudflare CDN / GitHub API scenarios (`3,912 B × 5,000 = 60,000` policy + `Vary` + conditional revalidation + 304 merge evaluations), with Rust's `http::Request` / `http::Response` objects **prebuilt once outside the timed loop** for equal-footing comparison. Both implementations verify **100% byte-for-byte SHA-256 identity** across the full canonical decision digest (`381d374237a9503d7bf37d00fce5073ac74741213a17cefb98a1264cc44f229e`):
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `http-cache-semantics 3.0.0`) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `http-cache-semantics 3.0.0` prebuilt) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 83.382 | 80.814 | 85.177 | 234.58 | 1389.71 | 2.03 MiB | **1.34x** |
-| `rust_http_cache_semantics` (`3.0.0`, `--release`) | 111.693 | 109.364 | 120.333 | 175.12 | 1861.55 | 2.53 MiB | 1.00x (baseline) |
+| `pion` (`--release`) | 65.263 | 63.918 | 70.426 | 299.71 | 1087.72 | 2.05 MiB | **1.14x** |
+| `rust_http_cache_semantics_prebuilt` (`3.0.0`, `--release`) | 74.413 | 71.017 | 78.214 | 262.86 | 1240.22 | 2.50 MiB | 1.00x (baseline) |
