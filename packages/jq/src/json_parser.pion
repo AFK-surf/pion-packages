@@ -1,0 +1,455 @@
+///| Iterative strict RFC 8259 JSON parser for `packages/jq`.
+///| - O(1) call stack (explicit heap stack; safe for 10,000+ nesting on Wasm32).
+///| - Lossless exact integers (`JqVal::Int` / `JqVal::BigInt`).
+///| - Deduplicates object keys with LastWins semantics via seeded `ObjHashIndex`.
+
+import "json5"
+
+enum JsonFrame {
+  Arr(Array[JqVal])
+  Obj(Array[(String, JqVal)], Option[ObjHashIndex], String)
+}
+
+fn json_skip_ws(src : String, start : Int) -> Int {
+  let n = src.length()
+  let mut i = start
+  while i < n {
+    let b = src.code_unit_at(i)
+    if b == 32 || b == 9 || b == 10 || b == 13 {
+      i = i + 1
+    } else {
+      break
+    }
+  }
+  i
+}
+
+fn json_parse_string(src : String, start : Int) -> Result[(String, Int), JqError] {
+  let n = src.length()
+  if start >= n || src.code_unit_at(start) != 34 {
+    return Err(JqError::InvalidJson("expected '\"'"))
+  }
+  let mut i = start + 1
+  // Fast path: scan until '"' or '\' or control/invalid UTF-8
+  let mut fast = true
+  while i < n {
+    let b = src.code_unit_at(i)
+    if b == 34 {
+      return Ok((src.slice(start + 1, i), i + 1))
+    }
+    if b == 92 || b < 0x20 || b >= 0x80 {
+      fast = false
+      break
+    }
+    i = i + 1
+  }
+  if fast {
+    return Err(JqError::InvalidJson("unterminated string"))
+  }
+  let sb = StringBuilder::new()
+  if i > start + 1 {
+    sb.write_string(src.slice(start + 1, i))
+  }
+  while i < n {
+    let b = src.code_unit_at(i)
+    if b == 34 {
+      return Ok((sb.to_string(), i + 1))
+    }
+    if b == 92 {
+      if i + 1 >= n {
+        return Err(JqError::InvalidJson("unterminated escape"))
+      }
+      let esc = src.code_unit_at(i + 1)
+      if esc == 34 {
+        sb.write_byte(34.to_byte())
+        i = i + 2
+      } else if esc == 92 {
+        sb.write_byte(92.to_byte())
+        i = i + 2
+      } else if esc == 47 {
+        sb.write_byte(47.to_byte())
+        i = i + 2
+      } else if esc == 98 {
+        sb.write_byte(8.to_byte())
+        i = i + 2
+      } else if esc == 102 {
+        sb.write_byte(12.to_byte())
+        i = i + 2
+      } else if esc == 110 {
+        sb.write_byte(10.to_byte())
+        i = i + 2
+      } else if esc == 114 {
+        sb.write_byte(13.to_byte())
+        i = i + 2
+      } else if esc == 116 {
+        sb.write_byte(9.to_byte())
+        i = i + 2
+      } else if esc == 117 {
+        if i + 6 > n {
+          return Err(JqError::InvalidJson("incomplete \\uXXXX escape"))
+        }
+        let u1 = match scan_hex4(src, i + 2) {
+          Ok(v) => v
+          Err(_) => return Err(JqError::InvalidJson("invalid \\uXXXX escape"))
+        }
+        i = i + 6
+        if u1 >= 0xD800 && u1 <= 0xDBFF {
+          if i + 6 <= n && src.code_unit_at(i) == 92 && src.code_unit_at(i + 1) == 117 {
+            let u2 = match scan_hex4(src, i + 2) {
+              Ok(v) => v
+              Err(_) => return Err(JqError::InvalidJson("invalid \\uXXXX surrogate"))
+            }
+            if u2 >= 0xDC00 && u2 <= 0xDFFF {
+              let cp = 0x10000 + ((u1 - 0xD800) << 10) + (u2 - 0xDC00)
+              write_utf8_cp(sb, cp)
+              i = i + 6
+            } else {
+              write_utf8_cp(sb, 0xFFFD)
+            }
+          } else {
+            write_utf8_cp(sb, 0xFFFD)
+          }
+        } else if u1 >= 0xDC00 && u1 <= 0xDFFF {
+          write_utf8_cp(sb, 0xFFFD)
+        } else {
+          write_utf8_cp(sb, u1)
+        }
+      } else {
+        return Err(JqError::InvalidJson("invalid escape sequence"))
+      }
+    } else if b < 0x20 {
+      return Err(JqError::InvalidJson("unescaped control character in string"))
+    } else if b < 0x80 {
+      sb.write_byte(b.to_byte())
+      i = i + 1
+    } else {
+      // Validate UTF-8 multi-byte sequence
+      if (b & 0xE0) == 0xC0 {
+        if i + 1 >= n || b < 0xC2 {
+          return Err(JqError::InvalidJson("invalid UTF-8 sequence"))
+        }
+        let b1 = src.code_unit_at(i + 1)
+        if (b1 & 0xC0) != 0x80 {
+          return Err(JqError::InvalidJson("invalid UTF-8 continuation"))
+        }
+        sb.write_byte(b.to_byte())
+        sb.write_byte(b1.to_byte())
+        i = i + 2
+      } else if (b & 0xF0) == 0xE0 {
+        if i + 2 >= n {
+          return Err(JqError::InvalidJson("truncated UTF-8 sequence"))
+        }
+        let b1 = src.code_unit_at(i + 1)
+        let b2 = src.code_unit_at(i + 2)
+        if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+          return Err(JqError::InvalidJson("invalid UTF-8 continuation"))
+        }
+        if (b == 0xE0 && b1 < 0xA0) || (b == 0xED && b1 >= 0xA0) {
+          return Err(JqError::InvalidJson("invalid UTF-8 overlong or surrogate"))
+        }
+        sb.write_byte(b.to_byte())
+        sb.write_byte(b1.to_byte())
+        sb.write_byte(b2.to_byte())
+        i = i + 3
+      } else if (b & 0xF8) == 0xF0 {
+        if i + 3 >= n || b > 0xF4 {
+          return Err(JqError::InvalidJson("invalid UTF-8 4-byte sequence"))
+        }
+        let b1 = src.code_unit_at(i + 1)
+        let b2 = src.code_unit_at(i + 2)
+        let b3 = src.code_unit_at(i + 3)
+        if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+          return Err(JqError::InvalidJson("invalid UTF-8 continuation"))
+        }
+        if (b == 0xF0 && b1 < 0x90) || (b == 0xF4 && b1 >= 0x90) {
+          return Err(JqError::InvalidJson("invalid UTF-8 range"))
+        }
+        sb.write_byte(b.to_byte())
+        sb.write_byte(b1.to_byte())
+        sb.write_byte(b2.to_byte())
+        sb.write_byte(b3.to_byte())
+        i = i + 4
+      } else {
+        return Err(JqError::InvalidJson("invalid UTF-8 lead byte"))
+      }
+    }
+  }
+  Err(JqError::InvalidJson("unterminated string"))
+}
+
+fn json_parse_number(src : String, start : Int) -> Result[(JqVal, Int), JqError] {
+  let n = src.length()
+  let mut i = start
+  if i < n && src.code_unit_at(i) == 45 {
+    i = i + 1
+  }
+  if i >= n {
+    return Err(JqError::InvalidJson("invalid number"))
+  }
+  let c0 = src.code_unit_at(i)
+  if c0 == 48 {
+    i = i + 1
+    if i < n && is_ascii_digit(src.code_unit_at(i)) {
+      return Err(JqError::InvalidJson("leading zero in JSON number"))
+    }
+  } else if c0 >= 49 && c0 <= 57 {
+    i = i + 1
+    while i < n && is_ascii_digit(src.code_unit_at(i)) {
+      i = i + 1
+    }
+  } else {
+    return Err(JqError::InvalidJson("invalid number"))
+  }
+  let mut is_float = false
+  if i < n && src.code_unit_at(i) == 46 {
+    is_float = true
+    i = i + 1
+    if i >= n || !is_ascii_digit(src.code_unit_at(i)) {
+      return Err(JqError::InvalidJson("expected digit after decimal point"))
+    }
+    while i < n && is_ascii_digit(src.code_unit_at(i)) {
+      i = i + 1
+    }
+  }
+  if i < n && (src.code_unit_at(i) == 101 || src.code_unit_at(i) == 69) {
+    is_float = true
+    i = i + 1
+    if i < n && (src.code_unit_at(i) == 43 || src.code_unit_at(i) == 45) {
+      i = i + 1
+    }
+    if i >= n || !is_ascii_digit(src.code_unit_at(i)) {
+      return Err(JqError::InvalidJson("expected digit in exponent"))
+    }
+    while i < n && is_ascii_digit(src.code_unit_at(i)) {
+      i = i + 1
+    }
+  }
+  let raw = src.slice(start, i)
+  if !is_float {
+    if raw == "-0" {
+      return Ok((JqVal::Float(-0.0), i))
+    }
+    return Ok((jq_int_from_decimal(raw), i))
+  }
+  match json5::parse_with_options(raw, json5::ParseOptions::default()) {
+    Ok(json5::Json5Value::Number(x)) => Ok((JqVal::Float(x), i))
+    _ => Err(JqError::InvalidJson("invalid float number: " + raw))
+  }
+}
+
+fn json_obj_insert_last_wins(
+  entries : Array[(String, JqVal)],
+  hi_opt : Option[ObjHashIndex],
+  key : String,
+  v : JqVal,
+) -> Option[ObjHashIndex] {
+  match hi_opt {
+    Some(hi) => {
+      let existing = hi.get(key)
+      if existing >= 0 {
+        entries[existing] = (key, v)
+      } else {
+        let idx = entries.length()
+        let _ = hi.upsert(key, idx)
+        entries.push((key, v))
+      }
+      Some(hi)
+    }
+    None => {
+      let n = entries.length()
+      if n < 16 {
+        let mut j = 0
+        while j < n {
+          let (ek, _) = entries[j]
+          if ek == key {
+            entries[j] = (key, v)
+            return None
+          }
+          j = j + 1
+        }
+        entries.push((key, v))
+        None
+      } else {
+        let hi = ObjHashIndex::new(32)
+        let mut j = 0
+        while j < n {
+          let (ek, _) = entries[j]
+          let _ = hi.upsert(ek, j)
+          j = j + 1
+        }
+        let existing = hi.get(key)
+        if existing >= 0 {
+          entries[existing] = (key, v)
+        } else {
+          let idx = entries.length()
+          let _ = hi.upsert(key, idx)
+          entries.push((key, v))
+        }
+        Some(hi)
+      }
+    }
+  }
+}
+
+///| Parse strict RFC 8259 JSON iteratively up to `max_depth`.
+fn parse_json_to_jqval(src : String, max_depth : Int) -> Result[JqVal, JqError] {
+  let n = src.length()
+  let stack : Array[JsonFrame] = []
+  let mut i = json_skip_ws(src, 0)
+  if i >= n {
+    return Err(JqError::InvalidJson("empty JSON input"))
+  }
+  while true {
+    // Expect a value at `i`
+    if i >= n {
+      return Err(JqError::InvalidJson("unexpected end of JSON"))
+    }
+    let b = src.code_unit_at(i)
+    let mut parsed_val : Option[JqVal] = None
+    if b == 91 {
+      // '['
+      if stack.length() >= max_depth {
+        return Err(JqError::LimitExceeded("max JSON parse depth exceeded"))
+      }
+      i = json_skip_ws(src, i + 1)
+      if i < n && src.code_unit_at(i) == 93 {
+        i = i + 1
+        parsed_val = Some(JqVal::Array([]))
+      } else {
+        stack.push(JsonFrame::Arr([]))
+        continue
+      }
+    } else if b == 123 {
+      // '{'
+      if stack.length() >= max_depth {
+        return Err(JqError::LimitExceeded("max JSON parse depth exceeded"))
+      }
+      i = json_skip_ws(src, i + 1)
+      if i < n && src.code_unit_at(i) == 125 {
+        i = i + 1
+        parsed_val = Some(JqVal::Object(jq_obj_from_entries([])))
+      } else {
+        let (key, next_i) = match json_parse_string(src, i) {
+          Ok(r) => r
+          Err(e) => return Err(e)
+        }
+        i = json_skip_ws(src, next_i)
+        if i >= n || src.code_unit_at(i) != 58 {
+          return Err(JqError::InvalidJson("expected ':' after object key"))
+        }
+        i = json_skip_ws(src, i + 1)
+        stack.push(JsonFrame::Obj([], None, key))
+        continue
+      }
+    } else if b == 34 {
+      let (s, next_i) = match json_parse_string(src, i) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      i = next_i
+      parsed_val = Some(JqVal::Str(s))
+    } else if b == 110 {
+      // null
+      if i + 4 <= n && src.slice(i, i + 4) == "null" {
+        i = i + 4
+        parsed_val = Some(JqVal::Null)
+      } else {
+        return Err(JqError::InvalidJson("invalid token"))
+      }
+    } else if b == 116 {
+      // true
+      if i + 4 <= n && src.slice(i, i + 4) == "true" {
+        i = i + 4
+        parsed_val = Some(JqVal::Bool(true))
+      } else {
+        return Err(JqError::InvalidJson("invalid token"))
+      }
+    } else if b == 102 {
+      // false
+      if i + 5 <= n && src.slice(i, i + 5) == "false" {
+        i = i + 5
+        parsed_val = Some(JqVal::Bool(false))
+      } else {
+        return Err(JqError::InvalidJson("invalid token"))
+      }
+    } else if b == 45 || is_ascii_digit(b) {
+      let (nv, next_i) = match json_parse_number(src, i) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      i = next_i
+      parsed_val = Some(nv)
+    } else {
+      return Err(JqError::InvalidJson("unexpected character in JSON"))
+    }
+    // Unwind completed values into parent containers
+    let mut cur_val = match parsed_val {
+      Some(v) => v
+      None => return Err(JqError::InvalidJson("internal parser error"))
+    }
+    let mut need_next_val = false
+    while stack.length() > 0 {
+      let top = match stack.pop() {
+        Some(f) => f
+        None => break
+      }
+      match top {
+        JsonFrame::Arr(items) => {
+          items.push(cur_val)
+          i = json_skip_ws(src, i)
+          if i >= n {
+            return Err(JqError::InvalidJson("unterminated array"))
+          }
+          let sep = src.code_unit_at(i)
+          if sep == 44 {
+            i = json_skip_ws(src, i + 1)
+            stack.push(JsonFrame::Arr(items))
+            need_next_val = true
+            break
+          } else if sep == 93 {
+            i = i + 1
+            cur_val = JqVal::Array(items)
+          } else {
+            return Err(JqError::InvalidJson("expected ',' or ']' in array"))
+          }
+        }
+        JsonFrame::Obj(entries, hi_opt, key) => {
+          let next_hi = json_obj_insert_last_wins(entries, hi_opt, key, cur_val)
+          i = json_skip_ws(src, i)
+          if i >= n {
+            return Err(JqError::InvalidJson("unterminated object"))
+          }
+          let sep = src.code_unit_at(i)
+          if sep == 44 {
+            i = json_skip_ws(src, i + 1)
+            let (next_key, next_i) = match json_parse_string(src, i) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            i = json_skip_ws(src, next_i)
+            if i >= n || src.code_unit_at(i) != 58 {
+              return Err(JqError::InvalidJson("expected ':' after object key"))
+            }
+            i = json_skip_ws(src, i + 1)
+            stack.push(JsonFrame::Obj(entries, next_hi, next_key))
+            need_next_val = true
+            break
+          } else if sep == 125 {
+            i = i + 1
+            cur_val = JqVal::Object(JqObj::{ entries: entries, index: next_hi })
+          } else {
+            return Err(JqError::InvalidJson("expected ',' or '}' in object"))
+          }
+        }
+      }
+    }
+    if !need_next_val {
+      i = json_skip_ws(src, i)
+      if i != n {
+        return Err(JqError::InvalidJson("trailing data after JSON value"))
+      }
+      return Ok(cur_val)
+    }
+  }
+  Err(JqError::InvalidJson("unexpected end of JSON"))
+}
