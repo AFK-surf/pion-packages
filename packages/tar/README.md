@@ -60,6 +60,47 @@ pub fn example() -> Result[Array[tar::Entry], tar::TarError] {
 - **Differential verification**: 154/154 archives (44 Go testdata + 110 adversarial corpus) read identically to Go 1.27.3 `archive/tar` (Format field ignored), and 303/303 writer specs match Go byte-for-byte.
 - **Wasm32 smoke test**: `packages/tar/wasm_smoke/` builds and runs cleanly with `pionc build --release --target wasm32` and `pionc run --release --target wasm32`.
 
+## Formal Verification (Lean 4)
+
+The core security and numeric kernels of `packages/tar` (`packages/tar/src/{path,format,types}.pion`) are annotated with `#verify` and formally verified end-to-end in Lean 4 (`v4.36.0-rc2` + Aeneas + `PionLean`) directly over the extracted `Tar.Funs` definitions (**0 `sorry`**, **0 `admit`**, **0 `native_decide`**, **0 `bv_decide`**, strictly standard axioms `propext`, `Classical.choice`, `Quot.sound` only).
+
+Reproduce all proofs, axiom audits, and Lean-vs-Native differential checks (38 cases, `diff -u` exit 0) with zero worktree pollution:
+
+```sh
+sh packages/tar/proofs/run_proofs.sh
+```
+
+### Verified Theorem Suite (`packages/tar/proofs/TarProofs.lean`, 34 audited theorems)
+
+1. **Zip-Slip & Extraction Path Safety (`packages/tar/src/path.pion`)**:
+   - `validate_extract_path_bytes_sound`: Master safety theorem over the production `validate_extract_path_bytes` kernel (directly invoked by `clean_extract_path`) proving that any accepted path is simultaneously:
+     - non-empty (`b.val.length > 0`);
+     - non-absolute (no leading `'/'` or `'\\'`);
+     - free of NUL bytes (`0x00`) and `':'` (`0x3A`, blocking Windows drive letters `[A-Za-z]:` and NTFS Alternate Data Streams);
+     - free of any parent-directory traversal segment `".."` across both `'/'` and `'\\'` separators (`validate_extract_path_rejects_dotdot`);
+     - free of any Windows reserved device name segment (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`);
+     - guaranteed to contain at least one real (non-empty, non-`"."`) segment.
+   - `is_windows_reserved_name_total`, `is_windows_reserved_name_sound3`: Totality and case-insensitive soundness (including trailing spaces and `.ext` suffixes).
+   - `ascii_upper_spec`, `ascii_upper_idempotent`, `is_path_sep_iff`, `is_dotdot_segment_spec`, `has_invalid_path_byte_spec`.
+2. **TAR 512-Byte Block Alignment & Padding Arithmetic (`packages/tar/src/format.pion`)**:
+   - `block_padding_total`, `block_padding_zero`: `block_padding` never panics and always yields `p ∈ [0, 512)` with `block_padding 0 = 0`.
+   - `padded_size_spec`, `padded_size_zero`, `padded_size_mono`, `padded_size_idempotent`: For all `0 ≤ size ≤ 2^63 - 512`, `padded_size` never overflows, always yields a 512-byte multiple (`r % 512 = 0`) satisfying `size ≤ r < size + 512`, is monotone, and is idempotent.
+3. **TAR Numeric Encoding/Decoding — Octal & GNU Base-256 (`packages/tar/src/format.pion`)**:
+   - `fits_in_octal_spec`, `fits_in_octal_neg_false`, `fits_in_base256_spec`, `fits_in_octal_imp_fits_in_base256`: Exact capacity bounds for all widths and `Int64` values; negative integers never fit in octal; every octal-fitting integer fits in base-256.
+   - `parse_octal_slice_fast_nonneg`: On all standard TAR header fields (`width ≤ 20`, covering 8-byte and 12-byte fields), `parse_octal_slice` never panics and every `Ok v` satisfies `0 ≤ v < 2^60` (never silently wraps negative to bypass `max_entry_size`).
+   - `parse_numeric_slice_base256_sign`: For GNU base-256 fields (`b[start] & 0x80 ≠ 0`), `parse_numeric_slice` never panics, positive headers (`& 0x40 = 0`) always decode to `v ≥ 0`, and negative headers (`& 0x40 ≠ 0`) always decode to `v < 0`.
+   - `format_numeric_invalid_width`, `format_numeric_spec`: Totality, rejection of `width ≤ 0`, and exact `Ok` length/capacity characterization (`out.length = width ↔ fits_in_base256 width x`).
+4. **Typeflags & `TarFormat` Soundness (`packages/tar/src/types.pion`)**:
+   - `is_header_only_type_total`, `is_header_only_type_iff`, `typeflag_classification`: Exact characterization of all 14 TAR typeflag constants.
+   - `format_equals_iff`, `format_equals_refl`, `format_equals_symm`, `format_equals_trans`: Equivalence relation and exact equality decision on `TarFormat`.
+
+### Proof Artifacts
+
+- `packages/tar/proofs/TarProofs.lean`: Full Lean 4 proof suite over `Tar.Funs`.
+- `packages/tar/proofs/CheckAxioms.lean`: `#print axioms` audit across all 34 main theorems (verified: only `propext`, `Classical.choice`, `Quot.sound`).
+- `packages/tar/proofs/EvalDiff.lean`: `#guard` + `#eval` test suite over extracted `Tar.Funs`, cross-checked byte-for-byte (`diff -u`) against Pion native execution by `run_proofs.sh`.
+- `packages/tar/proofs/run_proofs.sh`: Self-contained verification script using `/private/tmp/pion-lean-tar` (zero git worktree pollution).
+
 ## Head-to-Head Benchmarks
 
 Measured on **Darwin arm64** (`AFK-surf/pion@69a0189d`) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved) against Go 1.27.3 stdlib `archive/tar` and Rust `tar` 0.4.46 (`--release`, LTO), with mandatory byte-for-byte stdout SHA-256 verification. All three read benchmarks compute FNV-1a over **every payload byte**.

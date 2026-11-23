@@ -27,6 +27,46 @@ pionc build --release --target wasm32 -o /tmp/uuid_wasm_smoke.wasm packages/uuid
 node "$HOME/.pion/share/pion/pion_wasm_rt.mjs" /tmp/uuid_wasm_smoke.wasm
 ```
 
+## Formal Verification (Lean 4)
+
+The pure 128-bit ordering, RFC 9562 version/variant bitfield, ULID timestamp/random bijection & monotonic increment, and single-character hexadecimal / Crockford Base32 codec kernels in `packages/uuid/src/{types,uuid,ulid}.pion` are marked `#verify` and extracted directly into Lean 4 (`Uuid.Types`, `Uuid.Funs`) via `pionc extract-lean` (on top of `Aeneas.Std` and `PionLean`, Lean `v4.36.0-rc2`, Aeneas `1dc8ad31b1`, with `0` external axioms).
+
+### Reproducing the Proofs
+
+```sh
+sh packages/uuid/proofs/run_proofs.sh
+```
+
+The script builds an isolated Lake project under `/private/tmp/pion-lean-uuid` (zero git worktree pollution), runs `pionc extract-lean --json`, builds `PionLean Uuid UuidProofs`, rejects any `sorry`/`admit`/`bv_decide`/`native_decide`, audits `#print axioms` across all main theorems, and runs `#guard` + `#eval` differential checks against native Pion execution (`diff -u` exit 0).
+
+### Verified Theorems (`packages/uuid/proofs/UuidProofs.lean`)
+
+All **55** theorems are kernel-checked with **0 `sorry` / `admit` / `native_decide` / `bv_decide`** and depend strictly on the three standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`), verified by `packages/uuid/proofs/CheckAxioms.lean`:
+
+1. **128-bit Unsigned Strict Total Order & `Uuid` / `Ulid` Equivalence (`Uuid.compare`, `Ulid.compare`, `uuid_lt`, `ulid_lt`, `Uuid.eq`, `Ulid.eq`)**:
+   - `uuid_compare_total`, `ulid_compare_total`: panic/trap-free totality across the full `2^128` domain, returning `r ∈ {-1, 0, 1}`.
+   - `uuid_compare_spec_lt`, `uuid_compare_spec_gt`, `uuid_compare_spec_eq` (and `ulid_compare_spec_*`): exact equivalence with the mathematical 128-bit unsigned integer `hi * 2^64 + lo` (`<`, `>`, `=`), immune to signed `Int64` MSB-flip bugs.
+   - `uuid_compare_refl`, `uuid_compare_antisymm`, `uuid_compare_trans` (and `ulid_compare_*`): full strict total order axioms.
+   - `uuid_lt_iff_compare`, `ulid_lt_iff_compare`: exact equivalence between sorting predicate and `compare`.
+   - `uuid_from_as_u64_pair`, `uuid_as_from_u64_pair`, `ulid_from_as_u64_pair`, `ulid_as_from_u64_pair`, `ulid_uuid_roundtrip`, `uuid_ulid_roundtrip`: lossless 128-bit conversions.
+   - `uuid_nil_min`, `uuid_max_max`, `ulid_nil_min`, `ulid_max_max`, `uuid_is_nil_iff`, `uuid_is_max_iff`: `nil` is the global minimum and `max` is the global maximum across all `2^128` values.
+2. **RFC 9562 Version (bits 48..51) & Variant (bits 64..65) Bitfield Invariants (`set_version_and_variant`, `Uuid.new_v4_from_u64_pair`, `Uuid.new_v7_from_parts`, `Uuid.new_v8`, `Uuid.version`, `Uuid.variant`, `Uuid.timestamp_ms`)**:
+   - `set_version_and_variant_variant`: for all `2^128` payloads and all `ver : UInt64`, `Uuid.variant` is always `Rfc4122`.
+   - `set_version_and_variant_version_num`: `Uuid.version_num` always equals `ver & 0xF`.
+   - `new_v4_from_u64_pair_spec`, `set_version_and_variant_v3_v5_v8`, `new_v8_spec`: RFC 9562 v3 (`Md5`), v4 (`Random`), v5 (`Sha1`), and v8 (`Custom`) constructors always satisfy `variant = Rfc4122` and exact expected `version`.
+   - `new_v7_from_parts_spec`: for all `0 ≤ ts_ms < 2^48` and all random payloads, `Uuid.new_v7_from_parts` yields `variant = Rfc4122`, `version = SortRand` (v7), and exact `timestamp_ms = some ts_ms`.
+   - `new_v7_from_parts_strict_monotonic`: for all `0 ≤ ts1 < ts2 < 2^48` and any random payloads, `Uuid.compare (v7 ts1 ...) (v7 ts2 ...) = ok (-1)` (**strict UUIDv7 time-order monotonicity**).
+   - `uuid_nil_version`, `uuid_max_version`: `Uuid.nil` reports `Nil` and `Uuid.max` reports `Max`.
+3. **ULID 48-bit Timestamp + 80-bit Random Bijection, Monotonicity & Increment (`Ulid.from_parts`, `Ulid.timestamp_ms`, `Ulid.random_parts`, `Ulid.increment`)**:
+   - `ulid_from_parts_roundtrip`, `ulid_from_parts_reject_invalid`: exact `(timestamp_ms, random_parts)` roundtrip on `0 ≤ ts_ms < 2^48` and `InvalidTimestamp` rejection outside range.
+   - `ulid_parts_bijection`: decomposing any `Ulid` into `(timestamp_ms, random_parts)` and reconstructing via `Ulid.from_parts` recovers the exact original `Ulid`.
+   - `ulid_from_parts_strict_monotonic`: for all `0 ≤ ts1 < ts2 < 2^48` and any 80-bit random payloads, `Ulid.compare u1 u2 = ok (-1)`.
+   - `ulid_increment_ok`, `ulid_increment_overflow`: `Ulid.increment` strictly increments `ulidVal` by `+1` while preserving `timestamp_ms`, and returns `Err(Overflow)` on 80-bit random saturation without carrying into the timestamp.
+4. **Hexadecimal & Crockford Base32 Single-Character Codecs (`hex_val_char`, `hex_char_lower`, `hex_char_upper`, `crockford_val`, `crockford_val_strict`, `crockford_encode_digit`)**:
+   - `hex_lower_roundtrip`, `hex_upper_roundtrip`, `hex_val_char_case_insensitive`, `hex_val_char_range`: exact roundtrip for all nibbles `0..15`, case-insensitivity, and bounded output.
+   - `crockford_encode_decode_roundtrip`, `crockford_encode_decode_strict_roundtrip`: exact roundtrip for all 5-bit values `0..31` in both standard and strict modes.
+   - `crockford_aliases`, `crockford_strict_rejects_aliases`, `crockford_case_insensitive`, `crockford_rejects_invalid`: `I`/`i`/`L`/`l` → `1`, `O`/`o` → `0` in standard mode, rejected in strict mode, case-insensitive on ASCII letters, and rejects `U`/`u`, control characters, symbols, and non-ASCII inputs.
+
 ## Head-to-Head Benchmarks (Pion Native & Wasm32 vs Rust `uuid` 1.29.3 + `ulid` 1.2.1 `--release`)
 
 Measured on `Darwin arm64` with `pionc 0.1.0 (arm64_apple, self-hosted)` (`AFK-surf/pion@69a0189d`) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification). Both the **idiomatic typed API** (`Uuid::parse_slice`/`Ulid::parse_slice` + `Uuid::sort`/`Ulid::sort` + `encode_*` or `to_hyphenated()`/`to_string()`) and the **raw batch API** (`parse_*_lines_raw` + `sort_u128_pairs_raw` + `encode_*_raw`) are reported side by side.

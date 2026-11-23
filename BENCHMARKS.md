@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 35 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7 + Wave 8）
+## 基准总榜（v0.2.0 + Wave 4–8 + `base64` + `effect` + `crypto` + Farview 沉淀波 1 + `fts`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -166,6 +166,36 @@
 | `css` | 单遍流式 `parse_stylesheet()` vs `lightningcss` 解析（5 语料） | 1.34–2.09 MB × 3 | 37.8–91.2 ms | 105.4–449.6 ms (`lightningcss`) | **1.62x–4.93x** | **8.2–41.2 MB** | 34.6–202.6 MB |
 | `css` | 单遍流式 `minify()` vs `lightningcss` 压缩器（5 语料；后者另做类型化属性优化） | 1.34–2.09 MB × 3 | 67.8–125.2 ms | 125.3–569.7 ms (`lightningcss`) | **1.26x–4.55x** | **5.7–7.6 MB** | 35.1–203.4 MB |
 | `css` | 单遍流式 `parse_stylesheet()` vs Node `css-tree` 解析（5 语料） | 1.34–2.09 MB × 3 | 37.8–91.2 ms | 442.8–1220.2 ms (`css-tree`) | **5.19x–19.86x** | **8.2–41.2 MB** | 164.1–448.6 MB |
+| `base64` | `b64_encode` Base64 编码 4 MiB × 64 | 268,435,456 B | 239.2 ms | 100.7 ms (Rust) / 122.6 ms (Go) | 0.42x (vs Rust) · 0.51x (vs Go) | 16.4 MiB | 11.1 / 31.7 MiB (Rust / Go) |
+| `base64` | `b64_decode` Base64 严格解码 4 MiB × 64 | 268,435,456 B | 228.9 ms | 99.0 ms (Rust) / 110.5 ms (Go) | 0.43x (vs Rust) · 0.48x (vs Go) | 20.5 MiB | 15.1 / 32.5 MiB (Rust / Go) |
+| `base64` | `url_encode` Base64URL 编码 4 MiB × 64 | 268,435,456 B | 228.6 ms | 99.3 ms (Rust) / 122.4 ms (Go) | 0.43x (vs Rust) · 0.54x (vs Go) | 16.5 MiB | 11.1 / 26.8 MiB (Rust / Go) |
+| `base64` | `url_decode` Base64URL 严格解码 4 MiB × 64 | 268,435,456 B | 226.5 ms | 94.6 ms (Rust) / 106.7 ms (Go) | 0.42x (vs Rust) · 0.47x (vs Go) | 20.5 MiB | 15.1 / 30.4 MiB (Rust / Go) |
+| `base64` | `b32_encode` Base32 编码 4 MiB × 64 | 268,435,456 B | 253.3 ms | 113.2 ms (Rust) / 118.6 ms (Go) | 0.45x (vs Rust) · 0.47x (vs Go) | 18.6 MiB | 12.2 / 29.9 MiB (Rust / Go) |
+| `base64` | `b32_decode` Base32 严格解码 4 MiB × 64 | 268,435,456 B | 253.1 ms | 110.9 ms (Rust) / 642.3 ms (Go) | 0.44x (vs Rust) · **2.54x** (vs Go) | 22.6 MiB | 16.2 / 49.1 MiB (Rust / Go) |
+| `base64` | `hex_encode` Hex 编码 4 MiB × 64 | 268,435,456 B | 300.7 ms | 511.6 ms (Rust) / 209.7 ms (Go) | **1.70x** (vs Rust) · 0.70x (vs Go) | 21.8 MiB | 13.8 / 66.3 MiB (Rust / Go) |
+| `base64` | `hex_decode` Hex 解码 4 MiB × 64 | 268,435,456 B | 315.7 ms | 1449.4 ms (Rust) / 185.1 ms (Go) | **4.59x** (vs Rust) · 0.59x (vs Go) | 25.8 MiB | 20.0 / 31.4 MiB (Rust / Go) |
+| `effect` | W1 有界队列乒乓（cap = 16） | 50,000 msgs | 18.318 ms | 17.479 ms (Go) / 57.203 ms (Node) | 0.95x (vs Go) · **3.12x** (vs Node) | **1.83 MiB** | 4.59 / 48.62 MiB (Go / Node) |
+| `effect` | W2 虚拟时钟定时器调度（Pion 为完整结构化纤程，基线为裸最小堆，见明细） | 20,000 timers | 47.402 ms | 18.574 ms (Go) / 58.455 ms (Node) | 0.39x (vs Go) · **1.23x** (vs Node) | 28.23 MiB | 5.95 / 49.86 MiB (Go / Node) |
+| `effect` | W3 结构化扇出汇合（2,500 × 4） | 10,000 fibers | 19.481 ms | 18.090 ms (Go) / 51.110 ms (Node) | 0.93x (vs Go) · **2.62x** (vs Node) | **1.84 MiB** | 5.42 / 45.16 MiB (Go / Node) |
+| `crypto` | SHA-256 流式哈希 | 16 MiB | 93.978 ms | 15.941 ms (Go stdlib) | 0.17x | **1.80 MiB** | 4.66 MiB |
+| `crypto` | SHA-512 流式哈希 | 16 MiB | 55.985 ms | 18.779 ms (Go stdlib) | 0.34x | **1.80 MiB** | 4.72 MiB |
+| `crypto` | HMAC-SHA256 | 50,000 × 256 B | 122.492 ms | 27.119 ms (Go stdlib) | 0.22x | **1.75 MiB** | 11.16 MiB |
+| `crypto` | Ed25519 签名 + 验签 | 200 + 200 ops | 44.075 ms | 16.478 ms (Go stdlib) | 0.37x | **1.83 MiB** | 4.78 MiB |
+| `brotli` | Web HTML/CSS/JS/JSON 解压（2 MiB q6 × 10） | 20 MiB | 34.820 ms | 25.524 ms (`rust_brotli`) / 24.281 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.70x (vs C) | — | — |
+| `brotli` | WOFF2 字体载荷解压（1 MiB q11 × 10） | 10 MiB | 33.678 ms | 24.419 ms (`rust_brotli`) / 25.004 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.74x (vs C) | — | — |
+| `brotli` | 小包批量解压（512 pkts q5 × 10） | 5,120 pkts | 43.355 ms | 69.620 ms (`rust_brotli`) / 35.054 ms (`c_brotlidec`) | **1.61x** (vs Rust) · 0.81x (vs C) | — | — |
+| `unicode_bidi` | Pure LTR 快路径（40k ops） | 3.98 MB | 63.711 ms | 68.927 ms (`rust_unicode_bidi`) | **1.08x** | — | — |
+| `unicode_bidi` | Mixed 阿/希/英双向混排（10k ops） | 900 KB | 46.083 ms | 38.388 ms (`rust_unicode_bidi`) | 0.83x | — | — |
+| `unicode_bidi` | Deep 嵌套隔离与配对括号（5k ops） | 383 KB | 30.637 ms | 27.972 ms (`rust_unicode_bidi`) | 0.91x | — | — |
+| `unicode_bidi` | 逐行 `visual_runs` + `reorder_line`（10k ops） | 900 KB | 69.079 ms | 48.495 ms (`rust_unicode_bidi`) | 0.70x | — | — |
+| `hyphenation` | `bench100k` 批量断词（100k × 10，`opportunities_into`） | 10.28 MB（1M ops） | 144.435 ms | 487.704 ms (`rust_hyphenation`) | **3.38x** | 10.02 MiB | 9.06 MiB |
+| `hyphenation` | 全量去重词典（235,915 词 × 10，`opportunities_into`） | 22.57 MB（2.36M ops） | 457.358 ms | 1,154.906 ms (`rust_hyphenation`) | **2.53x** | 18.58 MiB | 15.56 MiB |
+| `hyphenation` | 词典文本建树（4,938 模式 + 1,441 例外 × 20） | 20 loads | 33.691 ms | 34.398 ms (`rust_from_text`) / 10.458 ms (`rust_bincode`) | **1.02x** (vs 文本建树) · 0.31x (vs 预编译 bincode) | 4.72 MiB | 4.48 / 2.23 MiB |
+| `pdf` | 100 页矢量 + 文本报表（`/FlateDecode`） | 100 pages | 22.71 ms | 14.57 ms (`rust_pdf_writer`) | 0.64x | **4.11 MiB** | 6.36 MiB |
+| `pdf` | 10 页 800×600 RGBA 导出（`/FlateDecode`，14.4 MB RGB） | 14.4 MB | 75.77 ms | 74.52 ms (`rust_pdf_writer`) | 0.98x | **24.62 MiB** | 27.61 MiB |
+| `pdf` | 10 页 800×600 RGBA 导出（`/RunLengthDecode`，14.4 MB RGB） | 14.4 MB | 64.56 ms | 37.54 ms (`rust_pdf_writer`) | 0.58x | 55.41 MiB | 38.20 MiB |
+| `fts` | 10,000 文档建索引 + 30 查询（多语言 + 代码语料） | 620,254 B | 45.518 ms | 32.386 ms (`sqlite_fts5_c`) / 61.211 ms (`sqlite_fts5_py`) | 0.71x (vs C) · **1.34x** (vs Python) | 25.41 MiB | 6.53 / 16.44 MiB |
+| `fts` | 10,000 文档建索引 + 600 查询（30 × 20） | 600 queries | 226.551 ms | 196.257 ms (`sqlite_fts5_c`) / 223.737 ms (`sqlite_fts5_py`) | 0.87x (vs C) · 0.99x (vs Python) | 25.41 MiB | 6.58 / 16.58 MiB |
 
 ## 各包明细
 
@@ -1330,3 +1360,144 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 | `custom_props` | 22.7 | **22.5** | 56.2 | **7.6** | 58.2 | 164.1 |
 
 红队：32/32 单测；红队审计 `pionc test -p css_audit packages/css/audit` 34/34，原 P0（CSS Nesting 声明顺序丢失、`:is()` / `:not()` / `:where()` / `:has()` 内后代组合器被压缩删除）与 P1 / P2 均已修复；`tok_diff.py` 17,904 例 + 2,014 例原始字节输入 99.85% 与 `cssparser` 一致（`tokenize_bytes` 2,014 / 2,014）；`minify_diff.py` 2,114 例 0 语义破坏、0 非幂等；`dos.py` 20 / 20 线性、0 崩溃；`wasm4.py` 12 语料 × 4 模式 SHA-256 逐字节一致。领先项：`count_tokens()` 1.28x–1.63x（vs `cssparser`），`parse_stylesheet()` 1.62x–4.93x（vs `lightningcss`），`minify()` 1.26x–4.55x 且内存低 4.9x–29.5x（vs `lightningcss`，后者另做简写合并、厂商前缀与颜色空间转换等深度优化）。落后项：全量物化 `tokenize()` 0.47x–0.52x，`parse_stylesheet()` 对 `cssparser` 自有 AST 在 `color_heavy` / `selector_heavy` / `custom_props` 上 0.79x–0.94x，`nesting_heavy` 峰值 RSS 41.2 MB 高于 `cssparser` 的 34.0 MB。
+
+### base64
+
+参考实现：Rust [`base64`](https://github.com/marshallpierce/rust-base64) `=0.22.1`（`STANDARD` / `URL_SAFE`）、[`data-encoding`](https://github.com/ia0/data-encoding) `=2.11.1`（Base32）、[`hex`](https://github.com/KokaKiwi/rust-hex) `=0.4.3`（`--release`，LTO）；Go `go1.27.3` 标准库 `encoding/base64`（`.Strict()`）/ `encoding/base32` / `encoding/hex`。`sh packages/base64/bench/run_bench.sh 4194304 64` 构建三方实现并按模式调用 `scripts/bench_compare.py --warmup 1 --rounds 5`：每次运行生成 4 MiB xorshift32 数据并编码（或解码）64 次，吞吐按 256 MiB 原始字节计，耗时含约 20 ms 的输入生成；每个模式三方 stdout（尺寸、逐轮采样和与末次结果 FNV-1a 64）SHA-256 逐字节一致。采样时机器负载约 16–18，小差距需谨慎解读。详见 [`packages/base64/README.md`](packages/base64/README.md)。
+
+**8-Mode Head-to-Head (median ms, MB/s)**
+
+| Mode | Pion | Go stdlib | Rust | Pion vs Rust | Pion vs Go | Peak RSS Pion / Go / Rust (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `b64_encode` | 239.2 (1122) | 122.6 (2189) | 100.7 (2667) | 0.42x | 0.51x | 16.4 / 31.7 / 11.1 |
+| `b64_decode` | 228.9 (1173) | 110.5 (2429) | 99.0 (2711) | 0.43x | 0.48x | 20.5 / 32.5 / 15.1 |
+| `url_encode` | 228.6 (1175) | 122.4 (2193) | 99.3 (2703) | 0.43x | 0.54x | 16.5 / 26.8 / 11.1 |
+| `url_decode` | 226.5 (1185) | 106.7 (2515) | 94.6 (2838) | 0.42x | 0.47x | 20.5 / 30.4 / 15.1 |
+| `b32_encode` | 253.3 (1060) | 118.6 (2263) | 113.2 (2371) | 0.45x | 0.47x | 18.6 / 29.9 / 12.2 |
+| `b32_decode` | 253.1 (1060) | 642.3 (418) | 110.9 (2421) | 0.44x | **2.54x** | 22.6 / 49.1 / 16.2 |
+| `hex_encode` | 300.7 (893) | 209.7 (1280) | 511.6 (525) | **1.70x** | 0.70x | 21.8 / 66.3 / 13.8 |
+| `hex_decode` | 315.7 (850) | 185.1 (1450) | 1449.4 (185) | **4.59x** | 0.59x | 25.8 / 31.4 / 20.0 |
+
+23/23 单测（RFC 4648 §10 五种编码向量、Go 用例与错误偏移、Base64 2 / 3 符号尾部与 Base32 各尾长规范性穷举、0–64 全长度与 64 KiB / 1 MiB 往返）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `b9babfa55084789669b9487724ff5d938cbc2517d10008490c09b9310df19539`。领先项：hex 编码 / 解码为 Rust `hex` 的 1.70x / 4.59x，Base32 解码为 Go 的 2.54x（Go 按组处理填充与换行）。落后项：Base64 / Base64URL 编解码与 Base32 编码为 Rust 与 Go 的 0.42x–0.54x，Base32 解码为 Rust `data-encoding` 的 0.44x，hex 为 Go 的 0.70x / 0.59x（参考实现按机器字批量处理，本包逐字节经边界检查 `Bytes` 索引查表；4,096 项双符号表与展开索引实测无收益）。峰值 RSS 每个模式都介于 Rust 与 Go 之间。
+
+### effect
+
+参考实现：同语义 Go（`go1.27.3`，goroutine / channel / `container/heap`）与 Node.js（`v24.22.2`，Promise / 微任务）基线，源码见 [`packages/effect/bench/`](packages/effect/bench/)。`sh packages/effect/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对三个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5 --baseline go`，三方 stdout SHA-256 逐字节一致。详见 [`packages/effect/README.md`](packages/effect/README.md)。
+
+| Workload | Pion Median / Peak RSS | Go Median / Peak RSS | Node Median / Peak RSS | Pion vs Go | Pion vs Node |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| W1 有界队列乒乓（50k msgs，cap = 16） | 18.318 ms / 1.83 MiB | 17.479 ms / 4.59 MiB | 57.203 ms / 48.62 MiB | 0.95x | **3.12x** |
+| W2 虚拟时钟定时器调度（20k fibers / timers） | 47.402 ms / 28.23 MiB | 18.574 ms / 5.95 MiB | 58.455 ms / 49.86 MiB | 0.39x | **1.23x** |
+| W3 结构化扇出汇合（2,500 × 4 = 10k fibers） | 19.481 ms / 1.84 MiB | 18.090 ms / 5.42 MiB | 51.110 ms / 45.16 MiB | 0.93x | **2.62x** |
+
+19 / 19 单测；`wasm_smoke` 4 模式 stdout SHA-256 均为 `3a81d54555c2f572d5dcf8c3cc934a5a8d02606e41cf0a42bc4e2600b671d57a`。领先项：三个负载均快于 Node（1.23x–3.12x），W1 / W3 峰值 RSS 低于 Go 与 Node。落后项：W1 / W3 为 Go 的 0.95x / 0.93x；W2 为 Go 的 0.39x，峰值 RSS 28.23 MiB 高于 Go 的 5.95 MiB——两侧结构不对等：Pion 同时创建 20,000 个完整结构化纤程（`Task` + `Fiber` + `sleep_k` 定时器 + 作用域监视），Go 与 Node 基线只往最小堆压入裸 `{at, seq, idx}` 结构体，该比值反映的是结构化纤程的固定开销而非堆本身。
+
+### crypto
+
+参考实现：Go `go1.27.3` 标准库 `crypto/sha256` / `crypto/sha512` / `crypto/hmac` / `crypto/ed25519`，源码见 [`packages/crypto/bench/`](packages/crypto/bench/)。编译器 `AFK-surf/pion@8d110a3`。`sh packages/crypto/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对四个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5 --baseline go_stdlib`，双方 stdout SHA-256 逐字节一致。详见 [`packages/crypto/README.md`](packages/crypto/README.md)。
+
+| Workload | Pion Median / Peak RSS | Go stdlib Median / Peak RSS | Pion 吞吐 | Pion vs Go |
+| --- | ---: | ---: | ---: | ---: |
+| SHA-256（16 MiB 流式） | 93.978 ms / 1.80 MiB | 15.941 ms / 4.66 MiB | 178.5 MB/s | 0.17x |
+| SHA-512（16 MiB 流式） | 55.985 ms / 1.80 MiB | 18.779 ms / 4.72 MiB | 299.7 MB/s | 0.34x |
+| HMAC-SHA256（50,000 × 256 B） | 122.492 ms / 1.75 MiB | 27.119 ms / 11.16 MiB | 2,449.84 ns/op（约 408k ops/s） | 0.22x |
+| Ed25519（200 签名 + 200 验签） | 44.075 ms / 1.83 MiB | 16.478 ms / 4.78 MiB | 110.19 µs/op（约 9.1k ops/s） | 0.37x |
+
+41 / 41 单测（含 27 个红队测试）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `259b374d007b191c2415407d487ff639131c8625f8766e3104714fd48c2f8fa6`。领先项：峰值 RSS 1.75–1.83 MiB，比 Go 的 4.66–11.16 MiB 低 2.6×–6.4×。落后项：四个负载全部慢于 Go（0.17x–0.37x）。两侧实现手段不对等：Go 在 `darwin/arm64` 上用 ARMv8 加密扩展（`SHA256H` / `SHA512H` 指令）加速 SHA-256 / SHA-512，Ed25519 用手写 ARM64 汇编与预计算基点表；本包是零 C FFI、零汇编的纯标量 Pion 代码，Native 与 `wasm32` 共用同一实现，签名路径额外付出无分支常量时间查表的开销。
+
+### brotli
+
+参考实现：Rust [`brotli`](https://github.com/dropbox/rust-brotli) `7.0.0`（`--release`）与 Google C [`libbrotlidec`](https://github.com/google/brotli) `1.2.1`（`-O3`）。通过 `sh packages/brotli/bench/run_bench.sh` 在 `Darwin arm64` 上调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，三方 stdout SHA-256 逐字节一致。详见 [`packages/brotli/README.md`](packages/brotli/README.md)。
+
+| Workload | `pion` Median (Throughput) | `rust_brotli` Median (Throughput) | `c_brotlidec` Median (Throughput) | `pion` vs `rust_brotli` |
+| --- | ---: | ---: | ---: | ---: |
+| Web HTML/CSS/JS/JSON (2 MiB q6 × 10 = 20 MiB) | 34.820 ms (602.28 MB/s) | 25.524 ms (821.63 MB/s) | 24.281 ms (863.71 MB/s) | 0.73x |
+| WOFF2 Binary Font Payload (1 MiB q11 × 10 = 10 MiB) | 33.678 ms (311.35 MB/s) | 24.419 ms (429.41 MB/s) | 25.004 ms (419.36 MB/s) | 0.73x |
+| Small Packet Batch (512 pkts q5 × 10 = 5,120 pkts) | 43.355 ms (62.80 MB/s) | 69.620 ms (39.11 MB/s) | 35.054 ms (77.67 MB/s) | **1.61x** |
+
+红队：10 / 10 单测，`audit` 6 / 6，226,218 例差分与 Google C `libbrotlidec 1.2.1` 0 差异；IMTF 修复后提速 10.5×，`hp_literals` 达 C 的 0.85×；`wasm_smoke` 4 模式 stdout SHA-256 均为 `027a31d9b0e0094c6dc068938bfd187f8561d338945e1b828ecd6cb3cd71e23e`。领先项：小包批量解压反超 Rust `brotli` 至 **1.61x**（无每包大型状态结构分配开销）。落后项：Web 与 WOFF2 大流解压为 Rust 的 0.73x（C 的 0.70x–0.74x），受纯标量热循环与边界检查数组访问限制；小包批量仍为 C 的 0.81x。
+
+### unicode_bidi
+
+参考实现：Rust [`unicode-bidi`](https://github.com/servo/unicode-bidi) `0.3.18`（`--release`）。通过 `sh packages/unicode_bidi/bench/run_bench.sh` 在 `Darwin arm64` 上调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，所有轮次 stdout SHA-256 逐字节一致。详见 [`packages/unicode_bidi/README.md`](packages/unicode_bidi/README.md)。
+
+| Benchmark | Pion Median (ms) | Rust Median (ms) | Pion Throughput (MB/s) | Rust Throughput (MB/s) | Speedup vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pure LTR fast path (`40k ops`, `3.98 MB`) | 63.711 | 68.927 | 62.43 | 57.71 | **1.08x** |
+| Mixed Arabic/Hebrew/English (`10k ops`, `900 KB`) | 46.083 | 38.388 | 19.54 | 23.46 | 0.83x |
+| Deep nested isolates & brackets (`5k ops`, `383 KB`) | 30.637 | 27.972 | 12.52 | 13.71 | 0.91x |
+| Per-line `visual_runs` + `reorder_line` (`10k ops`, `900 KB`) | 69.079 | 48.495 | 13.04 | 18.57 | 0.70x |
+
+红队：11 / 11 单测，`audit` 18 / 18，Unicode 16.0.0 全码点表 0 / 1,112,064 偏差，`BidiCharacterTest` 91,707 / 91,707 + `BidiTest` 770,241 / 770,241 零失败。领先项：Pure LTR 快路径反超 Rust 至 **1.08x**。落后项：Mixed 0.83x、Deep 嵌套隔离与配对括号 0.91x、逐行 `visual_runs` + `reorder_line` 0.70x。
+
+### hyphenation
+
+参考实现：Rust [`hyphenation`](https://github.com/tapeinos/hyphenation) `=0.8.4`（`--release`, `lto = true`），双方执行完全相同的 `hyph-en-us` 4,938 模式 + 1,441 例外表。通过 `packages/hyphenation/audit/scripts/bench_fair.py`（底层调用 `scripts/bench_compare.py --warmup 1 --rounds 5`）严格交替采样，stdout SHA-256 逐字节一致。详见 [`packages/hyphenation/README.md`](packages/hyphenation/README.md)。
+
+**1. Batch Hyphenation — `bench100k`（100,000 draws × 10 = 1,000,000 ops，10.28 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_hyph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_into` | **144.435** | 142.740 | 155.014 | **71.21** | **144.44** | 10.02 MiB | **3.38x** |
+| `pion_alloc` | 145.391 | 143.380 | 149.541 | 70.74 | 145.39 | 10.02 MiB | **3.35x** |
+| `rust_hyph` | 487.704 | 472.676 | 509.784 | 21.09 | 487.70 | 9.06 MiB | 1.00x (baseline) |
+| `rust_opp` | 475.928 | 448.806 | 499.748 | 21.61 | 475.93 | 12.94 MiB | 1.02x |
+
+_SHA-256: `569e94245a2ebfa02b5152c63d86f731704a7cc8b5cadbe4a0cf98f0f34254c5`._
+
+**2. Batch Hyphenation — Full Distinct Dictionary（235,915 distinct words × 10 = 2,359,150 ops，22.57 MB）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_hyph`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_into` | **457.358** | 450.269 | 729.512 | **49.36** | **193.87** | 18.58 MiB | **2.53x** |
+| `pion_alloc` | 466.959 | 464.261 | 633.838 | 48.34 | 197.94 | 18.58 MiB | **2.47x** |
+| `rust_hyph` | 1,154.906 | 1,126.700 | 1,227.287 | 19.55 | 489.54 | 15.56 MiB | 1.00x (baseline) |
+| `rust_opp` | 1,156.373 | 1,093.154 | 2,045.208 | 19.52 | 490.17 | 21.98 MiB | 1.00x |
+
+_SHA-256: `9a65ebd3301a0401dfa90968e96d0a34ad36bc8ed6a15952b2a0476fc2f78b26`._
+
+**3. Dictionary Load（4,938 patterns + 1,441 exceptions × 20 loads）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_from_text`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_from_tex` | **33.691** | 32.945 | 34.960 | **1,684,545.80** | 4.72 MiB | **1.02x** |
+| `rust_from_text` | 34.398 | 32.425 | 40.342 | 1,719,883.35 | 4.48 MiB | 1.00x (baseline) |
+| `rust_bincode` (pre-compiled) | 10.458 | 10.082 | 11.593 | 522,904.20 | 2.23 MiB | 3.29x |
+
+_SHA-256: `bd519a5b90095c9523b1d7ca8d114f327f4b87d62b2eec8f11c1560c84c5ca6b`._
+
+红队：11 / 11 单测，`audit` 21 / 21，80 语种 99.995% 一致。领先项：三项公平对比全部领先 Rust `hyphenation =0.8.4`（`bench100k` **3.38x**、全词典 **2.53x**、文本词典建树 **1.02x**）。落后项：相比 Rust 预编译 `bincode` 反序列化（10.458 ms，2.23 MiB），从文本现场建树为 0.31x；各负载峰值 RSS 略高于 Rust `rust_hyph`（10.02 vs 9.06 MiB、18.58 vs 15.56 MiB、4.72 vs 4.48 MiB）。
+
+### pdf
+
+参考实现：Rust [`pdf-writer`](https://github.com/typst/pdf-writer) `0.12.1` + `flate2 1.1`（`rust_backend`, `--release`）。通过 `sh packages/pdf/bench/run_bench.sh` 在 `Darwin arm64` 上调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，stdout SHA-256 逐字节一致，且全部产出 PDF 通过 Rust `lopdf 0.35.0` 第三方解析校验。详见 [`packages/pdf/README.md`](packages/pdf/README.md)。
+
+| Workload | Pion Median | Rust `pdf-writer` Median | Pion Throughput / ns/op | Pion Peak RSS | Rust Peak RSS | Speedup vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100-Page Vector + Text Report (`/FlateDecode`) | 22.71 ms | 14.57 ms | 227.1 us/page | **4.11 MiB** | 6.36 MiB | 0.64x |
+| 10-Page 800×600 RGBA Image Export (`/FlateDecode`, 14.4 MB RGB) | 75.77 ms | 74.52 ms | 190.06 MB/s | **24.62 MiB** | 27.61 MiB | 0.98x |
+| 10-Page 800×600 RGBA Image Export (`/RunLengthDecode`, 14.4 MB RGB) | 64.56 ms | 37.54 ms | 223.05 MB/s | 55.41 MiB | 38.20 MiB | 0.58x |
+
+红队：8 / 8 单测（复用 `flate` 20 / 20），`audit` 30 / 30（2 P0 + 9 P1 + 14 P2 清零，`v_quadratic_40k` 提速 2,380× 至 6 ms）。领先项：`images_flate` 与 Rust `--release` 基本持平（0.98x）且峰值 RSS 更低（24.62 vs 27.61 MiB）；`report100` 峰值 RSS 同样更低（4.11 vs 6.36 MiB），输出体积更小（93 KB vs 97 KB）。落后项：`report100` 为 0.64x（每流 `flate` 状态初始化占 22.7 ms 中约 11 ms）；`images_rle` 为 0.58x 且峰值 RSS 较高（55.41 vs 38.20 MiB，标量 PackBits 扫描与逐字节拷贝对比 LLVM 自动向量化 Rust）。
+
+### fts
+
+参考实现：SQLite [FTS5](https://www.sqlite.org/fts5.html)（C `-O3 -lsqlite3` 与 Python `sqlite3`，均为 `:memory:`，`tokenize="unicode61 tokenchars '_'"`）。`sh packages/fts/bench/run_bench.sh 10000` 在确定性的 10,000 文档多语言 + 代码语料（英文、中文、日文、韩文、`CamelCase`、`snake_case`、`#PR`、十六进制 SHA）上跑 30 个查询（精确、CJK、代码词、短语、前缀、`NOT`），调用 `scripts/bench_compare.py --warmup 1 --rounds 5` 严格交替采样，三方 stdout SHA-256 逐字节一致。Pion 在建索引时现场分词，SQLite FTS5 摄入同源 `fts5_index_text` 产出的 token。编译器 `AFK-surf/pion@8d110a3`。详见 [`packages/fts/README.md`](packages/fts/README.md)。
+
+**1. 10,000 文档建索引 + 30 查询（620,254 B 原文，`sha256:1d044d63afdb2ecb...`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `sqlite_fts5_c`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 45.518 | 43.582 | 46.837 | 13.63 | 25.41 MiB | 0.71x |
+| `sqlite_fts5_c` | 32.386 | 31.103 | 33.194 | 19.15 | 6.53 MiB | 1.00x (baseline) |
+| `sqlite_fts5_py` | 61.211 | 60.792 | 62.303 | 10.13 | 16.44 MiB | 0.53x |
+
+**2. 10,000 文档建索引 + 600 查询（30 查询 × 20 次，`sha256:742eb42a94d684ec...`）**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `sqlite_fts5_c`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 226.551 | 217.275 | 265.433 | 377585.42 | 25.41 MiB | 0.87x |
+| `sqlite_fts5_c` | 196.257 | 192.415 | 204.213 | 327095.42 | 6.58 MiB | 1.00x (baseline) |
+| `sqlite_fts5_py` | 223.737 | 222.254 | 226.689 | 372895.07 | 16.58 MiB | 0.88x |
+
+红队：23 / 23 单测（含 11 个红队测试），`audit/difftest.py` 对 SQLite 3.54.0 FTS5 9 个种子约 34,000 次查询与 21,600 次摘要 0 差异（token、`MATCH` 表达式、结果顺序与 BM25 分值 ±1e-12、摘要 UTF-8 安全）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `1ebc76fd113f109093c0d76af062b1300d6b6a5846920a24552ff45759715562`。领先项：30 查询负载快于 Python `sqlite3`（45.5 vs 61.2 ms）。落后项：两个负载均慢于 C SQLite FTS5（0.71x / 0.87x）；600 查询负载与 Python `sqlite3` 基本持平（226.6 vs 223.7 ms）；峰值 RSS 25.41 MiB，约为 C 的 3.9×、Python `sqlite3` 的 1.5×。

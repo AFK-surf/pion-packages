@@ -57,6 +57,44 @@ node "$HOME/.pion/share/pion/pion_wasm_rt.mjs" /tmp/semver_smoke.wasm
 - **Red-team audit**: `23/23` passing, `166,458/166,458` differential cases byte-identical (`0` mismatches), exhaustive `small` + `max` + `u64::MAX` matrices byte-identical.
 - **Wasm32**: compiles cleanly with `--release --target wasm32` and exits `0` under Node.js (`pion_wasm_rt.mjs`).
 
+## Formal Verification (Lean 4)
+
+The pure comparison and Cargo `Comparator` matching kernels in `packages/semver/src/{types,compare,eval}.pion` are marked `#verify` and extracted directly into Lean 4 (`Semver.Types`, `Semver.Funs`) via `pionc extract-lean` (on top of `Aeneas.Std` and `PionLean`, Lean `v4.36.0-rc2`, Aeneas `1dc8ad31b1`, with `0` external axioms).
+
+### Reproducing the Proofs
+
+```sh
+sh packages/semver/proofs/run_proofs.sh
+```
+
+The script builds an isolated Lake project under `/private/tmp/pion-lean-semver` (zero git worktree pollution), runs `pionc extract-lean --json`, builds `PionLean Semver SemverProofs`, rejects any `sorry`/`admit`/`bv_decide`/`native_decide`, audits `#print axioms` across all 32 theorems, and runs `#guard` + `#eval` differential checks against native Pion execution (including `UInt64::MAX = 18446744073709551615`).
+
+### Verified Theorems (`packages/semver/proofs/SemverProofs.lean`)
+
+All **32** theorems are kernel-checked with **0 `sorry` / `admit` / `native_decide` / `bv_decide`** and depend strictly on the three standard Lean axioms (`propext`, `Classical.choice`, `Quot.sound`), verified by `packages/semver/proofs/CheckAxioms.lean`:
+
+1. **Core `(major, minor, patch : UInt64)` Lexicographic Strict Total Order (`semver.cmp_core`)**:
+   - `cmp_core_total`: panic/trap-free totality across the full `0 .. 2^64 - 1` domain, returning `r ∈ {-1, 0, 1}`.
+   - `cmp_core_refl`: reflexivity (`cmp_core m n p m n p = ok 0`).
+   - `cmp_core_antisymm`: antisymmetry (`cmp_core a b = ok (-r) ↔ cmp_core b a = ok r`).
+   - `cmp_core_eq_zero_iff`: equivalence consistency (`cmp_core a b = ok 0 ↔ a = b`).
+   - `cmp_core_lt_iff`: exact lexicographic `<` characterization.
+   - `cmp_core_trans_lt`, `cmp_core_trans_le`: strict `<` and non-strict `≤` transitivity.
+2. **SemVer 2.0.0 Prerelease & Build Metadata Precedence (`semver.cmp_precedence_core`, `semver.cmp_pre_segment_order`)**:
+   - `cmp_precedence_release_gt_pre`, `cmp_precedence_pre_lt_release`: release versions strictly outrank any non-empty prerelease with the same `(major, minor, patch)` (SemVer 2.0.0 §11.3).
+   - `cmp_precedence_ignores_build`, `cmp_precedence_same_except_build`: build metadata is completely ignored in precedence comparison (SemVer 2.0.0 §10).
+   - `cmp_pre_segment_order_numeric_lt_alpha`, `cmp_pre_segment_order_refl`, `cmp_pre_segment_order_antisymm`, `cmp_pre_segment_order_trans_lt`: strict total ordering and numeric `<` alphanumeric precedence for prerelease segments (SemVer 2.0.0 §11.4).
+3. **Cargo `Comparator` / `Op` Interval Matching & `UInt64::MAX` Overflow Immunity (`semver.matches_release`, `semver.pre_is_compatible`)**:
+   - `matches_release_total_no_overflow`: all 8 operators (`Exact`, `Greater`, `GreaterEq`, `Less`, `LessEq`, `Tilde`, `Caret`, `Wildcard`) never panic or overflow across full `UInt64`.
+   - `matches_release_caret_major_pos`, `matches_release_caret_zero_minor_pos`, `matches_release_caret_zero_zero`: exact three-regime Cargo `Caret` (`^M.m.p`) specification (`M > 0`, `M = 0 ∧ m > 0`, `M = 0 ∧ m = 0`).
+   - `matches_release_tilde_spec`: exact Cargo `Tilde` (`~M.m.p`) specification.
+   - `matches_release_caret_u64_max`, `matches_release_tilde_u64_max`, `matches_release_greater_u64_max`: `UInt64::MAX` overflow immunity (no `major + 1` or `minor + 1` wraparound to `0`).
+   - `matches_release_exact_iff`, `matches_release_wildcard_eq_exact`: `Exact` and `Wildcard` exactness.
+   - `matches_release_refl_ge`, `matches_release_refl_caret`, `matches_release_refl_tilde`: reflexivity on full triples.
+   - `matches_release_lt_ge_complement`, `matches_release_gt_le_complement`: exact complementarity of `Less`/`GreaterEq` and `Greater`/`LessEq` for all comparators (full and partial).
+   - `matches_release_ge_monotone`: monotonicity of `GreaterEq` with respect to `cmp_core`.
+   - `pre_is_compatible_spec`: exact Cargo prerelease opt-in compatibility rule.
+
 ## Head-to-Head Benchmarks (Pion Native vs Rust `dtolnay/semver =1.0.28 --release`)
 
 Run via:
