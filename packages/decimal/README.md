@@ -51,7 +51,32 @@ pionc run --release --target wasm32 packages/decimal/wasm_smoke
 
 # Full red-team differential + DoS + adversarial benchmarks
 sh packages/decimal/audit/run_audit.sh
+
+# End-to-end Lean 4 formal verification (0 sorry / 0 admit / standard axioms + native diff)
+sh packages/decimal/proofs/run_proofs.sh
 ```
+
+## Formal Verification (Lean 4)
+
+The pure 96/128-bit arithmetic, flag/sign/scale, wire-format, comparison, and truncation kernels in `packages/decimal/src/*.pion` are annotated with `#verify`, extracted directly into Lean 4 (`Decimal.Types` / `Decimal.Funs`) via `pionc extract-lean`, and machine-checked in [`proofs/DecimalProofs.lean`](proofs/DecimalProofs.lean) with **0 `sorry`**, **0 `admit`**, **0 `native_decide`**, and **0 `bv_decide`**, depending strictly on Lean's 3 standard axioms (`propext`, `Classical.choice`, `Quot.sound`):
+
+- **96/128-bit Multi-Precision Arithmetic Kernels**:
+  - `u64_mul_wide_spec`: exact 64×64 → 128-bit unsigned multiplication (`lo + 2^64 * hi = a * b`, never traps).
+  - `u96_cmp_spec`, `u96_cmp_refl`, `u96_cmp_antisymm`, `u96_cmp_trans_lt`: strict total order on 3-word `[lo, mid, hi]` 96-bit unsigned integers, equivalent to mathematical `Nat` ordering on `lo + 2^32 * mid + 2^64 * hi`.
+  - `inc96_spec`, `mul10_add96_spec`, `overflow96_div10_spec`, `pow10_u32_spec`, `pow10_u64_spec`: exact 96-bit `+ 1`, `* 10 + digit`, and overflow detection (never silently truncates overflow).
+  - `reduce_scale_overflow96_spec`, `aligned_add_96_add_no_overflow`, `aligned_add_96_add_overflow_scale0`, `aligned_add_96_add_overflow_rescale`, `aligned_add_96_sub_spec`: exact 96-bit aligned add/sub, guaranteed `Err(Overflow)` at `scale = 0`, and valid rescaling for `1 ≤ scale ≤ 28`.
+- **Flags, Sign, Scale (`0..=28`) & `neg` / `abs` / `is_zero` Invariants**:
+  - `make_flags_spec`, `Decimal.from_parts_ok_spec`, `Decimal.from_parts_err_spec`, `Decimal.set_scale_spec`, `Decimal.scale_le_28`: `scale` is strictly bounded in `0..=28` and `scale > 28` always returns `Err(ScaleExceedsMaximumPrecision)`.
+  - `Decimal.neg_spec`, `Decimal.neg_involutive`, `Decimal.abs_spec`, `Decimal.abs_idempotent`, `Decimal.abs_neg`, `Decimal.is_zero_spec`: `neg (neg d) = d`, `is_sign_negative (abs d) = false`, `abs (abs d) = abs d`, and `abs (neg d) = abs d`.
+- **16-Byte Binary Wire Format (`serialize` ↔ `deserialize`) & Red-Team F-5 Mask (`0x801F0000`)**:
+  - `Decimal.serialize_spec`, `Decimal.serialize_length`, `Decimal.deserialize_serialize_roundtrip`: exact bit-for-bit roundtrip `deserialize (serialize d) = ok (Ok d)` for every valid `Decimal`.
+  - `Decimal.deserialize_wrong_length_err`: rejects any non-16-byte input with `Err(EmptyData)`.
+  - `Decimal.deserialize_always_valid`: for any 16-byte input (including arbitrary reserved bits or 5-bit scales 29..31), `deserialize` never traps, masks reserved bits outside `0x801F0000`, and always returns a strictly valid `Decimal` (`scale ≤ 28`).
+- **Exact Cross-Scale Decimal Comparison & Truncation**:
+  - `cmp_magnitude_spec`, `Decimal.compare_spec`, `Decimal.compare_neg_zero_eq_pos_zero`, `Decimal.compare_refl`, `Decimal.compare_antisymm`, `Decimal.compare_trans_lt`, `Decimal.eq_spec`, `Decimal.lt_spec`, `Decimal.le_spec`: full cross-scale (`0..=28`) numerical ordering matching exact rational arithmetic (`a * 10^s2 ⋛ b * 10^s1`), with `-0 == +0` at all scales.
+  - `truncate_core_spec`, `Decimal.trunc_spec`, `scale_up_96_spec`: exact integer truncation (`dec_mag d / 10^(dec_scale d)`) and overflow-safe scale-up preserving numerical value.
+
+Run `sh packages/decimal/proofs/run_proofs.sh` to reproduce extraction, `lake build`, `#print axioms` audit (`proofs/CheckAxioms.lean`), and the 20-case Lean-vs-Native differential cross-check (`proofs/EvalDiff.lean` + `diff -u`).
 
 ## Head-to-Head Benchmarks (Pion Native `--release` vs Rust `rust_decimal =1.37.2` `--release`)
 
