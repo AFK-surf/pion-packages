@@ -169,10 +169,20 @@ fn run_w3(path: &str, iters: usize) {
     println!("hash={}", hash);
 }
 
+fn run_w4(path: &str, iters: usize) {
+    let src = fs::read_to_string(path).expect("read w4");
+    let mut st = Stats::default();
+    for _ in 0..iters {
+        let doc: KdlDocument = src.parse().expect("parse w4");
+        walk_doc(&mut st, &doc);
+    }
+    print_stats("w4_wide_props", iters, &st);
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: kdl_bench_rust <w1|w2|w3> <file> <iters>");
+        eprintln!("usage: kdl_bench_rust <w1|w2|w3|w4> <file> <iters>");
         process::exit(1);
     }
     let iters: usize = args[3].parse().expect("iters");
@@ -180,6 +190,7 @@ fn main() {
         "w1" => run_w1(&args[2], iters),
         "w2" => run_w2(&args[2], iters),
         "w3" => run_w3(&args[2], iters),
+        "w4" => run_w4(&args[2], iters),
         other => {
             eprintln!("unknown mode: {}", other);
             process::exit(1);

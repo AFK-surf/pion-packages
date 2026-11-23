@@ -6,17 +6,20 @@ set -eu
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/w15-kdl-bench"
+OUT_DIR="${KDL_BENCH_OUT:-/private/tmp/fix-kdl-bench}"
 BIN_DIR="$OUT_DIR/bin"
 W1_FILE="$OUT_DIR/w1_large_config.kdl"
 W2_FILE="$OUT_DIR/w2_mixed_roundtrip.kdl"
 W3_FILE="$OUT_DIR/w3_hot_reload.kdl"
+W4_FILE="$OUT_DIR/w4_wide_props.kdl"
 
 W1_SECTIONS="${KDL_W1_SECTIONS:-3000}"
 W1_ITERS="${KDL_W1_ITERS:-3}"
 W2_BLOCKS="${KDL_W2_BLOCKS:-120}"
 W2_ITERS="${KDL_W2_ITERS:-20}"
 W3_ITERS="${KDL_W3_ITERS:-8000}"
+W4_PROPS="${KDL_W4_PROPS:-100000}"
+W4_ITERS="${KDL_W4_ITERS:-3}"
 
 mkdir -p "$BIN_DIR"
 
@@ -24,16 +27,20 @@ echo "==> Generating deterministic benchmark corpora -> $OUT_DIR"
 python3 "$BENCH_DIR/gen_data.py" w1 "$W1_FILE" "$W1_SECTIONS"
 python3 "$BENCH_DIR/gen_data.py" w2 "$W2_FILE" "$W2_BLOCKS"
 python3 "$BENCH_DIR/gen_data.py" w3 "$W3_FILE"
+python3 "$BENCH_DIR/gen_data.py" w4 "$W4_FILE" "$W4_PROPS"
 
 W1_BYTES=$(wc -c < "$W1_FILE" | tr -d ' ')
 W2_BYTES=$(wc -c < "$W2_FILE" | tr -d ' ')
 W3_BYTES=$(wc -c < "$W3_FILE" | tr -d ' ')
+W4_BYTES=$(wc -c < "$W4_FILE" | tr -d ' ')
 W1_TOTAL_BYTES=$((W1_BYTES * W1_ITERS))
 W2_TOTAL_BYTES=$((W2_BYTES * W2_ITERS))
 W3_TOTAL_BYTES=$((W3_BYTES * W3_ITERS))
+W4_TOTAL_BYTES=$((W4_BYTES * W4_ITERS))
 echo "    W1=${W1_BYTES} B x ${W1_ITERS} = ${W1_TOTAL_BYTES} B"
 echo "    W2=${W2_BYTES} B x ${W2_ITERS} = ${W2_TOTAL_BYTES} B"
 echo "    W3=${W3_BYTES} B x ${W3_ITERS} = ${W3_TOTAL_BYTES} B"
+echo "    W4=${W4_BYTES} B x ${W4_ITERS} = ${W4_TOTAL_BYTES} B"
 
 echo "==> Building Pion Native benchmark (--release)"
 PION_CACHE_DIR="$OUT_DIR/pion-cache" pionc build --release -o "$BIN_DIR/pion_kdl" "$BENCH_DIR/pion_bench"
@@ -64,11 +71,22 @@ python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --md-out "$OUT_DIR/w2.md" --json-out "$OUT_DIR/w2.json"
 
 echo ""
-echo "=== W3: High-Frequency Small Config Parse + Query (${W3_ITERS}x ${W3_BYTES} B) ==="
+echo "=== W3: High-Frequency Small Config Parse + Extract (Accessors & kdl::query) (${W3_ITERS}x ${W3_BYTES} B) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
-  --title "W3: High-Frequency Small Config Parse + Extract Query (${W3_ITERS}x ${W3_BYTES} B)" \
-  --impl "pion=$BIN_DIR/pion_kdl w3 $W3_FILE $W3_ITERS" \
+  --title "W3: High-Frequency Small Config Parse + Extract (${W3_ITERS}x ${W3_BYTES} B)" \
+  --impl "pion_accessor=$BIN_DIR/pion_kdl w3 $W3_FILE $W3_ITERS" \
+  --impl "pion_query=$BIN_DIR/pion_kdl w3q $W3_FILE $W3_ITERS" \
   --impl "rust_kdl=$BIN_DIR/rust_kdl w3 $W3_FILE $W3_ITERS" \
   --baseline rust_kdl \
   --warmup 1 --rounds 5 --bytes "$W3_TOTAL_BYTES" --ops "$W3_ITERS" \
   --md-out "$OUT_DIR/w3.md" --json-out "$OUT_DIR/w3.json"
+
+echo ""
+echo "=== W4: Wide Node (${W4_PROPS} Distinct Properties) Parse (${W4_ITERS}x ${W4_BYTES} B = ${W4_TOTAL_BYTES} B) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "W4: Wide Node (${W4_PROPS} Distinct Properties) Parse (${W4_ITERS}x ${W4_BYTES} B)" \
+  --impl "pion=$BIN_DIR/pion_kdl w4 $W4_FILE $W4_ITERS" \
+  --impl "rust_kdl=$BIN_DIR/rust_kdl w4 $W4_FILE $W4_ITERS" \
+  --baseline rust_kdl \
+  --warmup 1 --rounds 5 --bytes "$W4_TOTAL_BYTES" --ops "$W4_ITERS" \
+  --md-out "$OUT_DIR/w4.md" --json-out "$OUT_DIR/w4.json"

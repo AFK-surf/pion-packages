@@ -88,6 +88,16 @@ def gen_w3(path: str) -> None:
         f.write(snippet)
 
 
+def gen_w4(path: str, props: int = 100000) -> None:
+    """Generate a single wide node with `props` distinct properties (adversarial wide-node benchmark)."""
+    parts = ["wide_node"]
+    for i in range(props):
+        parts.append(f" k{i}={i}")
+    parts.append("\n")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("".join(parts))
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     if mode == "w1":
@@ -96,5 +106,7 @@ if __name__ == "__main__":
         gen_w2(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 80)
     elif mode == "w3":
         gen_w3(sys.argv[2])
+    elif mode == "w4":
+        gen_w4(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 100000)
     else:
         raise SystemExit(f"unknown mode: {mode}")
