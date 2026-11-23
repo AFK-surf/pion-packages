@@ -1,11 +1,635 @@
-///| Stub DNS Wire Encoder, Builders, TCP Framing, and DoH Base64url Encoder (Red phase).
+///| RFC 1035 / 3596 / 6891 / 8484 / 9460 DNS Wire Encoder with zero-allocation
+///| flat suffix compression table, Builders, TCP Framing, and DoH Base64url Encoder.
+
+///|
+struct WireWriter {
+  mut buf : Bytes
+  mut len : Int
+  compress : Bool
+  // Open-addressing hash table for RFC 1035 suffix compression:
+  // `tab_hash[slot]` holds 31-bit non-zero hash (0 = empty slot),
+  // `tab_off[slot]` holds wire offset (< 16384) inside `buf`.
+  mut tab_hash : Array[Int]
+  mut tab_off : Array[Int]
+  mut tab_mask : Int
+  mut tab_count : Int
+}
+
+///|
+fn WireWriter::new(initial_cap : Int, compress : Bool) -> WireWriter {
+  let cap = if initial_cap < 64 { 64 } else { initial_cap }
+  let th : Array[Int] = []
+  let to : Array[Int] = []
+  if compress {
+    let mut i = 0
+    while i < 128 {
+      th.push(0)
+      to.push(0)
+      i = i + 1
+    }
+  }
+  WireWriter::{
+    buf: Bytes::new(cap),
+    len: 0,
+    compress: compress,
+    tab_hash: th,
+    tab_off: to,
+    tab_mask: if compress { 127 } else { 0 },
+    tab_count: 0,
+  }
+}
+
+///|
+fn WireWriter::ensure(self : WireWriter, extra : Int) -> Unit {
+  let needed = self.len + extra
+  let cur_cap = self.buf.length()
+  if needed <= cur_cap {
+    return
+  }
+  let mut new_cap = cur_cap * 2
+  while new_cap < needed {
+    new_cap = new_cap * 2
+  }
+  let mut next = Bytes::new(new_cap)
+  let cur_len = self.len
+  let old = self.buf
+  let mut i = 0
+  while i < cur_len {
+    next[i] = old[i]
+    i = i + 1
+  }
+  self.buf = next
+}
+
+///|
+fn WireWriter::write_u8(self : WireWriter, v : Int) -> Unit {
+  self.ensure(1)
+  self.buf[self.len] = (v & 0xFF).to_byte()
+  self.len = self.len + 1
+}
+
+///|
+fn WireWriter::write_u16(self : WireWriter, v : Int) -> Unit {
+  self.ensure(2)
+  let p = self.len
+  self.buf[p] = ((v >> 8) & 0xFF).to_byte()
+  self.buf[p + 1] = (v & 0xFF).to_byte()
+  self.len = p + 2
+}
+
+///|
+fn WireWriter::write_u32(self : WireWriter, v : Int64) -> Unit {
+  self.ensure(4)
+  let p = self.len
+  self.buf[p] = ((v >> 24) & 0xFFL).to_int().to_byte()
+  self.buf[p + 1] = ((v >> 16) & 0xFFL).to_int().to_byte()
+  self.buf[p + 2] = ((v >> 8) & 0xFFL).to_int().to_byte()
+  self.buf[p + 3] = (v & 0xFFL).to_int().to_byte()
+  self.len = p + 4
+}
+
+///|
+fn WireWriter::write_bytes(self : WireWriter, b : Bytes) -> Unit {
+  let n = b.length()
+  if n == 0 {
+    return
+  }
+  self.ensure(n)
+  let p = self.len
+  let out = self.buf
+  let mut i = 0
+  while i < n {
+    out[p + i] = b[i]
+    i = i + 1
+  }
+  self.len = p + n
+}
+
+///|
+fn WireWriter::write_u16_at(self : WireWriter, pos : Int, v : Int) -> Unit {
+  self.buf[pos] = ((v >> 8) & 0xFF).to_byte()
+  self.buf[pos + 1] = (v & 0xFF).to_byte()
+}
+
+///|
+fn WireWriter::to_bytes(self : WireWriter) -> Bytes {
+  let n = self.len
+  let mut out = Bytes::new(n)
+  let src = self.buf
+  let mut i = 0
+  while i < n {
+    out[i] = src[i]
+    i = i + 1
+  }
+  out
+}
+
+///| Compare `wire[w_pos..]` against a previously written (possibly compressed) name at `buf[b_pos..]`.
+fn suffix_matches_buf(wire : Bytes, w_pos : Int, buf : Bytes, b_pos : Int) -> Bool {
+  let mut wp = w_pos
+  let mut bp = b_pos
+  let wlen = wire.length()
+  while wp < wlen {
+    let wl = wire[wp].to_int()
+    // Follow pointer in `buf` if present
+    let mut bl = buf[bp].to_int()
+    while (bl & 0xC0) == 0xC0 {
+      bp = ((bl & 0x3F) << 8) | buf[bp + 1].to_int()
+      bl = buf[bp].to_int()
+    }
+    if wl != bl {
+      return false
+    }
+    if wl == 0 {
+      return true
+    }
+    wp = wp + 1
+    bp = bp + 1
+    let mut j = 0
+    while j < wl {
+      if ascii_lower_byte(wire[wp + j].to_int()) != ascii_lower_byte(buf[bp + j].to_int()) {
+        return false
+      }
+      j = j + 1
+    }
+    wp = wp + wl
+    bp = bp + wl
+  }
+  false
+}
+
+///|
+fn WireWriter::rehash(self : WireWriter) -> Unit {
+  let old_h = self.tab_hash
+  let old_o = self.tab_off
+  let old_cap = old_h.length()
+  let new_cap = old_cap * 2
+  let new_mask = new_cap - 1
+  let nh : Array[Int] = []
+  let no : Array[Int] = []
+  let mut i = 0
+  while i < new_cap {
+    nh.push(0)
+    no.push(0)
+    i = i + 1
+  }
+  i = 0
+  while i < old_cap {
+    let h = old_h[i]
+    if h != 0 {
+      let mut slot = h & new_mask
+      while nh[slot] != 0 {
+        slot = (slot + 1) & new_mask
+      }
+      nh[slot] = h
+      no[slot] = old_o[i]
+    }
+    i = i + 1
+  }
+  self.tab_hash = nh
+  self.tab_off = no
+  self.tab_mask = new_mask
+}
+
+///|
+fn WireWriter::table_lookup(self : WireWriter, wire : Bytes, w_pos : Int, h : Int) -> Int {
+  let mask = self.tab_mask
+  let th = self.tab_hash
+  let to = self.tab_off
+  let buf = self.buf
+  let mut slot = h & mask
+  while true {
+    let sh = th[slot]
+    if sh == 0 {
+      return -1
+    }
+    if sh == h && suffix_matches_buf(wire, w_pos, buf, to[slot]) {
+      return to[slot]
+    }
+    slot = (slot + 1) & mask
+  }
+  -1
+}
+
+///|
+fn WireWriter::table_insert(self : WireWriter, h : Int, offset : Int) -> Unit {
+  if offset >= 16384 {
+    return
+  }
+  if (self.tab_count + 1) * 2 >= self.tab_hash.length() {
+    self.rehash()
+  }
+  let mask = self.tab_mask
+  let th = self.tab_hash
+  let to = self.tab_off
+  let mut slot = h & mask
+  while th[slot] != 0 {
+    slot = (slot + 1) & mask
+  }
+  th[slot] = h
+  to[slot] = offset
+  self.tab_count = self.tab_count + 1
+}
+
+///| Write a DNS Name, applying RFC 1035 §4.1.4 suffix compression if `allow_compress && self.compress`.
+fn WireWriter::write_name(self : WireWriter, name : Name, allow_compress : Bool) -> Unit {
+  let w = name.wire
+  let wlen = w.length()
+  if !allow_compress || !self.compress || wlen <= 1 {
+    self.write_bytes(w)
+    return
+  }
+  // Collect label start offsets inside `w`
+  let starts : Array[Int] = []
+  let mut p = 0
+  while p < wlen {
+    let llen = w[p].to_int()
+    if llen == 0 {
+      break
+    }
+    starts.push(p)
+    p = p + 1 + llen
+  }
+  let lcount = starts.length()
+  if lcount == 0 {
+    self.write_u8(0)
+    return
+  }
+  // Compute suffix hashes bottom-up (case-insensitive)
+  let hashes : Array[Int] = []
+  let mut i = 0
+  while i < lcount {
+    hashes.push(0)
+    i = i + 1
+  }
+  let mut acc = 216613626
+  i = lcount - 1
+  while i >= 0 {
+    let lp = starts[i]
+    let llen = w[lp].to_int()
+    acc = (acc * 16777619) ^ llen
+    let mut j = 0
+    while j < llen {
+      acc = (acc * 16777619) ^ ascii_lower_byte(w[lp + 1 + j].to_int())
+      j = j + 1
+    }
+    let h = (acc & 0x7FFFFFFF)
+    hashes[i] = if h == 0 { 1 } else { h }
+    i = i - 1
+  }
+  // Find longest matching suffix in compression table
+  let mut match_idx = -1
+  let mut match_off = -1
+  i = 0
+  while i < lcount {
+    let found = self.table_lookup(w, starts[i], hashes[i])
+    if found >= 0 {
+      match_idx = i
+      match_off = found
+      break
+    }
+    i = i + 1
+  }
+  let limit = if match_idx >= 0 { match_idx } else { lcount }
+  // Write uncompressed prefix labels and register their offsets in the table
+  i = 0
+  while i < limit {
+    let out_off = self.len
+    let lp = starts[i]
+    let llen = w[lp].to_int()
+    self.ensure(1 + llen)
+    self.buf[out_off] = llen.to_byte()
+    let mut j = 0
+    while j < llen {
+      self.buf[out_off + 1 + j] = w[lp + 1 + j]
+      j = j + 1
+    }
+    self.len = out_off + 1 + llen
+    self.table_insert(hashes[i], out_off)
+    i = i + 1
+  }
+  if match_idx >= 0 {
+    self.write_u16(0xC000 | match_off)
+  } else {
+    self.write_u8(0)
+  }
+}
+
+///|
+fn encode_nsec_bitmaps(w : WireWriter, types : Array[Int]) -> Unit {
+  let n = types.length()
+  if n == 0 {
+    return
+  }
+  // Sort a copy of `types` (insertion sort; NSEC typically has < 32 types)
+  let sorted : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    sorted.push(types[i])
+    i = i + 1
+  }
+  i = 1
+  while i < n {
+    let cur = sorted[i]
+    let mut j = i
+    while j > 0 && sorted[j - 1] > cur {
+      sorted[j] = sorted[j - 1]
+      j = j - 1
+    }
+    sorted[j] = cur
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    let win = (sorted[i] >> 8) & 0xFF
+    let mut bm = Bytes::new(32)
+    let mut max_byte = 0
+    while i < n && ((sorted[i] >> 8) & 0xFF) == win {
+      let low = sorted[i] & 0xFF
+      let bi = low >> 3
+      let bit = 0x80 >> (low & 7)
+      bm[bi] = (bm[bi].to_int() | bit).to_byte()
+      if bi + 1 > max_byte {
+        max_byte = bi + 1
+      }
+      i = i + 1
+    }
+    w.write_u8(win)
+    w.write_u8(max_byte)
+    let mut k = 0
+    while k < max_byte {
+      w.write_u8(bm[k].to_int())
+      k = k + 1
+    }
+  }
+}
+
+///|
+fn encode_svcb_rdata(w : WireWriter, sd : SvcbData) -> Result[Unit, DnsError] {
+  w.write_u16(sd.priority)
+  // RFC 9460 §2.2: target name MUST NOT be compressed
+  w.write_name(sd.target, false)
+  let n = sd.params.length()
+  let mut i = 0
+  while i < n {
+    match sd.params[i] {
+      SvcParam::Mandatory(ks) => {
+        w.write_u16(svcparam_mandatory)
+        w.write_u16(ks.length() * 2)
+        let mut j = 0
+        while j < ks.length() {
+          w.write_u16(ks[j])
+          j = j + 1
+        }
+      }
+      SvcParam::Alpn(ids) => {
+        let mut vlen = 0
+        let mut j = 0
+        while j < ids.length() {
+          let ilen = ids[j].length()
+          if ilen == 0 || ilen > 255 {
+            return Err(DnsError::InvalidRData("invalid ALPN id length"))
+          }
+          vlen = vlen + 1 + ilen
+          j = j + 1
+        }
+        w.write_u16(svcparam_alpn)
+        w.write_u16(vlen)
+        j = 0
+        while j < ids.length() {
+          w.write_u8(ids[j].length())
+          w.write_bytes(ids[j])
+          j = j + 1
+        }
+      }
+      SvcParam::NoDefaultAlpn => {
+        w.write_u16(svcparam_no_default_alpn)
+        w.write_u16(0)
+      }
+      SvcParam::Port(p) => {
+        w.write_u16(svcparam_port)
+        w.write_u16(2)
+        w.write_u16(p)
+      }
+      SvcParam::Ipv4Hint(ips) => {
+        w.write_u16(svcparam_ipv4hint)
+        w.write_u16(ips.length() * 4)
+        let mut j = 0
+        while j < ips.length() {
+          let ip = ips[j]
+          w.write_u8(ip.a)
+          w.write_u8(ip.b)
+          w.write_u8(ip.c)
+          w.write_u8(ip.d)
+          j = j + 1
+        }
+      }
+      SvcParam::Ech(ech) => {
+        w.write_u16(svcparam_ech)
+        w.write_u16(ech.length())
+        w.write_bytes(ech)
+      }
+      SvcParam::Ipv6Hint(ips) => {
+        w.write_u16(svcparam_ipv6hint)
+        w.write_u16(ips.length() * 16)
+        let mut j = 0
+        while j < ips.length() {
+          w.write_bytes(ips[j].to_bytes())
+          j = j + 1
+        }
+      }
+      SvcParam::Unknown(k, v) => {
+        w.write_u16(k)
+        w.write_u16(v.length())
+        w.write_bytes(v)
+      }
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+///|
+fn encode_rr(w : WireWriter, rr : ResourceRecord) -> Result[Unit, DnsError] {
+  w.write_name(rr.name, true)
+  w.write_u16(rr.rtype)
+  w.write_u16(rr.rclass)
+  w.write_u32(rr.ttl)
+  let rdlen_pos = w.len
+  w.write_u16(0)
+  let rd_start = w.len
+  match rr.rdata {
+    RData::A(ip) => {
+      w.write_u8(ip.a)
+      w.write_u8(ip.b)
+      w.write_u8(ip.c)
+      w.write_u8(ip.d)
+    }
+    RData::AAAA(ip) => w.write_bytes(ip.to_bytes())
+    RData::CNAME(n) => w.write_name(n, true)
+    RData::NS(n) => w.write_name(n, true)
+    RData::PTR(n) => w.write_name(n, true)
+    RData::MX(mx) => {
+      w.write_u16(mx.preference)
+      w.write_name(mx.exchange, true)
+    }
+    RData::TXT(chunks) => {
+      let mut i = 0
+      while i < chunks.length() {
+        let c = chunks[i]
+        if c.length() > 255 {
+          return Err(DnsError::InvalidRData("TXT chunk exceeds 255 bytes"))
+        }
+        w.write_u8(c.length())
+        w.write_bytes(c)
+        i = i + 1
+      }
+    }
+    RData::SOA(soa) => {
+      w.write_name(soa.mname, true)
+      w.write_name(soa.rname, true)
+      w.write_u32(soa.serial)
+      w.write_u32(soa.refresh)
+      w.write_u32(soa.retry)
+      w.write_u32(soa.expire)
+      w.write_u32(soa.minimum)
+    }
+    RData::SRV(srv) => {
+      w.write_u16(srv.priority)
+      w.write_u16(srv.weight)
+      w.write_u16(srv.port)
+      // RFC 2782: SRV target MUST NOT be compressed
+      w.write_name(srv.target, false)
+    }
+    RData::CAA(caa) => {
+      let tb = caa.tag.to_bytes()
+      if tb.length() == 0 || tb.length() > 255 {
+        return Err(DnsError::InvalidRData("invalid CAA tag length"))
+      }
+      w.write_u8(caa.flags)
+      w.write_u8(tb.length())
+      w.write_bytes(tb)
+      w.write_bytes(caa.value)
+    }
+    RData::NAPTR(n) => {
+      w.write_u16(n.order)
+      w.write_u16(n.preference)
+      if n.flags.length() > 255 || n.service.length() > 255 || n.regexp.length() > 255 {
+        return Err(DnsError::InvalidRData("NAPTR character-string exceeds 255 bytes"))
+      }
+      w.write_u8(n.flags.length())
+      w.write_bytes(n.flags)
+      w.write_u8(n.service.length())
+      w.write_bytes(n.service)
+      w.write_u8(n.regexp.length())
+      w.write_bytes(n.regexp)
+      // RFC 3597: NAPTR replacement MUST NOT be compressed
+      w.write_name(n.replacement, false)
+    }
+    RData::OPT(od) => {
+      let mut i = 0
+      while i < od.options.length() {
+        match od.options[i] {
+          EdnsOption::Ecs(e) => {
+            w.write_u16(edns_opt_ecs)
+            w.write_u16(4 + e.address.length())
+            w.write_u16(e.family)
+            w.write_u8(e.source_prefix_len)
+            w.write_u8(e.scope_prefix_len)
+            w.write_bytes(e.address)
+          }
+          EdnsOption::Cookie(c) => {
+            w.write_u16(edns_opt_cookie)
+            w.write_u16(c.client.length() + c.server.length())
+            w.write_bytes(c.client)
+            w.write_bytes(c.server)
+          }
+          EdnsOption::Padding(plen) => {
+            w.write_u16(edns_opt_padding)
+            w.write_u16(plen)
+            let mut k = 0
+            while k < plen {
+              w.write_u8(0)
+              k = k + 1
+            }
+          }
+          EdnsOption::Unknown(code, data) => {
+            w.write_u16(code)
+            w.write_u16(data.length())
+            w.write_bytes(data)
+          }
+        }
+        i = i + 1
+      }
+    }
+    RData::SVCB(sd) | RData::HTTPS(sd) =>
+    match encode_svcb_rdata(w, sd) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    RData::DS(ds) => {
+      w.write_u16(ds.key_tag)
+      w.write_u8(ds.algorithm)
+      w.write_u8(ds.digest_type)
+      w.write_bytes(ds.digest)
+    }
+    RData::DNSKEY(dk) => {
+      w.write_u16(dk.flags)
+      w.write_u8(dk.protocol)
+      w.write_u8(dk.algorithm)
+      w.write_bytes(dk.public_key)
+    }
+    RData::RRSIG(sig) => {
+      w.write_u16(sig.type_covered)
+      w.write_u8(sig.algorithm)
+      w.write_u8(sig.labels)
+      w.write_u32(sig.original_ttl)
+      w.write_u32(sig.expiration)
+      w.write_u32(sig.inception)
+      w.write_u16(sig.key_tag)
+      w.write_name(sig.signer_name, false)
+      w.write_bytes(sig.signature)
+    }
+    RData::NSEC(nsec) => {
+      w.write_name(nsec.next_domain, false)
+      encode_nsec_bitmaps(w, nsec.types)
+    }
+    RData::Unknown(_, raw) => w.write_bytes(raw)
+  }
+  let rd_len = w.len - rd_start
+  if rd_len > 65535 {
+    return Err(DnsError::InvalidRData("RDATA exceeds 65535 bytes"))
+  }
+  w.write_u16_at(rdlen_pos, rd_len)
+  Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Convenience Builders & EDNS0 Accessors
+// ---------------------------------------------------------------------------
 
 ///|
 pub fn Message::query(id : Int, name : Name, qtype : Int) -> Message {
-  let _ = (id, name, qtype)
+  let hdr = Header::{
+    id: id & 0xFFFF,
+    qr: false,
+    opcode: opcode_query,
+    aa: false,
+    tc: false,
+    rd: true,
+    ra: false,
+    z: false,
+    ad: false,
+    cd: false,
+    rcode: rcode_noerror,
+    qdcount: 1,
+    ancount: 0,
+    nscount: 0,
+    arcount: 0,
+  }
   Message::{
-    header: Header::new(0),
-    questions: [],
+    header: hdr,
+    questions: [Question::new(name, qtype, class_in)],
     answers: [],
     authorities: [],
     additionals: [],
@@ -14,10 +638,32 @@ pub fn Message::query(id : Int, name : Name, qtype : Int) -> Message {
 
 ///|
 pub fn Message::response_for(req : Message, rcode : Int) -> Message {
-  let _ = (req, rcode)
+  let qs : Array[Question] = []
+  let mut i = 0
+  while i < req.questions.length() {
+    qs.push(req.questions[i])
+    i = i + 1
+  }
+  let hdr = Header::{
+    id: req.header.id,
+    qr: true,
+    opcode: req.header.opcode,
+    aa: false,
+    tc: false,
+    rd: req.header.rd,
+    ra: false,
+    z: false,
+    ad: false,
+    cd: req.header.cd,
+    rcode: rcode & 0x0F,
+    qdcount: qs.length(),
+    ancount: 0,
+    nscount: 0,
+    arcount: 0,
+  }
   Message::{
-    header: Header::new(0),
-    questions: [],
+    header: hdr,
+    questions: qs,
     answers: [],
     authorities: [],
     additionals: [],
@@ -32,45 +678,55 @@ pub fn ResourceRecord::opt(
   dnssec_ok : Bool,
   options : Array[EdnsOption],
 ) -> ResourceRecord {
-  let _ = (udp_payload_size, ext_rcode, version, dnssec_ok, options)
+  let do_bit = if dnssec_ok { 0x8000L } else { 0L }
+  let ttl = (((ext_rcode & 0xFF).to_int64()) << 24) |
+  (((version & 0xFF).to_int64()) << 16) |
+  do_bit
   ResourceRecord::{
     name: Name::root(),
     rtype: type_opt,
-    rclass: 0,
-    ttl: 0L,
-    rdata: RData::OPT(OptData::{ options: [] }),
+    rclass: udp_payload_size & 0xFFFF,
+    ttl: ttl,
+    rdata: RData::OPT(OptData::{ options: options }),
   }
 }
 
 ///|
 pub fn ResourceRecord::edns_udp_size(self : ResourceRecord) -> Int {
-  let _ = self
-  0
+  self.rclass
 }
 
 ///|
 pub fn ResourceRecord::edns_ext_rcode(self : ResourceRecord) -> Int {
-  let _ = self
-  0
+  ((self.ttl >> 24) & 0xFFL).to_int()
 }
 
 ///|
 pub fn ResourceRecord::edns_version(self : ResourceRecord) -> Int {
-  let _ = self
-  0
+  ((self.ttl >> 16) & 0xFFL).to_int()
 }
 
 ///|
 pub fn ResourceRecord::edns_dnssec_ok(self : ResourceRecord) -> Bool {
-  let _ = self
-  false
+  (self.ttl & 0x8000L) != 0L
 }
 
 ///|
 pub fn Message::extended_rcode(self : Message) -> Int {
-  let _ = self
-  0
+  let mut i = 0
+  while i < self.additionals.length() {
+    let rr = self.additionals[i]
+    if rr.rtype == type_opt {
+      return (rr.edns_ext_rcode() << 4) | (self.header.rcode & 0x0F)
+    }
+    i = i + 1
+  }
+  self.header.rcode & 0x0F
 }
+
+// ---------------------------------------------------------------------------
+// Wire, TCP, and DoH Encoders
+// ---------------------------------------------------------------------------
 
 ///|
 pub fn encode_message(msg : Message) -> Result[Bytes, DnsError] {
@@ -79,8 +735,61 @@ pub fn encode_message(msg : Message) -> Result[Bytes, DnsError] {
 
 ///|
 pub fn encode_message_with(msg : Message, opts : EncodeOptions) -> Result[Bytes, DnsError] {
-  let _ = (msg, opts)
-  Err(DnsError::InvalidField("unimplemented"))
+  let w = WireWriter::new(512, opts.compress)
+  let h = msg.header
+  let b2 = (if h.qr { 0x80 } else { 0 }) |
+  ((h.opcode & 0x0F) << 3) |
+  (if h.aa { 0x04 } else { 0 }) |
+  (if h.tc { 0x02 } else { 0 }) |
+  (if h.rd { 0x01 } else { 0 })
+  let b3 = (if h.ra { 0x80 } else { 0 }) |
+  (if h.z { 0x40 } else { 0 }) |
+  (if h.ad { 0x20 } else { 0 }) |
+  (if h.cd { 0x10 } else { 0 }) |
+  (h.rcode & 0x0F)
+  w.write_u16(h.id)
+  w.write_u8(b2)
+  w.write_u8(b3)
+  w.write_u16(msg.questions.length())
+  w.write_u16(msg.answers.length())
+  w.write_u16(msg.authorities.length())
+  w.write_u16(msg.additionals.length())
+  let mut i = 0
+  while i < msg.questions.length() {
+    let q = msg.questions[i]
+    w.write_name(q.name, true)
+    w.write_u16(q.qtype)
+    w.write_u16(q.qclass)
+    i = i + 1
+  }
+  i = 0
+  while i < msg.answers.length() {
+    match encode_rr(w, msg.answers[i]) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < msg.authorities.length() {
+    match encode_rr(w, msg.authorities[i]) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < msg.additionals.length() {
+    match encode_rr(w, msg.additionals[i]) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  if w.len > 65535 {
+    return Err(DnsError::MessageTooLarge(w.len))
+  }
+  Ok(w.to_bytes())
 }
 
 ///|
@@ -90,12 +799,53 @@ pub fn encode_tcp(msg : Message) -> Result[Bytes, DnsError] {
 
 ///|
 pub fn encode_tcp_with(msg : Message, opts : EncodeOptions) -> Result[Bytes, DnsError] {
-  let _ = (msg, opts)
-  Err(DnsError::InvalidField("unimplemented"))
+  let wire = match encode_message_with(msg, opts) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  let n = wire.length()
+  let mut out = Bytes::new(2 + n)
+  out[0] = ((n >> 8) & 0xFF).to_byte()
+  out[1] = (n & 0xFF).to_byte()
+  let mut i = 0
+  while i < n {
+    out[2 + i] = wire[i]
+    i = i + 1
+  }
+  Ok(out)
 }
 
-///|
+///| RFC 8484 §4.1 DoH GET `dns=` base64url (no padding) encoder.
 pub fn encode_doh_get_param(msg : Message) -> Result[String, DnsError] {
-  let _ = msg
-  Err(DnsError::InvalidField("unimplemented"))
+  let wire = match encode_message(msg) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  let alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+  let sb = StringBuilder::new()
+  let n = wire.length()
+  let mut i = 0
+  while i + 3 <= n {
+    let b0 = wire[i].to_int()
+    let b1 = wire[i + 1].to_int()
+    let b2 = wire[i + 2].to_int()
+    sb.write_byte(alpha.code_unit_at(b0 >> 2).to_byte())
+    sb.write_byte(alpha.code_unit_at(((b0 & 0x03) << 4) | (b1 >> 4)).to_byte())
+    sb.write_byte(alpha.code_unit_at(((b1 & 0x0F) << 2) | (b2 >> 6)).to_byte())
+    sb.write_byte(alpha.code_unit_at(b2 & 0x3F).to_byte())
+    i = i + 3
+  }
+  let rem = n - i
+  if rem == 1 {
+    let b0 = wire[i].to_int()
+    sb.write_byte(alpha.code_unit_at(b0 >> 2).to_byte())
+    sb.write_byte(alpha.code_unit_at((b0 & 0x03) << 4).to_byte())
+  } else if rem == 2 {
+    let b0 = wire[i].to_int()
+    let b1 = wire[i + 1].to_int()
+    sb.write_byte(alpha.code_unit_at(b0 >> 2).to_byte())
+    sb.write_byte(alpha.code_unit_at(((b0 & 0x03) << 4) | (b1 >> 4)).to_byte())
+    sb.write_byte(alpha.code_unit_at((b1 & 0x0F) << 2).to_byte())
+  }
+  Ok(sb.to_string())
 }

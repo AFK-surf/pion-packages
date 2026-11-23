@@ -1,4 +1,594 @@
-///| Stub DNS Wire Decoder, TCP Framing, and DoH Base64url Decoder (Red phase).
+///| RFC 1035 / 3596 / 6891 / 8484 / 9460 DNS Wire Decoder, TCP Framing, and DoH Base64url Decoder.
+
+///|
+fn read_u16_be(buf : Bytes, pos : Int) -> Int {
+  (buf[pos].to_int() << 8) | buf[pos + 1].to_int()
+}
+
+///|
+fn read_u32_be(buf : Bytes, pos : Int) -> Int64 {
+  let b0 = buf[pos].to_int().to_int64()
+  let b1 = buf[pos + 1].to_int().to_int64()
+  let b2 = buf[pos + 2].to_int().to_int64()
+  let b3 = buf[pos + 3].to_int().to_int64()
+  (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+///|
+fn slice_bytes(buf : Bytes, start : Int, len : Int) -> Bytes {
+  let mut out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = buf[start + i]
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn decode_edns_options(buf : Bytes, start : Int, end : Int) -> Result[OptData, DnsError] {
+  let opts : Array[EdnsOption] = []
+  let mut pos = start
+  while pos < end {
+    if pos + 4 > end {
+      return Err(DnsError::InvalidRData("truncated EDNS option header"))
+    }
+    let code = read_u16_be(buf, pos)
+    let olen = read_u16_be(buf, pos + 2)
+    pos = pos + 4
+    if pos + olen > end {
+      return Err(DnsError::InvalidRData("truncated EDNS option data"))
+    }
+    if code == edns_opt_ecs {
+      if olen < 4 {
+        return Err(DnsError::InvalidRData("ECS option shorter than 4 bytes"))
+      }
+      let family = read_u16_be(buf, pos)
+      let src_len = buf[pos + 2].to_int()
+      let scope_len = buf[pos + 3].to_int()
+      let addr_len = olen - 4
+      let expected_addr_len = (src_len + 7) / 8
+      if family == 1 && (src_len > 32 || scope_len > 32 || addr_len < expected_addr_len || addr_len > 4) {
+        return Err(DnsError::InvalidRData("invalid IPv4 ECS option"))
+      }
+      if family == 2 && (src_len > 128 || scope_len > 128 || addr_len < expected_addr_len || addr_len > 16) {
+        return Err(DnsError::InvalidRData("invalid IPv6 ECS option"))
+      }
+      opts.push(
+        EdnsOption::Ecs(EcsOption::{
+          family: family,
+          source_prefix_len: src_len,
+          scope_prefix_len: scope_len,
+          address: slice_bytes(buf, pos + 4, addr_len),
+        }),
+      )
+    } else if code == edns_opt_cookie {
+      if olen != 8 && (olen < 16 || olen > 40) {
+        return Err(DnsError::InvalidRData("invalid DNS Cookie length"))
+      }
+      let client = slice_bytes(buf, pos, 8)
+      let server = if olen > 8 { slice_bytes(buf, pos + 8, olen - 8) } else { Bytes::new(0) }
+      opts.push(EdnsOption::Cookie(CookieOption::{ client: client, server: server }))
+    } else if code == edns_opt_padding {
+      opts.push(EdnsOption::Padding(olen))
+    } else {
+      opts.push(EdnsOption::Unknown(code, slice_bytes(buf, pos, olen)))
+    }
+    pos = pos + olen
+  }
+  Ok(OptData::{ options: opts })
+}
+
+///|
+fn decode_svcb_rdata(
+  buf : Bytes,
+  base : Int,
+  rd_start : Int,
+  rd_end : Int,
+  max_pointers : Int,
+) -> Result[SvcbData, DnsError] {
+  if rd_start + 3 > rd_end {
+    return Err(DnsError::InvalidRData("SVCB/HTTPS RDATA too short"))
+  }
+  let priority = read_u16_be(buf, rd_start)
+  let (target, next_pos) = match
+  decode_name_internal(buf, base, rd_end, rd_start + 2, 12, max_pointers)
+  {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if priority == 0 {
+    if next_pos != rd_end {
+      return Err(DnsError::InvalidRData("SVCB AliasMode must not contain SvcParams"))
+    }
+    return Ok(SvcbData::{ priority: 0, target: target, params: [] })
+  }
+  let params : Array[SvcParam] = []
+  let mut pos = next_pos
+  let mut prev_key = -1
+  while pos < rd_end {
+    if pos + 4 > rd_end {
+      return Err(DnsError::InvalidRData("truncated SvcParam header"))
+    }
+    let key = read_u16_be(buf, pos)
+    let vlen = read_u16_be(buf, pos + 2)
+    pos = pos + 4
+    if key <= prev_key {
+      return Err(DnsError::InvalidRData("SvcParam keys must be in strictly increasing order"))
+    }
+    prev_key = key
+    if pos + vlen > rd_end {
+      return Err(DnsError::InvalidRData("truncated SvcParam value"))
+    }
+    if key == svcparam_mandatory {
+      if vlen == 0 || (vlen & 1) != 0 {
+        return Err(DnsError::InvalidRData("invalid mandatory SvcParam length"))
+      }
+      let keys : Array[Int] = []
+      let mut p = pos
+      while p < pos + vlen {
+        keys.push(read_u16_be(buf, p))
+        p = p + 2
+      }
+      params.push(SvcParam::Mandatory(keys))
+    } else if key == svcparam_alpn {
+      if vlen == 0 {
+        return Err(DnsError::InvalidRData("empty alpn SvcParam"))
+      }
+      let ids : Array[Bytes] = []
+      let mut p = pos
+      let pend = pos + vlen
+      while p < pend {
+        let ilen = buf[p].to_int()
+        p = p + 1
+        if ilen == 0 || p + ilen > pend {
+          return Err(DnsError::InvalidRData("invalid alpn protocol-id"))
+        }
+        ids.push(slice_bytes(buf, p, ilen))
+        p = p + ilen
+      }
+      params.push(SvcParam::Alpn(ids))
+    } else if key == svcparam_no_default_alpn {
+      if vlen != 0 {
+        return Err(DnsError::InvalidRData("no-default-alpn must be empty"))
+      }
+      params.push(SvcParam::NoDefaultAlpn)
+    } else if key == svcparam_port {
+      if vlen != 2 {
+        return Err(DnsError::InvalidRData("port SvcParam must be 2 bytes"))
+      }
+      params.push(SvcParam::Port(read_u16_be(buf, pos)))
+    } else if key == svcparam_ipv4hint {
+      if vlen == 0 || (vlen & 3) != 0 {
+        return Err(DnsError::InvalidRData("invalid ipv4hint length"))
+      }
+      let ips : Array[Ipv4Addr] = []
+      let mut p = pos
+      while p < pos + vlen {
+        ips.push(
+          Ipv4Addr::{
+            a: buf[p].to_int(),
+            b: buf[p + 1].to_int(),
+            c: buf[p + 2].to_int(),
+            d: buf[p + 3].to_int(),
+          },
+        )
+        p = p + 4
+      }
+      params.push(SvcParam::Ipv4Hint(ips))
+    } else if key == svcparam_ech {
+      params.push(SvcParam::Ech(slice_bytes(buf, pos, vlen)))
+    } else if key == svcparam_ipv6hint {
+      if vlen == 0 || (vlen & 15) != 0 {
+        return Err(DnsError::InvalidRData("invalid ipv6hint length"))
+      }
+      let ips : Array[Ipv6Addr] = []
+      let mut p = pos
+      while p < pos + vlen {
+        let ip = match Ipv6Addr::from_bytes(slice_bytes(buf, p, 16)) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        ips.push(ip)
+        p = p + 16
+      }
+      params.push(SvcParam::Ipv6Hint(ips))
+    } else {
+      params.push(SvcParam::Unknown(key, slice_bytes(buf, pos, vlen)))
+    }
+    pos = pos + vlen
+  }
+  Ok(SvcbData::{ priority: priority, target: target, params: params })
+}
+
+///|
+fn decode_nsec_bitmaps(buf : Bytes, start : Int, end : Int) -> Result[Array[Int], DnsError] {
+  let types : Array[Int] = []
+  let mut pos = start
+  let mut prev_window = -1
+  while pos < end {
+    if pos + 2 > end {
+      return Err(DnsError::InvalidRData("truncated NSEC bitmap window header"))
+    }
+    let window = buf[pos].to_int()
+    let wlen = buf[pos + 1].to_int()
+    pos = pos + 2
+    if window <= prev_window || wlen == 0 || wlen > 32 || pos + wlen > end {
+      return Err(DnsError::InvalidRData("invalid NSEC type bitmap window"))
+    }
+    prev_window = window
+    let base_type = window << 8
+    let mut bi = 0
+    while bi < wlen {
+      let byte_val = buf[pos + bi].to_int()
+      if byte_val != 0 {
+        let mut bit = 0
+        while bit < 8 {
+          if (byte_val & (0x80 >> bit)) != 0 {
+            types.push(base_type + bi * 8 + bit)
+          }
+          bit = bit + 1
+        }
+      }
+      bi = bi + 1
+    }
+    pos = pos + wlen
+  }
+  Ok(types)
+}
+
+///|
+fn decode_rdata(
+  buf : Bytes,
+  base : Int,
+  end : Int,
+  rtype : Int,
+  rd_start : Int,
+  rd_len : Int,
+  max_pointers : Int,
+) -> Result[RData, DnsError] {
+  let rd_end = rd_start + rd_len
+  if rtype == type_a {
+    if rd_len != 4 {
+      return Err(DnsError::InvalidRData("A record must be 4 bytes"))
+    }
+    return Ok(
+      RData::A(Ipv4Addr::{
+        a: buf[rd_start].to_int(),
+        b: buf[rd_start + 1].to_int(),
+        c: buf[rd_start + 2].to_int(),
+        d: buf[rd_start + 3].to_int(),
+      }),
+    )
+  }
+  if rtype == type_aaaa {
+    if rd_len != 16 {
+      return Err(DnsError::InvalidRData("AAAA record must be 16 bytes"))
+    }
+    let mut hi = 0UL
+    let mut i = 0
+    while i < 8 {
+      hi = (hi << 8) | buf[rd_start + i].to_int().to_int64().to_uint64()
+      i = i + 1
+    }
+    let mut lo = 0UL
+    while i < 16 {
+      lo = (lo << 8) | buf[rd_start + i].to_int().to_int64().to_uint64()
+      i = i + 1
+    }
+    return Ok(RData::AAAA(Ipv6Addr::{ hi: hi, lo: lo }))
+  }
+  if rtype == type_cname || rtype == type_ns || rtype == type_ptr {
+    let (name, next) = match
+    decode_name_internal(buf, base, end, rd_start, 12, max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if next != rd_end {
+      return Err(DnsError::InvalidRData("domain name length mismatch in RDATA"))
+    }
+    if rtype == type_cname {
+      return Ok(RData::CNAME(name))
+    } else if rtype == type_ns {
+      return Ok(RData::NS(name))
+    } else {
+      return Ok(RData::PTR(name))
+    }
+  }
+  if rtype == type_mx {
+    if rd_len < 3 {
+      return Err(DnsError::InvalidRData("MX record too short"))
+    }
+    let pref = read_u16_be(buf, rd_start)
+    let (exch, next) = match
+    decode_name_internal(buf, base, end, rd_start + 2, 12, max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if next != rd_end {
+      return Err(DnsError::InvalidRData("MX exchange length mismatch"))
+    }
+    return Ok(RData::MX(MxData::{ preference: pref, exchange: exch }))
+  }
+  if rtype == type_txt {
+    let chunks : Array[Bytes] = []
+    let mut pos = rd_start
+    while pos < rd_end {
+      let clen = buf[pos].to_int()
+      pos = pos + 1
+      if pos + clen > rd_end {
+        return Err(DnsError::InvalidRData("TXT character-string exceeds rdlength"))
+      }
+      chunks.push(slice_bytes(buf, pos, clen))
+      pos = pos + clen
+    }
+    return Ok(RData::TXT(chunks))
+  }
+  if rtype == type_soa {
+    let (mname, p1) = match
+    decode_name_internal(buf, base, end, rd_start, 12, max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if p1 > rd_end {
+      return Err(DnsError::InvalidRData("SOA mname exceeds rdlength"))
+    }
+    let (rname, p2) = match decode_name_internal(buf, base, end, p1, 12, max_pointers) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if p2 + 20 != rd_end {
+      return Err(DnsError::InvalidRData("SOA timers length mismatch"))
+    }
+    return Ok(
+      RData::SOA(SoaData::{
+        mname: mname,
+        rname: rname,
+        serial: read_u32_be(buf, p2),
+        refresh: read_u32_be(buf, p2 + 4),
+        retry: read_u32_be(buf, p2 + 8),
+        expire: read_u32_be(buf, p2 + 12),
+        minimum: read_u32_be(buf, p2 + 16),
+      }),
+    )
+  }
+  if rtype == type_srv {
+    if rd_len < 7 {
+      return Err(DnsError::InvalidRData("SRV record too short"))
+    }
+    let priority = read_u16_be(buf, rd_start)
+    let weight = read_u16_be(buf, rd_start + 2)
+    let port = read_u16_be(buf, rd_start + 4)
+    let (target, next) = match
+    decode_name_internal(buf, base, end, rd_start + 6, 12, max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if next != rd_end {
+      return Err(DnsError::InvalidRData("SRV target length mismatch"))
+    }
+    return Ok(
+      RData::SRV(SrvData::{ priority: priority, weight: weight, port: port, target: target }),
+    )
+  }
+  if rtype == type_caa {
+    if rd_len < 2 {
+      return Err(DnsError::InvalidRData("CAA record too short"))
+    }
+    let flags = buf[rd_start].to_int()
+    let tag_len = buf[rd_start + 1].to_int()
+    if tag_len == 0 || rd_start + 2 + tag_len > rd_end {
+      return Err(DnsError::InvalidRData("invalid CAA tag length"))
+    }
+    let tag = slice_bytes(buf, rd_start + 2, tag_len).to_string()
+    let val_start = rd_start + 2 + tag_len
+    let caa_val = slice_bytes(buf, val_start, rd_end - val_start)
+    return Ok(RData::CAA(CaaData::{ flags: flags, tag: tag, value: caa_val }))
+  }
+  if rtype == type_naptr {
+    if rd_len < 7 {
+      return Err(DnsError::InvalidRData("NAPTR record too short"))
+    }
+    let order = read_u16_be(buf, rd_start)
+    let pref = read_u16_be(buf, rd_start + 2)
+    let mut pos = rd_start + 4
+    if pos >= rd_end {
+      return Err(DnsError::InvalidRData("truncated NAPTR flags"))
+    }
+    let flen = buf[pos].to_int()
+    pos = pos + 1
+    if pos + flen > rd_end {
+      return Err(DnsError::InvalidRData("truncated NAPTR flags"))
+    }
+    let flags = slice_bytes(buf, pos, flen)
+    pos = pos + flen
+    if pos >= rd_end {
+      return Err(DnsError::InvalidRData("truncated NAPTR service"))
+    }
+    let slen = buf[pos].to_int()
+    pos = pos + 1
+    if pos + slen > rd_end {
+      return Err(DnsError::InvalidRData("truncated NAPTR service"))
+    }
+    let service = slice_bytes(buf, pos, slen)
+    pos = pos + slen
+    if pos >= rd_end {
+      return Err(DnsError::InvalidRData("truncated NAPTR regexp"))
+    }
+    let rlen = buf[pos].to_int()
+    pos = pos + 1
+    if pos + rlen > rd_end {
+      return Err(DnsError::InvalidRData("truncated NAPTR regexp"))
+    }
+    let regexp = slice_bytes(buf, pos, rlen)
+    pos = pos + rlen
+    let (repl, next) = match decode_name_internal(buf, base, end, pos, 12, max_pointers) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if next != rd_end {
+      return Err(DnsError::InvalidRData("NAPTR replacement length mismatch"))
+    }
+    return Ok(
+      RData::NAPTR(NaptrData::{
+        order: order,
+        preference: pref,
+        flags: flags,
+        service: service,
+        regexp: regexp,
+        replacement: repl,
+      }),
+    )
+  }
+  if rtype == type_opt {
+    return match decode_edns_options(buf, rd_start, rd_end) {
+      Ok(od) => Ok(RData::OPT(od))
+      Err(e) => Err(e)
+    }
+  }
+  if rtype == type_svcb || rtype == type_https {
+    return match decode_svcb_rdata(buf, base, rd_start, rd_end, max_pointers) {
+      Ok(sd) =>
+      if rtype == type_svcb {
+        Ok(RData::SVCB(sd))
+      } else {
+        Ok(RData::HTTPS(sd))
+      }
+      Err(e) => Err(e)
+    }
+  }
+  if rtype == type_ds {
+    if rd_len < 4 {
+      return Err(DnsError::InvalidRData("DS record too short"))
+    }
+    return Ok(
+      RData::DS(DsData::{
+        key_tag: read_u16_be(buf, rd_start),
+        algorithm: buf[rd_start + 2].to_int(),
+        digest_type: buf[rd_start + 3].to_int(),
+        digest: slice_bytes(buf, rd_start + 4, rd_len - 4),
+      }),
+    )
+  }
+  if rtype == type_dnskey {
+    if rd_len < 4 {
+      return Err(DnsError::InvalidRData("DNSKEY record too short"))
+    }
+    return Ok(
+      RData::DNSKEY(DnskeyData::{
+        flags: read_u16_be(buf, rd_start),
+        protocol: buf[rd_start + 2].to_int(),
+        algorithm: buf[rd_start + 3].to_int(),
+        public_key: slice_bytes(buf, rd_start + 4, rd_len - 4),
+      }),
+    )
+  }
+  if rtype == type_rrsig {
+    if rd_len < 19 {
+      return Err(DnsError::InvalidRData("RRSIG record too short"))
+    }
+    let type_covered = read_u16_be(buf, rd_start)
+    let algorithm = buf[rd_start + 2].to_int()
+    let labels = buf[rd_start + 3].to_int()
+    let original_ttl = read_u32_be(buf, rd_start + 4)
+    let expiration = read_u32_be(buf, rd_start + 8)
+    let inception = read_u32_be(buf, rd_start + 12)
+    let key_tag = read_u16_be(buf, rd_start + 16)
+    let (signer, sig_start) = match
+    decode_name_internal(buf, base, rd_end, rd_start + 18, 12, max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if sig_start > rd_end {
+      return Err(DnsError::InvalidRData("RRSIG signer exceeds rdlength"))
+    }
+    return Ok(
+      RData::RRSIG(RrsigData::{
+        type_covered: type_covered,
+        algorithm: algorithm,
+        labels: labels,
+        original_ttl: original_ttl,
+        expiration: expiration,
+        inception: inception,
+        key_tag: key_tag,
+        signer_name: signer,
+        signature: slice_bytes(buf, sig_start, rd_end - sig_start),
+      }),
+    )
+  }
+  if rtype == type_nsec {
+    let (next_dom, bm_start) = match
+    decode_name_internal(buf, base, rd_end, rd_start, 12, max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if bm_start > rd_end {
+      return Err(DnsError::InvalidRData("NSEC next_domain exceeds rdlength"))
+    }
+    let types = match decode_nsec_bitmaps(buf, bm_start, rd_end) {
+      Ok(ts) => ts
+      Err(e) => return Err(e)
+    }
+    return Ok(RData::NSEC(NsecData::{ next_domain: next_dom, types: types }))
+  }
+  Ok(RData::Unknown(rtype, slice_bytes(buf, rd_start, rd_len)))
+}
+
+///|
+fn decode_rr_section(
+  buf : Bytes,
+  base : Int,
+  end : Int,
+  start_pos : Int,
+  count : Int,
+  max_pointers : Int,
+) -> Result[(Array[ResourceRecord], Int), DnsError] {
+  let out : Array[ResourceRecord] = []
+  let mut pos = start_pos
+  let mut i = 0
+  while i < count {
+    if pos >= end {
+      return Err(DnsError::UnexpectedEof(pos - base))
+    }
+    let (name, after_name) = match
+    decode_name_internal(buf, base, end, pos, 12, max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if after_name + 10 > end {
+      return Err(DnsError::UnexpectedEof(after_name - base))
+    }
+    let rtype = read_u16_be(buf, after_name)
+    let rclass = read_u16_be(buf, after_name + 2)
+    let ttl = read_u32_be(buf, after_name + 4)
+    let rdlength = read_u16_be(buf, after_name + 8)
+    let rd_start = after_name + 10
+    if rd_start + rdlength > end {
+      return Err(DnsError::UnexpectedEof(rd_start - base))
+    }
+    let rdata = match decode_rdata(buf, base, end, rtype, rd_start, rdlength, max_pointers) {
+      Ok(r) => r
+      Err(e) => return Err(e)
+    }
+    out.push(ResourceRecord::{
+      name: name,
+      rtype: rtype,
+      rclass: rclass,
+      ttl: ttl,
+      rdata: rdata,
+    })
+    pos = rd_start + rdlength
+    i = i + 1
+  }
+  Ok((out, pos))
+}
 
 ///|
 pub fn decode_message(buf : Bytes) -> Result[Message, DnsError] {
@@ -17,11 +607,97 @@ pub fn decode_message_at(
   end : Int,
   limits : DecodeLimits,
 ) -> Result[Message, DnsError] {
-  let _ = (buf, start, end, limits)
-  Err(DnsError::InvalidField("unimplemented"))
+  let msg_len = end - start
+  if msg_len < 12 {
+    return Err(DnsError::UnexpectedEof(msg_len))
+  }
+  if msg_len > limits.max_message_bytes {
+    return Err(DnsError::MessageTooLarge(msg_len))
+  }
+  let id = read_u16_be(buf, start)
+  let b2 = buf[start + 2].to_int()
+  let b3 = buf[start + 3].to_int()
+  let qdcount = read_u16_be(buf, start + 4)
+  let ancount = read_u16_be(buf, start + 6)
+  let nscount = read_u16_be(buf, start + 8)
+  let arcount = read_u16_be(buf, start + 10)
+  if qdcount > limits.max_questions {
+    return Err(DnsError::TooManyQuestions(limits.max_questions))
+  }
+  let total_rrs = ancount + nscount + arcount
+  if total_rrs > limits.max_records {
+    return Err(DnsError::TooManyRecords(limits.max_records))
+  }
+  let header = Header::{
+    id: id,
+    qr: (b2 & 0x80) != 0,
+    opcode: (b2 >> 3) & 0x0F,
+    aa: (b2 & 0x04) != 0,
+    tc: (b2 & 0x02) != 0,
+    rd: (b2 & 0x01) != 0,
+    ra: (b3 & 0x80) != 0,
+    z: (b3 & 0x40) != 0,
+    ad: (b3 & 0x20) != 0,
+    cd: (b3 & 0x10) != 0,
+    rcode: b3 & 0x0F,
+    qdcount: qdcount,
+    ancount: ancount,
+    nscount: nscount,
+    arcount: arcount,
+  }
+  let mut pos = start + 12
+  let questions : Array[Question] = []
+  let mut qi = 0
+  while qi < qdcount {
+    if pos >= end {
+      return Err(DnsError::UnexpectedEof(pos - start))
+    }
+    let (qname, after_name) = match
+    decode_name_internal(buf, start, end, pos, 12, limits.max_pointers)
+    {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if after_name + 4 > end {
+      return Err(DnsError::UnexpectedEof(after_name - start))
+    }
+    let qtype = read_u16_be(buf, after_name)
+    let qclass = read_u16_be(buf, after_name + 2)
+    questions.push(Question::{ name: qname, qtype: qtype, qclass: qclass })
+    pos = after_name + 4
+    qi = qi + 1
+  }
+  let (answers, p_an) = match
+  decode_rr_section(buf, start, end, pos, ancount, limits.max_pointers)
+  {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (authorities, p_ns) = match
+  decode_rr_section(buf, start, end, p_an, nscount, limits.max_pointers)
+  {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (additionals, p_ar) = match
+  decode_rr_section(buf, start, end, p_ns, arcount, limits.max_pointers)
+  {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if !limits.allow_trailing_bytes && p_ar < end {
+    return Err(DnsError::TrailingBytes(p_ar - start))
+  }
+  Ok(Message::{
+    header: header,
+    questions: questions,
+    answers: answers,
+    authorities: authorities,
+    additionals: additionals,
+  })
 }
 
-///|
+///| RFC 1035 §4.2.2 TCP 2-byte length-prefixed framing decoder.
 pub fn decode_tcp(buf : Bytes) -> Result[TcpDecodeStatus, DnsError] {
   decode_tcp_with(buf, DecodeLimits::default())
 }
@@ -31,12 +707,81 @@ pub fn decode_tcp_with(
   buf : Bytes,
   limits : DecodeLimits,
 ) -> Result[TcpDecodeStatus, DnsError] {
-  let _ = (buf, limits)
-  Err(DnsError::InvalidField("unimplemented"))
+  let n = buf.length()
+  if n < 2 {
+    return Ok(TcpDecodeStatus::Incomplete(2))
+  }
+  let frame_len = read_u16_be(buf, 0)
+  let total_needed = 2 + frame_len
+  if n < total_needed {
+    return Ok(TcpDecodeStatus::Incomplete(total_needed))
+  }
+  match decode_message_at(buf, 2, total_needed, limits) {
+    Ok(msg) => Ok(TcpDecodeStatus::Complete(msg, total_needed))
+    Err(e) => Err(e)
+  }
 }
 
 ///|
+fn b64url_val(c : Int) -> Int {
+  if c >= 65 && c <= 90 {
+    c - 65
+  } else if c >= 97 && c <= 122 {
+    c - 71
+  } else if c >= 48 && c <= 57 {
+    c + 4
+  } else if c == 45 {
+    62
+  } else if c == 95 {
+    63
+  } else {
+    -1
+  }
+}
+
+///| RFC 8484 §4.1 DoH GET `dns=` base64url (no padding) decoder.
 pub fn decode_doh_get_param(param : String) -> Result[Message, DnsError] {
-  let _ = param
-  Err(DnsError::InvalidField("unimplemented"))
+  let raw = param.to_bytes()
+  let n = raw.length()
+  if n == 0 || (n & 3) == 1 {
+    return Err(DnsError::InvalidBase64Url(0))
+  }
+  let full_groups = n / 4
+  let rem = n & 3
+  let out_len = full_groups * 3 + (if rem == 2 { 1 } else if rem == 3 { 2 } else { 0 })
+  let mut out = Bytes::new(out_len)
+  let mut i = 0
+  let mut o = 0
+  while i + 4 <= n {
+    let v0 = b64url_val(raw[i].to_int())
+    let v1 = b64url_val(raw[i + 1].to_int())
+    let v2 = b64url_val(raw[i + 2].to_int())
+    let v3 = b64url_val(raw[i + 3].to_int())
+    if v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0 {
+      return Err(DnsError::InvalidBase64Url(i))
+    }
+    out[o] = ((v0 << 2) | (v1 >> 4)).to_byte()
+    out[o + 1] = (((v1 & 0x0F) << 4) | (v2 >> 2)).to_byte()
+    out[o + 2] = (((v2 & 0x03) << 6) | v3).to_byte()
+    i = i + 4
+    o = o + 3
+  }
+  if rem == 2 {
+    let v0 = b64url_val(raw[i].to_int())
+    let v1 = b64url_val(raw[i + 1].to_int())
+    if v0 < 0 || v1 < 0 || (v1 & 0x0F) != 0 {
+      return Err(DnsError::InvalidBase64Url(i))
+    }
+    out[o] = ((v0 << 2) | (v1 >> 4)).to_byte()
+  } else if rem == 3 {
+    let v0 = b64url_val(raw[i].to_int())
+    let v1 = b64url_val(raw[i + 1].to_int())
+    let v2 = b64url_val(raw[i + 2].to_int())
+    if v0 < 0 || v1 < 0 || v2 < 0 || (v2 & 0x03) != 0 {
+      return Err(DnsError::InvalidBase64Url(i))
+    }
+    out[o] = ((v0 << 2) | (v1 >> 4)).to_byte()
+    out[o + 1] = (((v1 & 0x0F) << 4) | (v2 >> 2)).to_byte()
+  }
+  decode_message(out)
 }
