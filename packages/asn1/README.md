@@ -61,6 +61,15 @@ let der = seq.to_bytes()
 - **Dual-Target Wasm32 Smoke (`packages/asn1/wasm_smoke`)**: All 4 build modes (Native debug/release + Wasm32 debug/release executed on `node` with `pion_wasm_rt.mjs`) exit `0` with byte-identical non-empty stdout (`sha256:b288d45fcb867c782303a0be5cf5cd29b02e5ae56f44415561f1609e376e0fbc`).
 - **Formatting & Typecheck**: `pionc fmt --check packages/asn1` and `pionc check --json packages/asn1` pass with 0 diagnostics.
 
+## Formal Verification (Lean 4)
+
+Run `sh packages/asn1/proofs/run_proofs.sh` (or `sh scripts/verify-lean.sh asn1`) to extract `packages/asn1/src/*.pion` via `pionc extract-lean` and machine-check **24 production theorems** (`0 sorry`, `0 admit`, `0 native_decide`, `0 bv_decide`, only `{propext, Classical.choice, Quot.sound}`):
+
+- **X.690 DER Tag, Length, Boolean, Integer & BitString (`Asn1Proofs/TagDer.lean`, 14 theorems)**: `TagClass` 2-bit bijection & exact equality, `Tag::equals` exact decidable equality, X.690 §8.1.2 identifier octet byte bounds (`[0, 255]`), full short-form tag bijection (`0 ≤ num ≤ 30`), §8.1.2.4 high-tag sentinel (`0x1F`) non-collision, §11.1 strict DER BOOLEAN (`0x00` / `0xFF` only), §8.3.2 minimal two's-complement INTEGER pair (rejects redundant leading `0x00`/`0xFF`, accepts sign-extension guards), §8.6/§11.2.2 BIT STRING padding rules, and §8.1.3/§10.1 canonical length byte count bounds (`[1, 5]`) & monotonicity.
+- **RFC 5280 Time & RFC 7468 PEM (`Asn1Proofs/TimePem.lean`, 7 theorems)**: Gregorian 4/100/400 `is_leap_year` spec & 400-year periodicity, `days_in_month` bounds (`28..31` / `0`) & Feb 29 ↔ leap year, RFC 5280 §4.1.2.5.1 UTCTime year expansion (`[0, 99] → [1950, 2049]`), `is_valid_hms` (`[0, 23] × [0, 59] × [0, 59]`), and RFC 7468 §3 PEM `labelchar` exact range (`%x21-2C / %x2E-7E`).
+- **RFC 5280 KeyUsage Bitmask (`Asn1Proofs/KeyUsage.lean`, 3 theorems)**: zero/all-ones completeness and 9-bit single-bit orthogonality across all 9 `KeyUsage` flags.
+- **Native vs Lean Differential**: `50/50` cases byte-identical (`diff -u` exit `0`).
+
 ## Head-to-Head Benchmarks
 
 Measured on `Darwin arm64` via `sh packages/asn1/bench/run_bench.sh` and `sh packages/asn1/audit/run_audit.sh bench` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) comparing:

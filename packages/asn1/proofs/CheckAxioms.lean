@@ -1,0 +1,26 @@
+import Asn1Proofs
+
+#print axioms Asn1Proofs.tag_class_roundtrip
+#print axioms Asn1Proofs.tag_class_equals_iff
+#print axioms Asn1Proofs.tag_equals_iff
+#print axioms Asn1Proofs.encode_tag_first_byte_range
+#print axioms Asn1Proofs.short_tag_byte_roundtrip
+#print axioms Asn1Proofs.high_tag_sentinel_invariant
+#print axioms Asn1Proofs.der_bool_canonical_iff
+#print axioms Asn1Proofs.der_int_pair_rejects_redundant_zero
+#print axioms Asn1Proofs.der_int_pair_rejects_redundant_ff
+#print axioms Asn1Proofs.der_int_pair_accepts_sign_guard
+#print axioms Asn1Proofs.bit_string_padding_rejects_out_of_range
+#print axioms Asn1Proofs.bit_string_empty_requires_zero_unused
+#print axioms Asn1Proofs.bit_string_zero_unused_always_valid
+#print axioms Asn1Proofs.der_length_encoded_size_bounds_and_monotone
+#print axioms Asn1Proofs.is_leap_year_spec
+#print axioms Asn1Proofs.is_leap_year_period_400
+#print axioms Asn1Proofs.days_in_month_bounds
+#print axioms Asn1Proofs.days_in_month_feb_leap
+#print axioms Asn1Proofs.utc_time_expand_year_rfc5280
+#print axioms Asn1Proofs.is_valid_hms_iff
+#print axioms Asn1Proofs.pem_label_char_rfc7468_iff
+#print axioms Asn1Proofs.key_usage_zero_all_false
+#print axioms Asn1Proofs.key_usage_all_ones_all_true
+#print axioms Asn1Proofs.key_usage_single_bit_orthogonality
