@@ -1,0 +1,770 @@
+///| RFC 6570 path template trie router with static-before-template priority,
+///| inline template segments, percent-decoding, 404/405 distinction, and typed parameter coercion.
+
+import "json5"
+
+fn empty_trie_node() -> TrieNode {
+  TrieNode::{
+    static_keys: [],
+    static_children: [],
+    param_name: None,
+    param_child: -1,
+    inline_edges: [],
+    route_methods: [],
+    route_ids: [],
+  }
+}
+
+///| Strip query string `?…` and fragment `#…` from a request path.
+fn strip_query_and_fragment(path : String) -> String {
+  let n = path.length()
+  let mut i = 0
+  while i < n {
+    let b = path.code_unit_at(i)
+    if b == 63 || b == 35 {
+      return path.slice(0, i)
+    }
+    i = i + 1
+  }
+  path
+}
+
+///| Split a path into `/` segments, preserving empty segments and trailing slashes.
+///| `/` -> `[]`, `/users` -> `["users"]`, `/users/` -> `["users", ""]`, `//users` -> `["", "users"]`.
+fn split_path_segments(path : String) -> Array[String] {
+  let clean = strip_query_and_fragment(path)
+  let segs : Array[String] = []
+  let n = clean.length()
+  if n == 0 || (n == 1 && clean.code_unit_at(0) == 47) {
+    return segs
+  }
+  let mut i = 0
+  if clean.code_unit_at(0) == 47 {
+    i = 1
+  }
+  while true {
+    let start = i
+    while i < n && clean.code_unit_at(i) != 47 {
+      i = i + 1
+    }
+    segs.push(clean.slice(start, i))
+    if i >= n {
+      break
+    }
+    i = i + 1
+  }
+  segs
+}
+
+///| Extract the base path component from a Server URL (stripping scheme + authority, query, fragment, and trailing slash).
+fn extract_server_base_path(url : String) -> String {
+  let clean = strip_query_and_fragment(url)
+  let n = clean.length()
+  // Check for "://" scheme separator
+  let mut scheme_end = -1
+  let mut i = 0
+  while i + 2 < n {
+    if clean.code_unit_at(i) == 58 && clean.code_unit_at(i + 1) == 47 && clean.code_unit_at(i + 2) == 47 {
+      scheme_end = i + 3
+      break
+    }
+    i = i + 1
+  }
+  let raw_path = if scheme_end >= 0 {
+    let mut slash = -1
+    let mut j = scheme_end
+    while j < n {
+      if clean.code_unit_at(j) == 47 {
+        slash = j
+        break
+      }
+      j = j + 1
+    }
+    if slash < 0 {
+      ""
+    } else {
+      clean.slice(slash, n)
+    }
+  } else if n >= 2 && clean.code_unit_at(0) == 47 && clean.code_unit_at(1) == 47 {
+    let mut slash = -1
+    let mut j = 2
+    while j < n {
+      if clean.code_unit_at(j) == 47 {
+        slash = j
+        break
+      }
+      j = j + 1
+    }
+    if slash < 0 {
+      ""
+    } else {
+      clean.slice(slash, n)
+    }
+  } else {
+    clean
+  }
+  // Strip trailing slashes from server base path (so "/" -> "", "/api/" -> "/api")
+  let mut end = raw_path.length()
+  while end > 0 && raw_path.code_unit_at(end - 1) == 47 {
+    end = end - 1
+  }
+  if end == 0 {
+    ""
+  } else {
+    raw_path.slice(0, end)
+  }
+}
+
+fn find_server_var(
+  vars : Array[(String, ServerVariable)],
+  name : String,
+) -> Option[ServerVariable] {
+  let mut i = 0
+  while i < vars.length() {
+    let (k, v) = vars[i]
+    if k == name {
+      return Some(v)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn build_server_prefixes(servers : Array[Server]) -> Array[ServerPrefix] {
+  let out : Array[ServerPrefix] = []
+  let mut i = 0
+  while i < servers.length() {
+    let srv = servers[i]
+    let bp = extract_server_base_path(srv.url)
+    let raw_segs = if bp.length() == 0 { [] } else { split_path_segments(bp) }
+    let p_segs : Array[ServerPrefixSeg] = []
+    let mut si = 0
+    while si < raw_segs.length() {
+      let s = raw_segs[si]
+      match classify_segment(s) {
+        SegKind::WholeParam(vname) => {
+          match find_server_var(srv.variables, vname) {
+            Some(sv) => {
+              let allowed : Array[String] = []
+              let mut ei = 0
+              while ei < sv.enum_values.length() {
+                allowed.push(sv.enum_values[ei])
+                ei = ei + 1
+              }
+              if allowed.length() > 0 && sv.default_value.length() > 0 && !str_arr_contains(allowed, sv.default_value) {
+                allowed.push(sv.default_value)
+              }
+              p_segs.push(ServerPrefixSeg::Var(allowed))
+            }
+            None => p_segs.push(ServerPrefixSeg::Var([]))
+          }
+        }
+        _ => p_segs.push(ServerPrefixSeg::Static(s))
+      }
+      si = si + 1
+    }
+    out.push(ServerPrefix::{ segments: p_segs })
+    i = i + 1
+  }
+  out
+}
+
+fn match_server_prefix(prefix : ServerPrefix, segs : Array[String]) -> Bool {
+  let pn = prefix.segments.length()
+  if segs.length() < pn {
+    return false
+  }
+  let mut i = 0
+  while i < pn {
+    let seg = segs[i]
+    match prefix.segments[i] {
+      ServerPrefixSeg::Static(lit) => {
+        if seg != lit {
+          return false
+        }
+      }
+      ServerPrefixSeg::Var(allowed) => {
+        if seg.length() == 0 {
+          return false
+        }
+        if allowed.length() > 0 && !str_arr_contains(allowed, seg) {
+          return false
+        }
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Classify a template segment:
+///| - Static: no `{`
+///| - Whole param: `{name}`
+///| - Inline template: e.g. `{name}.{ext}` -> `(literals, param_names)`
+enum SegKind {
+  Static(String)
+  WholeParam(String)
+  Inline(Array[String], Array[String])
+}
+
+fn classify_segment(seg : String) -> SegKind {
+  let n = seg.length()
+  let mut has_brace = false
+  let mut i = 0
+  while i < n {
+    if seg.code_unit_at(i) == 123 {
+      has_brace = true
+      break
+    }
+    i = i + 1
+  }
+  if !has_brace {
+    return SegKind::Static(seg)
+  }
+  // Check whole-segment `{name}`
+  if n >= 3 && seg.code_unit_at(0) == 123 && seg.code_unit_at(n - 1) == 125 {
+    let mut inner_brace = false
+    i = 1
+    while i < n - 1 {
+      let b = seg.code_unit_at(i)
+      if b == 123 || b == 125 {
+        inner_brace = true
+        break
+      }
+      i = i + 1
+    }
+    if !inner_brace {
+      return SegKind::WholeParam(seg.slice(1, n - 1))
+    }
+  }
+  // Parse inline template into alternating literals[0..k] and param_names[0..k-1]
+  let literals : Array[String] = []
+  let pnames : Array[String] = []
+  let mut pos = 0
+  while pos <= n {
+    let lit_start = pos
+    while pos < n && seg.code_unit_at(pos) != 123 {
+      pos = pos + 1
+    }
+    literals.push(seg.slice(lit_start, pos))
+    if pos >= n {
+      break
+    }
+    let p_start = pos + 1
+    pos = p_start
+    while pos < n && seg.code_unit_at(pos) != 125 {
+      pos = pos + 1
+    }
+    pnames.push(seg.slice(p_start, pos))
+    if pos < n {
+      pos = pos + 1
+    }
+  }
+  SegKind::Inline(literals, pnames)
+}
+
+fn str_starts_with_at(s : String, offset : Int, prefix : String) -> Bool {
+  let pn = prefix.length()
+  if offset + pn > s.length() {
+    return false
+  }
+  let mut i = 0
+  while i < pn {
+    if s.code_unit_at(offset + i) != prefix.code_unit_at(i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn find_substr_from(s : String, from : Int, needle : String) -> Int {
+  let sn = s.length()
+  let nn = needle.length()
+  if nn == 0 {
+    return from
+  }
+  let mut i = from
+  while i + nn <= sn {
+    if str_starts_with_at(s, i, needle) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///| Match a single request segment against an `InlineTemplateEdge`.
+fn match_inline_edge(
+  seg : String,
+  edge : InlineTemplateEdge,
+  out_params : Array[(String, String)],
+) -> Bool {
+  let lits = edge.literals
+  let pnames = edge.param_names
+  let num_p = pnames.length()
+  if num_p == 0 || lits.length() != num_p + 1 {
+    return false
+  }
+  if !str_starts_with_at(seg, 0, lits[0]) {
+    return false
+  }
+  let mut pos = lits[0].length()
+  let mut pi = 0
+  while pi < num_p {
+    let next_lit = lits[pi + 1]
+    if pi == num_p - 1 {
+      // Last param must end with trailing literal `next_lit`
+      let sn = seg.length()
+      let ln = next_lit.length()
+      if sn - pos < ln {
+        return false
+      }
+      let end_pos = sn - ln
+      if ln > 0 && !str_starts_with_at(seg, end_pos, next_lit) {
+        return false
+      }
+      if end_pos <= pos {
+        return false
+      }
+      out_params.push((pnames[pi], percent_decode(seg.slice(pos, end_pos))))
+      pos = sn
+    } else {
+      if next_lit.length() == 0 {
+        return false
+      }
+      let idx = find_substr_from(seg, pos + 1, next_lit)
+      if idx < 0 {
+        return false
+      }
+      out_params.push((pnames[pi], percent_decode(seg.slice(pos, idx))))
+      pos = idx + next_lit.length()
+    }
+    pi = pi + 1
+  }
+  true
+}
+
+///| Build an RFC 6570 trie `Router` from an `OpenApiDoc`.
+fn build_router_impl(doc : OpenApiDoc) -> Router {
+  let nodes : Array[TrieNode] = [empty_trie_node()]
+  let routes : Array[RouteEntry] = []
+
+  let mut pi = 0
+  while pi < doc.paths.length() {
+    let (path_tpl, item) = doc.paths[pi]
+    let segs = split_path_segments(path_tpl)
+    let mut cur = 0
+    let mut si = 0
+    while si < segs.length() {
+      let seg = segs[si]
+      match classify_segment(seg) {
+        SegKind::Static(lit) => {
+          let node = nodes[cur]
+          let mut found = -1
+          let mut k = 0
+          while k < node.static_keys.length() {
+            if node.static_keys[k] == lit {
+              found = node.static_children[k]
+              break
+            }
+            k = k + 1
+          }
+          if found >= 0 {
+            cur = found
+          } else {
+            let child_id = nodes.length()
+            nodes.push(empty_trie_node())
+            node.static_keys.push(lit)
+            node.static_children.push(child_id)
+            cur = child_id
+          }
+        }
+        SegKind::WholeParam(pname) => {
+          let node = nodes[cur]
+          if node.param_child >= 0 {
+            cur = node.param_child
+          } else {
+            let child_id = nodes.length()
+            nodes.push(empty_trie_node())
+            nodes[cur] = TrieNode::{
+              static_keys: node.static_keys,
+              static_children: node.static_children,
+              param_name: Some(pname),
+              param_child: child_id,
+              inline_edges: node.inline_edges,
+              route_methods: node.route_methods,
+              route_ids: node.route_ids,
+            }
+            cur = child_id
+          }
+        }
+        SegKind::Inline(lits, pnames) => {
+          let child_id = nodes.length()
+          nodes.push(empty_trie_node())
+          nodes[cur].inline_edges.push(
+            InlineTemplateEdge::{
+              literals: lits,
+              param_names: pnames,
+              child: child_id,
+            },
+          )
+          cur = child_id
+        }
+      }
+      si = si + 1
+    }
+
+    let tpl_pnames = match parse_path_template_meta(path_tpl) {
+      Ok((pns, _)) => pns
+      Err(_) => []
+    }
+    let mut oi = 0
+    while oi < item.operations.length() {
+      let (method, op) = item.operations[oi]
+      let rid = routes.length()
+      routes.push(
+        RouteEntry::{
+          route_id: rid,
+          path_template: path_tpl,
+          method: method,
+          operation: op,
+          template_param_names: tpl_pnames,
+        },
+      )
+      nodes[cur].route_methods.push(method)
+      nodes[cur].route_ids.push(rid)
+      oi = oi + 1
+    }
+    pi = pi + 1
+  }
+
+  Router::{
+    routes: routes,
+    root_node: 0,
+    nodes: nodes,
+    server_prefixes: build_server_prefixes(doc.servers),
+  }
+}
+
+///| Backtracking trie search: Static > Inline Template > Whole-Segment Param.
+///| Returns `Some(route_id)` if method matched, or records `allowed` methods if path matched with different method.
+fn router_search(
+  router : Router,
+  node_id : Int,
+  segs : Array[String],
+  seg_idx : Int,
+  method : HttpMethod,
+  params : Array[(String, String)],
+  allowed_out : Array[HttpMethod],
+) -> Int {
+  let node = router.nodes[node_id]
+  if seg_idx == segs.length() {
+    let mut i = 0
+    while i < node.route_methods.length() {
+      if http_method_eq(node.route_methods[i], method) {
+        return node.route_ids[i]
+      }
+      i = i + 1
+    }
+    // Path matched, but method did not -> record allowed methods for 405
+    i = 0
+    while i < node.route_methods.length() {
+      allowed_out.push(node.route_methods[i])
+      i = i + 1
+    }
+    return -1
+  }
+
+  let seg = segs[seg_idx]
+
+  // 1. Static match first (highest priority)
+  let mut k = 0
+  while k < node.static_keys.length() {
+    if node.static_keys[k] == seg {
+      let rid = router_search(
+        router,
+        node.static_children[k],
+        segs,
+        seg_idx + 1,
+        method,
+        params,
+        allowed_out,
+      )
+      if rid >= 0 {
+        return rid
+      }
+      break
+    }
+    k = k + 1
+  }
+
+  // 2. Inline template edges (non-empty segment only)
+  if seg.length() > 0 {
+    let mut ei = 0
+    while ei < node.inline_edges.length() {
+      let edge = node.inline_edges[ei]
+      let saved_len = params.length()
+      if match_inline_edge(seg, edge, params) {
+        let rid = router_search(
+          router,
+          edge.child,
+          segs,
+          seg_idx + 1,
+          method,
+          params,
+          allowed_out,
+        )
+        if rid >= 0 {
+          return rid
+        }
+        while params.length() > saved_len {
+          let _ = params.pop()
+        }
+      }
+      ei = ei + 1
+    }
+  }
+
+  // 3. Whole-segment parameter match (lowest priority, non-empty segment only)
+  if node.param_child >= 0 && seg.length() > 0 {
+    let pname = match node.param_name {
+      Some(n) => n
+      None => ""
+    }
+    params.push((pname, percent_decode(seg)))
+    let rid = router_search(
+      router,
+      node.param_child,
+      segs,
+      seg_idx + 1,
+      method,
+      params,
+      allowed_out,
+    )
+    if rid >= 0 {
+      return rid
+    }
+    let _ = params.pop()
+  }
+
+  -1
+}
+
+fn router_find_impl(
+  router : Router,
+  method : HttpMethod,
+  path : String,
+) -> Result[RouteMatch, RouteError] {
+  if router.nodes.length() == 0 {
+    return Err(RouteError::NotFound(path))
+  }
+  let segs = split_path_segments(path)
+  let params : Array[(String, String)] = []
+  let allowed : Array[HttpMethod] = []
+  let mut rid = -1
+  if router.server_prefixes.length() == 0 {
+    rid = router_search(router, router.root_node, segs, 0, method, params, allowed)
+  } else {
+    let mut pi = 0
+    while pi < router.server_prefixes.length() {
+      let pref = router.server_prefixes[pi]
+      if match_server_prefix(pref, segs) {
+        let saved_params = params.length()
+        let found = router_search(
+          router,
+          router.root_node,
+          segs,
+          pref.segments.length(),
+          method,
+          params,
+          allowed,
+        )
+        if found >= 0 {
+          rid = found
+          break
+        }
+        while params.length() > saved_params {
+          let _ = params.pop()
+        }
+      }
+      pi = pi + 1
+    }
+  }
+  if rid >= 0 {
+    let entry = router.routes[rid]
+    // Remap parameter names to this specific route's pre-computed template parameter names
+    let final_params = if params.length() > 0 && entry.template_param_names.length() == params.length() {
+      let out : Array[(String, String)] = []
+      let mut i = 0
+      while i < params.length() {
+        let (_, pv) = params[i]
+        out.push((entry.template_param_names[i], pv))
+        i = i + 1
+      }
+      out
+    } else {
+      params
+    }
+    Ok(
+      RouteMatch::{
+        path_template: entry.path_template,
+        method: entry.method,
+        operation: entry.operation,
+        path_params: final_params,
+        route_id: rid,
+      },
+    )
+  } else if allowed.length() > 0 {
+    Err(RouteError::MethodNotAllowed(path, allowed))
+  } else {
+    Err(RouteError::NotFound(path))
+  }
+}
+
+fn has_surrounding_whitespace(s : String) -> Bool {
+  let n = s.length()
+  if n == 0 {
+    return false
+  }
+  let first = s.code_unit_at(0)
+  let last = s.code_unit_at(n - 1)
+  first == 32 || first == 9 || first == 10 || first == 13 ||
+  last == 32 || last == 9 || last == 10 || last == 13
+}
+
+///| Coerce a raw parameter string to a `Json5Value` based on schema `type`.
+fn coerce_scalar_by_type(
+  raw : String,
+  schema_type : String,
+  loc : String,
+) -> Result[json5::Json5Value, RuntimeValidationError] {
+  if schema_type == "integer" {
+    if raw.length() == 0 || has_surrounding_whitespace(raw) {
+      return Err(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::InvalidParameter,
+          loc,
+          "expected integer, got: " + raw,
+        ),
+      )
+    }
+    match json5::parse_with_options(raw, json5::ParseOptions::strict_json()) {
+      Ok(json5::Json5Value::Number(x)) => {
+        match json5::as_int(json5::Json5Value::Number(x)) {
+          Some(_) => Ok(json5::Json5Value::Number(x))
+          None => {
+            Err(
+              RuntimeValidationError::new(
+                RuntimeErrorKind::InvalidParameter,
+                loc,
+                "expected integer, got: " + raw,
+              ),
+            )
+          }
+        }
+      }
+      _ => {
+        Err(
+          RuntimeValidationError::new(
+            RuntimeErrorKind::InvalidParameter,
+            loc,
+            "expected integer, got: " + raw,
+          ),
+        )
+      }
+    }
+  } else if schema_type == "number" {
+    if raw.length() == 0 || has_surrounding_whitespace(raw) {
+      return Err(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::InvalidParameter,
+          loc,
+          "expected number, got: " + raw,
+        ),
+      )
+    }
+    match json5::parse_with_options(raw, json5::ParseOptions::strict_json()) {
+      Ok(json5::Json5Value::Number(x)) => Ok(json5::Json5Value::Number(x))
+      _ => {
+        Err(
+          RuntimeValidationError::new(
+            RuntimeErrorKind::InvalidParameter,
+            loc,
+            "expected number, got: " + raw,
+          ),
+        )
+      }
+    }
+  } else if schema_type == "boolean" {
+    if raw == "true" {
+      Ok(json5::Json5Value::Bool(true))
+    } else if raw == "false" {
+      Ok(json5::Json5Value::Bool(false))
+    } else {
+      Err(
+        RuntimeValidationError::new(
+          RuntimeErrorKind::InvalidParameter,
+          loc,
+          "expected boolean ('true' or 'false'), got: " + raw,
+        ),
+      )
+    }
+  } else {
+    Ok(json5::Json5Value::Str(raw))
+  }
+}
+
+fn schema_primary_type(schema : Option[json5::Json5Value]) -> String {
+  match schema {
+    Some(sv) => {
+      match json5::get(sv, "type") {
+        Some(json5::Json5Value::Str(t)) => t
+        Some(json5::Json5Value::Array(items)) => {
+          let mut i = 0
+          while i < items.length() {
+            match items[i] {
+              json5::Json5Value::Str(t) => {
+                if t != "null" {
+                  return t
+                }
+              }
+              _ => ()
+            }
+            i = i + 1
+          }
+          "string"
+        }
+        _ => "string"
+      }
+    }
+    None => "string"
+  }
+}
+
+fn typed_path_params_impl(
+  m : RouteMatch,
+) -> Result[Array[(String, json5::Json5Value)], RuntimeValidationError] {
+  let out : Array[(String, json5::Json5Value)] = []
+  let mut i = 0
+  while i < m.path_params.length() {
+    let (name, raw) = m.path_params[i]
+    let mut param_schema : Option[json5::Json5Value] = None
+    let mut j = 0
+    while j < m.operation.parameters.length() {
+      let p = m.operation.parameters[j]
+      if p.name == name && param_in_eq(p.location, ParamIn::Path) {
+        param_schema = p.schema
+        break
+      }
+      j = j + 1
+    }
+    let ty = schema_primary_type(param_schema)
+    match coerce_scalar_by_type(raw, ty, "path." + name) {
+      Ok(v) => out.push((name, v))
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  Ok(out)
+}

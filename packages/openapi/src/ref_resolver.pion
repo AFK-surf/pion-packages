@@ -1,0 +1,1321 @@
+///| Internal JSON Pointer `$ref` resolution, OpenAPI 3.1 sibling preservation,
+///| cycle detection, shared `$defs` hoisting, expansion budget DoS protection,
+///| `readOnly`/`writeOnly` request/response views, and 3.0->2020-12 schema normalization.
+
+import "json5"
+
+fn clamp_safe_depth(d : Int) -> Int {
+  let eff = if d <= 0 { 64 } else { d }
+  if eff > 160 {
+    160
+  } else {
+    eff
+  }
+}
+
+fn hex_val(b : Int) -> Int {
+  if b >= 48 && b <= 57 {
+    b - 48
+  } else if b >= 65 && b <= 70 {
+    b - 55
+  } else if b >= 97 && b <= 102 {
+    b - 87
+  } else {
+    -1
+  }
+}
+
+fn hex_digit_upper(n : Int) -> Byte {
+  let d = n & 15
+  if d < 10 {
+    (48 + d).to_byte()
+  } else {
+    (55 + d).to_byte()
+  }
+}
+
+///| Percent-decode a URI component (e.g. `%20` -> ` `, `%2F` -> `/`).
+fn percent_decode(s : String) -> String {
+  let n = s.length()
+  let mut has_pct = false
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i) == 37 {
+      has_pct = true
+      break
+    }
+    i = i + 1
+  }
+  if !has_pct {
+    return s
+  }
+  let sb = StringBuilder::new()
+  i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b == 37 && i + 2 < n {
+      let h1 = hex_val(s.code_unit_at(i + 1))
+      let h2 = hex_val(s.code_unit_at(i + 2))
+      if h1 >= 0 && h2 >= 0 {
+        sb.write_byte(((h1 << 4) | h2).to_byte())
+        i = i + 3
+        continue
+      }
+    }
+    sb.write_byte(b.to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Parse a non-negative array index token per RFC 6901.
+fn parse_array_index(tok : String) -> Option[Int] {
+  let n = tok.length()
+  if n == 0 {
+    return None
+  }
+  if n > 1 && tok.code_unit_at(0) == 48 {
+    return None
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    let b = tok.code_unit_at(i)
+    if b < 48 || b > 57 {
+      return None
+    }
+    if acc > 200000000 {
+      return None
+    }
+    acc = acc * 10 + (b - 48)
+    i = i + 1
+  }
+  Some(acc)
+}
+
+///| Unescape a single RFC 6901 JSON Pointer token after URI percent-decoding.
+fn unescape_pointer_token(raw_tok : String) -> Result[String, OpenApiError] {
+  let dec = percent_decode(raw_tok)
+  let n = dec.length()
+  let mut has_tilde = false
+  let mut i = 0
+  while i < n {
+    if dec.code_unit_at(i) == 126 {
+      has_tilde = true
+      break
+    }
+    i = i + 1
+  }
+  if !has_tilde {
+    return Ok(dec)
+  }
+  let sb = StringBuilder::new()
+  i = 0
+  while i < n {
+    let b = dec.code_unit_at(i)
+    if b == 126 {
+      if i + 1 >= n {
+        return Err(
+          OpenApiError::new(
+            OpenApiErrorKind::InvalidPointer,
+            raw_tok,
+            "trailing '~' in JSON pointer token",
+          ),
+        )
+      }
+      let next = dec.code_unit_at(i + 1)
+      if next == 48 {
+        sb.write_byte((126).to_byte())
+      } else if next == 49 {
+        sb.write_byte((47).to_byte())
+      } else {
+        return Err(
+          OpenApiError::new(
+            OpenApiErrorKind::InvalidPointer,
+            raw_tok,
+            "invalid '~' escape in JSON pointer token",
+          ),
+        )
+      }
+      i = i + 2
+    } else {
+      sb.write_byte(b.to_byte())
+      i = i + 1
+    }
+  }
+  Ok(sb.to_string())
+}
+
+///| O(1) index over `components/schemas` for fast `#/components/schemas/<name>` lookups.
+struct ComponentsIndex {
+  schema_map : StrHashMap
+  schema_vals : Array[json5::Json5Value]
+  has_schemas : Bool
+}
+
+fn ComponentsIndex::from_root(root : json5::Json5Value) -> ComponentsIndex {
+  match json5::get(root, "components") {
+    Some(comp) => {
+      match json5::get(comp, "schemas") {
+        Some(json5::Json5Value::Object(entries)) => {
+          let m = StrHashMap::with_capacity(entries.length())
+          let vals : Array[json5::Json5Value] = []
+          let mut i = 0
+          while i < entries.length() {
+            let (k, v) = entries[i]
+            let idx = vals.length()
+            vals.push(v)
+            m.set(k, idx)
+            i = i + 1
+          }
+          ComponentsIndex::{ schema_map: m, schema_vals: vals, has_schemas: true }
+        }
+        _ => ComponentsIndex::{ schema_map: StrHashMap::new(), schema_vals: [], has_schemas: false }
+      }
+    }
+    None => ComponentsIndex::{ schema_map: StrHashMap::new(), schema_vals: [], has_schemas: false }
+  }
+}
+
+fn has_slash_from(s : String, start : Int) -> Bool {
+  let n = s.length()
+  let mut i = start
+  while i < n {
+    if s.code_unit_at(i) == 47 {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Fast O(1) pointer lookup for `#/components/schemas/<name>`, falling back to `resolve_pointer_raw`.
+fn resolve_pointer_indexed(
+  root : json5::Json5Value,
+  idx : ComponentsIndex,
+  ref_str : String,
+) -> Result[json5::Json5Value, OpenApiError] {
+  // Fast path: "#/components/schemas/" has length 21
+  if idx.has_schemas && ref_str.length() > 21 && ref_str.slice(0, 21) == "#/components/schemas/" {
+    if !has_slash_from(ref_str, 21) {
+      let raw_tok = ref_str.slice(21, ref_str.length())
+      let tok = match unescape_pointer_token(raw_tok) {
+        Ok(t) => t
+        Err(e) => return Err(e)
+      }
+      let pos = idx.schema_map.get(tok)
+      if pos >= 0 {
+        return Ok(idx.schema_vals[pos])
+      } else {
+        return Err(
+          OpenApiError::new(
+            OpenApiErrorKind::UnresolvedRef,
+            ref_str,
+            "JSON Pointer segment not found: " + tok,
+          ),
+        )
+      }
+    }
+  }
+  resolve_pointer_raw(root, ref_str)
+}
+
+///| Resolve a raw internal JSON Pointer `#/...` against a root `Json5Value`.
+fn resolve_pointer_raw(
+  root : json5::Json5Value,
+  ref_str : String,
+) -> Result[json5::Json5Value, OpenApiError] {
+  let n = ref_str.length()
+  if n == 0 || ref_str.code_unit_at(0) != 35 {
+    return Err(
+      OpenApiError::new(
+        OpenApiErrorKind::UnresolvedRef,
+        ref_str,
+        "only internal '#...' JSON Pointer $ref is supported",
+      ),
+    )
+  }
+  if n == 1 {
+    return Ok(root)
+  }
+  if ref_str.code_unit_at(1) != 47 {
+    return Err(
+      OpenApiError::new(
+        OpenApiErrorKind::InvalidPointer,
+        ref_str,
+        "JSON Pointer fragment must start with '#/'",
+      ),
+    )
+  }
+  let mut cur = root
+  let mut pos = 2
+  while pos <= n {
+    let mut end = pos
+    while end < n && ref_str.code_unit_at(end) != 47 {
+      end = end + 1
+    }
+    let raw_tok = ref_str.slice(pos, end)
+    let tok = match unescape_pointer_token(raw_tok) {
+      Ok(t) => t
+      Err(e) => return Err(e)
+    }
+    match cur {
+      json5::Json5Value::Object(entries) => {
+        let mut found : Option[json5::Json5Value] = None
+        let mut i = entries.length() - 1
+        while i >= 0 {
+          let (k, v) = entries[i]
+          if k == tok {
+            found = Some(v)
+            break
+          }
+          i = i - 1
+        }
+        match found {
+          Some(next_v) => cur = next_v
+          None => {
+            return Err(
+              OpenApiError::new(
+                OpenApiErrorKind::UnresolvedRef,
+                ref_str,
+                "JSON Pointer segment not found: " + tok,
+              ),
+            )
+          }
+        }
+      }
+      json5::Json5Value::Array(items) => {
+        match parse_array_index(tok) {
+          Some(idx) => {
+            if idx >= 0 && idx < items.length() {
+              cur = items[idx]
+            } else {
+              return Err(
+                OpenApiError::new(
+                  OpenApiErrorKind::UnresolvedRef,
+                  ref_str,
+                  "array index out of bounds in $ref: " + tok,
+                ),
+              )
+            }
+          }
+          None => {
+            return Err(
+              OpenApiError::new(
+                OpenApiErrorKind::UnresolvedRef,
+                ref_str,
+                "invalid array index in $ref: " + tok,
+              ),
+            )
+          }
+        }
+      }
+      _ => {
+        return Err(
+          OpenApiError::new(
+            OpenApiErrorKind::UnresolvedRef,
+            ref_str,
+            "cannot traverse non-container at segment: " + tok,
+          ),
+        )
+      }
+    }
+    if end == n {
+      break
+    }
+    pos = end + 1
+  }
+  Ok(cur)
+}
+
+fn str_arr_contains(arr : Array[String], needle : String) -> Bool {
+  let mut i = 0
+  let n = arr.length()
+  while i < n {
+    if arr[i] == needle {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Extract `"$ref"` string if `v` is an object containing `"$ref": Str(...)`.
+fn get_ref_str(v : json5::Json5Value) -> Option[String] {
+  match json5::get(v, "$ref") {
+    Some(json5::Json5Value::Str(r)) => Some(r)
+    _ => None
+  }
+}
+
+///| Merge OpenAPI 3.1 sibling keys (especially `summary`, `description`) from `overlay`
+///| onto `target` when both are objects. Outermost overlay wins.
+fn merge_ref_siblings(
+  target : json5::Json5Value,
+  overlay_entries : Array[(String, json5::Json5Value)],
+  is_31 : Bool,
+) -> json5::Json5Value {
+  if overlay_entries.length() == 0 {
+    return target
+  }
+  match target {
+    json5::Json5Value::Object(t_entries) => {
+      let out : Array[(String, json5::Json5Value)] = []
+      let mut i = 0
+      while i < t_entries.length() {
+        let (tk, tv) = t_entries[i]
+        let mut overridden = false
+        let mut j = 0
+        while j < overlay_entries.length() {
+          let (ok, _) = overlay_entries[j]
+          if ok == tk {
+            overridden = true
+            break
+          }
+          j = j + 1
+        }
+        if !overridden {
+          out.push((tk, tv))
+        }
+        i = i + 1
+      }
+      let mut j = 0
+      while j < overlay_entries.length() {
+        let (ok, ov) = overlay_entries[j]
+        if ok != "$ref" && (is_31 || ok == "summary" || ok == "description") {
+          out.push((ok, ov))
+        }
+        j = j + 1
+      }
+      json5::Json5Value::Object(out)
+    }
+    _ => target
+  }
+}
+
+///| Collect sibling entries from an object (excluding `$ref`), without overriding
+///| keys already collected from an outer referrer.
+fn collect_siblings(
+  obj_entries : Array[(String, json5::Json5Value)],
+  acc : Array[(String, json5::Json5Value)],
+  is_31 : Bool,
+) -> Unit {
+  let mut i = 0
+  while i < obj_entries.length() {
+    let (k, v) = obj_entries[i]
+    if k != "$ref" && (is_31 || k == "summary" || k == "description") {
+      let mut exists = false
+      let mut j = 0
+      while j < acc.length() {
+        let (ak, _) = acc[j]
+        if ak == k {
+          exists = true
+          break
+        }
+        j = j + 1
+      }
+      if !exists {
+        acc.push((k, v))
+      }
+    }
+    i = i + 1
+  }
+}
+
+///| Resolve a `$ref` string against `raw` root using an optional `ComponentsIndex`.
+fn resolve_ref_indexed(
+  root : json5::Json5Value,
+  idx : ComponentsIndex,
+  ref_str : String,
+  is_31 : Bool,
+  max_ref_depth : Int,
+) -> Result[json5::Json5Value, OpenApiError] {
+  let limit = if max_ref_depth <= 0 { 64 } else { max_ref_depth }
+  let visited : Array[String] = []
+  let siblings : Array[(String, json5::Json5Value)] = []
+  let mut cur_ref = ref_str
+  while true {
+    if str_arr_contains(visited, cur_ref) {
+      return Err(
+        OpenApiError::new(
+          OpenApiErrorKind::RefCycle,
+          cur_ref,
+          "cyclic $ref detected: " + cur_ref,
+        ),
+      )
+    }
+    if visited.length() >= limit {
+      return Err(
+        OpenApiError::new(
+          OpenApiErrorKind::LimitExceeded,
+          cur_ref,
+          "$ref resolution depth exceeded limit",
+        ),
+      )
+    }
+    visited.push(cur_ref)
+    let target = match resolve_pointer_indexed(root, idx, cur_ref) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    match target {
+      json5::Json5Value::Object(entries) => {
+        match get_ref_str(target) {
+          Some(next_ref) => {
+            collect_siblings(entries, siblings, is_31)
+            cur_ref = next_ref
+          }
+          None => {
+            return Ok(merge_ref_siblings(target, siblings, is_31))
+          }
+        }
+      }
+      _ => return Ok(target)
+    }
+  }
+  Err(OpenApiError::new(OpenApiErrorKind::RefCycle, ref_str, "cyclic $ref"))
+}
+
+///| Resolve a `$ref` string against `raw` root, following chained `$ref`s with
+///| cycle detection and `max_ref_depth` enforcement, preserving OpenAPI 3.1 siblings.
+fn resolve_ref_raw(
+  root : json5::Json5Value,
+  ref_str : String,
+  is_31 : Bool,
+  max_ref_depth : Int,
+) -> Result[json5::Json5Value, OpenApiError] {
+  let empty_idx = ComponentsIndex::{ schema_map: StrHashMap::new(), schema_vals: [], has_schemas: false }
+  resolve_ref_indexed(root, empty_idx, ref_str, is_31, max_ref_depth)
+}
+
+///| Resolve a `Json5Value` that may be a `$ref` object (preserving OpenAPI 3.1 siblings).
+fn resolve_value_raw(
+  root : json5::Json5Value,
+  value : json5::Json5Value,
+  is_31 : Bool,
+  max_ref_depth : Int,
+) -> Result[json5::Json5Value, OpenApiError] {
+  match value {
+    json5::Json5Value::Object(entries) => {
+      match get_ref_str(value) {
+        Some(r) => {
+          let target = match resolve_ref_raw(root, r, is_31, max_ref_depth) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          let sibs : Array[(String, json5::Json5Value)] = []
+          collect_siblings(entries, sibs, is_31)
+          Ok(merge_ref_siblings(target, sibs, is_31))
+        }
+        None => Ok(value)
+      }
+    }
+    _ => Ok(value)
+  }
+}
+
+fn enum_has_null(items : Array[json5::Json5Value]) -> Bool {
+  let mut i = 0
+  while i < items.length() {
+    match items[i] {
+      json5::Json5Value::Null => return true
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Normalize an OpenAPI 3.0 schema object into JSON Schema Draft 2020-12 compatible form
+///| (handles `nullable: true`, `nullable: true` + `enum`, and boolean `exclusiveMinimum` / `exclusiveMaximum`).
+fn normalize_openapi_schema_obj(
+  entries : Array[(String, json5::Json5Value)],
+  is_30 : Bool,
+) -> json5::Json5Value {
+  if !is_30 {
+    return json5::Json5Value::Object(entries)
+  }
+  let mut is_nullable = false
+  let mut has_bool_excl_min = false
+  let mut has_bool_excl_max = false
+  let mut min_val : Option[Double] = None
+  let mut max_val : Option[Double] = None
+  let mut i = 0
+  while i < entries.length() {
+    let (k, v) = entries[i]
+    if k == "nullable" {
+      match v {
+        json5::Json5Value::Bool(b) => is_nullable = b
+        _ => ()
+      }
+    } else if k == "exclusiveMinimum" {
+      match v {
+        json5::Json5Value::Bool(b) => has_bool_excl_min = b
+        _ => ()
+      }
+    } else if k == "exclusiveMaximum" {
+      match v {
+        json5::Json5Value::Bool(b) => has_bool_excl_max = b
+        _ => ()
+      }
+    } else if k == "minimum" {
+      match v {
+        json5::Json5Value::Number(x) => min_val = Some(x)
+        _ => ()
+      }
+    } else if k == "maximum" {
+      match v {
+        json5::Json5Value::Number(x) => max_val = Some(x)
+        _ => ()
+      }
+    }
+    i = i + 1
+  }
+  if !is_nullable && !has_bool_excl_min && !has_bool_excl_max {
+    return json5::Json5Value::Object(entries)
+  }
+  let out : Array[(String, json5::Json5Value)] = []
+  let mut patched_type = false
+  i = 0
+  while i < entries.length() {
+    let (k, v) = entries[i]
+    if k == "nullable" {
+      i = i + 1
+      continue
+    }
+    if k == "minimum" && has_bool_excl_min {
+      i = i + 1
+      continue
+    }
+    if k == "maximum" && has_bool_excl_max {
+      i = i + 1
+      continue
+    }
+    if k == "exclusiveMinimum" && has_bool_excl_min {
+      match min_val {
+        Some(mv) => out.push(("exclusiveMinimum", json5::Json5Value::Number(mv)))
+        None => ()
+      }
+      i = i + 1
+      continue
+    }
+    if k == "exclusiveMaximum" && has_bool_excl_max {
+      match max_val {
+        Some(mv) => out.push(("exclusiveMaximum", json5::Json5Value::Number(mv)))
+        None => ()
+      }
+      i = i + 1
+      continue
+    }
+    if k == "type" && is_nullable {
+      match v {
+        json5::Json5Value::Str(t) => {
+          out.push((
+            "type",
+            json5::Json5Value::Array([
+              json5::Json5Value::Str(t),
+              json5::Json5Value::Str("null"),
+            ]),
+          ))
+          patched_type = true
+          i = i + 1
+          continue
+        }
+        _ => ()
+      }
+    }
+    if k == "enum" && is_nullable {
+      match v {
+        json5::Json5Value::Array(eitems) => {
+          if !enum_has_null(eitems) {
+            let new_e : Array[json5::Json5Value] = []
+            let mut ei = 0
+            while ei < eitems.length() {
+              new_e.push(eitems[ei])
+              ei = ei + 1
+            }
+            new_e.push(json5::Json5Value::Null)
+            out.push(("enum", json5::Json5Value::Array(new_e)))
+            i = i + 1
+            continue
+          }
+        }
+        _ => ()
+      }
+    }
+    out.push((k, v))
+    i = i + 1
+  }
+  if is_nullable && !patched_type {
+    return json5::Json5Value::Object([
+      (
+        "anyOf",
+        json5::Json5Value::Array([
+          json5::Json5Value::Object(out),
+          json5::Json5Value::Object([("type", json5::Json5Value::Str("null"))]),
+        ]),
+      ),
+    ])
+  }
+  json5::Json5Value::Object(out)
+}
+
+///| Collision-free injective `$defs` key name from a full `#/...` JSON Pointer string.
+///| Keeps `[A-Za-z0-9-]` verbatim and hex-encodes every other byte (including `_`, `.`, `/`, `~`, `%`) as `_HH`.
+fn def_name_from_ref(ref_str : String) -> String {
+  let n = ref_str.length()
+  let start = if n >= 2 && ref_str.code_unit_at(0) == 35 && ref_str.code_unit_at(1) == 47 {
+    2
+  } else if n >= 1 && ref_str.code_unit_at(0) == 35 {
+    1
+  } else {
+    0
+  }
+  let sb = StringBuilder::new()
+  let mut i = start
+  while i < n {
+    let b = ref_str.code_unit_at(i)
+    let ok =
+    (b >= 48 && b <= 57) ||
+    (b >= 65 && b <= 90) ||
+    (b >= 97 && b <= 122) ||
+    b == 45
+    if ok {
+      sb.write_byte(b.to_byte())
+    } else {
+      sb.write_byte((95).to_byte())
+      sb.write_byte(hex_digit_upper(b >> 4))
+      sb.write_byte(hex_digit_upper(b))
+    }
+    i = i + 1
+  }
+  let res = sb.to_string()
+  if res.length() == 0 {
+    "Def"
+  } else {
+    res
+  }
+}
+
+///| Request/Response view for `readOnly` / `writeOnly` schema enforcement.
+enum SchemaView {
+  Neutral
+  Request
+  Response
+}
+
+fn is_request_view(v : SchemaView) -> Bool {
+  match v {
+    SchemaView::Request => true
+    _ => false
+  }
+}
+
+fn is_response_view(v : SchemaView) -> Bool {
+  match v {
+    SchemaView::Response => true
+    _ => false
+  }
+}
+
+///| Check whether a schema (possibly behind a `$ref`) has `"readOnly": true` or `"writeOnly": true`.
+fn schema_has_bool_flag(
+  root : json5::Json5Value,
+  idx : ComponentsIndex,
+  schema : json5::Json5Value,
+  flag : String,
+  is_31 : Bool,
+  max_ref_depth : Int,
+) -> Bool {
+  match json5::get(schema, flag) {
+    Some(json5::Json5Value::Bool(true)) => return true
+    _ => ()
+  }
+  match get_ref_str(schema) {
+    Some(r) => {
+      match resolve_ref_indexed(root, idx, r, is_31, max_ref_depth) {
+        Ok(target) => {
+          match json5::get(target, flag) {
+            Some(json5::Json5Value::Bool(true)) => true
+            _ => false
+          }
+        }
+        Err(_) => false
+      }
+    }
+    None => false
+  }
+}
+
+fn cap_add(a : Int, b : Int, cap : Int) -> Int {
+  if a >= cap || b >= cap {
+    cap
+  } else if a > cap - b {
+    cap
+  } else {
+    a + b
+  }
+}
+
+///| Mutable state for schema dereferencing with shared `$defs` hoisting,
+///| cycle detection, O(V+E) DAG bomb detection, and shared `max_nodes` output budget.
+struct DerefState {
+  root : json5::Json5Value
+  comp_idx : ComponentsIndex
+  is_30 : Bool
+  is_31 : Bool
+  view : SchemaView
+  max_depth : Int
+  max_ref_depth : Int
+  max_nodes : Int
+  node_budget : Array[Int]
+  active_refs : Array[String]
+  cyclic_refs : StrHashMap
+  resolved_idx : StrHashMap
+  resolved_vals : Array[json5::Json5Value]
+  resolved_weights : Array[Int]
+  hoisted_map : StrHashMap
+  hoisted_defs : Array[(String, json5::Json5Value)]
+}
+
+fn DerefState::new_with_view(
+  doc : OpenApiDoc,
+  comp_idx : ComponentsIndex,
+  view : SchemaView,
+  node_budget : Array[Int],
+) -> DerefState {
+  let max_d = clamp_safe_depth(doc.limits.max_depth)
+  let max_rd = clamp_safe_depth(doc.limits.max_ref_depth)
+  let max_n = if doc.limits.max_nodes <= 0 { 200000 } else { doc.limits.max_nodes }
+  DerefState::{
+    root: doc.raw,
+    comp_idx: comp_idx,
+    is_30: doc.openapi.is_30(),
+    is_31: doc.openapi.is_31(),
+    view: view,
+    max_depth: max_d,
+    max_ref_depth: max_rd,
+    max_nodes: max_n,
+    node_budget: node_budget,
+    active_refs: [],
+    cyclic_refs: StrHashMap::new(),
+    resolved_idx: StrHashMap::new(),
+    resolved_vals: [],
+    resolved_weights: [],
+    hoisted_map: StrHashMap::new(),
+    hoisted_defs: [],
+  }
+}
+
+fn DerefState::new(doc : OpenApiDoc) -> DerefState {
+  DerefState::new_with_view(
+    doc,
+    ComponentsIndex::from_root(doc.raw),
+    SchemaView::Neutral,
+    [0],
+  )
+}
+
+fn charge_node(st : DerefState, ref_ctx : String) -> Result[Unit, OpenApiError] {
+  st.node_budget[0] = st.node_budget[0] + 1
+  if st.node_budget[0] > st.max_nodes {
+    return Err(
+      OpenApiError::new(
+        OpenApiErrorKind::LimitExceeded,
+        ref_ctx,
+        "schema expansion exceeded max_nodes budget",
+      ),
+    )
+  }
+  Ok(())
+}
+
+fn is_schema_map_keyword(k : String) -> Bool {
+  k == "properties" ||
+  k == "patternProperties" ||
+  k == "$defs" ||
+  k == "definitions" ||
+  k == "dependentSchemas"
+}
+
+fn is_schema_array_keyword(k : String) -> Bool {
+  k == "allOf" || k == "anyOf" || k == "oneOf" || k == "prefixItems"
+}
+
+fn is_single_schema_keyword(k : String) -> Bool {
+  k == "items" ||
+  k == "additionalProperties" ||
+  k == "additionalItems" ||
+  k == "not" ||
+  k == "if" ||
+  k == "then" ||
+  k == "else" ||
+  k == "contains" ||
+  k == "propertyNames" ||
+  k == "unevaluatedItems" ||
+  k == "unevaluatedProperties" ||
+  k == "contentSchema"
+}
+
+fn is_annotation_only_key(k : String) -> Bool {
+  k == "summary" || k == "description"
+}
+
+///| Combine a resolved `$ref` schema with OpenAPI 3.1 sibling entries (AND semantics per 2020-12 §8.2.3.1).
+fn apply_31_ref_siblings(
+  st : DerefState,
+  base : json5::Json5Value,
+  entries : Array[(String, json5::Json5Value)],
+  depth : Int,
+) -> Result[(json5::Json5Value, Int), OpenApiError] {
+  if !st.is_31 {
+    return Ok((base, 0))
+  }
+  let sib_entries : Array[(String, json5::Json5Value)] = []
+  let mut has_validation_sib = false
+  let mut i = 0
+  while i < entries.length() {
+    let (k, v) = entries[i]
+    if k != "$ref" {
+      if !is_annotation_only_key(k) {
+        has_validation_sib = true
+      }
+      sib_entries.push((k, v))
+    }
+    i = i + 1
+  }
+  if sib_entries.length() == 0 {
+    return Ok((base, 0))
+  }
+  if !has_validation_sib {
+    return Ok((merge_ref_siblings(base, sib_entries, true), 0))
+  }
+  let (sib_schema, sib_w) = match deref_schema_walk(st, json5::Json5Value::Object(sib_entries), depth + 1) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  Ok((
+    json5::Json5Value::Object([
+      ("allOf", json5::Json5Value::Array([base, sib_schema])),
+    ]),
+    sib_w,
+  ))
+}
+
+fn ensure_hoisted(
+  st : DerefState,
+  dname : String,
+  schema : json5::Json5Value,
+) -> Unit {
+  if !st.hoisted_map.contains(dname) {
+    st.hoisted_map.set(dname, 1)
+    st.hoisted_defs.push((dname, schema))
+  }
+}
+
+fn deref_schema_walk(
+  st : DerefState,
+  node : json5::Json5Value,
+  depth : Int,
+) -> Result[(json5::Json5Value, Int), OpenApiError] {
+  if depth > st.max_depth {
+    return Err(
+      OpenApiError::new(
+        OpenApiErrorKind::LimitExceeded,
+        "#",
+        "schema dereference exceeded max_depth",
+      ),
+    )
+  }
+  match charge_node(st, "#") {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match node {
+    json5::Json5Value::Object(entries) => {
+      match get_ref_str(node) {
+        Some(ref_str) => {
+          let dname = def_name_from_ref(ref_str)
+          if str_arr_contains(st.active_refs, ref_str) {
+            // Recursive schema cycle: emit local #/$defs/<name> reference!
+            st.cyclic_refs.set(ref_str, 1)
+            let ref_node = json5::Json5Value::Object([
+              ("$ref", json5::Json5Value::Str("#/$defs/" + dname)),
+            ])
+            let (combined, sib_w) = match apply_31_ref_siblings(st, ref_node, entries, depth) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            return Ok((combined, cap_add(1, sib_w, st.max_nodes + 1)))
+          }
+          // Cache hit for an already-resolved acyclic/shared ref: hoist to $defs and emit local $ref!
+          let cached_pos = st.resolved_idx.get(ref_str)
+          if cached_pos >= 0 {
+            let cached_schema = st.resolved_vals[cached_pos]
+            let cached_w = st.resolved_weights[cached_pos]
+            if cached_w > st.max_nodes {
+              return Err(
+                OpenApiError::new(
+                  OpenApiErrorKind::LimitExceeded,
+                  ref_str,
+                  "$ref expansion budget exceeded (possible $ref bomb)",
+                ),
+              )
+            }
+            ensure_hoisted(st, dname, cached_schema)
+            let ref_node = json5::Json5Value::Object([
+              ("$ref", json5::Json5Value::Str("#/$defs/" + dname)),
+            ])
+            let (combined, sib_w) = match apply_31_ref_siblings(st, ref_node, entries, depth) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            let total_w = cap_add(cached_w, sib_w, st.max_nodes + 1)
+            if total_w > st.max_nodes {
+              return Err(
+                OpenApiError::new(
+                  OpenApiErrorKind::LimitExceeded,
+                  ref_str,
+                  "$ref expansion budget exceeded (possible $ref bomb)",
+                ),
+              )
+            }
+            return Ok((combined, total_w))
+          }
+          if st.active_refs.length() >= st.max_ref_depth {
+            return Err(
+              OpenApiError::new(
+                OpenApiErrorKind::LimitExceeded,
+                ref_str,
+                "$ref nesting depth exceeded max_ref_depth",
+              ),
+            )
+          }
+          let target = match resolve_ref_indexed(st.root, st.comp_idx, ref_str, st.is_31, st.max_ref_depth) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          st.active_refs.push(ref_str)
+          let (expanded, inner_w) = match deref_schema_walk(st, target, depth) {
+            Ok(r) => r
+            Err(e) => {
+              let _ = st.active_refs.pop()
+              return Err(e)
+            }
+          }
+          let _ = st.active_refs.pop()
+          let target_w = cap_add(1, inner_w, st.max_nodes + 1)
+          if target_w > st.max_nodes {
+            return Err(
+              OpenApiError::new(
+                OpenApiErrorKind::LimitExceeded,
+                ref_str,
+                "$ref expansion budget exceeded (possible $ref bomb)",
+              ),
+            )
+          }
+          let new_pos = st.resolved_vals.length()
+          st.resolved_vals.push(expanded)
+          st.resolved_weights.push(target_w)
+          st.resolved_idx.set(ref_str, new_pos)
+          if st.cyclic_refs.contains(ref_str) {
+            ensure_hoisted(st, dname, expanded)
+          }
+          let (combined, sib_w) = match apply_31_ref_siblings(st, expanded, entries, depth) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let total_w = cap_add(target_w, sib_w, st.max_nodes + 1)
+          if total_w > st.max_nodes {
+            return Err(
+              OpenApiError::new(
+                OpenApiErrorKind::LimitExceeded,
+                ref_str,
+                "$ref expansion budget exceeded (possible $ref bomb)",
+              ),
+            )
+          }
+          Ok((combined, total_w))
+        }
+        None => {
+          let out : Array[(String, json5::Json5Value)] = []
+          let blocked_props : Array[String] = []
+          let mut sum_w = 0
+          let mut i = 0
+          while i < entries.length() {
+            let (k, v) = entries[i]
+            if is_schema_map_keyword(k) {
+              match v {
+                json5::Json5Value::Object(map_entries) => {
+                  match charge_node(st, k) {
+                    Ok(_) => ()
+                    Err(e) => return Err(e)
+                  }
+                  let map_out : Array[(String, json5::Json5Value)] = []
+                  let is_props = k == "properties"
+                  let mut mi = 0
+                  while mi < map_entries.length() {
+                    let (pk, pv) = map_entries[mi]
+                    if is_props && is_request_view(st.view) && schema_has_bool_flag(st.root, st.comp_idx, pv, "readOnly", st.is_31, st.max_ref_depth) {
+                      blocked_props.push(pk)
+                      map_out.push((pk, json5::Json5Value::Bool(false)))
+                      mi = mi + 1
+                      continue
+                    }
+                    if is_props && is_response_view(st.view) && schema_has_bool_flag(st.root, st.comp_idx, pv, "writeOnly", st.is_31, st.max_ref_depth) {
+                      blocked_props.push(pk)
+                      map_out.push((pk, json5::Json5Value::Bool(false)))
+                      mi = mi + 1
+                      continue
+                    }
+                    let (sub, sw) = match deref_schema_walk(st, pv, depth + 1) {
+                      Ok(r) => r
+                      Err(e) => return Err(e)
+                    }
+                    sum_w = cap_add(sum_w, sw, st.max_nodes + 1)
+                    if sum_w > st.max_nodes {
+                      return Err(
+                        OpenApiError::new(
+                          OpenApiErrorKind::LimitExceeded,
+                          "#",
+                          "$ref expansion budget exceeded (possible $ref bomb)",
+                        ),
+                      )
+                    }
+                    map_out.push((pk, sub))
+                    mi = mi + 1
+                  }
+                  out.push((k, json5::Json5Value::Object(map_out)))
+                }
+                _ => out.push((k, v))
+              }
+            } else if is_schema_array_keyword(k) {
+              match v {
+                json5::Json5Value::Array(items) => {
+                  match charge_node(st, k) {
+                    Ok(_) => ()
+                    Err(e) => return Err(e)
+                  }
+                  let arr_out : Array[json5::Json5Value] = []
+                  let mut ai = 0
+                  while ai < items.length() {
+                    let (sub, sw) = match deref_schema_walk(st, items[ai], depth + 1) {
+                      Ok(r) => r
+                      Err(e) => return Err(e)
+                    }
+                    sum_w = cap_add(sum_w, sw, st.max_nodes + 1)
+                    if sum_w > st.max_nodes {
+                      return Err(
+                        OpenApiError::new(
+                          OpenApiErrorKind::LimitExceeded,
+                          "#",
+                          "$ref expansion budget exceeded (possible $ref bomb)",
+                        ),
+                      )
+                    }
+                    arr_out.push(sub)
+                    ai = ai + 1
+                  }
+                  out.push((k, json5::Json5Value::Array(arr_out)))
+                }
+                _ => out.push((k, v))
+              }
+            } else if is_single_schema_keyword(k) {
+              match v {
+                json5::Json5Value::Array(items) => {
+                  match charge_node(st, k) {
+                    Ok(_) => ()
+                    Err(e) => return Err(e)
+                  }
+                  let arr_out : Array[json5::Json5Value] = []
+                  let mut ai = 0
+                  while ai < items.length() {
+                    let (sub, sw) = match deref_schema_walk(st, items[ai], depth + 1) {
+                      Ok(r) => r
+                      Err(e) => return Err(e)
+                    }
+                    sum_w = cap_add(sum_w, sw, st.max_nodes + 1)
+                    if sum_w > st.max_nodes {
+                      return Err(
+                        OpenApiError::new(
+                          OpenApiErrorKind::LimitExceeded,
+                          "#",
+                          "$ref expansion budget exceeded (possible $ref bomb)",
+                        ),
+                      )
+                    }
+                    arr_out.push(sub)
+                    ai = ai + 1
+                  }
+                  out.push((k, json5::Json5Value::Array(arr_out)))
+                }
+                json5::Json5Value::Object(_) => {
+                  let (sub, sw) = match deref_schema_walk(st, v, depth + 1) {
+                    Ok(r) => r
+                    Err(e) => return Err(e)
+                  }
+                  sum_w = cap_add(sum_w, sw, st.max_nodes + 1)
+                  if sum_w > st.max_nodes {
+                    return Err(
+                      OpenApiError::new(
+                        OpenApiErrorKind::LimitExceeded,
+                        "#",
+                        "$ref expansion budget exceeded (possible $ref bomb)",
+                      ),
+                    )
+                  }
+                  out.push((k, sub))
+                }
+                _ => out.push((k, v))
+              }
+            } else {
+              // Literal data (example, examples, default, enum, const) & scalar keywords: copy verbatim!
+              out.push((k, v))
+            }
+            i = i + 1
+          }
+          // Filter blocked readOnly/writeOnly property names out of `required`
+          let final_entries = if blocked_props.length() > 0 {
+            let filt : Array[(String, json5::Json5Value)] = []
+            let mut fi = 0
+            while fi < out.length() {
+              let (fk, fv) = out[fi]
+              if fk == "required" {
+                match fv {
+                  json5::Json5Value::Array(req_items) => {
+                    let kept : Array[json5::Json5Value] = []
+                    let mut ri = 0
+                    while ri < req_items.length() {
+                      match req_items[ri] {
+                        json5::Json5Value::Str(rname) => {
+                          if !str_arr_contains(blocked_props, rname) {
+                            kept.push(req_items[ri])
+                          }
+                        }
+                        other => kept.push(other)
+                      }
+                      ri = ri + 1
+                    }
+                    if kept.length() > 0 {
+                      filt.push(("required", json5::Json5Value::Array(kept)))
+                    }
+                  }
+                  _ => filt.push((fk, fv))
+                }
+              } else {
+                filt.push((fk, fv))
+              }
+              fi = fi + 1
+            }
+            filt
+          } else {
+            out
+          }
+          Ok((normalize_openapi_schema_obj(final_entries, st.is_30), sum_w))
+        }
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let out : Array[json5::Json5Value] = []
+      let mut sum_w = 0
+      let mut i = 0
+      while i < items.length() {
+        let (sub, sw) = match deref_schema_walk(st, items[i], depth + 1) {
+          Ok(r) => r
+          Err(e) => return Err(e)
+        }
+        sum_w = cap_add(sum_w, sw, st.max_nodes + 1)
+        if sum_w > st.max_nodes {
+          return Err(
+            OpenApiError::new(
+              OpenApiErrorKind::LimitExceeded,
+              "#",
+              "$ref expansion budget exceeded (possible $ref bomb)",
+            ),
+          )
+        }
+        out.push(sub)
+        i = i + 1
+      }
+      Ok((json5::Json5Value::Array(out), sum_w))
+    }
+    _ => Ok((node, 0))
+  }
+}
+
+///| Attach hoisted `$defs` to a dereferenced root schema object if any defs were hoisted.
+fn attach_hoisted_defs(
+  schema : json5::Json5Value,
+  hoisted : Array[(String, json5::Json5Value)],
+) -> json5::Json5Value {
+  if hoisted.length() == 0 {
+    return schema
+  }
+  match schema {
+    json5::Json5Value::Object(entries) => {
+      let out : Array[(String, json5::Json5Value)] = []
+      let mut has_defs = false
+      let mut i = 0
+      while i < entries.length() {
+        let (k, v) = entries[i]
+        if k == "$defs" {
+          has_defs = true
+          match v {
+            json5::Json5Value::Object(existing) => {
+              let merged : Array[(String, json5::Json5Value)] = []
+              let mut j = 0
+              while j < existing.length() {
+                merged.push(existing[j])
+                j = j + 1
+              }
+              j = 0
+              while j < hoisted.length() {
+                merged.push(hoisted[j])
+                j = j + 1
+              }
+              out.push(("$defs", json5::Json5Value::Object(merged)))
+            }
+            _ => out.push(("$defs", json5::Json5Value::Object(hoisted)))
+          }
+        } else {
+          out.push((k, v))
+        }
+        i = i + 1
+      }
+      if !has_defs {
+        out.push(("$defs", json5::Json5Value::Object(hoisted)))
+      }
+      json5::Json5Value::Object(out)
+    }
+    _ => schema
+  }
+}
+
+///| Deeply dereference a schema value with an explicit view, components index, and shared node budget.
+fn dereference_schema_with_ctx(
+  doc : OpenApiDoc,
+  comp_idx : ComponentsIndex,
+  schema : json5::Json5Value,
+  view : SchemaView,
+  node_budget : Array[Int],
+) -> Result[json5::Json5Value, OpenApiError] {
+  let st = DerefState::new_with_view(doc, comp_idx, view, node_budget)
+  let (expanded, _) = match deref_schema_walk(st, schema, 0) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  Ok(attach_hoisted_defs(expanded, st.hoisted_defs))
+}
+
+///| Deeply dereference a schema value into a standalone JSON Schema with `$defs` for shared/cyclic refs.
+fn dereference_schema_impl(
+  doc : OpenApiDoc,
+  schema : json5::Json5Value,
+) -> Result[json5::Json5Value, OpenApiError] {
+  let st = DerefState::new(doc)
+  let (expanded, _) = match deref_schema_walk(st, schema, 0) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  Ok(attach_hoisted_defs(expanded, st.hoisted_defs))
+}
