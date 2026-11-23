@@ -77,8 +77,9 @@ pionc add <package-name>
 | [`graphql`](packages/graphql) | `0.1.0` | GraphQL（October 2021）词法、全迭代显式栈 AST 解析（Executable + SDL + 扩展）、无损幂等格式化 `print_document`、与 `stripIgnoredCharacters` 逐字节一致的流式 `minify_query`，以及 13 条无 schema 可执行规则的 O(V + E) 静态校验与深度 / 别名 / 字段预算，`ParseOptions` 防 DoS（`max_depth` 硬上限 500），零依赖无 `World` | Rust [`apollo-parser`](https://github.com/apollographql/apollo-rs) `=0.8.4` + Node [`graphql-js`](https://github.com/graphql/graphql-js) `16.10.0` | 33 / 33 | ✅ `wasm_smoke` | [SDL 解析 **1.34×** · 查询解析 + 校验 **1.85×** · 压缩 + 打印往返 **1.23×**（vs Rust）](BENCHMARKS.md#graphql) | `pionc add graphql --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`woff2`](packages/woff2) | `0.1.0` | W3C WOFF 2.0（`wOF2`，复用 `brotli`）与 WOFF 1.0（`wOFF`，复用 `flate`）字体容器解码至 TrueType/OpenType（SFNT）：全 63 已知表标签 + 自定义标签、`glyf` / `loca` / `hmtx` 变换重建、整字体校验和 `0xB1B0AFBA` 与 `DecodeLimits` 防字体炸弹，零 C 依赖无 `World` | Rust [`wuff`](https://github.com/googlefonts/wuff) `0.2.10` + W3C WOFF2 Conformance（`google/woff2`） | 35 / 35 | ✅ `wasm_smoke` | [Arial.woff2 0.55× · Monaco.woff2 0.59× · Arial.woff 0.67×（vs `wuff`，含 `glyf`/`loca` 逐字节一致）](BENCHMARKS.md#woff2) | `pionc add woff2 --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`mp4`](packages/mp4) | `0.1.0` | ISO/IEC 14496-12（ISO BMFF / MP4 / fMP4）与 W3C MSE 字节流零拷贝解复用器：完整 `moov`（`elst`/`stbl`/`stsd` 含 H.264/HEVC/AV1/VP9/AAC/Opus/FLAC/MP3）与 fMP4（`sidx`/`moof`/`traf`/`trun` 多 `trun`）解析、RFC 6381 codec 字符串探测、非单调 B 帧安全 seek 与 `DecodeLimits` 防样本放大炸弹，零依赖无 `World` | Rust [`symphonia-format-isomp4`](https://github.com/pdeljanov/Symphonia) `0.5.5` + `ffprobe` 真值 | 8 / 8 | ✅ `wasm_smoke` | [MP4 18.04 µs/iter (**49.60×**) · fMP4 视频 11.05–13.99 µs/iter (**26.68–35.50×**) · 音频 7.35 µs/iter (**2.97×**)](BENCHMARKS.md#mp4) | `pionc add mp4 --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`glsl`](packages/glsl) | `0.1.0` | GLSL ES 1.00 (WebGL 1.0) / ES 3.00 (WebGL 2.0) 词法、校验、静态反射与 OpenGL 4.10 Core 转译器：支持 Three.js / Shadertoy 真实着色器、`#line` 映射、`packHalf2x16`/`packSnorm2x16` polyfill、关键字安全重命名与 `ParseLimits` 防 DoS，零依赖无 `World` | Rust [`glsl`](https://crates.io/crates/glsl) `7.0.0` + macOS OpenGL 4.1 Core 真值编译链接 | 16 / 16 | ✅ `wasm_smoke` | [Three.js **23.77×** · Shadertoy **39.03×** · 2D 后处理 **25.35×**（parse+reflect，含 75/75 GL 4.1 真值编译）](BENCHMARKS.md#glsl) | `pionc add glsl --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 46 个包合计 **4,595 / 4,595** 单测通过（`sh scripts/verify.sh`）。
+全仓 47 个包合计 **4,611 / 4,611** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -150,6 +151,10 @@ Wave 9 发布验证在 `AFK-surf/pion@c375cee` 上完成：`sh scripts/verify.sh
 ### Farview 生态沉淀波 3（多媒体生态首包）：`mp4` `v0.1.0`
 
 - **`mp4` `v0.1.0`**：零依赖纯 Pion ISO/IEC 14496-12（MP4 / fMP4 / W3C MSE）零拷贝解复用器，经独立红队审计与全量修复后合入（8 / 8 单测，`redteam_test` 22 / 22 全绿，`compare` 37 / 37 与 `ffprobe` 逐样本对齐且 31 条 `elst` 偏移归零，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 分歧，`trun`/`stco` 放大炸弹在 1.9 MiB 峰值 RSS 下 0 ms 拒收）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`4c1fad12…`）。头对头基准对照 Rust `symphonia-format-isomp4 0.5.5`（含 `ffprobe` 真值校验，以 `µs/iter` 计）：标准 MP4 18.04 µs/iter（**49.60×**）、MSE fMP4 视频 13.99 µs/iter（**26.68×**）、多 `trun` fMP4 视频 11.05 µs/iter（**35.50×**）、MSE fMP4 音频 7.35 µs/iter（**2.97×**）；进程内微基准 `parse_init_segment` 0.83 µs/iter、`parse_media_segment` 0.87 µs/iter（详见 [`BENCHMARKS.md`](BENCHMARKS.md#mp4)，含零拷贝 vs `next_packet()` 拷贝口径说明）。
+
+### Farview 生态沉淀波 4：`glsl` `v0.1.0`
+
+- **`glsl` `v0.1.0`**：零依赖纯 Pion GLSL ES 1.00 / 3.00 → OpenGL 4.10 Core 前端转译与反射库，经独立红队审计与全量修复后合入（16 / 16 单测，`audit unit` 26 / 26 全绿，真实 macOS OpenGL 4.1 Core `judge` **75 / 75 PASS**，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 差异，50k `#define` 由 2 s 降至 49 ms）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`ff7966c2…`）。头对头 `parse + reflect` 基准对照 Rust `glsl 7.0.0`：Three.js PBR ES 1.00 **23.77×**、WebGL2 Shadertoy ES 3.00 **39.03×**、2D 后处理 ES 1.00 **25.35×**（详见 [`BENCHMARKS.md`](BENCHMARKS.md#glsl)，含前端架构差异说明）。
 
 ## 贡献与移植流程
 

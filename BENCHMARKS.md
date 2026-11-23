@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–3 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–4 + `fts`）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -223,6 +223,9 @@
 | `mp4` | YouTube MSE fMP4 视频（`sidx`+`moof`+`mdat`，60 samples，init+seg × 1,000） | 1,000 iters | **13.992 ms** (`13.99 µs/iter`) | 373.335 ms (`373.33 µs/iter`, `rust_symphonia`) | **26.68x** | **5.30 MiB** | 7.69 MiB |
 | `mp4` | 多 `trun` fMP4 视频（2 `trun`/1 `traf`，60 samples，init+seg × 1,000） | 1,000 iters | **11.052 ms** (`11.05 µs/iter`) | 392.389 ms (`392.39 µs/iter`, `rust_symphonia`) | **35.50x** | **5.30 MiB** | 7.67 MiB |
 | `mp4` | YouTube MSE fMP4 音频（AAC-LC 48kHz，92 samples，init+seg × 2,000） | 2,000 iters | **14.700 ms** (`7.35 µs/iter`) | 43.697 ms (`21.85 µs/iter`, `rust_symphonia`) | **2.97x** | **2.05 MiB** | 2.66 MiB |
+| `glsl` | Three.js PBR ES 1.00 Frag（parse + reflect + 410 转译，4.77 KB × 500） | 2.39 MB | **63.358 ms** (37.61 MB/s) | 1,505.716 ms (`rust_glsl 7.0.0`) | **23.77x** | **2.25 MiB** | 2.75 MiB |
+| `glsl` | WebGL2 Shadertoy ES 3.00 Frag（parse + reflect + 410 转译，2.88 KB × 500） | 1.44 MB | **38.506 ms** (37.33 MB/s) | 1,502.805 ms (`rust_glsl 7.0.0`) | **39.03x** | **2.12 MiB** | 2.67 MiB |
+| `glsl` | 2D Post-Process ES 1.00 Frag（parse + reflect + 410 转译，1.44 KB × 500） | 0.72 MB | **35.911 ms** (20.08 MB/s) | 910.515 ms (`rust_glsl 7.0.0`) | **25.35x** | **2.05 MiB** | 2.56 MiB |
 
 ## 各包明细
 
@@ -1703,3 +1706,15 @@ _SHA-256: `bd519a5b90095c9523b1d7ca8d114f327f4b87d62b2eec8f11c1560c84c5ca6b`._
 进程内微基准（`mp4_audit prof-fmp4`，300k 轮 `yt_init_0.m4s` + `yt_seg_0_1.m4s`）：`parse_init_segment` = **0.83 µs/iter**（250 ms / 300k），`parse_media_segment` = **0.87 µs/iter**（262 ms / 300k）。
 
 红队与诚实口径说明：8 / 8 单测，`redteam_test` 22 / 22 全绿，`compare` 37 / 37 与 `ffprobe` 逐样本对齐且 31 条 `elst` 偏移归零，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 分歧，`trun`/`stco` 放大炸弹在 1.9 MiB RSS 下 0 ms 拒收。**口径说明**：fMP4 基准每轮均同时解析 init 与 media segment，按 `µs/iter` 而非被 `mdat` 体积虚增的 `MB/s` 报告；`symphonia-format-isomp4` 的 `next_packet()` 会把 `mdat` 载荷拷入逐包 `Vec<u8>`，而 `packages/mp4` 是返回 `(offset, size)` 范围的零拷贝解复用器，倍率同时反映了纯 Pion 元数据解析效率与零拷贝索引设计。
+
+### glsl
+
+参考实现：Rust [`glsl`](https://crates.io/crates/glsl) `7.0.0`（`--release`，LTO）。`sh packages/glsl/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替）运行于真实 Three.js PBR（ES 1.00）、WebGL2 Shadertoy 光线步进（ES 3.00）与 2D 后处理（ES 1.00）片元着色器，双方输出规范化反射摘要并经 SHA-256 逐字节一致校验。详见 [`packages/glsl/README.md`](packages/glsl/README.md)。
+
+| Workload | `pion` Median (Throughput) | `rust_glsl` Median (Throughput) | `pion` Peak RSS | `rust_glsl` Peak RSS | `pion` vs `rust_glsl` | Reflection SHA-256 (identical) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Three.js PBR ES 1.00 Frag (`4.77 KB × 500`) | **63.358 ms (37.61 MB/s)** | 1,505.716 ms (1.58 MB/s) | **2.25 MiB** | 2.75 MiB | **23.77x** | `a1a0175c13201ce9...` |
+| WebGL2 Shadertoy ES 3.00 Frag (`2.88 KB × 500`) | **38.506 ms (37.33 MB/s)** | 1,502.805 ms (0.96 MB/s) | **2.12 MiB** | 2.67 MiB | **39.03x** | `f848fbeb2be7e14d...` |
+| 2D Post-Process ES 1.00 Frag (`1.44 KB × 500`) | **35.911 ms (20.08 MB/s)** | 910.515 ms (0.79 MB/s) | **2.05 MiB** | 2.56 MiB | **25.35x** | `6afda6cb4886d4b6...` |
+
+真值编译与红队验证：真实 macOS OpenGL 4.1 Core（`4.1 Metal - 91.7 | GLSL: 4.10`）`judge` **75 / 75 PASS**（74 / 74 有效 WebGL1/WebGL2 着色器对编译链接全过 + 1 / 1 非法 UTF-8 BOM 拒收），`verify_gl41.c` 基准语料 **5 / 5 PASS**；`audit unit` **26 / 26** 全绿，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 差异，50k `#define` 由 2 s 降至 49 ms。**口径说明**：本基准对比 **parse + reflect** 吞吐（Pion 侧同时完成 ES→410 Core 转译，且支持函数体内 `#ifdef`/`#if`）；Rust `glsl 7.0.0` 通过 `nom` 构造完整递归下降表达式 AST 并按原 ES 方言打印，不做 ES→410 转译，倍率同时反映前端架构定位差异。
