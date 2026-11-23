@@ -111,3 +111,16 @@ Every decision field (`allowed`, `violated_directive`, `effective_directive`, `m
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Real-World CSP3 Parse + Eval (10k policies + 100k checks) | 96.534 ms (`965.34 ns/op`) | 65.204 ms (`652.04 ns/op`) | 95.560 / 104.051 | 64.188 / 69.148 | 2.80 MiB | 2.31 MiB | **0.68x** | `0c6bda1f51bef097...` |
 | WHATWG Fetch CORS Preflight + Response + Origin (200k ops) | 67.541 ms (`337.71 ns/op`) | 42.427 ms (`212.13 ns/op`) | 66.518 / 84.032 | 41.177 / 47.698 | 2.73 MiB | 2.16 MiB | **0.63x** | `f78bb5cbd9976a46...` |
+
+## Formal Verification (Lean 4)
+
+The core W3C CSP3 header-injection / serialization / port-matching guards, `ParseLimits` DoS validator, and WHATWG Fetch CORS safety / `Access-Control-Max-Age` clamping kernels (`src/types.pion`, `src/csp.pion`, `src/cors.pion`) are annotated with `#verify`, extracted directly via `pionc extract-lean` (`2` types, `16` functions, `0` externals), and formally verified in Lean 4 with **24 theorems**, **0 `sorry`**, **0 `admit`**, **0 custom `axiom`**, **0 `bv_decide`**, **0 `native_decide`**, and **44/44** native-vs-Lean differential cross-checks:
+
+- `proofs/CspProofs/HeaderAndPort.lean` (12 theorems): `ParseLimits::default` / zero-limit validity and 4-field `parse_limits_all_nonneg` iff; `csp_is_illegal_header_byte` injection rejection (NUL/LF/VT/CR/DEL) and CSP3 §2.2.1 legality of HTAB/FF/printable/non-ASCII; `csp_is_safe_serialized_byte` delimiter rejection (`;`, `,`, SP, controls) and implication of legal header byte; `csp_is_safe_directive_byte` ⊆ safe serialized byte; `csp_is_alpha` / `csp_is_digit` disjointness; overflow-free `[0, 65535]` `csp_port_step` accumulation; CSP3 §6.7.2.8 `csp_explicit_port_matches` 80→443 secure upgrade iff and no-downgrade (`443` never matches `80`).
+- `proofs/CspProofs/CorsAndSafety.lean` (12 theorems): `cors_is_include` iff; `cors_clamp_max_age` exact `[0, 86400]` formula, bounds, monotonicity, and idempotency across all `Int32`; Fetch §2.2.2 `cors_is_unsafe_request_header_byte` C0/DEL and 13-punctuation rejection + HTAB/alnum safety; `cors_is_language_byte` ⊆ CORS-safe printable ASCII `[32, 122]`; `cors_is_http_ws` & `csp_is_ws` exact characterizations and legality.
+- `proofs/CheckAxioms.lean`: verifies all 24 theorems depend only on Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`).
+- `proofs/EvalDiff.lean`: 44-case Lean vs native Pion differential cross-check (`diff -u` zero differences).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/csp/proofs/run_proofs.sh
+```
