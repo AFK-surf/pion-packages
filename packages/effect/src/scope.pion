@@ -1,0 +1,240 @@
+// Structured concurrency scopes and finalizers.
+
+struct ScopeState {
+  children : Map[Int, Task]
+  finalizers : Array[((Exit[Unit]) -> Unit) -> Unit]
+  mut closed : Bool
+  report : Bool
+}
+
+fn ScopeState::new(report : Bool) -> ScopeState {
+  ScopeState::{ children: Map::new(), finalizers: [], closed: false, report }
+}
+
+/// A scope: what is opened in it (fibers, finalizers, child scopes) ends when it closes.
+pub struct EffectScope {
+  rt : Runtime
+  st : ScopeState
+}
+
+fn EffectScope::make(rt : Runtime, report : Bool) -> EffectScope {
+  EffectScope::{ rt, st: ScopeState::new(report) }
+}
+
+/// A new scope of its own, closed with `close_k` or `close_now`.
+pub fn Runtime::new_scope(self : Runtime) -> EffectScope {
+  EffectScope::make(self, true)
+}
+
+/// A scope closed when this one closes.
+pub fn EffectScope::child(self : EffectScope) -> EffectScope {
+  let c = EffectScope::make(self.rt, self.st.report)
+  self.add_finalizer(fn(k : (Exit[Unit]) -> Unit) -> Unit { c.close_k(k) })
+  c
+}
+
+pub fn EffectScope::is_closed(self : EffectScope) -> Bool {
+  self.st.closed
+}
+
+/// How many fibers of it are still running.
+pub fn EffectScope::running(self : EffectScope) -> Int {
+  self.st.children.length()
+}
+
+/// Starts `f` as a fiber of the scope.
+pub fn EffectScope::fork[X](self : EffectScope, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
+  self.fork_with(f, "", self.st.report)
+}
+
+/// Starts `f` as a named fiber of the scope.
+pub fn EffectScope::fork_named[X](self : EffectScope, name : String, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
+  self.fork_with(f, name, self.st.report)
+}
+
+/// Starts `f` as a fiber of the scope whose failure is left for `join` or `wait` alone.
+pub fn EffectScope::fork_quiet[X](self : EffectScope, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
+  self.fork_with(f, "", false)
+}
+
+/// Starts `f` as a named quiet fiber of the scope.
+pub fn EffectScope::fork_quiet_named[X](
+  self : EffectScope,
+  name : String,
+  f : ((Exit[X]) -> Unit) -> Unit,
+) -> Fiber[X] {
+  self.fork_with(f, name, false)
+}
+
+/// Starts `f` as a named background fiber of the scope: failures go to `on_error` (never `on_defect`),
+/// while interruption ends it as `Interrupted` without calling `on_error`.
+pub fn EffectScope::fork_daemon(
+  self : EffectScope,
+  name : String,
+  f : ((Exit[Unit]) -> Unit) -> Unit,
+  on_error : (EffectError) -> Unit,
+) -> Fiber[Unit] {
+  self.fork_quiet_named(name, fn(k : (Exit[Unit]) -> Unit) -> Unit {
+    f(fn(ex : Exit[Unit]) -> Unit {
+      match ex {
+        Exit::Succeeded(_) => k(Exit::Succeeded(()))
+        Exit::Interrupted => k(Exit::Interrupted)
+        Exit::Failed(e) =>
+        match e {
+          EffectError::Interrupt =>
+          if is_interrupted() {
+            k(Exit::Interrupted)
+          } else {
+            on_error(e)
+            k(Exit::Succeeded(()))
+          }
+          _ => {
+            on_error(e)
+            k(Exit::Succeeded(()))
+          }
+        }
+      }
+    })
+  })
+}
+
+fn EffectScope::fork_with[X](
+  self : EffectScope,
+  f : ((Exit[X]) -> Unit) -> Unit,
+  name : String,
+  report : Bool,
+) -> Fiber[X] {
+  let cell : FiberCell[X] = FiberCell::{ item: None }
+  let t = self.rt.start(name, fn(done : (Exit[Unit]) -> Unit) -> Unit {
+    f(fn(ex : Exit[X]) -> Unit {
+      match ex {
+        Exit::Succeeded(x) => {
+          cell.item = Some(x)
+          done(Exit::Succeeded(()))
+        }
+        Exit::Failed(e) => done(Exit::Failed(e))
+        Exit::Interrupted => done(Exit::Interrupted)
+      }
+    })
+  })
+  if self.st.closed {
+    t.interrupt()
+  } else {
+    self.st.children.set(t.id, t)
+    let _ = t.watch(fn() -> Unit {
+      self.st.children.remove(t.id)
+      if report {
+        match t.end {
+          End::Raised(e) => self.rt.report(e)
+          _ => ()
+        }
+      }
+    })
+  }
+  Fiber::{ task: t, cell }
+}
+
+/// Runs `f` when the scope closes; on a closed scope, soon.
+pub fn EffectScope::add_finalizer(self : EffectScope, f : ((Exit[Unit]) -> Unit) -> Unit) -> Unit {
+  if self.st.closed {
+    let _ = self.rt.start("finalizer", f)
+  } else {
+    self.st.finalizers.push(f)
+  }
+}
+
+/// `acquire`, uninterruptibly, and `release` of what it gave when the scope closes.
+pub fn EffectScope::acquire_release_k[X](
+  self : EffectScope,
+  acquire : ((Exit[X]) -> Unit) -> Unit,
+  release : (X, (Exit[Unit]) -> Unit) -> Unit,
+  k : (Exit[X]) -> Unit,
+) -> Unit {
+  uninterruptible_k(
+    fn(done : (Exit[X]) -> Unit) -> Unit {
+      acquire(fn(ex : Exit[X]) -> Unit {
+        match ex {
+          Exit::Succeeded(x) => {
+            self.add_finalizer(fn(fk : (Exit[Unit]) -> Unit) -> Unit { release(x, fk) })
+            done(Exit::Succeeded(x))
+          }
+          Exit::Failed(e) => done(Exit::Failed(e))
+          Exit::Interrupted => done(Exit::Interrupted)
+        }
+      })
+    },
+    k,
+  )
+}
+
+fn await_all_kids(kids : Array[Task], idx : Int, done : () -> Unit) -> Unit {
+  if idx >= kids.length() {
+    done()
+    return
+  }
+  kids[idx].await_end_k(fn(_ex : Exit[Unit]) -> Unit {
+    await_all_kids(kids, idx + 1, done)
+  })
+}
+
+fn run_finalizers_lifo(self : EffectScope, done : () -> Unit) -> Unit {
+  match self.st.finalizers.pop() {
+    None => done()
+    Some(f) => {
+      f(fn(ex : Exit[Unit]) -> Unit {
+        match ex {
+          Exit::Failed(e) => self.rt.report(e)
+          _ => ()
+        }
+        run_finalizers_lifo(self, done)
+      })
+    }
+  }
+}
+
+/// Closes it: its fibers are interrupted and waited for, then its finalizers run, last first; all uninterruptibly.
+pub fn EffectScope::close_k(self : EffectScope, k : (Exit[Unit]) -> Unit) -> Unit {
+  if self.st.closed {
+    k(Exit::Succeeded(()))
+    return
+  }
+  self.st.closed = true
+  let t = current_task()
+  t.shield = t.shield + 1
+  let ks = self.st.children.keys()
+  let kids : Array[Task] = []
+  for cid in ks {
+    if cid == t.id {
+      t.interrupted = true
+    } else {
+      match self.st.children.get(cid) {
+        Some(child) => kids.push(child)
+        None => ()
+      }
+    }
+  }
+  for child in kids {
+    child.interrupt()
+  }
+  await_all_kids(kids, 0, fn() -> Unit {
+    run_finalizers_lifo(self, fn() -> Unit {
+      t.shield = t.shield - 1
+      k(Exit::Succeeded(()))
+    })
+  })
+}
+
+/// Closes it from outside any fiber (a host's call): done by a task of its own.
+pub fn EffectScope::close_now(self : EffectScope) -> Unit {
+  let _ = self.rt.start("close", fn(k : (Exit[Unit]) -> Unit) -> Unit { self.close_k(k) })
+}
+
+/// Runs `body` with a scope of its own, closed when it ends however it ends.
+pub fn scoped_k[X](body : (EffectScope, (Exit[X]) -> Unit) -> Unit, k : (Exit[X]) -> Unit) -> Unit {
+  let s = EffectScope::make(current_task().rt, false)
+  body(s, fn(out : Exit[X]) -> Unit {
+    s.close_k(fn(_c : Exit[Unit]) -> Unit {
+      k(out)
+    })
+  })
+}

@@ -1,0 +1,943 @@
+// Cooperative single-threaded fiber & timer scheduler.
+
+enum Resume {
+  Go
+  Stop
+}
+
+enum End {
+  NotYet
+  Done
+  Raised(EffectError)
+  Cut
+}
+
+/// A task: the code of one fiber, run by the scheduler between suspensions.
+struct Task {
+  id : Int
+  rt : Runtime
+  name : String
+  /// Parked: what resumes it (None while it runs, and once it ended).
+  mut state : Option[(Resume) -> Unit]
+  mut end : End
+  /// Asked to stop: the next suspension (outside a shield) cancels it.
+  mut interrupted : Bool
+  /// Inside `uninterruptible` (finalizers, acquisition): not cut.
+  mut shield : Int
+  mut queued : Bool
+  /// When it became ready: a frame's turn runs it at that moment, in its place among timers due by then.
+  mut since : Int64
+  /// Where it was made ready among what was set (the timers' `seq`).
+  mut seq : Int
+  /// The host's event it was made ready in between frames (-seq if its own).
+  mut event : Int
+  watchers : Map[Int, () -> Unit]
+}
+
+struct Timer {
+  at : Int64
+  seq : Int
+  mut fire : () -> Unit
+  mut live : Bool
+  later : Bool
+  who : String
+}
+
+fn Timer::before(self : Timer, other : Timer) -> Bool {
+  self.at < other.at || (self.at == other.at && self.seq < other.seq)
+}
+
+/// A binary min-heap of timers: by time, then by when they were set.
+struct TimerHeap {
+  mut items : Array[Timer]
+}
+
+fn TimerHeap::new() -> TimerHeap {
+  TimerHeap::{ items: [] }
+}
+
+fn TimerHeap::push(self : TimerHeap, t : Timer) -> Unit {
+  self.items.push(t)
+  let mut i = self.items.length() - 1
+  while i > 0 {
+    let p = (i - 1) / 2
+    if self.items[i].before(self.items[p]) {
+      let tmp = self.items[i]
+      self.items[i] = self.items[p]
+      self.items[p] = tmp
+      i = p
+    } else {
+      break
+    }
+  }
+}
+
+fn TimerHeap::peek(self : TimerHeap) -> Option[Timer] {
+  if self.items.length() == 0 {
+    None
+  } else {
+    Some(self.items[0])
+  }
+}
+
+fn TimerHeap::pop(self : TimerHeap) -> Option[Timer] {
+  let n = self.items.length()
+  if n == 0 {
+    return None
+  }
+  let top = self.items[0]
+  let last = match self.items.pop() {
+    Some(x) => x
+    None => return None
+  }
+  if n > 1 {
+    self.items[0] = last
+    let m = n - 1
+    let mut i = 0
+    while true {
+      let l = 2 * i + 1
+      let r = l + 1
+      let mut s = i
+      if l < m && self.items[l].before(self.items[s]) {
+        s = l
+      }
+      if r < m && self.items[r].before(self.items[s]) {
+        s = r
+      }
+      if s == i {
+        break
+      }
+      let tmp = self.items[i]
+      self.items[i] = self.items[s]
+      self.items[s] = tmp
+      i = s
+    }
+  }
+  Some(top)
+}
+
+struct CurrentBox {
+  mut task : Option[Task]
+}
+
+let current_box : CurrentBox = CurrentBox::{ task: None }
+
+/// Cooperative fiber, timer, frame, and outside-work runtime.
+pub struct Runtime {
+  mut time : Int64
+  clock : Option[() -> Int64]
+  ready : RingDeque[Task]
+  mut later : Array[Task]
+  mut later_head : Int
+  timers : TimerHeap
+  pub mut seq : Int
+  shuffle : Bool
+  sched : Rng
+  /// Draws for simulations (jitter, order, loss): apart from the scheduler's, from the same seed.
+  pub rng : Rng
+  /// The seed the run was made with (0: none, FIFO).
+  pub seed : Int
+  mut ids : Int
+  root_state : ScopeState
+  frame_waiters : Waiters
+  mut dead : Int
+  mut live_tasks : Int
+  /// Frames so far (`frame`).
+  pub mut frames : Int
+  mut defect : (EffectError) -> Unit
+  mut waker : () -> Unit
+  mut timer_waker : (Int64) -> Unit
+  mut outside : () -> Int64
+  mut outside_event : () -> Int
+  mut turning : Bool
+  /// What failed, as said, when nobody else was told.
+  pub defects : Array[String]
+  /// What the run said (`trace`), each line with its time.
+  pub log : Array[String]
+  /// Task resumptions and timers fired so far.
+  pub mut steps : Int
+  awaited : Map[Int, (String, Int64)]
+  mut tickets : Int
+  mut ended : Array[(Int, String)]
+  mut ended_n : Int
+  mut keep_ended : Bool
+}
+
+fn Runtime::make(seed : Int, shuffle : Bool, start : Int64, clock : Option[() -> Int64]) -> Runtime {
+  let defects : Array[String] = []
+  Runtime::{
+    time: start,
+    clock,
+    ready: RingDeque::with_capacity(64),
+    later: [],
+    later_head: 0,
+    timers: TimerHeap::new(),
+    seq: 0,
+    shuffle,
+    sched: Rng::new(seed),
+    rng: Rng::new(seed * 7919 + 17),
+    seed,
+    ids: 0,
+    root_state: ScopeState::new(true),
+    frame_waiters: Waiters::new(),
+    dead: 0,
+    live_tasks: 0,
+    frames: 0,
+    defect: fn(e : EffectError) -> Unit { defects.push(effect_error_to_string(e)) },
+    waker: fn() -> Unit { () },
+    timer_waker: fn(_at : Int64) -> Unit { () },
+    outside: fn() -> Int64 { -1.to_int64() },
+    outside_event: fn() -> Int { -1 },
+    turning: false,
+    defects,
+    log: [],
+    steps: 0,
+    awaited: Map::new(),
+    tickets: 0,
+    ended: [],
+    ended_n: 0,
+    keep_ended: false,
+  }
+}
+
+/// A runtime on virtual time from 0 ms (FIFO ready order).
+pub fn Runtime::new() -> Runtime {
+  Runtime::make(0, false, 0.to_int64(), None)
+}
+
+/// A runtime on virtual time from 0 ms with seeded scheduler shuffling.
+pub fn Runtime::new_seeded(seed : Int) -> Runtime {
+  Runtime::make(seed, true, 0.to_int64(), None)
+}
+
+/// A runtime on virtual time from `start` ms with optional `seed`.
+pub fn Runtime::new_at(seed : Option[Int], start : Int64) -> Runtime {
+  match seed {
+    Some(s) => Runtime::make(s, true, start, None)
+    None => Runtime::make(0, false, start, None)
+  }
+}
+
+/// A runtime on the host's clock (ms): the host calls `tick` when it is due.
+pub fn Runtime::live(now_fn : () -> Int64) -> Runtime {
+  Runtime::make(0, false, now_fn(), Some(now_fn))
+}
+
+/// Who is told of failures nobody waited for (by default `defects` keeps them).
+pub fn Runtime::on_defect(self : Runtime, f : (EffectError) -> Unit) -> Unit {
+  self.defect = f
+}
+
+fn Runtime::report(self : Runtime, e : EffectError) -> Unit {
+  (self.defect)(e)
+}
+
+/// Who is told that a task became ready while no turn runs.
+pub fn Runtime::on_wake(self : Runtime, f : () -> Unit) -> Unit {
+  self.waker = f
+}
+
+/// Who is told of a timer set while no turn runs, at its moment (`f(at)`).
+pub fn Runtime::on_timer(self : Runtime, f : (Int64) -> Unit) -> Unit {
+  self.timer_waker = f
+}
+
+/// The clock between frames (ms; negative: none).
+pub fn Runtime::outside_clock(self : Runtime, f : () -> Int64) -> Unit {
+  self.outside = f
+}
+
+/// Which of the host's events a task made ready between frames comes in (-1: one of its own).
+pub fn Runtime::outside_event(self : Runtime, f : () -> Int) -> Unit {
+  self.outside_event = f
+}
+
+/// The core's own scope: closing it ends everything.
+pub fn Runtime::root(self : Runtime) -> EffectScope {
+  EffectScope::{ rt: self, st: self.root_state }
+}
+
+/// The runtime's clock, in whole ms.
+pub fn Runtime::now(self : Runtime) -> Int64 {
+  match self.clock {
+    Some(f) => f()
+    None =>
+    if self.turning {
+      self.time
+    } else {
+      let t = (self.outside)()
+      if t > self.time { t } else { self.time }
+    }
+  }
+}
+
+/// Notes a line in the run's log, with the time.
+pub fn Runtime::trace(self : Runtime, s : String) -> Unit {
+  self.log.push(self.now().to_string() + " " + s)
+}
+
+/// The log as one text, a line each.
+pub fn Runtime::trace_text(self : Runtime) -> String {
+  let sb = StringBuilder::new()
+  for i in 0..<self.log.length() {
+    if i > 0 {
+      sb.write_byte(10 as Byte)
+    }
+    let line = self.log[i]
+    for j in 0..<line.length() {
+      sb.write_byte(line.code_unit_at(j) as Byte)
+    }
+  }
+  sb.to_string()
+}
+
+fn current_task() -> Task {
+  match current_box.task {
+    Some(t) => t
+    None => halt_saying("effect: not inside a task", "effect/runtime.pion:current_task")
+  }
+}
+
+/// The runtime the running code is on.
+pub fn runtime() -> Runtime {
+  current_task().rt
+}
+
+/// The time on the running code's clock (ms).
+pub fn now() -> Int64 {
+  current_task().rt.now()
+}
+
+/// Notes a line in the run's log (`Runtime::trace`).
+pub fn trace(s : String) -> Unit {
+  current_task().rt.trace(s)
+}
+
+fn Runtime::start(
+  self : Runtime,
+  name : String,
+  body : ((Exit[Unit]) -> Unit) -> Unit,
+) -> Task {
+  self.ids = self.ids + 1
+  let t = Task::{
+    id: self.ids,
+    rt: self,
+    name,
+    state: None,
+    end: End::NotYet,
+    interrupted: false,
+    shield: 0,
+    queued: false,
+    since: 0.to_int64(),
+    seq: 0,
+    event: 0,
+    watchers: Map::new(),
+  }
+  t.state = Some(fn(r : Resume) -> Unit {
+    match r {
+      Resume::Stop => {
+        t.end = End::Cut
+        t.state = None
+        t.finish()
+      }
+      Resume::Go => {
+        body(fn(ex : Exit[Unit]) -> Unit {
+          match ex {
+            Exit::Succeeded(_) => {
+              match t.end {
+                End::NotYet => t.end = End::Done
+                _ => ()
+              }
+            }
+            Exit::Failed(e) => t.end = End::Raised(e)
+            Exit::Interrupted => t.end = End::Cut
+          }
+          t.state = None
+          t.finish()
+        })
+      }
+    }
+  })
+  self.live_tasks = self.live_tasks + 1
+  self.make_ready(t)
+  t
+}
+
+fn Runtime::make_ready(self : Runtime, t : Task) -> Unit {
+  t.queued = true
+  t.since = if self.turning { self.time } else { self.now() }
+  let has_clock = match self.clock {
+    Some(_) => true
+    None => false
+  }
+  if !has_clock && !self.turning {
+    self.seq = self.seq + 1
+    t.seq = self.seq
+    let e = (self.outside_event)()
+    t.event = if e >= 0 { e } else { -self.seq }
+    self.later.push(t)
+  } else {
+    self.ready.push_back(t)
+  }
+  if !self.turning {
+    (self.waker)()
+  }
+}
+
+fn Task::finish(self : Task) -> Unit {
+  self.rt.live_tasks = self.rt.live_tasks - 1
+  if self.watchers.length() == 0 {
+    return
+  }
+  let ks = self.watchers.keys()
+  let ws : Array[() -> Unit] = []
+  for k in ks {
+    match self.watchers.get(k) {
+      Some(w) => ws.push(w)
+      None => ()
+    }
+    self.watchers.remove(k)
+  }
+  for w in ws {
+    w()
+  }
+}
+
+fn Task::watch(self : Task, f : () -> Unit) -> Int {
+  self.rt.ids = self.rt.ids + 1
+  let id = self.rt.ids
+  self.watchers.set(id, f)
+  id
+}
+
+fn Task::wake(self : Task) -> Unit {
+  if !self.queued {
+    match self.state {
+      Some(_) => self.rt.make_ready(self)
+      None => ()
+    }
+  }
+}
+
+fn Task::is_ended(self : Task) -> Bool {
+  match self.end {
+    End::NotYet => false
+    _ => true
+  }
+}
+
+fn Task::interrupt(self : Task) -> Unit {
+  if !self.is_ended() {
+    self.interrupted = true
+    if self.shield == 0 {
+      self.wake()
+    }
+  }
+}
+
+/// Parks the running task until something wakes it; interrupted (outside a shield), calls `on_cancel`.
+fn park_k(on_go : () -> Unit, on_cancel : () -> Unit) -> Unit {
+  let t = current_task()
+  if t.interrupted && t.shield == 0 {
+    on_cancel()
+    return
+  }
+  t.state = Some(fn(r : Resume) -> Unit {
+    match r {
+      Resume::Go => on_go()
+      Resume::Stop => on_cancel()
+    }
+  })
+}
+
+fn Task::await_end_k(self : Task, k : (Exit[Unit]) -> Unit) -> Unit {
+  if self.is_ended() {
+    k(Exit::Succeeded(()))
+    return
+  }
+  let me = current_task()
+  let id = self.watch(fn() -> Unit { me.wake() })
+  park_k(
+    fn() -> Unit {
+      self.watchers.remove(id)
+      self.await_end_k(k)
+    },
+    fn() -> Unit {
+      self.watchers.remove(id)
+      k(Exit::Interrupted)
+    },
+  )
+}
+
+/// Lets the other ready tasks run first.
+pub fn pause_k(k : (Exit[Unit]) -> Unit) -> Unit {
+  let t = current_task()
+  if t.interrupted && t.shield == 0 {
+    k(Exit::Interrupted)
+    return
+  }
+  t.state = Some(fn(r : Resume) -> Unit {
+    match r {
+      Resume::Go => k(Exit::Succeeded(()))
+      Resume::Stop => k(Exit::Interrupted)
+    }
+  })
+  t.queued = true
+  t.since = t.rt.time
+  t.rt.ready.push_back(t)
+}
+
+fn Runtime::add_timer(
+  self : Runtime,
+  at : Int64,
+  fire : () -> Unit,
+  later : Bool,
+  who : String,
+) -> Timer {
+  self.seq = self.seq + 1
+  let t = Timer::{ at, seq: self.seq, fire, live: true, later, who }
+  self.timers.push(t)
+  if !self.turning {
+    (self.timer_waker)(at)
+  }
+  t
+}
+
+/// Calls `f` (sync code) `ms` from now on the runtime's clock.
+pub fn Runtime::after(self : Runtime, ms : Int, f : () -> Unit) -> Unit {
+  let _ = self.add_timer(self.now() + ms.to_int64(), f, false, "")
+}
+
+/// Calls `f` `ms` from now, with explicit `later` and `who` metadata.
+pub fn Runtime::after_with(self : Runtime, ms : Int, f : () -> Unit, later : Bool, who : String) -> Unit {
+  let _ = self.add_timer(self.now() + ms.to_int64(), f, later, who)
+}
+
+fn sleep_loop(rt : Runtime, at : Int64, timer : Timer, k : (Exit[Unit]) -> Unit) -> Unit {
+  if rt.now() >= at {
+    if timer.live {
+      timer.live = false
+      timer.fire = fn() -> Unit { () }
+      rt.dropped()
+    }
+    k(Exit::Succeeded(()))
+    return
+  }
+  park_k(
+    fn() -> Unit { sleep_loop(rt, at, timer, k) },
+    fn() -> Unit {
+      if timer.live {
+        timer.live = false
+        timer.fire = fn() -> Unit { () }
+        rt.dropped()
+      }
+      k(Exit::Interrupted)
+    },
+  )
+}
+
+/// Waits `ms` on the runtime's clock.
+pub fn sleep_k(ms : Int, k : (Exit[Unit]) -> Unit) -> Unit {
+  sleep_later_k(ms, false, k)
+}
+
+/// Waits `ms` on the runtime's clock (`later`: does not block `unsettled`).
+pub fn sleep_later_k(ms : Int, later : Bool, k : (Exit[Unit]) -> Unit) -> Unit {
+  let t = current_task()
+  let rt = t.rt
+  let at = rt.now() + ms.to_int64()
+  let timer = rt.add_timer(at, fn() -> Unit { t.wake() }, later, t.name)
+  sleep_loop(rt, at, timer, k)
+}
+
+fn Runtime::pick(self : Runtime) -> Option[Task] {
+  let n = self.ready.length()
+  if n == 0 {
+    None
+  } else if self.shuffle {
+    self.ready.remove_at(self.sched.below(n))
+  } else {
+    self.ready.pop_front()
+  }
+}
+
+fn Runtime::later_len(self : Runtime) -> Int {
+  self.later.length() - self.later_head
+}
+
+fn Runtime::clear_later(self : Runtime) -> Unit {
+  self.later.clear()
+  self.later_head = 0
+}
+
+fn Runtime::ready_later(self : Runtime) -> Option[Int64] {
+  match self.clock {
+    Some(_) => return None
+    None => ()
+  }
+  let mut first : Option[Int64] = None
+  for i in self.later_head..<self.later.length() {
+    let t = self.later[i]
+    match first {
+      Some(f) => {
+        if t.since < f {
+          first = Some(t.since)
+        }
+      }
+      None => first = Some(t.since)
+    }
+  }
+  first
+}
+
+fn Runtime::run_ready_now(self : Runtime) -> Unit {
+  if self.later_len() > 0 {
+    let keep : Array[Task] = []
+    for i in self.later_head..<self.later.length() {
+      let t = self.later[i]
+      if t.since <= self.time {
+        self.ready.push_back(t)
+      } else {
+        keep.push(t)
+      }
+    }
+    self.later = keep
+    self.later_head = 0
+  }
+  let _ = self.run_tasks()
+}
+
+fn Runtime::step_task(self : Runtime, t : Task) -> Unit {
+  t.queued = false
+  let k = match t.state {
+    Some(f) => f
+    None => return
+  }
+  t.state = None
+  let prev = current_box.task
+  current_box.task = Some(t)
+  self.steps = self.steps + 1
+  let r = if t.interrupted && t.shield == 0 { Resume::Stop } else { Resume::Go }
+  k(r)
+  current_box.task = prev
+}
+
+fn Runtime::dropped(self : Runtime) -> Unit {
+  self.dead = self.dead + 1
+  if self.dead >= 32 && self.dead * 2 > self.timers.items.length() {
+    let live : Array[Timer] = []
+    for t in self.timers.items {
+      if t.live {
+        live.push(t)
+      }
+    }
+    self.timers.items = []
+    for t in live {
+      self.timers.push(t)
+    }
+    self.dead = 0
+  }
+}
+
+/// Runs ready tasks until none is, including those made ready between frames; returns resumptions count.
+pub fn Runtime::run_ready(self : Runtime) -> Int {
+  for i in self.later_head..<self.later.length() {
+    self.ready.push_back(self.later[i])
+  }
+  self.clear_later()
+  self.run_tasks()
+}
+
+fn Runtime::run_tasks(self : Runtime) -> Int {
+  let outer = self.turning
+  self.turning = true
+  let mut n = 0
+  while true {
+    match self.pick() {
+      None => break
+      Some(t) => {
+        self.step_task(t)
+        n = n + 1
+        if n > 10000000 {
+          self.turning = outer
+          halt_saying(
+            "effect: tasks kept each other ready without end (" + t.name + ")",
+            "effect/runtime.pion:run_tasks",
+          )
+        }
+      }
+    }
+  }
+  self.turning = outer
+  n
+}
+
+/// The next non-`later` live timer due, when and who set it.
+pub fn Runtime::next_due(self : Runtime) -> Option[(Int64, String)] {
+  let mut best : Option[(Int64, String)] = None
+  for t in self.timers.items {
+    if t.live && !t.later {
+      match best {
+        Some((at, _)) => {
+          if t.at < at {
+            best = Some((t.at, t.who))
+          }
+        }
+        None => best = Some((t.at, t.who))
+      }
+    }
+  }
+  best
+}
+
+/// When the next timer is due, if one is set.
+pub fn Runtime::next_timer(self : Runtime) -> Option[Int64] {
+  while true {
+    match self.timers.peek() {
+      Some(t) => {
+        if !t.live {
+          let _ = self.timers.pop()
+          self.dead = self.dead - 1
+        } else {
+          return Some(t.at)
+        }
+      }
+      None => return None
+    }
+  }
+  None
+}
+
+fn Runtime::later_due(self : Runtime) -> Option[Int] {
+  for i in self.later_head..<self.later.length() {
+    if self.later[i].since <= self.time {
+      return Some(i)
+    }
+  }
+  None
+}
+
+fn Runtime::next_instant(self : Runtime) -> Option[Int64] {
+  match (self.next_timer(), self.ready_later()) {
+    (Some(a), Some(b)) => Some(if a < b { a } else { b })
+    (Some(a), None) => Some(a)
+    (None, Some(b)) => Some(b)
+    _ => None
+  }
+}
+
+fn Runtime::fire_until(self : Runtime, until : Int64) -> Unit {
+  let outer = self.turning
+  self.turning = true
+  let _ = self.run_tasks()
+  while true {
+    let at = match self.next_instant() {
+      Some(a) => if a <= until { a } else { break }
+      None => break
+    }
+    let has_clock = match self.clock {
+      Some(_) => true
+      None => false
+    }
+    if !has_clock && at > self.time {
+      self.time = at
+    }
+    while true {
+      let task = self.later_due()
+      let fire_timer = match self.timers.peek() {
+        Some(t) =>
+        t.at <= at &&
+        match task {
+          Some(i) => t.seq < self.later[i].seq
+          None => true
+        }
+        None => false
+      }
+      if fire_timer {
+        match self.timers.pop() {
+          Some(t) => {
+            if t.live {
+              t.live = false
+              self.steps = self.steps + 1
+              (t.fire)()
+            } else {
+              self.dead = self.dead - 1
+            }
+          }
+          None => break
+        }
+      } else {
+        match task {
+          Some(i) => {
+            let event = self.later[i].event
+            let before : Option[Int] = match self.timers.peek() {
+              Some(t) => if t.at <= at { Some(t.seq) } else { None }
+              None => None
+            }
+            let mut end = i
+            while end < self.later.length() &&
+            self.later[end].event == event &&
+            self.later[end].since <= self.time &&
+            match before {
+              Some(b) => self.later[end].seq < b
+              None => true
+            } {
+              self.ready.push_back(self.later[end])
+              end = end + 1
+            }
+            if i == self.later_head {
+              self.later_head = end
+              if self.later_head >= self.later.length() {
+                self.clear_later()
+              } else if self.later_head >= 1024 && self.later_head * 2 >= self.later.length() {
+                let rem : Array[Task] = []
+                for idx in self.later_head..<self.later.length() {
+                  rem.push(self.later[idx])
+                }
+                self.later = rem
+                self.later_head = 0
+              }
+            } else {
+              let n = end - i
+              let mut k = i
+              while k < self.later.length() - n {
+                self.later[k] = self.later[k + n]
+                k = k + 1
+              }
+              for _ in 0..<n {
+                let _ = self.later.pop()
+              }
+            }
+            let _ = self.run_tasks()
+          }
+          None => break
+        }
+      }
+    }
+    let _ = self.run_tasks()
+  }
+  self.turning = outer
+}
+
+/// Moves virtual time on `ms`: every timer due meanwhile fires at its time.
+pub fn Runtime::advance(self : Runtime, ms : Int) -> Unit {
+  match self.clock {
+    Some(_) => {
+      let _ : Unit = halt_saying("effect: advance on the host's clock", "effect/runtime.pion:advance")
+    }
+    None => ()
+  }
+  let until = self.time + ms.to_int64()
+  self.fire_until(until)
+  self.time = until
+}
+
+/// The host's turn (`Runtime::live`): fires what is due on its clock and runs what is ready.
+pub fn Runtime::tick(self : Runtime) -> Unit {
+  self.fire_until(self.now())
+}
+
+/// A frame at `at` (ms, virtual time).
+pub fn Runtime::frame(self : Runtime, at : Int64) -> Unit {
+  match self.clock {
+    Some(_) => {
+      let _ : Unit = halt_saying("effect: frame on the host's clock", "effect/runtime.pion:frame")
+    }
+    None => ()
+  }
+  let outer = self.turning
+  self.turning = true
+  self.frames = self.frames + 1
+  let moment = if at > self.time { at } else { self.time }
+  self.fire_until(moment - 1.to_int64())
+  let waited = self.frame_waiters.next
+  self.fire_until(moment)
+  if at > self.time {
+    self.time = at
+  }
+  self.frame_waiters.wake_until(waited)
+  self.run_ready_now()
+  self.turning = outer
+}
+
+/// Whether it needs another frame.
+pub fn Runtime::wants_frame(self : Runtime) -> Bool {
+  !self.idle() || !self.frame_waiters.is_empty()
+}
+
+/// Waits for the next frame (`Runtime::frame`).
+pub fn next_frame_k(k : (Exit[Unit]) -> Unit) -> Unit {
+  current_task().rt.frame_waiters.wait_k(k)
+}
+
+/// What it still holds: (live_tasks, ready+later, live_timers, root_children, root_finalizers, frame_waiters).
+pub fn Runtime::holding(self : Runtime) -> (Int, Int, Int, Int, Int, Int) {
+  let mut live_timers = 0
+  for t in self.timers.items {
+    if t.live {
+      live_timers = live_timers + 1
+    }
+  }
+  (
+    self.live_tasks,
+    self.ready.length() + self.later_len(),
+    live_timers,
+    self.root_state.children.length(),
+    self.root_state.finalizers.length(),
+    self.frame_waiters.count(),
+  )
+}
+
+/// Timers in the heap, live or given up.
+pub fn Runtime::timer_slots(self : Runtime) -> Int {
+  self.timers.items.length()
+}
+
+/// Whether a fiber waits for the next frame (`next_frame_k`).
+pub fn Runtime::waits_frame(self : Runtime) -> Bool {
+  !self.frame_waiters.is_empty()
+}
+
+/// Nothing is ready to run.
+pub fn Runtime::idle(self : Runtime) -> Bool {
+  self.ready.is_empty() && self.later_len() == 0
+}
+
+/// Starts `f` as a fiber of the root scope.
+pub fn Runtime::fork[X](self : Runtime, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
+  self.root().fork(f)
+}
+
+/// Starts `f` as a named fiber of the root scope.
+pub fn Runtime::fork_named[X](self : Runtime, name : String, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
+  self.root().fork_named(name, f)
+}
+
+/// Starts `f` as a quiet fiber of the root scope (failures never reported to `on_defect`).
+pub fn Runtime::fork_quiet[X](self : Runtime, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
+  self.root().fork_quiet(f)
+}
+
+/// Starts `f` as a named quiet fiber of the root scope.
+pub fn Runtime::fork_quiet_named[X](
+  self : Runtime,
+  name : String,
+  f : ((Exit[X]) -> Unit) -> Unit,
+) -> Fiber[X] {
+  self.root().fork_quiet_named(name, f)
+}
+
+/// Starts `f` as a named background daemon fiber of the root scope.
+pub fn Runtime::fork_daemon(
+  self : Runtime,
+  name : String,
+  f : ((Exit[Unit]) -> Unit) -> Unit,
+  on_error : (EffectError) -> Unit,
+) -> Fiber[Unit] {
+  self.root().fork_daemon(name, f, on_error)
+}
+
+/// Closes the root scope: everything is interrupted, finalizers run.
+pub fn Runtime::shutdown(self : Runtime) -> Unit {
+  self.root().close_now()
+}
