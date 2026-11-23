@@ -1,0 +1,1042 @@
+///| 100% iterative, single-pass streaming CSS Syntax Level 3 stylesheet & declaration block parser.
+///| Consumes tokens directly from `Lexer` without materializing an intermediate `Array[Token]`.
+
+fn trim_ascii_ws(s : String) -> String {
+  let n = s.length()
+  let mut start = 0
+  while start < n {
+    let b = s.code_unit_at(start)
+    if b == 32 || b == 9 || b == 10 || b == 13 || b == 12 {
+      start = start + 1
+    } else {
+      break
+    }
+  }
+  let mut end = n
+  while end > start {
+    let b = s.code_unit_at(end - 1)
+    if b == 32 || b == 9 || b == 10 || b == 13 || b == 12 {
+      end = end - 1
+    } else {
+      break
+    }
+  }
+  if start == 0 && end == n {
+    s
+  } else {
+    s.slice(start, end)
+  }
+}
+
+fn is_ws_tok(t : Token) -> Bool {
+  match t.kind {
+    TokenKind::Whitespace => true
+    _ => false
+  }
+}
+
+///| Slice raw text from `src` covering tokens `[lo, hi)`, trimmed if `trim` is true.
+fn slice_tokens_text(
+  src : String,
+  tokens : Array[Token],
+  lo : Int,
+  hi : Int,
+  trim : Bool,
+) -> String {
+  if lo >= hi {
+    return ""
+  }
+  let s = src.slice(tokens[lo].start, tokens[hi - 1].end)
+  if trim {
+    trim_ascii_ws(s)
+  } else {
+    s
+  }
+}
+
+///| Validate balanced nesting depth of `()[]{}` across tokens (100% iterative, used by selector/media).
+fn check_token_nesting_depth(
+  tokens : Array[Token],
+  max_depth : Int,
+) -> Result[Unit, CssError] {
+  let n = tokens.length()
+  let mut depth = 0
+  let mut i = 0
+  while i < n {
+    match tokens[i].kind {
+      TokenKind::LeftCurly | TokenKind::LeftParen | TokenKind::LeftSquare | TokenKind::Function(_) => {
+        depth = depth + 1
+        if depth > max_depth {
+          return Err(
+            CssError::new(
+              CssErrorKind::LimitExceeded,
+              tokens[i].start,
+              1,
+              1,
+              "nesting depth limit exceeded",
+            ),
+          )
+        }
+      }
+      TokenKind::RightCurly | TokenKind::RightParen | TokenKind::RightSquare => {
+        if depth > 0 {
+          depth = depth - 1
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+///| Check whether an at-rule block is primarily a declaration list.
+fn is_decl_at_rule(name : String) -> Bool {
+  name == "font-face" ||
+  name == "page" ||
+  name == "property" ||
+  name == "counter-style" ||
+  name == "font-palette-values" ||
+  name == "font-feature-values" ||
+  name == "viewport"
+}
+
+///| Check whether an at-rule is a conditional/grouping rule (rules-only at top-level, mixed when nested).
+fn is_group_at_rule(name : String) -> Bool {
+  name == "media" ||
+  name == "supports" ||
+  name == "container" ||
+  name == "layer" ||
+  name == "document" ||
+  name == "scope" ||
+  name == "starting-style"
+}
+
+fn is_keyframes_at_rule(name : String) -> Bool {
+  if name == "keyframes" {
+    return true
+  }
+  let n = name.length()
+  n > 10 && name.slice(n - 10, n) == "-keyframes"
+}
+
+///| Frame kinds and block content modes.
+let FRAME_STYLESHEET : Int = 0
+let FRAME_QUALIFIED : Int = 1
+let FRAME_AT_RULE : Int = 2
+
+let CTX_RULE_LIST : Int = 0 // Rules only (stylesheet root, top-level @media, @keyframes)
+let CTX_BODY : Int = 1 // Declarations + nested rules (style rule body, nested @media)
+let CTX_DECL_LIST : Int = 2 // Declarations only (@font-face, @page, inline style)
+
+struct ParseFrame {
+  kind : Int
+  ctx : Int
+  nested : Bool
+  name : String
+  prelude : String
+  declarations : Array[Declaration]
+  rules : Array[Rule]
+}
+
+fn ParseFrame::new(
+  kind : Int,
+  ctx : Int,
+  nested : Bool,
+  name : String,
+  prelude : String,
+) -> ParseFrame {
+  ParseFrame::{
+    kind: kind,
+    ctx: ctx,
+    nested: nested,
+    name: name,
+    prelude: prelude,
+    declarations: [],
+    rules: [],
+  }
+}
+
+fn pop_and_attach_frame(stack : Array[ParseFrame]) -> Unit {
+  if stack.length() <= 1 {
+    return
+  }
+  let frame = stack[stack.length() - 1]
+  let _ = stack.pop()
+  let parent = stack[stack.length() - 1]
+  if frame.kind == FRAME_QUALIFIED {
+    let qr = QualifiedRule::{
+      prelude: frame.prelude,
+      declarations: frame.declarations,
+      nested_rules: frame.rules,
+    }
+    parent.rules.push(Rule::Qualified(qr))
+  } else if frame.kind == FRAME_AT_RULE {
+    let ar = AtRule::{
+      name: frame.name,
+      prelude: frame.prelude,
+      has_block: true,
+      declarations: frame.declarations,
+      rules: frame.rules,
+    }
+    parent.rules.push(Rule::At(ar))
+  }
+}
+
+fn compute_paren_limit(max_depth : Int) -> Int {
+  if max_depth >= 256 {
+    max_depth * 4
+  } else {
+    max_depth
+  }
+}
+
+///| Strip trailing comments and whitespace from `src[start..end)` (fast path when no `*/` at end).
+fn trim_raw_slice(src : String, start : Int, end : Int) -> String {
+  if start >= end {
+    return ""
+  }
+  trim_ascii_ws(src.slice(start, end))
+}
+
+///| Consume a declaration value after `:` has been read from `lex`.
+///| For custom properties (`is_custom == true`), `{}` blocks are kept as part of the value
+///| and only top-level `;`, `}`, or EOF terminates the declaration.
+///| For standard properties (`is_custom == false`), hitting `{` at depth 0:
+///|   - if `saw_other` is true, returns `Ok((2, lcur_start, None))` so caller can open a nested QualifiedRule;
+///|   - if `saw_other` is false (e.g. `color:{red};`), consumes the `{}` block as a declaration value.
+///| Returns `(stop_kind, stop_offset, Option[Declaration])`:
+///|   stop_kind: 0 = EOF, 1 = `;`, 2 = `{` (nested rule fallback), 3 = `}`.
+fn stream_parse_decl_value(
+  lex : Lexer,
+  prop_name : String,
+  is_custom : Bool,
+  after_rule : Int,
+  max_paren : Int,
+  allow_nested_rule : Bool,
+) -> Result[(Int, Int, Option[Declaration]), CssError] {
+  let clean = lex.src
+  let mut depth = 0
+  let mut has_bad = false
+  let mut saw_any_ws = false
+  let mut saw_other = false
+  let mut saw_top_curly = false
+
+  // Track first and last non-WS token spans, plus last 2 non-WS tokens at depth 0 for `!important`.
+  let mut first_non_ws = -1
+  let mut last_non_ws_end = -1
+  let mut prev2_kind = TK_EOF
+  let mut prev2_end = -1
+  let mut prev1_kind = TK_EOF
+  let mut prev1_start = -1
+  let mut prev1_end = -1
+  let mut prev1_is_bang = false
+  let mut prev1_is_imp = false
+  let mut prev2_is_bang = false
+  let mut prev3_end = -1
+
+  while true {
+    let tk = match lex.next() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    if tk == TK_EOF {
+      break
+    }
+    if depth == 0 {
+      if tk == TK_SEMI {
+        return Ok(
+          (
+            1,
+            lex.tok_start,
+            finalize_decl(
+              clean,
+              prop_name,
+              is_custom,
+              after_rule,
+              has_bad,
+              saw_any_ws,
+              first_non_ws,
+              last_non_ws_end,
+              prev1_is_imp && prev2_is_bang,
+              prev3_end,
+            ),
+          ),
+        )
+      }
+      if tk == TK_RCUR {
+        return Ok(
+          (
+            3,
+            lex.tok_start,
+            finalize_decl(
+              clean,
+              prop_name,
+              is_custom,
+              after_rule,
+              has_bad,
+              saw_any_ws,
+              first_non_ws,
+              last_non_ws_end,
+              prev1_is_imp && prev2_is_bang,
+              prev3_end,
+            ),
+          ),
+        )
+      }
+      if tk == TK_LCUR {
+        if !is_custom && allow_nested_rule && (saw_other || saw_top_curly) {
+          return Ok((2, lex.tok_start, None))
+        }
+        saw_top_curly = true
+        depth = depth + 1
+        if depth > max_paren {
+          return Err(
+            CssError::new(
+              CssErrorKind::LimitExceeded,
+              lex.tok_start,
+              1,
+              1,
+              "nesting depth limit exceeded",
+            ),
+          )
+        }
+        if first_non_ws < 0 {
+          first_non_ws = lex.tok_start
+        }
+        // Shift trailing token history (reset !important match since we entered a block)
+        prev3_end = prev2_end
+        prev2_kind = prev1_kind
+        prev2_end = prev1_end
+        prev2_is_bang = prev1_is_bang
+        prev1_kind = TK_LCUR
+        prev1_start = lex.tok_start
+        prev1_end = lex.tok_end
+        prev1_is_bang = false
+        prev1_is_imp = false
+        last_non_ws_end = lex.tok_end
+        continue
+      }
+    }
+
+    if tk == TK_WS {
+      saw_any_ws = true
+      continue
+    }
+
+    if tk == TK_BADSTR || tk == TK_BADURL {
+      has_bad = true
+    }
+
+    if tk == TK_LPAR || tk == TK_LSQ || tk == TK_FUNC || tk == TK_LCUR {
+      depth = depth + 1
+      if depth > max_paren {
+        return Err(
+          CssError::new(
+            CssErrorKind::LimitExceeded,
+            lex.tok_start,
+            1,
+            1,
+            "nesting depth limit exceeded",
+          ),
+        )
+      }
+      if depth == 1 {
+        saw_other = true
+        if first_non_ws < 0 {
+          first_non_ws = lex.tok_start
+        }
+        prev3_end = prev2_end
+        prev2_kind = prev1_kind
+        prev2_end = prev1_end
+        prev2_is_bang = prev1_is_bang
+        prev1_kind = tk
+        prev1_start = lex.tok_start
+        prev1_end = lex.tok_end
+        prev1_is_bang = false
+        prev1_is_imp = false
+      }
+      last_non_ws_end = lex.tok_end
+      continue
+    }
+
+    if tk == TK_RPAR || tk == TK_RSQ || tk == TK_RCUR {
+      if depth > 0 {
+        depth = depth - 1
+      }
+      last_non_ws_end = lex.tok_end
+      if depth == 0 {
+        prev1_end = lex.tok_end
+      }
+      continue
+    }
+
+    // Regular non-WS token
+    if depth == 0 {
+      if !is_custom && saw_top_curly {
+        // Non-custom property had a `{}` block followed by another token; check if it's `!important`
+        let is_bang = tk == TK_DELIM && lex.tok_end - lex.tok_start == 1 && clean.code_unit_at(lex.tok_start) == 33
+        let is_imp = tk == TK_IDENT && is_important_ident(clean, lex.tok_start, lex.tok_end, lex.tok_has_esc, lex.lut)
+        if !is_bang && !(is_imp && prev1_is_bang) {
+          has_bad = true
+        }
+      } else {
+        saw_other = true
+      }
+      if first_non_ws < 0 {
+        first_non_ws = lex.tok_start
+      }
+      let is_bang = tk == TK_DELIM && lex.tok_end - lex.tok_start == 1 && clean.code_unit_at(lex.tok_start) == 33
+      let is_imp = tk == TK_IDENT && is_important_ident(clean, lex.tok_start, lex.tok_end, lex.tok_has_esc, lex.lut)
+      prev3_end = prev2_end
+      prev2_kind = prev1_kind
+      prev2_end = prev1_end
+      prev2_is_bang = prev1_is_bang
+      prev1_kind = tk
+      prev1_start = lex.tok_start
+      prev1_end = lex.tok_end
+      prev1_is_bang = is_bang
+      prev1_is_imp = is_imp
+    }
+    last_non_ws_end = lex.tok_end
+  }
+
+  let _ = prev1_start
+  let _ = prev2_kind
+  Ok(
+    (
+      0,
+      lex.n,
+      finalize_decl(
+        clean,
+        prop_name,
+        is_custom,
+        after_rule,
+        has_bad,
+        saw_any_ws,
+        first_non_ws,
+        last_non_ws_end,
+        prev1_is_imp && prev2_is_bang,
+        prev3_end,
+      ),
+    ),
+  )
+}
+
+fn finalize_decl(
+  clean : String,
+  prop_name : String,
+  is_custom : Bool,
+  after_rule : Int,
+  has_bad : Bool,
+  saw_any_ws : Bool,
+  first_non_ws : Int,
+  last_non_ws_end : Int,
+  important : Bool,
+  end_before_imp : Int,
+) -> Option[Declaration] {
+  if has_bad {
+    return None
+  }
+  let val_end = if important { end_before_imp } else { last_non_ws_end }
+  let value = if first_non_ws >= 0 && val_end > first_non_ws {
+    clean.slice(first_non_ws, val_end)
+  } else if is_custom && saw_any_ws {
+    // CSS Variables 1: whitespace-only custom property normalizes to single space " "
+    " "
+  } else {
+    ""
+  }
+  Some(Declaration::new_at(prop_name, value, important, is_custom, after_rule))
+}
+
+///| Scan forward from current lexer state until `{`, `;`, `}`, or EOF at `paren_depth == 0`.
+///| `stop_on_semi`: false in `CTX_RULE_LIST` for qualified rule preludes (CSS Syntax 3 §5.4.3).
+///| `stop_on_rcur`: false at top-level stylesheet (stray `}` is part of prelude per CSS Syntax 3).
+///| Returns `(stop_kind, stop_offset, last_non_ws_end)`:
+///|   stop_kind: 0 = EOF, 1 = `;`, 2 = `{`, 3 = `}`.
+fn stream_scan_until(
+  lex : Lexer,
+  first_tk : Int,
+  first_start : Int,
+  first_end : Int,
+  stop_on_semi : Bool,
+  stop_on_rcur : Bool,
+  max_paren : Int,
+) -> Result[(Int, Int, Int), CssError] {
+  let mut paren_depth = 0
+  let mut tk = first_tk
+  let mut tstart = first_start
+  let mut tend = first_end
+  let mut last_non_ws_end = -1
+
+  while true {
+    if tk == TK_EOF {
+      return Ok((0, lex.n, last_non_ws_end))
+    }
+    if paren_depth == 0 {
+      if tk == TK_LCUR {
+        return Ok((2, tstart, last_non_ws_end))
+      }
+      if stop_on_semi && tk == TK_SEMI {
+        return Ok((1, tstart, last_non_ws_end))
+      }
+      if stop_on_rcur && tk == TK_RCUR {
+        return Ok((3, tstart, last_non_ws_end))
+      }
+    }
+    if tk == TK_LPAR || tk == TK_LSQ || tk == TK_FUNC {
+      paren_depth = paren_depth + 1
+      if paren_depth > max_paren {
+        return Err(
+          CssError::new(
+            CssErrorKind::LimitExceeded,
+            tstart,
+            1,
+            1,
+            "nesting depth limit exceeded",
+          ),
+        )
+      }
+    } else if tk == TK_RPAR || tk == TK_RSQ {
+      if paren_depth > 0 {
+        paren_depth = paren_depth - 1
+      }
+    }
+    if tk != TK_WS {
+      last_non_ws_end = tend
+    }
+    tk = match lex.next() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    tstart = lex.tok_start
+    tend = lex.tok_end
+  }
+  Ok((0, lex.n, last_non_ws_end))
+}
+
+///| 100% iterative, single-pass streaming stylesheet parser.
+pub fn parse_stylesheet_internal(
+  src : String,
+  opts : ParseOptions,
+) -> Result[Stylesheet, CssError] {
+  let clean = preprocess_string(src)
+  let lex = Lexer::new(clean, opts.max_tokens)
+  let max_paren = compute_paren_limit(opts.max_depth)
+  let stack : Array[ParseFrame] = [
+    ParseFrame::new(FRAME_STYLESHEET, CTX_RULE_LIST, false, "", ""),
+  ]
+  let mut rule_count = 0
+
+  while true {
+    let tk = match lex.next() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    if tk == TK_EOF {
+      break
+    }
+
+    let cur_frame = stack[stack.length() - 1]
+    let at_root = stack.length() == 1
+
+    // Whitespace is always skipped between items
+    if tk == TK_WS {
+      continue
+    }
+
+    // CDO / CDC are ONLY skipped at top-level stylesheet (CSS Syntax 3 §5.4.1)
+    if at_root && (tk == TK_CDO || tk == TK_CDC) {
+      continue
+    }
+
+    // Inside a block: '}' closes the current block, ';' is an empty statement
+    if !at_root {
+      if tk == TK_RCUR {
+        pop_and_attach_frame(stack)
+        continue
+      }
+      if tk == TK_SEMI && cur_frame.ctx != CTX_RULE_LIST {
+        continue
+      }
+    }
+
+    // At-rule
+    if tk == TK_AT {
+      rule_count = rule_count + 1
+      if rule_count > opts.max_rules {
+        return Err(
+          CssError::new(
+            CssErrorKind::LimitExceeded,
+            lex.tok_start,
+            1,
+            1,
+            "rule limit exceeded",
+          ),
+        )
+      }
+      let raw_at = decode_ident_slice(clean, lex.tok_start + 1, lex.tok_end, lex.tok_has_esc, lex.lut)
+      let at_name = ascii_lower(raw_at)
+      let prelude_first_tk = match lex.next() {
+        Ok(k) => k
+        Err(e) => return Err(e)
+      }
+      let mut p_tk = prelude_first_tk
+      while p_tk == TK_WS {
+        p_tk = match lex.next() {
+          Ok(k) => k
+          Err(e) => return Err(e)
+        }
+      }
+      let p_start = lex.tok_start
+      let (stop_kind, _, p_end) = match stream_scan_until(
+        lex,
+        p_tk,
+        lex.tok_start,
+        lex.tok_end,
+        true,
+        !at_root,
+        max_paren,
+      ) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      let prelude = if p_end > p_start {
+        trim_raw_slice(clean, p_start, p_end)
+      } else {
+        ""
+      }
+      if stop_kind == 2 {
+        // '{' -> open at-rule block
+        if stack.length() > opts.max_depth {
+          return Err(
+            CssError::new(
+              CssErrorKind::LimitExceeded,
+              lex.tok_start,
+              1,
+              1,
+              "nesting depth limit exceeded",
+            ),
+          )
+        }
+        let child_ctx = if is_decl_at_rule(at_name) {
+          CTX_DECL_LIST
+        } else if is_keyframes_at_rule(at_name) {
+          CTX_RULE_LIST
+        } else if is_group_at_rule(at_name) {
+          if cur_frame.nested { CTX_BODY } else { CTX_RULE_LIST }
+        } else {
+          CTX_BODY
+        }
+        let child_nested = cur_frame.nested || child_ctx == CTX_BODY
+        stack.push(ParseFrame::new(FRAME_AT_RULE, child_ctx, child_nested, at_name, prelude))
+      } else {
+        // Statement at-rule (';', '}', or EOF)
+        let ar = AtRule::{
+          name: at_name,
+          prelude: prelude,
+          has_block: false,
+          declarations: [],
+          rules: [],
+        }
+        cur_frame.rules.push(Rule::At(ar))
+        if stop_kind == 3 && !at_root {
+          pop_and_attach_frame(stack)
+        }
+      }
+      continue
+    }
+
+    // In CTX_RULE_LIST (top-level or top-level @media / @keyframes): qualified rule only!
+    if cur_frame.ctx == CTX_RULE_LIST {
+      let item_start = lex.tok_start
+      let (stop_kind, _, item_end) = match stream_scan_until(
+        lex,
+        tk,
+        lex.tok_start,
+        lex.tok_end,
+        false,
+        !at_root,
+        max_paren,
+      ) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      if stop_kind == 2 {
+        rule_count = rule_count + 1
+        if rule_count > opts.max_rules {
+          return Err(
+            CssError::new(
+              CssErrorKind::LimitExceeded,
+              item_start,
+              1,
+              1,
+              "rule limit exceeded",
+            ),
+          )
+        }
+        if stack.length() > opts.max_depth {
+          return Err(
+            CssError::new(
+              CssErrorKind::LimitExceeded,
+              lex.tok_start,
+              1,
+              1,
+              "nesting depth limit exceeded",
+            ),
+          )
+        }
+        let prelude = if item_end > item_start {
+          trim_raw_slice(clean, item_start, item_end)
+        } else {
+          ""
+        }
+        stack.push(ParseFrame::new(FRAME_QUALIFIED, CTX_BODY, true, "", prelude))
+      } else if stop_kind == 3 && !at_root {
+        pop_and_attach_frame(stack)
+      }
+      continue
+    }
+
+    // Inside CTX_BODY or CTX_DECL_LIST: try declaration if starts with Ident + ':'
+    let item_start = lex.tok_start
+    let item_end_first = lex.tok_end
+    if tk == TK_IDENT {
+      let raw_name = decode_ident_slice(clean, lex.tok_start, lex.tok_end, lex.tok_has_esc, lex.lut)
+      // Peek next non-WS token
+      let mut next_tk = match lex.next() {
+        Ok(k) => k
+        Err(e) => return Err(e)
+      }
+      while next_tk == TK_WS {
+        next_tk = match lex.next() {
+          Ok(k) => k
+          Err(e) => return Err(e)
+        }
+      }
+      if next_tk == TK_COLON {
+        let is_custom = raw_name.length() >= 2 &&
+        raw_name.code_unit_at(0) == 45 &&
+        raw_name.code_unit_at(1) == 45
+        let prop_name = if is_custom { raw_name } else { ascii_lower(raw_name) }
+        let allow_nested = cur_frame.ctx == CTX_BODY
+        let (stop_kind, stop_off, decl_opt) = match stream_parse_decl_value(
+          lex,
+          prop_name,
+          is_custom,
+          cur_frame.rules.length(),
+          max_paren,
+          allow_nested,
+        ) {
+          Ok(r) => r
+          Err(e) => return Err(e)
+        }
+        if stop_kind == 2 {
+          // Fallback to nested QualifiedRule (e.g. `a:hover { ... }`)
+          rule_count = rule_count + 1
+          if rule_count > opts.max_rules {
+            return Err(
+              CssError::new(
+                CssErrorKind::LimitExceeded,
+                item_start,
+                1,
+                1,
+                "rule limit exceeded",
+              ),
+            )
+          }
+          if stack.length() > opts.max_depth {
+            return Err(
+              CssError::new(
+                CssErrorKind::LimitExceeded,
+                stop_off,
+                1,
+                1,
+                "nesting depth limit exceeded",
+              ),
+            )
+          }
+          let prelude = trim_raw_slice(clean, item_start, stop_off)
+          stack.push(ParseFrame::new(FRAME_QUALIFIED, CTX_BODY, true, "", prelude))
+        } else {
+          match decl_opt {
+            Some(decl) => cur_frame.declarations.push(decl)
+            None => ()
+          }
+          if stop_kind == 3 {
+            pop_and_attach_frame(stack)
+          }
+        }
+        continue
+      }
+      // Ident not followed by ':' -> scan rest of item (might be a nested rule like `div > p { ... }`)
+      let (stop_kind, _, item_end) = match stream_scan_until(
+        lex,
+        next_tk,
+        lex.tok_start,
+        lex.tok_end,
+        true,
+        true,
+        max_paren,
+      ) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      if stop_kind == 2 {
+        if cur_frame.ctx == CTX_BODY {
+          rule_count = rule_count + 1
+          if rule_count > opts.max_rules {
+            return Err(
+              CssError::new(
+                CssErrorKind::LimitExceeded,
+                item_start,
+                1,
+                1,
+                "rule limit exceeded",
+              ),
+            )
+          }
+          if stack.length() > opts.max_depth {
+            return Err(
+              CssError::new(
+                CssErrorKind::LimitExceeded,
+                lex.tok_start,
+                1,
+                1,
+                "nesting depth limit exceeded",
+              ),
+            )
+          }
+          let end_pos = if item_end > item_start { item_end } else { item_end_first }
+          let prelude = trim_raw_slice(clean, item_start, end_pos)
+          stack.push(ParseFrame::new(FRAME_QUALIFIED, CTX_BODY, true, "", prelude))
+        } else {
+          // CTX_DECL_LIST: skip unexpected `{...}` block
+          match skip_balanced_curly(lex, max_paren) {
+            Ok(()) => ()
+            Err(e) => return Err(e)
+          }
+        }
+      } else if stop_kind == 3 {
+        pop_and_attach_frame(stack)
+      }
+      continue
+    }
+
+    // Non-ident start inside CTX_BODY or CTX_DECL_LIST (e.g. `&:hover { ... }`, `.child { ... }`, `<!-- ...`)
+    let (stop_kind, _, item_end) = match stream_scan_until(
+      lex,
+      tk,
+      lex.tok_start,
+      lex.tok_end,
+      true,
+      true,
+      max_paren,
+    ) {
+      Ok(r) => r
+      Err(e) => return Err(e)
+    }
+    if stop_kind == 2 {
+      if cur_frame.ctx == CTX_BODY {
+        rule_count = rule_count + 1
+        if rule_count > opts.max_rules {
+          return Err(
+            CssError::new(
+              CssErrorKind::LimitExceeded,
+              item_start,
+              1,
+              1,
+              "rule limit exceeded",
+            ),
+          )
+        }
+        if stack.length() > opts.max_depth {
+          return Err(
+            CssError::new(
+              CssErrorKind::LimitExceeded,
+              lex.tok_start,
+              1,
+              1,
+              "nesting depth limit exceeded",
+            ),
+          )
+        }
+        let prelude = if item_end > item_start {
+          trim_raw_slice(clean, item_start, item_end)
+        } else {
+          ""
+        }
+        stack.push(ParseFrame::new(FRAME_QUALIFIED, CTX_BODY, true, "", prelude))
+      } else {
+        match skip_balanced_curly(lex, max_paren) {
+          Ok(()) => ()
+          Err(e) => return Err(e)
+        }
+      }
+    } else if stop_kind == 3 {
+      pop_and_attach_frame(stack)
+    }
+  }
+
+  // Close any unclosed blocks at EOF gracefully (CSS Syntax 3 fault tolerance)
+  while stack.length() > 1 {
+    pop_and_attach_frame(stack)
+  }
+  Ok(Stylesheet::{ rules: stack[0].rules })
+}
+
+fn skip_balanced_curly(lex : Lexer, max_paren : Int) -> Result[Unit, CssError] {
+  let mut depth = 1
+  while depth > 0 {
+    let tk = match lex.next() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    if tk == TK_EOF {
+      return Ok(())
+    }
+    if tk == TK_LCUR || tk == TK_LPAR || tk == TK_LSQ || tk == TK_FUNC {
+      depth = depth + 1
+      if depth > max_paren {
+        return Err(
+          CssError::new(
+            CssErrorKind::LimitExceeded,
+            lex.tok_start,
+            1,
+            1,
+            "nesting depth limit exceeded",
+          ),
+        )
+      }
+    } else if tk == TK_RCUR || tk == TK_RPAR || tk == TK_RSQ {
+      depth = depth - 1
+    }
+  }
+  Ok(())
+}
+
+///| 100% iterative, single-pass streaming declaration list parser (e.g. inline `style` attribute).
+pub fn parse_declarations_internal(
+  src : String,
+  opts : ParseOptions,
+) -> Result[Array[Declaration], CssError] {
+  let clean = preprocess_string(src)
+  let lex = Lexer::new(clean, opts.max_tokens)
+  let max_paren = compute_paren_limit(opts.max_depth)
+  let decls : Array[Declaration] = []
+
+  while true {
+    let tk = match lex.next() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    if tk == TK_EOF {
+      break
+    }
+    if tk == TK_WS || tk == TK_SEMI {
+      continue
+    }
+    if tk == TK_AT {
+      // Skip at-rule in declaration list
+      let next_tk = match lex.next() {
+        Ok(k) => k
+        Err(e) => return Err(e)
+      }
+      let (stop_kind, _, _) = match stream_scan_until(
+        lex,
+        next_tk,
+        lex.tok_start,
+        lex.tok_end,
+        true,
+        false,
+        max_paren,
+      ) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      if stop_kind == 2 {
+        match skip_balanced_curly(lex, max_paren) {
+          Ok(()) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      continue
+    }
+    if tk == TK_IDENT {
+      let raw_name = decode_ident_slice(clean, lex.tok_start, lex.tok_end, lex.tok_has_esc, lex.lut)
+      let mut next_tk = match lex.next() {
+        Ok(k) => k
+        Err(e) => return Err(e)
+      }
+      while next_tk == TK_WS {
+        next_tk = match lex.next() {
+          Ok(k) => k
+          Err(e) => return Err(e)
+        }
+      }
+      if next_tk == TK_COLON {
+        let is_custom = raw_name.length() >= 2 &&
+        raw_name.code_unit_at(0) == 45 &&
+        raw_name.code_unit_at(1) == 45
+        let prop_name = if is_custom { raw_name } else { ascii_lower(raw_name) }
+        let (stop_kind, _, decl_opt) = match stream_parse_decl_value(
+          lex,
+          prop_name,
+          is_custom,
+          0,
+          max_paren,
+          false,
+        ) {
+          Ok(r) => r
+          Err(e) => return Err(e)
+        }
+        match decl_opt {
+          Some(d) => decls.push(d)
+          None => ()
+        }
+        let _ = stop_kind
+        continue
+      }
+      let (stop_kind, _, _) = match stream_scan_until(
+        lex,
+        next_tk,
+        lex.tok_start,
+        lex.tok_end,
+        true,
+        false,
+        max_paren,
+      ) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      if stop_kind == 2 {
+        match skip_balanced_curly(lex, max_paren) {
+          Ok(()) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      continue
+    }
+    // Non-ident: skip until ';' or skip '{...}' block
+    let (stop_kind, _, _) = match stream_scan_until(
+      lex,
+      tk,
+      lex.tok_start,
+      lex.tok_end,
+      true,
+      false,
+      max_paren,
+    ) {
+      Ok(r) => r
+      Err(e) => return Err(e)
+    }
+    if stop_kind == 2 {
+      match skip_balanced_curly(lex, max_paren) {
+        Ok(()) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+  Ok(decls)
+}
