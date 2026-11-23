@@ -86,8 +86,8 @@ SHA-256: `96dfab9a281eb5f28ff90fb48fce58432871efa657702e23f02b67803167b7bb`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_ref`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 145.185 | 141.776 | 149.054 | 725.93 | 1.92 MiB | 0.54x |
-| `go_ref` | 77.739 | 76.431 | 79.299 | 388.70 | 16.48 MiB | 1.00x (baseline) |
+| `pion` | 59.627 | 59.378 | 60.257 | 298.14 | 1.84 MiB | **1.20x** |
+| `go_ref` | 71.454 | 69.677 | 71.498 | 357.27 | 16.00 MiB | 1.00x (baseline) |
 
 ### W2: SOCKS5 Full Bidirectional Handshake (`UserPass` + `ATYP=0x03`, `500,000` rounds)
 
@@ -95,8 +95,8 @@ SHA-256: `bd5d0f40fb590fb8256a99a89e1416f98ce0358b6eb65c6a4acaed42b61f51d7`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_ref`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 271.333 | 259.824 | 277.209 | 542.67 | 1.81 MiB | 0.15x |
-| `go_ref` | 40.945 | 40.154 | 42.045 | 81.89 | 9.14 MiB | 1.00x (baseline) |
+| `pion` | 213.555 | 206.391 | 222.242 | 427.11 | 1.83 MiB | 0.18x |
+| `go_ref` | 39.357 | 38.658 | 41.770 | 78.71 | 9.20 MiB | 1.00x (baseline) |
 
 ### W3: HTTP `CONNECT` + Plaintext Forward-Proxy Header Sanitization (`100,000` requests)
 
@@ -104,10 +104,10 @@ SHA-256: `88bc1dee6f226e2b2f0f26caa4449beee6cec65b48a2d12b920e94d6fbc0c800`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_net_http`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 438.944 | 431.199 | 454.696 | 4389.44 | 2.02 MiB | 0.85x |
-| `go_net_http` | 374.719 | 372.832 | 395.230 | 3747.19 | 21.84 MiB | 1.00x (baseline) |
+| `pion` | 245.813 | 241.749 | 267.560 | 2458.13 | 1.95 MiB | **1.55x** |
+| `go_net_http` | 382.039 | 368.789 | 425.250 | 3820.39 | 19.59 MiB | 1.00x (baseline) |
 
 **Honest takeaways**:
-- **W3 (HTTP `CONNECT` + forward-proxy sanitization)** is near parity with Go `net/http` (**~0.85x–1.0x** depending on host load; `0.85x` here vs `0.91x` in the audit run) while using **~10.8x less peak RSS** (`2.02 MiB` vs `21.84 MiB`), and performs full CL/TE smuggling validation that the Go bench loop omits.
-- **W1 (Proxy URL + `NO_PROXY`)** is `0.54x` of the hand-written Go reference (`726 ns/op` vs `389 ns/op`, **8.6x lower RSS**), primarily due to `String::to_bytes()` copies inside helper scans.
-- **W2 (SOCKS5 binary framing)** is `0.15x` of the hand-inlined Go byte-slice loop (`543 ns/round` / ~1.84M full 6-step handshakes/sec, **5.0x lower RSS**), where Go avoids typed codec allocations per frame.
+- **W3 (HTTP `CONNECT` + forward-proxy sanitization)** leads Go `net/http` by **1.55x** (`245.8 ms` vs `382.0 ms`, **10.0x lower peak RSS** at `1.95 MiB` vs `19.59 MiB`), while performing full CL/TE smuggling validation that the Go bench loop omits.
+- **W1 (Proxy URL + `NO_PROXY`)** leads the hand-written Go reference by **1.20x** (`59.6 ms` vs `71.5 ms`, **8.7x lower peak RSS** at `1.84 MiB` vs `16.00 MiB`), with zero-allocation `NoProxyMatcher::matches` and direct `code_unit_at` URL scanning.
+- **W2 (SOCKS5 binary framing)** reaches `427 ns/round` (~2.34M full 6-step handshakes/sec, **5.0x lower RSS** at `1.83 MiB` vs `9.20 MiB`, `0.18x–0.19x` vs the hand-inlined zero-allocation Go byte loop), where ARM64 disassembly shows the remaining gap is dominated by ~42 per-round `_pion_alloc_uninit` / `_pion_rc_dec` pairs for boxed `Result[DecodeStatus[T], ProxyError]` / enum / non-`val` struct wrappers and `Bytes::slice().to_string()` double-copies.
