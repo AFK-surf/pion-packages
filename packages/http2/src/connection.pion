@@ -1,14 +1,62 @@
-///| Sans-IO RFC 9113 HTTP/2 Connection State Machine, Flow Control & Security Defenses.
-///| Stub for Red phase.
+///| Sans-IO RFC 9113 HTTP/2 Connection State Machine, Flow Control Windows,
+///| Header Block Reassembly, and Day-1 CVE Defenses (Rapid Reset, CONTINUATION Flood).
+
+///|
+struct StreamEntry {
+  stream_id : Int
+  mut state : StreamState
+  mut send_window : Int64
+  mut recv_window : Int64
+  mut headers_received : Bool
+}
 
 ///|
 pub struct Connection {
   pub config : ConnectionConfig
+  hpack_decoder : HpackDecoder
+  hpack_encoder : HpackEncoder
+  mut remote_max_frame_size : Int
+  mut remote_initial_window_size : Int64
+  mut local_initial_window_size : Int64
+  mut conn_send_win : Int64
+  mut conn_recv_win : Int64
+  mut last_remote_stream_id : Int
+  mut rapid_reset_count : Int
+  mut streams : Array[StreamEntry]
+  // Pending HEADERS / PUSH_PROMISE reassembly across CONTINUATION frames
+  mut pending_stream_id : Int
+  mut pending_end_stream : Bool
+  mut pending_is_push : Bool
+  mut pending_promised_id : Int
+  mut pending_cont_count : Int
+  mut pending_buf : ByteBuf
 }
 
 ///|
 pub fn Connection::new(config : ConnectionConfig) -> Connection {
-  Connection::{ config: config }
+  let init_win = config.initial_window_size.to_int64()
+  Connection::{
+    config: config,
+    hpack_decoder: HpackDecoder::with_limits(
+      config.max_dynamic_table_size,
+      config.max_header_list_size,
+    ),
+    hpack_encoder: HpackEncoder::new(config.max_dynamic_table_size),
+    remote_max_frame_size: config.max_frame_size,
+    remote_initial_window_size: default_initial_window_size.to_int64(),
+    local_initial_window_size: init_win,
+    conn_send_win: default_initial_window_size.to_int64(),
+    conn_recv_win: init_win,
+    last_remote_stream_id: 0,
+    rapid_reset_count: 0,
+    streams: [],
+    pending_stream_id: 0,
+    pending_end_stream: false,
+    pending_is_push: false,
+    pending_promised_id: 0,
+    pending_cont_count: 0,
+    pending_buf: ByteBuf::new(64),
+  }
 }
 
 ///|
@@ -22,90 +70,455 @@ pub fn Connection::client() -> Connection {
 }
 
 ///|
+fn Connection::find_stream_idx(self : Connection, stream_id : Int) -> Int {
+  let n = self.streams.length()
+  let mut i = n - 1
+  while i >= 0 {
+    if self.streams[i].stream_id == stream_id {
+      return i
+    }
+    i = i - 1
+  }
+  -1
+}
+
+///|
+fn Connection::get_or_create_stream(self : Connection, stream_id : Int) -> Int {
+  let idx = self.find_stream_idx(stream_id)
+  if idx >= 0 {
+    return idx
+  }
+  let entry = StreamEntry::{
+    stream_id: stream_id,
+    state: StreamState::Idle,
+    send_window: self.remote_initial_window_size,
+    recv_window: self.local_initial_window_size,
+    headers_received: false,
+  }
+  self.streams.push(entry)
+  self.streams.length() - 1
+}
+
+///|
 pub fn Connection::stream_state(self : Connection, stream_id : Int) -> StreamState {
-  let _ = self
-  let _ = stream_id
-  StreamState::Idle
+  let idx = self.find_stream_idx(stream_id)
+  if idx < 0 {
+    return StreamState::Idle
+  }
+  self.streams[idx].state
 }
 
 ///|
 pub fn Connection::conn_send_window(self : Connection) -> Int64 {
-  let _ = self
-  0L
+  self.conn_send_win
 }
 
 ///|
 pub fn Connection::conn_recv_window(self : Connection) -> Int64 {
-  let _ = self
-  0L
+  self.conn_recv_win
 }
 
 ///|
 pub fn Connection::stream_send_window(self : Connection, stream_id : Int) -> Int64 {
-  let _ = self
-  let _ = stream_id
-  0L
+  let idx = self.find_stream_idx(stream_id)
+  if idx < 0 {
+    return self.remote_initial_window_size
+  }
+  self.streams[idx].send_window
 }
 
 ///|
 pub fn Connection::stream_recv_window(self : Connection, stream_id : Int) -> Int64 {
-  let _ = self
-  let _ = stream_id
-  0L
+  let idx = self.find_stream_idx(stream_id)
+  if idx < 0 {
+    return self.local_initial_window_size
+  }
+  self.streams[idx].recv_window
 }
 
 ///|
+fn Connection::finish_header_block(
+  self : Connection,
+  sid : Int,
+  block : Bytes,
+  end_stream : Bool,
+  is_push : Bool,
+  promised_id : Int,
+) -> Result[Option[ConnectionEvent], H2Error] {
+  let headers = match self.hpack_decoder.decode(block) {
+    Ok(hs) => hs
+    Err(e) => return Err(e)
+  }
+  if is_push {
+    if self.config.validate_headers {
+      match validate_request_headers(headers) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    let pidx = self.get_or_create_stream(promised_id)
+    self.streams[pidx].state = StreamState::ReservedRemote
+    return Ok(Some(ConnectionEvent::PushPromise(sid, promised_id, headers)))
+  }
+
+  let idx = self.get_or_create_stream(sid)
+  let st = self.streams[idx].state
+  let is_trailer = self.streams[idx].headers_received && end_stream
+
+  if self.config.validate_headers {
+    if is_trailer {
+      match validate_trailers(headers) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    } else if self.config.is_server {
+      match validate_request_headers(headers) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    } else {
+      match validate_response_headers(headers) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+
+  match st {
+    StreamState::Idle => {
+      if sid > self.last_remote_stream_id {
+        self.last_remote_stream_id = sid
+      }
+      self.streams[idx].headers_received = true
+      self.streams[idx].state = if end_stream {
+        StreamState::HalfClosedRemote
+      } else {
+        StreamState::Open
+      }
+    }
+    StreamState::ReservedRemote => {
+      self.streams[idx].headers_received = true
+      self.streams[idx].state = if end_stream {
+        StreamState::Closed
+      } else {
+        StreamState::HalfClosedLocal
+      }
+    }
+    StreamState::Open => {
+      self.streams[idx].headers_received = true
+      if end_stream {
+        self.streams[idx].state = StreamState::HalfClosedRemote
+      }
+    }
+    StreamState::HalfClosedLocal => {
+      self.streams[idx].headers_received = true
+      if end_stream {
+        self.streams[idx].state = StreamState::Closed
+      }
+    }
+    StreamState::HalfClosedRemote | StreamState::Closed => {
+      return Err(H2Error::StreamClosed(sid))
+    }
+    StreamState::ReservedLocal => {
+      return Err(H2Error::ProtocolError("received HEADERS on ReservedLocal stream"))
+    }
+  }
+  Ok(Some(ConnectionEvent::Headers(sid, headers, end_stream)))
+}
+
+///| Process one decoded RFC 9113 frame through the connection state machine.
 pub fn Connection::receive_frame(
   self : Connection,
   frame : Frame,
 ) -> Result[Option[ConnectionEvent], H2Error] {
-  let _ = self
-  let _ = frame
-  Err(H2Error::ProtocolError("unimplemented"))
+  // If we are in the middle of a HEADERS/PUSH_PROMISE block awaiting END_HEADERS,
+  // ONLY a CONTINUATION frame for the exact same stream_id is permitted!
+  if self.pending_stream_id != 0 {
+    match frame {
+      Frame::Continuation(sid, frag, end_headers) => {
+        if sid != self.pending_stream_id {
+          return Err(
+            H2Error::ProtocolError("CONTINUATION stream_id does not match pending header block"),
+          )
+        }
+        self.pending_cont_count = self.pending_cont_count + 1
+        if self.pending_cont_count > self.config.max_continuation_frames {
+          return Err(H2Error::EnhanceYourCalm("CONTINUATION flood limit exceeded"))
+        }
+        if self.pending_buf.len + frag.length() > self.config.max_header_list_size {
+          return Err(H2Error::EnhanceYourCalm("header block exceeds max_header_list_size"))
+        }
+        self.pending_buf.push_bytes(frag)
+        if !end_headers {
+          return Ok(None)
+        }
+        let block = self.pending_buf.to_bytes()
+        let psid = self.pending_stream_id
+        let pes = self.pending_end_stream
+        let pis_push = self.pending_is_push
+        let pprom = self.pending_promised_id
+        self.pending_stream_id = 0
+        self.pending_cont_count = 0
+        self.pending_buf.len = 0
+        return self.finish_header_block(psid, block, pes, pis_push, pprom)
+      }
+      _ => {
+        return Err(
+          H2Error::ProtocolError("interleaved non-CONTINUATION frame before END_HEADERS"),
+        )
+      }
+    }
+  }
+
+  match frame {
+    Frame::Headers(sid, frag, end_stream, end_headers, _) => {
+      if !end_headers {
+        if frag.length() > self.config.max_header_list_size {
+          return Err(H2Error::EnhanceYourCalm("header block exceeds max_header_list_size"))
+        }
+        self.pending_stream_id = sid
+        self.pending_end_stream = end_stream
+        self.pending_is_push = false
+        self.pending_promised_id = 0
+        self.pending_cont_count = 0
+        self.pending_buf.len = 0
+        self.pending_buf.push_bytes(frag)
+        return Ok(None)
+      }
+      self.finish_header_block(sid, frag, end_stream, false, 0)
+    }
+    Frame::PushPromise(sid, promised_id, frag, end_headers) => {
+      if !end_headers {
+        if frag.length() > self.config.max_header_list_size {
+          return Err(H2Error::EnhanceYourCalm("push promise header block too large"))
+        }
+        self.pending_stream_id = sid
+        self.pending_end_stream = false
+        self.pending_is_push = true
+        self.pending_promised_id = promised_id
+        self.pending_cont_count = 0
+        self.pending_buf.len = 0
+        self.pending_buf.push_bytes(frag)
+        return Ok(None)
+      }
+      self.finish_header_block(sid, frag, false, true, promised_id)
+    }
+    Frame::Continuation(_, _, _) => {
+      Err(H2Error::ProtocolError("unexpected CONTINUATION without preceding HEADERS"))
+    }
+    Frame::Data(sid, data, end_stream) => {
+      let idx = self.find_stream_idx(sid)
+      if idx < 0 {
+        return Err(H2Error::ProtocolError("DATA received on idle stream"))
+      }
+      let st = self.streams[idx].state
+      match st {
+        StreamState::Open | StreamState::HalfClosedLocal => ()
+        StreamState::HalfClosedRemote | StreamState::Closed => {
+          return Err(H2Error::StreamClosed(sid))
+        }
+        _ => return Err(H2Error::ProtocolError("DATA received in invalid stream state"))
+      }
+      let dlen = data.length().to_int64()
+      if dlen > self.conn_recv_win || dlen > self.streams[idx].recv_window {
+        return Err(H2Error::FlowControlError("received DATA exceeds flow control window"))
+      }
+      self.conn_recv_win = self.conn_recv_win - dlen
+      self.streams[idx].recv_window = self.streams[idx].recv_window - dlen
+      if end_stream {
+        self.streams[idx].state = match st {
+          StreamState::Open => StreamState::HalfClosedRemote
+          _ => StreamState::Closed
+        }
+      }
+      Ok(Some(ConnectionEvent::Data(sid, data, end_stream)))
+    }
+    Frame::RstStream(sid, code) => {
+      let idx = self.find_stream_idx(sid)
+      if idx < 0 {
+        return Err(H2Error::ProtocolError("RST_STREAM on idle stream"))
+      }
+      // CVE-2023-44487 Rapid Reset defense
+      self.rapid_reset_count = self.rapid_reset_count + 1
+      if self.rapid_reset_count > self.config.max_rapid_resets {
+        return Err(H2Error::EnhanceYourCalm("CVE-2023-44487 rapid reset limit exceeded"))
+      }
+      self.streams[idx].state = StreamState::Closed
+      Ok(Some(ConnectionEvent::RstStream(sid, code)))
+    }
+    Frame::Settings(settings, ack) => {
+      if !ack {
+        let mut i = 0
+        while i < settings.length() {
+          let s = settings[i]
+          if s.id == setting_header_table_size {
+            let max_s = if s.value > self.config.max_dynamic_table_size.to_int64() {
+              self.config.max_dynamic_table_size
+            } else {
+              s.value.to_int()
+            }
+            self.hpack_encoder.set_max_table_size(max_s)
+          } else if s.id == setting_initial_window_size {
+            let new_win = s.value
+            let delta = new_win - self.remote_initial_window_size
+            self.remote_initial_window_size = new_win
+            let mut j = 0
+            while j < self.streams.length() {
+              let st = self.streams[j].state
+              match st {
+                StreamState::Open | StreamState::HalfClosedRemote => {
+                  let updated = self.streams[j].send_window + delta
+                  if updated > max_window_size.to_int64() {
+                    return Err(
+                      H2Error::FlowControlError(
+                        "SETTINGS_INITIAL_WINDOW_SIZE caused stream window overflow",
+                      ),
+                    )
+                  }
+                  self.streams[j].send_window = updated
+                }
+                _ => ()
+              }
+              j = j + 1
+            }
+          } else if s.id == setting_max_frame_size {
+            self.remote_max_frame_size = s.value.to_int()
+          }
+          i = i + 1
+        }
+      }
+      Ok(Some(ConnectionEvent::Settings(settings, ack)))
+    }
+    Frame::WindowUpdate(sid, inc) => {
+      let inc64 = inc.to_int64()
+      if sid == 0 {
+        let nw = self.conn_send_win + inc64
+        if nw > max_window_size.to_int64() {
+          return Err(H2Error::FlowControlError("connection send window overflow > 2^31-1"))
+        }
+        self.conn_send_win = nw
+      } else {
+        let idx = self.find_stream_idx(sid)
+        if idx < 0 {
+          return Err(H2Error::ProtocolError("WINDOW_UPDATE on idle stream"))
+        }
+        let nw = self.streams[idx].send_window + inc64
+        if nw > max_window_size.to_int64() {
+          return Err(H2Error::FlowControlError("stream send window overflow > 2^31-1"))
+        }
+        self.streams[idx].send_window = nw
+      }
+      Ok(Some(ConnectionEvent::WindowUpdate(sid, inc)))
+    }
+    Frame::Ping(opaque, ack) => Ok(Some(ConnectionEvent::Ping(opaque, ack))),
+    Frame::GoAway(last_sid, code, dbg) => {
+      Ok(Some(ConnectionEvent::GoAway(last_sid, code, dbg)))
+    }
+    Frame::Priority(sid, spec) => Ok(Some(ConnectionEvent::Priority(sid, spec))),
+    Frame::Unknown(hdr, body) => Ok(Some(ConnectionEvent::UnknownFrame(hdr, body))),
+  }
 }
 
-///|
+///| Feed a chunk of wire bytes, decoding and processing as many complete frames as possible.
+///| Returns `Ok((events, bytes_consumed))`.
 pub fn Connection::feed(
   self : Connection,
   data : Bytes,
 ) -> Result[(Array[ConnectionEvent], Int), H2Error] {
-  let _ = self
-  let _ = data
-  Err(H2Error::ProtocolError("unimplemented"))
+  let events : Array[ConnectionEvent] = []
+  let mut pos = 0
+  let n = data.length()
+  while pos < n {
+    match decode_frame(data, pos, self.config.max_frame_size) {
+      Ok((frame, next_pos)) => {
+        match self.receive_frame(frame) {
+          Ok(Some(ev)) => events.push(ev)
+          Ok(None) => ()
+          Err(e) => return Err(e)
+        }
+        pos = next_pos
+      }
+      Err(H2Error::Incomplete) => break
+      Err(e) => return Err(e)
+    }
+  }
+  Ok((events, pos))
 }
 
-///|
+///| Local state transition when opening a stream (sending HEADERS).
 pub fn Connection::open_stream(
   self : Connection,
   stream_id : Int,
   end_stream : Bool,
 ) -> Result[Unit, H2Error] {
-  let _ = self
-  let _ = stream_id
-  let _ = end_stream
-  Err(H2Error::ProtocolError("unimplemented"))
+  if stream_id <= 0 || stream_id > max_stream_id {
+    return Err(H2Error::ProtocolError("invalid stream_id"))
+  }
+  let idx = self.get_or_create_stream(stream_id)
+  match self.streams[idx].state {
+    StreamState::Idle => {
+      self.streams[idx].state = if end_stream {
+        StreamState::HalfClosedLocal
+      } else {
+        StreamState::Open
+      }
+      Ok(())
+    }
+    StreamState::ReservedLocal => {
+      self.streams[idx].state = if end_stream {
+        StreamState::Closed
+      } else {
+        StreamState::HalfClosedRemote
+      }
+      Ok(())
+    }
+    _ => Err(H2Error::ProtocolError("cannot open stream in current state"))
+  }
 }
 
-///|
+///| Local flow-control accounting and state transition when sending DATA.
 pub fn Connection::send_data(
   self : Connection,
   stream_id : Int,
   len : Int,
   end_stream : Bool,
 ) -> Result[Unit, H2Error] {
-  let _ = self
-  let _ = stream_id
-  let _ = len
-  let _ = end_stream
-  Err(H2Error::ProtocolError("unimplemented"))
+  if len < 0 {
+    return Err(H2Error::ProtocolError("negative DATA length"))
+  }
+  let idx = self.find_stream_idx(stream_id)
+  if idx < 0 {
+    return Err(H2Error::ProtocolError("send_data on idle stream"))
+  }
+  let st = self.streams[idx].state
+  match st {
+    StreamState::Open | StreamState::HalfClosedRemote => ()
+    _ => return Err(H2Error::StreamClosed(stream_id))
+  }
+  let len64 = len.to_int64()
+  if len64 > self.conn_send_win || len64 > self.streams[idx].send_window {
+    return Err(H2Error::FlowControlError("send_data exceeds flow control window"))
+  }
+  self.conn_send_win = self.conn_send_win - len64
+  self.streams[idx].send_window = self.streams[idx].send_window - len64
+  if end_stream {
+    self.streams[idx].state = match st {
+      StreamState::Open => StreamState::HalfClosedLocal
+      _ => StreamState::Closed
+    }
+  }
+  Ok(())
 }
 
-///|
+///| Local state transition when sending RST_STREAM.
 pub fn Connection::send_rst_stream(
   self : Connection,
   stream_id : Int,
 ) -> Result[Unit, H2Error] {
-  let _ = self
-  let _ = stream_id
-  Err(H2Error::ProtocolError("unimplemented"))
+  let idx = self.find_stream_idx(stream_id)
+  if idx < 0 {
+    return Err(H2Error::ProtocolError("send_rst_stream on idle stream"))
+  }
+  self.streams[idx].state = StreamState::Closed
+  Ok(())
 }
