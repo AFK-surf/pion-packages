@@ -89,3 +89,11 @@ Measured on `Darwin arm64` with `scripts/bench_compare.py --warmup 1 --rounds 5`
 **Honest hardware & runtime gap note**:
 - On `Darwin arm64`, Go stdlib / `golang.org/x/crypto` accelerates SHA-256/SHA-512 via ARMv8 Cryptography Extensions (`SHA256H`/`SHA512H`), ChaCha20/Poly1305 via NEON/ARM64 assembly, and Ed25519/P-256 via hand-tuned ARM64 assembly + precomputed tables, whereas `packages/crypto` is 100% pure-Pion portable scalar code (zero C FFI / zero assembly, identical on Native and `wasm32`).
 - Pure Pion reaches **0.96× of Go stdlib on X25519**, sustains **113.7 MB/s** ChaCha20-Poly1305 AEAD, **169.1 MB/s** SHA-256, and **265.4 MB/s** SHA-512 while using **2.6×–6.6× lower Peak RSS** (1.80–2.05 MiB vs 4.92–12.11 MiB).
+
+## Formal Verification (Lean 4)
+
+The core constant-time primitives, RFC 7748 X25519 scalar clamping & ladder swap, Ed25519/P-256 windowed nibble equality, RFC 8439 ChaCha20 rotation & AEAD length guards, RFC 5869 HKDF block-counter bounds, and hex decoder kernels (`Fe`, `fe_cmov`, `fe_cswap_pair`, `ct_eq_nibble`, `ct_diff_acc`, `x25519_clamp_low_byte`, `x25519_clamp_high_byte`, `cc_rotl32`, `chacha20_is_valid_key_len`, `chacha20_is_valid_nonce_len`, `chacha20_is_valid_ct_len`, `hkdf_sha256_valid_len`, `hkdf_sha256_blocks`, `hkdf_sha512_valid_len`, `hkdf_sha512_blocks`, `hex_nibble_val`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (24 `0-sorry` theorems, standard axioms only, 44-case native-vs-Lean differential cross-check):
+
+```bash
+bash packages/crypto/proofs/run_proofs.sh
+```
