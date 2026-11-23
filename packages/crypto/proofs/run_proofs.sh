@@ -175,6 +175,22 @@ pub fn main(world : World) -> Int {
   io_println(world, "hex_f=" + crypto::hex_nibble_val(102).to_string())
   io_println(world, "hex_min=" + crypto::hex_nibble_val(-2147483648).to_string())
   io_println(world, "hex_max=" + crypto::hex_nibble_val(2147483647).to_string())
+  let fa = crypto::fe_add(fe_a, fe_b)
+  io_println(world, "fe_add_ab=" + fa.h0.to_string() + "," + fa.h1.to_string() + "," + fa.h2.to_string() + "," + fa.h3.to_string() + "," + fa.h4.to_string() + "," + fa.h5.to_string() + "," + fa.h6.to_string() + "," + fa.h7.to_string() + "," + fa.h8.to_string() + "," + fa.h9.to_string())
+  let fs = crypto::fe_sub(fe_b, fe_a)
+  io_println(world, "fe_sub_ba=" + fs.h0.to_string() + "," + fs.h1.to_string() + "," + fs.h2.to_string() + "," + fs.h3.to_string() + "," + fs.h4.to_string() + "," + fs.h5.to_string() + "," + fs.h6.to_string() + "," + fs.h7.to_string() + "," + fs.h8.to_string() + "," + fs.h9.to_string())
+  let fm = crypto::fe_mul(fe_a, fe_b)
+  io_println(world, "fe_mul_ab=" + fm.h0.to_string() + "," + fm.h1.to_string() + "," + fm.h2.to_string() + "," + fm.h3.to_string() + "," + fm.h4.to_string() + "," + fm.h5.to_string() + "," + fm.h6.to_string() + "," + fm.h7.to_string() + "," + fm.h8.to_string() + "," + fm.h9.to_string())
+  let fq = crypto::fe_sq(fe_b)
+  io_println(world, "fe_sq_b=" + fq.h0.to_string() + "," + fq.h1.to_string() + "," + fq.h2.to_string() + "," + fq.h3.to_string() + "," + fq.h4.to_string() + "," + fq.h5.to_string() + "," + fq.h6.to_string() + "," + fq.h7.to_string() + "," + fq.h8.to_string() + "," + fq.h9.to_string())
+  let (pc0, pc1, pc2, pc3, pc4) = crypto::poly1305_clamp_r(0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL)
+  io_println(world, "poly_clamp_allff=" + pc0.to_string() + "," + pc1.to_string() + "," + pc2.to_string() + "," + pc3.to_string() + "," + pc4.to_string())
+  let (pr0, pr1, pr2, pr3, pr4) = crypto::poly1305_final_reduce(67108859UL, 67108863UL, 67108863UL, 67108863UL, 67108863UL)
+  io_println(world, "poly_reduce_p=" + pr0.to_string() + "," + pr1.to_string() + "," + pr2.to_string() + "," + pr3.to_string() + "," + pr4.to_string())
+  let (pm0, pm1, pm2, pm3, pm4) = crypto::poly1305_final_reduce(67108858UL, 67108863UL, 67108863UL, 67108863UL, 67108863UL)
+  io_println(world, "poly_reduce_pm1=" + pm0.to_string() + "," + pm1.to_string() + "," + pm2.to_string() + "," + pm3.to_string() + "," + pm4.to_string())
+  io_println(world, "ct_nib_eq=" + crypto::ct_eq_nibble(7, 7).to_string())
+  io_println(world, "ct_nib_ne=" + crypto::ct_eq_nibble(7, 8).to_string())
   0
 }
 EOF

@@ -12,3 +12,10 @@ import CryptoProofs
 #print axioms CryptoProofs.hkdf_sha256_blocks_counter_safe
 #print axioms CryptoProofs.hex_nibble_val_bounds
 #print axioms CryptoProofs.hex_nibble_val_case_insensitive
+#print axioms CryptoProofs.fe_add_mod_p_and_bounds
+#print axioms CryptoProofs.fe_sub_mod_p_and_bounds
+#print axioms CryptoProofs.fe_mul_mod_p_and_bounds
+#print axioms CryptoProofs.fe_sq_mod_p_and_bounds
+#print axioms CryptoProofs.poly1305_clamp_r_rfc8439_spec
+#print axioms CryptoProofs.poly1305_final_reduce_canonical
+#print axioms CryptoProofs.ct_eq_nibble_spec
