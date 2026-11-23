@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6）
+## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -119,6 +119,28 @@
 | `template` | 编译 + 渲染端到端（2,000 次） | 938 KB 输出 | 25.865 ms | 39.368 ms (`rust_minijinja`) | **1.52x** | **2.30 MiB** | 3.12 MiB |
 | `template` | 对抗：`bench_attr_lookup_100k` | — | 56.65 ms | 30.91 ms (`rust_minijinja`) | 0.55x | — | — |
 | `template` | 对抗：`bench_set_concat_20k` | — | 18.87 ms | 54.55 ms (`rust_minijinja`) | **2.89x** | — | — |
+| `cron` | W1 解析 100 条生产 cron 表达式 × 1,000 | 100,000 ops | 23.914 ms | 152.088 ms (`rust_croner`) / 50.801 ms (`go_robfig`) | **6.36x**（vs Rust）/ **2.12x**（vs Go） | 1.75 MiB | 5.66 / 12.28 MiB |
+| `cron` | W2 `next_after` 步进（100 表达式 × 20 × 50） | 100,000 ops | 15.311 ms | 78.508 ms (`rust_croner`) / 141.102 ms (`go_robfig`) | **5.13x** / **9.22x** | 1.77 MiB | 5.67 / 4.55 MiB |
+| `cron` | W3 稀疏 / 罕见日期步进 | 10,000 ops | 8.095 ms | 28.057 ms (`rust_croner`) / 34.111 ms (`go_robfig`) | **3.47x** / **4.21x** | 1.75 MiB | 5.48 / 4.41 MiB |
+| `cron` | W4 13 号星期五（`dom_and_dow = true`） | 10,000 ops | 8.962 ms | 62.558 ms (`rust_croner`) | **6.98x** | 1.75 MiB | 5.45 MiB |
+| `cron` | 对抗：A4 不可能日期 + 157 项年份列表 | 2,000 searches | 9,624.88 ns/op | 346,684.19 ns/op (Java Quartz 2.3.2) | **36.02x** | — | — |
+| `cron` | 对抗：A6 长显式列表（至 2 KB） | 60,000 parses | 5,350.61 ns/op | 21,389.53 ns/op (`croner`) / 15,941.90 ns/op (`robfig`) | **2.98x**（vs 最佳上游） | — | — |
+| `msgpack` | W1 嵌套 RPC / 遥测解码（80,000 条） | 13,655,320 B | 71.684 ms | 108.612 ms (`rust_rmpv`) / 118.004 ms (`go_vmihailenco`) | **1.52x**（vs Rust）/ **1.65x**（vs Go） | 7.66 MiB | 6.62 / 15.77 MiB |
+| `msgpack` | W2 嵌套 RPC / 遥测编码（50,000 条） | 50,000 ops | 36.296 ms | 37.416 ms (`rust_rmpv`) / 47.108 ms (`go_vmihailenco`) | **1.03x** / **1.30x** | **1.78 MiB** | 1.98 / 11.25 MiB |
+| `msgpack` | W3 大 `bin` + `str` + `array` 解码（~64 MiB） | 64,811,276 B | 29.840 ms | 25.849 ms (`rust_rmpv`) / 24.195 ms (`go_vmihailenco`) | 0.87x / 0.81x | **37.64 MiB** | 40.06 / 67.84 MiB |
+| `msgpack` | 对抗：W1 解码 vs Go 类型化 struct | 80,000 | 69.9 ms | 61.9 ms (Go struct) | 0.89x（Go 1.13×） | — | — |
+| `msgpack` | 对抗：W2 编码 vs Go 类型化 struct | 50,000 | 39.4 ms | 27.8 ms (Go struct) | 0.71x（Go 1.42×） | — | — |
+| `msgpack` | 对抗：HashDoS 262,144 构造 uint64 键（`reject_duplicate_keys`） | — | 30 ms | 57 ms (Rust HashSet) / 55 ms (Go map) | **1.90x** / **1.83x** | — | — |
+| `json5` | W1 大型带注释 JSON5 配置解析（60 × 95.6 KB） | 5,738,040 B | 46.070 ms | 45.344 ms (`rust_json5`) / 335.266 ms (`node_json5`) | 0.98x（vs Rust）/ **7.28x**（vs Node） | 2.58 MiB | 2.84 / 71.67 MiB |
+| `json5` | W2 JSON5 → 标准 JSON 序列化往返（40 × 95.6 KB） | 3,825,360 B | 47.108 ms | 39.354 ms (`rust_json5`) / 239.411 ms (`node_json5`) | 0.84x / **5.08x** | 2.84 MiB | 3.06 / 70.34 MiB |
+| `json5` | W3 RFC 6902 Patch + RFC 6901 Pointer | 100,000 ops | 106.641 ms | 140.022 ms (`rust_json_patch`) / 266.937 ms (`node_fast_json_patch`) | **1.31x** / **2.50x** | 2.00 MiB | 2.14 / 52.78 MiB |
+| `json5` | 对抗：A4 `diff()` 50k 键对象（红队修复前 16,594 ms） | — | 48.6 ms | 24.0 ms (Rust) / 89.8 ms (Node) | 0.49x | — | — |
+| `json5` | 对抗：A6 50k 键 `Array` 对象上 50k 次 `pointer_get`（O(k) 线性扫描） | — | 6,114 ms | 23.4 ms (Rust) / 84.3 ms (Node) | 0.004x（重复查找应改用 `ObjectIndex`） | — | — |
+| `html` | Bench 1 HTML5 文档解析 + 文本 / 链接抽取（20 轮） | 1,377,460 B | 31.347 ms | 35.603 ms (`rust_scraper`) / 24.969 ms (`go_net_html`) | **1.14x**（vs Rust）/ 0.80x（vs Go） | **2.91 MiB** | 3.58 / 11.48 MiB |
+| `html` | Bench 2 大 DOM CSS 选择器查询（250 次） | 250 queries | 18.284 ms | 16.559 ms (`rust_scraper`) | 0.91x | **3.09 MiB** | 3.56 MiB |
+| `html` | Bench 3 HTML XSS 清洗（20 轮） | 2,451,400 B | 51.752 ms | 70.666 ms (`rust_ammonia`) | **1.37x** | **3.44 MiB** | 4.78 MiB |
+| `html` | 对抗：全部 2,125 个 WHATWG `;` 实体 × 40 | — | 22.9 ms | 103.7 ms (`html5ever`) | **4.53x** | — | — |
+| `html` | 对抗：`div.a div.b em`（30k 节点） | — | 17.1 ms | 13.9 ms (`scraper`) | 0.81x | — | — |
 
 ## 各包明细
 
@@ -895,3 +917,226 @@ _SHA-256 verified identical: `1561f2114958a0d8e74a73a6d50ccf3a69514b983377865297
 | `bench_attr_lookup_100k` | 56.65 ms | 30.91 ms | **0.55x** |
 
 红队：45/45 单测；审计 29/29；对 `minijinja =3.1.0` 差分 251 / 283 逐字节一致，283 / 283 Native vs Wasm32 逐字节一致（0 Wasm32 trap）；62 / 62 DoS 矩阵 0 SIGSEGV / SIGABRT / OOM / 超时。领先项：Prompt 渲染 **1.39x**、编译 + 渲染 **1.52x**、`bench_set_concat_20k` **2.89x**、`bench_unique_20k` **1.46x**，标准负载峰值 RSS 均更低（2.30–2.50 vs 2.88–3.12 MiB）。落后项：HTML SSR 0.77x，渲染密集循环与属性查找 0.55x–0.81x（树遍历 AST 解释器 vs MiniJinja 字节码 VM 与哈希索引查找；且 Rust 基线未开 `speedups`）。已知差异（32 / 283 例，均为 P2）：未实现 `{% for ... recursive %}` / `loop(...)`、`loop.changed(...)`、`{% break %}` / `{% continue %}`、`self.<block>()`、`{%+` / `+%}`、`|format`、`|pprint`、`debug` 全局与宏 `.name` / `.arguments`；元组渲染为列表、极大 / 极小浮点用科学计数法、`-0.0` 部分路径输出 `0.0`；`-2 ** 2`、`2 ** 3 ** 2` 按 Python / Jinja2 优先级（`-4` / `512`）。
+
+### cron
+
+参考实现：Rust [`croner`](https://github.com/Hexagon/croner-rust) `=2.1.0` + `chrono` `=0.4.39`（`cargo build --release`）、Go [`robfig/cron/v3`](https://github.com/robfig/cron) `v3.0.1`；对抗负载另对照 Java Quartz 2.3.2。`--warmup 1 --rounds 5`，标准负载 `sh packages/cron/bench/run_bench.sh`，对抗负载 `sh packages/cron/audit/run_audit.sh` §7。详见 [`packages/cron/README.md`](packages/cron/README.md)。
+
+**W1: Parse 100 Production Cron Expressions × 1,000 Rounds (100,000 parse ops)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_croner`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 23.914 | 22.227 | 27.972 | 239.14 | 1.75 MiB | 6.36x |
+| `rust_croner` | 152.088 | 146.412 | 171.631 | 1520.88 | 5.66 MiB | 1.00x (baseline) |
+| `go_robfig` | 50.801 | 45.282 | 52.404 | 508.01 | 12.28 MiB | 2.99x |
+
+_SHA-256 verified identical across all implementations and rounds: `1be910972faf8b39adb7459b4b9cb4354c69f49b106a23b21b0bf58306a6d321`._
+
+**W2: Next-After Stepping (100 Expressions × 20 Rounds × 50 Steps = 100,000 `next_after` ops)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_croner`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 15.311 | 14.351 | 16.666 | 153.11 | 1.77 MiB | 5.13x |
+| `rust_croner` | 78.508 | 73.963 | 83.178 | 785.08 | 5.67 MiB | 1.00x (baseline) |
+| `go_robfig` | 141.102 | 132.285 | 142.351 | 1411.02 | 4.55 MiB | 0.56x |
+
+_SHA-256 verified identical across all implementations and rounds: `58ad2a568af15f5aabd5ea178ade64496cd0f4f14c0cf778e71aa15a09db851f`._
+
+**W3: Sparse / Rare Dates Stepping (`0 0 29 2 *`, `0 0 31 12 *`, `0 0 30 4 *`, `0 0 1 1 *`, `0 0 31 1,3,5,7,8,10,12 *`, 10,000 ops)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_croner`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 8.095 | 7.655 | 13.684 | 809.45 | 1.75 MiB | 3.47x |
+| `rust_croner` | 28.057 | 27.752 | 41.915 | 2805.67 | 5.48 MiB | 1.00x (baseline) |
+| `go_robfig` | 34.111 | 33.779 | 41.001 | 3411.12 | 4.41 MiB | 0.82x |
+
+_SHA-256 verified identical across all implementations and rounds: `54226233917f64c1af181715a2cdb1e62a4d03c24a0000cfaa2ff82f14367747`._
+
+**W4: Friday the 13th (`0 0 13 * 5` with `dom_and_dow = true`, 10,000 ops, Pion vs Rust `croner`)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_croner`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 8.962 | 7.829 | 9.591 | 896.16 | 1.75 MiB | 6.98x |
+| `rust_croner` | 62.558 | 60.504 | 64.561 | 6255.83 | 5.45 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `329bd33da0317b71d7d614d94a091b1498227820e127a83d6750ab7a343fb3ee`._
+
+**Adversarial Workloads A1–A6 (`sh packages/cron/audit/run_audit.sh` §7, `Darwin arm64`, `--warmup 1 --rounds 5`, SHA-256 verified identical)**
+
+| Workload | Pion | Rust `croner` 2.1.0 | Go `robfig` v3.0.1 | Java `Quartz` 2.3.2 | Pion vs best upstream |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A1 Quartz `L`/`W`/`#`/`nL` stepping (320k ops) | 123.43 ns/op | 1,040.21 ns/op | — | 2,085.80 ns/op | **8.43x faster** |
+| A2 Quartz `LW` / `L-n` stepping (200k ops) | 137.21 ns/op | — | — | 2,704.71 ns/op | **19.71x faster** |
+| A3 7-field year ranges/steps/lists (66.8k ops) | 237.63 ns/op | — | — | 3,558.31 ns/op | **14.97x faster** |
+| A4 Impossible date + 157-item year list (2k searches) | 9,624.88 ns/op | — | — | 346,684.19 ns/op | **36.02x faster** |
+| A5 Reject 21 malformed expressions (420k ops) | 95.53 ns/op | 919.47 ns/op | 310.42 ns/op | — | **3.25x faster** |
+| A6 Long explicit lists up to 2 KB (60k parses) | 5,350.61 ns/op | 21,389.53 ns/op | 15,941.90 ns/op | — | **2.98x faster** |
+
+_9,999-item year list DoS probe (`0 0 0 31 2,4,6,9,11 ? 1,2,...,9999`, single `next_after`): **0.008 s** wall-clock (including process start), down from 10.042 s prior to year-bitmap precompilation._
+
+红队：15/15 单测；对抗负载 A1–A6 与上游 SHA-256 一致，对最佳上游 2.98x–36.02x；9,999 项年份列表 DoS 探针（单次 `next_after`）由年份位图预编译前的 10.042 s 降至 0.008 s（含进程启动）。领先项：W1–W4 全部快于 `croner`（3.47x–6.98x），峰值 RSS 最低（1.75–1.77 MiB）。落后 / 口径说明：W2–W3 中 Go `robfig` 慢于 `croner`（0.56x / 0.82x）；W3 / W4 墙钟约 9.5–10.8 ms，进程启动占明显比例；`robfig` 不接受 `7` 表示周日、无 `dom_and_dow` AND 选项（故不参与 W4）、单次前瞻上限 `t.Year() + 5`（W3 闰日步进限定在 `2024..2088`）；`packages/cron` 只处理 UTC 民用时间 / Unix 秒，不做 IANA 时区与 DST 调整。
+
+### msgpack
+
+参考实现：Rust [`rmpv`](https://github.com/3Hren/msgpack-rust) `1.3.1`（`--release`，`read_value` 动态树）、Go [`vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack) `v5.4.1`（`any` / `map[string]any`，`SetSortMapKeys(true)`）。`--warmup 1 --rounds 5`，标准负载 `sh packages/msgpack/bench/run_bench.sh`，对抗与惯用口径对比来自 `audit/run_audit.sh`。详见 [`packages/msgpack/README.md`](packages/msgpack/README.md)。
+
+**Workload 1: Nested RPC/Telemetry Decode (40 × 2,000 = 80,000 records)**
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `67 B` (`sha256:988b268324c5f308...`) | Input: `13655320 B` | Ops: `80000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs go_vmihailenco) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **71.684** | 70.188 | 75.939 | **190.49** | **896.06** | 7.66 MiB | **1.65x** |
+| `rust_rmpv` | 108.612 | 95.365 | 113.814 | 125.73 | 1357.65 | 6.62 MiB | 1.09x |
+| `go_vmihailenco` | 118.004 | 114.465 | 122.632 | 115.72 | 1475.05 | 15.77 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `988b268324c5f308408ec8f8c6f2b855114df4704c463f0240a64a64e491c1df`._
+
+**Workload 2: Nested RPC/Telemetry Encode (50,000 records)**
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `48 B` (`sha256:76af0c6f9e92027a...`) | Ops: `50000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs go_vmihailenco) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **36.296** | 35.673 | 38.111 | **725.92** | **1.78 MiB** | **1.30x** |
+| `rust_rmpv` | 37.416 | 35.998 | 38.195 | 748.32 | 1.98 MiB | 1.26x |
+| `go_vmihailenco` | 47.108 | 46.527 | 48.053 | 942.17 | 11.25 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `76af0c6f9e92027a3c488da154c32a0c13b5bba73a8aec34daa7ed9e2d7377f2`._
+
+**Workload 3: Large `bin` + `str` + `array` Decode (4 × ~16 MiB = ~64 MiB)**
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `57 B` (`sha256:556ed267b0263a59...`) | Input: `64811276 B`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs go_vmihailenco) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 29.840 | 28.826 | 31.210 | 2171.92 | **37.64 MiB** | 0.81x |
+| `rust_rmpv` | 25.849 | 24.355 | 28.997 | 2507.25 | 40.06 MiB | 0.94x |
+| `go_vmihailenco` | **24.195** | 23.763 | 26.274 | **2678.71** | 67.84 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `556ed267b0263a59107e7938427c471ffe6938cdf76b06c916625136a90d7ed1`._
+
+**Idiomatic & Adversarial Comparison (from `audit/run_audit.sh`, SHA-256 verified)**
+
+| Workload | Pion | Go (idiomatic struct / `any`) | Rust `rmpv::read_value` | Rust `rmpv::read_value_ref` |
+| --- | ---: | ---: | ---: | ---: |
+| W1 decode-rpc 80k (vs Go typed struct) | 69.9 ms | **61.9 ms** (struct, Go 1.13×) / 119.9 ms (`any`) | 96.6 ms | — |
+| W1 RPC generic tree walk (80k) | 62.5 ms | 116.1 ms (`any`) | 94.6 ms | **54.5 ms** (Rust ref 1.15×) |
+| W2 encode-rpc 50k (vs Go typed struct) | 39.4 ms | **27.8 ms** (struct, Go 1.42×) / 48.0 ms (`any`) | 37.6 ms | — |
+| 1M `int` array ×5 | 82.9 ms | 120.9 ms (`any`) | 60.9 ms | **53.2 ms** |
+| 1M `float32` array ×5 | 69.9 ms | 112.6 ms (`any`) | 59.6 ms | **48.6 ms** |
+| 1M `float64` array ×5 | 81.5 ms | 117.8 ms (`any`) | 63.3 ms | **54.7 ms** |
+| Depth 100 × 10k ×5 (`decode_iter` path) | 396.1 ms | **241.5 ms** (`any`) | 530.7 ms | 397.3 ms |
+| 10k-key `str` map ×50 (dup reject) | **43.8 ms** | 62.2 ms (Go map) | 121.1 ms | — |
+| Streaming 256 KiB / 65,536 frames (`decode_prefix_at`) | 14.9 ms (2.3 MiB RSS) | 22.5 ms | **12.8 ms** | — |
+| Streaming 2 MiB / 524,288 frames (`decode_prefix_at`) | 52 ms (5.7 MiB RSS) | 103 ms | **36 ms** | — |
+| HashDoS 262,144 crafted uint64 keys (`reject_duplicate_keys`) | **30 ms** (random: 34 ms) | 55 ms (Go map) | 57 ms (HashSet) | — |
+
+红队：27/27 单测 + 11 个红队审计测试；15 个官方 `msgpack-test-suite` 套件全量移植。领先项：对动态树基线，W1 RPC 解码 1.65x（vs Go）/ 1.52x（vs Rust）、W2 RPC 编码 1.30x / 1.03x，峰值 RSS 最低；keyed SipHash-1-3 使 262,144 个构造键 HashDoS 用时 30 ms（与随机键 34 ms 相当），优于 Go / Rust；`decode_prefix_at` 去掉整缓冲 `to_string()` 缓存后 2 MiB / 524,288 帧流式解码 52 ms（5.7 MiB RSS）。落后项：W3 64 MiB 大载荷 0.81x（vs Go）/ 0.87x（vs Rust），因 Pion 对 12.5 MiB 多字节 UTF-8 做完整标量 RFC 3629 校验（Go `msgpack` 跳过校验，Rust 用 SIMD `from_utf8`）；Go 类型化 struct 仍更快（解码 1.13×、编码 1.42×），Rust 零拷贝 `read_value_ref` 在借用树（1.15×）与 1M 稠密数值数组（1.44–1.56×）上仍更快。
+
+### json5
+
+参考实现：Rust [`json5`](https://github.com/callum-oakley/json5-rs) `=1.3.8` + `serde_json` `=1.0.140`（`preserve_order`）+ [`json-patch`](https://github.com/idubrov/json-patch) `=4.2.0`（`--release`，LTO）、Node.js `json5@2.2.3` + `fast-json-patch@3.1.1`（Node v24.22.2）。`--warmup 1 --rounds 5`，`sh packages/json5/bench/run_bench.sh`，对抗负载来自 `packages/json5/audit`。详见 [`packages/json5/README.md`](packages/json5/README.md)。
+
+**Workload 1: Large Commented JSON5 Config Parse (60× 95.6 KB = 5.74 MB)**
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `181 B` (`sha256:0a2adae864081868...`) | Input: `5738040 B` | Ops: `60`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_json5) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 46.070 | 43.051 | 47.728 | 124.55 | 767840.28 | 2.58 MiB | 0.98x |
+| `rust_json5` | 45.344 | 43.230 | 46.249 | 126.54 | 755736.10 | 2.84 MiB | 1.00x (baseline) |
+| `node_json5` | 335.266 | 311.695 | 346.727 | 17.11 | 5587772.92 | 71.67 MiB | 0.14x |
+
+_Note: Against the earlier `pest`-based Rust `json5 =0.4.1` (271.919 ms median / 21.10 MB/s), `pion` is **5.48x faster**. Against the rewritten Rust `json5 =1.3.8`, `pion` matches within 2% (0.98x median, faster min) with lower peak RSS (2.58 MiB vs 2.84 MiB) and is **7.28x faster** than Node `json5@2.2.3`._
+
+**Workload 2: JSON5 → Standard JSON Serialization Roundtrip (40× 95.6 KB = 3.83 MB)**
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `63 B` (`sha256:0c48002fe75458d2...`) | Input: `3825360 B` | Ops: `40`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_json5) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 47.108 | 45.472 | 51.839 | 81.20 | 1177703.12 | 2.84 MiB | 0.84x |
+| `rust_json5` | 39.354 | 38.548 | 40.435 | 97.20 | 983857.28 | 3.06 MiB | 1.00x (baseline) |
+| `node_json5` | 239.411 | 220.521 | 263.252 | 15.98 | 5985281.25 | 70.34 MiB | 0.16x |
+
+_Honest trade-off: `pion` trails Rust `json5 1.3.8 + serde_json` by ~16% (0.84x) on serialize roundtrip due to its 100% iterative serializer task stack (trading stack-overflow immunity for extra heap task pushes) compared to `serde_json`'s recursive stack serializer, while outperforming Node `json5@2.2.3 + JSON.stringify` by **5.08x** with 25× lower peak RSS._
+
+**Workload 3: RFC 6902 Patch Apply + RFC 6901 Pointer Query (100,000 ops)**
+
+50,000 RFC 6901 `pointer_get` queries (including `~0`/`~1` escaped keys and array indices) + 50,000 atomic RFC 6902 `apply_patch` operations (7-op patches covering `test`, `replace`, `add` `/-`, `remove`, `move`, `copy`):
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `95 B` (`sha256:890c0a8943a1b7c0...`) | Ops: `100000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs rust_json_patch) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 106.641 | 103.842 | 119.429 | 1066.41 | 2.00 MiB | 1.31x |
+| `rust_json_patch` | 140.022 | 134.873 | 148.554 | 1400.22 | 2.14 MiB | 1.00x (baseline) |
+| `node_fast_json_patch` | 266.937 | 256.552 | 303.542 | 2669.37 | 52.78 MiB | 0.52x |
+
+_`pion` leads Rust `json-patch =4.2.0` by **1.19x** (1,362 ns/op vs 1,626 ns/op) and Node `fast-json-patch@3.1.1` by **2.29x**, at 2.16 MiB peak RSS._
+
+**Adversarial Benchmarks (A1–A8, `packages/json5/audit`)**
+
+Measured on `Darwin arm64` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against Rust `json5 =1.3.8` + `serde_json =1.0.140` (`preserve_order`) + `json-patch =4.2.0` and Node `json5@2.2.3` + `fast-json-patch@3.1.1`:
+
+| Workload | Pion (Before) | Pion (After) | Rust | Node | Pion vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **A1** Parse 5.5 MB JSON5, 240k non-ASCII keys | 0.83x | **78.1 ms** | 72.4 ms | 649.3 ms | **0.93x** (8.3x faster than Node) |
+| **A2** Parse 6.9 MB, 300k 17-digit doubles | 0.49x | **59.9 ms** | 36.6 ms | 395.9 ms | **0.61x** (6.6x faster than Node) |
+| **A3** RFC 6902 `test`: 50k-key object vs itself | 5,545 ms | **52.1 ms** | 28.9 ms | 116.4 ms | **0.55x** (106x speedup; 2.2x faster than Node) |
+| **A4** `diff()`: 50k-key objects, 1 value changed | 16,594 ms | **48.6 ms** | 24.0 ms | 89.8 ms | **0.49x** (341x speedup; 1.85x faster than Node) |
+| **A5** `diff()`: 100-level spine, 5k-int pad/level | — | **94.8 ms** | 56.3 ms | 76.4 ms | **0.59x** |
+| **A6** 50k `pointer_get` on 50k-key `Array` object | 5,022 ms | 6,114 ms | 23.4 ms | 84.3 ms | O(k) linear scan (use `ObjectIndex` for O(1)) |
+| **A7** 200 single-op atomic patches on 2.5 MB doc | 1,193 ms | **36.8 ms** | 28.4 ms | 59.3 ms | **0.77x** (32.4x speedup; 1.61x faster than Node) |
+| **A8** 18,000-op add/move nesting 6,000 levels | 4,009 ms | **31.0 ms**\* | 25.6 ms | throws | **0.82x** (129x speedup)\* |
+
+_\*Default `apply_patch` enforces `max_depth: 512` and safely rejects the 6,000-level nesting DoS (0 Wasm32 crash on `patchgrow` 1,890 rounds). The A8 timing above uses `apply_patch_with_options(PatchOptions::{ max_depth: 8192, max_nodes: 1_000_000 })` with SHA-256-verified identical output against Rust._
+
+红队：242/242 单测；114/114 官方 `json5-tests`、108/108 RFC 6902 `json-patch-tests` 向量；独立红队审计 13/15（剩余 2 例为 `>2^53` 整数按 IEEE-754 `Double` 表示的已知边界）；对 Node `json5` 1,112,064 个 Unicode 标识符 0 分歧、37,995 个数值解析 0 分歧，59,999 次浮点往返 0 失败。领先项：W1 解析与 Rust `json5 =1.3.8` 持平（0.98x，min 更快、RSS 更低），W3 Patch + Pointer 1.31x（vs Rust）；A3 / A4 / A7 / A8 修复后提速 106x–341x。落后项：W2 序列化 0.84x（全迭代任务栈 vs `serde_json` 递归序列化），A1–A5 / A7 / A8 为 Rust 的 0.49x–0.93x，A6 宽对象单次 `pointer_get` 线性扫描 6,114 ms（重复查找应用 `ObjectIndex`）；`wasm32` 上递归 RC 析构限制文档深度约 1,400–1,600 层（默认 `max_depth` 128 / 512 兜底）。注：W3 表格中位数给出 1.31x（vs Rust），而包 README 表下注释写的是 1.19x / 2.29x（1,362 ns/op），两者不一致，本榜以表格中位数为准。
+
+### html
+
+参考实现：Rust [`scraper`](https://github.com/rust-scraper/scraper) `=0.22.0`（`html5ever 0.29.1`）+ [`ammonia`](https://github.com/rust-ammonia/ammonia) `=4.0.0`（`cargo build --release`，`opt-level = 3`，`lto = "thin"`）、Go `golang.org/x/net` `v0.35.0`（`go 1.27.3`）。`--warmup 1 --rounds 5`，`sh packages/html/bench/run_bench.sh`，非精选 / 对抗负载来自 `audit/scripts/adv_bench.py`。详见 [`packages/html/README.md`](packages/html/README.md)。
+
+**Bench 1: HTML5 Document Parse + Text/Link Extraction (20 rounds, 1,377,460 B)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_scraper`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **31.347** | 29.814 | 32.733 | **43.94** | **2.91 MiB** | **1.14x** |
+| `go_net_html` | **24.969** | 22.554 | 25.792 | **55.17** | 11.48 MiB | 1.43x |
+| `rust_scraper` | 35.603 | 33.965 | 38.610 | 38.69 | 3.58 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `d288e1dc3c38f7787b4573bfc647fff56c5308b8c49d25e0f7fd58a35637f211`._
+
+**Bench 2: CSS Selector Query on Large DOM (50 rounds × 5 complex selectors = 250 queries)**
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_scraper`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 18.284 | 17.862 | 19.226 | 73,135 | **3.09 MiB** | **0.91x** (up from 0.45x) |
+| `rust_scraper` | **16.559** | 15.915 | 17.961 | **66,238** | 3.56 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `af4b62ca244afbee8b7a38bfc72531a5c2be6fd03f96d9da816e9124bbd224d8`._
+
+**Bench 3: HTML XSS Sanitization Throughput (20 rounds, 2,451,400 B)**
+
+Note: `rust_ammonia` is configured with `.add_clean_content_tags(["iframe"])` so both sanitizers enforce identical `<iframe>` subtree stripping and produce byte-for-byte identical sanitized HTML (`fnv64` verified).
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_ammonia`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **51.752** | 51.282 | 54.927 | **47.37** | **3.44 MiB** | **1.37x** |
+| `rust_ammonia` | 70.666 | 67.387 | 71.797 | 34.69 | 4.78 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `07a42875443631f00e8fa857076d34f1c34e6b9d962b017c7cbc93251871b6ff`._
+
+**Un-Curated / Adversarial Benchmarks (`audit/scripts/adv_bench.py`)**
+
+Bench 1–3 use a curated synthetic corpus; on un-curated real-world / adversarial corpora (`scripts/adv_bench.py`):
+- **All 2,125 WHATWG `;`-entities ×40**: Pion **22.9 ms** vs Rust `html5ever` **103.7 ms** (**4.53x**, `same_output=True`).
+- **`li:nth-child(2n+1)` on 20k siblings**: Pion **15.2 ms** vs Rust `scraper` **18.3 ms** (**1.20x**, `same_output=True`, down from 770 ms).
+- **`li:last-child` / `li:first-of-type` / `[data-k$='7']` on 20k siblings**: Pion **13.2–14.2 ms** vs Rust **16.9–18.9 ms** (**1.19–1.43x**, `same_output=True`).
+- **`section > article p > span em` (30k nodes)**: Pion **11.0 ms** vs Rust **12.1 ms** (**1.11x**, `same_output=True`).
+- **`div.a div.b em` (30k nodes)**: Pion **17.1 ms** vs Rust **13.9 ms** (**0.81x**, `same_output=True`).
+- **Filtered html5lib messy corpus ×40**: parse Pion **277.9 ms** vs Rust **322.2 ms** (**1.16x**) vs Go **230.1 ms**; sanitize Pion **217.8 ms** vs `ammonia` **265.0 ms** (**1.22x**).
+
+红队：29/29 单测；红队审计 36/37（25/25 `p1_*`、8/8 `control_*`、3/4 `p2_*`，唯一差异为默认只允许 `http` / `https` / `mailto` 3 种 URL scheme，比 `ammonia` 的 25 种更严）；WHATWG 命名字符引用 2,231/2,231；html5lib tree-construction（`9329e64`，scripting-on）1,147/1,578（72.69%）；20,137 例 XSS / mXSS 往返 0 不安全输出、0 非幂等输出；CSS 选择器对 `scraper` 差分 139/141 一致（剩余 2 例为 EOF 未闭合 `[lang` 被有意拒绝）。领先项：Bench 1 解析 1.14x、Bench 3 清洗 1.37x（vs Rust），峰值 RSS 均最低；20k 兄弟节点伪类查询 1.19–1.43x，实体解码 4.53x。落后项：Bench 1 慢于 Go `x/net/html`（Go 为 Rust 的 1.43x），Bench 2 CSS 查询 0.91x（由 0.45x 优化而来），`div.a div.b em` 0.81x；`<template>` 内容未单独包 `DocumentFragment`，公开 `Node` API 无独立命名空间访问器。
