@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–8 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–9 + `fts`）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -255,6 +255,8 @@
 | `webm` | Pure Opus 60s 音频 WebM 解复用（959 KB × 200） | 191.8 MB | **17.994 ms** (10,653.33 MB/s) | 31.679 ms (`rust_matroska 0.6.1`) | **1.76x** | 4.25 MiB | 3.31 MiB |
 | `webm` | AV1 + Opus 10s WebM 解复用（360 KB × 200） | 72.0 MB | **13.200 ms** (5,454.25 MB/s) | 19.635 ms (`rust_matroska 0.6.1`) | **1.49x** | 2.97 MiB | 2.59 MiB |
 | `webm` | YouTube MSE Init + Clusters（562 KB × 200） | 112.4 MB | **13.249 ms** (8,490.17 MB/s) | 20.020 ms (`rust_matroska 0.6.1`) | **1.51x** | 3.39 MiB | 3.30 MiB |
+| `csp` | 真实 CSP3 解析 + 评估（10k 策略 + 100k 检查，`rounds=11`） | 100,000 ops | 96.534 ms (`965.34 ns/op`) | 65.204 ms (`rust_csp`, `url 2.5.9`) | 0.68x | 2.80 MiB | 2.31 MiB |
+| `csp` | WHATWG Fetch CORS 预检 + 响应 + Origin（200k ops，`rounds=11`） | 200,000 ops | 67.541 ms (`337.71 ns/op`) | 42.427 ms (`rust_csp`, `url 2.5.9`) | 0.63x | 2.73 MiB | 2.16 MiB |
 
 ## 各包明细
 
@@ -2047,3 +2049,14 @@ Single-certificate extension cliff (`N = 64,000` distinct extensions, `1.2 MB` D
 | YouTube MSE Init + Clusters (562 KB × 200) | **13.249 ms (8,490.17 MB/s)** | 20.020 ms (5,618.56 MB/s) | 3.39 MiB | **3.30 MiB** | **1.51x** | `90ce627eec08617d...` |
 
 红队：10 / 10 单测，`audit/` 零改动且 `audit unit` **19 / 19** 全绿（11 / 11 redteam + 8 / 8 control，1 P0 + 2 P1 + 11 P2 全部根治），12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 `wasm_trap` / 0 差异。领先项：凭借 `0xA3` `SimpleBlock` 快路径与零拷贝帧索引，4 项真实语料全面领先 Rust `matroska-demuxer 0.6.1`（**1.49×–1.76×**）。落后项：4 项峰值 RSS 略高于 Rust（2.97–4.25 vs 2.59–3.31 MiB）。
+
+### csp
+
+参考实现：基于 `servo/rust-url`（`url = 2.5.9`）与 `percent-encoding = 2.3.2` 的独立 Rust W3C CSP3 + WHATWG Fetch CORS 实现（`packages/csp/bench/rust`，`cargo build --release`）。`sh packages/csp/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=11`，严格交替）运行，双方全部决策字段（`allowed`、`violated_directive`、`effective_directive`、`matched_source`、`exposed_headers`、`format_origin`、`max_age`）逐字节 FNV-1a 64-bit 哈希并经 SHA-256 逐字节一致校验。详见 [`packages/csp/README.md`](packages/csp/README.md)。
+
+| Workload | `pion` Median (`ns/op`) | `rust_csp` Median (`ns/op`) | `pion` Min / P95 (ms) | `rust_csp` Min / P95 (ms) | `pion` Peak RSS | `rust_csp` Peak RSS | `pion` vs `rust_csp` | Stdout SHA-256 (Identical) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Real-World CSP3 Parse + Eval (10k policies + 100k checks) | 96.534 ms (`965.34 ns/op`) | **65.204 ms (`652.04 ns/op`)** | 95.560 / 104.051 | 64.188 / 69.148 | 2.80 MiB | **2.31 MiB** | 0.68x | `0c6bda1f51bef097...` |
+| WHATWG Fetch CORS Preflight + Response + Origin (200k ops) | 67.541 ms (`337.71 ns/op`) | **42.427 ms (`212.13 ns/op`)** | 66.518 / 84.032 | 41.177 / 47.698 | 2.73 MiB | **2.16 MiB** | 0.63x | `f78bb5cbd9976a46...` |
+
+红队：18 / 18 单测（复用 `url` 50 / 50），`audit/` 零改动且 `run_audit.sh all` 全绿（**32 / 32** unit = 12 / 12 control + 20 / 20 redteam，全部 2 P0 + 6 P1 + 10 P2 根治），对 Node WHATWG `URL` + CSP3 §6.7.2 独立参考差分 **88,856 / 88,856 (100.0%)** 零 bypass / 零 over-block / 零 origin mismatch，30k × 4 fuzz 零崩零差异，DoS 探针全线性（20k 指令 4 ms、100k 源 26 ms）。两项吞吐如实落后 Rust `servo/rust-url` 基线（0.68× / 0.63×），峰值 RSS 接近（2.73–2.80 vs 2.16–2.31 MiB）。
