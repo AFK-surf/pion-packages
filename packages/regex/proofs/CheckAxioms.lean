@@ -1,0 +1,26 @@
+import RegexProofs
+
+#print axioms RegexProofs.dfa_mode_exclusive
+#print axioms RegexProofs.dfa_look_word_ascii_complement
+#print axioms RegexProofs.dfa_look_word_unicode_complement
+#print axioms RegexProofs.dfa_look_end_text_implies_end_line
+#print axioms RegexProofs.dfa_look_end_line_iff
+#print axioms RegexProofs.reverse_look_kind_involutive
+#print axioms RegexProofs.reverse_look_preserves_word_boundary
+#print axioms RegexProofs.onepass_can_compile_iff
+#print axioms RegexProofs.onepass_mask_add_slot_oob
+#print axioms RegexProofs.onepass_mask_add_slot_idempotent
+#print axioms RegexProofs.captures_slot_valid_bounds
+#print axioms RegexProofs.captures_slot_valid_neg
+#print axioms RegexProofs.char_range_le_refl
+#print axioms RegexProofs.char_range_le_antisymm
+#print axioms RegexProofs.char_range_le_trans
+#print axioms RegexProofs.char_range_le_total
+#print axioms RegexProofs.char_range_intersect_comm
+#print axioms RegexProofs.char_range_intersect_idem
+#print axioms RegexProofs.char_range_intersect_mem_iff
+#print axioms RegexProofs.is_utf8_cont_byte_iff
+#print axioms RegexProofs.utf8_lead_len_bounds
+#print axioms RegexProofs.hex_val_bounds
+#print axioms RegexProofs.hex_val_case_insensitive
+#print axioms RegexProofs.regex_ws_meta_disjoint

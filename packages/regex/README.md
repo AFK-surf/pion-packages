@@ -129,3 +129,14 @@ All scenarios below verified 100% stdout byte-identical against Rust `regex =1.1
     - `(a){0}` reports 2 capture groups (matching RE2) whereas Rust `regex 1.11.1` drops groups inside `{0}` and reports 1.
     - ~0.24% of random fuzz/capfuzz patterns with deeply nested nullable capture loops still show sub-match group tie-breaking differences vs Rust.
     - The parser is recursive-descent: default `nest_limit = 250` is safe on both Native and Wasm32, but raising `nest_limit` above ~400 on Wasm32 can overflow the Wasm call stack.
+
+## Formal Verification (Lean 4)
+
+24 machine-checked, 0-`sorry` Lean 4 theorems (standard axioms only: `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 15 production `#verify` kernels in `packages/regex/src/`:
+- **Automata & Captures (`proofs/RegexProofs/AutomataAndCaptures.lean`, 12 theorems)**: Lazy DFA mode exclusivity, ASCII/Unicode `\b`/`\B` lookaround complementarity, `\z → (?m)$` implication, reverse-NFA lookaround involution & word-boundary preservation, One-Pass DFA 64-bit capture slot bitmask bounds & idempotence, and `Captures` slot index memory-safety bounds.
+- **Character Ranges & Syntax (`proofs/RegexProofs/RangesAndSyntax.lean`, 12 theorems)**: `CharRange` lexicographic total order (reflexive, antisymmetric, transitive, total), `char_range_intersect` commutativity/idempotence/exact membership, UTF-8 continuation & lead-length invariants, `hex_val` bounds & case-insensitivity, and `(?x)` whitespace vs `escape()` metacharacter disjointness.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion harness (`diff -u` 44/44 cases identical).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/regex/proofs/run_proofs.sh
+```
