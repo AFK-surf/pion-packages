@@ -42,7 +42,7 @@ host- or port-confusion rows. The API documents neither contract.
 - **Impact**: any host-source (`https://trusted.com`, `*.trusted.com`, `trusted.com:*`, ...) admits any
   other host: full script-src / connect-src / frame-src bypass, trigger ③ with the precondition above.
 - **Evidence**: `p0_backslash_authority_confusion_allows_evil_host`,
-  `p0_backslash_authority_confusion_wildcard_host`; the `\\@` rows of `BYPASS/raw` in `compare`.
+  `p0_backslash_authority_confusion_wildcard_host`; the `\@` rows of `BYPASS/raw` in `compare`.
 - **Fix**: do not hand-parse URLs. Take a parsed URL (the repo has `packages/url`) or parse with a
   WHATWG-conformant parser before matching; at minimum, for special schemes treat `\` as `/`, strip
   ASCII tab/LF/CR first, and take the **last** `@` of the authority. Side effect: none intended; a
