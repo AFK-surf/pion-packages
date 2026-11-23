@@ -1,0 +1,26 @@
+import EmailProofs
+
+#print axioms EmailProofs.email_limits_default_positive
+#print axioms EmailProofs.email_is_ftext_exact
+#print axioms EmailProofs.email_is_injection_byte_exact
+#print axioms EmailProofs.email_is_ftext_disjoint_injection
+#print axioms EmailProofs.email_effective_fold_limit_bounds
+#print axioms EmailProofs.email_effective_fold_limit_idempotent
+#print axioms EmailProofs.hdr_ascii_lower_idempotent
+#print axioms EmailProofs.hdr_ascii_lower_eq_dt_lower
+#print axioms EmailProofs.addr_is_atext_accepts_alnum_and_utf8
+#print axioms EmailProofs.addr_is_atext_rejects_ctl_and_specials
+#print axioms EmailProofs.addr_is_dtext_exact_and_safe
+#print axioms EmailProofs.addr_is_qtext_char_disjoint_injection
+#print axioms EmailProofs.dt_is_digit_exact
+#print axioms EmailProofs.dt_is_digit_subset_email_classes
+#print axioms EmailProofs.dt_normalize_year_2digit_bounds
+#print axioms EmailProofs.dt_normalize_year_3digit_bounds
+#print axioms EmailProofs.dt_normalize_year_4digit_identity
+#print axioms EmailProofs.dt_clamp_leap_second_bounds
+#print axioms EmailProofs.dt_clamp_leap_second_idempotent
+#print axioms EmailProofs.dt_numeric_offset_in_valid_range
+#print axioms EmailProofs.dt_numeric_offset_negation_symmetry
+#print axioms EmailProofs.dt_numeric_offset_zero_both_signs
+#print axioms EmailProofs.dt_epoch_rem_sec_bounds
+#print axioms EmailProofs.dt_epoch_floor_rem_identity
