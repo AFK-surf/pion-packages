@@ -95,7 +95,7 @@ def gen_queries(path: str, count: int = 200) -> int:
             q = (
                 f"# query {i} with duplicate arg\n"
                 f"query GetBoard{i}($id: ID!, $first: Int = 25) {{\n"
-                f"  board(id: $id, id: $id) {{\n"
+                f"  board(id: $id, id: $id, first: $first) {{\n"
                 f"    id, title\n"
                 f"    ...BoardMeta{i}\n"
                 f"  }}\n"
@@ -108,7 +108,7 @@ def gen_queries(path: str, count: int = 200) -> int:
                 f"query GetWorkspace{i}($org: String! = \"acme\", $first: Int = 25, $withComments: Boolean = true) @cached {{\n"
                 f"  org: organization(slug: $org) {{\n"
                 f"    id, name, plan\n"
-                f"    teams(first: $first, filter: {{ archived: false, minPriority: {i % 5}, tags: [\"core\", \"v2\"] }}) {{\n"
+                f"    teams(first: $first, note: \"\"\"\n      workspace {i}\n        summary\n    \"\"\", tag: \"\"\"  lead\"\"\", filter: {{ archived: false, minPriority: {i % 5}, tags: [\"core\", \"v2\"] }}) {{\n"
                 f"      totalCount\n"
                 f"      edges {{\n"
                 f"        cursor\n"

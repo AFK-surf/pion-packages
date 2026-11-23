@@ -26,6 +26,52 @@ fn needs_space(prev: u8, cur: u8) -> bool {
     (prev == 1 || prev == 2 || prev == 4) && cur != 0
 }
 
+fn minify_block_string_apollo(raw_tok: &str) -> String {
+    let inner = &raw_tok[3..raw_tok.len() - 3];
+    let unescaped = inner.replace("\\\"\"\"", "\"\"\"");
+    let raw_lines: Vec<&str> = unescaped.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut common_indent = usize::MAX;
+    for l in raw_lines.iter().skip(1) {
+        let ind = l.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+        if ind < l.len() && ind < common_indent {
+            common_indent = ind;
+        }
+    }
+    let mut lines: Vec<&str> = Vec::with_capacity(raw_lines.len());
+    for (i, l) in raw_lines.iter().enumerate() {
+        if i == 0 || common_indent == usize::MAX || common_indent == 0 {
+            lines.push(l);
+        } else if l.len() >= common_indent {
+            lines.push(&l[common_indent..]);
+        } else {
+            lines.push("");
+        }
+    }
+    let first = lines.iter().position(|l| l.bytes().any(|b| b != b' ' && b != b'\t'));
+    let last = lines.iter().rposition(|l| l.bytes().any(|b| b != b' ' && b != b'\t'));
+    let val = match (first, last) {
+        (Some(f), Some(l)) => lines[f..=l].join("\n"),
+        _ => String::new(),
+    };
+    let escaped = val.replace("\"\"\"", "\\\"\"\"");
+    let elines: Vec<&str> = escaped.split('\n').collect();
+    let force_leading = elines.len() > 1
+        && elines.iter().skip(1).all(|l| l.is_empty() || matches!(l.as_bytes()[0], b' ' | b'\t'));
+    let has_trailing_triple = escaped.ends_with("\\\"\"\"");
+    let force_trailing = (val.ends_with('"') && !has_trailing_triple) || val.ends_with('\\');
+    let mut out = String::with_capacity(escaped.len() + 8);
+    out.push_str("\"\"\"");
+    if force_leading {
+        out.push('\n');
+    }
+    out.push_str(&escaped);
+    if force_trailing {
+        out.push('\n');
+    }
+    out.push_str("\"\"\"");
+    out
+}
+
 fn minify_apollo(src: &str) -> String {
     let lexer = Lexer::new(src);
     let mut out = String::with_capacity(src.len() / 2);
@@ -43,7 +89,12 @@ fn minify_apollo(src: &str) -> String {
         if needs_space(prev_cls, cur_cls) {
             out.push(' ');
         }
-        out.push_str(tok.data());
+        let data = tok.data();
+        if k == TokenKind::StringValue && data.len() >= 6 && data.starts_with("\"\"\"") {
+            out.push_str(&minify_block_string_apollo(data));
+        } else {
+            out.push_str(data);
+        }
         prev_cls = cur_cls;
     }
     out
@@ -321,6 +372,8 @@ fn main() {
         let mut total_q = 0u64;
         let mut total_min_bytes = 0u64;
         let mut min_hash: u32 = 2166136261;
+        let mut total_print_min_bytes = 0u64;
+        let mut print_min_hash: u32 = 2166136261;
         let mut total_defs = 0u64;
         let mut total_printed_ok = 0u64;
         for _ in 0..iters {
@@ -338,6 +391,9 @@ fn main() {
                 if !printed.is_empty() {
                     total_printed_ok += 1;
                 }
+                let printed_min = minify_apollo(&printed);
+                total_print_min_bytes += printed_min.len() as u64;
+                print_min_hash = fnv1a_update(print_min_hash, printed_min.as_bytes());
                 total_defs += doc.definitions().count() as u64;
                 total_q += 1;
             }
@@ -347,6 +403,8 @@ fn main() {
         println!("queries={}", total_q);
         println!("min_bytes={}", total_min_bytes);
         println!("min_fnv1a={}", min_hash);
+        println!("printed_min_bytes={}", total_print_min_bytes);
+        println!("printed_min_fnv1a={}", print_min_hash);
         println!("defs={}", total_defs);
         println!("printed_ok={}", total_printed_ok);
         return;

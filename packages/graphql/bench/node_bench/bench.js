@@ -204,6 +204,8 @@ if (mode === 'sdl') {
   let totalQ = 0;
   let totalMinBytes = 0;
   let minHash = 2166136261 >>> 0;
+  let totalPrintMinBytes = 0;
+  let printMinHash = 2166136261 >>> 0;
   let totalDefs = 0;
   let totalPrintedOk = 0;
   for (let r = 0; r < iters; r++) {
@@ -214,11 +216,14 @@ if (mode === 'sdl') {
       const doc = parse(min, { noLocation: true });
       const printed = print(doc);
       if (printed.length > 0) totalPrintedOk++;
+      const printedMin = stripIgnoredCharacters(printed);
+      totalPrintMinBytes += Buffer.byteLength(printedMin, 'utf8');
+      printMinHash = fnv1aUpdate(printMinHash, printedMin);
       totalDefs += doc.definitions.length;
       totalQ++;
     }
   }
-  console.log(`mode=roundtrip\niters=${iters}\nqueries=${totalQ}\nmin_bytes=${totalMinBytes}\nmin_fnv1a=${minHash}\ndefs=${totalDefs}\nprinted_ok=${totalPrintedOk}`);
+  console.log(`mode=roundtrip\niters=${iters}\nqueries=${totalQ}\nmin_bytes=${totalMinBytes}\nmin_fnv1a=${minHash}\nprinted_min_bytes=${totalPrintMinBytes}\nprinted_min_fnv1a=${printMinHash}\ndefs=${totalDefs}\nprinted_ok=${totalPrintedOk}`);
 } else {
   console.error('unknown mode:', mode);
   process.exit(1);
