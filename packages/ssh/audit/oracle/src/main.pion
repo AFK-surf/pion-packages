@@ -1,0 +1,587 @@
+///| Red-team differential oracle for `packages/ssh` (Pion side).
+///|
+///| Modes (line-oriented, diffed against ../diff/go/main.go which prints the same format):
+///|   vectors <corpus.tsv>      one "<label>\t<result>" line per "<label>\t<kind>\t<hex>[\t<arg>]" line
+///|       kinds: pk (wire public key blob), cert (wire cert blob), ak (authorized_keys line text),
+///|              kh (known_hosts line text), certchk (wire cert blob; arg = "<principal> <unix_now>",
+///|              CA = the cert's own signature key, expected type User)
+///|   craft <ca_openssh_pem> <user_pub_line> <variant> [principal=admin]   print an OpenSSH cert line signed by the CA
+///|       variants: dupcrit, unsorted_crit, srcaddr_other, dupext, unsorted_ext, ok
+///|   akinject <victim_pub_line> <attacker_pub_line>  print encode_authorized_key() output (newline injection)
+///|   sshsig_sign <pem> <namespace> <msg_file> <sha256|sha512>   print an armored SSHSIG (for ssh-keygen -Y check-novalidate)
+///|   sshsig_verify <sig_file> <namespace> <msg_file>            "OK <alg> <signer fp>" / "ERR <reason>"
+///|   reencode <pem>                                             parse + encode_openssh_private_key (for ssh-keygen -y)
+///|   bench_sshsig <sig_file> <msg_file> <n>                     n x (parse_sshsig + sshsig_verify "git")
+///|   dos <shape> <n>           adversarial-shape single shot (timed externally)
+///|       shapes: kh_star (pattern "a*"*n + "b" vs "a"*4n), ak_opts (n options), principals (n principals),
+///|               namelist (KEXINIT with 256 x n-byte names), negkh (n "!x<i>" patterns + "*")
+
+import "ssh"
+
+///|
+let hex_digits : String = "0123456789abcdef"
+
+///|
+fn to_hex(b : Bytes) -> String {
+  let n = b.length()
+  let out = Bytes::new(n * 2)
+  let mut i = 0
+  while i < n {
+    let v = b[i].to_int() & 0xFF
+    out[2 * i] = hex_digits.code_unit_at(v >> 4).to_byte()
+    out[2 * i + 1] = hex_digits.code_unit_at(v & 15).to_byte()
+    i = i + 1
+  }
+  out.to_string()
+}
+
+///|
+fn hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else {
+    0
+  }
+}
+
+///|
+fn from_hex(buf : Bytes, start : Int, end : Int) -> Bytes {
+  let n = (end - start) / 2
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    let hi = hex_val(buf[start + 2 * i].to_int() & 0xFF)
+    let lo = hex_val(buf[start + 2 * i + 1].to_int() & 0xFF)
+    out[i] = ((hi << 4) | lo).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn find_byte(buf : Bytes, from : Int, end : Int, c : Int) -> Int {
+  let mut i = from
+  while i < end {
+    if (buf[i].to_int() & 0xFF) == c {
+      return i
+    }
+    i = i + 1
+  }
+  end
+}
+
+///|
+fn parse_u64(s : String) -> UInt64 {
+  let b = s.to_bytes()
+  let mut v = 0UL
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c >= 48 && c <= 57 {
+      v = v * 10UL + (c - 48).to_int64().to_uint64()
+    }
+    i = i + 1
+  }
+  v
+}
+
+///|
+fn parse_int(s : String) -> Int {
+  parse_u64(s).to_int64().to_int()
+}
+
+///|
+fn pk_desc(pk : ssh::PublicKey) -> String {
+  ssh::public_key_algorithm(pk) + " " + ssh::public_key_fingerprint_sha256(pk)
+}
+
+///|
+fn cert_desc(c : ssh::Certificate) -> String {
+  let ty = match c.cert_type {
+    ssh::CertType::User => "1"
+    ssh::CertType::Host => "2"
+  }
+  c.cert_type_name +
+  " type=" +
+  ty +
+  " serial=" +
+  c.serial.to_string() +
+  " key=" +
+  ssh::public_key_fingerprint_sha256(c.key) +
+  " ca=" +
+  ssh::public_key_fingerprint_sha256(c.signature_key) +
+  " np=" +
+  c.valid_principals.length().to_string() +
+  " nc=" +
+  c.critical_options.length().to_string() +
+  " ne=" +
+  c.extensions.length().to_string()
+}
+
+///|
+fn run_one(kind : String, data : Bytes, arg : String) -> String {
+  if kind == "pk" {
+    match ssh::parse_public_key_wire(data) {
+      Ok(pk) => "OK " + pk_desc(pk)
+      Err(_) => "ERR"
+    }
+  } else if kind == "cert" {
+    match ssh::Certificate::from_wire(data) {
+      Ok(c) => "OK " + cert_desc(c)
+      Err(_) => "ERR"
+    }
+  } else if kind == "ak" {
+    match ssh::parse_authorized_key_line(data.to_string()) {
+      Ok(Some(ak)) => {
+        let d = match ak.key {
+          ssh::AuthorizedKeyMaterial::Key(pk) => pk_desc(pk)
+          ssh::AuthorizedKeyMaterial::Cert(c) => c.cert_type_name +
+          " " +
+          ssh::public_key_fingerprint_sha256(c.key)
+        }
+        "OK " + d + " nopts=" + ak.options.length().to_string()
+      }
+      Ok(None) => "SKIP"
+      Err(_) => "ERR"
+    }
+  } else if kind == "kh" {
+    match ssh::parse_known_hosts_line(data.to_string()) {
+      Ok(Some(e)) => {
+        let m = match e.marker {
+          ssh::KnownHostMarker::None => "-"
+          ssh::KnownHostMarker::CertAuthority => "cert-authority"
+          ssh::KnownHostMarker::Revoked => "revoked"
+        }
+        "OK marker=" + m + " nh=" + e.patterns.length().to_string() + " " + pk_desc(e.key)
+      }
+      Ok(None) => "SKIP"
+      Err(_) => "ERR"
+    }
+  } else if kind == "certchk" {
+    let ab = arg.to_bytes()
+    let sp = find_byte(ab, 0, ab.length(), 32)
+    let principal = ab.slice(0, sp).to_string()
+    let now = if sp < ab.length() {
+      parse_u64(ab.slice(sp + 1, ab.length()).to_string())
+    } else {
+      0UL
+    }
+    match ssh::Certificate::from_wire(data) {
+      Ok(c) => match c.verify(c.signature_key, ssh::CertType::User, principal, now) {
+        Ok(_) => "OK"
+        Err(e) => "REJECT " + ssh::ssh_error_message(e)
+      }
+      Err(_) => "ERR"
+    }
+  } else {
+    "BADKIND"
+  }
+}
+
+///|
+fn run_vectors(world : World, path : String) -> Int {
+  let buf = match fs_read_bytes(world, path) {
+    Ok(b) => b
+    Err(_) => {
+      io_eprintln(world, "cannot read " + path)
+      return 1
+    }
+  }
+  let n = buf.length()
+  let sb = StringBuilder::new()
+  let mut pos = 0
+  while pos < n {
+    let le = find_byte(buf, pos, n, 10)
+    let t1 = find_byte(buf, pos, le, 9)
+    let t2 = find_byte(buf, t1 + 1, le, 9)
+    let t3 = find_byte(buf, t2 + 1, le, 9)
+    let label = buf.slice(pos, t1).to_string()
+    let kind = buf.slice(t1 + 1, t2).to_string()
+    let data = from_hex(buf, t2 + 1, t3)
+    let arg = if t3 < le { buf.slice(t3 + 1, le).to_string() } else { "" }
+    sb.write_string(label)
+    sb.write_string("\t")
+    sb.write_string(run_one(kind, data, arg))
+    sb.write_string("\n")
+    pos = le + 1
+  }
+  io_print(world, sb.to_string())
+  0
+}
+
+///|
+fn opt(name : String, value : Bytes) -> ssh::CertOption {
+  ssh::CertOption::{ name, value }
+}
+
+///|
+fn str_value(s : String) -> Bytes {
+  let w = ssh::SshWriter::new()
+  w.write_string(s)
+  w.to_bytes()
+}
+
+///|
+fn run_craft(
+  world : World,
+  pem_path : String,
+  user_pub : String,
+  variant : String,
+  principal : String,
+) -> Int {
+  let pem = match fs_read_bytes(world, pem_path) {
+    Ok(b) => b.to_string()
+    Err(_) => {
+      io_eprintln(world, "cannot read " + pem_path)
+      return 1
+    }
+  }
+  let ca = match ssh::parse_openssh_private_key(pem) {
+    Ok(k) => k
+    Err(e) => {
+      io_eprintln(world, "ca: " + ssh::ssh_error_message(e))
+      return 1
+    }
+  }
+  let (user_pk, _) = match ssh::parse_public_key_openssh(user_pub) {
+    Ok(v) => v
+    Err(e) => {
+      io_eprintln(world, "user: " + ssh::ssh_error_message(e))
+      return 1
+    }
+  }
+  let empty = Bytes::new(0)
+  let pty = opt("permit-pty", empty)
+  let fwd = opt("permit-port-forwarding", empty)
+  let fc1 = opt("force-command", str_value("/bin/true"))
+  let fc2 = opt("force-command", str_value("/bin/sh"))
+  let sa = opt("source-address", str_value("127.0.0.0/8,10.0.0.0/8"))
+  let sa_other = opt("source-address", str_value("10.0.0.0/8"))
+  let (crit, ext) = if variant == "dupcrit" {
+    ([fc1, fc2], [pty])
+  } else if variant == "unsorted_crit" {
+    ([sa, fc1], [pty])
+  } else if variant == "srcaddr_other" {
+    ([sa_other], [pty])
+  } else if variant == "dupext" {
+    ([], [pty, pty])
+  } else if variant == "unsorted_ext" {
+    ([], [pty, fwd])
+  } else {
+    ([], [fwd, pty])
+  }
+  let alg = match user_pk {
+    ssh::PublicKey::Ed25519(_) => "ssh-ed25519-cert-v01@openssh.com"
+    ssh::PublicKey::EcdsaP256(_) => "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+    ssh::PublicKey::Rsa(_, _) => "ssh-rsa-cert-v01@openssh.com"
+  }
+  let nonce = Bytes::new(32)
+  let unsigned = ssh::Certificate::{
+    cert_type_name: alg,
+    nonce,
+    key: user_pk,
+    serial: 4242UL,
+    cert_type: ssh::CertType::User,
+    key_id: "rt-" + variant,
+    valid_principals: [principal],
+    valid_after: 0UL,
+    valid_before: 0xFFFFFFFFFFFFFFFFUL,
+    critical_options: crit,
+    extensions: ext,
+    reserved: empty,
+    signature_key: ssh::private_key_public_key(ca.private_key),
+    signature: ssh::Signature::{ algorithm: "", blob: empty },
+  }
+  match unsigned.sign(ca.private_key) {
+    Ok(c) => {
+      io_println(world, c.to_openssh("rt-" + variant))
+      0
+    }
+    Err(e) => {
+      io_eprintln(world, "sign: " + ssh::ssh_error_message(e))
+      1
+    }
+  }
+}
+
+///| Print what encode_authorized_key() produces for `restrict,command="true\n<attacker line> " <victim key>`.
+fn run_akinject(world : World, victim_line : String, attacker_line : String) -> Int {
+  match ssh::parse_public_key_openssh(victim_line) {
+    Ok((k, comment)) => {
+      let ak = ssh::AuthorizedKey::{
+        options: [
+          ssh::AuthorizedKeyOption::{ name: "restrict", value: None },
+          ssh::AuthorizedKeyOption::{ name: "command", value: Some("true\n" + attacker_line + " ") },
+        ],
+        key: ssh::AuthorizedKeyMaterial::Key(k),
+        comment,
+      }
+      io_println(world, ssh::encode_authorized_key(ak))
+      0
+    }
+    Err(e) => {
+      io_eprintln(world, ssh::ssh_error_message(e))
+      1
+    }
+  }
+}
+
+///|
+fn read_text(world : World, path : String) -> String {
+  match fs_read_bytes(world, path) {
+    Ok(b) => b.to_string()
+    Err(_) => ""
+  }
+}
+
+///|
+fn read_raw(world : World, path : String) -> Bytes {
+  match fs_read_bytes(world, path) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+}
+
+///|
+fn run_interop(world : World, args : Array[String]) -> Int {
+  let mode = args[1]
+  if mode == "sshsig_sign" && args.length() >= 6 {
+    let key = match ssh::parse_openssh_private_key(read_text(world, args[2])) {
+      Ok(k) => k
+      Err(e) => {
+        io_println(world, "ERR " + ssh::ssh_error_message(e))
+        return 1
+      }
+    }
+    let h = if args[5] == "sha256" { ssh::HashAlgorithm::Sha256 } else { ssh::HashAlgorithm::Sha512 }
+    match ssh::sshsig_sign(key.private_key, args[3], h, read_raw(world, args[4])) {
+      Ok(sig) => {
+        io_print(world, ssh::encode_sshsig(sig))
+        0
+      }
+      Err(e) => {
+        io_println(world, "ERR " + ssh::ssh_error_message(e))
+        1
+      }
+    }
+  } else if mode == "sshsig_verify" && args.length() >= 5 {
+    match ssh::parse_sshsig(read_text(world, args[2])) {
+      Ok(s) => match ssh::sshsig_verify(s, args[3], read_raw(world, args[4])) {
+        Ok(_) => io_println(world, "OK " + s.signature.algorithm + " " + ssh::public_key_fingerprint_sha256(s.public_key))
+        Err(e) => io_println(world, "ERR " + ssh::ssh_error_message(e))
+      }
+      Err(e) => io_println(world, "ERR " + ssh::ssh_error_message(e))
+    }
+    0
+  } else if mode == "reencode" && args.length() >= 3 {
+    match ssh::parse_openssh_private_key(read_text(world, args[2])) {
+      Ok(k) => match ssh::encode_openssh_private_key(k.private_key, k.comment, 0x5EED5EEDU) {
+        Ok(pem) => {
+          io_print(world, pem)
+          0
+        }
+        Err(e) => {
+          io_println(world, "ERR " + ssh::ssh_error_message(e))
+          1
+        }
+      }
+      Err(e) => {
+        io_println(world, "ERR " + ssh::ssh_error_message(e))
+        1
+      }
+    }
+  } else if mode == "bench_sshsig" && args.length() >= 5 {
+    let armored = read_text(world, args[2])
+    let msg = read_raw(world, args[3])
+    let n = parse_int(args[4])
+    let mut ok = 0
+    let mut i = 0
+    while i < n {
+      match ssh::parse_sshsig(armored) {
+        Ok(sig) => match ssh::sshsig_verify(sig, "git", msg) {
+          Ok(_) => ok = ok + 1
+          Err(_) => ()
+        }
+        Err(_) => ()
+      }
+      i = i + 1
+    }
+    io_println(world, "ok=" + ok.to_string() + "/" + n.to_string())
+    0
+  } else {
+    2
+  }
+}
+
+///|
+fn repeat(s : String, n : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    sb.write_string(s)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+let dos_key : String = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHiojgVRI/bzT9/KdnJv9QzVjj6cRUQldIZUq76+c0ib"
+
+///|
+fn run_dos(world : World, shape : String, n : Int) -> Int {
+  if shape == "kh_star" {
+    let pat = repeat("a*", n) + "b"
+    let host = repeat("a", 4 * n)
+    let hit = ssh::match_host_pattern(pat, host)
+    io_println(world, "kh_star n=" + n.to_string() + " match=" + hit.to_string())
+  } else if shape == "negkh" {
+    let sb = StringBuilder::new()
+    let mut i = 0
+    while i < n {
+      sb.write_string("!x" + i.to_string() + ".example.com,")
+      i = i + 1
+    }
+    sb.write_string("* ")
+    sb.write_string(dos_key)
+    match ssh::parse_known_hosts_line(sb.to_string()) {
+      Ok(Some(e)) => {
+        let hit = ssh::match_known_host_patterns(e.patterns, "host.example.com")
+        io_println(world, "negkh n=" + n.to_string() + " patterns=" + e.patterns.length().to_string() + " match=" + hit.to_string())
+      }
+      _ => io_println(world, "negkh ERR")
+    }
+  } else if shape == "ak_opts" {
+    let sb = StringBuilder::new()
+    let mut i = 0
+    while i < n {
+      sb.write_string("environment=\"K" + i.to_string() + "=v\",")
+      i = i + 1
+    }
+    sb.write_string("restrict ")
+    sb.write_string(dos_key)
+    match ssh::parse_authorized_key_line(sb.to_string()) {
+      Ok(Some(ak)) => io_println(world, "ak_opts n=" + n.to_string() + " opts=" + ak.options.length().to_string())
+      _ => io_println(world, "ak_opts ERR")
+    }
+  } else if shape == "principals" {
+    // n non-matching wildcard host principals, then verify (rejects with PrincipalMismatch before crypto)
+    let ps : Array[String] = []
+    let mut i = 0
+    while i < n {
+      ps.push(repeat("a*", 16) + "z" + i.to_string())
+      i = i + 1
+    }
+    let (pk, _) = match ssh::parse_public_key_openssh(dos_key) {
+      Ok(v) => v
+      Err(_) => return 1
+    }
+    let c = ssh::Certificate::{
+      cert_type_name: "ssh-ed25519-cert-v01@openssh.com",
+      nonce: Bytes::new(32),
+      key: pk,
+      serial: 1UL,
+      cert_type: ssh::CertType::Host,
+      key_id: "dos",
+      valid_principals: ps,
+      valid_after: 0UL,
+      valid_before: 0xFFFFFFFFFFFFFFFFUL,
+      critical_options: [],
+      extensions: [],
+      reserved: Bytes::new(0),
+      signature_key: pk,
+      signature: ssh::Signature::{ algorithm: "ssh-ed25519", blob: Bytes::new(64) },
+    }
+    let wire = c.to_wire()
+    match ssh::Certificate::from_wire(wire) {
+      Ok(c2) => {
+        let r = match c2.verify(pk, ssh::CertType::Host, repeat("a", 64), 1UL) {
+          Ok(_) => "ok"
+          Err(e) => ssh::ssh_error_message(e)
+        }
+        io_println(world, "principals n=" + n.to_string() + " bytes=" + wire.length().to_string() + " -> " + r)
+      }
+      Err(e) => io_println(world, "principals ERR " + ssh::ssh_error_message(e))
+    }
+  } else if shape == "namelist" {
+    let names : Array[String] = []
+    let mut i = 0
+    while i < 256 {
+      names.push(repeat("k", n) + i.to_string())
+      i = i + 1
+    }
+    let kex = ssh::KexInit::{
+      cookie: Bytes::new(16),
+      kex_algorithms: names,
+      server_host_key_algorithms: names,
+      encryption_c2s: names,
+      encryption_s2c: names,
+      mac_c2s: names,
+      mac_s2c: names,
+      compression_c2s: names,
+      compression_s2c: names,
+      languages_c2s: [],
+      languages_s2c: [],
+      first_kex_packet_follows: false,
+      reserved: 0U,
+    }
+    let srv_names : Array[String] = []
+    let mut j = 0
+    while j < 256 {
+      srv_names.push(repeat("s", n) + j.to_string())
+      j = j + 1
+    }
+    srv_names.push(names[255])
+    let payload = match kex.to_payload() {
+      Ok(p) => p
+      Err(_) => return 1
+    }
+    let lim = ssh::Limits::{ max_string_len: 1048576, max_packet_len: 35000, max_list_items: 1024 }
+    match ssh::KexInit::from_payload(payload, lim) {
+      Ok(k) => {
+        let srv = ssh::KexInit::{ ..k, kex_algorithms: srv_names }
+        let r = match ssh::negotiate_kex(k, srv) {
+          Ok(neg) => neg.kex.length().to_string()
+          Err(e) => ssh::ssh_error_message(e)
+        }
+        io_println(world, "namelist n=" + n.to_string() + " payload=" + payload.length().to_string() + " -> " + r)
+      }
+      Err(e) => io_println(world, "namelist ERR " + ssh::ssh_error_message(e))
+    }
+  } else {
+    io_eprintln(world, "unknown dos shape")
+    return 2
+  }
+  0
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() >= 3 && args[1] == "vectors" {
+    return run_vectors(world, args[2])
+  }
+  if args.length() >= 5 && args[1] == "craft" {
+    let principal = if args.length() >= 6 { args[5] } else { "admin" }
+    return run_craft(world, args[2], args[3], args[4], principal)
+  }
+  if args.length() >= 4 && args[1] == "akinject" {
+    return run_akinject(world, args[2], args[3])
+  }
+  if args.length() >= 3 && (
+    args[1] == "sshsig_sign" ||
+    args[1] == "sshsig_verify" ||
+    args[1] == "reencode" ||
+    args[1] == "bench_sshsig"
+  ) {
+    return run_interop(world, args)
+  }
+  if args.length() >= 4 && args[1] == "dos" {
+    return run_dos(world, args[2], parse_int(args[3]))
+  }
+  io_eprintln(world, "usage: ssh_redteam_oracle vectors <tsv> | craft <ca_pem> <user_pub_line> <variant> | dos <shape> <n>")
+  2
+}
