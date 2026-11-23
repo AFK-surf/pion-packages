@@ -1,11 +1,11 @@
 # `css`
 
-Pure Pion **W3C CSS Syntax Level 3** tokenizer, fault-tolerant iterative stylesheet & declaration-block AST parser, **Selectors Level 4** specificity calculator, **Media Queries Level 4** parser, **CSS Color Level 4** parser (including all 148 named colors), and CSS formatter / minifier.
+Pure Pion **W3C CSS Syntax Level 3** (2019+) tokenizer, fault-tolerant single-pass streaming stylesheet & declaration-block AST parser, **Selectors Level 4** validator & specificity calculator, **Media Queries Level 4** iterative parser, **CSS Color Level 4** parser (148 named colors + hex/rgb/hsl/hwb/lab/lch/oklab/oklch/`color()`/`none`), and CSS formatter / single-pass streaming minifier.
 
-- **Zero C dependencies / zero `World` dependency** — compiles and runs identically on **Native** and **`wasm32`** (verified across all 4 modes: Native/Wasm32 × debug/release via `wasm_smoke`).
-- **Full CSS Syntax Level 3 tokenizer** — 256-byte ASCII classification LUT, zero-copy fast paths for unescaped identifiers/strings/numbers, `\r\n`/`\r`/`\f` → `\n` and NUL (`\u{0000}`) → `U+FFFD` input preprocessing, invalid UTF-8 byte replacement, full CSS escapes (`\` + 1–6 hex digits + optional single whitespace, clamping `0`/surrogates/`> 0x10FFFF` to `U+FFFD`), `Ident`, `Function`, `AtKeyword`, `Hash(Id | Unrestricted)`, `Str`/`BadString` (with `\<newline>` line continuation), `Url`/`BadUrl`, `Number`/`Percentage`/`Dimension`, `UnicodeRange`, `Cdo`/`Cdc`, `Delim`, `Whitespace`, punctuation, and unclosed-EOF comments in O(N).
-- **100% iterative AST parser & specificity evaluator (0 recursion)** — explicit heap stacks for stylesheet blocks, CSS nesting (`&`, nested qualified rules, nested `@media`), `@font-face`/`@supports`/`@keyframes`/`@import`/`@layer`/`@charset`/`@container`, case-insensitive `!important`, verbatim custom property (`--*`) whitespace/case preservation, and fault-tolerant recovery on malformed declarations/rules.
-- **Day-1 security & resource budgets** — configurable `ParseOptions { max_depth, max_tokens, max_rules }` (default `256` / `2_000_000` / `500_000`), verified against 50,000-level nested `{`/`(`/ `@media {` (0 SIGSEGV), 50k unclosed comments/strings/escapes (strict O(N)), and NUL / invalid UTF-8 raw bytes.
+- **Zero C dependencies / zero `World` dependency** — compiles and runs identically on **Native** and **`wasm32`** (byte-identical SHA-256 across all 4 modes: Native/Wasm32 × debug/release).
+- **W3C CSS Syntax Level 3 (2019+) tokenizer** — 256-byte ASCII classification LUT, zero-copy fast paths for unescaped identifiers/strings/numbers, `\r\n`/`\r`/`\f` → `\n` and NUL (`\u{0000}`) → `U+FFFD` preprocessing, WHATWG maximal-subpart invalid UTF-8 replacement in both `String` and `Bytes` entry points, full CSS escapes, IEEE-754 `-0` sign preservation, `Ident`, `Function`, `AtKeyword`, `Hash(Id | Unrestricted)`, `Str`/`BadString`, `Url`/`BadUrl`, `Number`/`Percentage`/`Dimension`, `Cdo`/`Cdc`, `Delim`, `Whitespace`, punctuation, and O(N) unclosed-EOF comments. (`<unicode-range-token>` removed per CSS Syntax 3 2019 so `u+a` selectors tokenize accurately.)
+- **100% iterative, single-pass streaming parser, selector validator, media parser & minifier (0 recursion)** — explicit heap stacks everywhere (`parser.pion`, `selector.pion`, `media.pion`, `serialize.pion`); `parse_stylesheet` and `minify` consume a zero-allocation streaming `Lexer` without materializing an intermediate `Array[Token]`; CSS Nesting preserves exact declaration / nested-rule source order in both `to_css` and `minify`; custom properties (`--*`) preserve `{}` block values, `!important`, and CSS Variables 1 whitespace semantics; `minify` obeys W3C CSS Syntax 3 §9.2 token-separation rules and is 100% idempotent.
+- **Day-1 security & resource budgets** — configurable `ParseOptions { max_depth, max_tokens, max_rules }` (default `256` block depth / `10_000_000` non-whitespace tokens / `500_000` rules), verified linear O(N) with 0 crashes against 50,000-level nested `{`/`(`/ `[` / `@media {` / `:is(` / `calc(`, 10 MB unclosed comments/strings, and 1 MB escape runs.
 
 ## API
 
@@ -23,30 +23,30 @@ pub fn tokenize_bytes_with_options(src : Bytes, opts : ParseOptions) -> Result[A
 pub fn count_tokens(src : String) -> Result[Int, CssError]
 pub fn count_non_ws_tokens(src : String) -> Result[Int, CssError]
 
-// Stylesheet & Declaration Block Parser
+// Stylesheet & Declaration Block Parser (single-pass streaming)
 pub fn parse_stylesheet(src : String) -> Result[Stylesheet, CssError]
 pub fn parse_stylesheet_with_options(src : String, opts : ParseOptions) -> Result[Stylesheet, CssError]
 pub fn parse_stylesheet_bytes(src : Bytes) -> Result[Stylesheet, CssError]
 pub fn parse_declarations(src : String) -> Result[Array[Declaration], CssError]
 pub fn parse_declarations_with_options(src : String, opts : ParseOptions) -> Result[Array[Declaration], CssError]
 
-// Selectors Level 4 Specificity
+// Selectors Level 4 Validation & Specificity
 pub val struct Specificity { pub ids : Int, pub classes : Int, pub elements : Int }
 pub fn selector_specificity(selector : String) -> Result[Specificity, CssError]
 pub fn selector_list_specificity(selectors : String) -> Result[Array[Specificity], CssError]
 pub fn max_specificity(selectors : String) -> Result[Specificity, CssError]
 
-// Media Queries Level 4
+// Media Queries Level 4 (100% iterative)
 pub fn parse_media_query_list(src : String) -> Result[Array[MediaQuery], CssError]
 
-// CSS Color Level 4 (hex, rgb/rgba, hsl/hsla, 148 named colors, transparent, currentcolor)
+// CSS Color Level 4 (hex, rgb/rgba, hsl/hsla, hwb, lab, lch, oklab, oklch, color(), none, 148 named colors)
 pub val struct Color { pub r : Int, pub g : Int, pub b : Int, pub a : Double, pub is_current_color : Bool }
 pub fn parse_color(src : String) -> Result[Color, CssError]
 pub fn Color::to_hex(self : Color) -> String
 pub fn Color::to_css(self : Color) -> String
 pub fn Color::to_minified_css(self : Color) -> String
 
-// Serializer & Minifier
+// Serializer & Single-Pass Streaming Minifier
 pub fn to_css(sheet : Stylesheet) -> String
 pub fn minify(src : String) -> Result[String, CssError]
 pub fn minify_with_options(src : String, opts : ParseOptions) -> Result[String, CssError]
@@ -64,7 +64,7 @@ match css::parse_stylesheet(src) {
     let pretty = css::to_css(sheet)
     let compact = css::minify_stylesheet(sheet)
     let spec = css::selector_specificity("#app .card:not(.hidden)")
-    let col = css::parse_color("rgb(255 0 128 / 50%)")
+    let col = css::parse_color("oklch(0.6 0.1 200)")
     let mq = css::parse_media_query_list("screen and (width >= 768px)")
     let _ = (pretty, compact, spec, col, mq)
   }
@@ -74,65 +74,56 @@ match css::parse_stylesheet(src) {
 }
 ```
 
-## Head-to-Head Benchmarks
+## Head-to-Head Benchmarks (Like-for-Like)
 
-Measured on `Darwin arm64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved rotation, **mandatory stdout SHA-256 byte-for-byte verification** across all implementations and rounds).
+Measured on `Darwin arm64` using `packages/css/audit/scripts/perf.py --rounds 5` (`3` reps/process, `5` interleaved rounds after warmup, median wall time and peak RSS):
 
-- **Pion**: `packages/css` (`pionc build --release`)
-- **Rust**: `cssparser =0.35.0` (`cargo build --release`, `opt-level = 3`, `lto = true`)
-- **Node.js**: `css-tree@3.1.0` (`node v24.22.2`)
-- **Corpus**: deterministic 2.09 MB realistic design-system CSS stylesheet (`6,000` component rules + `1,500` `@media` rules + `@font-face`, `calc(...)`, `!important`, custom properties `--ds-gap-*`, comments).
+- **Pion**: `packages/css` (`pionc build --release`), reporting **both** zero-allocation `count_tokens()` and full-materialization `tokenize()`, plus single-pass streaming `parse_stylesheet()` and `minify()`.
+- **Rust `cssparser =0.35.0`**: `tokcount` (token walk producing full `Token` values) and `sheet` (owned generic AST matching Pion's `Stylesheet` shape).
+- **Rust `lightningcss =1.0.0-alpha.72`**: `lparse` (full typed AST) and `lmin` (real production CSS minifier).
+- **Node `css-tree@3.1.0`** (`node v24.22.2`): `tokcount`, `parse` (full AST), and `gen` (parse + generate).
 
 Reproduce with:
 
 ```sh
-sh packages/css/bench/run_bench.sh
+sh packages/css/audit/run_audit.sh
 ```
 
-### Workload 1: Large Design-System CSS Tokenize (`5x` 2.09 MB = 10.44 MB)
+### 5-Corpus Head-to-Head Matrix (median ms, lower is better)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_cssparser`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | **29.686** | 28.064 | 30.724 | **351.75** | 5.78 MiB | **1.08x** |
-| `rust_cssparser` | 32.088 | 29.818 | 32.929 | 325.42 | 3.81 MiB | 1.00x (baseline) |
-| `node_csstree` | 131.138 | 126.901 | 145.367 | 79.63 | 67.45 MiB | 0.24x |
+| Corpus (size × 3) | Pion `count_tokens` | Pion `tokenize()` | `cssparser` tok walk | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify | `css-tree` parse |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `design_system` (2.09 MB) | **25.9** | 66.7 | 34.7 | **63.1** | 66.2 | 110.5 | **85.2** | 135.1 | 531.4 |
+| `color_heavy` (1.81 MB) | **25.7** | 69.3 | 33.0 | 64.9 | **61.0** | 105.4 | **99.7** | 125.3 | 626.1 |
+| `selector_heavy` (1.34 MB) | **21.4** | 61.8 | 31.5 | 37.8 | **29.7** | 110.2 | **84.0** | 172.0 | 750.9 |
+| `nesting_heavy` (1.74 MB) | **26.1** | 89.8 | 42.5 | **91.2** | 107.2 | 449.6 | **125.2** | 569.7 | 1220.2 |
+| `custom_props` (2.04 MB) | **24.6** | 70.1 | 33.6 | 85.3 | **76.4** | 202.8 | **67.8** | 237.1 | 442.8 |
 
-_SHA-256 verified identical across all implementations and rounds: `6f6fb94bb07de68e0f3ad3b25ccd54d4e49bc2be13b4f1a0102a45e8f26c7a85`._
+### Peak RSS (MB, lower is better)
 
-### Workload 2: Stylesheet AST Parse + Rule/Declaration/Important Count (`3x` 2.09 MB = 6.27 MB)
-
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_cssparser`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 114.701 | 107.574 | 154.690 | 54.62 | 47.75 MiB | 0.21x |
-| `rust_cssparser` | **23.799** | 22.613 | 26.141 | **263.25** | 3.83 MiB | 1.00x (baseline) |
-| `node_csstree` | 388.135 | 352.918 | 408.555 | 16.14 | 264.19 MiB | 0.06x |
-
-_SHA-256 verified identical across all implementations and rounds: `4fe1f3226b3cda156d74bffa8cac013e7390e720fecf96ad6abe2c8de1cd4ec3`._
-
-### Workload 3: CSS Minify Throughput (`2x` 2.09 MB = 4.18 MB)
-
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_cssparser`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 124.818 | 123.266 | 132.286 | 33.46 | 49.53 MiB | 0.20x |
-| `rust_cssparser` | **24.496** | 23.812 | 33.334 | **170.51** | 6.97 MiB | 1.00x (baseline) |
-| `node_csstree` | 308.406 | 299.117 | 671.752 | 13.54 | 248.69 MiB | 0.08x |
-
-_SHA-256 verified identical across all implementations and rounds: `d1fc6cd5cccb2251816137e6e2477b59d97906ea70bf1b6c1c3b5f95f304edaf`._
+| Corpus | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify | `css-tree` parse |
+|---|---:|---:|---:|---:|---:|---:|
+| `design_system` | 18.1 | **18.0** | 44.2 | **7.4** | 46.4 | 247.6 |
+| `color_heavy` | **16.8** | 17.0 | 34.6 | **7.1** | 35.1 | 326.0 |
+| `selector_heavy` | **8.2** | 9.1 | 36.2 | **5.7** | 37.7 | 280.8 |
+| `nesting_heavy` | 41.2 | **34.0** | 202.6 | **6.9** | 203.4 | 448.6 |
+| `custom_props` | 22.7 | **22.5** | 56.2 | **7.6** | 58.2 | 164.1 |
 
 ### Honest Performance Notes
 
-- **Where Pion leads**:
-  - On **streaming CSS tokenization** (Workload 1), Pion reaches **351.75 MB/s** (`1.08x` faster than Rust `cssparser`, `4.42x` faster than Node `css-tree`, and `11.7x` lower RSS than Node `css-tree`), thanks to the 256-byte LUT and zero-allocation scan loop.
-  - Across **full AST parsing** (Workload 2) and **AST-based minification** (Workload 3), Pion is **3.38x** and **2.47x** faster than Node `css-tree` while using **5.0x–5.5x less memory** (47–50 MiB vs 248–264 MiB).
-- **Where Pion currently trails Rust `cssparser`**:
-  - In Workloads 2 and 3, `rust_cssparser` operates as a zero-AST streaming callback parser (3.8–7.0 MiB RSS) without materializing an intermediate `Vec<Token>` or full AST. In contrast, `packages/css` currently materializes a full `Array[Token]` before building `Stylesheet` AST nodes, and `minify` re-tokenizes each declaration value and prelude string.
-  - Moving `parse_stylesheet` and `minify` to a single-pass streaming tokenizer (without materializing the intermediate `Array[Token]`) is the clearest path to closing the remaining gap with Rust `cssparser` while keeping RSS under 15 MiB.
+- **Token counting vs `tokenize()`**: `count_tokens()` (zero-allocation scan) beats Rust `cssparser`'s token walk by `1.28x–1.63x` across all 5 corpora. Materializing a full `Array[Token]` via `tokenize()` takes `61.8–89.8 ms` (`0.47x–0.52x` of `cssparser`'s streaming walk) because it allocates every `Token` struct upfront.
+- **Single-pass streaming `parse_stylesheet()`**: By consuming `Lexer` directly without materializing `Array[Token]`, Pion `parse_stylesheet()` matches or beats Rust `cssparser`'s owned generic AST (`1.05x` on `design_system`, `1.18x` on `nesting_heavy`, `0.79x–0.94x` on the other 3 corpora) with comparable RSS (`8–41 MB`), and beats Rust `lightningcss` parse by `1.62x–4.93x` across all 5 corpora.
+- **Single-pass streaming `minify()`**: By streaming directly from `Lexer` to `StringBuilder` (zero AST, zero `Array[Token]`), Pion `minify()` beats Rust `lightningcss` minify on all 5 corpora (`1.26x–4.55x` faster) while using `4.9x–29.5x` less memory (`5.7–7.6 MB` peak RSS). Note that `lightningcss` performs deeper typed property optimizations (e.g. shorthand merging, vendor prefixing, color-space conversion), whereas Pion performs syntax-preserving structural, whitespace, number, zero-unit, and hex minification.
 
 ## Verification
 
 - `pionc fmt --check packages/css` — pass
 - `pionc check --json packages/css` — pass (0 diagnostics)
-- `pionc test --json packages/css` — **27 / 27 passed** (W3C CSS Syntax 3 tokenizer, stylesheet/declaration parser, Selectors Level 4 specificity, all 148 CSS Color 4 named colors + hex/rgb/hsl, Media Queries Level 4, serializer/minifier, and Day-1 red-team suite)
-- `packages/css/wasm_smoke` — all 4 modes pass with exit code `0`:
-  - Native debug & Native release
-  - `wasm32` debug & `wasm32` release executed under `node ~/.pion/share/pion/pion_wasm_rt.mjs`
+- `pionc test --json packages/css` — **32 / 32 passed**
+- `pionc test --json -p css_audit packages/css/audit` — **34 / 34 passed** (0 P0/P1/P2/control failures)
+- `sh packages/css/audit/run_audit.sh`:
+  - `tok_diff.py` (17,904 cases + 2,014 raw-byte inputs): **99.85%** `pion==cssparser`, **2,014 / 2,014 (100%)** `tokenize_bytes==cssparser(lossy)`, **0** invalid UTF-8 in `tokenize(String)`
+  - `minify_diff.py` (2,114 cases): **0 / 1,991 (0.0%)** generated semantic breaks, **0** `to_css` semantic breaks, **0** strict-parser rejections, **0** non-idempotent cases
+  - `dos.py` (20 probes × N/2N): **20 / 20** linear, **0** crashes
+  - `wasm4.py` (12 corpora × 4 modes): **12 / 12** byte-identical SHA-256 across Native debug/release & Wasm32 debug/release under Node, **0** traps
+- `packages/css/wasm_smoke` — all 4 modes pass with exit code `0`
