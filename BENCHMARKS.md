@@ -336,9 +336,9 @@
 | `xpath` | W3 深层递归轴 + 聚合 | 156,950 B | 49.204 ms | 69.649 ms (`rust_sxd`) / **42.092 ms** (`c_libxml2`) | **1.42x**（vs Rust）/ 0.86x（vs C） | 5.20 MiB | **4.55 MiB** |
 | `xpath` | W4 大节点集比较（8,000 × 8,000） | 182,939 B | **36.693 ms** | 276.451 ms (`rust_sxd`) / 585.176 ms (`c_libxml2`) | **7.53x**（vs Rust）/ **15.95x**（vs C） | 10.00 MiB | **7.45 MiB** |
 | `xpath` | W5 > 1 MB 文档（50,000 元素，默认 `XPathLimits`） | 1,188,939 B | **168.141 ms** | 404.483 ms (`rust_sxd`) / 195.615 ms (`c_libxml2`) | **2.41x**（vs Rust）/ **1.16x**（vs C） | **27.69 MiB** | 29.89 MiB (C) |
-| `proxy` | W1 代理 URL 解析 + 强制脱敏 + `NO_PROXY` 匹配 | 200,000 ops | 145.185 ms (`725.93 ns/op`) | **77.739 ms** (`go_ref`，`net/url` + `net/netip` 手写) | 0.54x | **1.92 MiB** | 16.48 MiB |
-| `proxy` | W2 SOCKS5 完整双向握手（`UserPass` + `ATYP=0x03`） | 500,000 rounds | 271.333 ms (`542.67 ns/op`) | **40.945 ms** (`go_ref`，内联字节切片) | 0.15x | **1.81 MiB** | 9.14 MiB |
-| `proxy` | W3 HTTP `CONNECT` + 明文正向代理头清洗（Pion 含完整 CL/TE 走私校验） | 100,000 requests | 438.944 ms (`4389.44 ns/op`) | **374.719 ms** (`go_net_http`) | 0.85x | **2.02 MiB** | 21.84 MiB |
+| `proxy` | W1 代理 URL 解析 + 强制脱敏 + `NO_PROXY` 匹配 | 200,000 ops | **59.627 ms** (`298.14 ns/op`) | 71.454 ms (`go_ref`，`net/url` + `net/netip` 手写) | **1.20x** | **1.84 MiB** | 16.00 MiB |
+| `proxy` | W2 SOCKS5 完整双向握手（`UserPass` + `ATYP=0x03`） | 500,000 rounds | 213.555 ms (`427.11 ns/op`) | **39.357 ms** (`go_ref`，内联字节切片) | 0.18x | **1.83 MiB** | 9.20 MiB |
+| `proxy` | W3 HTTP `CONNECT` + 明文正向代理头清洗（Pion 含完整 CL/TE 走私校验） | 100,000 requests | **245.813 ms** (`2458.13 ns/op`) | 382.039 ms (`go_net_http`) | **1.55x** | **1.95 MiB** | 19.59 MiB |
 
 ## 各包明细
 
@@ -1548,7 +1548,7 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 
 ### crypto
 
-`v0.4.0`。参考实现：Go `go1.27.3` 标准库 `crypto/sha256` / `crypto/sha512` / `crypto/hmac` / `crypto/ed25519` / `crypto/ecdsa` / `crypto/aes` + `cipher.NewGCMWithNonceSize` / `crypto/ecdh` 与 `golang.org/x/crypto` `v0.58.0`（`curve25519` / `chacha20poly1305` / `hkdf` / `pbkdf2` / `scrypt`），源码见 [`packages/crypto/bench/`](packages/crypto/bench/)。数据取自包 v0.3.0 红队修复后刷新的 README（`Darwin arm64`，`AFK-surf/pion@66d2b4b`），发布验证（`verify.sh` 79 包、`audit_v030/run_audit.sh tests` / `diff` / `ct`、`audit/ct_ssa_check.py` 与 `wasm_smoke` 4 模式）同样使用 `AFK-surf/pion@66d2b4b`（`v0.2.0` 为 `AFK-surf/pion@c375cee`）。`sh packages/crypto/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对 12 个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5`（严格交替），双方 stdout SHA-256 在每个负载上逐字节一致。详见 [`packages/crypto/README.md`](packages/crypto/README.md)。
+`v0.4.1`。参考实现：Go `go1.27.3` 标准库 `crypto/sha256` / `crypto/sha512` / `crypto/hmac` / `crypto/ed25519` / `crypto/ecdsa` / `crypto/aes` + `cipher.NewGCMWithNonceSize` / `crypto/ecdh` 与 `golang.org/x/crypto` `v0.58.0`（`curve25519` / `chacha20poly1305` / `hkdf` / `pbkdf2` / `scrypt`），源码见 [`packages/crypto/bench/`](packages/crypto/bench/)。数据取自包 v0.3.0 红队修复后刷新的 README（`Darwin arm64`，`AFK-surf/pion@66d2b4b`），发布验证（`verify.sh` 79 包、`audit_v030/run_audit.sh tests` / `diff` / `ct`、`audit/ct_ssa_check.py` 与 `wasm_smoke` 4 模式）同样使用 `AFK-surf/pion@66d2b4b`（`v0.2.0` 为 `AFK-surf/pion@c375cee`）。`sh packages/crypto/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对 12 个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5`（严格交替），双方 stdout SHA-256 在每个负载上逐字节一致。详见 [`packages/crypto/README.md`](packages/crypto/README.md)。
 
 | Workload | Pion Median / Peak RSS | Go Median / Peak RSS | Pion 吞吐 / 单次 | Pion vs Go |
 | --- | ---: | ---: | ---: | ---: |
@@ -1564,8 +1564,10 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 | NIST P-256 ES256（50 签名 + 50 验签） | 121.651 ms / 1.97 MiB | 14.271 ms / 5.81 MiB | 1.22 ms/op | 0.12x |
 | NIST P-256 ECDH（2,000 次密钥交换，v0.3.0） | 1,402.492 ms / 1.89 MiB | 69.888 ms / 7.09 MiB | 701.25 µs/op | 0.05x |
 | NIST P-256 公钥校验（20,000 非压缩 + 20,000 压缩，v0.3.0） | 828.830 ms / 1.81 MiB | 81.086 ms / 11.11 MiB | 20.72 µs/op | 0.10x |
-| PBKDF2-HMAC-SHA256（500,000 次迭代，32 B，v0.4.0） | 251.241 ms / 1.78 MiB | 51.484 ms / 4.95 MiB | 502.48 ns/op | 0.20x |
-| scrypt（`N=16384, r=8, p=1`，32 B × 4，v0.4.0） | 130.075 ms / 33.78 MiB | 80.441 ms / 39.81 MiB | 32.52 ms/op | 0.62x |
+| PBKDF2-HMAC-SHA256（500,000 次迭代，32 B，v0.4.1） | 175.074 ms / 1.81 MiB | 55.964 ms / 4.97 MiB | 350.15 ns/op | 0.32x（Go `-tags purego` 纯标量的 0.95x） |
+| scrypt（`N=16384, r=8, p=1`，32 B × 4，v0.4.1） | 101.280 ms / **17.80 MiB** | 83.341 ms / 39.38 MiB | 25.32 ms/op | 0.82x |
+
+v0.4.1（性能补丁，API 与输出不变，`wasm_smoke` SHA-256 同 v0.4.0）：scrypt 改用打包 `FixedArray[UInt64]` 的 `V` / `xy`、Phase 1 直接写 `V`、Phase 2 融合 `BlockMix(X ^ V[j])`，0.62x → **0.82x**、峰值 RSS 33.78 → **17.80 MiB**（余下约 18–19 ms 差距对应 QBE 把每次循环移位生成 `lsl`/`lsr`/`orr` 三条指令而非 ARM64 单条 `ror`）；PBKDF2-HMAC-SHA256 内循环改用全展开的 32 字节单块 SHA-256 压缩，0.20x → **0.32x**，对 Go `-tags purego` 纯标量 SHA-256 为 **0.95x**（320 ns/op），余下差距即 ARMv8 `SHA256H` 约 3.1× 的硬件指令优势。
 
 v0.4.0：83 / 83 单测；`wasm_smoke` 4 模式 stdout 均为 `4605 B`、SHA-256 `10520b20c8735bf7eec51d3ef5c4fb5c744b47e12161e43a0f2798b62bc38fac`（新增 PBKDF2 / scrypt 向量）。新增 2 行数据取自包 v0.4.0 README，迭代数按 Go 侧 ≥ 50 ms 实际工作量设定；发布验证中 `audit_v040/run_audit.sh` 的 `bench` 门禁复测 Go 固定进程开销占 6 % / 4 %，进程内放大复测 PBKDF2 0.185x、scrypt 0.587x，与仓库比值（0.208x / 0.633x）相差在 1.1 倍以内。PBKDF2 落后来自 Go 在 `darwin/arm64` 上用 ARMv8 `SHA256H` 指令（与 SHA-256 行同一差距）；scrypt 主要受 Salsa20/8 与内存带宽限制，达 Go 的 0.62x，峰值 RSS 33.78 MiB 低于 Go 的 39.81 MiB。v0.4.0 红队审计（[`packages/crypto/audit_v040/REPORT.md`](packages/crypto/audit_v040/REPORT.md)）：0 P0 + 1 P1 + 3 P2 全部修复，1,103 个 Go / Node.js 交叉核对向量 4 模逐字节一致，17 / 17 变异体被检出。
 
@@ -2584,10 +2586,10 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000` | SHA-256: `
 
 | Workload | Pion Median (ms) | Go Median (ms) | Pion ns/op | Pion RSS | Go RSS | Pion vs Go | SHA-256 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| W1 代理 URL 解析 + 强制脱敏 + `NO_PROXY` 匹配（200,000 ops，vs `go_ref`） | 145.185 | **77.739** | 725.93 | **1.92 MiB** | 16.48 MiB | 0.54x | `96dfab9a...` |
-| W2 SOCKS5 完整双向握手（`UserPass` + `ATYP=0x03`，500,000 rounds，vs `go_ref`） | 271.333 | **40.945** | 542.67 | **1.81 MiB** | 9.14 MiB | 0.15x | `bd5d0f40...` |
-| W3 HTTP `CONNECT` + 明文正向代理头清洗（100,000 requests，vs `go_net_http`） | 438.944 | **374.719** | 4,389.44 | **2.02 MiB** | 21.84 MiB | 0.85x | `88bc1dee...` |
+| W1 代理 URL 解析 + 强制脱敏 + `NO_PROXY` 匹配（200,000 ops，vs `go_ref`） | **59.627** | 71.454 | 298.14 | **1.84 MiB** | 16.00 MiB | **1.20x** | `96dfab9a...` |
+| W2 SOCKS5 完整双向握手（`UserPass` + `ATYP=0x03`，500,000 rounds，vs `go_ref`） | 213.555 | **39.357** | 427.11 | **1.83 MiB** | 9.20 MiB | 0.18x | `bd5d0f40...` |
+| W3 HTTP `CONNECT` + 明文正向代理头清洗（100,000 requests，vs `go_net_http`） | **245.813** | 382.039 | 2,458.13 | **1.95 MiB** | 19.59 MiB | **1.55x** | `88bc1dee...` |
 
-诚实说明：三项全部落后 Go。W3 接近持平（0.85x；红队审计复测 0.87x），且 Pion 额外做了 Go 基准循环省略的 CL/TE 走私校验，峰值 RSS 低 10.8 倍；W1 为 0.54x（RSS 低 8.6 倍），主要来自辅助扫描中的 `String::to_bytes()` 拷贝；W2 为 0.15x（RSS 低 5.0 倍），Go 侧是不分配的内联字节切片循环，Pion 侧每帧构造类型化编解码结构体。
+诚实说明（v0.1.1 性能补丁，API 与输出不变）：W3 领先 Go `net/http` **1.55x**（v0.1.0 为 0.85x），且 Pion 额外做了 Go 基准循环省略的 CL/TE 走私校验，峰值 RSS 低 10.0 倍；W1 领先手写 Go 参考 **1.20x**（v0.1.0 为 0.54x，RSS 低 8.7 倍），来自零分配 `NoProxyMatcher::matches` 与按 `code_unit_at` 直接扫描 URL；W2 仍落后（0.18x，v0.1.0 为 0.15x，271 → 214 ms，RSS 低 5.0 倍），Go 侧是不分配的内联字节切片循环，ARM64 反汇编显示余下差距主要是每轮约 42 对装箱 `Result[DecodeStatus[T], ProxyError]` / 枚举 / 非 `val` 结构体的分配与释放及 `Bytes::slice().to_string()` 双重拷贝。
 
 红队：16 / 16 单测，`audit/` 零改动；2 P0 + 2 P1 + 11 P2 全部修复，`audit/run_audit.sh` **exit 0**（15 / 15 finding 与 10 / 10 control 通过、6 万例流式 fuzz `violations=0`、4 模 SHA-256 一致）；`wasm_smoke` 4 模式 stdout 均为 `30 B`、SHA-256 `f55443b19671d3efef568b67f2a3a147789897004ce10771f1be4961e0f26245`。
