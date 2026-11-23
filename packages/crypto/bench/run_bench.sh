@@ -171,3 +171,23 @@ python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --baseline go_stdlib \
   --warmup 1 --rounds 5 --ops 40000 \
   --md-out "$OUT_DIR/bench_p256_validate.md" --json-out "$OUT_DIR/bench_p256_validate.json"
+
+echo ""
+echo "=== BENCH 13: PBKDF2-HMAC-SHA256 (500,000 iterations, dkLen=32) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "Crypto Bench 13: PBKDF2-HMAC-SHA256 (500,000 iterations, dkLen=32)" \
+  --impl "pion=$BIN_DIR/pion_crypto_bench pbkdf2_sha256" \
+  --impl "go_xcrypto=$BIN_DIR/go_crypto_bench pbkdf2_sha256" \
+  --baseline go_xcrypto \
+  --warmup 1 --rounds 5 --ops 500000 \
+  --md-out "$OUT_DIR/bench_pbkdf2_sha256.md" --json-out "$OUT_DIR/bench_pbkdf2_sha256.json"
+
+echo ""
+echo "=== BENCH 14: scrypt (N=16384, r=8, p=1, dkLen=32 x 4) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "Crypto Bench 14: scrypt (N=16384, r=8, p=1, dkLen=32 x 4)" \
+  --impl "pion=$BIN_DIR/pion_crypto_bench scrypt" \
+  --impl "go_xcrypto=$BIN_DIR/go_crypto_bench scrypt" \
+  --baseline go_xcrypto \
+  --warmup 1 --rounds 5 --ops 4 \
+  --md-out "$OUT_DIR/bench_scrypt.md" --json-out "$OUT_DIR/bench_scrypt.json"
