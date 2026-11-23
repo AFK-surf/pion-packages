@@ -1,0 +1,544 @@
+///| Red-team regression tests for packages/protobuf @ 8df2404 (branch feat/pkg-protobuf).
+///
+/// Every `redteam_*` test asserts what the reference implementations do
+/// (Go google.golang.org/protobuf v1.36.6 dynamicpb/protojson + protocompile, Rust prost 0.13.5,
+/// protoc) — a FAILURE here is the evidence. The expected values were produced by
+/// go/cmd/oracle (see ../REPORT.md, `run_audit.sh` section 2).
+/// `control_*` tests are attacks Pion survived; they must keep passing.
+/// Crash / DoS findings (SIGSEGV, quadratic time) cannot live in a unit test that must finish:
+/// they are reproduced by ../run_audit.sh (see REPORT.md).
+
+import "protobuf"
+
+///|
+fn sch(src : String) -> protobuf::Schema {
+  match protobuf::parse_schema(src) {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, "schema must parse: " + protobuf::error_message(e))
+      protobuf::Schema::{
+        syntax: protobuf::Syntax::Proto3,
+        package_name: "",
+        imports: [],
+        options: [],
+        messages: [],
+        enums: [],
+      }
+    }
+  }
+}
+
+///|
+fn parses(src : String) -> Bool {
+  match protobuf::parse_schema(src) {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+///|
+fn field_number_of(s : protobuf::Schema, msg : String, field : String) -> Int {
+  match protobuf::schema_find_message(s, msg) {
+    Some(m) => {
+      let mut i = 0
+      while i < m.fields.length() {
+        if m.fields[i].name == field {
+          return m.fields[i].number
+        }
+        i = i + 1
+      }
+      -1
+    }
+    None => -2
+  }
+}
+
+// ===========================================================================
+// F-1 (P0) Type-name resolution is not scoped: an unqualified name falls back to the FIRST
+// message/enum with that short name anywhere in the file (depth-first), and enums win over
+// messages. protoc/protocompile resolve C++-style from the innermost scope outwards.
+// Result: fields silently decode with the WRONG descriptor.
+// ===========================================================================
+
+///|
+test "redteam_scoped_name_resolution_picks_enclosing_scope" {
+  // B.C.item refers to B.Item (enclosing scope). Pion resolves it to A.Item (first in file).
+  let s = sch(
+    "syntax = \"proto3\";\n" +
+    "message A { message Item { int32 x = 1; } Item a = 1; }\n" +
+    "message B { message Item { string name = 1; } message C { Item item = 1; } C c = 1; }",
+  )
+  // B{ c: C{ item: Item{ name: "hi" } } }
+  let got = dec_json(s, "B", "0a060a040a026869")
+  let want = "{\"c\":{\"item\":{\"name\":\"hi\"}}}" // go protojson
+  debug_assert(got == want, "B.C.item must be B.Item\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "redteam_message_not_shadowed_by_unrelated_enum_of_same_name" {
+  // Holder.status is the nested *message* Holder.Status; Other.Status is an unrelated *enum*.
+  // Pion asks "is there an enum called Status anywhere?" first, treats the message as an enum,
+  // sees wire type 2 != varint and drops the whole sub-message into unknown fields.
+  let s = sch(
+    "syntax = \"proto3\";\n" +
+    "message Other { enum Status { UNKNOWN = 0; OK = 1; } Status s = 1; }\n" +
+    "message Holder { message Status { int32 code = 1; } Status status = 1; }",
+  )
+  let got = dec_json(s, "Holder", "0a020807")
+  let want = "{\"status\":{\"code\":7}}"
+  debug_assert(got == want, "Holder.status must decode as message\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "redteam_decoded_submessage_reencodes_with_its_own_descriptor" {
+  // decode_dynamic stores DynamicMessage.message_name = desc.name (short "Item"), so
+  // encode_dynamic / to_proto3_json on a decoded B.Item look up A.Item instead.
+  let s = sch(
+    "syntax = \"proto3\";\n" +
+    "message A { message Item { int32 x = 1; } }\n" +
+    "message B { message Item { string name = 1; } }",
+  )
+  // go: {"name":"hi"} / 0a026869. Pion prints A.Item's field name ("x") and fails to re-encode.
+  let js = dec_json(s, "B.Item", "0a026869")
+  debug_assert(js == "{\"name\":\"hi\"}", "JSON of decoded B.Item\n got:  " + js + "\n want: {\"name\":\"hi\"}")
+  match protobuf::decode_dynamic_default(s, "B.Item", hx("0a026869")) {
+    Err(e) => debug_assert(false, "decode B.Item: " + protobuf::error_message(e))
+    Ok(m) => {
+      match protobuf::encode_dynamic(s, m) {
+        Ok(b) => debug_assert(tohex(b) == "0a026869", "re-encode changed bytes: " + tohex(b))
+        Err(e) => debug_assert(false, "encode_dynamic(decoded B.Item) failed: " + protobuf::error_message(e))
+      }
+    }
+  }
+}
+
+// ===========================================================================
+// F-2 (P0) `.proto` integer literals: octal is read as decimal and overflow wraps silently.
+// protoc: `017` is octal 15; numbers > 2^29-1 (after full 64-bit parse) are rejected.
+// ===========================================================================
+
+///|
+test "redteam_octal_field_number_is_octal" {
+  let s = sch("syntax = \"proto3\"; message M { int32 a = 017; }")
+  let n = field_number_of(s, "M", "a")
+  debug_assert(n == 15, "017 is octal 15 (protoc/protocompile), got " + n.to_string())
+}
+
+///|
+test "redteam_field_number_overflow_rejected" {
+  // 4294967297 = 2^32 + 1; Pion truncates to Int and gets field number 1.
+  debug_assert(
+    !parses("syntax = \"proto3\"; message M { int32 a = 4294967297; }"),
+    "field number 4294967297 must be rejected",
+  )
+}
+
+///|
+test "redteam_enum_value_overflow_rejected" {
+  // protoc: "Integer out of range." Pion wraps 2^32 to 0.
+  debug_assert(
+    !parses("syntax = \"proto3\"; enum E { Z = 0; BIG = 4294967296; }"),
+    "enum value 4294967296 must be rejected",
+  )
+}
+
+///|
+test "redteam_hex_literal_without_digits_rejected" {
+  debug_assert(!parses("syntax = \"proto3\"; enum E { Z = 0x; }"), "`0x` is not a number")
+}
+
+// ===========================================================================
+// F-5 (P1) Proto3 Canonical JSON drops explicitly-present zero values
+// (proto3 `optional` and every proto2 singular field have explicit presence).
+// ===========================================================================
+
+///|
+test "redteam_json_proto3_optional_zero_is_emitted" {
+  let s = sch("syntax = \"proto3\"; message M { optional int32 a = 1; optional string b = 2; }")
+  let got = dec_json(s, "M", "08001200")
+  let want = "{\"a\":0,\"b\":\"\"}"
+  debug_assert(got == want, "proto3 optional zero must be in JSON\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "redteam_json_proto2_optional_zero_is_emitted" {
+  let s = sch("syntax = \"proto2\"; message M { optional int32 a = 1; optional bool b = 2; }")
+  let got = dec_json(s, "M", "08001000")
+  let want = "{\"a\":0,\"b\":false}"
+  debug_assert(got == want, "proto2 optional zero must be in JSON\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "redteam_json_emit_defaults_emits_unpopulated_fields" {
+  // protojson EmitUnpopulated: every implicit-presence field is printed with its default.
+  let s = sch("syntax = \"proto3\"; message M { int32 a = 1; string b = 2; repeated int32 c = 3; }")
+  match protobuf::decode_dynamic_default(s, "M", Bytes::new(0)) {
+    Err(e) => debug_assert(false, protobuf::error_message(e))
+    Ok(m) => {
+      let opts = protobuf::JsonOptions::{ ..protobuf::JsonOptions::default(), emit_defaults: true }
+      match protobuf::to_proto3_json_with_options(s, m, opts) {
+        Ok(js) => {
+          let want = "{\"a\":0,\"b\":\"\",\"c\":[]}"
+          debug_assert(js == want, "emit_defaults\n got:  " + js + "\n want: " + want)
+        }
+        Err(e) => debug_assert(false, protobuf::error_message(e))
+      }
+    }
+  }
+}
+
+// ===========================================================================
+// F-6 (P1) map<K,V>: duplicate keys on the wire are kept (no last-wins).
+// Every Protobuf runtime (Go, C++, Java, prost HashMap) keeps exactly one entry per key.
+// ===========================================================================
+
+///|
+test "redteam_map_duplicate_key_last_wins_json" {
+  let s = sch("syntax = \"proto3\"; message M { map<string, int32> m = 1; }")
+  // entries {"k":1} then {"k":2}
+  let got = dec_json(s, "M", "0a050a016b10010a050a016b1002")
+  let want = "{\"m\":{\"k\":2}}"
+  debug_assert(got == want, "duplicate map key\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "redteam_map_duplicate_key_last_wins_reencode" {
+  let s = sch("syntax = \"proto3\"; message M { map<string, int32> m = 1; }")
+  let got = dec_enc(s, "M", "0a050a016b10010a050a016b1002")
+  let want = "0a050a016b1002" // go: proto.Marshal(Deterministic) of the decoded message
+  debug_assert(got == want, "duplicate map key re-encode\n got:  " + got + "\n want: " + want)
+}
+
+// ===========================================================================
+// F-7 (P1) proto2 / real-world `.proto` grammar that the parser rejects.
+// protocompile (and protoc) accept every schema below.
+// ===========================================================================
+
+///|
+test "redteam_schema_nested_extend_block" {
+  debug_assert(
+    parses(
+      "syntax = \"proto2\"; message Foo { extensions 100 to max; }\n" +
+      "message Bar { extend Foo { optional int32 bar = 100; } optional int32 x = 1; }",
+    ),
+    "extend inside a message must parse",
+  )
+}
+
+///|
+test "redteam_schema_proto2_group_field" {
+  debug_assert(
+    parses("syntax = \"proto2\"; message M { optional group Result = 1 { optional string url = 2; } }"),
+    "proto2 group fields must parse",
+  )
+}
+
+///|
+test "redteam_schema_aggregate_option_with_brace_in_string" {
+  // The `{ ... }` scanner counts braces inside string literals.
+  debug_assert(
+    parses(
+      "syntax = \"proto3\"; import \"google/protobuf/descriptor.proto\";\n" +
+      "message Opt { string s = 1; } extend google.protobuf.MessageOptions { Opt my_opt = 50001; }\n" +
+      "message M { option (my_opt) = { s: \"}\" }; int32 a = 1; }",
+    ),
+    "aggregate option value containing \"}\" must parse",
+  )
+}
+
+///|
+test "redteam_schema_editions_2023" {
+  debug_assert(
+    parses("edition = \"2023\"; message M { int32 a = 1; }"),
+    "edition = \"2023\" must parse (protobuf-go v1.36 supports editions)",
+  )
+}
+
+///|
+test "redteam_schema_string_hex_and_octal_escapes" {
+  // json_name = "\x41\102" is "AB" in protoc.
+  let s = sch("syntax = \"proto3\"; message M { int32 a = 1 [json_name = \"\\x41\\102\"]; }")
+  let got = dec_json(s, "M", "0801")
+  debug_assert(got == "{\"AB\":1}", "escaped json_name\n got:  " + got + "\n want: {\"AB\":1}")
+}
+
+// ===========================================================================
+// F-12 (P2) Semantic validation protoc performs that the parser skips (all accepted by Pion).
+// ===========================================================================
+
+///|
+test "redteam_schema_field_uses_reserved_number_rejected" {
+  debug_assert(
+    !parses("syntax = \"proto3\"; message M { reserved 5; int32 a = 5; }"),
+    "field number 5 is reserved",
+  )
+}
+
+///|
+test "redteam_schema_duplicate_field_name_rejected" {
+  debug_assert(
+    !parses("syntax = \"proto3\"; message M { int32 a = 1; string a = 2; }"),
+    "duplicate field name",
+  )
+}
+
+///|
+test "redteam_schema_proto3_first_enum_value_must_be_zero" {
+  debug_assert(
+    !parses("syntax = \"proto3\"; enum E { ONE = 1; }"),
+    "proto3 enums must start with 0",
+  )
+}
+
+///|
+test "redteam_schema_proto3_required_rejected" {
+  debug_assert(
+    !parses("syntax = \"proto3\"; message M { required int32 a = 1; }"),
+    "required is not allowed in proto3",
+  )
+}
+
+///|
+test "redteam_schema_json_name_conflict_rejected" {
+  // foo_bar and fooBar both map to JSON "fooBar".
+  debug_assert(
+    !parses("syntax = \"proto3\"; message M { int32 foo_bar = 1; int32 fooBar = 2; }"),
+    "JSON name conflict",
+  )
+}
+
+///|
+test "redteam_schema_enum_alias_without_allow_alias_rejected" {
+  debug_assert(
+    !parses("syntax = \"proto3\"; enum E { A = 0; B = 0; }"),
+    "duplicate enum value without allow_alias",
+  )
+}
+
+///|
+test "redteam_schema_unresolved_type_rejected" {
+  debug_assert(
+    !parses("syntax = \"proto3\"; message M { Missing m = 1; }"),
+    "unknown type Missing",
+  )
+}
+
+// ===========================================================================
+// F-9 (P1) proto2 `string` fields are not UTF-8 validated by any upstream runtime
+// (Go validates only proto3 / editions utf8_validation=VERIFY). Pion rejects the message.
+// ===========================================================================
+
+///|
+test "redteam_proto2_string_accepts_non_utf8" {
+  let s = sch("syntax = \"proto2\"; message M { optional string s = 1; }")
+  let got = dec_enc(s, "M", "0a02e9ff")
+  debug_assert(got == "0a02e9ff", "proto2 string latin-1 bytes must round-trip, got " + got)
+}
+
+// ===========================================================================
+// F-13 (P2) proto2 required fields are not checked (proto.Unmarshal returns
+// "required field M.a not set").
+// ===========================================================================
+
+///|
+test "redteam_proto2_missing_required_rejected" {
+  let s = sch("syntax = \"proto2\"; message M { required int32 a = 1; optional int32 b = 2; }")
+  let got = dec_json(s, "M", "1001")
+  debug_assert(got.length() >= 3 && got.slice(0, 3) == "ERR", "missing required a must fail, got " + got)
+}
+
+// ===========================================================================
+// F-14 (P2) Proto3 JSON: float (binary32) is printed with binary64 digits.
+// protojson: strconv.AppendFloat(v, 'g', -1, 32) -> "0.1".
+// ===========================================================================
+
+///|
+test "redteam_json_float32_shortest" {
+  let s = sch("syntax = \"proto3\"; message M { float f = 1; }")
+  let got = dec_json(s, "M", "0dcdcccc3d") // 0.1f
+  debug_assert(got == "{\"f\":0.1}", "float32 JSON\n got:  " + got + "\n want: {\"f\":0.1}")
+}
+
+// ===========================================================================
+// F-11 (P1) map entry with a mis-typed key/value field: Go skips it as unknown,
+// Pion fails the whole message.
+// ===========================================================================
+
+///|
+test "redteam_map_entry_wrong_wire_type_is_skipped" {
+  let s = sch("syntax = \"proto3\"; message M { map<string, int32> m = 1; }")
+  // entry { key(1) = "k", value(2) as fixed32 (wire type 5) = 7 }
+  let got = dec_json(s, "M", "0a080a016b1507000000")
+  let want = "{\"m\":{\"k\":0}}"
+  debug_assert(got == want, "mis-typed map value\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "redteam_map_entry_wrong_key_wire_type_is_skipped" {
+  let s = sch("syntax = \"proto3\"; message M { map<string, int32> m = 1; }")
+  // entry { key(1) as varint 3, value(2) = 7 } -> go: {"m":{"":7}}
+  let got = dec_json(s, "M", "0a0408031007")
+  debug_assert(got == "{\"m\":{\"\":7}}", "mis-typed map key\n got:  " + got + "\n want: {\"m\":{\"\":7}}")
+}
+
+// ===========================================================================
+// F-8 (P1) Imports are recorded but never resolved: any message that uses a well-known type
+// (google.protobuf.Timestamp, wrappers, Struct, Any, ...) cannot be decoded at all.
+// ===========================================================================
+
+///|
+test "redteam_wkt_timestamp_field_decodes" {
+  let s = sch("syntax = \"proto3\"; import \"google/protobuf/timestamp.proto\"; message M { google.protobuf.Timestamp ts = 1; }")
+  let got = dec_json(s, "M", "0a0408011005")
+  let want = "{\"ts\":\"1970-01-01T00:00:01.000000005Z\"}" // go protojson
+  debug_assert(got == want, "Timestamp\n got:  " + got + "\n want: " + want)
+}
+
+// ===========================================================================
+// F-5 (cont.) proto2 fields with explicit presence: a present zero value is dropped from JSON
+// even for `required` fields and empty `bytes`.
+// ===========================================================================
+
+///|
+test "redteam_json_proto2_required_zero_is_emitted" {
+  let s = sch("syntax = \"proto2\"; message R { required int32 a = 1; optional bytes b = 2; }")
+  let got = dec_json(s, "R", "08001200")
+  debug_assert(got == "{\"a\":0,\"b\":\"\"}", "proto2 present zeros\n got:  " + got + "\n want: {\"a\":0,\"b\":\"\"}")
+}
+
+// ===========================================================================
+// Controls — attacks Pion survived (must stay green).
+// ===========================================================================
+
+///|
+test "control_bool_high_bits_true" {
+  let s = sch("syntax = \"proto3\"; message M { bool b = 1; int32 i = 2; }")
+  // b = varint 0x1_0000_0000 (low 32 bits zero), i = same value -> int32 truncates to 0
+  let got = dec_json(s, "M", "088080808010108080808010")
+  debug_assert(got == "{\"b\":true}", "bool high bits\n got: " + got)
+}
+
+///|
+test "control_double_json_roundtrip_precision" {
+  let s = sch("syntax = \"proto3\"; message M { double a = 1; double b = 2; double c = 3; }")
+  // 0.30000000000000004, 1e-300, 1.7976931348623157e308
+  let got = dec_json(s, "M", "09343333333333d33f" + "1159f3f8c21f6ea501" + "19ffffffffffffef7f")
+  let want = "{\"a\":0.30000000000000004,\"b\":1e-300,\"c\":1.7976931348623157e+308}"
+  debug_assert(got == want, "double JSON\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "control_json_int64_extremes_are_strings" {
+  let s = sch("syntax = \"proto3\"; message M { int64 a = 1; uint64 b = 2; sint64 c = 3; fixed64 d = 4; sfixed64 e = 5; }")
+  let w = protobuf::WireWriter::new()
+  w.write_int64_field(1, -9223372036854775807L - 1L)
+  w.write_uint64_field(2, 18446744073709551615UL)
+  w.write_sint64_field(3, -9223372036854775807L - 1L)
+  w.write_fixed64_field(4, 18446744073709551615UL)
+  w.write_sfixed64_field(5, -9223372036854775807L - 1L)
+  let got = dec_json(s, "M", tohex(w.to_bytes()))
+  let want = "{\"a\":\"-9223372036854775808\",\"b\":\"18446744073709551615\",\"c\":\"-9223372036854775808\",\"d\":\"18446744073709551615\",\"e\":\"-9223372036854775808\"}"
+  debug_assert(got == want, "int64 JSON\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "control_oneof_zero_value_present_on_wire_and_json" {
+  let s = sch("syntax = \"proto3\"; message M { oneof o { int32 a = 1; string b = 2; } }")
+  debug_assert(dec_json(s, "M", "0800") == "{\"a\":0}", "oneof zero int: " + dec_json(s, "M", "0800"))
+  debug_assert(dec_enc(s, "M", "1200") == "1200", "oneof empty string re-encode: " + dec_enc(s, "M", "1200"))
+  // switching arms clears the old arm
+  debug_assert(dec_json(s, "M", "08051200") == "{\"b\":\"\"}", "oneof switch: " + dec_json(s, "M", "08051200"))
+}
+
+///|
+test "control_oneof_same_arm_message_merges" {
+  let s = sch("syntax = \"proto3\"; message Sub { int32 x = 1; int32 y = 2; } message M { oneof o { Sub s = 1; int32 i = 2; } }")
+  // s{x:1} then s{y:2} -> merged s{x:1,y:2}
+  let got = dec_json(s, "M", "0a0208010a021002")
+  debug_assert(got == "{\"s\":{\"x\":1,\"y\":2}}", "oneof merge: " + got)
+}
+
+///|
+test "control_map_missing_key_and_value_get_defaults" {
+  let s = sch("syntax = \"proto3\"; message M { map<int64, string> m = 1; }")
+  debug_assert(dec_json(s, "M", "0a00") == "{\"m\":{\"0\":\"\"}}", "empty map entry: " + dec_json(s, "M", "0a00"))
+  // value before key
+  debug_assert(
+    dec_json(s, "M", "0a051201760807") == "{\"m\":{\"7\":\"v\"}}",
+    "value-before-key entry: " + dec_json(s, "M", "0a051201760807"),
+  )
+}
+
+///|
+test "control_packed_and_unpacked_interleaved" {
+  let s = sch("syntax = \"proto3\"; message M { repeated int32 r = 1; }")
+  // packed [1,2], unpacked 3, packed [] , packed [4]
+  let got = dec_json(s, "M", "0a020102" + "0803" + "0a00" + "0a0104")
+  debug_assert(got == "{\"r\":[1,2,3,4]}", "packed/unpacked: " + got)
+}
+
+///|
+test "control_json_lower_camel_case_edges" {
+  let s = sch("syntax = \"proto3\"; message M { int32 foo_bar_baz = 1; int32 _foo = 2; int32 foo__bar = 3; int32 foo_1bar = 4; int32 x = 5 [json_name = \"my-X\"]; }")
+  let got = dec_json(s, "M", "0801" + "1001" + "1801" + "2001" + "2801")
+  let want = "{\"fooBarBaz\":1,\"Foo\":1,\"fooBar\":1,\"foo1bar\":1,\"my-X\":1}"
+  debug_assert(got == want, "camelCase\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "control_json_string_escapes_and_bytes_base64" {
+  let s = sch("syntax = \"proto3\"; message M { string s = 1; bytes b = 2; }")
+  // s = "\x00\x1f\"\\", b = 0xff 0xfe
+  let got = dec_json(s, "M", "0a04001f225c" + "1202fffe")
+  let want = "{\"s\":\"\\u0000\\u001f\\\"\\\\\",\"b\":\"//4=\"}"
+  debug_assert(got == want, "escapes\n got:  " + got + "\n want: " + want)
+}
+
+///|
+test "control_float_bit_exact_roundtrip" {
+  let s = sch("syntax = \"proto3\"; message M { repeated float f = 1 [packed = false]; repeated double d = 2 [packed = false]; }")
+  // float: -0.0, min subnormal, +inf, signaling NaN 0x7f800001, quiet NaN 0x7fc00001
+  // double: -0.0, min subnormal, -inf, signaling NaN 0x7ff0000000000001
+  let hex2 = "0d00000080" + "0d01000000" + "0d0000807f" + "0d0100807f" + "0d0100c07f" +
+  "110000000000000080" + "110100000000000000" + "11000000000000f0ff" + "11010000000000f07f"
+  let got = dec_enc(s, "M", hex2)
+  debug_assert(got == hex2, "float bit-exact\n got:  " + got + "\n want: " + hex2)
+}
+
+///|
+test "control_unknown_fields_and_groups_roundtrip" {
+  let s = sch("syntax = \"proto3\"; message M { int32 a = 1; }")
+  // unknown 2:varint, 3:fixed32, 4:fixed64, 5:bytes, 6:group{7:varint}, and a = 1
+  let hex = "0801" + "1005" + "1d01020304" + "210102030405060708" + "2a03616263" + "33380134"
+  debug_assert(dec_enc(s, "M", hex) == hex, "unknowns: " + dec_enc(s, "M", hex))
+}
+
+///|
+test "control_schema_depth_bomb_rejected" {
+  let sb = StringBuilder::new()
+  sb.write_string("syntax = \"proto3\";")
+  let mut i = 0
+  while i < 50000 {
+    sb.write_string("message A { ")
+    i = i + 1
+  }
+  i = 0
+  while i < 50000 {
+    sb.write_string("} ")
+    i = i + 1
+  }
+  debug_assert(!parses(sb.to_string()), "50,000-deep schema must be rejected (not crash)")
+}
+
+///|
+test "control_schema_real_world_grpc_service" {
+  let src = "syntax = \"proto3\";\npackage pkg.v1;\nimport \"google/api/annotations.proto\";\n" +
+  "option go_package = \"example.com/pkg\" \";v1\";\n" +
+  "message Req { string name = 1; }\nmessage Resp { bytes data = 1; }\n" +
+  "service Foo {\n  option (svc.opt) = { a: \"}\" b: 1 };\n" +
+  "  rpc Bar (stream Req) returns (stream Resp) { option (google.api.http) = { post: \"/v1/{name=*}\" body: \"*\" }; }\n" +
+  "  rpc Baz(Req) returns (Resp);\n}\n" +
+  "enum E { option allow_alias = true; NEG = -1; Z = 0; ZZ = 0; HEX = 0x10; }\n" +
+  "message Outer { message Inner { int32 v = 1 [default = -0x1F, deprecated = true]; } .pkg.v1.Outer.Inner a = 1; Outer.Inner b = 2; Inner c = 3; /* block */ ; }"
+  debug_assert(parses(src), "gRPC-style schema must parse")
+}
