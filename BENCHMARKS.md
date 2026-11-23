@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–2 + `fts`）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -216,6 +216,9 @@
 | `graphql` | 大型 Schema SDL 解析 | 3 × 2,040,452 B | **82.777 ms** | 110.948 ms (`rust_apollo`) / 159.354 ms (`node_graphqljs`) | **1.34x** (vs Rust) · **1.93x** (vs Node) | 31.19 MiB | 23.17 / 301.61 MiB |
 | `graphql` | 复杂可执行查询解析 + 静态校验 | 20,000 queries | 211.478 ms | 391.700 ms (`rust_apollo`) / 168.720 ms (`node_graphqljs`) | **1.85x** (vs Rust) · 0.80x (vs Node) | 2.73 MiB | 2.70 / 72.91 MiB |
 | `graphql` | 查询压缩 + 重解析 + 打印往返 | 10,000 queries（7.25 MB） | **226.587 ms** | 278.217 ms (`rust_apollo`) / 1,050.477 ms (`node_graphqljs`) | **1.23x** (vs Rust) · **4.64x** (vs Node) | **2.75 MiB** | 2.97 / 81.27 MiB |
+| `woff2` | WOFF2 解码 `Arial.woff2`（含 `glyf`/`loca` 全表逐字节一致） | 755 KB SFNT × 10 | 66.423 ms | 36.295 ms (`rust_wuff`) | 0.55x | **7.84 MiB** | 9.80 MiB |
+| `woff2` | WOFF2 解码 `Monaco.woff2`（含 `glyf`/`loca` 全表逐字节一致） | 517 KB SFNT × 10 | 33.235 ms | 19.566 ms (`rust_wuff`) | 0.59x | 5.20 MiB | 4.75 MiB |
+| `woff2` | WOFF1 解码 `Arial.woff`（全表逐字节一致） | 755 KB SFNT × 10 | 43.867 ms | 29.495 ms (`rust_wuff`) | 0.67x | 6.59 MiB | 5.66 MiB |
 
 ## 各包明细
 
@@ -1669,3 +1672,15 @@ _SHA-256: `bd519a5b90095c9523b1d7ca8d114f327f4b87d62b2eec8f11c1560c84c5ca6b`._
 | `node_graphqljs` (`graphql 16.10.0`) | 1,050.477 | 1,003.847 | 1,124.690 | 6.90 | 105,047.74 | 81.27 MiB | 0.26x |
 
 红队：33 / 33 单测，`audit` 30 / 30（2 P0 + 4 P1 + 9 P2 全部修复）；6,000 例语法生成文档 AST 与 `graphql-js` 100% 一致。领先项：3 项负载全部领先 Rust `apollo-parser`（**1.34x / 1.85x / 1.23x**），大 SDL 解析与压缩往返分别为 Node `graphql-js` 的 **1.93x** / **4.64x**，峰值 RSS 比 Node 低 10–30×。落后项与 caveat：W2 20k 小查询落后 V8 热 JIT（0.80x，但 Pion 同时跑全部 13 条规则，峰值 RSS 2.73 vs 72.91 MiB）；W1 峰值 RSS 高于 Rust（31.19 vs 23.17 MiB，40 万平铺字段时高至 3×）；`apollo-parser` 构造无损 Rowan CST 而非紧凑 AST，其 W3 "打印" 为 CST 原文 `to_string()`；Node 计时含每轮约 40 ms 进程启动与 JIT 预热；**Wasm32 caveat**：`audit/scripts/perf.py` 在 Node 下实测 Pion Wasm32 比 Pion Native 慢 1.9–2.7×，5 个语料中 4 个解析比 `graphql-js` 慢 1.3–1.8×（仅转义密集字符串领先，打印与压缩仍领先 `graphql-js`）；`validate_executable` 只含 13 条 schema-free 规则，schema-aware 类型检查不在 `v0.1.0` 范围内。
+
+### woff2
+
+参考实现：纯 Rust [`wuff`](https://github.com/googlefonts/wuff) `0.2.10`（`--release`）。`sh packages/woff2/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替）运行于真实 TrueType 字体（`Arial.ttf` 755 KB / 3,381 glyphs、`Monaco.ttf` 517 KB / 1,678 glyphs）；每个解码出的 SFNT 表载荷——含完整重建的 `glyf` 与 `loca` 表——均经全 SFNT SHA-256 验证 **100% 逐字节一致**，且 Pion 解码出的 SFNT 整字体校验和精确等于 `0xB1B0AFBA`。详见 [`packages/woff2/README.md`](packages/woff2/README.md)。
+
+| Workload | `pion` Median (Throughput) | `rust_wuff` Median (Throughput) | `pion` Peak RSS | `rust_wuff` Peak RSS | `pion` vs `rust_wuff` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| WOFF2 Decode: `Arial.woff2` (755 KB SFNT × 10) | 66.423 ms (116.91 MB/s) | 36.295 ms (213.95 MB/s) | **7.84 MiB** | 9.80 MiB | 0.55x |
+| WOFF2 Decode: `Monaco.woff2` (517 KB SFNT × 10) | 33.235 ms (159.21 MB/s) | 19.566 ms (270.45 MB/s) | 5.20 MiB | 4.75 MiB | 0.59x |
+| WOFF1 Decode: `Arial.woff` (755 KB SFNT × 10) | 43.867 ms (176.27 MB/s) | 29.495 ms (262.15 MB/s) | 6.59 MiB | 5.66 MiB | 0.67x |
+
+红队：35 / 35 单测，`run_audit.sh all` 退出码 0，110 / 110 真实字体（含 `glyf`/`loca`）与 Rust `wuff` 逐字节一致，12k `--release` fuzz 0 crash。领先项：`Arial.woff2` 峰值 RSS 低于 Rust `wuff`（7.84 vs 9.80 MiB）。落后项：3 项吞吐为 `wuff` 的 0.55x / 0.59x / 0.67x（底层分别复用纯 Pion `brotli` 与 `flate`，叠加 SFNT 轮廓重建与边界校验开销）。

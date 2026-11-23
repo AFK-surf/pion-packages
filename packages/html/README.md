@@ -1,6 +1,6 @@
 # `html` — Pure-Pion HTML5 Parser, CSS Selector Engine & XSS Sanitizer
 
-Pure-Pion, zero-C-dependency, Native + Wasm32 compatible **WHATWG HTML5 parser**, **CSS Selectors query engine**, and **`ammonia`-grade whitelist HTML XSS sanitizer** (`v0.1.0`), benchmarked head-to-head against Rust `scraper` (`html5ever`) + `ammonia` and Go `golang.org/x/net/html`.
+Pure-Pion, zero-C-dependency, Native + Wasm32 compatible **WHATWG HTML5 parser**, **CSS Selectors query engine**, **`ammonia`-grade whitelist HTML XSS sanitizer**, and **HTML §4.8.4.3 `srcset` / `<picture>` source selector** (`v0.1.1`), benchmarked head-to-head against Rust `scraper` (`html5ever`) + `ammonia` and Go `golang.org/x/net/html`.
 
 ## Features
 
@@ -49,7 +49,7 @@ pub fn example() -> Unit {
 
 ## Verification & Conformance
 
-- **Unit, Compliance & Red-Team Tests**: `pionc test packages/html` — **29/29 passed** (`html5_parser_test.pion`, `selector_test.pion`, `sanitizer_test.pion`, `redteam_test.pion`).
+- **Unit, Compliance & Red-Team Tests**: `pionc test packages/html` — **35/35 passed** (`html5_parser_test.pion`, `selector_test.pion`, `sanitizer_test.pion`, `srcset_test.pion`, `redteam_test.pion`).
 - **Red-Team Audit Suite**: `pionc test -p html_audit packages/html/audit` — **36/37 passed** (**25/25 `p1_*`**, **8/8 `control_*`**, **3/4 `p2_*`**; the sole intentional difference is `p2_sanitizer_scheme_allowlist_narrower_than_ammonia`, as Pion defaults to 3 safe URL schemes `http`/`https`/`mailto` rather than `ammonia`'s 25 schemes including `tel:`/`ftp:`).
 - **WHATWG Named Character References**: **2,231 / 2,231 (100.0%)** in both text and attribute contexts, with **0 / 36** legacy/numeric edge differences vs `html5ever`.
 - **html5lib Tree-Construction Suite (`9329e64`, scripting-on)**: **1,147 / 1,578 (72.69%)** overall (up from 44.17%; **90.2%** of the 1,272 tests not requiring `<svg ...>`/`<math ...>` namespace prefixes or `<template> content` in the audit dumper), with 100% on `blocks.dat`, `comments01.dat`, `entities01.dat`, `entities02.dat`, `ruby.dat`, `scriptdata01.dat`, `adoption02.dat`, and 16/17 on `adoption01.dat`.
