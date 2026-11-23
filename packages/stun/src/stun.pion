@@ -1,0 +1,796 @@
+///| RFC 8489 STUN wire codec, integrity/fingerprint signing & verification,
+///| and RFC 7983 demultiplexing helper.
+
+///|
+fn read_u16_be(b : Bytes, off : Int) -> Int {
+  (b[off].to_int() << 8) | b[off + 1].to_int()
+}
+
+///|
+fn read_u32_be(b : Bytes, off : Int) -> UInt {
+  (b[off].to_int().to_uint() << 24U) |
+  (b[off + 1].to_int().to_uint() << 16U) |
+  (b[off + 2].to_int().to_uint() << 8U) |
+  b[off + 3].to_int().to_uint()
+}
+
+///|
+fn read_u64_be(b : Bytes, off : Int) -> UInt64 {
+  let hi : UInt64 = read_u32_be(b, off).to_int64().to_uint64()
+  let lo : UInt64 = read_u32_be(b, off + 4).to_int64().to_uint64()
+  (hi << 32) | lo
+}
+
+///|
+fn write_u16_be(b : Bytes, off : Int, v : Int) -> Unit {
+  b[off] = ((v >> 8) & 0xFF).to_byte()
+  b[off + 1] = (v & 0xFF).to_byte()
+}
+
+///|
+fn write_u32_be(b : Bytes, off : Int, v : UInt) -> Unit {
+  b[off] = ((v >> 24U) & 0xFFU).to_int().to_byte()
+  b[off + 1] = ((v >> 16U) & 0xFFU).to_int().to_byte()
+  b[off + 2] = ((v >> 8U) & 0xFFU).to_int().to_byte()
+  b[off + 3] = (v & 0xFFU).to_int().to_byte()
+}
+
+///|
+fn write_u64_be(b : Bytes, off : Int, v : UInt64) -> Unit {
+  let hi : UInt = ((v >> 32) & 0xFFFFFFFFUL).to_int().to_uint()
+  let lo : UInt = (v & 0xFFFFFFFFUL).to_int().to_uint()
+  write_u32_be(b, off, hi)
+  write_u32_be(b, off + 4, lo)
+}
+
+///|
+fn slice_bytes(b : Bytes, start : Int, len : Int) -> Bytes {
+  let mut out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = b[start + i]
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn slice_utf8_string(b : Bytes, start : Int, len : Int) -> String {
+  slice_bytes(b, start, len).to_string()
+}
+
+///|
+fn align4(n : Int) -> Int {
+  (n + 3) & -4
+}
+
+///| RFC 7983 §7 demultiplexing: fast check distinguishing STUN packets from
+///| DTLS (20..63), TURN Channel (64..79), and RTP/RTCP (128..191).
+pub fn is_stun_packet(data : Bytes) -> Bool {
+  let n = data.length()
+  if n < stun_header_size {
+    return false
+  }
+  let b0 = data[0].to_int()
+  if b0 > 3 {
+    return false
+  }
+  if read_u32_be(data, 4) != stun_magic_cookie {
+    return false
+  }
+  let msg_len = read_u16_be(data, 2)
+  (msg_len & 3) == 0 && stun_header_size + msg_len == n
+}
+
+///| RFC 8489 §5: encode MessageClass + 12-bit MessageMethod into 14-bit STUN Message Type.
+pub fn encode_message_type(
+  msg_class : MessageClass,
+  method : MessageMethod,
+) -> Result[Int, StunError] {
+  let m = message_method_to_code(method)
+  if m < 0 || m > 0xFFF {
+    return Err(StunError::InvalidHeader("method out of 12-bit range"))
+  }
+  let c = match msg_class {
+    MessageClass::Request => 0
+    MessageClass::Indication => 1
+    MessageClass::SuccessResponse => 2
+    MessageClass::ErrorResponse => 3
+  }
+  let c0 = c & 1
+  let c1 = (c >> 1) & 1
+  let raw = ((m & 0x0F80) << 2) | (c1 << 8) | ((m & 0x0070) << 1) | (c0 << 4) | (m & 0x000F)
+  Ok(raw)
+}
+
+///| RFC 8489 §5: decode 16-bit STUN Message Type (top 2 bits must be 00).
+pub fn decode_message_type(raw_type : Int) -> Result[(MessageClass, MessageMethod), StunError] {
+  if (raw_type & 0xC000) != 0 {
+    return Err(StunError::InvalidHeader("top 2 bits of STUN message type must be 00"))
+  }
+  let c0 = (raw_type >> 4) & 1
+  let c1 = (raw_type >> 8) & 1
+  let c = (c1 << 1) | c0
+  let msg_class = if c == 0 {
+    MessageClass::Request
+  } else if c == 1 {
+    MessageClass::Indication
+  } else if c == 2 {
+    MessageClass::SuccessResponse
+  } else {
+    MessageClass::ErrorResponse
+  }
+  let m = (raw_type & 0x000F) | ((raw_type >> 1) & 0x0070) | ((raw_type >> 2) & 0x0F80)
+  Ok((msg_class, message_method_from_code(m)))
+}
+
+///|
+fn validate_limits(limits : DecodeLimits) -> Result[Unit, StunError] {
+  if limits.max_message_bytes < 0 {
+    return Err(StunError::InvalidLimits("max_message_bytes must be >= 0"))
+  }
+  if limits.max_attributes < 0 {
+    return Err(StunError::InvalidLimits("max_attributes must be >= 0"))
+  }
+  if limits.max_attribute_bytes < 0 {
+    return Err(StunError::InvalidLimits("max_attribute_bytes must be >= 0"))
+  }
+  Ok(())
+}
+
+///|
+fn decode_socket_addr(
+  data : Bytes,
+  off : Int,
+  len : Int,
+  tx_id : Bytes,
+  is_xor : Bool,
+) -> Result[SocketAddr, StunError] {
+  if len < 4 {
+    return Err(StunError::InvalidAttribute("address attribute too short"))
+  }
+  let family = data[off + 1].to_int()
+  let raw_port = read_u16_be(data, off + 2)
+  let port = if is_xor { raw_port ^ 0x2112 } else { raw_port }
+  if family == 0x01 {
+    if len != 8 {
+      return Err(StunError::InvalidAttribute("IPv4 address attribute must be 8 bytes"))
+    }
+    let raw_ip = read_u32_be(data, off + 4)
+    let ip = if is_xor { raw_ip ^ stun_magic_cookie } else { raw_ip }
+    Ok(SocketAddr::Ipv4(ip, port))
+  } else if family == 0x02 {
+    if len != 20 {
+      return Err(StunError::InvalidAttribute("IPv6 address attribute must be 20 bytes"))
+    }
+    let mut ip6 = Bytes::new(16)
+    let mut i = 0
+    while i < 16 {
+      let mut b = data[off + 4 + i].to_int()
+      if is_xor {
+        let mask = if i == 0 {
+          0x21
+        } else if i == 1 {
+          0x12
+        } else if i == 2 {
+          0xA4
+        } else if i == 3 {
+          0x42
+        } else {
+          tx_id[i - 4].to_int()
+        }
+        b = b ^ mask
+      }
+      ip6[i] = b.to_byte()
+      i = i + 1
+    }
+    Ok(SocketAddr::Ipv6(ip6, port))
+  } else {
+    Err(StunError::InvalidAttribute("unsupported address family: " + family.to_string()))
+  }
+}
+
+///|
+pub fn decode_message(data : Bytes) -> Result[Message, StunError] {
+  decode_message_with_limits(data, DecodeLimits::default())
+}
+
+///|
+pub fn decode_message_with_limits(
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[Message, StunError] {
+  match validate_limits(limits) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let n = data.length()
+  if n > limits.max_message_bytes {
+    return Err(
+      StunError::LimitExceeded(
+        "message size " + n.to_string() + " exceeds max_message_bytes",
+      ),
+    )
+  }
+  if n < stun_header_size {
+    return Err(StunError::PacketTooShort("STUN header requires at least 20 bytes"))
+  }
+
+  let raw_type = read_u16_be(data, 0)
+  let (msg_class, method) = match decode_message_type(raw_type) {
+    Ok(pair) => pair
+    Err(e) => return Err(e)
+  }
+
+  let msg_len = read_u16_be(data, 2)
+  if (msg_len & 3) != 0 {
+    return Err(StunError::InvalidHeader("STUN message length must be a multiple of 4"))
+  }
+
+  let cookie = read_u32_be(data, 4)
+  if cookie != stun_magic_cookie {
+    return Err(StunError::InvalidMagicCookie(cookie))
+  }
+
+  if stun_header_size + msg_len != n {
+    return Err(
+      StunError::LengthMismatch(
+        "header length " + msg_len.to_string() + " does not match packet size " + n.to_string(),
+      ),
+    )
+  }
+
+  let tx_id = slice_bytes(data, 8, 12)
+  let attrs : Array[Attribute] = []
+  let mut pos = stun_header_size
+  let end = n
+
+  while pos < end {
+    if pos + 4 > end {
+      return Err(StunError::TruncatedAttribute("attribute header truncated"))
+    }
+    if attrs.length() >= limits.max_attributes {
+      return Err(StunError::LimitExceeded("attribute count exceeds max_attributes"))
+    }
+    let atype = read_u16_be(data, pos)
+    let alen = read_u16_be(data, pos + 2)
+    let val_off = pos + 4
+    let padded_len = align4(alen)
+    if val_off + alen > end || val_off + padded_len > end {
+      return Err(StunError::TruncatedAttribute("attribute value exceeds message boundary"))
+    }
+    if alen > limits.max_attribute_bytes {
+      return Err(StunError::LimitExceeded("attribute value exceeds max_attribute_bytes"))
+    }
+
+    let attr = if atype == attr_mapped_address {
+      match decode_socket_addr(data, val_off, alen, tx_id, false) {
+        Ok(addr) => Attribute::MappedAddress(addr)
+        Err(e) => return Err(e)
+      }
+    } else if atype == attr_xor_mapped_address {
+      match decode_socket_addr(data, val_off, alen, tx_id, true) {
+        Ok(addr) => Attribute::XorMappedAddress(addr)
+        Err(e) => return Err(e)
+      }
+    } else if atype == attr_username {
+      Attribute::Username(slice_utf8_string(data, val_off, alen))
+    } else if atype == attr_realm {
+      Attribute::Realm(slice_utf8_string(data, val_off, alen))
+    } else if atype == attr_nonce {
+      Attribute::Nonce(slice_utf8_string(data, val_off, alen))
+    } else if atype == attr_software {
+      Attribute::Software(slice_utf8_string(data, val_off, alen))
+    } else if atype == attr_error_code {
+      if alen < 4 {
+        return Err(StunError::InvalidAttribute("ERROR-CODE must be at least 4 bytes"))
+      }
+      let cls = data[val_off + 2].to_int() & 0x07
+      let num = data[val_off + 3].to_int()
+      if cls < 3 || cls > 6 || num > 99 {
+        return Err(StunError::InvalidAttribute("invalid ERROR-CODE class/number"))
+      }
+      let reason = slice_utf8_string(data, val_off + 4, alen - 4)
+      Attribute::ErrorCode(ErrorCode::new(cls * 100 + num, reason))
+    } else if atype == attr_unknown_attributes {
+      if (alen & 1) != 0 {
+        return Err(StunError::InvalidAttribute("UNKNOWN-ATTRIBUTES length must be even"))
+      }
+      let list : Array[Int] = []
+      let mut k = 0
+      while k < alen {
+        list.push(read_u16_be(data, val_off + k))
+        k = k + 2
+      }
+      Attribute::UnknownAttributes(list)
+    } else if atype == attr_priority {
+      if alen != 4 {
+        return Err(StunError::InvalidAttribute("PRIORITY must be 4 bytes"))
+      }
+      Attribute::Priority(read_u32_be(data, val_off))
+    } else if atype == attr_use_candidate {
+      if alen != 0 {
+        return Err(StunError::InvalidAttribute("USE-CANDIDATE must be 0 bytes"))
+      }
+      Attribute::UseCandidate
+    } else if atype == attr_ice_controlled {
+      if alen != 8 {
+        return Err(StunError::InvalidAttribute("ICE-CONTROLLED must be 8 bytes"))
+      }
+      Attribute::IceControlled(read_u64_be(data, val_off))
+    } else if atype == attr_ice_controlling {
+      if alen != 8 {
+        return Err(StunError::InvalidAttribute("ICE-CONTROLLING must be 8 bytes"))
+      }
+      Attribute::IceControlling(read_u64_be(data, val_off))
+    } else if atype == attr_message_integrity {
+      if alen != 20 {
+        return Err(StunError::InvalidAttribute("MESSAGE-INTEGRITY must be 20 bytes"))
+      }
+      Attribute::MessageIntegrity(slice_bytes(data, val_off, 20))
+    } else if atype == attr_message_integrity_sha256 {
+      if alen != 32 {
+        return Err(StunError::InvalidAttribute("MESSAGE-INTEGRITY-SHA256 must be 32 bytes"))
+      }
+      Attribute::MessageIntegritySha256(slice_bytes(data, val_off, 32))
+    } else if atype == attr_fingerprint {
+      if alen != 4 {
+        return Err(StunError::InvalidAttribute("FINGERPRINT must be 4 bytes"))
+      }
+      Attribute::Fingerprint(read_u32_be(data, val_off))
+    } else {
+      Attribute::Unknown(atype, slice_bytes(data, val_off, alen))
+    }
+
+    attrs.push(attr)
+    pos = val_off + padded_len
+  }
+
+  Ok(Message::{
+    msg_class: msg_class,
+    method: method,
+    transaction_id: tx_id,
+    attributes: attrs,
+  })
+}
+
+///|
+fn attr_encoded_value_len(attr : Attribute) -> Result[Int, StunError] {
+  match attr {
+    Attribute::MappedAddress(addr) | Attribute::XorMappedAddress(addr) => {
+      match addr {
+        SocketAddr::Ipv4(_, _) => Ok(8)
+        SocketAddr::Ipv6(ip6, _) => {
+          if ip6.length() != 16 {
+            Err(StunError::InvalidInput("IPv6 address must be 16 bytes"))
+          } else {
+            Ok(20)
+          }
+        }
+      }
+    }
+    Attribute::Username(s) | Attribute::Realm(s) | Attribute::Nonce(s) | Attribute::Software(s) => {
+      Ok(s.length())
+    }
+    Attribute::ErrorCode(ec) => {
+      if ec.code < 300 || ec.code > 699 {
+        Err(StunError::InvalidInput("ERROR-CODE must be in 300..699"))
+      } else {
+        Ok(4 + ec.reason.length())
+      }
+    }
+    Attribute::UnknownAttributes(list) => Ok(list.length() * 2)
+    Attribute::Priority(_) => Ok(4)
+    Attribute::UseCandidate => Ok(0)
+    Attribute::IceControlled(_) | Attribute::IceControlling(_) => Ok(8)
+    Attribute::MessageIntegrity(b) => {
+      if b.length() != 20 {
+        Err(StunError::InvalidInput("MESSAGE-INTEGRITY must be 20 bytes"))
+      } else {
+        Ok(20)
+      }
+    }
+    Attribute::MessageIntegritySha256(b) => {
+      if b.length() != 32 {
+        Err(StunError::InvalidInput("MESSAGE-INTEGRITY-SHA256 must be 32 bytes"))
+      } else {
+        Ok(32)
+      }
+    }
+    Attribute::Fingerprint(_) => Ok(4)
+    Attribute::Unknown(t, b) => {
+      if t < 0 || t > 0xFFFF {
+        Err(StunError::InvalidInput("attribute type out of u16 range"))
+      } else {
+        Ok(b.length())
+      }
+    }
+  }
+}
+
+///|
+fn write_socket_addr(
+  out : Bytes,
+  off : Int,
+  addr : SocketAddr,
+  tx_id : Bytes,
+  is_xor : Bool,
+) -> Unit {
+  match addr {
+    SocketAddr::Ipv4(ip, port) => {
+      out[off] = (0).to_byte()
+      out[off + 1] = (0x01).to_byte()
+      let p = if is_xor { (port & 0xFFFF) ^ 0x2112 } else { port & 0xFFFF }
+      write_u16_be(out, off + 2, p)
+      let xip = if is_xor { ip ^ stun_magic_cookie } else { ip }
+      write_u32_be(out, off + 4, xip)
+    }
+    SocketAddr::Ipv6(ip6, port) => {
+      out[off] = (0).to_byte()
+      out[off + 1] = (0x02).to_byte()
+      let p = if is_xor { (port & 0xFFFF) ^ 0x2112 } else { port & 0xFFFF }
+      write_u16_be(out, off + 2, p)
+      let mut i = 0
+      while i < 16 {
+        let mut b = ip6[i].to_int()
+        if is_xor {
+          let mask = if i == 0 {
+            0x21
+          } else if i == 1 {
+            0x12
+          } else if i == 2 {
+            0xA4
+          } else if i == 3 {
+            0x42
+          } else {
+            tx_id[i - 4].to_int()
+          }
+          b = b ^ mask
+        }
+        out[off + 4 + i] = b.to_byte()
+        i = i + 1
+      }
+    }
+  }
+}
+
+///|
+fn write_utf8_into(out : Bytes, off : Int, s : String) -> Unit {
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    out[off + i] = (s.code_unit_at(i) & 0xFF).to_byte()
+    i = i + 1
+  }
+}
+
+///|
+fn write_attr(out : Bytes, pos : Int, attr : Attribute, tx_id : Bytes) -> Int {
+  match attr {
+    Attribute::MappedAddress(addr) => {
+      let vlen = match addr {
+        SocketAddr::Ipv4(_, _) => 8
+        SocketAddr::Ipv6(_, _) => 20
+      }
+      write_u16_be(out, pos, attr_mapped_address)
+      write_u16_be(out, pos + 2, vlen)
+      write_socket_addr(out, pos + 4, addr, tx_id, false)
+      pos + 4 + vlen
+    }
+    Attribute::XorMappedAddress(addr) => {
+      let vlen = match addr {
+        SocketAddr::Ipv4(_, _) => 8
+        SocketAddr::Ipv6(_, _) => 20
+      }
+      write_u16_be(out, pos, attr_xor_mapped_address)
+      write_u16_be(out, pos + 2, vlen)
+      write_socket_addr(out, pos + 4, addr, tx_id, true)
+      pos + 4 + vlen
+    }
+    Attribute::Username(s) => {
+      let vlen = s.length()
+      write_u16_be(out, pos, attr_username)
+      write_u16_be(out, pos + 2, vlen)
+      write_utf8_into(out, pos + 4, s)
+      pos + 4 + align4(vlen)
+    }
+    Attribute::Realm(s) => {
+      let vlen = s.length()
+      write_u16_be(out, pos, attr_realm)
+      write_u16_be(out, pos + 2, vlen)
+      write_utf8_into(out, pos + 4, s)
+      pos + 4 + align4(vlen)
+    }
+    Attribute::Nonce(s) => {
+      let vlen = s.length()
+      write_u16_be(out, pos, attr_nonce)
+      write_u16_be(out, pos + 2, vlen)
+      write_utf8_into(out, pos + 4, s)
+      pos + 4 + align4(vlen)
+    }
+    Attribute::Software(s) => {
+      let vlen = s.length()
+      write_u16_be(out, pos, attr_software)
+      write_u16_be(out, pos + 2, vlen)
+      write_utf8_into(out, pos + 4, s)
+      pos + 4 + align4(vlen)
+    }
+    Attribute::ErrorCode(ec) => {
+      let vlen = 4 + ec.reason.length()
+      write_u16_be(out, pos, attr_error_code)
+      write_u16_be(out, pos + 2, vlen)
+      out[pos + 4] = (0).to_byte()
+      out[pos + 5] = (0).to_byte()
+      out[pos + 6] = ((ec.code / 100) & 0x07).to_byte()
+      out[pos + 7] = (ec.code % 100).to_byte()
+      write_utf8_into(out, pos + 8, ec.reason)
+      pos + 4 + align4(vlen)
+    }
+    Attribute::UnknownAttributes(list) => {
+      let vlen = list.length() * 2
+      write_u16_be(out, pos, attr_unknown_attributes)
+      write_u16_be(out, pos + 2, vlen)
+      let mut i = 0
+      while i < list.length() {
+        write_u16_be(out, pos + 4 + i * 2, list[i])
+        i = i + 1
+      }
+      pos + 4 + align4(vlen)
+    }
+    Attribute::Priority(p) => {
+      write_u16_be(out, pos, attr_priority)
+      write_u16_be(out, pos + 2, 4)
+      write_u32_be(out, pos + 4, p)
+      pos + 8
+    }
+    Attribute::UseCandidate => {
+      write_u16_be(out, pos, attr_use_candidate)
+      write_u16_be(out, pos + 2, 0)
+      pos + 4
+    }
+    Attribute::IceControlled(v) => {
+      write_u16_be(out, pos, attr_ice_controlled)
+      write_u16_be(out, pos + 2, 8)
+      write_u64_be(out, pos + 4, v)
+      pos + 12
+    }
+    Attribute::IceControlling(v) => {
+      write_u16_be(out, pos, attr_ice_controlling)
+      write_u16_be(out, pos + 2, 8)
+      write_u64_be(out, pos + 4, v)
+      pos + 12
+    }
+    Attribute::MessageIntegrity(b) => {
+      write_u16_be(out, pos, attr_message_integrity)
+      write_u16_be(out, pos + 2, 20)
+      let mut i = 0
+      while i < 20 {
+        out[pos + 4 + i] = b[i]
+        i = i + 1
+      }
+      pos + 24
+    }
+    Attribute::MessageIntegritySha256(b) => {
+      write_u16_be(out, pos, attr_message_integrity_sha256)
+      write_u16_be(out, pos + 2, 32)
+      let mut i = 0
+      while i < 32 {
+        out[pos + 4 + i] = b[i]
+        i = i + 1
+      }
+      pos + 36
+    }
+    Attribute::Fingerprint(fp) => {
+      write_u16_be(out, pos, attr_fingerprint)
+      write_u16_be(out, pos + 2, 4)
+      write_u32_be(out, pos + 4, fp)
+      pos + 8
+    }
+    Attribute::Unknown(t, b) => {
+      let vlen = b.length()
+      write_u16_be(out, pos, t)
+      write_u16_be(out, pos + 2, vlen)
+      let mut i = 0
+      while i < vlen {
+        out[pos + 4 + i] = b[i]
+        i = i + 1
+      }
+      pos + 4 + align4(vlen)
+    }
+  }
+}
+
+///|
+pub fn encode_message(msg : Message) -> Result[Bytes, StunError] {
+  encode_message_signed(msg, None, false, false)
+}
+
+///| Encode a STUN message, optionally appending MESSAGE-INTEGRITY (HMAC-SHA1 or HMAC-SHA256)
+///| and/or FINGERPRINT (CRC-32 XOR 0x5354554E) with RFC 8489 §14.5/§14.7 length adjustments.
+pub fn encode_message_signed(
+  msg : Message,
+  integrity_key : Option[Bytes],
+  use_sha256 : Bool,
+  with_fingerprint : Bool,
+) -> Result[Bytes, StunError] {
+  if msg.transaction_id.length() != 12 {
+    return Err(StunError::InvalidInput("transaction_id must be exactly 12 bytes"))
+  }
+  let raw_type = match encode_message_type(msg.msg_class, msg.method) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+
+  let has_integrity = match integrity_key {
+    Some(_) => true
+    None => false
+  }
+  let mut body_len = 0
+  let mut i = 0
+  while i < msg.attributes.length() {
+    let vlen = match attr_encoded_value_len(msg.attributes[i]) {
+      Ok(l) => l
+      Err(e) => return Err(e)
+    }
+    if vlen > 0xFFFF {
+      return Err(StunError::InvalidInput("attribute value exceeds 65535 bytes"))
+    }
+    body_len = body_len + 4 + align4(vlen)
+    i = i + 1
+  }
+
+  let mi_total = if has_integrity {
+    if use_sha256 { 36 } else { 24 }
+  } else {
+    0
+  }
+  let fp_total = if with_fingerprint { 8 } else { 0 }
+  let final_body_len = body_len + mi_total + fp_total
+  if final_body_len > 0xFFFF {
+    return Err(StunError::InvalidInput("encoded STUN message exceeds 65535 bytes"))
+  }
+
+  let mut out = Bytes::new(stun_header_size + final_body_len)
+  write_u16_be(out, 0, raw_type)
+  write_u16_be(out, 2, final_body_len)
+  write_u32_be(out, 4, stun_magic_cookie)
+  let mut t = 0
+  while t < 12 {
+    out[8 + t] = msg.transaction_id[t]
+    t = t + 1
+  }
+
+  let mut pos = stun_header_size
+  let mut j = 0
+  while j < msg.attributes.length() {
+    pos = write_attr(out, pos, msg.attributes[j], msg.transaction_id)
+    j = j + 1
+  }
+
+  match integrity_key {
+    Some(key) => {
+      let adj_len = (pos - stun_header_size) + mi_total
+      if use_sha256 {
+        let mac = hmac_sha256_stun_prefix(key, out, pos, adj_len)
+        write_u16_be(out, pos, attr_message_integrity_sha256)
+        write_u16_be(out, pos + 2, 32)
+        let mut k = 0
+        while k < 32 {
+          out[pos + 4 + k] = mac[k]
+          k = k + 1
+        }
+        pos = pos + 36
+      } else {
+        let mac = hmac_sha1_stun_prefix(key, out, pos, adj_len)
+        write_u16_be(out, pos, attr_message_integrity)
+        write_u16_be(out, pos + 2, 20)
+        let mut k = 0
+        while k < 20 {
+          out[pos + 4 + k] = mac[k]
+          k = k + 1
+        }
+        pos = pos + 24
+      }
+    }
+    None => ()
+  }
+
+  if with_fingerprint {
+    write_u16_be(out, 2, final_body_len)
+    let fp = crc32_ieee(out, 0, pos) ^ stun_fingerprint_xor
+    write_u16_be(out, pos, attr_fingerprint)
+    write_u16_be(out, pos + 2, 4)
+    write_u32_be(out, pos + 4, fp)
+  }
+
+  Ok(out)
+}
+
+///| Locate an attribute offset and length in raw STUN wire bytes.
+fn find_attr_offset(raw : Bytes, target_type : Int) -> Result[Option[(Int, Int)], StunError] {
+  let n = raw.length()
+  if n < stun_header_size {
+    return Err(StunError::PacketTooShort("STUN packet shorter than 20 bytes"))
+  }
+  if (raw[0].to_int() & 0xC0) != 0 {
+    return Err(StunError::InvalidHeader("top 2 bits must be 00"))
+  }
+  let msg_len = read_u16_be(raw, 2)
+  if (msg_len & 3) != 0 || stun_header_size + msg_len != n {
+    return Err(StunError::LengthMismatch("invalid STUN length"))
+  }
+  if read_u32_be(raw, 4) != stun_magic_cookie {
+    return Err(StunError::InvalidMagicCookie(read_u32_be(raw, 4)))
+  }
+
+  let mut pos = stun_header_size
+  while pos < n {
+    if pos + 4 > n {
+      return Err(StunError::TruncatedAttribute("truncated attribute header"))
+    }
+    let atype = read_u16_be(raw, pos)
+    let alen = read_u16_be(raw, pos + 2)
+    let padded = align4(alen)
+    if pos + 4 + padded > n {
+      return Err(StunError::TruncatedAttribute("truncated attribute value"))
+    }
+    if atype == target_type {
+      return Ok(Some((pos, alen)))
+    }
+    pos = pos + 4 + padded
+  }
+  Ok(None)
+}
+
+///| Verify RFC 8489 §14.5 MESSAGE-INTEGRITY (HMAC-SHA1) over raw STUN wire bytes.
+pub fn verify_message_integrity(raw : Bytes, key : Bytes) -> Result[Bool, StunError] {
+  match find_attr_offset(raw, attr_message_integrity) {
+    Err(e) => Err(e)
+    Ok(None) => Ok(false)
+    Ok(Some((off, alen))) => {
+      if alen != 20 {
+        return Err(StunError::InvalidAttribute("MESSAGE-INTEGRITY must be 20 bytes"))
+      }
+      let adjusted_len = (off - stun_header_size) + 24
+      let computed = hmac_sha1_stun_prefix(key, raw, off, adjusted_len)
+      let expected = slice_bytes(raw, off + 4, 20)
+      Ok(verify_ct_eq(computed, expected))
+    }
+  }
+}
+
+///| Verify RFC 8489 §14.6 MESSAGE-INTEGRITY-SHA256 (HMAC-SHA256) over raw STUN wire bytes.
+pub fn verify_message_integrity_sha256(raw : Bytes, key : Bytes) -> Result[Bool, StunError] {
+  match find_attr_offset(raw, attr_message_integrity_sha256) {
+    Err(e) => Err(e)
+    Ok(None) => Ok(false)
+    Ok(Some((off, alen))) => {
+      if alen != 32 {
+        return Err(StunError::InvalidAttribute("MESSAGE-INTEGRITY-SHA256 must be 32 bytes"))
+      }
+      let adjusted_len = (off - stun_header_size) + 36
+      let computed = hmac_sha256_stun_prefix(key, raw, off, adjusted_len)
+      let expected = slice_bytes(raw, off + 4, 32)
+      Ok(verify_ct_eq(computed, expected))
+    }
+  }
+}
+
+///| Verify RFC 8489 §14.7 FINGERPRINT (CRC-32 XOR 0x5354554E) as the final attribute.
+pub fn verify_fingerprint(raw : Bytes) -> Result[Bool, StunError] {
+  match find_attr_offset(raw, attr_fingerprint) {
+    Err(e) => Err(e)
+    Ok(None) => Ok(false)
+    Ok(Some((off, alen))) => {
+      if alen != 4 {
+        return Err(StunError::InvalidAttribute("FINGERPRINT must be 4 bytes"))
+      }
+      if off + 8 != raw.length() {
+        return Err(StunError::InvalidAttribute("FINGERPRINT must be the last attribute"))
+      }
+      let computed = crc32_ieee(raw, 0, off) ^ stun_fingerprint_xor
+      let expected = read_u32_be(raw, off + 4)
+      Ok(computed == expected)
+    }
+  }
+}
