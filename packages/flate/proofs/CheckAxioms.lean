@@ -1,0 +1,21 @@
+import FlateProofs
+
+#print axioms FlateProofs.is_valid_level_spec
+#print axioms FlateProofs.decompress_limits_default_spec
+#print axioms FlateProofs.decompress_limits_new_spec
+#print axioms FlateProofs.is_valid_btype_spec
+#print axioms FlateProofs.is_valid_stored_nlen_spec
+#print axioms FlateProofs.zlib_flevel_spec
+#print axioms FlateProofs.zlib_flevel_bounds
+#print axioms FlateProofs.zlib_compute_flg_fcheck
+#print axioms FlateProofs.zlib_encoder_decoder_duality
+#print axioms FlateProofs.zlib_check_header_rejects_bad_fcheck
+#print axioms FlateProofs.zlib_check_header_rejects_bad_cm_and_cinfo
+#print axioms FlateProofs.zlib_standard_headers_valid
+#print axioms FlateProofs.huff_direct_entry_roundtrip
+#print axioms FlateProofs.huff_subtable_entry_roundtrip
+#print axioms FlateProofs.huff_direct_subtable_disjoint
+#print axioms FlateProofs.bit_reverse_zero_bits
+#print axioms FlateProofs.adler32_pack_roundtrip
+#print axioms FlateProofs.adler32_pack_injective
+#print axioms FlateProofs.crc32_byte_poly_ieee_vectors
