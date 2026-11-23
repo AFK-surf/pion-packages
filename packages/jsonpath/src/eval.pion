@@ -1,0 +1,1068 @@
+///| Fast, iterative RFC 9535 JSONPath evaluator with:
+///| - Zero-path-allocation hot path for `query()`
+///| - Exact RFC 9535 §2.7 Normalized Path formatting for `query_with_paths()`
+///| - Iterative pre-order descendant (`..`) traversal
+///| - Strict `JsonPathLimits` (`max_depth`, `max_nodes_visited`, `max_results`)
+///| - All 5 RFC 9535 built-in functions (`length`, `count`, `value`, `match`, `search`)
+
+enum EvalVal {
+  Nothing
+  Value(JsonValue)
+}
+
+///| Format an object member key as an RFC 9535 §2.7 normalized bracket selector `['...']`.
+pub fn format_norm_name(parent : String, key : String) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string(parent)
+  sb.write_string("['")
+  let n = key.length()
+  let mut i = 0
+  while i < n {
+    let b = key.code_unit_at(i)
+    if b == 8 {
+      sb.write_string("\\b")
+    } else if b == 9 {
+      sb.write_string("\\t")
+    } else if b == 10 {
+      sb.write_string("\\n")
+    } else if b == 12 {
+      sb.write_string("\\f")
+    } else if b == 13 {
+      sb.write_string("\\r")
+    } else if b == 39 {
+      sb.write_string("\\'")
+    } else if b == 92 {
+      sb.write_string("\\\\")
+    } else if b < 0x20 {
+      sb.write_string("\\u00")
+      sb.write_byte(lower_hex_byte(b >> 4))
+      sb.write_byte(lower_hex_byte(b & 0xF))
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    i = i + 1
+  }
+  sb.write_string("']")
+  sb.to_string()
+}
+
+///| Format an array index as an RFC 9535 §2.7 normalized bracket selector `[i]`.
+pub fn format_norm_index(parent : String, idx : Int) -> String {
+  parent + "[" + idx.to_string() + "]"
+}
+
+struct EvalState {
+  root : JsonValue
+  limits : JsonPathLimits
+  mut visited : Int
+}
+
+fn EvalState::new(root : JsonValue, limits : JsonPathLimits) -> EvalState {
+  EvalState::{ root: root, limits: limits, visited: 0 }
+}
+
+fn EvalState::visit(self : EvalState) -> Result[Unit, JsonPathError] {
+  self.visited = self.visited + 1
+  if self.visited > self.limits.max_nodes_visited {
+    return Err(
+      JsonPathError::new(
+        JsonPathErrorKind::LimitExceeded,
+        0,
+        "query exceeded max_nodes_visited",
+      ),
+    )
+  }
+  Ok(())
+}
+
+///| Evaluate a compiled `JsonPath` returning only matched `JsonValue`s (fast path: no path string allocations).
+pub fn eval_query_values(
+  path : JsonPath,
+  root : JsonValue,
+  limits : JsonPathLimits,
+) -> Result[Array[JsonValue], JsonPathError] {
+  let st = EvalState::new(root, limits)
+  st.eval_segments_values([root], path.segments)
+}
+
+///| Evaluate a compiled `JsonPath` returning `NodeMatch` with RFC 9535 §2.7 Normalized Paths.
+pub fn eval_query_with_paths(
+  path : JsonPath,
+  root : JsonValue,
+  limits : JsonPathLimits,
+) -> Result[Array[NodeMatch], JsonPathError] {
+  let st = EvalState::new(root, limits)
+  st.eval_segments_paths([NodeMatch::{ path: "$", value: root }], path.segments)
+}
+
+fn slice_bounds(
+  len : Int,
+  start_opt : Option[Int64],
+  end_opt : Option[Int64],
+  step_opt : Option[Int64],
+) -> (Int64, Int64, Int64) {
+  let step = match step_opt {
+    Some(s) => s
+    None => 1L
+  }
+  if step == 0L {
+    return (0L, 0L, 0L)
+  }
+  let len64 = len.to_int64()
+  let start = match start_opt {
+    Some(s) => s
+    None => if step >= 0L { 0L } else { len64 - 1L }
+  }
+  let end = match end_opt {
+    Some(e) => e
+    None => if step >= 0L { len64 } else { -len64 - 1L }
+  }
+  let n_start = if start >= 0L { start } else { len64 + start }
+  let n_end = if end >= 0L { end } else { len64 + end }
+  if step > 0L {
+    let lower = if n_start < 0L {
+      0L
+    } else if n_start > len64 {
+      len64
+    } else {
+      n_start
+    }
+    let upper = if n_end < 0L {
+      0L
+    } else if n_end > len64 {
+      len64
+    } else {
+      n_end
+    }
+    (lower, upper, step)
+  } else {
+    let upper = if n_start < -1L {
+      -1L
+    } else if n_start > len64 - 1L {
+      len64 - 1L
+    } else {
+      n_start
+    }
+    let lower = if n_end < -1L {
+      -1L
+    } else if n_end > len64 - 1L {
+      len64 - 1L
+    } else {
+      n_end
+    }
+    (lower, upper, step)
+  }
+}
+
+fn EvalState::apply_selector_values(
+  self : EvalState,
+  node : JsonValue,
+  sel : Selector,
+  out : Array[JsonValue],
+) -> Result[Unit, JsonPathError] {
+  match sel {
+    Selector::Name(key) => {
+      match node {
+        JsonValue::Object(entries) => {
+          match json_object_get(entries, key) {
+            Some(v) => {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(v)
+            }
+            None => ()
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Wildcard => {
+      match node {
+        JsonValue::Array(items) => {
+          let mut i = 0
+          let n = items.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            if out.length() >= self.limits.max_results {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "query exceeded max_results",
+                ),
+              )
+            }
+            out.push(items[i])
+            i = i + 1
+          }
+        }
+        JsonValue::Object(entries) => {
+          let mut i = 0
+          let n = entries.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            if out.length() >= self.limits.max_results {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "query exceeded max_results",
+                ),
+              )
+            }
+            let (_, v) = entries[i]
+            out.push(v)
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Index(idx) => {
+      match node {
+        JsonValue::Array(items) => {
+          let len64 = items.length().to_int64()
+          let norm = if idx >= 0L { idx } else { len64 + idx }
+          if norm >= 0L && norm < len64 {
+            if out.length() >= self.limits.max_results {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "query exceeded max_results",
+                ),
+              )
+            }
+            out.push(items[norm.to_int()])
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Slice(s_opt, e_opt, step_opt) => {
+      match node {
+        JsonValue::Array(items) => {
+          let (lower, upper, step) = slice_bounds(items.length(), s_opt, e_opt, step_opt)
+          if step > 0L {
+            let mut i = lower
+            while i < upper {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(items[i.to_int()])
+              i = i + step
+            }
+          } else if step < 0L {
+            let mut i = upper
+            while i > lower {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(items[i.to_int()])
+              i = i + step
+            }
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Filter(expr) => {
+      match node {
+        JsonValue::Array(items) => {
+          let mut i = 0
+          let n = items.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let ok = match self.eval_filter(expr, items[i]) {
+              Ok(b) => b
+              Err(e) => return Err(e)
+            }
+            if ok {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(items[i])
+            }
+            i = i + 1
+          }
+        }
+        JsonValue::Object(entries) => {
+          let mut i = 0
+          let n = entries.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let (_, v) = entries[i]
+            let ok = match self.eval_filter(expr, v) {
+              Ok(b) => b
+              Err(e) => return Err(e)
+            }
+            if ok {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(v)
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+  Ok(())
+}
+
+fn EvalState::eval_segments_values(
+  self : EvalState,
+  initial : Array[JsonValue],
+  segments : Array[Segment],
+) -> Result[Array[JsonValue], JsonPathError] {
+  let mut current = initial
+  let mut s_idx = 0
+  let n_segs = segments.length()
+  while s_idx < n_segs {
+    // Zero-allocation fast path for single-node Child([Name]) / Child([Index])
+    if current.length() == 1 {
+      match segments[s_idx] {
+        Segment::Child(sels) => {
+          if sels.length() == 1 {
+            match sels[0] {
+              Selector::Name(key) => {
+                match current[0] {
+                  JsonValue::Object(entries) => {
+                    match json_object_get(entries, key) {
+                      Some(v) => {
+                        if self.limits.max_results <= 0 {
+                          return Err(
+                            JsonPathError::new(
+                              JsonPathErrorKind::LimitExceeded,
+                              0,
+                              "query exceeded max_results",
+                            ),
+                          )
+                        }
+                        current[0] = v
+                        s_idx = s_idx + 1
+                        continue
+                      }
+                      None => return Ok([])
+                    }
+                  }
+                  _ => return Ok([])
+                }
+              }
+              Selector::Index(idx) => {
+                match current[0] {
+                  JsonValue::Array(items) => {
+                    let len64 = items.length().to_int64()
+                    let norm = if idx >= 0L { idx } else { len64 + idx }
+                    if norm >= 0L && norm < len64 {
+                      if self.limits.max_results <= 0 {
+                        return Err(
+                          JsonPathError::new(
+                            JsonPathErrorKind::LimitExceeded,
+                            0,
+                            "query exceeded max_results",
+                          ),
+                        )
+                      }
+                      current[0] = items[norm.to_int()]
+                      s_idx = s_idx + 1
+                      continue
+                    }
+                    return Ok([])
+                  }
+                  _ => return Ok([])
+                }
+              }
+              _ => ()
+            }
+          }
+        }
+        _ => ()
+      }
+    }
+    let next : Array[JsonValue] = []
+    match segments[s_idx] {
+      Segment::Child(sels) => {
+        let mut n_idx = 0
+        while n_idx < current.length() {
+          let node = current[n_idx]
+          let mut k = 0
+          while k < sels.length() {
+            match self.apply_selector_values(node, sels[k], next) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            k = k + 1
+          }
+          n_idx = n_idx + 1
+        }
+      }
+      Segment::Descendant(sels) => {
+        // Iterative pre-order descendant traversal (stack-safe on deep trees!)
+        let mut n_idx = 0
+        while n_idx < current.length() {
+          let stack : Array[(JsonValue, Int)] = [(current[n_idx], 0)]
+          while stack.length() > 0 {
+            let (cur, depth) = match stack.pop() {
+              Some(p) => p
+              None => break
+            }
+            if depth > self.limits.max_depth {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "descendant traversal exceeded max_depth",
+                ),
+              )
+            }
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let mut k = 0
+            while k < sels.length() {
+              match self.apply_selector_values(cur, sels[k], next) {
+                Ok(_) => ()
+                Err(e) => return Err(e)
+              }
+              k = k + 1
+            }
+            // Push children in reverse order so pop() visits them left-to-right
+            match cur {
+              JsonValue::Array(items) => {
+                let mut ci = items.length() - 1
+                while ci >= 0 {
+                  stack.push((items[ci], depth + 1))
+                  ci = ci - 1
+                }
+              }
+              JsonValue::Object(entries) => {
+                let mut ci = entries.length() - 1
+                while ci >= 0 {
+                  let (_, ev) = entries[ci]
+                  stack.push((ev, depth + 1))
+                  ci = ci - 1
+                }
+              }
+              _ => ()
+            }
+          }
+          n_idx = n_idx + 1
+        }
+      }
+    }
+    current = next
+    if current.length() == 0 {
+      break
+    }
+    s_idx = s_idx + 1
+  }
+  Ok(current)
+}
+
+fn EvalState::apply_selector_paths(
+  self : EvalState,
+  nm : NodeMatch,
+  sel : Selector,
+  out : Array[NodeMatch],
+) -> Result[Unit, JsonPathError] {
+  match sel {
+    Selector::Name(key) => {
+      match nm.value {
+        JsonValue::Object(entries) => {
+          match json_object_get(entries, key) {
+            Some(v) => {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(NodeMatch::{ path: format_norm_name(nm.path, key), value: v })
+            }
+            None => ()
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Wildcard => {
+      match nm.value {
+        JsonValue::Array(items) => {
+          let mut i = 0
+          let n = items.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            if out.length() >= self.limits.max_results {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "query exceeded max_results",
+                ),
+              )
+            }
+            out.push(NodeMatch::{ path: format_norm_index(nm.path, i), value: items[i] })
+            i = i + 1
+          }
+        }
+        JsonValue::Object(entries) => {
+          let mut i = 0
+          let n = entries.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            if out.length() >= self.limits.max_results {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "query exceeded max_results",
+                ),
+              )
+            }
+            let (k, v) = entries[i]
+            out.push(NodeMatch::{ path: format_norm_name(nm.path, k), value: v })
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Index(idx) => {
+      match nm.value {
+        JsonValue::Array(items) => {
+          let len64 = items.length().to_int64()
+          let norm = if idx >= 0L { idx } else { len64 + idx }
+          if norm >= 0L && norm < len64 {
+            let ii = norm.to_int()
+            if out.length() >= self.limits.max_results {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "query exceeded max_results",
+                ),
+              )
+            }
+            out.push(NodeMatch::{ path: format_norm_index(nm.path, ii), value: items[ii] })
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Slice(s_opt, e_opt, step_opt) => {
+      match nm.value {
+        JsonValue::Array(items) => {
+          let (lower, upper, step) = slice_bounds(items.length(), s_opt, e_opt, step_opt)
+          if step > 0L {
+            let mut i = lower
+            while i < upper {
+              let ii = i.to_int()
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(NodeMatch::{ path: format_norm_index(nm.path, ii), value: items[ii] })
+              i = i + step
+            }
+          } else if step < 0L {
+            let mut i = upper
+            while i > lower {
+              let ii = i.to_int()
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(NodeMatch::{ path: format_norm_index(nm.path, ii), value: items[ii] })
+              i = i + step
+            }
+          }
+        }
+        _ => ()
+      }
+    }
+    Selector::Filter(expr) => {
+      match nm.value {
+        JsonValue::Array(items) => {
+          let mut i = 0
+          let n = items.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let ok = match self.eval_filter(expr, items[i]) {
+              Ok(b) => b
+              Err(e) => return Err(e)
+            }
+            if ok {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(NodeMatch::{ path: format_norm_index(nm.path, i), value: items[i] })
+            }
+            i = i + 1
+          }
+        }
+        JsonValue::Object(entries) => {
+          let mut i = 0
+          let n = entries.length()
+          while i < n {
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let (k, v) = entries[i]
+            let ok = match self.eval_filter(expr, v) {
+              Ok(b) => b
+              Err(e) => return Err(e)
+            }
+            if ok {
+              if out.length() >= self.limits.max_results {
+                return Err(
+                  JsonPathError::new(
+                    JsonPathErrorKind::LimitExceeded,
+                    0,
+                    "query exceeded max_results",
+                  ),
+                )
+              }
+              out.push(NodeMatch::{ path: format_norm_name(nm.path, k), value: v })
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+  Ok(())
+}
+
+fn EvalState::eval_segments_paths(
+  self : EvalState,
+  initial : Array[NodeMatch],
+  segments : Array[Segment],
+) -> Result[Array[NodeMatch], JsonPathError] {
+  let mut current = initial
+  let mut s_idx = 0
+  while s_idx < segments.length() {
+    let next : Array[NodeMatch] = []
+    match segments[s_idx] {
+      Segment::Child(sels) => {
+        let mut n_idx = 0
+        while n_idx < current.length() {
+          let nm = current[n_idx]
+          let mut k = 0
+          while k < sels.length() {
+            match self.apply_selector_paths(nm, sels[k], next) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            k = k + 1
+          }
+          n_idx = n_idx + 1
+        }
+      }
+      Segment::Descendant(sels) => {
+        let mut n_idx = 0
+        while n_idx < current.length() {
+          let stack : Array[(NodeMatch, Int)] = [(current[n_idx], 0)]
+          while stack.length() > 0 {
+            let (cur, depth) = match stack.pop() {
+              Some(p) => p
+              None => break
+            }
+            if depth > self.limits.max_depth {
+              return Err(
+                JsonPathError::new(
+                  JsonPathErrorKind::LimitExceeded,
+                  0,
+                  "descendant traversal exceeded max_depth",
+                ),
+              )
+            }
+            match self.visit() {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let mut k = 0
+            while k < sels.length() {
+              match self.apply_selector_paths(cur, sels[k], next) {
+                Ok(_) => ()
+                Err(e) => return Err(e)
+              }
+              k = k + 1
+            }
+            match cur.value {
+              JsonValue::Array(items) => {
+                let mut ci = items.length() - 1
+                while ci >= 0 {
+                  stack.push(
+                    (
+                      NodeMatch::{ path: format_norm_index(cur.path, ci), value: items[ci] },
+                      depth + 1,
+                    ),
+                  )
+                  ci = ci - 1
+                }
+              }
+              JsonValue::Object(entries) => {
+                let mut ci = entries.length() - 1
+                while ci >= 0 {
+                  let (ek, ev) = entries[ci]
+                  stack.push(
+                    (
+                      NodeMatch::{ path: format_norm_name(cur.path, ek), value: ev },
+                      depth + 1,
+                    ),
+                  )
+                  ci = ci - 1
+                }
+              }
+              _ => ()
+            }
+          }
+          n_idx = n_idx + 1
+        }
+      }
+    }
+    current = next
+    if current.length() == 0 {
+      break
+    }
+    s_idx = s_idx + 1
+  }
+  Ok(current)
+}
+
+// ============================================================================
+// Filter Expression & Function Evaluation
+// ============================================================================
+
+fn eval_singular(
+  base : JsonValue,
+  segs : Array[SingularSeg],
+) -> EvalVal {
+  let mut cur = base
+  let mut i = 0
+  while i < segs.length() {
+    match segs[i] {
+      SingularSeg::Name(k) => {
+        match cur {
+          JsonValue::Object(entries) => {
+            match json_object_get(entries, k) {
+              Some(v) => cur = v
+              None => return EvalVal::Nothing
+            }
+          }
+          _ => return EvalVal::Nothing
+        }
+      }
+      SingularSeg::Index(idx) => {
+        match cur {
+          JsonValue::Array(items) => {
+            let len64 = items.length().to_int64()
+            let norm = if idx >= 0L { idx } else { len64 + idx }
+            if norm >= 0L && norm < len64 {
+              cur = items[norm.to_int()]
+            } else {
+              return EvalVal::Nothing
+            }
+          }
+          _ => return EvalVal::Nothing
+        }
+      }
+    }
+    i = i + 1
+  }
+  EvalVal::Value(cur)
+}
+
+fn eval_val_eq(a : EvalVal, b : EvalVal) -> Bool {
+  match (a, b) {
+    (EvalVal::Nothing, EvalVal::Nothing) => true
+    (EvalVal::Value(va), EvalVal::Value(vb)) => json_value_eq_impl(va, vb)
+    _ => false
+  }
+}
+
+fn eval_val_lt(a : EvalVal, b : EvalVal) -> Bool {
+  match (a, b) {
+    (EvalVal::Value(va), EvalVal::Value(vb)) => json_value_lt(va, vb)
+    _ => false
+  }
+}
+
+fn EvalState::eval_comparable(
+  self : EvalState,
+  comp : Comparable,
+  current : JsonValue,
+) -> Result[EvalVal, JsonPathError] {
+  match comp {
+    Comparable::Literal(v) => Ok(EvalVal::Value(v))
+    Comparable::SingularQuery(is_rel, segs) => {
+      let base = if is_rel { current } else { self.root }
+      Ok(eval_singular(base, segs))
+    }
+    Comparable::FuncCall(f) => self.eval_func_value(f, current)
+  }
+}
+
+fn EvalState::eval_arg_as_value(
+  self : EvalState,
+  arg : FuncArg,
+  current : JsonValue,
+) -> Result[EvalVal, JsonPathError] {
+  match arg {
+    FuncArg::Literal(v) => Ok(EvalVal::Value(v))
+    FuncArg::FilterQuery(is_rel, segs) => {
+      let base = if is_rel { current } else { self.root }
+      let nodes = match self.eval_segments_values([base], segs) {
+        Ok(ns) => ns
+        Err(e) => return Err(e)
+      }
+      if nodes.length() == 1 {
+        Ok(EvalVal::Value(nodes[0]))
+      } else {
+        Ok(EvalVal::Nothing)
+      }
+    }
+    FuncArg::FuncCall(sub) => self.eval_func_value(sub, current)
+    FuncArg::LogicalExpr(_) => Ok(EvalVal::Nothing)
+  }
+}
+
+fn EvalState::eval_arg_as_nodes(
+  self : EvalState,
+  arg : FuncArg,
+  current : JsonValue,
+) -> Result[Array[JsonValue], JsonPathError] {
+  match arg {
+    FuncArg::FilterQuery(is_rel, segs) => {
+      let base = if is_rel { current } else { self.root }
+      self.eval_segments_values([base], segs)
+    }
+    _ => Ok([])
+  }
+}
+
+fn EvalState::eval_func_value(
+  self : EvalState,
+  f : FuncExpr,
+  current : JsonValue,
+) -> Result[EvalVal, JsonPathError] {
+  if f.name == "length" {
+    let v = match self.eval_arg_as_value(f.args[0], current) {
+      Ok(ev) => ev
+      Err(e) => return Err(e)
+    }
+    match v {
+      EvalVal::Value(JsonValue::Str(s)) =>
+      Ok(EvalVal::Value(JsonValue::Int(utf8_codepoint_count(s).to_int64())))
+      EvalVal::Value(JsonValue::Array(items)) =>
+      Ok(EvalVal::Value(JsonValue::Int(items.length().to_int64())))
+      EvalVal::Value(JsonValue::Object(entries)) =>
+      Ok(EvalVal::Value(JsonValue::Int(entries.length().to_int64())))
+      _ => Ok(EvalVal::Nothing)
+    }
+  } else if f.name == "count" {
+    let nodes = match self.eval_arg_as_nodes(f.args[0], current) {
+      Ok(ns) => ns
+      Err(e) => return Err(e)
+    }
+    Ok(EvalVal::Value(JsonValue::Int(nodes.length().to_int64())))
+  } else if f.name == "value" {
+    let nodes = match self.eval_arg_as_nodes(f.args[0], current) {
+      Ok(ns) => ns
+      Err(e) => return Err(e)
+    }
+    if nodes.length() == 1 {
+      Ok(EvalVal::Value(nodes[0]))
+    } else {
+      Ok(EvalVal::Nothing)
+    }
+  } else {
+    Ok(EvalVal::Nothing)
+  }
+}
+
+fn EvalState::eval_func_logical(
+  self : EvalState,
+  f : FuncExpr,
+  current : JsonValue,
+) -> Result[Bool, JsonPathError] {
+  if f.name == "match" || f.name == "search" {
+    let v0 = match self.eval_arg_as_value(f.args[0], current) {
+      Ok(ev) => ev
+      Err(e) => return Err(e)
+    }
+    let text = match v0 {
+      EvalVal::Value(JsonValue::Str(s)) => s
+      _ => return Ok(false)
+    }
+    if f.has_const_regex {
+      return match f.compiled_regex {
+        Some(re) => Ok(re.is_match(text))
+        None => Ok(false)
+      }
+    }
+    let v1 = match self.eval_arg_as_value(f.args[1], current) {
+      Ok(ev) => ev
+      Err(e) => return Err(e)
+    }
+    let pat = match v1 {
+      EvalVal::Value(JsonValue::Str(s)) => s
+      _ => return Ok(false)
+    }
+    if f.name == "match" {
+      Ok(iregexp_match(text, pat))
+    } else {
+      Ok(iregexp_search(text, pat))
+    }
+  } else {
+    Ok(false)
+  }
+}
+
+fn EvalState::eval_filter(
+  self : EvalState,
+  expr : FilterExpr,
+  current : JsonValue,
+) -> Result[Bool, JsonPathError] {
+  match expr {
+    FilterExpr::Or(items) => {
+      let mut i = 0
+      while i < items.length() {
+        let b = match self.eval_filter(items[i], current) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if b {
+          return Ok(true)
+        }
+        i = i + 1
+      }
+      Ok(false)
+    }
+    FilterExpr::And(items) => {
+      let mut i = 0
+      while i < items.length() {
+        let b = match self.eval_filter(items[i], current) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if !b {
+          return Ok(false)
+        }
+        i = i + 1
+      }
+      Ok(true)
+    }
+    FilterExpr::Not(inner) => {
+      match self.eval_filter(inner, current) {
+        Ok(v) => Ok(!v)
+        Err(e) => Err(e)
+      }
+    }
+    FilterExpr::Comparison(lhs_c, op, rhs_c) => {
+      let lhs = match self.eval_comparable(lhs_c, current) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let rhs = match self.eval_comparable(rhs_c, current) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let res = match op {
+        CompOp::Eq => eval_val_eq(lhs, rhs)
+        CompOp::Ne => !eval_val_eq(lhs, rhs)
+        CompOp::Lt => eval_val_lt(lhs, rhs)
+        CompOp::Le => eval_val_lt(lhs, rhs) || eval_val_eq(lhs, rhs)
+        CompOp::Gt => eval_val_lt(rhs, lhs)
+        CompOp::Ge => eval_val_lt(rhs, lhs) || eval_val_eq(lhs, rhs)
+      }
+      Ok(res)
+    }
+    FilterExpr::TestQuery(is_rel, segs) => {
+      let base = if is_rel { current } else { self.root }
+      let nodes = match self.eval_segments_values([base], segs) {
+        Ok(ns) => ns
+        Err(e) => return Err(e)
+      }
+      Ok(nodes.length() > 0)
+    }
+    FilterExpr::TestFunc(f) => self.eval_func_logical(f, current)
+  }
+}
