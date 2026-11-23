@@ -16,19 +16,26 @@ Zero-dependency, pure-Pion cryptographic primitives package (`World`-free, porta
 3. **Canonical point encoding (`A` and `R`)**: rejects `y >= p` (`p = 2^255 - 19`), off-curve points (`InvalidPoint`), and non-canonical negative zero (`x == 0` with sign bit `1`, `NonCanonicalPoint`).
 4. **Small-order torsion rejection (`A` and `R`)**: checks `[8]P != O` for both public key `A` and signature point `R`, rejecting all 8 small-order torsion points (`SmallOrderPoint`).
 5. **Strict un-cofactored equation**: verifies `[S]B == R + [k]A` directly in projective coordinates. Note: this intentionally differs from ZIP-215 (which permits non-canonical encodings and uses cofactored `[8S]B == [8]R + [8k]A` for batch verification) in order to guarantee strict single-signature non-malleability.
-6. **Zero-length inputs**: empty messages (`Bytes::new(0)`) and empty HMAC keys are handled safely without panics.
-7. **Legacy notice**: `Sha1` is provided only for legacy protocol compatibility (e.g. WebSocket handshakes, Git object IDs); use `Sha256` / `Sha512` for cryptographic security.
+6. **Mixed-order public keys**: a canonical `A` that is not small-order but carries a torsion component (`A + T`) is accepted, exactly like `verify_strict`; with the un-cofactored equation such a key verifies only when `[k]T == O`. `R + T` is always rejected, so honest signatures are not malleable.
+7. **Side channels**: key generation and signing use a 4-bit fixed-window base-point ladder whose table lookup is branch-free (`ct_eq_nibble` + masked `cmov`, no secret-dependent `jnz` in the emitted SSA). Verification is variable-time (public inputs only). `hex_to_bytes` / `bytes_to_hex` are not constant-time; `constant_time_eq` returns early only on a length mismatch.
+8. **Zero-length inputs**: empty messages (`Bytes::new(0)`) and empty HMAC keys are handled safely without panics. `update_slice(data, start, end)` clamps to `[max(start, 0), min(end, len))`; an empty or inverted range is a no-op.
+9. **Internal state is not encapsulated**: Pion does not yet enforce field privacy or immutability across packages, so the fields of `Ed25519KeyPair` (secret scalar, nonce prefix, public key) and of the hasher/HMAC structs are reachable by callers. Never read or write them; use `public_key()`, `sign()` and the hasher methods only. Signing with a modified `pk` field leaks the secret key.
+10. **Legacy notice**: `Sha1` is provided only for legacy protocol compatibility (e.g. WebSocket handshakes, Git object IDs); use `Sha256` / `Sha512` for cryptographic security.
 
 ## Verification
 
 ```sh
 sh scripts/verify.sh packages/crypto
-sh packages/crypto/bench/run_bench.sh
+sh packages/crypto/bench/run_bench.sh   # 4-mode wasm_smoke parity + head-to-head benchmarks
 ```
 
-### 4-Mode Cross-Target Parity (`bench/wasm_smoke`)
+### 4-Mode Cross-Target Parity (`wasm_smoke`)
 
-Native debug, Native release, Wasm32 debug, and Wasm32 release all produce byte-identical stdout (`1015 B`, `sha256:c9431b5eed16aa6088a11cec23f738e143a19a3924d1fadf4e907dc134924738`).
+Native debug, Native release, Wasm32 debug, and Wasm32 release all produce byte-identical stdout (`2398 B`, `sha256:259b374d007b191c2415407d487ff639131c8625f8766e3104714fd48c2f8fa6`), including the red-team section (SHA block boundaries, hostile `update_slice` bounds, 1024-byte HMAC key, a 100,000-byte Ed25519 vector from an independent implementation, and exact rejection reasons for non-canonical / small-order / wrong-length inputs).
+
+### Red-team audit
+
+See [`audit/REDTEAM_AUDIT.md`](audit/REDTEAM_AUDIT.md) and `redteam_test.pion`.
 
 ## Head-to-Head Benchmarks
 
