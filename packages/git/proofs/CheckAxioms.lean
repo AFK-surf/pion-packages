@@ -1,0 +1,24 @@
+import GitProofs
+
+#print axioms GitProofs.hex_nibble_range
+#print axioms GitProofs.hex_nibble_exact_spec
+#print axioms GitProofs.pkt_line_decode_len_exact
+#print axioms GitProofs.pkt_line_decode_len_injective
+#print axioms GitProofs.pkt_line_classify_len_spec
+#print axioms GitProofs.pkt_line_encode_decode_roundtrip
+#print axioms GitProofs.is_ref_forbidden_char_spec
+#print axioms GitProofs.is_ref_forbidden_char_allows_safe_chars
+#print axioms GitProofs.is_ref_forbidden_pair_spec
+#print axioms GitProofs.object_kind_pack_type_bijection
+#print axioms GitProofs.file_mode_to_u32_injective_and_equals
+#print axioms GitProofs.hash_kind_byte_len_spec
+#print axioms GitProofs.git_limits_default_valid
+#print axioms GitProofs.git_limits_is_valid_iff
+#print axioms GitProofs.index_flags_stage_bounds
+#print axioms GitProofs.index_flags_stage_exact
+#print axioms GitProofs.index_v2_padded_len_spec
+#print axioms GitProofs.index_v2_pad_bytes_spec
+#print axioms GitProofs.index_v2_encode_decode_alignment_eq
+#print axioms GitProofs.delta_copy_size_roundtrip
+#print axioms GitProofs.delta_copy_size_decode_pos
+#print axioms GitProofs.delta_copy_range_ok_sound

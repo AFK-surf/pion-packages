@@ -41,6 +41,14 @@ Modeled after Rust [`gix`](https://github.com/GitoxideLabs/gitoxide) (`gix-objec
 - **4-Mode `wasm_smoke` (`packages/git/wasm_smoke`)**: All 4 build modes (Native debug/release + Wasm32 debug/release, each with isolated clean `PION_CACHE_DIR`) exit `0` with byte-identical stdout:
   - `sha256: 722ac87d312b6e35dc2f06fd514c83636016a05474b35a2bd705a7f0795e6d48`
 
+## Formal Verification (Lean 4)
+
+Production `#verify` kernels (4 types, 19 functions, 0 externals) across `src/types.pion`, `src/object.pion`, `src/oid.pion`, `src/pktline.pion`, `src/refs.pion`, `src/index.pion`, and `src/delta.pion` are extracted via `pionc extract-lean` and formally verified in `packages/git/proofs/` (**22 theorems**, 0 `sorry`, 0 `admit`, 0 custom axioms, 0 `bv_decide`, 0 `native_decide`):
+
+- **`GitProofs/WireAndRefs.lean` (11 theorems)**: `hex_nibble` exact range & ASCII hex specification, `pkt_line_decode_len` exact 16-bit big-endian assembly & injectivity, `pkt_line_classify_len` total partition (Flush / Delim / ResponseEnd / Data `4..65520` / Invalid), end-to-end `pkt_line_encode_decode_roundtrip` over `[0, 65516]`, `git-check-ref-format(1)` forbidden single-char & pair specs, `ObjectKind` pack-type bijection, and `FileMode::to_u32` injectivity.
+- **`GitProofs/IndexAndDelta.lean` (11 theorems)**: `HashKind::byte_len` (20 / 32), `GitLimits::default` positivity & `git_limits_is_valid` iff characterization, `index_flags_stage` exact `[0, 3]` extraction, `.git/index` v2/v3 8-byte alignment (`index_v2_padded_len`, `index_v2_pad_bytes`, and encoder-decoder equivalence `index_v2_encode_decode_alignment_eq`), `delta_copy_size` roundtrip on `[1, 65536]`, and overflow-free `delta_copy_range_ok` bounds soundness.
+- **Reproduce**: `packages/git/proofs/run_proofs.sh` (verifies extraction, static scan, `lake build`, `CheckAxioms.lean` standard-axioms-only check, and 39-case Native Pion vs Lean `EvalDiff` `diff -u` cross-check).
+
 ## Head-to-Head Benchmarks vs Rust `gix` (`--release --locked`)
 
 Run on `Darwin arm64` via `sh packages/git/bench/run_bench.sh` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification). W1 uses a fair single-pass `gix-pack` decode loop (`pack.entry(offset)` + `decode_entry` advancing by `outcome.compressed_size`, inflating each entry once).
