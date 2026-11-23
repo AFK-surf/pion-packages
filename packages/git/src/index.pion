@@ -1,0 +1,334 @@
+///| Git Index (`.git/index` dircache v2 / v3 / v4) parser and serializer.
+
+///| Single entry in `.git/index`.
+pub struct IndexEntry {
+  pub ctime_sec : UInt
+  pub ctime_nsec : UInt
+  pub mtime_sec : UInt
+  pub mtime_nsec : UInt
+  pub dev : UInt
+  pub ino : UInt
+  pub mode : UInt
+  pub uid : UInt
+  pub gid : UInt
+  pub file_size : UInt
+  pub oid : Oid
+  pub flags : UInt
+  pub extended_flags : UInt
+  pub path : String
+}
+
+///|
+pub fn IndexEntry::stage(self : IndexEntry) -> Int {
+  ((self.flags >> 12U) & 3U).to_int()
+}
+
+///|
+pub fn IndexEntry::assume_valid(self : IndexEntry) -> Bool {
+  (self.flags & 0x8000U) != 0U
+}
+
+///|
+pub fn IndexEntry::intent_to_add(self : IndexEntry) -> Bool {
+  (self.extended_flags & 0x2000U) != 0U
+}
+
+///|
+pub fn IndexEntry::skip_worktree(self : IndexEntry) -> Bool {
+  (self.extended_flags & 0x4000U) != 0U
+}
+
+///| Raw extension block in `.git/index` (e.g. `TREE`, `REUC`, `LINK`).
+pub struct IndexExtension {
+  pub signature : String
+  pub data : Bytes
+}
+
+///| Parsed `.git/index` dircache.
+pub struct GitIndex {
+  pub version : Int
+  pub entries : Array[IndexEntry]
+  pub extensions : Array[IndexExtension]
+  pub checksum : Oid
+}
+
+///|
+pub fn GitIndex::parse(
+  data : Bytes,
+  limits : GitLimits,
+) -> Result[GitIndex, GitError] {
+  match limits.validate() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let n = data.length()
+  if n < 32 {
+    return Err(GitError::Truncated("index file shorter than 32 bytes"))
+  }
+  if data[0].to_int() != 68 ||
+  data[1].to_int() != 73 ||
+  data[2].to_int() != 82 ||
+  data[3].to_int() != 67 {
+    return Err(GitError::InvalidIndex("invalid DIRC magic"))
+  }
+  let version = read_u32_be(data, 4).to_int()
+  if version < 2 || version > 4 {
+    return Err(GitError::UnsupportedVersion(version))
+  }
+  let count_u = read_u32_be(data, 8)
+  if count_u > 0x7FFFFFFFU {
+    return Err(GitError::LimitExceeded("index entry count overflow"))
+  }
+  let count = count_u.to_int()
+  if count > limits.max_index_entries {
+    return Err(GitError::LimitExceeded("index exceeds max_index_entries"))
+  }
+
+  // Verify trailing 20-byte SHA-1 checksum
+  let body_end = n - 20
+  let hasher = crypto::Sha1::new()
+  hasher.update_slice(data, 0, body_end)
+  let actual_csum = hasher.finalize()
+  let expected_csum = data.slice(body_end, n)
+  if !bytes_eq(actual_csum, expected_csum) {
+    return Err(GitError::ChecksumMismatch("index trailer SHA-1 mismatch"))
+  }
+
+  let entries : Array[IndexEntry] = Array::new()
+  let mut pos = 12
+  let mut prev_path = ""
+  let mut i = 0
+  while i < count {
+    let entry_start = pos
+    if pos + 62 > body_end {
+      return Err(GitError::Truncated("truncated index entry header"))
+    }
+    let ctime_sec = read_u32_be(data, pos)
+    let ctime_nsec = read_u32_be(data, pos + 4)
+    let mtime_sec = read_u32_be(data, pos + 8)
+    let mtime_nsec = read_u32_be(data, pos + 12)
+    let dev = read_u32_be(data, pos + 16)
+    let ino = read_u32_be(data, pos + 20)
+    let mode = read_u32_be(data, pos + 24)
+    let uid = read_u32_be(data, pos + 28)
+    let gid = read_u32_be(data, pos + 32)
+    let file_size = read_u32_be(data, pos + 36)
+    let oid = Oid::{ kind: HashKind::Sha1, bytes: data.slice(pos + 40, pos + 60) }
+    let flags = read_u16_be(data, pos + 60)
+    pos = pos + 62
+
+    let mut extended_flags = 0U
+    if (flags & 0x4000U) != 0U {
+      if pos + 2 > body_end {
+        return Err(GitError::Truncated("truncated extended flags"))
+      }
+      extended_flags = read_u16_be(data, pos)
+      if (extended_flags & 0x9FFFU) != 0U {
+        return Err(GitError::InvalidIndex("unknown extended flag bits"))
+      }
+      pos = pos + 2
+    }
+
+    let path = if version == 4 {
+      let (strip_i64, np) = match read_ofs_varint(data, pos, body_end) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      pos = np
+      let strip = strip_i64.to_int()
+      if strip < 0 || strip > prev_path.length() {
+        return Err(GitError::InvalidIndex("v4 prefix strip exceeds previous path length"))
+      }
+      let mut nul = pos
+      while nul < body_end && data[nul].to_int() != 0 {
+        nul = nul + 1
+      }
+      if nul >= body_end {
+        return Err(GitError::Truncated("unterminated v4 index path"))
+      }
+      let suffix = data.slice(pos, nul).to_string()
+      pos = nul + 1
+      prev_path.slice(0, prev_path.length() - strip) + suffix
+    } else {
+      let name_len = (flags & 0x0FFFU).to_int()
+      let nul = if name_len < 0x0FFF {
+        if pos + name_len >= body_end {
+          return Err(GitError::Truncated("truncated index path"))
+        }
+        if data[pos + name_len].to_int() != 0 {
+          return Err(GitError::InvalidIndex("index path length mismatch with flags.name_len"))
+        }
+        pos + name_len
+      } else {
+        let mut scan = pos
+        while scan < body_end && data[scan].to_int() != 0 {
+          scan = scan + 1
+        }
+        if scan >= body_end {
+          return Err(GitError::Truncated("unterminated index path"))
+        }
+        scan
+      }
+      let p_str = data.slice(pos, nul).to_string()
+      // Pad entry to 8-byte boundary (at least 1 NUL byte)
+      let raw_len = (nul - entry_start) + 1
+      let padded_len = (raw_len + 7) & -8
+      pos = entry_start + padded_len
+      if pos > body_end {
+        return Err(GitError::Truncated("index entry padding past EOF"))
+      }
+      p_str
+    }
+
+    match validate_git_rel_path(path) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    prev_path = path
+    entries.push(
+      IndexEntry::{
+        ctime_sec: ctime_sec,
+        ctime_nsec: ctime_nsec,
+        mtime_sec: mtime_sec,
+        mtime_nsec: mtime_nsec,
+        dev: dev,
+        ino: ino,
+        mode: mode,
+        uid: uid,
+        gid: gid,
+        file_size: file_size,
+        oid: oid,
+        flags: flags,
+        extended_flags: extended_flags,
+        path: path,
+      },
+    )
+    i = i + 1
+  }
+
+  // Parse extensions until body_end
+  let extensions : Array[IndexExtension] = Array::new()
+  while pos < body_end {
+    if pos + 8 > body_end {
+      return Err(GitError::Truncated("truncated index extension header"))
+    }
+    let sig = data.slice(pos, pos + 4).to_string()
+    let sig_b0 = data[pos].to_int()
+    if sig_b0 < 65 || sig_b0 > 90 {
+      return Err(GitError::InvalidIndex("unknown required index extension: " + sig))
+    }
+    let ext_len_u = read_u32_be(data, pos + 4)
+    if ext_len_u > 0x7FFFFFFFU {
+      return Err(GitError::LimitExceeded("index extension size overflow"))
+    }
+    let ext_len = ext_len_u.to_int()
+    pos = pos + 8
+    if pos + ext_len > body_end {
+      return Err(GitError::Truncated("truncated index extension payload"))
+    }
+    let ext_data = data.slice(pos, pos + ext_len)
+    pos = pos + ext_len
+    extensions.push(IndexExtension::{ signature: sig, data: ext_data })
+  }
+
+  Ok(
+    GitIndex::{
+      version: version,
+      entries: entries,
+      extensions: extensions,
+      checksum: Oid::{ kind: HashKind::Sha1, bytes: expected_csum },
+    },
+  )
+}
+
+///|
+pub fn GitIndex::encode(self : GitIndex) -> Result[Bytes, GitError] {
+  if self.version < 2 || self.version > 4 {
+    return Err(GitError::UnsupportedVersion(self.version))
+  }
+  let count = self.entries.length()
+  let bb = ByteBuf::new(64 + count * 80)
+  bb.push_str("DIRC")
+  bb.push_u32_be(self.version.to_uint())
+  bb.push_u32_be(count.to_uint())
+
+  let mut prev_path = ""
+  let mut i = 0
+  while i < count {
+    let e = self.entries[i]
+    match validate_git_rel_path(e.path) {
+      Ok(_) => ()
+      Err(err) => return Err(err)
+    }
+    let entry_start = bb.len
+    bb.push_u32_be(e.ctime_sec)
+    bb.push_u32_be(e.ctime_nsec)
+    bb.push_u32_be(e.mtime_sec)
+    bb.push_u32_be(e.mtime_nsec)
+    bb.push_u32_be(e.dev)
+    bb.push_u32_be(e.ino)
+    bb.push_u32_be(e.mode)
+    bb.push_u32_be(e.uid)
+    bb.push_u32_be(e.gid)
+    bb.push_u32_be(e.file_size)
+    bb.push_bytes(e.oid.raw_bytes())
+
+    let path_b = e.path.to_bytes()
+    let name_len = if path_b.length() < 0x0FFF { path_b.length() } else { 0x0FFF }
+    let has_ext = self.version >= 3 && ((e.flags & 0x4000U) != 0U || e.extended_flags != 0U)
+    let mut flags = (e.flags & 0xB000U) | name_len.to_uint()
+    if has_ext {
+      flags = flags | 0x4000U
+    }
+    bb.push_u16_be(flags)
+    if has_ext {
+      bb.push_u16_be(e.extended_flags)
+    }
+
+    if self.version == 4 {
+      let prev_b = prev_path.to_bytes()
+      let min_l = if prev_b.length() < path_b.length() {
+        prev_b.length()
+      } else {
+        path_b.length()
+      }
+      let mut common = 0
+      while common < min_l && prev_b[common] == path_b[common] {
+        common = common + 1
+      }
+      let strip = prev_b.length() - common
+      write_ofs_varint(bb, strip.to_int64())
+      bb.push_bytes_slice(path_b, common, path_b.length())
+      bb.push_byte(0)
+    } else {
+      bb.push_bytes(path_b)
+      bb.push_byte(0)
+      let mut pad = 8 - ((bb.len - entry_start) & 7)
+      if pad == 8 {
+        pad = 0
+      }
+      while pad > 0 {
+        bb.push_byte(0)
+        pad = pad - 1
+      }
+    }
+    prev_path = e.path
+    i = i + 1
+  }
+
+  let mut k = 0
+  while k < self.extensions.length() {
+    let ext = self.extensions[k]
+    if ext.signature.length() != 4 {
+      return Err(GitError::InvalidIndex("extension signature must be 4 bytes"))
+    }
+    bb.push_str(ext.signature)
+    bb.push_u32_be(ext.data.length().to_uint())
+    bb.push_bytes(ext.data)
+    k = k + 1
+  }
+
+  let body = bb.to_bytes()
+  let csum = crypto::sha1(body)
+  Ok(body.concat(csum))
+}

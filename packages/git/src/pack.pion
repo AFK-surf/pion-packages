@@ -1,0 +1,574 @@
+///| Git Packfile v2 reader and writer.
+
+///| Packfile entry type tag.
+pub enum PackEntryKind {
+  Commit
+  Tree
+  Blob
+  Tag
+  OfsDelta(Int64)
+  RefDelta(Oid)
+}
+
+///| Scanned metadata for a single packfile entry.
+pub struct PackEntryMeta {
+  pub offset : Int64
+  pub compressed_len : Int
+  pub uncompressed_size : Int
+  pub crc32 : UInt
+  pub kind : PackEntryKind
+}
+
+///| In-memory Git Packfile v2 reader supporting multi-level OFS_DELTA & REF_DELTA resolution.
+pub struct PackReader {
+  raw : Bytes
+  checksum : Oid
+  entries : Array[PackEntryMeta]
+  resolved : Array[RawObject]
+  oid_to_idx : Map[String, Int]
+  limits : GitLimits
+}
+
+///| Binary search `entries` by byte offset (entries are strictly ascending by offset).
+fn find_entry_by_offset(entries : Array[PackEntryMeta], target : Int64) -> Int {
+  let mut lo = 0
+  let mut hi = entries.length()
+  while lo < hi {
+    let mid = lo + ((hi - lo) >> 1)
+    let off = entries[mid].offset
+    if off == target {
+      return mid
+    } else if off < target {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  -1
+}
+
+///| Read Git OFS_DELTA negative offset varint.
+fn read_ofs_varint(data : Bytes, start : Int, end : Int) -> Result[(Int64, Int), GitError] {
+  if start >= end {
+    return Err(GitError::Truncated("truncated OFS_DELTA offset"))
+  }
+  let mut pos = start
+  let mut b = data[pos].to_int()
+  pos = pos + 1
+  let mut acc : Int64 = (b & 0x7F).to_int64()
+  while (b & 0x80) != 0 {
+    if pos >= end {
+      return Err(GitError::Truncated("truncated OFS_DELTA offset continuation"))
+    }
+    if acc >= 0x00FFFFFFFFFFFFFFL {
+      return Err(GitError::InvalidPack("OFS_DELTA offset overflow"))
+    }
+    b = data[pos].to_int()
+    pos = pos + 1
+    acc = ((acc + 1L) << 7) | (b & 0x7F).to_int64()
+  }
+  Ok((acc, pos))
+}
+
+///| Write Git OFS_DELTA negative offset varint to `bb`.
+fn write_ofs_varint(bb : ByteBuf, value : Int64) -> Unit {
+  let tmp : FixedArray[Int] = FixedArray::make(12, 0)
+  let mut v = value
+  let mut n = 0
+  tmp[n] = (v & 0x7FL).to_int()
+  n = n + 1
+  v = v >> 7
+  while v > 0L {
+    v = v - 1L
+    tmp[n] = 0x80 | (v & 0x7FL).to_int()
+    n = n + 1
+    v = v >> 7
+  }
+  let mut i = n - 1
+  while i >= 0 {
+    bb.push_byte(tmp[i])
+    i = i - 1
+  }
+}
+
+///| Write pack entry type+size header.
+fn write_pack_entry_header(bb : ByteBuf, ptype : Int, size : Int) -> Unit {
+  let mut sz = size
+  let mut b = ((ptype & 7) << 4) | (sz & 0x0F)
+  sz = sz >> 4
+  if sz > 0 {
+    b = b | 0x80
+  }
+  bb.push_byte(b)
+  while sz > 0 {
+    let mut nb = sz & 0x7F
+    sz = sz >> 7
+    if sz > 0 {
+      nb = nb | 0x80
+    }
+    bb.push_byte(nb)
+  }
+}
+
+///|
+pub fn PackReader::open(
+  data : Bytes,
+  limits : GitLimits,
+) -> Result[PackReader, GitError] {
+  match limits.validate() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let n = data.length()
+  if n < 32 {
+    return Err(GitError::Truncated("packfile shorter than 32 bytes"))
+  }
+  if data[0].to_int() != 80 ||
+  data[1].to_int() != 65 ||
+  data[2].to_int() != 67 ||
+  data[3].to_int() != 75 {
+    return Err(GitError::InvalidPack("invalid PACK magic"))
+  }
+  let version = read_u32_be(data, 4).to_int()
+  if version != 2 && version != 3 {
+    return Err(GitError::UnsupportedVersion(version))
+  }
+  let count_u = read_u32_be(data, 8)
+  if count_u > 0x7FFFFFFFU {
+    return Err(GitError::LimitExceeded("packfile object count overflow"))
+  }
+  let count = count_u.to_int()
+  if count > limits.max_pack_entries {
+    return Err(GitError::LimitExceeded("packfile exceeds max_pack_entries"))
+  }
+
+  // Verify trailing 20-byte SHA-1 checksum
+  let body_end = n - 20
+  let expected_csum = data.slice(body_end, n)
+  let hasher = crypto::Sha1::new()
+  hasher.update_slice(data, 0, body_end)
+  let actual_csum = hasher.finalize()
+  if !bytes_eq(expected_csum, actual_csum) {
+    return Err(GitError::ChecksumMismatch("packfile trailer SHA-1 mismatch"))
+  }
+  let checksum = Oid::{ kind: HashKind::Sha1, bytes: expected_csum }
+
+  // Effective aggregate byte budget: caps amplification bombs while allowing real large packs
+  let mut total_budget = limits.max_pack_total_bytes
+  if total_budget >= 268435456L {
+    let scaled = n.to_int64() * 16L
+    let cap = 1073741824L
+    let scaled_capped = if scaled > cap { cap } else { scaled }
+    if scaled_capped > total_budget {
+      total_budget = scaled_capped
+    }
+  }
+  let mut total_bytes : Int64 = 0L
+
+  // Pass 1: sequential scan & inflate
+  let entries : Array[PackEntryMeta] = Array::new()
+  let raw_payloads : Array[Bytes] = Array::new()
+  let scratch = PackInflateScratch::new()
+  let mut pos = 12
+  let mut idx = 0
+  while idx < count {
+    if pos >= body_end {
+      return Err(GitError::Truncated("unexpected EOF before pack entry"))
+    }
+    let entry_off = pos
+    let b0 = data[pos].to_int()
+    pos = pos + 1
+    let ptype = (b0 >> 4) & 7
+    let mut size64 : Int64 = (b0 & 0x0F).to_int64()
+    let mut shift = 4
+    let mut cur_b = b0
+    while (cur_b & 0x80) != 0 {
+      if pos >= body_end {
+        return Err(GitError::Truncated("truncated pack entry size varint"))
+      }
+      if shift >= 60 {
+        return Err(GitError::LimitExceeded("pack entry size overflow"))
+      }
+      cur_b = data[pos].to_int()
+      pos = pos + 1
+      size64 = size64 | ((cur_b & 0x7F).to_int64() << shift)
+      shift = shift + 7
+    }
+    let max_bytes = if ptype == 6 || ptype == 7 {
+      limits.max_delta_result_bytes
+    } else {
+      limits.max_object_bytes
+    }
+    if size64 < 0L || size64 > max_bytes.to_int64() {
+      return Err(GitError::LimitExceeded("pack entry exceeds size limit"))
+    }
+    let size = size64.to_int()
+    if total_bytes + size64 > total_budget {
+      return Err(GitError::LimitExceeded("packfile exceeds max_pack_total_bytes"))
+    }
+
+    let kind = if ptype == 1 {
+      PackEntryKind::Commit
+    } else if ptype == 2 {
+      PackEntryKind::Tree
+    } else if ptype == 3 {
+      PackEntryKind::Blob
+    } else if ptype == 4 {
+      PackEntryKind::Tag
+    } else if ptype == 6 {
+      let (neg_off, np) = match read_ofs_varint(data, pos, body_end) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      pos = np
+      let base_off = entry_off.to_int64() - neg_off
+      if base_off < 12L || base_off >= entry_off.to_int64() {
+        return Err(GitError::InvalidPack("OFS_DELTA base offset out of range"))
+      }
+      PackEntryKind::OfsDelta(base_off)
+    } else if ptype == 7 {
+      if pos + 20 > body_end {
+        return Err(GitError::Truncated("truncated REF_DELTA base OID"))
+      }
+      let base_oid = Oid::{ kind: HashKind::Sha1, bytes: data.slice(pos, pos + 20) }
+      pos = pos + 20
+      PackEntryKind::RefDelta(base_oid)
+    } else {
+      return Err(GitError::InvalidPack("invalid pack entry type: " + ptype.to_string()))
+    }
+
+    let rem_budget64 = total_budget - total_bytes
+    let inflate_cap = if rem_budget64 < max_bytes.to_int64() {
+      rem_budget64.to_int()
+    } else {
+      max_bytes
+    }
+    let (inflated, next_pos) = match zlib_inflate_at(data, pos, size, inflate_cap, scratch) {
+      Ok(p) => p
+      Err(e) => return Err(e)
+    }
+    if inflated.length() != size {
+      return Err(
+        GitError::InvalidPack(
+          "pack entry size mismatch: header=" +
+          size.to_string() +
+          ", inflated=" +
+          inflated.length().to_string(),
+        ),
+      )
+    }
+    if next_pos > body_end {
+      return Err(GitError::Truncated("pack entry extends into checksum trailer"))
+    }
+    total_bytes = total_bytes + size64
+    let crc = flate::crc32_update_slice(0U, data, entry_off, next_pos)
+    entries.push(
+      PackEntryMeta::{
+        offset: entry_off.to_int64(),
+        compressed_len: next_pos - entry_off,
+        uncompressed_size: size,
+        crc32: crc,
+        kind: kind,
+      },
+    )
+    raw_payloads.push(inflated)
+    pos = next_pos
+    idx = idx + 1
+  }
+
+  if pos != body_end {
+    return Err(GitError::InvalidPack("trailing bytes before packfile checksum"))
+  }
+
+  // Pass 2: resolve base objects, OFS_DELTA, and REF_DELTA chains
+  let dummy = RawObject::{
+    kind: ObjectKind::Blob,
+    payload: Bytes::new(0),
+    oid: Oid::zero(HashKind::Sha1),
+  }
+  let resolved : Array[RawObject] = Array::make(count, dummy)
+  let done : FixedArray[Bool] = FixedArray::make(count, false)
+  let depths : FixedArray[Int] = FixedArray::make(count, 0)
+  let oid_to_idx : Map[String, Int] = Map::new()
+  let mut remaining = count
+
+  // 2a: direct non-delta objects
+  let mut i = 0
+  while i < count {
+    let e = entries[i]
+    let obj_kind_opt : Option[ObjectKind] = match e.kind {
+      PackEntryKind::Commit => Some(ObjectKind::Commit)
+      PackEntryKind::Tree => Some(ObjectKind::Tree)
+      PackEntryKind::Blob => Some(ObjectKind::Blob)
+      PackEntryKind::Tag => Some(ObjectKind::Tag)
+      _ => None
+    }
+    match obj_kind_opt {
+      Some(k) => {
+        let payload = raw_payloads[i]
+        raw_payloads[i] = Bytes::new(0)
+        let oid = hash_object_sha1(k, payload)
+        resolved[i] = RawObject::{ kind: k, payload: payload, oid: oid }
+        done[i] = true
+        depths[i] = 0
+        oid_to_idx.set(oid.to_hex(), i)
+        remaining = remaining - 1
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+
+  // 2b: iteratively resolve OFS_DELTA & REF_DELTA chains until fixed point
+  while remaining > 0 {
+    let mut progressed = false
+    let mut j = 0
+    while j < count {
+      if !done[j] {
+        let base_idx = match entries[j].kind {
+          PackEntryKind::OfsDelta(base_off) => find_entry_by_offset(entries, base_off)
+          PackEntryKind::RefDelta(base_oid) =>
+          match oid_to_idx.get(base_oid.to_hex()) {
+            Some(bi) => bi
+            None => -1
+          }
+          _ => -1
+        }
+        if base_idx >= 0 && done[base_idx] {
+          let new_depth = depths[base_idx] + 1
+          if new_depth > limits.max_delta_depth {
+            return Err(GitError::LimitExceeded("delta chain depth exceeds max_delta_depth"))
+          }
+          let base_obj = resolved[base_idx]
+          let delta_bytes = raw_payloads[j]
+          let (_, target_sz, _) = match decode_delta_header(delta_bytes) {
+            Ok(h) => h
+            Err(e) => return Err(e)
+          }
+          if target_sz < 0 {
+            return Err(GitError::InvalidDelta("negative delta target size"))
+          }
+          if total_bytes + target_sz.to_int64() > total_budget {
+            return Err(GitError::LimitExceeded("packfile resolved objects exceed max_pack_total_bytes"))
+          }
+          let target_payload = match apply_delta(base_obj.payload, delta_bytes, limits) {
+            Ok(p) => p
+            Err(e) => return Err(e)
+          }
+          total_bytes = total_bytes - delta_bytes.length().to_int64() + target_payload.length().to_int64()
+          raw_payloads[j] = Bytes::new(0)
+          let oid = hash_object_sha1(base_obj.kind, target_payload)
+          resolved[j] = RawObject::{
+            kind: base_obj.kind,
+            payload: target_payload,
+            oid: oid,
+          }
+          done[j] = true
+          depths[j] = new_depth
+          oid_to_idx.set(oid.to_hex(), j)
+          remaining = remaining - 1
+          progressed = true
+        }
+      }
+      j = j + 1
+    }
+    if !progressed {
+      // Distinguish cycle vs missing external base
+      let mut k = 0
+      while k < count {
+        if !done[k] {
+          match entries[k].kind {
+            PackEntryKind::OfsDelta(_) =>
+            return Err(GitError::CycleDetected("unresolvable or cyclic OFS_DELTA"))
+            PackEntryKind::RefDelta(bo) =>
+            return Err(GitError::ObjectNotFound("missing REF_DELTA base: " + bo.to_hex()))
+            _ => ()
+          }
+        }
+        k = k + 1
+      }
+      return Err(GitError::CycleDetected("cyclic delta chain"))
+    }
+  }
+
+  Ok(
+    PackReader::{
+      raw: data,
+      checksum: checksum,
+      entries: entries,
+      resolved: resolved,
+      oid_to_idx: oid_to_idx,
+      limits: limits,
+    },
+  )
+}
+
+///|
+pub fn PackReader::len(self : PackReader) -> Int {
+  self.entries.length()
+}
+
+///|
+pub fn PackReader::checksum(self : PackReader) -> Oid {
+  self.checksum
+}
+
+///|
+pub fn PackReader::entries(self : PackReader) -> Array[PackEntryMeta] {
+  self.entries
+}
+
+///|
+pub fn PackReader::resolve_object(
+  self : PackReader,
+  oid : Oid,
+) -> Result[RawObject, GitError] {
+  match self.oid_to_idx.get(oid.to_hex()) {
+    Some(i) => Ok(self.resolved[i])
+    None => Err(GitError::ObjectNotFound("object not in pack: " + oid.to_hex()))
+  }
+}
+
+///|
+pub fn PackReader::resolve_at_offset(
+  self : PackReader,
+  offset : Int64,
+) -> Result[RawObject, GitError] {
+  let i = find_entry_by_offset(self.entries, offset)
+  if i < 0 {
+    return Err(GitError::ObjectNotFound("no pack entry at offset " + offset.to_string()))
+  }
+  Ok(self.resolved[i])
+}
+
+///|
+pub fn PackReader::resolve_all(
+  self : PackReader,
+) -> Result[Array[RawObject], GitError] {
+  Ok(self.resolved)
+}
+
+///|
+pub fn PackReader::build_idx_v2(self : PackReader) -> Result[Bytes, GitError] {
+  let count = self.entries.length()
+  let idx_entries : Array[(Oid, Int64, UInt)] = Array::new()
+  let mut i = 0
+  while i < count {
+    idx_entries.push((self.resolved[i].oid, self.entries[i].offset, self.entries[i].crc32))
+    i = i + 1
+  }
+  PackIndex::build(idx_entries, self.checksum)
+}
+
+// ============================================================================
+// PackWriter
+// ============================================================================
+
+///| Internal queued entry for `PackWriter`.
+struct PackWriteEntry {
+  ptype : Int
+  base_index : Int
+  base_oid : Option[Oid]
+  payload : Bytes
+}
+
+///| Git Packfile v2 builder.
+pub struct PackWriter {
+  items : Array[PackWriteEntry]
+}
+
+///|
+pub fn PackWriter::new() -> PackWriter {
+  PackWriter::{ items: Array::new() }
+}
+
+///|
+pub fn PackWriter::add_object(
+  self : PackWriter,
+  kind : ObjectKind,
+  payload : Bytes,
+) -> Oid {
+  let oid = hash_object_sha1(kind, payload)
+  self.items.push(
+    PackWriteEntry::{
+      ptype: kind.pack_type(),
+      base_index: -1,
+      base_oid: None,
+      payload: payload,
+    },
+  )
+  oid
+}
+
+///|
+pub fn PackWriter::add_ofs_delta(
+  self : PackWriter,
+  base_index : Int,
+  delta : Bytes,
+) -> Unit {
+  self.items.push(
+    PackWriteEntry::{
+      ptype: 6,
+      base_index: base_index,
+      base_oid: None,
+      payload: delta,
+    },
+  )
+}
+
+///|
+pub fn PackWriter::add_ref_delta(
+  self : PackWriter,
+  base_oid : Oid,
+  delta : Bytes,
+) -> Unit {
+  self.items.push(
+    PackWriteEntry::{
+      ptype: 7,
+      base_index: -1,
+      base_oid: Some(base_oid),
+      payload: delta,
+    },
+  )
+}
+
+///|
+pub fn PackWriter::finish(self : PackWriter) -> Result[(Bytes, Oid), GitError] {
+  let count = self.items.length()
+  let bb = ByteBuf::new(256 + count * 64)
+  bb.push_str("PACK")
+  bb.push_u32_be(2U)
+  bb.push_u32_be(count.to_uint())
+
+  let offsets : Array[Int64] = Array::new()
+  let mut i = 0
+  while i < count {
+    let item = self.items[i]
+    let cur_off = bb.len.to_int64()
+    offsets.push(cur_off)
+    write_pack_entry_header(bb, item.ptype, item.payload.length())
+    if item.ptype == 6 {
+      if item.base_index < 0 || item.base_index >= i {
+        return Err(GitError::InvalidPack("OFS_DELTA base_index out of range"))
+      }
+      let neg_off = cur_off - offsets[item.base_index]
+      write_ofs_varint(bb, neg_off)
+    } else if item.ptype == 7 {
+      match item.base_oid {
+        Some(bo) => bb.push_bytes(bo.raw_bytes())
+        None => return Err(GitError::InvalidPack("REF_DELTA missing base_oid"))
+      }
+    }
+    let comp = match flate::zlib_compress(item.payload, 6) {
+      Ok(c) => c
+      Err(e) => return Err(GitError::CompressError(e.to_string()))
+    }
+    bb.push_bytes(comp)
+    i = i + 1
+  }
+
+  let body = bb.to_bytes()
+  let csum_bytes = crypto::sha1(body)
+  let csum_oid = Oid::{ kind: HashKind::Sha1, bytes: csum_bytes }
+  Ok((body.concat(csum_bytes), csum_oid))
+}

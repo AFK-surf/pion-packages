@@ -1,0 +1,771 @@
+///| RT-git adversarial audit suite for `packages/git` @ `4eab80e`.
+///|
+///| Naming:
+///|   p0_*      confirmed crash / process abort reachable from untrusted bytes (currently FAIL)
+///|   p1_*      confirmed security-parity or major interop defect vs `git` / `gix` (currently FAIL)
+///|   p2_*      confirmed spec-conformance / round-trip / minor interop defect (currently FAIL)
+///|   control_* adversarial inputs the package already handles like `git` (currently PASS)
+///|
+///| Every expectation is the verdict of real `git 2.54.0` (`git hash-object` built-in fsck,
+///| `git fsck --strict`, `git index-pack`, `git ls-files`, `git check-ref-format`); see REPORT.md.
+
+import "git"
+import "crypto"
+import "flate"
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn bytes_of(vals : Array[Int]) -> Bytes {
+  let b = Bytes::new(vals.length())
+  let mut i = 0
+  while i < vals.length() {
+    b[i] = vals[i].to_byte()
+    i = i + 1
+  }
+  b
+}
+
+fn hexb(h : String) -> Bytes {
+  match crypto::hex_to_bytes(h) {
+    Some(b) => b
+    None => {
+      debug_assert(false, "bad hex fixture")
+      Bytes::new(0)
+    }
+  }
+}
+
+fn same_bytes(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn lim() -> git::GitLimits {
+  git::GitLimits::default()
+}
+
+///| Permissive limits (deep chains / large objects) for complexity probes.
+fn lim_wide() -> git::GitLimits {
+  git::GitLimits::new(1073741824, 10000000, 1000000, 1073741824, 10000000, 10000000)
+}
+
+let empty_blob_hex : String = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
+let empty_tree_hex : String = "4b825dc642cb6eb9a060e54bf8d69288fbe4904b"
+
+fn blob_oid() -> git::Oid {
+  match git::Oid::from_hex(empty_blob_hex) {
+    Ok(o) => o
+    Err(_) => git::Oid::zero(git::HashKind::Sha1)
+  }
+}
+
+///| One raw tree entry: `<mode> <name>\0<20-byte oid>`.
+fn tree_entry_raw(mode : String, name : Bytes) -> Bytes {
+  (mode + " ").to_bytes().concat(name).concat(Bytes::new(1)).concat(blob_oid().raw_bytes())
+}
+
+fn tree_ok(payload : Bytes) -> Bool {
+  match git::Tree::parse(payload, git::HashKind::Sha1, lim()) {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+fn commit_with(author_line : String, extra : String) -> Bytes {
+  (
+    "tree " +
+    empty_tree_hex +
+    "\n" +
+    author_line +
+    "committer A U Thor <a@example.com> 1700000000 +0000\n" +
+    extra +
+    "\nmsg\n"
+  ).to_bytes()
+}
+
+fn commit_ok(payload : Bytes) -> Bool {
+  match git::Commit::parse(payload, lim()) {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+fn varint(v : Int) -> Bytes {
+  let out : Array[Int] = Array::new()
+  let mut x = v
+  while true {
+    let b = x & 0x7F
+    x = x >> 7
+    if x != 0 {
+      out.push(b | 0x80)
+    } else {
+      out.push(b)
+      break
+    }
+  }
+  bytes_of(out)
+}
+
+fn kib_base() -> Bytes {
+  let b = Bytes::new(1024)
+  let mut i = 0
+  while i < 1024 {
+    b[i] = (i & 0xFF).to_byte()
+    i = i + 1
+  }
+  b
+}
+
+///| Build `PACK` with one blob base + one OFS_DELTA carrying `delta`.
+fn pack_with_delta(base : Bytes, delta : Bytes) -> Bytes {
+  let w = git::PackWriter::new()
+  let _ = w.add_object(git::ObjectKind::Blob, base)
+  w.add_ofs_delta(0, delta)
+  match w.finish() {
+    Ok((b, _)) => b
+    Err(_) => Bytes::new(0)
+  }
+}
+
+///| OFS_DELTA chain: blob "x", then `depth` deltas each appending one byte.
+fn chain_pack(depth : Int) -> Bytes {
+  let w = git::PackWriter::new()
+  let mut cur = "x".to_bytes()
+  let _ = w.add_object(git::ObjectKind::Blob, cur)
+  let mut i = 0
+  while i < depth {
+    let next = cur.concat("y".to_bytes())
+    w.add_ofs_delta(i, git::create_delta(cur, next))
+    cur = next
+    i = i + 1
+  }
+  match w.finish() {
+    Ok((b, _)) => b
+    Err(_) => Bytes::new(0)
+  }
+}
+
+fn pack_ok(data : Bytes, limits : git::GitLimits) -> Bool {
+  match git::PackReader::open(data, limits) {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+///| Recompute the trailing 20-byte SHA-1 over `body` and append it.
+fn with_sha1_trailer(body : Bytes) -> Bytes {
+  body.concat(crypto::sha1(body))
+}
+
+fn loose_of(raw : Bytes) -> Bytes {
+  match flate::zlib_compress(raw, 6) {
+    Ok(c) => c
+    Err(_) => Bytes::new(0)
+  }
+}
+
+fn index_entry_v2(path : Bytes, flags : Int) -> Bytes {
+  let hdr = Bytes::new(62)
+  hdr[26] = 0x81.to_byte()
+  hdr[27] = 0xA4.to_byte()
+  let oid = blob_oid().raw_bytes()
+  let mut i = 0
+  while i < 20 {
+    hdr[40 + i] = oid[i]
+    i = i + 1
+  }
+  hdr[60] = ((flags >> 8) & 0xFF).to_byte()
+  hdr[61] = (flags & 0xFF).to_byte()
+  let mut e = hdr.concat(path).concat(Bytes::new(1))
+  while (e.length() & 7) != 0 {
+    e = e.concat(Bytes::new(1))
+  }
+  e
+}
+
+fn index_file(version : Int, count : Int, entries : Bytes, exts : Bytes) -> Bytes {
+  let hdr = "DIRC".to_bytes().concat(bytes_of([0, 0, 0, version, 0, 0, 0, count]))
+  with_sha1_trailer(hdr.concat(entries).concat(exts))
+}
+
+// ============================================================================
+// P0: process abort (native SIGABRT rc=134 / wasm32 trap) from untrusted bytes
+// ============================================================================
+
+///| `cp_off + cp_size` is computed in 32-bit `Int`: 0x7fffffff + 0x10000 wraps negative, the
+///| bounds check passes and `base[cp_off]` aborts. git: "failed to apply delta"; gix 0.56 also panics.
+test "p0_apply_delta_copy_offset_overflow_must_not_abort" {
+  let base = kib_base()
+  let delta = varint(1024).concat(varint(0x10000)).concat(bytes_of([0x8F, 0xFF, 0xFF, 0xFF, 0x7F]))
+  match git::apply_delta(base, delta, lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "overflowing copy must be rejected")
+  }
+}
+
+///| Same overflow reached remotely through `PackReader::open` (fetch / receive-pack path).
+test "p0_pack_open_copy_offset_overflow_must_not_abort" {
+  let base = kib_base()
+  let delta = varint(1024).concat(varint(0x10000)).concat(bytes_of([0x8F, 0xFF, 0xFF, 0xFF, 0x7F]))
+  debug_assert(!pack_ok(pack_with_delta(base, delta), lim()), "pack must be rejected, not abort")
+}
+
+///| `read_delta_varint` lets bit 31 through at shift 28: target_size 0xffffffff decodes to -1,
+///| passes `target_size > max_delta_result_bytes`, then `Bytes::new(-1)` aborts.
+test "p0_apply_delta_negative_target_size_must_not_abort" {
+  let base = kib_base()
+  let delta = varint(1024).concat(bytes_of([0xFF, 0xFF, 0xFF, 0xFF, 0x0F])).concat(
+    bytes_of([0x90, 0x00]),
+  )
+  match git::decode_delta_header(delta) {
+    Ok((_, t, _)) => debug_assert(t >= 0, "decoded target_size must never be negative")
+    Err(_) => ()
+  }
+  match git::apply_delta(base, delta, lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "negative target_size must be rejected")
+  }
+}
+
+///| Same through `PackReader::open`.
+test "p0_pack_open_negative_target_size_must_not_abort" {
+  let base = kib_base()
+  let delta = varint(1024).concat(bytes_of([0xFF, 0xFF, 0xFF, 0xFF, 0x0F])).concat(
+    bytes_of([0x90, 0x00]),
+  )
+  debug_assert(!pack_ok(pack_with_delta(base, delta), lim()), "pack must be rejected, not abort")
+}
+
+// ============================================================================
+// P1: security parity / major interop
+// ============================================================================
+
+///| `.idx` table offsets are `count * 20 / 28` in 32-bit `Int`. With `max_pack_entries` raised via
+///| the public `GitLimits::new`, fanout[255] = 153391690 makes `off64_off` wrap to 1056 so a 1096-byte
+///| file parses; `lookup` then indexes ~1.5 GB past the buffer and aborts.
+test "p1_pack_index_table_offset_overflow_must_not_abort" {
+  let limits = git::GitLimits::new(67108864, 2147483647, 50, 67108864, 100000, 1000000)
+  let body = Bytes::new(1076)
+  body[0] = 0xFF.to_byte()
+  body[1] = 0x74.to_byte()
+  body[2] = 0x4F.to_byte()
+  body[3] = 0x63.to_byte()
+  body[7] = 2.to_byte()
+  // fanout[255] = 153391690 = 0x0924924A
+  let f = 8 + 255 * 4
+  body[f] = 0x09.to_byte()
+  body[f + 1] = 0x24.to_byte()
+  body[f + 2] = 0x92.to_byte()
+  body[f + 3] = 0x4A.to_byte()
+  let data = with_sha1_trailer(body)
+  match git::PackIndex::parse(data, limits) {
+    Err(_) => ()
+    Ok(ix) => {
+      let probe = Bytes::new(20)
+      probe[0] = 0xFF.to_byte()
+      match git::Oid::from_bytes(probe) {
+        Ok(o) =>
+        match ix.lookup(o) {
+          Some(_) => debug_assert(false, "lookup must not hit")
+          None => ()
+        }
+        Err(_) => ()
+      }
+      debug_assert(false, "idx whose tables cannot fit must be rejected at parse time")
+    }
+  }
+}
+
+///| git fsck `treeNotSorted` (ERROR). Pion accepts and `encode()` silently re-sorts => new OID.
+test "p1_tree_parse_rejects_unsorted_entries" {
+  let t = tree_entry_raw("100644", "b".to_bytes()).concat(tree_entry_raw("100644", "a".to_bytes()))
+  debug_assert(!tree_ok(t), "unsorted tree must be rejected (git: treeNotSorted)")
+}
+
+///| git fsck `duplicateEntries` (ERROR); two parsers would disagree on which `a` wins.
+test "p1_tree_parse_rejects_duplicate_entries" {
+  let t = tree_entry_raw("100644", "a".to_bytes()).concat(tree_entry_raw("100644", "a".to_bytes()))
+  debug_assert(!tree_ok(t), "duplicate names must be rejected (git: duplicateEntries)")
+  let t2 = tree_entry_raw("100644", "a".to_bytes())
+  .concat(tree_entry_raw("100644", "a-b".to_bytes()))
+  .concat(tree_entry_raw("40000", "a".to_bytes()))
+  debug_assert(!tree_ok(t2), "file a + dir a (non-adjacent) must be rejected (git: duplicateEntries)")
+}
+
+///| `Tree::encode` only compares sorted neighbours; file `a` and dir `a` sort apart ("a" < "a-b" < "a/"),
+///| so encode emits a tree that `git hash-object` / fsck / GitHub push reject.
+test "p1_tree_encode_rejects_nonadjacent_file_dir_duplicate" {
+  let o = blob_oid()
+  let t = git::Tree::{
+    entries: [
+      git::TreeEntry::{ mode: git::FileMode::Blob, name: "a", oid: o },
+      git::TreeEntry::{ mode: git::FileMode::Blob, name: "a-b", oid: o },
+      git::TreeEntry::{ mode: git::FileMode::Tree, name: "a", oid: o },
+    ],
+  }
+  match t.encode() {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "encode must refuse duplicate name a (file) / a (dir)")
+  }
+}
+
+///| Pion blocks only the exact `.git` (case-insensitive). git fsck `hasDotgit` also covers NTFS
+///| (`.git.`, `.git `, `GIT~1`, `.git::$INDEX_ALLOCATION`) and HFS+ ignorables (`.g‌it`):
+///| the CVE-2014-9390 / CVE-2019-1353 class.
+test "p1_tree_rejects_ntfs_hfs_dotgit_aliases" {
+  let names : Array[Bytes] = [
+    ".git.".to_bytes(),
+    ".git ".to_bytes(),
+    "GIT~1".to_bytes(),
+    "git~1".to_bytes(),
+    ".git::$INDEX_ALLOCATION".to_bytes(),
+    bytes_of([46, 103, 0xE2, 0x80, 0x8C, 105, 116]),
+    bytes_of([46, 103, 105, 0xE2, 0x80, 0x8D, 116]),
+  ]
+  let mut i = 0
+  let mut accepted = 0
+  while i < names.length() {
+    if tree_ok(tree_entry_raw("40000", names[i])) {
+      accepted = accepted + 1
+    }
+    i = i + 1
+  }
+  debug_assert(accepted == 0, accepted.to_string() + " of 7 .git aliases accepted (git: hasDotgit)")
+}
+
+///| git fsck `gitmodulesSymlink` / `gitattributesSymlink` / `gitignoreSymlink` (ERROR, CVE-2018-11235 class).
+test "p1_tree_rejects_symlinked_gitmodules" {
+  debug_assert(
+    !tree_ok(tree_entry_raw("120000", ".gitmodules".to_bytes())),
+    "symlink .gitmodules must be rejected",
+  )
+  debug_assert(
+    !tree_ok(tree_entry_raw("120000", "GITMOD~1".to_bytes())),
+    "symlink GITMOD~1 must be rejected",
+  )
+}
+
+///| Interop: `\` is a legal byte in Git tree names (git and gix accept); Pion rejects the whole tree,
+///| so any real repository containing such a file cannot be read.
+test "p1_tree_accepts_backslash_names_like_git" {
+  debug_assert(tree_ok(tree_entry_raw("100644", "a\\b".to_bytes())), "git accepts 'a\\\\b'")
+}
+
+///| Parser differential: two `tree` headers - git rejects (fsck), gix rejects; Pion keeps the LAST one,
+///| so a Pion consumer and a git consumer resolve different trees for the same commit id.
+test "p1_commit_rejects_duplicate_tree_header" {
+  let c = (
+    "tree " +
+    empty_tree_hex +
+    "\ntree " +
+    empty_blob_hex +
+    "\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n"
+  ).to_bytes()
+  debug_assert(!commit_ok(c), "duplicate tree header must be rejected")
+}
+
+///| git fsck `multipleAuthors` (ERROR); gix rejects; Pion keeps the last author.
+test "p1_commit_rejects_duplicate_author" {
+  let c = commit_with("author A <a@x> 1 +0000\nauthor B <b@x> 2 +0000\n", "")
+  debug_assert(!commit_ok(c), "duplicate author must be rejected")
+}
+
+///| OFS_DELTA offset varint has no overflow check: a 20-byte encoding wraps Int64 back to a valid
+///| base offset. git: "offset value overflow for delta base object"; gix rejects. Pion resolves it.
+test "p1_pack_rejects_overflowing_ofs_delta_varint" {
+  let p = hexb(
+    "5041434b0000000200000002b816789c4b4a2c4e5548cac94f5248cecf2b49cd2be14a1a15a1810800b61181ede10180fefefefefefefefeff80fefefefefefefeff21789c7bc1f49169430623676241416a5e4a6a0a17003e17064b62cbe1c24bb849ae1f7a7a74baff142f4d84ee31",
+  )
+  debug_assert(!pack_ok(p, lim()), "non-canonical overflowing OFS varint must be rejected")
+}
+
+///| Interop: default `max_delta_depth = 50` rejects packs git and gix read fine
+///| (`git repack --depth=250`, `pack.depth` up to 4095).
+test "p1_default_limits_accept_depth_51_delta_chain" {
+  debug_assert(pack_ok(chain_pack(51), lim()), "git index-pack accepts depth 51")
+}
+
+// ============================================================================
+// P2: spec conformance / round-trip / minor interop
+// ============================================================================
+
+///| git `parse_loose_header` rejects a zero-padded size ("unable to parse header").
+test "p2_loose_rejects_zero_padded_size" {
+  let raw = "blob 012\u{0}hello loose\n".to_bytes()
+  match git::decode_loose_object(loose_of(raw), None, lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "zero-padded size must be rejected")
+  }
+}
+
+///| git: "garbage at end of loose object"; Pion ignores bytes after the Adler-32 trailer.
+test "p2_loose_rejects_trailing_garbage" {
+  let raw = "blob 12\u{0}hello loose\n".to_bytes()
+  let z = loose_of(raw).concat("junk".to_bytes())
+  match git::decode_loose_object(z, None, lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "trailing bytes after zlib stream must be rejected")
+  }
+}
+
+///| Timestamp overflow wraps silently (2^64 -> 0). git `badDateOverflow`; gix rejects.
+test "p2_signature_timestamp_overflow_rejected" {
+  match git::Signature::parse("A <a@x> 18446744073709551616 +0000") {
+    Err(_) => ()
+    Ok(s) => debug_assert(false, "overflow accepted as timestamp " + s.timestamp.to_string())
+  }
+}
+
+///| git fsck `badDate` (negative) and `zeroPaddedDate`.
+test "p2_signature_rejects_negative_and_zero_padded_dates" {
+  debug_assert(
+    !commit_ok(commit_with("author A <a@x> -5 +0000\n", "")),
+    "negative date must be rejected",
+  )
+  debug_assert(
+    !commit_ok(commit_with("author A <a@x> 01700000000 +0000\n", "")),
+    "zero-padded date must be rejected",
+  )
+}
+
+///| Interop: git and gix accept any 4-digit zone (`+0060`, `+9999` exist in old histories).
+test "p2_signature_accepts_out_of_range_tz_like_git" {
+  debug_assert(
+    commit_ok(commit_with("author A <a@x> 1700000000 +0060\n", "")),
+    "git accepts +0060",
+  )
+  debug_assert(
+    commit_ok(commit_with("author A <a@x> 1700000000 +9999\n", "")),
+    "git accepts +9999",
+  )
+}
+
+///| git fsck `missingTree` / header order (tree, parent*, author, committer).
+test "p2_commit_enforces_header_order" {
+  let c = (
+    "author A <a@x> 1 +0000\ntree " +
+    empty_tree_hex +
+    "\ncommitter A <a@x> 1 +0000\n\nm\n"
+  ).to_bytes()
+  debug_assert(!commit_ok(c), "author before tree must be rejected")
+}
+
+///| Round-trip: `encoding` is always re-emitted before extra headers, so a commit whose `gpgsig`
+///| precedes `encoding` (git accepts) re-encodes to different bytes => different OID.
+test "p2_commit_encode_preserves_header_order" {
+  let c = commit_with(
+    "author A <a@x> 1 +0000\n",
+    "gpgsig -----BEGIN PGP SIGNATURE-----\n iQEz\n -----END PGP SIGNATURE-----\nencoding UTF-8\n",
+  )
+  match git::Commit::parse(c, lim()) {
+    Ok(p) => debug_assert(same_bytes(p.encode(), c), "re-encode must be byte-identical")
+    Err(e) => debug_assert(false, "git accepts this commit: " + e.to_string())
+  }
+}
+
+///| Round-trip: unknown tag headers are silently dropped by `Tag::parse` => `encode` changes the OID.
+test "p2_tag_roundtrip_preserves_unknown_headers" {
+  let t = (
+    "object " +
+    empty_tree_hex +
+    "\ntype tree\ntag v1.0\ntagger A <a@x> 1 +0000\nx-foo bar\n\nmessage\n"
+  ).to_bytes()
+  match git::Tag::parse(t, lim()) {
+    Ok(p) => debug_assert(same_bytes(p.encode(), t), "re-encode must be byte-identical")
+    Err(e) => debug_assert(false, "git accepts this tag: " + e.to_string())
+  }
+}
+
+///| Interop: multi-line (space-continued) tag headers such as `gpgsig` are accepted by git.
+test "p2_tag_accepts_continuation_headers" {
+  let t = (
+    "object " +
+    empty_tree_hex +
+    "\ntype tree\ntag v1.0\ntagger A <a@x> 1 +0000\ngpgsig -----BEGIN-----\n line\n -----END-----\n\nm\n"
+  ).to_bytes()
+  match git::Tag::parse(t, lim()) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "git accepts continuation headers: " + e.to_string())
+  }
+}
+
+///| git fsck `badTagName`.
+test "p2_tag_rejects_invalid_tag_name" {
+  let t = (
+    "object " +
+    empty_tree_hex +
+    "\ntype tree\ntag v..1\ntagger A <a@x> 1 +0000\n\nm\n"
+  ).to_bytes()
+  match git::Tag::parse(t, lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "tag name 'v..1' must be rejected")
+  }
+}
+
+///| git: "unknown index entry format 0x00010000"; gix rejects. Pion accepts unknown extended bits.
+test "p2_index_rejects_unknown_extended_flag_bits" {
+  let e = index_entry_v2("a".to_bytes(), 0x4001)
+  // splice extended flags (0x0001) after the 62-byte header
+  // 62 + 2 + "a" + NUL = 66 -> padded to 72
+  let entry = e.slice(0, 62).concat(bytes_of([0x00, 0x01])).concat("a".to_bytes()).concat(
+    Bytes::new(7),
+  )
+  // sanity: the same layout with known bit 0x2000 (intent-to-add) parses
+  let ok_entry = e.slice(0, 62).concat(bytes_of([0x20, 0x00])).concat("a".to_bytes()).concat(
+    Bytes::new(7),
+  )
+  match git::GitIndex::parse(index_file(3, 1, ok_entry, Bytes::new(0)), lim()) {
+    Ok(_) => ()
+    Err(err) => debug_assert(false, "fixture sanity: " + err.to_string())
+  }
+  match git::GitIndex::parse(index_file(3, 1, entry, Bytes::new(0)), lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "unknown extended flag bits must be rejected")
+  }
+}
+
+///| git: "index uses zzzz extension, which we do not understand" (lowercase = required).
+test "p2_index_rejects_unknown_required_extension" {
+  let ext = "zzzz".to_bytes().concat(bytes_of([0, 0, 0, 0]))
+  let ix = index_file(2, 1, index_entry_v2("a".to_bytes(), 1), ext)
+  match git::GitIndex::parse(ix, lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "unknown required (lowercase) extension must be rejected")
+  }
+}
+
+///| Parser differential: `flags.name_len = 3` with on-disk name "abcdef": git ls-files -> "abcd",
+///| gix -> "abc", Pion -> "abcdef" (ignores name_len entirely). Expect Pion to honour name_len.
+test "p2_index_honours_name_len_field" {
+  let ix = index_file(2, 1, index_entry_v2("abcdef".to_bytes(), 3), Bytes::new(0))
+  match git::GitIndex::parse(ix, lim()) {
+    Ok(p) => debug_assert(p.entries[0].path != "abcdef", "path must follow flags.name_len, not the NUL")
+    Err(_) => ()
+  }
+}
+
+///| `.idx` OIDs must be strictly ascending (git verify-pack: "validation error"); otherwise `lookup`
+///| silently misses objects that `entry_at` returns.
+test "p2_pack_index_rejects_unsorted_oids" {
+  let w = git::PackWriter::new()
+  let mut i = 0
+  while i < 8 {
+    let _ = w.add_object(git::ObjectKind::Blob, ("blob " + i.to_string()).to_bytes())
+    i = i + 1
+  }
+  let pack = match w.finish() {
+    Ok((b, _)) => b
+    Err(_) => Bytes::new(0)
+  }
+  let idx = match git::PackReader::open(pack, lim()) {
+    Ok(r) =>
+    match r.build_idx_v2() {
+      Ok(b) => b
+      Err(_) => Bytes::new(0)
+    }
+    Err(_) => Bytes::new(0)
+  }
+  // swap OID #0 and #1 (keeps fanout plausible only if same first byte; resum either way)
+  let body = idx.slice(0, idx.length() - 20)
+  let a = body.slice(1032, 1052)
+  let b = body.slice(1052, 1072)
+  let swapped = body.slice(0, 1032).concat(b).concat(a).concat(body.slice(1072, body.length()))
+  match git::PackIndex::parse(with_sha1_trailer(swapped), lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "unsorted .idx OID table must be rejected")
+  }
+}
+
+///| git `patch_delta`: delta shorter than DELTA_SIZE_MIN (4) is invalid ("failed to apply delta").
+test "p2_delta_rejects_truncated_minimal_delta" {
+  match git::apply_delta(kib_base(), varint(1024).concat(varint(0)), lim()) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "3-byte delta must be rejected like git")
+  }
+}
+
+///| Interop: git index-pack accepts pack version 3 (same layout as v2).
+test "p2_pack_accepts_version_3" {
+  let p = hexb(
+    "5041434b0000000300000001b816789c4b4a2c4e5548cac94f5248cecf2b49cd2be14a1a15a1810800b61181ed9d4670248f903fc8795ea0f1cff67464114037c1",
+  )
+  debug_assert(pack_ok(p, lim()), "git accepts PACK version 3")
+}
+
+// ============================================================================
+// Controls: adversarial inputs already handled like git (must PASS)
+// ============================================================================
+
+test "control_tree_git_sort_rule_and_non_utf8_roundtrip" {
+  let t = tree_entry_raw("100644", "a-b".to_bytes())
+  .concat(tree_entry_raw("40000", "a".to_bytes()))
+  .concat(tree_entry_raw("100644", bytes_of([0xFF, 0xFE])))
+  match git::Tree::parse(t, git::HashKind::Sha1, lim()) {
+    Ok(p) =>
+    match p.encode() {
+      Ok(b) => debug_assert(same_bytes(b, t), "byte-identical re-encode")
+      Err(e) => debug_assert(false, e.to_string())
+    }
+    Err(e) => debug_assert(false, e.to_string())
+  }
+}
+
+test "control_tree_rejects_exact_dotgit_dot_dotdot" {
+  debug_assert(!tree_ok(tree_entry_raw("40000", ".GiT".to_bytes())), ".GiT")
+  debug_assert(!tree_ok(tree_entry_raw("40000", "..".to_bytes())), "..")
+  debug_assert(!tree_ok(tree_entry_raw("40000", ".".to_bytes())), ".")
+  debug_assert(!tree_ok(tree_entry_raw("40000", "".to_bytes())), "empty")
+}
+
+test "control_check_ref_format_matches_git" {
+  // (name, allow_onelevel, git check-ref-format verdict)
+  let ok_names = ["refs/heads/main", "refs/heads/a.b", "refs/heads/foo./bar", "refs/heads/@a", "refs/heads/a@"]
+  let bad_names = [
+    "refs/heads/a..b", "refs/heads/a.", "refs/heads/.a", "refs/heads/a.lock", "@", "refs/heads/a@{b",
+    "refs/heads/a b", "refs/heads/a~b", "refs/heads/a^b", "refs/heads/a:b", "refs/heads/a?b",
+    "refs/heads/a*b", "refs/heads/a[b", "refs/heads/a\\b", "refs/heads//a", "/refs/heads/a",
+    "refs/heads/a/", "main",
+  ]
+  let mut i = 0
+  while i < ok_names.length() {
+    match git::check_ref_format(ok_names[i], false) {
+      Ok(_) => ()
+      Err(_) => debug_assert(false, "git accepts " + ok_names[i])
+    }
+    i = i + 1
+  }
+  let mut j = 0
+  while j < bad_names.length() {
+    match git::check_ref_format(bad_names[j], false) {
+      Ok(_) => debug_assert(false, "git rejects " + bad_names[j])
+      Err(_) => ()
+    }
+    j = j + 1
+  }
+  match git::check_ref_format("main", true) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "--allow-onelevel main")
+  }
+}
+
+test "control_pkt_line_framing_matches_git" {
+  // git's hexval accepts upper-case; "0004" is an empty data packet; 0003 and >65520 rejected
+  match git::decode_pkt_line("000Ahello\n".to_bytes(), 0) {
+    Ok((git::PktLine::Data(b), n)) => debug_assert(b.length() == 6 && n == 10, "000A")
+    _ => debug_assert(false, "upper-case hex length")
+  }
+  match git::decode_pkt_line("0004".to_bytes(), 0) {
+    Ok((git::PktLine::Data(b), _)) => debug_assert(b.length() == 0, "0004")
+    _ => debug_assert(false, "0004 empty")
+  }
+  match git::decode_pkt_line("0003".to_bytes(), 0) {
+    Err(_) => ()
+    _ => debug_assert(false, "0003")
+  }
+  match git::decode_pkt_line("fff1".to_bytes().concat(Bytes::new(65517)), 0) {
+    Err(_) => ()
+    _ => debug_assert(false, "65521")
+  }
+}
+
+test "control_delta_size_zero_means_0x10000_and_limit_checked_before_alloc" {
+  let base = Bytes::new(0x10000)
+  match git::apply_delta(base, varint(0x10000).concat(varint(0x10000)).concat(bytes_of([0x80])), lim()) {
+    Ok(out) => debug_assert(out.length() == 0x10000, "size 0 = 0x10000")
+    Err(e) => debug_assert(false, e.to_string())
+  }
+  // 1 KiB delta declaring 64 MiB + 64 KiB result: rejected by limit before allocation
+  let big = varint(0x10000).concat(varint(1025 * 0x10000)).concat(Bytes::new(1))
+  match git::apply_delta(base, big, lim()) {
+    Err(git::GitError::LimitExceeded(_)) => ()
+    _ => debug_assert(false, "max_delta_result_bytes")
+  }
+}
+
+test "control_pack_header_count_and_delta_reference_attacks" {
+  // count 0x7fffffff: rejected by max_pack_entries without pre-allocation
+  let hdr = "PACK".to_bytes().concat(bytes_of([0, 0, 0, 2, 0x7F, 0xFF, 0xFF, 0xFF]))
+  debug_assert(!pack_ok(with_sha1_trailer(hdr.concat(Bytes::new(16))), lim()), "count")
+  // OFS_DELTA to itself / before header
+  let w = git::PackWriter::new()
+  let _ = w.add_object(git::ObjectKind::Blob, "x".to_bytes())
+  w.add_ofs_delta(1, git::create_delta("x".to_bytes(), "xy".to_bytes()))
+  match w.finish() {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "writer refuses forward ofs")
+  }
+  // REF_DELTA referencing its own result (unresolvable)
+  let target = "xy".to_bytes()
+  let w2 = git::PackWriter::new()
+  w2.add_ref_delta(git::hash_object_sha1(git::ObjectKind::Blob, target), git::create_delta(target, target))
+  match w2.finish() {
+    Ok((p, _)) => debug_assert(!pack_ok(p, lim()), "self ref_delta")
+    Err(_) => ()
+  }
+}
+
+test "control_ofs_chain_depth_5000_no_stack_overflow" {
+  match git::PackReader::open(chain_pack(5000), lim_wide()) {
+    Ok(r) => debug_assert(r.len() == 5001, "5001 objects")
+    Err(e) => debug_assert(false, e.to_string())
+  }
+}
+
+test "control_loose_zlib_bomb_capped_by_max_object_bytes" {
+  let payload = Bytes::new(2097152)
+  let raw = "blob 2097152\u{0}".to_bytes().concat(payload)
+  let limits = git::GitLimits::new(1048576, 1000000, 50, 1048576, 100000, 1000000)
+  match git::decode_loose_object(loose_of(raw), None, limits) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "2 MiB object over 1 MiB limit")
+  }
+}
+
+test "control_index_v4_non_ascii_prefix_compression_roundtrip" {
+  let e1 = bytes_of([0xE6, 0x97, 0xA5, 47, 97])
+  let e2 = bytes_of([0xE6, 0x97, 0xA5, 47, 98])
+  let mk = fn(p : Bytes) -> git::IndexEntry {
+    git::IndexEntry::{
+      ctime_sec: 0U,
+      ctime_nsec: 0U,
+      mtime_sec: 0U,
+      mtime_nsec: 0U,
+      dev: 0U,
+      ino: 0U,
+      mode: 0x81A4U,
+      uid: 0U,
+      gid: 0U,
+      file_size: 0U,
+      oid: blob_oid(),
+      flags: 0U,
+      extended_flags: 0U,
+      path: p.to_string(),
+    }
+  }
+  let ix = git::GitIndex::{
+    version: 4,
+    entries: [mk(e1), mk(e2)],
+    extensions: [],
+    checksum: git::Oid::zero(git::HashKind::Sha1),
+  }
+  match ix.encode() {
+    Ok(b) =>
+    match git::GitIndex::parse(b, lim()) {
+      Ok(p) => debug_assert(same_bytes(p.entries[1].path.to_bytes(), e2), "v4 non-ascii prefix")
+      Err(e) => debug_assert(false, e.to_string())
+    }
+    Err(e) => debug_assert(false, e.to_string())
+  }
+}

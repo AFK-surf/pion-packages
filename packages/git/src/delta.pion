@@ -1,0 +1,330 @@
+///| Git packfile delta instruction decoder and encoder.
+
+///| Read a Git delta base-128 LE size varint from `data[pos..]`.
+fn read_delta_varint(data : Bytes, start : Int) -> Result[(Int, Int), GitError] {
+  let n = data.length()
+  let mut pos = start
+  let mut shift = 0
+  let mut acc = 0
+  while true {
+    if pos >= n {
+      return Err(GitError::Truncated("truncated delta varint"))
+    }
+    let b = data[pos].to_int()
+    pos = pos + 1
+    if shift > 28 || (shift == 28 && (b & 0x78) != 0) {
+      return Err(GitError::InvalidDelta("delta varint overflow"))
+    }
+    acc = acc | ((b & 0x7F) << shift)
+    if (b & 0x80) == 0 {
+      return Ok((acc, pos))
+    }
+    shift = shift + 7
+  }
+  Err(GitError::InvalidDelta("unreachable"))
+}
+
+///| Write a Git delta base-128 LE size varint to `bb`.
+fn write_delta_varint(bb : ByteBuf, value : Int) -> Unit {
+  let mut v = value
+  while true {
+    let mut b = v & 0x7F
+    v = v >> 7
+    if v != 0 {
+      b = b | 0x80
+    }
+    bb.push_byte(b)
+    if v == 0 {
+      break
+    }
+  }
+}
+
+///| Decode `(base_size, target_size, next_pos)` from a Git delta header.
+pub fn decode_delta_header(delta : Bytes) -> Result[(Int, Int, Int), GitError] {
+  let (base_size, p1) = match read_delta_varint(delta, 0) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  let (target_size, p2) = match read_delta_varint(delta, p1) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  Ok((base_size, target_size, p2))
+}
+
+///| Apply a Git binary delta against `base`, enforcing `limits.max_delta_result_bytes`.
+pub fn apply_delta(
+  base : Bytes,
+  delta : Bytes,
+  limits : GitLimits,
+) -> Result[Bytes, GitError] {
+  match limits.validate() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  if delta.length() < 4 {
+    return Err(GitError::InvalidDelta("delta shorter than minimum size (4 bytes)"))
+  }
+  let (base_size, target_size, start_pos) = match decode_delta_header(delta) {
+    Ok(h) => h
+    Err(e) => return Err(e)
+  }
+  if base_size < 0 || target_size < 0 {
+    return Err(GitError::InvalidDelta("negative delta header size"))
+  }
+  if base.length() != base_size {
+    return Err(
+      GitError::InvalidDelta(
+        "delta base size mismatch: expected " +
+        base_size.to_string() +
+        ", got " +
+        base.length().to_string(),
+      ),
+    )
+  }
+  if target_size > limits.max_delta_result_bytes {
+    return Err(GitError::LimitExceeded("delta target size exceeds max_delta_result_bytes"))
+  }
+  let mut out = Bytes::new(target_size)
+  let mut out_pos = 0
+  let mut pos = start_pos
+  let dlen = delta.length()
+
+  while pos < dlen {
+    let cmd = delta[pos].to_int()
+    pos = pos + 1
+    if (cmd & 0x80) != 0 {
+      // Copy instruction: 4 offset bits + 3 size bits
+      let mut cp_off = 0
+      let mut cp_size = 0
+      if (cmd & 0x01) != 0 {
+        if pos >= dlen {
+          return Err(GitError::Truncated("truncated copy offset byte 0"))
+        }
+        cp_off = delta[pos].to_int()
+        pos = pos + 1
+      }
+      if (cmd & 0x02) != 0 {
+        if pos >= dlen {
+          return Err(GitError::Truncated("truncated copy offset byte 1"))
+        }
+        cp_off = cp_off | (delta[pos].to_int() << 8)
+        pos = pos + 1
+      }
+      if (cmd & 0x04) != 0 {
+        if pos >= dlen {
+          return Err(GitError::Truncated("truncated copy offset byte 2"))
+        }
+        cp_off = cp_off | (delta[pos].to_int() << 16)
+        pos = pos + 1
+      }
+      if (cmd & 0x08) != 0 {
+        if pos >= dlen {
+          return Err(GitError::Truncated("truncated copy offset byte 3"))
+        }
+        let b3 = delta[pos].to_int()
+        if b3 >= 128 {
+          return Err(GitError::InvalidDelta("copy offset overflow"))
+        }
+        cp_off = cp_off | (b3 << 24)
+        pos = pos + 1
+      }
+      if (cmd & 0x10) != 0 {
+        if pos >= dlen {
+          return Err(GitError::Truncated("truncated copy size byte 0"))
+        }
+        cp_size = delta[pos].to_int()
+        pos = pos + 1
+      }
+      if (cmd & 0x20) != 0 {
+        if pos >= dlen {
+          return Err(GitError::Truncated("truncated copy size byte 1"))
+        }
+        cp_size = cp_size | (delta[pos].to_int() << 8)
+        pos = pos + 1
+      }
+      if (cmd & 0x40) != 0 {
+        if pos >= dlen {
+          return Err(GitError::Truncated("truncated copy size byte 2"))
+        }
+        cp_size = cp_size | (delta[pos].to_int() << 16)
+        pos = pos + 1
+      }
+      if cp_size == 0 {
+        cp_size = 0x10000
+      }
+      if cp_off < 0 || cp_size < 0 || cp_size > base_size || cp_off > base_size - cp_size {
+        return Err(GitError::InvalidDelta("copy range exceeds base"))
+      }
+      if cp_size > target_size - out_pos {
+        return Err(GitError::InvalidDelta("copy range exceeds target_size"))
+      }
+      let mut k = 0
+      while k < cp_size {
+        out[out_pos + k] = base[cp_off + k]
+        k = k + 1
+      }
+      out_pos = out_pos + cp_size
+    } else if cmd != 0 {
+      // Insert literal bytes
+      if cmd > dlen - pos {
+        return Err(GitError::Truncated("truncated insert literal"))
+      }
+      if cmd > target_size - out_pos {
+        return Err(GitError::InvalidDelta("insert exceeds target_size"))
+      }
+      let mut k = 0
+      while k < cmd {
+        out[out_pos + k] = delta[pos + k]
+        k = k + 1
+      }
+      pos = pos + cmd
+      out_pos = out_pos + cmd
+    } else {
+      return Err(GitError::InvalidDelta("reserved delta opcode 0x00"))
+    }
+  }
+
+  if out_pos != target_size {
+    return Err(
+      GitError::InvalidDelta(
+        "delta output size mismatch: expected " +
+        target_size.to_string() +
+        ", produced " +
+        out_pos.to_string(),
+      ),
+    )
+  }
+  Ok(out)
+}
+
+///|
+fn delta_hash4(b : Bytes, pos : Int) -> Int {
+  let v = (b[pos].to_int().to_uint() << 24U) |
+  (b[pos + 1].to_int().to_uint() << 16U) |
+  (b[pos + 2].to_int().to_uint() << 8U) |
+  b[pos + 3].to_int().to_uint()
+  ((v * 2654435761U) >> 18U).to_int() & 0x3FFF
+}
+
+///|
+fn emit_delta_copy(bb : ByteBuf, offset : Int, length : Int) -> Unit {
+  let mut off = offset
+  let mut rem = length
+  while rem > 0 {
+    let chunk = if rem > 0x10000 { 0x10000 } else { rem }
+    let mut cmd = 0x80
+    if (off & 0xFF) != 0 {
+      cmd = cmd | 0x01
+    }
+    if ((off >> 8) & 0xFF) != 0 {
+      cmd = cmd | 0x02
+    }
+    if ((off >> 16) & 0xFF) != 0 {
+      cmd = cmd | 0x04
+    }
+    if ((off >> 24) & 0xFF) != 0 {
+      cmd = cmd | 0x08
+    }
+    let sz_enc = if chunk == 0x10000 { 0 } else { chunk }
+    if (sz_enc & 0xFF) != 0 {
+      cmd = cmd | 0x10
+    }
+    if ((sz_enc >> 8) & 0xFF) != 0 {
+      cmd = cmd | 0x20
+    }
+    if ((sz_enc >> 16) & 0xFF) != 0 {
+      cmd = cmd | 0x40
+    }
+    bb.push_byte(cmd)
+    if (cmd & 0x01) != 0 {
+      bb.push_byte(off & 0xFF)
+    }
+    if (cmd & 0x02) != 0 {
+      bb.push_byte((off >> 8) & 0xFF)
+    }
+    if (cmd & 0x04) != 0 {
+      bb.push_byte((off >> 16) & 0xFF)
+    }
+    if (cmd & 0x08) != 0 {
+      bb.push_byte((off >> 24) & 0xFF)
+    }
+    if (cmd & 0x10) != 0 {
+      bb.push_byte(sz_enc & 0xFF)
+    }
+    if (cmd & 0x20) != 0 {
+      bb.push_byte((sz_enc >> 8) & 0xFF)
+    }
+    if (cmd & 0x40) != 0 {
+      bb.push_byte((sz_enc >> 16) & 0xFF)
+    }
+    off = off + chunk
+    rem = rem - chunk
+  }
+}
+
+///|
+fn emit_delta_insert(bb : ByteBuf, target : Bytes, start : Int, end : Int) -> Unit {
+  let mut p = start
+  while p < end {
+    let chunk = if end - p > 127 { 127 } else { end - p }
+    bb.push_byte(chunk)
+    bb.push_bytes_slice(target, p, p + chunk)
+    p = p + chunk
+  }
+}
+
+///| Encode a Git binary delta transforming `base` into `target`.
+pub fn create_delta(base : Bytes, target : Bytes) -> Bytes {
+  let blen = base.length()
+  let tlen = target.length()
+  let bb = ByteBuf::new(64 + tlen / 2)
+  write_delta_varint(bb, blen)
+  write_delta_varint(bb, tlen)
+  if tlen == 0 {
+    return bb.to_bytes()
+  }
+  if blen < 4 {
+    emit_delta_insert(bb, target, 0, tlen)
+    return bb.to_bytes()
+  }
+  // Index 4-byte positions in base (16384-bucket table)
+  let table : FixedArray[Int] = FixedArray::make(16384, -1)
+  let mut bi = 0
+  let blim = blen - 4
+  while bi <= blim {
+    table[delta_hash4(base, bi)] = bi
+    bi = bi + 1
+  }
+
+  let mut ti = 0
+  let mut lit_start = 0
+  while ti + 4 <= tlen {
+    let cand = table[delta_hash4(target, ti)]
+    if cand >= 0 &&
+    base[cand] == target[ti] &&
+    base[cand + 1] == target[ti + 1] &&
+    base[cand + 2] == target[ti + 2] &&
+    base[cand + 3] == target[ti + 3] {
+      let mut mlen = 4
+      while cand + mlen < blen && ti + mlen < tlen && base[cand + mlen] == target[ti + mlen] {
+        mlen = mlen + 1
+      }
+      if mlen >= 4 {
+        if lit_start < ti {
+          emit_delta_insert(bb, target, lit_start, ti)
+        }
+        emit_delta_copy(bb, cand, mlen)
+        ti = ti + mlen
+        lit_start = ti
+        continue
+      }
+    }
+    ti = ti + 1
+  }
+  if lit_start < tlen {
+    emit_delta_insert(bb, target, lit_start, tlen)
+  }
+  bb.to_bytes()
+}
