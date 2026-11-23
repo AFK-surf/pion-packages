@@ -1,0 +1,1025 @@
+///| Pre-compiled AST evaluator and streaming renderer for Handlebars 4.x + Mustache 1.4.2.
+
+struct EvalState {
+  reg : Registry
+  tmpl_name : Option[String]
+  mut out : StringBuilder
+  mut out_bytes : Int
+  mut steps : Int64
+  mut depth : Int
+  mut partial_depth : Int
+  root : Value
+  ctx_stack : Array[Value]
+  data_stack : Array[Array[(String, Value)]]
+  block_params_stack : Array[Array[(String, Value)]]
+  inline_partials_stack : Array[Array[(String, Array[Node])]]
+  partial_block_stack : Array[Option[(Array[Node], Value)]]
+}
+
+fn EvalState::new(
+  reg : Registry,
+  tmpl_name : Option[String],
+  data : Value,
+) -> EvalState {
+  EvalState::{
+    reg: reg,
+    tmpl_name: tmpl_name,
+    out: StringBuilder::with_capacity(256),
+    out_bytes: 0,
+    steps: 0L,
+    depth: 0,
+    partial_depth: 0,
+    root: data,
+    ctx_stack: [data],
+    data_stack: [[]],
+    block_params_stack: [],
+    inline_partials_stack: [[]],
+    partial_block_stack: [],
+  }
+}
+
+fn EvalState::tick(
+  self : EvalState,
+  line : Int,
+  col : Int,
+) -> Result[Unit, HandlebarsError] {
+  self.steps = self.steps + 1L
+  if self.steps > self.reg.limits.max_steps {
+    return Err(
+      HandlebarsError::new(
+        ErrorKind::StepLimitExceeded,
+        "execution step limit exceeded",
+        self.tmpl_name,
+        line,
+        col,
+      ),
+    )
+  }
+  Ok(())
+}
+
+fn EvalState::write_raw(
+  self : EvalState,
+  s : String,
+  line : Int,
+  col : Int,
+) -> Result[Unit, HandlebarsError] {
+  let add = s.length()
+  if add == 0 {
+    return Ok(())
+  }
+  if self.out_bytes + add > self.reg.limits.max_output_bytes {
+    return Err(
+      HandlebarsError::new(
+        ErrorKind::OutputLimitExceeded,
+        "output byte limit exceeded",
+        self.tmpl_name,
+        line,
+        col,
+      ),
+    )
+  }
+  self.out.write_string(s)
+  self.out_bytes = self.out_bytes + add
+  Ok(())
+}
+
+fn EvalState::write_escaped(
+  self : EvalState,
+  s : String,
+  line : Int,
+  col : Int,
+) -> Result[Unit, HandlebarsError] {
+  if s.length() == 0 {
+    return Ok(())
+  }
+  if self.reg.no_escape {
+    return self.write_raw(s, line, col)
+  }
+  let add = escaped_html_len(s)
+  if self.out_bytes + add > self.reg.limits.max_output_bytes {
+    return Err(
+      HandlebarsError::new(
+        ErrorKind::OutputLimitExceeded,
+        "output byte limit exceeded",
+        self.tmpl_name,
+        line,
+        col,
+      ),
+    )
+  }
+  write_escaped_html(self.out, s)
+  self.out_bytes = self.out_bytes + add
+  Ok(())
+}
+
+fn EvalState::current_ctx(self : EvalState) -> Value {
+  let n = self.ctx_stack.length()
+  if n > 0 {
+    self.ctx_stack[n - 1]
+  } else {
+    Value::Null
+  }
+}
+
+fn obj_get(entries : Array[(String, Value)], key : String) -> Option[Value] {
+  let mut i = entries.length() - 1
+  while i >= 0 {
+    let (k, v) = entries[i]
+    if k == key {
+      return Some(v)
+    }
+    i = i - 1
+  }
+  None
+}
+
+fn value_get_prop(v : Value, seg : String) -> Option[Value] {
+  match v {
+    Value::Object(entries) => obj_get(entries, seg)
+    Value::Array(items) =>
+    match parse_i64_decimal(seg) {
+      Some(idx) => {
+        let ii = idx.to_int()
+        if ii >= 0 && ii < items.length() {
+          Some(items[ii])
+        } else {
+          None
+        }
+      }
+      None =>
+      if seg == "length" {
+        Some(Value::int(items.length()))
+      } else {
+        None
+      }
+    }
+    _ => None
+  }
+}
+
+fn traverse_segments(
+  base : Value,
+  segments : Array[String],
+  start_idx : Int,
+) -> Option[Value] {
+  let mut cur = base
+  let mut i = start_idx
+  while i < segments.length() {
+    match value_get_prop(cur, segments[i]) {
+      Some(next) => cur = next
+      None => return None
+    }
+    i = i + 1
+  }
+  Some(cur)
+}
+
+fn EvalState::lookup_data(
+  self : EvalState,
+  up_levels : Int,
+  key : String,
+) -> Option[Value] {
+  if key == "root" && up_levels == 0 {
+    return Some(self.root)
+  }
+  let n = self.data_stack.length()
+  if up_levels > 0 {
+    let idx = n - 1 - up_levels
+    if idx >= 0 && idx < n {
+      return obj_get(self.data_stack[idx], key)
+    }
+    return None
+  }
+  let mut i = n - 1
+  while i >= 0 {
+    match obj_get(self.data_stack[i], key) {
+      Some(v) => return Some(v)
+      None => ()
+    }
+    i = i - 1
+  }
+  None
+}
+
+///| Resolve a `PathExpr`, returning `Some(val)` if found, `None` if undefined.
+fn EvalState::resolve_path(self : EvalState, p : PathExpr) -> Option[Value] {
+  if p.is_data {
+    if p.segments.length() == 0 {
+      return None
+    }
+    let first = p.segments[0]
+    match self.lookup_data(p.up_levels, first) {
+      Some(base) => return traverse_segments(base, p.segments, 1)
+      None => return None
+    }
+  }
+  if p.up_levels > 0 {
+    let n = self.ctx_stack.length()
+    let idx = n - 1 - p.up_levels
+    if idx < 0 || idx >= n {
+      return None
+    }
+    return traverse_segments(self.ctx_stack[idx], p.segments, 0)
+  }
+  if p.local_only {
+    return traverse_segments(self.current_ctx(), p.segments, 0)
+  }
+  if p.segments.length() == 0 {
+    return Some(self.current_ctx())
+  }
+  let first = p.segments[0]
+  // 1. Check block parameters (innermost first)
+  let mut bi = self.block_params_stack.length() - 1
+  while bi >= 0 {
+    match obj_get(self.block_params_stack[bi], first) {
+      Some(base) => return traverse_segments(base, p.segments, 1)
+      None => ()
+    }
+    bi = bi - 1
+  }
+  // 2. Walk context stack for initial segment (Mustache & Handlebars dotted-name rule)
+  let mut ci = self.ctx_stack.length() - 1
+  while ci >= 0 {
+    match value_get_prop(self.ctx_stack[ci], first) {
+      Some(base) => return traverse_segments(base, p.segments, 1)
+      None => ()
+    }
+    ci = ci - 1
+  }
+  None
+}
+
+fn value_is_truthy(v : Value, include_zero : Bool) -> Bool {
+  match v {
+    Value::Null => false
+    Value::Bool(b) => b
+    Value::Int(n) => if include_zero { true } else { n != 0L }
+    Value::Float(f) =>
+    if f != f {
+      false
+    } else if include_zero {
+      true
+    } else {
+      f != 0.0
+    }
+    Value::Str(s) => s.length() > 0
+    Value::SafeStr(s) => s.length() > 0
+    Value::Array(xs) => xs.length() > 0
+    Value::Object(_) => true
+  }
+}
+
+fn value_to_string(v : Value) -> String {
+  match v {
+    Value::Null => ""
+    Value::Bool(b) => if b { "true" } else { "false" }
+    Value::Int(n) => n.to_string()
+    Value::Float(f) => f.to_string()
+    Value::Str(s) => s
+    Value::SafeStr(s) => s
+    Value::Array(xs) => {
+      let sb = StringBuilder::new()
+      let mut i = 0
+      while i < xs.length() {
+        if i > 0 {
+          sb.write_string(",")
+        }
+        sb.write_string(value_to_string(xs[i]))
+        i = i + 1
+      }
+      sb.to_string()
+    }
+    Value::Object(_) => "[object Object]"
+  }
+}
+
+fn EvalState::find_helper(
+  self : EvalState,
+  name : String,
+) -> Option[(HelperContext) -> Result[Value, HandlebarsError]] {
+  let mut i = self.reg.helpers.length() - 1
+  while i >= 0 {
+    let (k, f) = self.reg.helpers[i]
+    if k == name {
+      return Some(f)
+    }
+    i = i - 1
+  }
+  None
+}
+
+fn EvalState::find_partial(
+  self : EvalState,
+  name : String,
+) -> Option[Array[Node]] {
+  // 1. Check inline partials stack (innermost first)
+  let mut i = self.inline_partials_stack.length() - 1
+  while i >= 0 {
+    let frame = self.inline_partials_stack[i]
+    let mut j = frame.length() - 1
+    while j >= 0 {
+      let (k, nodes) = frame[j]
+      if k == name {
+        return Some(nodes)
+      }
+      j = j - 1
+    }
+    i = i - 1
+  }
+  // 2. Check registry partials
+  let mut pi = self.reg.partials.length() - 1
+  while pi >= 0 {
+    let (k, tmpl) = self.reg.partials[pi]
+    if k == name {
+      return Some(tmpl.nodes)
+    }
+    pi = pi - 1
+  }
+  None
+}
+
+fn EvalState::eval_expr(
+  self : EvalState,
+  expr : Expr,
+  strict : Bool,
+  line : Int,
+  col : Int,
+) -> Result[Value, HandlebarsError] {
+  match expr {
+    Expr::StrLit(s) => Ok(Value::Str(s))
+    Expr::IntLit(n) => Ok(Value::Int(n))
+    Expr::FloatLit(f) => Ok(Value::Float(f))
+    Expr::BoolLit(b) => Ok(Value::Bool(b))
+    Expr::NullLit => Ok(Value::Null)
+    Expr::Path(p) =>
+    match self.resolve_path(p) {
+      Some(v) => Ok(v)
+      None =>
+      if strict {
+        Err(
+          HandlebarsError::new(
+            ErrorKind::StrictUndefined,
+            "undefined path `" + expr_block_name(expr) + "`",
+            self.tmpl_name,
+            line,
+            col,
+          ),
+        )
+      } else {
+        Ok(Value::Null)
+      }
+    }
+    Expr::SubExpr(call) => self.eval_call(call, line, col)
+  }
+}
+
+fn EvalState::eval_params_and_hash(
+  self : EvalState,
+  param_exprs : Array[Expr],
+  hash_exprs : Array[(String, Expr)],
+  line : Int,
+  col : Int,
+) -> Result[(Array[Value], Array[(String, Value)]), HandlebarsError] {
+  let params : Array[Value] = []
+  let mut i = 0
+  while i < param_exprs.length() {
+    match self.eval_expr(param_exprs[i], self.reg.strict_mode, line, col) {
+      Ok(v) => params.push(v)
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  let hash : Array[(String, Value)] = []
+  let mut j = 0
+  while j < hash_exprs.length() {
+    let (k, ve) = hash_exprs[j]
+    match self.eval_expr(ve, self.reg.strict_mode, line, col) {
+      Ok(v) => hash.push((k, v))
+      Err(e) => return Err(e)
+    }
+    j = j + 1
+  }
+  Ok((params, hash))
+}
+
+fn EvalState::render_sub_nodes(
+  self : EvalState,
+  nodes : Array[Node],
+  ctx : Value,
+) -> Result[String, HandlebarsError] {
+  let saved_out = self.out
+  let saved_bytes = self.out_bytes
+  self.out = StringBuilder::new()
+  self.ctx_stack.push(ctx)
+  let res = self.eval_nodes(nodes)
+  let _ = self.ctx_stack.pop()
+  let captured = self.out.to_string()
+  self.out = saved_out
+  self.out_bytes = saved_bytes
+  match res {
+    Ok(()) => Ok(captured)
+    Err(e) => Err(e)
+  }
+}
+
+fn EvalState::eval_call(
+  self : EvalState,
+  call : CallExpr,
+  line : Int,
+  col : Int,
+) -> Result[Value, HandlebarsError] {
+  match self.tick(line, col) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+  // Check if head is a bare identifier matching a custom or built-in helper
+  let helper_name : Option[String] = match call.head {
+    Expr::Path(p) =>
+    if !p.is_data && !p.local_only && p.up_levels == 0 && p.segments.length() == 1 {
+      Some(p.segments[0])
+    } else {
+      None
+    }
+    _ => None
+  }
+
+  match helper_name {
+    Some(name) => {
+      // 1. Custom registered helper takes priority when called
+      match self.find_helper(name) {
+        Some(hf) => {
+          let (params, hash) = match
+          self.eval_params_and_hash(call.params, call.hash, line, col) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let hctx = HelperContext::{
+            name: name,
+            params: params,
+            hash: hash,
+            this_val: self.current_ctx(),
+            root: self.root,
+            is_block: false,
+            has_inverse: false,
+            render_fn: fn(_v : Value) -> Result[String, HandlebarsError] {
+              Ok("")
+            },
+            render_inverse: fn(_v : Value) -> Result[String, HandlebarsError] {
+              Ok("")
+            },
+            data_lookup: fn(k : String) -> Option[Value] {
+              self.lookup_data(0, k)
+            },
+          }
+          return hf(hctx)
+        }
+        None => ()
+      }
+      // 2. Built-in inline helpers: `lookup`, `log`
+      if name == "lookup" {
+        let (params, _) = match
+        self.eval_params_and_hash(call.params, call.hash, line, col) {
+          Ok(r) => r
+          Err(e) => return Err(e)
+        }
+        if params.length() < 2 {
+          return Ok(Value::Null)
+        }
+        let target = params[0]
+        let key_str = value_to_string(params[1])
+        return match value_get_prop(target, key_str) {
+          Some(v) => Ok(v)
+          None => Ok(Value::Null)
+        }
+      }
+      if name == "log" {
+        // Pure World-free no-op
+        return Ok(Value::Null)
+      }
+    }
+    None => ()
+  }
+
+  // Otherwise evaluate as a plain expression/path
+  self.eval_expr(call.head, self.reg.strict_mode, line, col)
+}
+
+fn hash_bool(hash : Array[(String, Value)], key : String) -> Bool {
+  match obj_get(hash, key) {
+    Some(Value::Bool(b)) => b
+    _ => false
+  }
+}
+
+fn EvalState::eval_block(
+  self : EvalState,
+  blk : BlockNode,
+) -> Result[Unit, HandlebarsError] {
+  match self.tick(blk.line, blk.col) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+  self.depth = self.depth + 1
+  if self.depth > self.reg.limits.max_depth {
+    self.depth = self.depth - 1
+    return Err(
+      HandlebarsError::new(
+        ErrorKind::DepthLimitExceeded,
+        "runtime block nesting depth limit exceeded",
+        self.tmpl_name,
+        blk.line,
+        blk.col,
+      ),
+    )
+  }
+  let res = self.eval_block_inner(blk)
+  self.depth = self.depth - 1
+  res
+}
+
+fn EvalState::eval_block_inner(
+  self : EvalState,
+  blk : BlockNode,
+) -> Result[Unit, HandlebarsError] {
+  let is_simple_name = match blk.head {
+    Expr::Path(p) =>
+    !p.is_data && !p.local_only && p.up_levels == 0 && p.segments.length() == 1
+    _ => false
+  }
+
+  // 1. Custom registered block helper (only when not inverted `^`)
+  if !blk.inverted && is_simple_name {
+    match self.find_helper(blk.name) {
+      Some(hf) => {
+        let (params, hash) = match
+        self.eval_params_and_hash(blk.params, blk.hash, blk.line, blk.col) {
+          Ok(r) => r
+          Err(e) => return Err(e)
+        }
+        let hctx = HelperContext::{
+          name: blk.name,
+          params: params,
+          hash: hash,
+          this_val: self.current_ctx(),
+          root: self.root,
+          is_block: true,
+          has_inverse: blk.inverse.length() > 0,
+          render_fn: fn(v : Value) -> Result[String, HandlebarsError] {
+            self.render_sub_nodes(blk.body, v)
+          },
+          render_inverse: fn(v : Value) -> Result[String, HandlebarsError] {
+            self.render_sub_nodes(blk.inverse, v)
+          },
+          data_lookup: fn(k : String) -> Option[Value] {
+            self.lookup_data(0, k)
+          },
+        }
+        match hf(hctx) {
+          Ok(Value::SafeStr(s)) => return self.write_raw(s, blk.line, blk.col)
+          Ok(Value::Null) => return Ok(())
+          Ok(v) => return self.write_escaped(value_to_string(v), blk.line, blk.col)
+          Err(e) => return Err(e)
+        }
+      }
+      None => ()
+    }
+  }
+
+  // 2. Built-in block helpers: `if`, `unless`, `each`, `with`
+  if !blk.inverted && is_simple_name {
+    if blk.name == "if" || blk.name == "unless" {
+      let (params, hash) = match
+      self.eval_params_and_hash(blk.params, blk.hash, blk.line, blk.col) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      let cond_val = if params.length() > 0 { params[0] } else { Value::Null }
+      let include_zero = hash_bool(hash, "includeZero")
+      let mut truthy = value_is_truthy(cond_val, include_zero)
+      if blk.name == "unless" {
+        truthy = !truthy
+      }
+      if truthy {
+        return self.eval_nodes(blk.body)
+      } else {
+        return self.eval_nodes(blk.inverse)
+      }
+    }
+
+    if blk.name == "with" {
+      let (params, _) = match
+      self.eval_params_and_hash(blk.params, blk.hash, blk.line, blk.col) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      let wval = if params.length() > 0 { params[0] } else { Value::Null }
+      if value_is_truthy(wval, false) {
+        self.ctx_stack.push(wval)
+        if blk.block_params.length() > 0 {
+          self.block_params_stack.push([(blk.block_params[0], wval)])
+        }
+        let r = self.eval_nodes(blk.body)
+        if blk.block_params.length() > 0 {
+          let _ = self.block_params_stack.pop()
+        }
+        let _ = self.ctx_stack.pop()
+        return r
+      } else {
+        return self.eval_nodes(blk.inverse)
+      }
+    }
+
+    if blk.name == "each" {
+      let (params, _) = match
+      self.eval_params_and_hash(blk.params, blk.hash, blk.line, blk.col) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      let target = if params.length() > 0 { params[0] } else { Value::Null }
+      match target {
+        Value::Array(items) => {
+          let n = items.length()
+          if n == 0 {
+            return self.eval_nodes(blk.inverse)
+          }
+          let mut i = 0
+          while i < n {
+            match self.tick(blk.line, blk.col) {
+              Ok(()) => ()
+              Err(e) => return Err(e)
+            }
+            let item = items[i]
+            let idx_val = Value::int(i)
+            self.ctx_stack.push(item)
+            self.data_stack.push([
+              ("index", idx_val),
+              ("first", Value::bool(i == 0)),
+              ("last", Value::bool(i == n - 1)),
+            ])
+            if blk.block_params.length() > 0 {
+              let bp : Array[(String, Value)] = [(blk.block_params[0], item)]
+              if blk.block_params.length() > 1 {
+                bp.push((blk.block_params[1], idx_val))
+              }
+              self.block_params_stack.push(bp)
+            }
+            let r = self.eval_nodes(blk.body)
+            if blk.block_params.length() > 0 {
+              let _ = self.block_params_stack.pop()
+            }
+            let _ = self.data_stack.pop()
+            let _ = self.ctx_stack.pop()
+            match r {
+              Ok(()) => ()
+              Err(e) => return Err(e)
+            }
+            i = i + 1
+          }
+          return Ok(())
+        }
+        Value::Object(entries) => {
+          let n = entries.length()
+          if n == 0 {
+            return self.eval_nodes(blk.inverse)
+          }
+          let mut i = 0
+          while i < n {
+            match self.tick(blk.line, blk.col) {
+              Ok(()) => ()
+              Err(e) => return Err(e)
+            }
+            let (k, item) = entries[i]
+            let key_val = Value::string(k)
+            let idx_val = Value::int(i)
+            self.ctx_stack.push(item)
+            self.data_stack.push([
+              ("key", key_val),
+              ("index", idx_val),
+              ("first", Value::bool(i == 0)),
+              ("last", Value::bool(i == n - 1)),
+            ])
+            if blk.block_params.length() > 0 {
+              let bp : Array[(String, Value)] = [(blk.block_params[0], item)]
+              if blk.block_params.length() > 1 {
+                bp.push((blk.block_params[1], key_val))
+              }
+              self.block_params_stack.push(bp)
+            }
+            let r = self.eval_nodes(blk.body)
+            if blk.block_params.length() > 0 {
+              let _ = self.block_params_stack.pop()
+            }
+            let _ = self.data_stack.pop()
+            let _ = self.ctx_stack.pop()
+            match r {
+              Ok(()) => ()
+              Err(e) => return Err(e)
+            }
+            i = i + 1
+          }
+          return Ok(())
+        }
+        _ => return self.eval_nodes(blk.inverse)
+      }
+    }
+  }
+
+  // 3. Mustache section `{{#x}}...{{/x}}` or inverted section `{{^x}}...{{/x}}`
+  let sval = match self.eval_expr(blk.head, false, blk.line, blk.col) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if blk.inverted {
+    if !value_is_truthy(sval, false) {
+      return self.eval_nodes(blk.body)
+    } else {
+      return self.eval_nodes(blk.inverse)
+    }
+  }
+  match sval {
+    Value::Array(items) => {
+      let n = items.length()
+      if n == 0 {
+        return self.eval_nodes(blk.inverse)
+      }
+      let mut i = 0
+      while i < n {
+        match self.tick(blk.line, blk.col) {
+          Ok(()) => ()
+          Err(e) => return Err(e)
+        }
+        self.ctx_stack.push(items[i])
+        self.data_stack.push([
+          ("index", Value::int(i)),
+          ("first", Value::bool(i == 0)),
+          ("last", Value::bool(i == n - 1)),
+        ])
+        let r = self.eval_nodes(blk.body)
+        let _ = self.data_stack.pop()
+        let _ = self.ctx_stack.pop()
+        match r {
+          Ok(()) => ()
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Value::Object(_) => {
+      self.ctx_stack.push(sval)
+      let r = self.eval_nodes(blk.body)
+      let _ = self.ctx_stack.pop()
+      r
+    }
+    _ =>
+    if value_is_truthy(sval, false) {
+      self.eval_nodes(blk.body)
+    } else {
+      self.eval_nodes(blk.inverse)
+    }
+  }
+}
+
+fn merge_hash_onto_ctx(
+  base : Value,
+  hash : Array[(String, Value)],
+) -> Value {
+  if hash.length() == 0 {
+    return base
+  }
+  let entries : Array[(String, Value)] = []
+  match base {
+    Value::Object(orig) => {
+      let mut i = 0
+      while i < orig.length() {
+        entries.push(orig[i])
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+  let mut j = 0
+  while j < hash.length() {
+    entries.push(hash[j])
+    j = j + 1
+  }
+  Value::Object(entries)
+}
+
+///| Indent every non-empty line of `s` with `indent` (Mustache spec partial indentation).
+fn indent_partial_output(s : String, indent : String) -> String {
+  if indent.length() == 0 || s.length() == 0 {
+    return s
+  }
+  let n = s.length()
+  let sb = StringBuilder::with_capacity(n + indent.length() * 4)
+  let mut at_line_start = true
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if at_line_start && b != 10 && b != 13 {
+      sb.write_string(indent)
+      at_line_start = false
+    }
+    sb.write_byte(b.to_byte())
+    if b == 10 {
+      at_line_start = true
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn EvalState::eval_partial(
+  self : EvalState,
+  pn : PartialNode,
+) -> Result[Unit, HandlebarsError] {
+  match self.tick(pn.line, pn.col) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+  // Resolve partial name (static identifier/string or dynamic subexpression)
+  let pname = match pn.name_expr {
+    Expr::SubExpr(call) =>
+    match self.eval_call(call, pn.line, pn.col) {
+      Ok(v) => value_to_string(v)
+      Err(e) => return Err(e)
+    }
+    Expr::StrLit(s) => s
+    other => expr_block_name(other)
+  }
+
+  // Special `@partial-block` invocation inside a layout partial
+  if pname == "@partial-block" {
+    let n = self.partial_block_stack.length()
+    if n > 0 {
+      match self.partial_block_stack[n - 1] {
+        Some((pb_nodes, pb_ctx)) => {
+          self.ctx_stack.push(pb_ctx)
+          let r = self.eval_nodes(pb_nodes)
+          let _ = self.ctx_stack.pop()
+          return r
+        }
+        None => return Ok(())
+      }
+    }
+    return Ok(())
+  }
+
+  // Enforce partial recursion depth
+  self.partial_depth = self.partial_depth + 1
+  if self.partial_depth > self.reg.limits.max_partial_depth {
+    self.partial_depth = self.partial_depth - 1
+    return Err(
+      HandlebarsError::new(
+        ErrorKind::PartialDepthLimitExceeded,
+        "partial recursion depth limit exceeded for `" + pname + "`",
+        self.tmpl_name,
+        pn.line,
+        pn.col,
+      ),
+    )
+  }
+
+  let base_ctx = match pn.ctx_expr {
+    Some(ce) =>
+    match self.eval_expr(ce, self.reg.strict_mode, pn.line, pn.col) {
+      Ok(v) => v
+      Err(e) => {
+        self.partial_depth = self.partial_depth - 1
+        return Err(e)
+      }
+    }
+    None => self.current_ctx()
+  }
+  let (_, hash_vals) = match
+  self.eval_params_and_hash([], pn.hash, pn.line, pn.col) {
+    Ok(r) => r
+    Err(e) => {
+      self.partial_depth = self.partial_depth - 1
+      return Err(e)
+    }
+  }
+  let call_ctx = merge_hash_onto_ctx(base_ctx, hash_vals)
+
+  let res = match self.find_partial(pname) {
+    Some(pnodes) => {
+      let pb_entry = match pn.fallback {
+        Some(fb) => Some((fb, self.current_ctx()))
+        None => None
+      }
+      self.partial_block_stack.push(pb_entry)
+      self.inline_partials_stack.push([])
+      let r = if pn.indent.length() > 0 {
+        // Render into temporary buffer to apply Mustache standalone indentation
+        let saved_out = self.out
+        let saved_bytes = self.out_bytes
+        self.out = StringBuilder::new()
+        self.ctx_stack.push(call_ctx)
+        let inner_r = self.eval_nodes(pnodes)
+        let _ = self.ctx_stack.pop()
+        let rendered = self.out.to_string()
+        self.out = saved_out
+        self.out_bytes = saved_bytes
+        match inner_r {
+          Ok(()) => {
+            let indented = indent_partial_output(rendered, pn.indent)
+            self.write_raw(indented, pn.line, pn.col)
+          }
+          Err(e) => Err(e)
+        }
+      } else {
+        self.ctx_stack.push(call_ctx)
+        let inner_r = self.eval_nodes(pnodes)
+        let _ = self.ctx_stack.pop()
+        inner_r
+      }
+      let _ = self.inline_partials_stack.pop()
+      let _ = self.partial_block_stack.pop()
+      r
+    }
+    None =>
+    match pn.fallback {
+      Some(fb_nodes) => {
+        self.ctx_stack.push(call_ctx)
+        let r = self.eval_nodes(fb_nodes)
+        let _ = self.ctx_stack.pop()
+        r
+      }
+      None => Ok(())
+    }
+  }
+
+  self.partial_depth = self.partial_depth - 1
+  res
+}
+
+fn EvalState::eval_nodes(
+  self : EvalState,
+  nodes : Array[Node],
+) -> Result[Unit, HandlebarsError] {
+  let mut i = 0
+  let n = nodes.length()
+  while i < n {
+    match nodes[i] {
+      Node::Text(s) =>
+      match self.write_raw(s, 0, 0) {
+        Ok(()) => ()
+        Err(e) => return Err(e)
+      }
+      Node::Mustache(call, escaped, line, col) =>
+      match self.eval_call(call, line, col) {
+        Ok(Value::Null) => ()
+        Ok(Value::SafeStr(s)) =>
+        match self.write_raw(s, line, col) {
+          Ok(()) => ()
+          Err(e) => return Err(e)
+        }
+        Ok(v) => {
+          let s = value_to_string(v)
+          let wr = if escaped {
+            self.write_escaped(s, line, col)
+          } else {
+            self.write_raw(s, line, col)
+          }
+          match wr {
+            Ok(()) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        Err(e) => return Err(e)
+      }
+      Node::Block(blk) =>
+      match self.eval_block(blk) {
+        Ok(()) => ()
+        Err(e) => return Err(e)
+      }
+      Node::Partial(pn) =>
+      match self.eval_partial(pn) {
+        Ok(()) => ()
+        Err(e) => return Err(e)
+      }
+      Node::InlinePartial(name, body, _, _) => {
+        let top = self.inline_partials_stack.length() - 1
+        if top >= 0 {
+          self.inline_partials_stack[top].push((name, body))
+        }
+      }
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+fn render_template_ast(
+  reg : Registry,
+  tmpl : Template,
+  data : Value,
+) -> Result[String, HandlebarsError] {
+  let st = EvalState::new(reg, tmpl.name, data)
+  match st.eval_nodes(tmpl.nodes) {
+    Ok(()) => Ok(st.out.to_string())
+    Err(e) => Err(e)
+  }
+}
