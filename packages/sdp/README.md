@@ -38,11 +38,18 @@ pub enum SdpError {
 pub fn parse(text : String) -> Result[SessionDescription, SdpError]
 pub fn parse_with_limits(text : String, limits : ParseLimits) -> Result[SessionDescription, SdpError]
 pub fn serialize(desc : SessionDescription) -> String
+pub fn serialize_checked(desc : SessionDescription) -> Result[String, SdpError]
+pub fn session_emails(desc : SessionDescription) -> Array[String]
+pub fn session_phones(desc : SessionDescription) -> Array[String]
+pub fn session_time_zones(desc : SessionDescription) -> Option[String]
+pub fn session_encryption_key(desc : SessionDescription) -> Option[String]
 pub fn parse_ice_candidate(value : String) -> Result[IceCandidate, SdpError]
 pub fn format_ice_candidate(cand : IceCandidate) -> String
+pub fn format_ice_candidate_checked(cand : IceCandidate) -> Result[String, SdpError]
 pub fn ice_candidates(media : MediaDescription) -> Result[Array[IceCandidate], SdpError]
 pub fn ice_credentials(session : SessionDescription, media_idx : Int) -> IceCredentials
 pub fn fingerprint(session : SessionDescription, media_idx : Int) -> Option[DtlsFingerprint]
+pub fn fingerprints(session : SessionDescription, media_idx : Int) -> Array[DtlsFingerprint]
 pub fn dtls_setup(media : MediaDescription) -> Option[DtlsSetup]
 pub fn rtpmaps(media : MediaDescription) -> Result[Array[RtpMap], SdpError]
 pub fn fmtps(media : MediaDescription) -> Result[Array[Fmtp], SdpError]
@@ -86,9 +93,9 @@ Run via `sh packages/sdp/bench/run_bench.sh` against pure-Rust **`webrtc-rs/sdp 
 
 | Workload | `pion` Median (Throughput) | `rust_sdp` Median (Throughput) | `pion` Peak RSS | `rust_sdp` Peak RSS | `pion` vs `rust_sdp` |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| SDP Parse: Google Meet Offer (`11,142 B × 2000`) | 70.248 ms (317.22 MB/s) | 125.416 ms (177.68 MB/s) | 1.97 MiB | 2.53 MiB | **1.79x** |
-| SDP Roundtrip: Google Meet Offer (`11,142 B × 2000`) | 78.810 ms (282.76 MB/s) | 151.342 ms (147.24 MB/s) | 2.17 MiB | 2.69 MiB | **1.92x** |
-| SDP Roundtrip: Google Meet SFU Answer (`9,370 B × 2000`) | 79.447 ms (235.88 MB/s) | 167.509 ms (111.87 MB/s) | 2.19 MiB | 2.59 MiB | **2.11x** |
+| SDP Parse: Google Meet Offer (`11,142 B × 2000`) | 54.080 ms (412.06 MB/s) | 105.431 ms (211.36 MB/s) | 2.08 MiB | 2.53 MiB | **1.95x** |
+| SDP Roundtrip: Google Meet Offer (`11,142 B × 2000`) | 87.608 ms (254.36 MB/s) | 127.865 ms (174.28 MB/s) | 2.30 MiB | 2.67 MiB | **1.46x** |
+| SDP Roundtrip: Google Meet SFU Answer (`9,370 B × 2000`) | 85.317 ms (219.65 MB/s) | 141.306 ms (132.62 MB/s) | 2.31 MiB | 2.55 MiB | **1.66x** |
 
 Verified SHA-256 digests:
 - Offer Parse: `d03b8b7e2d4cc1fdcc47d783f29c2c1f9d336acb3b9a8c1ab2f2249af6f803d3`
