@@ -1,0 +1,1158 @@
+///| JSON Schema (Draft 2020-12 & Draft-07) compiler into flat `CompiledSchema` IR.
+///| Handles `$id` scopes, `$anchor`, RFC 6901 JSON Pointer + percent-decoding `$ref`,
+///| cyclic `$ref` reservation, regex precompilation, and compile-time schema validation.
+
+import "json5"
+import "regex"
+
+fn is_finite_f64(x : Double) -> Bool {
+  x == x && x != 1.0 / 0.0 && x != -1.0 / 0.0
+}
+
+fn is_integer_f64(x : Double) -> Bool {
+  if !is_finite_f64(x) {
+    return false
+  }
+  if x >= 4503599627370496.0 || x <= -4503599627370496.0 {
+    return true
+  }
+  x.to_int64().to_double() == x
+}
+
+fn as_non_neg_int(v : json5::Json5Value) -> Option[Int] {
+  match v {
+    json5::Json5Value::Number(x) => {
+      if !is_integer_f64(x) || x < 0.0 || x > 2147483647.0 {
+        None
+      } else {
+        Some(x.to_int64().to_int())
+      }
+    }
+    _ => None
+  }
+}
+
+fn str_contains(haystack : String, needle : String) -> Bool {
+  let n = haystack.length()
+  let m = needle.length()
+  if m == 0 {
+    return true
+  }
+  if m > n {
+    return false
+  }
+  let mut i = 0
+  let limit = n - m
+  while i <= limit {
+    if haystack.slice(i, i + m) == needle {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn str_find_byte(s : String, target : Int) -> Int {
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i) == target {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+fn str_rfind_byte(s : String, target : Int) -> Int {
+  let mut i = s.length() - 1
+  while i >= 0 {
+    if s.code_unit_at(i) == target {
+      return i
+    }
+    i = i - 1
+  }
+  -1
+}
+
+fn is_abs_uri(uri : String) -> Bool {
+  let colon = str_find_byte(uri, 58)
+  if colon <= 0 {
+    return false
+  }
+  if !is_ascii_alpha(uri.code_unit_at(0)) {
+    return false
+  }
+  let mut i = 1
+  while i < colon {
+    let b = uri.code_unit_at(i)
+    if !is_ascii_alnum(b) && b != 43 && b != 45 && b != 46 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Strip `#fragment` from a URI, returning `(base_without_fragment, fragment_without_hash)`.
+fn split_uri_fragment(uri : String) -> (String, String) {
+  let hash = str_find_byte(uri, 35)
+  if hash < 0 {
+    (uri, "")
+  } else {
+    (uri.slice(0, hash), uri.slice(hash + 1, uri.length()))
+  }
+}
+
+///| Resolve a relative URI reference against a base URI (RFC 3986 subset for `$id` / `$ref`).
+fn resolve_uri(base : String, rel : String) -> String {
+  if rel.length() == 0 {
+    return base
+  }
+  if is_abs_uri(rel) {
+    return rel
+  }
+  if base.length() == 0 {
+    return rel
+  }
+  // If rel starts with '/', attach to scheme://authority
+  if rel.code_unit_at(0) == 47 {
+    let scheme_end = str_find_byte(base, 58)
+    if scheme_end > 0 && scheme_end + 2 < base.length() &&
+    base.code_unit_at(scheme_end + 1) == 47 &&
+    base.code_unit_at(scheme_end + 2) == 47 {
+      let mut auth_end = scheme_end + 3
+      let bn = base.length()
+      while auth_end < bn && base.code_unit_at(auth_end) != 47 {
+        auth_end = auth_end + 1
+      }
+      return base.slice(0, auth_end) + rel
+    }
+    return rel
+  }
+  // Relative path: replace after last '/' in base
+  let last_slash = str_rfind_byte(base, 47)
+  if last_slash >= 0 {
+    base.slice(0, last_slash + 1) + rel
+  } else {
+    rel
+  }
+}
+
+fn hex_val(b : Int) -> Int {
+  if b >= 48 && b <= 57 {
+    b - 48
+  } else if b >= 65 && b <= 70 {
+    b - 55
+  } else if b >= 97 && b <= 102 {
+    b - 87
+  } else {
+    -1
+  }
+}
+
+///| Percent-decode a URI fragment string (`%25` -> `%`, `%20` -> ` `, etc.).
+fn percent_decode(s : String) -> Result[String, SchemaError] {
+  let n = s.length()
+  let mut has_pct = false
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i) == 37 {
+      has_pct = true
+      break
+    }
+    i = i + 1
+  }
+  if !has_pct {
+    return Ok(s)
+  }
+  let sb = StringBuilder::new()
+  i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b == 37 {
+      if i + 2 >= n {
+        return Err(SchemaError::new(SchemaErrorKind::InvalidPointer, s, "truncated percent escape in $ref"))
+      }
+      let hi = hex_val(s.code_unit_at(i + 1))
+      let lo = hex_val(s.code_unit_at(i + 2))
+      if hi < 0 || lo < 0 {
+        return Err(SchemaError::new(SchemaErrorKind::InvalidPointer, s, "invalid hex escape in $ref"))
+      }
+      sb.write_byte((hi * 16 + lo).to_byte())
+      i = i + 3
+    } else {
+      sb.write_byte(b.to_byte())
+      i = i + 1
+    }
+  }
+  Ok(sb.to_string())
+}
+
+///| Escape a JSON Pointer token (`~` -> `~0`, `/` -> `~1`).
+fn escape_ptr_token(token : String) -> String {
+  json5::pointer_escape(token)
+}
+
+///| Registered `$id` resource scope.
+struct ScopeResource {
+  uri : String
+  root_val : json5::Json5Value
+  schema_path : String
+}
+
+///| Registered `$anchor` target.
+struct AnchorTarget {
+  scope_uri : String
+  anchor : String
+  jval : json5::Json5Value
+  schema_path : String
+  target_scope_uri : String
+}
+
+///| Compilation state across the schema document.
+struct CompilerState {
+  draft : Draft
+  max_depth : Int
+  validate_formats : Bool
+  scopes : Array[ScopeResource]
+  anchors : Array[AnchorTarget]
+  ///| Memoized compiled node IDs keyed by `scope_uri + "\u0000" + ptr_or_anchor`
+  compiled_keys : Array[String]
+  compiled_ids : Array[Int]
+  nodes : Array[SchemaNode]
+  mut has_unevaluated : Bool
+}
+
+fn CompilerState::find_scope(self : CompilerState, uri : String) -> Option[ScopeResource] {
+  let mut i = 0
+  let n = self.scopes.length()
+  while i < n {
+    if self.scopes[i].uri == uri {
+      return Some(self.scopes[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn CompilerState::find_anchor(
+  self : CompilerState,
+  scope_uri : String,
+  anchor : String,
+) -> Option[AnchorTarget] {
+  let mut i = 0
+  let n = self.anchors.length()
+  while i < n {
+    let a = self.anchors[i]
+    if a.scope_uri == scope_uri && a.anchor == anchor {
+      return Some(a)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn CompilerState::find_compiled(self : CompilerState, key : String) -> Int {
+  let mut i = 0
+  let n = self.compiled_keys.length()
+  while i < n {
+    if self.compiled_keys[i] == key {
+      return self.compiled_ids[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
+fn CompilerState::record_compiled(self : CompilerState, key : String, id : Int) -> Unit {
+  self.compiled_keys.push(key)
+  self.compiled_ids.push(id)
+}
+
+///| Walk schema tree to collect all `$id` scopes and `$anchor` targets.
+fn collect_resources(
+  state : CompilerState,
+  jval : json5::Json5Value,
+  cur_scope : String,
+  path : String,
+  depth : Int,
+) -> Result[Unit, SchemaError] {
+  if depth > state.max_depth {
+    return Err(SchemaError::new(SchemaErrorKind::LimitExceeded, path, "schema nesting exceeds max_depth"))
+  }
+  match jval {
+    json5::Json5Value::Object(entries) => {
+      let mut next_scope = cur_scope
+      // First check `$id` and `$anchor`
+      let mut i = 0
+      let n = entries.length()
+      while i < n {
+        let (k, v) = entries[i]
+        if k == "$id" {
+          match v {
+            json5::Json5Value::Str(id_str) => {
+              let (base_part, frag_part) = split_uri_fragment(id_str)
+              if base_part.length() > 0 {
+                let resolved = resolve_uri(cur_scope, base_part)
+                next_scope = resolved
+                state.scopes.push(ScopeResource::{
+                  uri: resolved,
+                  root_val: jval,
+                  schema_path: path,
+                })
+              }
+              if frag_part.length() > 0 && frag_part.code_unit_at(0) != 47 {
+                state.anchors.push(AnchorTarget::{
+                  scope_uri: next_scope,
+                  anchor: frag_part,
+                  jval: jval,
+                  schema_path: path,
+                  target_scope_uri: next_scope,
+                })
+              }
+            }
+            _ => ()
+          }
+        } else if k == "$anchor" {
+          match v {
+            json5::Json5Value::Str(anchor_str) => {
+              if anchor_str.length() > 0 {
+                state.anchors.push(AnchorTarget::{
+                  scope_uri: next_scope,
+                  anchor: anchor_str,
+                  jval: jval,
+                  schema_path: path,
+                  target_scope_uri: next_scope,
+                })
+              }
+            }
+            _ => ()
+          }
+        }
+        i = i + 1
+      }
+      // Recurse into subschema containers (skip const / enum raw data)
+      i = 0
+      while i < n {
+        let (k, v) = entries[i]
+        if k != "const" && k != "enum" && k != "default" && k != "examples" {
+          let child_path = path + "/" + escape_ptr_token(k)
+          match collect_resources(state, v, next_scope, child_path, depth + 1) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      let n = items.length()
+      while i < n {
+        match collect_resources(state, items[i], cur_scope, path + "/" + i.to_string(), depth + 1) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    _ => Ok(())
+  }
+}
+
+fn parse_type_name(name : String) -> Int {
+  if name == "null" {
+    type_null
+  } else if name == "boolean" {
+    type_bool
+  } else if name == "integer" {
+    type_int
+  } else if name == "number" {
+    type_num
+  } else if name == "string" {
+    type_str
+  } else if name == "array" {
+    type_arr
+  } else if name == "object" {
+    type_obj
+  } else {
+    0
+  }
+}
+
+///| Resolve a `$ref` string against `cur_scope`, returning the compiled target node ID.
+fn compile_ref(
+  state : CompilerState,
+  ref_str : String,
+  cur_scope : String,
+  schema_path : String,
+  depth : Int,
+) -> Result[Int, SchemaError] {
+  let (uri_part, frag_part) = split_uri_fragment(ref_str)
+  let target_scope = if uri_part.length() == 0 {
+    cur_scope
+  } else {
+    resolve_uri(cur_scope, uri_part)
+  }
+  // Check anchor vs JSON pointer
+  if frag_part.length() > 0 && frag_part.code_unit_at(0) != 47 {
+    let key = target_scope + "#" + frag_part
+    let cached = state.find_compiled(key)
+    if cached >= 0 {
+      return Ok(cached)
+    }
+    match state.find_anchor(target_scope, frag_part) {
+      Some(anc) => {
+        let node_id = state.nodes.length()
+        state.nodes.push(SchemaNode::empty(anc.schema_path, 0))
+        state.record_compiled(key, node_id)
+        match compile_into(state, node_id, anc.jval, anc.target_scope_uri, anc.schema_path, depth + 1) {
+          Ok(_) => Ok(node_id)
+          Err(e) => Err(e)
+        }
+      }
+      None => Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref anchor: " + ref_str))
+    }
+  } else {
+    // JSON Pointer fragment ("" or "/...")
+    let decoded_ptr = match percent_decode(frag_part) {
+      Ok(p) => p
+      Err(e) => return Err(e)
+    }
+    let key = target_scope + "#" + decoded_ptr
+    let cached = state.find_compiled(key)
+    if cached >= 0 {
+      return Ok(cached)
+    }
+    let scope_res = match state.find_scope(target_scope) {
+      Some(s) => s
+      None => return Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref scope: " + ref_str))
+    }
+    let target_val = if decoded_ptr.length() == 0 {
+      scope_res.root_val
+    } else {
+      match json5::pointer_get(scope_res.root_val, decoded_ptr) {
+        Ok(Some(v)) => v
+        Ok(None) => return Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref pointer: " + ref_str))
+        Err(e) => return Err(SchemaError::new(SchemaErrorKind::InvalidPointer, schema_path, e.message))
+      }
+    }
+    let target_path = if decoded_ptr.length() == 0 {
+      scope_res.schema_path
+    } else {
+      "#" + decoded_ptr
+    }
+    let node_id = state.nodes.length()
+    state.nodes.push(SchemaNode::empty(target_path, 0))
+    state.record_compiled(key, node_id)
+    match compile_into(state, node_id, target_val, target_scope, target_path, depth + 1) {
+      Ok(_) => Ok(node_id)
+      Err(e) => Err(e)
+    }
+  }
+}
+
+///| Allocate a new node ID and compile `jval` into it.
+fn compile_subschema(
+  state : CompilerState,
+  jval : json5::Json5Value,
+  cur_scope : String,
+  schema_path : String,
+  depth : Int,
+) -> Result[Int, SchemaError] {
+  if depth > state.max_depth {
+    return Err(SchemaError::new(SchemaErrorKind::LimitExceeded, schema_path, "schema nesting exceeds max_depth"))
+  }
+  let node_id = state.nodes.length()
+  state.nodes.push(SchemaNode::empty(schema_path, 0))
+  match compile_into(state, node_id, jval, cur_scope, schema_path, depth) {
+    Ok(_) => Ok(node_id)
+    Err(e) => Err(e)
+  }
+}
+
+///| Compile one keyword entry `(k, v)` into `node`.
+fn compile_keyword(
+  state : CompilerState,
+  node : SchemaNode,
+  k : String,
+  v : json5::Json5Value,
+  eff_scope : String,
+  kw_path : String,
+  depth : Int,
+) -> Result[Unit, SchemaError] {
+  if k == "type" {
+    match v {
+      json5::Json5Value::Str(tn) => {
+        let bit = parse_type_name(tn)
+        if bit == 0 {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "invalid type name: " + tn))
+        }
+        node.type_mask = bit
+        node.kw_mask = node.kw_mask | kw_type
+      }
+      json5::Json5Value::Array(arr) => {
+        if arr.length() == 0 {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "type array must not be empty"))
+        }
+        let mut mask = 0
+        let mut j = 0
+        while j < arr.length() {
+          match arr[j] {
+            json5::Json5Value::Str(tn) => {
+              let bit = parse_type_name(tn)
+              if bit == 0 {
+                return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "invalid type name: " + tn))
+              }
+              mask = mask | bit
+            }
+            _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "type array elements must be strings"))
+          }
+          j = j + 1
+        }
+        node.type_mask = mask
+        node.kw_mask = node.kw_mask | kw_type
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "type must be string or array of strings"))
+    }
+  } else if k == "const" {
+    node.const_val = Some(v)
+    node.kw_mask = node.kw_mask | kw_const
+  } else if k == "enum" {
+    match v {
+      json5::Json5Value::Array(arr) => {
+        node.enum_vals = arr
+        node.kw_mask = node.kw_mask | kw_enum
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "enum must be an array"))
+    }
+  } else if k == "minimum" {
+    match v {
+      json5::Json5Value::Number(x) => {
+        if !is_finite_f64(x) {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minimum must be finite"))
+        }
+        node.minimum = x
+        node.kw_mask = node.kw_mask | kw_min
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minimum must be a number"))
+    }
+  } else if k == "maximum" {
+    match v {
+      json5::Json5Value::Number(x) => {
+        if !is_finite_f64(x) {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maximum must be finite"))
+        }
+        node.maximum = x
+        node.kw_mask = node.kw_mask | kw_max
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maximum must be a number"))
+    }
+  } else if k == "exclusiveMinimum" {
+    match v {
+      json5::Json5Value::Number(x) => {
+        if !is_finite_f64(x) {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMinimum must be finite"))
+        }
+        node.exclusive_minimum = x
+        node.kw_mask = node.kw_mask | kw_excl_min
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMinimum must be a number"))
+    }
+  } else if k == "exclusiveMaximum" {
+    match v {
+      json5::Json5Value::Number(x) => {
+        if !is_finite_f64(x) {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMaximum must be finite"))
+        }
+        node.exclusive_maximum = x
+        node.kw_mask = node.kw_mask | kw_excl_max
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMaximum must be a number"))
+    }
+  } else if k == "multipleOf" {
+    match v {
+      json5::Json5Value::Number(x) => {
+        if !is_finite_f64(x) || x <= 0.0 {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "multipleOf must be strictly positive"))
+        }
+        node.multiple_of = x
+        node.kw_mask = node.kw_mask | kw_multiple_of
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "multipleOf must be a positive number"))
+    }
+  } else if k == "minLength" {
+    match as_non_neg_int(v) {
+      Some(iv) => {
+        node.min_length = iv
+        node.kw_mask = node.kw_mask | kw_min_len
+      }
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minLength must be a non-negative integer"))
+    }
+  } else if k == "maxLength" {
+    match as_non_neg_int(v) {
+      Some(iv) => {
+        node.max_length = iv
+        node.kw_mask = node.kw_mask | kw_max_len
+      }
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maxLength must be a non-negative integer"))
+    }
+  } else if k == "pattern" {
+    match v {
+      json5::Json5Value::Str(pat) => {
+        match regex::compile(pat) {
+          Ok(re) => {
+            node.pattern_str = pat
+            node.pattern_re = Some(re)
+            node.kw_mask = node.kw_mask | kw_pattern
+          }
+          Err(e) => return Err(SchemaError::new(SchemaErrorKind::InvalidRegex, kw_path, e.message))
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "pattern must be a string"))
+    }
+  } else if k == "format" {
+    match v {
+      json5::Json5Value::Str(fmt) => {
+        node.format_name = fmt
+        node.kw_mask = node.kw_mask | kw_format
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "format must be a string"))
+    }
+  } else if k == "minItems" {
+    match as_non_neg_int(v) {
+      Some(iv) => {
+        node.min_items = iv
+        node.kw_mask = node.kw_mask | kw_min_items
+      }
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minItems must be a non-negative integer"))
+    }
+  } else if k == "maxItems" {
+    match as_non_neg_int(v) {
+      Some(iv) => {
+        node.max_items = iv
+        node.kw_mask = node.kw_mask | kw_max_items
+      }
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maxItems must be a non-negative integer"))
+    }
+  } else if k == "uniqueItems" {
+    match v {
+      json5::Json5Value::Bool(b) => {
+        node.unique_items = b
+        if b {
+          node.kw_mask = node.kw_mask | kw_unique_items
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "uniqueItems must be a boolean"))
+    }
+  } else if k == "prefixItems" {
+    match v {
+      json5::Json5Value::Array(arr) => {
+        let mut j = 0
+        while j < arr.length() {
+          match compile_subschema(state, arr[j], eff_scope, kw_path + "/" + j.to_string(), depth + 1) {
+            Ok(cid) => node.prefix_items.push(cid)
+            Err(e) => return Err(e)
+          }
+          j = j + 1
+        }
+        node.kw_mask = node.kw_mask | kw_prefix_items
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "prefixItems must be an array of schemas"))
+    }
+  } else if k == "contains" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => {
+        node.contains_node = cid
+        node.kw_mask = node.kw_mask | kw_contains
+      }
+      Err(e) => return Err(e)
+    }
+  } else if k == "minContains" {
+    match as_non_neg_int(v) {
+      Some(iv) => node.min_contains = iv
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minContains must be a non-negative integer"))
+    }
+  } else if k == "maxContains" {
+    match as_non_neg_int(v) {
+      Some(iv) => node.max_contains = iv
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maxContains must be a non-negative integer"))
+    }
+  } else if k == "minProperties" {
+    match as_non_neg_int(v) {
+      Some(iv) => {
+        node.min_properties = iv
+        node.kw_mask = node.kw_mask | kw_min_props
+      }
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minProperties must be a non-negative integer"))
+    }
+  } else if k == "maxProperties" {
+    match as_non_neg_int(v) {
+      Some(iv) => {
+        node.max_properties = iv
+        node.kw_mask = node.kw_mask | kw_max_props
+      }
+      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maxProperties must be a non-negative integer"))
+    }
+  } else if k == "required" {
+    match v {
+      json5::Json5Value::Array(arr) => {
+        let mut j = 0
+        while j < arr.length() {
+          match arr[j] {
+            json5::Json5Value::Str(rk) => node.required.push(rk)
+            _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "required elements must be strings"))
+          }
+          j = j + 1
+        }
+        if node.required.length() > 0 {
+          node.kw_mask = node.kw_mask | kw_required
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "required must be an array of strings"))
+    }
+  } else if k == "properties" {
+    match v {
+      json5::Json5Value::Object(p_entries) => {
+        let mut j = 0
+        while j < p_entries.length() {
+          let (pk, pv) = p_entries[j]
+          match compile_subschema(state, pv, eff_scope, kw_path + "/" + escape_ptr_token(pk), depth + 1) {
+            Ok(cid) => node.properties.push(CompiledProp::{ name: pk, node_id: cid })
+            Err(e) => return Err(e)
+          }
+          j = j + 1
+        }
+        if node.properties.length() > 0 {
+          node.kw_mask = node.kw_mask | kw_properties
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "properties must be an object"))
+    }
+  } else if k == "patternProperties" {
+    match v {
+      json5::Json5Value::Object(pp_entries) => {
+        let mut j = 0
+        while j < pp_entries.length() {
+          let (ppat, pv) = pp_entries[j]
+          let re = match regex::compile(ppat) {
+            Ok(r) => r
+            Err(e) => return Err(SchemaError::new(SchemaErrorKind::InvalidRegex, kw_path, e.message))
+          }
+          match compile_subschema(state, pv, eff_scope, kw_path + "/" + escape_ptr_token(ppat), depth + 1) {
+            Ok(cid) => node.pattern_properties.push(CompiledPatternProp::{ pattern: ppat, compiled: re, node_id: cid })
+            Err(e) => return Err(e)
+          }
+          j = j + 1
+        }
+        if node.pattern_properties.length() > 0 {
+          node.kw_mask = node.kw_mask | kw_pattern_props
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "patternProperties must be an object"))
+    }
+  } else if k == "additionalProperties" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => {
+        node.additional_properties = cid
+        node.kw_mask = node.kw_mask | kw_additional_props
+      }
+      Err(e) => return Err(e)
+    }
+  } else if k == "propertyNames" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => {
+        node.property_names = cid
+        node.kw_mask = node.kw_mask | kw_property_names
+      }
+      Err(e) => return Err(e)
+    }
+  } else if k == "dependentRequired" {
+    match v {
+      json5::Json5Value::Object(dr_entries) => {
+        let mut j = 0
+        while j < dr_entries.length() {
+          let (dk, dv) = dr_entries[j]
+          match dv {
+            json5::Json5Value::Array(req_arr) => {
+              let reqs : Array[String] = []
+              let mut m = 0
+              while m < req_arr.length() {
+                match req_arr[m] {
+                  json5::Json5Value::Str(rs) => reqs.push(rs)
+                  _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired values must be string arrays"))
+                }
+                m = m + 1
+              }
+              node.dep_required.push(CompiledDepReq::{ key: dk, required: reqs })
+            }
+            _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired values must be arrays"))
+          }
+          j = j + 1
+        }
+        if node.dep_required.length() > 0 {
+          node.kw_mask = node.kw_mask | kw_dep_required
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired must be an object"))
+    }
+  } else if k == "dependentSchemas" {
+    match v {
+      json5::Json5Value::Object(ds_entries) => {
+        let mut j = 0
+        while j < ds_entries.length() {
+          let (dk, dv) = ds_entries[j]
+          match compile_subschema(state, dv, eff_scope, kw_path + "/" + escape_ptr_token(dk), depth + 1) {
+            Ok(cid) => node.dep_schemas.push(CompiledDepSchema::{ key: dk, node_id: cid })
+            Err(e) => return Err(e)
+          }
+          j = j + 1
+        }
+        if node.dep_schemas.length() > 0 {
+          node.kw_mask = node.kw_mask | kw_dep_schemas
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentSchemas must be an object"))
+    }
+  } else if k == "dependencies" {
+    match v {
+      json5::Json5Value::Object(d_entries) => {
+        let mut j = 0
+        while j < d_entries.length() {
+          let (dk, dv) = d_entries[j]
+          match dv {
+            json5::Json5Value::Array(req_arr) => {
+              let reqs : Array[String] = []
+              let mut m = 0
+              while m < req_arr.length() {
+                match req_arr[m] {
+                  json5::Json5Value::Str(rs) => reqs.push(rs)
+                  _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependencies array elements must be strings"))
+                }
+                m = m + 1
+              }
+              node.dep_required.push(CompiledDepReq::{ key: dk, required: reqs })
+              node.kw_mask = node.kw_mask | kw_dep_required
+            }
+            _ => {
+              match compile_subschema(state, dv, eff_scope, kw_path + "/" + escape_ptr_token(dk), depth + 1) {
+                Ok(cid) => {
+                  node.dep_schemas.push(CompiledDepSchema::{ key: dk, node_id: cid })
+                  node.kw_mask = node.kw_mask | kw_dep_schemas
+                }
+                Err(e) => return Err(e)
+              }
+            }
+          }
+          j = j + 1
+        }
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependencies must be an object"))
+    }
+  } else if k == "allOf" {
+    match v {
+      json5::Json5Value::Array(arr) => {
+        let mut j = 0
+        while j < arr.length() {
+          match compile_subschema(state, arr[j], eff_scope, kw_path + "/" + j.to_string(), depth + 1) {
+            Ok(cid) => node.all_of.push(cid)
+            Err(e) => return Err(e)
+          }
+          j = j + 1
+        }
+        node.kw_mask = node.kw_mask | kw_combinators
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "allOf must be an array"))
+    }
+  } else if k == "anyOf" {
+    match v {
+      json5::Json5Value::Array(arr) => {
+        let mut j = 0
+        while j < arr.length() {
+          match compile_subschema(state, arr[j], eff_scope, kw_path + "/" + j.to_string(), depth + 1) {
+            Ok(cid) => node.any_of.push(cid)
+            Err(e) => return Err(e)
+          }
+          j = j + 1
+        }
+        node.kw_mask = node.kw_mask | kw_combinators
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "anyOf must be an array"))
+    }
+  } else if k == "oneOf" {
+    match v {
+      json5::Json5Value::Array(arr) => {
+        let mut j = 0
+        while j < arr.length() {
+          match compile_subschema(state, arr[j], eff_scope, kw_path + "/" + j.to_string(), depth + 1) {
+            Ok(cid) => node.one_of.push(cid)
+            Err(e) => return Err(e)
+          }
+          j = j + 1
+        }
+        node.kw_mask = node.kw_mask | kw_combinators
+      }
+      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "oneOf must be an array"))
+    }
+  } else if k == "not" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => {
+        node.not_node = cid
+        node.kw_mask = node.kw_mask | kw_combinators
+      }
+      Err(e) => return Err(e)
+    }
+  } else if k == "if" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => {
+        node.if_node = cid
+        node.kw_mask = node.kw_mask | kw_conditional
+      }
+      Err(e) => return Err(e)
+    }
+  } else if k == "then" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => node.then_node = cid
+      Err(e) => return Err(e)
+    }
+  } else if k == "else" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => node.else_node = cid
+      Err(e) => return Err(e)
+    }
+  } else if k == "unevaluatedProperties" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => {
+        node.unevaluated_properties = cid
+        node.kw_mask = node.kw_mask | kw_unevaluated
+        state.has_unevaluated = true
+      }
+      Err(e) => return Err(e)
+    }
+  } else if k == "unevaluatedItems" {
+    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+      Ok(cid) => {
+        node.unevaluated_items = cid
+        node.kw_mask = node.kw_mask | kw_unevaluated
+        state.has_unevaluated = true
+      }
+      Err(e) => return Err(e)
+    }
+  }
+  Ok(())
+}
+
+///| Compile `jval` into pre-allocated `state.nodes[node_id]`.
+fn compile_into(
+  state : CompilerState,
+  node_id : Int,
+  jval : json5::Json5Value,
+  cur_scope : String,
+  schema_path : String,
+  depth : Int,
+) -> Result[Unit, SchemaError] {
+  if depth > state.max_depth {
+    return Err(SchemaError::new(SchemaErrorKind::LimitExceeded, schema_path, "schema nesting exceeds max_depth"))
+  }
+  match jval {
+    json5::Json5Value::Bool(b) => {
+      state.nodes[node_id].bool_kind = if b { 1 } else { -1 }
+      Ok(())
+    }
+    json5::Json5Value::Object(entries) => {
+      let node = state.nodes[node_id]
+      let mut eff_scope = cur_scope
+      let mut ref_str_opt : Option[String] = None
+      let mut i = 0
+      let n = entries.length()
+      while i < n {
+        let (k, v) = entries[i]
+        if k == "$id" {
+          match v {
+            json5::Json5Value::Str(id_s) => {
+              let (base_part, _) = split_uri_fragment(id_s)
+              if base_part.length() > 0 {
+                eff_scope = resolve_uri(cur_scope, base_part)
+              }
+            }
+            _ => ()
+          }
+        } else if k == "$ref" {
+          match v {
+            json5::Json5Value::Str(rs) => ref_str_opt = Some(rs)
+            _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, schema_path + "/$ref", "$ref must be a string"))
+          }
+        }
+        i = i + 1
+      }
+
+      // Compile `$ref` if present
+      match ref_str_opt {
+        Some(rs) => {
+          match compile_ref(state, rs, eff_scope, schema_path + "/$ref", depth) {
+            Ok(tid) => {
+              node.ref_node = tid
+              node.kw_mask = node.kw_mask | kw_ref
+            }
+            Err(e) => return Err(e)
+          }
+          // Draft-07: sibling keywords alongside `$ref` are ignored
+          if draft_eq(state.draft, Draft::Draft7) {
+            return Ok(())
+          }
+        }
+        None => ()
+      }
+
+      let mut has_draft7_tuple_items = false
+      let mut additional_items_val : Option[json5::Json5Value] = None
+      i = 0
+      while i < n {
+        let (k, v) = entries[i]
+        let kw_path = schema_path + "/" + escape_ptr_token(k)
+        if k == "items" {
+          match v {
+            json5::Json5Value::Array(arr) => {
+              has_draft7_tuple_items = true
+              let mut j = 0
+              while j < arr.length() {
+                match compile_subschema(state, arr[j], eff_scope, kw_path + "/" + j.to_string(), depth + 1) {
+                  Ok(cid) => node.prefix_items.push(cid)
+                  Err(e) => return Err(e)
+                }
+                j = j + 1
+              }
+              node.kw_mask = node.kw_mask | kw_prefix_items
+            }
+            _ => {
+              match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+                Ok(cid) => {
+                  node.items_node = cid
+                  node.kw_mask = node.kw_mask | kw_items
+                }
+                Err(e) => return Err(e)
+              }
+            }
+          }
+        } else if k == "additionalItems" {
+          additional_items_val = Some(v)
+        } else {
+          match compile_keyword(state, node, k, v, eff_scope, kw_path, depth) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        i = i + 1
+      }
+
+      if has_draft7_tuple_items {
+        match additional_items_val {
+          Some(av) => {
+            match compile_subschema(state, av, eff_scope, schema_path + "/additionalItems", depth + 1) {
+              Ok(cid) => {
+                node.items_node = cid
+                node.kw_mask = node.kw_mask | kw_items
+              }
+              Err(e) => return Err(e)
+            }
+          }
+          None => ()
+        }
+      }
+
+      if node.properties.length() >= 6 {
+        node.prop_map = Some(StrIndexMap::from_props(node.properties))
+      }
+      Ok(())
+    }
+    _ => Err(SchemaError::new(SchemaErrorKind::InvalidSchema, schema_path, "schema must be a boolean or object"))
+  }
+}
+
+fn detect_draft(schema : json5::Json5Value, requested : Draft) -> Draft {
+  if !draft_eq(requested, Draft::Auto) {
+    return requested
+  }
+  match json5::get(schema, "$schema") {
+    Some(json5::Json5Value::Str(s)) => {
+      if str_contains(s, "draft-07") || str_contains(s, "draft-06") {
+        Draft::Draft7
+      } else {
+        Draft::Draft202012
+      }
+    }
+    _ => Draft::Draft202012
+  }
+}
+
+fn compile_schema_impl(
+  schema : json5::Json5Value,
+  opts : CompileOptions,
+) -> Result[CompiledSchema, SchemaError] {
+  let eff_draft = detect_draft(schema, opts.draft)
+  let max_d = if opts.max_depth > 0 { opts.max_depth } else { 128 }
+  let state = CompilerState::{
+    draft: eff_draft,
+    max_depth: max_d,
+    validate_formats: opts.validate_formats,
+    scopes: [],
+    anchors: [],
+    compiled_keys: [],
+    compiled_ids: [],
+    nodes: [],
+    has_unevaluated: false,
+  }
+
+  // Root scope URI (from root `$id` if present, else "")
+  let mut root_scope = ""
+  match json5::get(schema, "$id") {
+    Some(json5::Json5Value::Str(id_s)) => {
+      let (base_part, _) = split_uri_fragment(id_s)
+      root_scope = base_part
+    }
+    _ => ()
+  }
+  state.scopes.push(ScopeResource::{
+    uri: root_scope,
+    root_val: schema,
+    schema_path: "#",
+  })
+  if root_scope.length() > 0 {
+    // Also register empty URI pointing to root for bare `#` lookups
+    state.scopes.push(ScopeResource::{
+      uri: "",
+      root_val: schema,
+      schema_path: "#",
+    })
+  }
+
+  match collect_resources(state, schema, root_scope, "#", 0) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  // Reserve root node 0 before compiling so `#` self-references resolve cleanly!
+  let root_id = 0
+  state.nodes.push(SchemaNode::empty("#", 0))
+  state.record_compiled(root_scope + "#", root_id)
+  if root_scope.length() > 0 {
+    state.record_compiled("#", root_id)
+  }
+
+  match compile_into(state, root_id, schema, root_scope, "#", 0) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  Ok(CompiledSchema::{
+    draft: eff_draft,
+    default_validate_formats: opts.validate_formats,
+    default_max_depth: max_d,
+    root: root_id,
+    has_unevaluated: state.has_unevaluated,
+    nodes: state.nodes,
+  })
+}

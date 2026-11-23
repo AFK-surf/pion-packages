@@ -1,0 +1,1263 @@
+///| High-performance JSON Schema validator:
+///| - Fast zero-allocation short-circuit `is_valid` path
+///| - Annotation-tracking path for `unevaluatedProperties` / `unevaluatedItems`
+///| - Full diagnostic `validate` path collecting all `ValidationError`s
+
+import "json5"
+
+fn abs_f64(x : Double) -> Double {
+  if x < 0.0 {
+    -x
+  } else {
+    x
+  }
+}
+
+fn max_f64(a : Double, b : Double) -> Double {
+  if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn round_f64(x : Double) -> Double {
+  if x >= 0.0 {
+    (x + 0.5).to_int64().to_double()
+  } else {
+    (x - 0.5).to_int64().to_double()
+  }
+}
+
+///| Accurate, overflow-safe `multipleOf` check for both integers and floats.
+fn check_multiple_of(x : Double, m : Double) -> Bool {
+  if x == 0.0 {
+    return true
+  }
+  if !is_finite_f64(x) || !is_finite_f64(m) || m <= 0.0 {
+    return false
+  }
+  // Exact Int64 fast path when both x and m are exact integers within safe range
+  if is_integer_f64(x) && is_integer_f64(m) &&
+  abs_f64(x) < 4503599627370496.0 && abs_f64(m) < 4503599627370496.0 {
+    let xi = x.to_int64()
+    let mi = m.to_int64()
+    if mi == 0L {
+      return false
+    }
+    return xi % mi == 0L
+  }
+  let q = x / m
+  if !is_finite_f64(q) {
+    return false
+  }
+  if abs_f64(q) >= 4503599627370496.0 {
+    return true
+  }
+  let nq = round_f64(q)
+  let rem = abs_f64(x - nq * m)
+  rem <= 1e-12 * max_f64(abs_f64(x), abs_f64(m))
+}
+
+///| Count Unicode scalar values (codepoints) in a UTF-8 `String`.
+fn utf8_codepoint_len(s : String) -> Int {
+  let n = s.length()
+  let mut count = 0
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if (b & 0xC0) != 0x80 {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  count
+}
+
+fn check_type_mask(mask : Int, jval : json5::Json5Value) -> Bool {
+  match jval {
+    json5::Json5Value::Null => (mask & type_null) != 0
+    json5::Json5Value::Bool(_) => (mask & type_bool) != 0
+    json5::Json5Value::Number(x) => {
+      if (mask & type_num) != 0 {
+        is_finite_f64(x)
+      } else if (mask & type_int) != 0 {
+        is_integer_f64(x)
+      } else {
+        false
+      }
+    }
+    json5::Json5Value::Str(_) => (mask & type_str) != 0
+    json5::Json5Value::Array(_) => (mask & type_arr) != 0
+    json5::Json5Value::Object(_) => (mask & type_obj) != 0
+  }
+}
+
+fn lookup_prop(node : SchemaNode, key : String) -> Int {
+  match node.prop_map {
+    Some(pm) => {
+      let idx = pm.get(key)
+      if idx >= 0 {
+        node.properties[idx].node_id
+      } else {
+        -1
+      }
+    }
+    None => {
+      let props = node.properties
+      let mut i = 0
+      let n = props.length()
+      while i < n {
+        if props[i].name == key {
+          return props[i].node_id
+        }
+        i = i + 1
+      }
+      -1
+    }
+  }
+}
+
+fn object_has_key(entries : Array[(String, json5::Json5Value)], key : String) -> Bool {
+  let mut i = 0
+  let n = entries.length()
+  while i < n {
+    let (k, _) = entries[i]
+    if k == key {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Fast zero-allocation short-circuit validator (used when `!schema.has_unevaluated`).
+fn is_valid_fast(
+  schema : CompiledSchema,
+  node_id : Int,
+  jval : json5::Json5Value,
+  depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+) -> Bool {
+  if depth > max_depth {
+    return false
+  }
+  let node = schema.nodes[node_id]
+  if node.bool_kind != 0 {
+    return node.bool_kind > 0
+  }
+  let km = node.kw_mask
+  if km == 0 {
+    return true
+  }
+
+  // Type
+  if (km & kw_type) != 0 {
+    if !check_type_mask(node.type_mask, jval) {
+      return false
+    }
+  }
+  // Const
+  if (km & kw_const) != 0 {
+    match node.const_val {
+      Some(cv) => {
+        if !json5::value_eq(jval, cv) {
+          return false
+        }
+      }
+      None => ()
+    }
+  }
+  // Enum
+  if (km & kw_enum) != 0 {
+    let mut matched = false
+    let evs = node.enum_vals
+    let mut i = 0
+    let n = evs.length()
+    while i < n {
+      if json5::value_eq(jval, evs[i]) {
+        matched = true
+        break
+      }
+      i = i + 1
+    }
+    if !matched {
+      return false
+    }
+  }
+
+  // Value-type-specific keywords
+  match jval {
+    json5::Json5Value::Number(x) => {
+      if (km & kw_min) != 0 && x < node.minimum {
+        return false
+      }
+      if (km & kw_max) != 0 && x > node.maximum {
+        return false
+      }
+      if (km & kw_excl_min) != 0 && x <= node.exclusive_minimum {
+        return false
+      }
+      if (km & kw_excl_max) != 0 && x >= node.exclusive_maximum {
+        return false
+      }
+      if (km & kw_multiple_of) != 0 && !check_multiple_of(x, node.multiple_of) {
+        return false
+      }
+    }
+    json5::Json5Value::Str(s) => {
+      if (km & (kw_min_len | kw_max_len)) != 0 {
+        let cp_len = utf8_codepoint_len(s)
+        if (km & kw_min_len) != 0 && cp_len < node.min_length {
+          return false
+        }
+        if (km & kw_max_len) != 0 && cp_len > node.max_length {
+          return false
+        }
+      }
+      if (km & kw_pattern) != 0 {
+        match node.pattern_re {
+          Some(re) => {
+            if !re.is_match(s) {
+              return false
+            }
+          }
+          None => ()
+        }
+      }
+      if validate_formats && (km & kw_format) != 0 {
+        if !check_format(node.format_name, s) {
+          return false
+        }
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let n = items.length()
+      if (km & kw_min_items) != 0 && n < node.min_items {
+        return false
+      }
+      if (km & kw_max_items) != 0 && n > node.max_items {
+        return false
+      }
+      if (km & kw_unique_items) != 0 && !check_unique_items(items) {
+        return false
+      }
+      let plen = node.prefix_items.length()
+      if (km & kw_prefix_items) != 0 {
+        let limit = if n < plen { n } else { plen }
+        let mut i = 0
+        while i < limit {
+          if !is_valid_fast(schema, node.prefix_items[i], items[i], depth + 1, max_depth, validate_formats) {
+            return false
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_items) != 0 && node.items_node >= 0 {
+        let mut i = plen
+        while i < n {
+          if !is_valid_fast(schema, node.items_node, items[i], depth + 1, max_depth, validate_formats) {
+            return false
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_contains) != 0 && node.contains_node >= 0 {
+        let mut matches = 0
+        let mut i = 0
+        while i < n {
+          if is_valid_fast(schema, node.contains_node, items[i], depth + 1, max_depth, validate_formats) {
+            matches = matches + 1
+          }
+          i = i + 1
+        }
+        if matches < node.min_contains {
+          return false
+        }
+        if node.max_contains >= 0 && matches > node.max_contains {
+          return false
+        }
+      }
+    }
+    json5::Json5Value::Object(entries) => {
+      let n = entries.length()
+      if (km & kw_min_props) != 0 && n < node.min_properties {
+        return false
+      }
+      if (km & kw_max_props) != 0 && n > node.max_properties {
+        return false
+      }
+      if (km & kw_required) != 0 {
+        let reqs = node.required
+        let rlen = reqs.length()
+        if n < rlen {
+          return false
+        }
+        let mut i = 0
+        while i < rlen {
+          if !object_has_key(entries, reqs[i]) {
+            return false
+          }
+          i = i + 1
+        }
+      }
+      if (km & (kw_properties | kw_pattern_props | kw_additional_props | kw_property_names)) != 0 {
+        let has_props = (km & kw_properties) != 0
+        let has_pprops = (km & kw_pattern_props) != 0
+        let has_addl = (km & kw_additional_props) != 0 && node.additional_properties >= 0
+        let has_pnames = (km & kw_property_names) != 0 && node.property_names >= 0
+        let pprops = node.pattern_properties
+        let pp_len = pprops.length()
+        let mut i = 0
+        while i < n {
+          let (k, ev) = entries[i]
+          if has_pnames {
+            if !is_valid_fast(schema, node.property_names, json5::Json5Value::Str(k), depth + 1, max_depth, validate_formats) {
+              return false
+            }
+          }
+          let mut matched = false
+          if has_props {
+            let pid = lookup_prop(node, k)
+            if pid >= 0 {
+              matched = true
+              if !is_valid_fast(schema, pid, ev, depth + 1, max_depth, validate_formats) {
+                return false
+              }
+            }
+          }
+          if has_pprops {
+            let mut j = 0
+            while j < pp_len {
+              if pprops[j].compiled.is_match(k) {
+                matched = true
+                if !is_valid_fast(schema, pprops[j].node_id, ev, depth + 1, max_depth, validate_formats) {
+                  return false
+                }
+              }
+              j = j + 1
+            }
+          }
+          if !matched && has_addl {
+            if !is_valid_fast(schema, node.additional_properties, ev, depth + 1, max_depth, validate_formats) {
+              return false
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_required) != 0 {
+        let drs = node.dep_required
+        let mut i = 0
+        while i < drs.length() {
+          if object_has_key(entries, drs[i].key) {
+            let reqs = drs[i].required
+            let mut j = 0
+            while j < reqs.length() {
+              if !object_has_key(entries, reqs[j]) {
+                return false
+              }
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_schemas) != 0 {
+        let dss = node.dep_schemas
+        let mut i = 0
+        while i < dss.length() {
+          if object_has_key(entries, dss[i].key) {
+            if !is_valid_fast(schema, dss[i].node_id, jval, depth + 1, max_depth, validate_formats) {
+              return false
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    _ => ()
+  }
+
+  // `$ref`
+  if (km & kw_ref) != 0 && node.ref_node >= 0 {
+    if !is_valid_fast(schema, node.ref_node, jval, depth + 1, max_depth, validate_formats) {
+      return false
+    }
+  }
+
+  // Combinators
+  if (km & kw_combinators) != 0 {
+    let mut i = 0
+    while i < node.all_of.length() {
+      if !is_valid_fast(schema, node.all_of[i], jval, depth + 1, max_depth, validate_formats) {
+        return false
+      }
+      i = i + 1
+    }
+    if node.any_of.length() > 0 {
+      let mut any_ok = false
+      i = 0
+      while i < node.any_of.length() {
+        if is_valid_fast(schema, node.any_of[i], jval, depth + 1, max_depth, validate_formats) {
+          any_ok = true
+          break
+        }
+        i = i + 1
+      }
+      if !any_ok {
+        return false
+      }
+    }
+    if node.one_of.length() > 0 {
+      let mut match_cnt = 0
+      i = 0
+      while i < node.one_of.length() {
+        if is_valid_fast(schema, node.one_of[i], jval, depth + 1, max_depth, validate_formats) {
+          match_cnt = match_cnt + 1
+          if match_cnt > 1 {
+            return false
+          }
+        }
+        i = i + 1
+      }
+      if match_cnt != 1 {
+        return false
+      }
+    }
+    if node.not_node >= 0 {
+      if is_valid_fast(schema, node.not_node, jval, depth + 1, max_depth, validate_formats) {
+        return false
+      }
+    }
+  }
+
+  // Conditional `if` / `then` / `else`
+  if (km & kw_conditional) != 0 && node.if_node >= 0 {
+    if is_valid_fast(schema, node.if_node, jval, depth + 1, max_depth, validate_formats) {
+      if node.then_node >= 0 {
+        if !is_valid_fast(schema, node.then_node, jval, depth + 1, max_depth, validate_formats) {
+          return false
+        }
+      }
+    } else if node.else_node >= 0 {
+      if !is_valid_fast(schema, node.else_node, jval, depth + 1, max_depth, validate_formats) {
+        return false
+      }
+    }
+  }
+
+  true
+}
+
+///| Annotation tracking for `unevaluatedProperties` and `unevaluatedItems`.
+struct EvalAnn {
+  mut all_props : Bool
+  props : Array[String]
+  mut all_items : Bool
+  mut max_prefix_item : Int
+  items : Array[Int]
+}
+
+fn EvalAnn::empty() -> EvalAnn {
+  EvalAnn::{
+    all_props: false,
+    props: [],
+    all_items: false,
+    max_prefix_item: -1,
+    items: [],
+  }
+}
+
+fn EvalAnn::add_prop(self : EvalAnn, k : String) -> Unit {
+  if self.all_props {
+    return
+  }
+  let mut i = 0
+  let n = self.props.length()
+  while i < n {
+    if self.props[i] == k {
+      return
+    }
+    i = i + 1
+  }
+  self.props.push(k)
+}
+
+fn EvalAnn::has_prop(self : EvalAnn, k : String) -> Bool {
+  if self.all_props {
+    return true
+  }
+  let mut i = 0
+  let n = self.props.length()
+  while i < n {
+    if self.props[i] == k {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn EvalAnn::add_item(self : EvalAnn, idx : Int) -> Unit {
+  if self.all_items || idx <= self.max_prefix_item {
+    return
+  }
+  let mut i = 0
+  let n = self.items.length()
+  while i < n {
+    if self.items[i] == idx {
+      return
+    }
+    i = i + 1
+  }
+  self.items.push(idx)
+}
+
+fn EvalAnn::has_item(self : EvalAnn, idx : Int) -> Bool {
+  if self.all_items || idx <= self.max_prefix_item {
+    return true
+  }
+  let mut i = 0
+  let n = self.items.length()
+  while i < n {
+    if self.items[i] == idx {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn EvalAnn::merge(self : EvalAnn, other : EvalAnn) -> Unit {
+  if other.all_props {
+    self.all_props = true
+  } else if !self.all_props {
+    let mut i = 0
+    while i < other.props.length() {
+      self.add_prop(other.props[i])
+      i = i + 1
+    }
+  }
+  if other.all_items {
+    self.all_items = true
+  } else if !self.all_items {
+    if other.max_prefix_item > self.max_prefix_item {
+      self.max_prefix_item = other.max_prefix_item
+    }
+    let mut i = 0
+    while i < other.items.length() {
+      self.add_item(other.items[i])
+      i = i + 1
+    }
+  }
+}
+
+///| Annotation-tracking evaluator (used when `schema.has_unevaluated` is true).
+fn eval_node_ann(
+  schema : CompiledSchema,
+  node_id : Int,
+  jval : json5::Json5Value,
+  depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+) -> (Bool, EvalAnn) {
+  let ann = EvalAnn::empty()
+  if depth > max_depth {
+    return (false, ann)
+  }
+  let node = schema.nodes[node_id]
+  if node.bool_kind != 0 {
+    return (node.bool_kind > 0, ann)
+  }
+  let km = node.kw_mask
+  if km == 0 {
+    return (true, ann)
+  }
+
+  let mut ok = true
+
+  if (km & kw_type) != 0 && !check_type_mask(node.type_mask, jval) {
+    return (false, ann)
+  }
+  if (km & kw_const) != 0 {
+    match node.const_val {
+      Some(cv) => if !json5::value_eq(jval, cv) { return (false, ann) }
+      None => ()
+    }
+  }
+  if (km & kw_enum) != 0 {
+    let mut matched = false
+    let mut i = 0
+    while i < node.enum_vals.length() {
+      if json5::value_eq(jval, node.enum_vals[i]) {
+        matched = true
+        break
+      }
+      i = i + 1
+    }
+    if !matched {
+      return (false, ann)
+    }
+  }
+
+  match jval {
+    json5::Json5Value::Number(x) => {
+      if (km & kw_min) != 0 && x < node.minimum { return (false, ann) }
+      if (km & kw_max) != 0 && x > node.maximum { return (false, ann) }
+      if (km & kw_excl_min) != 0 && x <= node.exclusive_minimum { return (false, ann) }
+      if (km & kw_excl_max) != 0 && x >= node.exclusive_maximum { return (false, ann) }
+      if (km & kw_multiple_of) != 0 && !check_multiple_of(x, node.multiple_of) { return (false, ann) }
+    }
+    json5::Json5Value::Str(s) => {
+      if (km & (kw_min_len | kw_max_len)) != 0 {
+        let cp_len = utf8_codepoint_len(s)
+        if (km & kw_min_len) != 0 && cp_len < node.min_length { return (false, ann) }
+        if (km & kw_max_len) != 0 && cp_len > node.max_length { return (false, ann) }
+      }
+      if (km & kw_pattern) != 0 {
+        match node.pattern_re {
+          Some(re) => if !re.is_match(s) { return (false, ann) }
+          None => ()
+        }
+      }
+      if validate_formats && (km & kw_format) != 0 {
+        if !check_format(node.format_name, s) { return (false, ann) }
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let n = items.length()
+      if (km & kw_min_items) != 0 && n < node.min_items { return (false, ann) }
+      if (km & kw_max_items) != 0 && n > node.max_items { return (false, ann) }
+      if (km & kw_unique_items) != 0 && !check_unique_items(items) { return (false, ann) }
+      let plen = node.prefix_items.length()
+      if (km & kw_prefix_items) != 0 {
+        let limit = if n < plen { n } else { plen }
+        let mut i = 0
+        while i < limit {
+          let (sub_ok, _) = eval_node_ann(schema, node.prefix_items[i], items[i], depth + 1, max_depth, validate_formats)
+          if !sub_ok {
+            return (false, ann)
+          }
+          i = i + 1
+        }
+        if limit - 1 > ann.max_prefix_item {
+          ann.max_prefix_item = limit - 1
+        }
+      }
+      if (km & kw_items) != 0 && node.items_node >= 0 {
+        let mut i = plen
+        while i < n {
+          let (sub_ok, _) = eval_node_ann(schema, node.items_node, items[i], depth + 1, max_depth, validate_formats)
+          if !sub_ok {
+            return (false, ann)
+          }
+          i = i + 1
+        }
+        if n > plen {
+          ann.all_items = true
+        }
+      }
+      if (km & kw_contains) != 0 && node.contains_node >= 0 {
+        let mut matches = 0
+        let mut i = 0
+        while i < n {
+          let (sub_ok, _) = eval_node_ann(schema, node.contains_node, items[i], depth + 1, max_depth, validate_formats)
+          if sub_ok {
+            matches = matches + 1
+            ann.add_item(i)
+          }
+          i = i + 1
+        }
+        if matches < node.min_contains { return (false, ann) }
+        if node.max_contains >= 0 && matches > node.max_contains { return (false, ann) }
+      }
+    }
+    json5::Json5Value::Object(entries) => {
+      let n = entries.length()
+      if (km & kw_min_props) != 0 && n < node.min_properties { return (false, ann) }
+      if (km & kw_max_props) != 0 && n > node.max_properties { return (false, ann) }
+      if (km & kw_required) != 0 {
+        let mut i = 0
+        while i < node.required.length() {
+          if !object_has_key(entries, node.required[i]) { return (false, ann) }
+          i = i + 1
+        }
+      }
+      if (km & (kw_properties | kw_pattern_props | kw_additional_props | kw_property_names)) != 0 {
+        let has_props = (km & kw_properties) != 0
+        let has_pprops = (km & kw_pattern_props) != 0
+        let has_addl = (km & kw_additional_props) != 0 && node.additional_properties >= 0
+        let has_pnames = (km & kw_property_names) != 0 && node.property_names >= 0
+        let pprops = node.pattern_properties
+        let mut i = 0
+        while i < n {
+          let (k, ev) = entries[i]
+          if has_pnames {
+            let (pn_ok, _) = eval_node_ann(schema, node.property_names, json5::Json5Value::Str(k), depth + 1, max_depth, validate_formats)
+            if !pn_ok { return (false, ann) }
+          }
+          let mut matched = false
+          if has_props {
+            let pid = lookup_prop(node, k)
+            if pid >= 0 {
+              matched = true
+              let (p_ok, _) = eval_node_ann(schema, pid, ev, depth + 1, max_depth, validate_formats)
+              if !p_ok { return (false, ann) }
+              ann.add_prop(k)
+            }
+          }
+          if has_pprops {
+            let mut j = 0
+            while j < pprops.length() {
+              if pprops[j].compiled.is_match(k) {
+                matched = true
+                let (pp_ok, _) = eval_node_ann(schema, pprops[j].node_id, ev, depth + 1, max_depth, validate_formats)
+                if !pp_ok { return (false, ann) }
+                ann.add_prop(k)
+              }
+              j = j + 1
+            }
+          }
+          if !matched && has_addl {
+            let (a_ok, _) = eval_node_ann(schema, node.additional_properties, ev, depth + 1, max_depth, validate_formats)
+            if !a_ok { return (false, ann) }
+            ann.add_prop(k)
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_required) != 0 {
+        let mut i = 0
+        while i < node.dep_required.length() {
+          if object_has_key(entries, node.dep_required[i].key) {
+            let reqs = node.dep_required[i].required
+            let mut j = 0
+            while j < reqs.length() {
+              if !object_has_key(entries, reqs[j]) { return (false, ann) }
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_schemas) != 0 {
+        let mut i = 0
+        while i < node.dep_schemas.length() {
+          if object_has_key(entries, node.dep_schemas[i].key) {
+            let (ds_ok, ds_ann) = eval_node_ann(schema, node.dep_schemas[i].node_id, jval, depth + 1, max_depth, validate_formats)
+            if !ds_ok { return (false, ann) }
+            ann.merge(ds_ann)
+          }
+          i = i + 1
+        }
+      }
+    }
+    _ => ()
+  }
+
+  // `$ref`
+  if (km & kw_ref) != 0 && node.ref_node >= 0 {
+    let (r_ok, r_ann) = eval_node_ann(schema, node.ref_node, jval, depth + 1, max_depth, validate_formats)
+    if !r_ok { return (false, ann) }
+    ann.merge(r_ann)
+  }
+
+  // Combinators
+  if (km & kw_combinators) != 0 {
+    let mut i = 0
+    while i < node.all_of.length() {
+      let (s_ok, s_ann) = eval_node_ann(schema, node.all_of[i], jval, depth + 1, max_depth, validate_formats)
+      if !s_ok { return (false, ann) }
+      ann.merge(s_ann)
+      i = i + 1
+    }
+    if node.any_of.length() > 0 {
+      let mut any_ok = false
+      i = 0
+      while i < node.any_of.length() {
+        let (s_ok, s_ann) = eval_node_ann(schema, node.any_of[i], jval, depth + 1, max_depth, validate_formats)
+        if s_ok {
+          any_ok = true
+          ann.merge(s_ann)
+        }
+        i = i + 1
+      }
+      if !any_ok { return (false, ann) }
+    }
+    if node.one_of.length() > 0 {
+      let mut match_cnt = 0
+      let mut matched_ann = EvalAnn::empty()
+      i = 0
+      while i < node.one_of.length() {
+        let (s_ok, s_ann) = eval_node_ann(schema, node.one_of[i], jval, depth + 1, max_depth, validate_formats)
+        if s_ok {
+          match_cnt = match_cnt + 1
+          matched_ann = s_ann
+        }
+        i = i + 1
+      }
+      if match_cnt != 1 { return (false, ann) }
+      ann.merge(matched_ann)
+    }
+    // `not` NEVER produces annotations!
+    if node.not_node >= 0 {
+      let (n_ok, _) = eval_node_ann(schema, node.not_node, jval, depth + 1, max_depth, validate_formats)
+      if n_ok { return (false, ann) }
+    }
+  }
+
+  // Conditional `if` / `then` / `else`
+  if (km & kw_conditional) != 0 && node.if_node >= 0 {
+    let (if_ok, if_ann) = eval_node_ann(schema, node.if_node, jval, depth + 1, max_depth, validate_formats)
+    if if_ok {
+      ann.merge(if_ann)
+      if node.then_node >= 0 {
+        let (t_ok, t_ann) = eval_node_ann(schema, node.then_node, jval, depth + 1, max_depth, validate_formats)
+        if !t_ok { return (false, ann) }
+        ann.merge(t_ann)
+      }
+    } else if node.else_node >= 0 {
+      let (e_ok, e_ann) = eval_node_ann(schema, node.else_node, jval, depth + 1, max_depth, validate_formats)
+      if !e_ok { return (false, ann) }
+      ann.merge(e_ann)
+    }
+  }
+
+  // `unevaluatedProperties` & `unevaluatedItems` (evaluated LAST, after all sibling & combinator annotations!)
+  if (km & kw_unevaluated) != 0 {
+    if node.unevaluated_properties >= 0 {
+      match jval {
+        json5::Json5Value::Object(entries) => {
+          let mut i = 0
+          while i < entries.length() {
+            let (k, ev) = entries[i]
+            if !ann.has_prop(k) {
+              let (u_ok, _) = eval_node_ann(schema, node.unevaluated_properties, ev, depth + 1, max_depth, validate_formats)
+              if !u_ok {
+                ok = false
+                break
+              }
+              ann.add_prop(k)
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+    if ok && node.unevaluated_items >= 0 {
+      match jval {
+        json5::Json5Value::Array(items) => {
+          let mut i = 0
+          while i < items.length() {
+            if !ann.has_item(i) {
+              let (u_ok, _) = eval_node_ann(schema, node.unevaluated_items, items[i], depth + 1, max_depth, validate_formats)
+              if !u_ok {
+                ok = false
+                break
+              }
+              ann.add_item(i)
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+
+  (ok, ann)
+}
+
+///| Full diagnostic validator collecting ALL `ValidationError`s and annotations.
+fn validate_node_collect(
+  schema : CompiledSchema,
+  node_id : Int,
+  jval : json5::Json5Value,
+  inst_path : String,
+  depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+  errors : Array[ValidationError],
+) -> (Bool, EvalAnn) {
+  let ann = EvalAnn::empty()
+  let start_errs = errors.length()
+  let node = schema.nodes[node_id]
+  if depth > max_depth {
+    errors.push(ValidationError::new(inst_path, node.schema_path, "maxDepth", "validation recursion depth exceeded"))
+    return (false, ann)
+  }
+  if node.bool_kind != 0 {
+    if node.bool_kind < 0 {
+      errors.push(ValidationError::new(inst_path, node.schema_path, "false", "boolean schema is false"))
+      return (false, ann)
+    }
+    return (true, ann)
+  }
+  let km = node.kw_mask
+  if km == 0 {
+    return (true, ann)
+  }
+
+  if (km & kw_type) != 0 && !check_type_mask(node.type_mask, jval) {
+    errors.push(ValidationError::new(inst_path, node.schema_path + "/type", "type", "instance type does not match schema"))
+  }
+  if (km & kw_const) != 0 {
+    match node.const_val {
+      Some(cv) => {
+        if !json5::value_eq(jval, cv) {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/const", "const", "instance does not match const value"))
+        }
+      }
+      None => ()
+    }
+  }
+  if (km & kw_enum) != 0 {
+    let mut matched = false
+    let mut i = 0
+    while i < node.enum_vals.length() {
+      if json5::value_eq(jval, node.enum_vals[i]) {
+        matched = true
+        break
+      }
+      i = i + 1
+    }
+    if !matched {
+      errors.push(ValidationError::new(inst_path, node.schema_path + "/enum", "enum", "instance is not one of the allowed enum values"))
+    }
+  }
+
+  match jval {
+    json5::Json5Value::Number(x) => {
+      if (km & kw_min) != 0 && x < node.minimum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/minimum", "minimum", "number is less than minimum"))
+      }
+      if (km & kw_max) != 0 && x > node.maximum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/maximum", "maximum", "number is greater than maximum"))
+      }
+      if (km & kw_excl_min) != 0 && x <= node.exclusive_minimum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/exclusiveMinimum", "exclusiveMinimum", "number is not strictly greater than exclusiveMinimum"))
+      }
+      if (km & kw_excl_max) != 0 && x >= node.exclusive_maximum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/exclusiveMaximum", "exclusiveMaximum", "number is not strictly less than exclusiveMaximum"))
+      }
+      if (km & kw_multiple_of) != 0 && !check_multiple_of(x, node.multiple_of) {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/multipleOf", "multipleOf", "number is not a multiple of multipleOf"))
+      }
+    }
+    json5::Json5Value::Str(s) => {
+      if (km & (kw_min_len | kw_max_len)) != 0 {
+        let cp_len = utf8_codepoint_len(s)
+        if (km & kw_min_len) != 0 && cp_len < node.min_length {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/minLength", "minLength", "string is shorter than minLength"))
+        }
+        if (km & kw_max_len) != 0 && cp_len > node.max_length {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/maxLength", "maxLength", "string is longer than maxLength"))
+        }
+      }
+      if (km & kw_pattern) != 0 {
+        match node.pattern_re {
+          Some(re) => {
+            if !re.is_match(s) {
+              errors.push(ValidationError::new(inst_path, node.schema_path + "/pattern", "pattern", "string does not match pattern: " + node.pattern_str))
+            }
+          }
+          None => ()
+        }
+      }
+      if validate_formats && (km & kw_format) != 0 {
+        if !check_format(node.format_name, s) {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/format", "format", "string does not match format: " + node.format_name))
+        }
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let n = items.length()
+      if (km & kw_min_items) != 0 && n < node.min_items {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/minItems", "minItems", "array has fewer items than minItems"))
+      }
+      if (km & kw_max_items) != 0 && n > node.max_items {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/maxItems", "maxItems", "array has more items than maxItems"))
+      }
+      if (km & kw_unique_items) != 0 && !check_unique_items(items) {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/uniqueItems", "uniqueItems", "array contains duplicate items"))
+      }
+      let plen = node.prefix_items.length()
+      if (km & kw_prefix_items) != 0 {
+        let limit = if n < plen { n } else { plen }
+        let mut i = 0
+        while i < limit {
+          let _ = validate_node_collect(schema, node.prefix_items[i], items[i], inst_path + "/" + i.to_string(), depth + 1, max_depth, validate_formats, errors)
+          i = i + 1
+        }
+        if limit - 1 > ann.max_prefix_item {
+          ann.max_prefix_item = limit - 1
+        }
+      }
+      if (km & kw_items) != 0 && node.items_node >= 0 {
+        let mut i = plen
+        while i < n {
+          let _ = validate_node_collect(schema, node.items_node, items[i], inst_path + "/" + i.to_string(), depth + 1, max_depth, validate_formats, errors)
+          i = i + 1
+        }
+        if n > plen {
+          ann.all_items = true
+        }
+      }
+      if (km & kw_contains) != 0 && node.contains_node >= 0 {
+        let mut matches = 0
+        let mut i = 0
+        while i < n {
+          let (sub_ok, _) = eval_node_ann(schema, node.contains_node, items[i], depth + 1, max_depth, validate_formats)
+          if sub_ok {
+            matches = matches + 1
+            ann.add_item(i)
+          }
+          i = i + 1
+        }
+        if matches < node.min_contains {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/contains", "contains", "array does not contain enough matching items"))
+        }
+        if node.max_contains >= 0 && matches > node.max_contains {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/maxContains", "maxContains", "array contains too many matching items"))
+        }
+      }
+    }
+    json5::Json5Value::Object(entries) => {
+      let n = entries.length()
+      if (km & kw_min_props) != 0 && n < node.min_properties {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/minProperties", "minProperties", "object has fewer properties than minProperties"))
+      }
+      if (km & kw_max_props) != 0 && n > node.max_properties {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/maxProperties", "maxProperties", "object has more properties than maxProperties"))
+      }
+      if (km & kw_required) != 0 {
+        let mut i = 0
+        while i < node.required.length() {
+          let rk = node.required[i]
+          if !object_has_key(entries, rk) {
+            errors.push(ValidationError::new(inst_path, node.schema_path + "/required", "required", "missing required property: " + rk))
+          }
+          i = i + 1
+        }
+      }
+      if (km & (kw_properties | kw_pattern_props | kw_additional_props | kw_property_names)) != 0 {
+        let has_props = (km & kw_properties) != 0
+        let has_pprops = (km & kw_pattern_props) != 0
+        let has_addl = (km & kw_additional_props) != 0 && node.additional_properties >= 0
+        let has_pnames = (km & kw_property_names) != 0 && node.property_names >= 0
+        let pprops = node.pattern_properties
+        let mut i = 0
+        while i < n {
+          let (k, ev) = entries[i]
+          let child_path = inst_path + "/" + escape_ptr_token(k)
+          if has_pnames {
+            let _ = validate_node_collect(schema, node.property_names, json5::Json5Value::Str(k), child_path, depth + 1, max_depth, validate_formats, errors)
+          }
+          let mut matched = false
+          if has_props {
+            let pid = lookup_prop(node, k)
+            if pid >= 0 {
+              matched = true
+              let _ = validate_node_collect(schema, pid, ev, child_path, depth + 1, max_depth, validate_formats, errors)
+              ann.add_prop(k)
+            }
+          }
+          if has_pprops {
+            let mut j = 0
+            while j < pprops.length() {
+              if pprops[j].compiled.is_match(k) {
+                matched = true
+                let _ = validate_node_collect(schema, pprops[j].node_id, ev, child_path, depth + 1, max_depth, validate_formats, errors)
+                ann.add_prop(k)
+              }
+              j = j + 1
+            }
+          }
+          if !matched && has_addl {
+            let _ = validate_node_collect(schema, node.additional_properties, ev, child_path, depth + 1, max_depth, validate_formats, errors)
+            ann.add_prop(k)
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_required) != 0 {
+        let mut i = 0
+        while i < node.dep_required.length() {
+          if object_has_key(entries, node.dep_required[i].key) {
+            let reqs = node.dep_required[i].required
+            let mut j = 0
+            while j < reqs.length() {
+              if !object_has_key(entries, reqs[j]) {
+                errors.push(ValidationError::new(inst_path, node.schema_path + "/dependentRequired", "dependentRequired", "missing dependent required property: " + reqs[j]))
+              }
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_schemas) != 0 {
+        let mut i = 0
+        while i < node.dep_schemas.length() {
+          if object_has_key(entries, node.dep_schemas[i].key) {
+            let (ds_ok, ds_ann) = validate_node_collect(schema, node.dep_schemas[i].node_id, jval, inst_path, depth + 1, max_depth, validate_formats, errors)
+            if ds_ok {
+              ann.merge(ds_ann)
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    _ => ()
+  }
+
+  // `$ref`
+  if (km & kw_ref) != 0 && node.ref_node >= 0 {
+    let (r_ok, r_ann) = validate_node_collect(schema, node.ref_node, jval, inst_path, depth + 1, max_depth, validate_formats, errors)
+    if r_ok {
+      ann.merge(r_ann)
+    }
+  }
+
+  // Combinators
+  if (km & kw_combinators) != 0 {
+    let mut i = 0
+    while i < node.all_of.length() {
+      let (s_ok, s_ann) = validate_node_collect(schema, node.all_of[i], jval, inst_path, depth + 1, max_depth, validate_formats, errors)
+      if s_ok {
+        ann.merge(s_ann)
+      }
+      i = i + 1
+    }
+    if node.any_of.length() > 0 {
+      let mut any_ok = false
+      i = 0
+      while i < node.any_of.length() {
+        let (s_ok, s_ann) = eval_node_ann(schema, node.any_of[i], jval, depth + 1, max_depth, validate_formats)
+        if s_ok {
+          any_ok = true
+          ann.merge(s_ann)
+        }
+        i = i + 1
+      }
+      if !any_ok {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/anyOf", "anyOf", "instance did not match any schema in anyOf"))
+      }
+    }
+    if node.one_of.length() > 0 {
+      let mut match_cnt = 0
+      let mut matched_ann = EvalAnn::empty()
+      i = 0
+      while i < node.one_of.length() {
+        let (s_ok, s_ann) = eval_node_ann(schema, node.one_of[i], jval, depth + 1, max_depth, validate_formats)
+        if s_ok {
+          match_cnt = match_cnt + 1
+          matched_ann = s_ann
+        }
+        i = i + 1
+      }
+      if match_cnt != 1 {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/oneOf", "oneOf", "instance must match exactly one schema in oneOf"))
+      } else {
+        ann.merge(matched_ann)
+      }
+    }
+    if node.not_node >= 0 {
+      let (n_ok, _) = eval_node_ann(schema, node.not_node, jval, depth + 1, max_depth, validate_formats)
+      if n_ok {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/not", "not", "instance must not match schema in not"))
+      }
+    }
+  }
+
+  // Conditional `if` / `then` / `else`
+  if (km & kw_conditional) != 0 && node.if_node >= 0 {
+    let (if_ok, if_ann) = eval_node_ann(schema, node.if_node, jval, depth + 1, max_depth, validate_formats)
+    if if_ok {
+      ann.merge(if_ann)
+      if node.then_node >= 0 {
+        let (t_ok, t_ann) = validate_node_collect(schema, node.then_node, jval, inst_path, depth + 1, max_depth, validate_formats, errors)
+        if t_ok {
+          ann.merge(t_ann)
+        }
+      }
+    } else if node.else_node >= 0 {
+      let (e_ok, e_ann) = validate_node_collect(schema, node.else_node, jval, inst_path, depth + 1, max_depth, validate_formats, errors)
+      if e_ok {
+        ann.merge(e_ann)
+      }
+    }
+  }
+
+  // `unevaluatedProperties` & `unevaluatedItems`
+  if (km & kw_unevaluated) != 0 {
+    if node.unevaluated_properties >= 0 {
+      match jval {
+        json5::Json5Value::Object(entries) => {
+          let mut i = 0
+          while i < entries.length() {
+            let (k, ev) = entries[i]
+            if !ann.has_prop(k) {
+              let child_path = inst_path + "/" + escape_ptr_token(k)
+              let (u_ok, _) = validate_node_collect(schema, node.unevaluated_properties, ev, child_path, depth + 1, max_depth, validate_formats, errors)
+              if u_ok {
+                ann.add_prop(k)
+              }
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+    if node.unevaluated_items >= 0 {
+      match jval {
+        json5::Json5Value::Array(items) => {
+          let mut i = 0
+          while i < items.length() {
+            if !ann.has_item(i) {
+              let child_path = inst_path + "/" + i.to_string()
+              let (u_ok, _) = validate_node_collect(schema, node.unevaluated_items, items[i], child_path, depth + 1, max_depth, validate_formats, errors)
+              if u_ok {
+                ann.add_item(i)
+              }
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+
+  (errors.length() == start_errs, ann)
+}
+
+fn is_valid_impl(
+  schema : CompiledSchema,
+  instance : json5::Json5Value,
+  opts : ValidateOptions,
+) -> Bool {
+  let max_d = if opts.max_depth > 0 { opts.max_depth } else { schema.default_max_depth }
+  if schema.has_unevaluated {
+    let (ok, _) = eval_node_ann(schema, schema.root, instance, 0, max_d, opts.validate_formats)
+    ok
+  } else {
+    is_valid_fast(schema, schema.root, instance, 0, max_d, opts.validate_formats)
+  }
+}
+
+fn validate_impl(
+  schema : CompiledSchema,
+  instance : json5::Json5Value,
+  opts : ValidateOptions,
+) -> Array[ValidationError] {
+  let max_d = if opts.max_depth > 0 { opts.max_depth } else { schema.default_max_depth }
+  let errors : Array[ValidationError] = []
+  let _ = validate_node_collect(schema, schema.root, instance, "", 0, max_d, opts.validate_formats, errors)
+  errors
+}
