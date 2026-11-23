@@ -1,4 +1,795 @@
-///| Redis RESP2 & RESP3 iterative decoder and Sans-IO `StreamDecoder` (stub for Red phase).
+///| Iterative, stack-safe Redis RESP2 & RESP3 decoder, inline command parser,
+///| and Sans-IO streaming pipeline `StreamDecoder` with bounded buffer compaction.
+
+///| Find `\r\n` starting at `pos` within `data[0 .. end]`.
+///| Returns the index of `\r`, or `-1` if incomplete.
+fn find_crlf(data : Bytes, pos : Int, end : Int) -> Int {
+  let mut i = pos
+  let lim = end - 1
+  while i < lim {
+    if data[i].to_int() == 13 && data[i + 1].to_int() == 10 {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///| Parse a signed 64-bit integer from `data[start .. end]` (optional leading `+` or `-`).
+fn parse_int64_slice(data : Bytes, start : Int, end : Int, err_pos : Int) -> Result[Int64, RespError] {
+  if start >= end {
+    return Err(RespError::InvalidInteger(err_pos))
+  }
+  let mut i = start
+  let mut neg = false
+  let first = data[i].to_int()
+  if first == 45 {
+    neg = true
+    i = i + 1
+  } else if first == 43 {
+    i = i + 1
+  }
+  if i >= end {
+    return Err(RespError::InvalidInteger(err_pos))
+  }
+  let mut acc : Int64 = 0L
+  while i < end {
+    let c = data[i].to_int()
+    if c < 48 || c > 57 {
+      return Err(RespError::InvalidInteger(err_pos))
+    }
+    let d = (c - 48).to_int64()
+    if neg {
+      // Check against Int64::MIN (-9223372036854775808)
+      if acc < -922337203685477580L || (acc == -922337203685477580L && d > 8L) {
+        return Err(RespError::InvalidInteger(err_pos))
+      }
+      acc = acc * 10L - d
+    } else {
+      // Check against Int64::MAX (9223372036854775807)
+      if acc > 922337203685477580L || (acc == 922337203685477580L && d > 7L) {
+        return Err(RespError::InvalidInteger(err_pos))
+      }
+      acc = acc * 10L + d
+    }
+    i = i + 1
+  }
+  Ok(acc)
+}
+
+///| Parse a RESP3 Double from `data[start .. end]` (handles `inf`, `-inf`, `+inf`, `nan`).
+fn parse_double_slice(data : Bytes, start : Int, end : Int, err_pos : Int) -> Result[Double, RespError] {
+  let n = end - start
+  if n <= 0 {
+    return Err(RespError::InvalidDouble(err_pos))
+  }
+  let s = slice_bytes(data, start, n).to_string()
+  if s == "inf" || s == "+inf" || s == "Inf" || s == "+Inf" || s == "INF" || s == "+INF" {
+    return Ok(Double::from_bits(0x7FF0000000000000L))
+  }
+  if s == "-inf" || s == "-Inf" || s == "-INF" {
+    return Ok(Double::from_bits(-4503599627370496L))
+  }
+  if s == "nan" || s == "NaN" || s == "NAN" || s == "-nan" || s == "+nan" {
+    return Ok(Double::from_bits(0x7FF8000000000000L))
+  }
+  // Reject leading/trailing whitespace or invalid chars before calling to_double()
+  let mut i = start
+  while i < end {
+    let c = data[i].to_int()
+    let ok = (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 || c == 101 || c == 69
+    if !ok {
+      return Err(RespError::InvalidDouble(err_pos))
+    }
+    i = i + 1
+  }
+  match s.to_double() {
+    Some(v) => Ok(v)
+    None => Err(RespError::InvalidDouble(err_pos))
+  }
+}
+
+///| Validate BigNumber bytes: optional `-` followed by >= 1 ASCII digits.
+fn validate_bignum_slice(data : Bytes, start : Int, end : Int, err_pos : Int) -> Result[String, RespError] {
+  if start >= end {
+    return Err(RespError::InvalidBigNumber(err_pos))
+  }
+  let mut i = start
+  if data[i].to_int() == 45 {
+    i = i + 1
+    if i >= end {
+      return Err(RespError::InvalidBigNumber(err_pos))
+    }
+  }
+  while i < end {
+    let c = data[i].to_int()
+    if c < 48 || c > 57 {
+      return Err(RespError::InvalidBigNumber(err_pos))
+    }
+    i = i + 1
+  }
+  Ok(slice_bytes(data, start, end - start).to_string())
+}
+
+///| Decode a RESP3 streamed BulkString starting right after `$?\r\n`.
+fn decode_streamed_bulk(
+  data : Bytes,
+  start : Int,
+  end : Int,
+  limits : RespLimits,
+) -> Result[(Bytes, Int), RespError] {
+  let out = ByteBuf::with_capacity(64)
+  let mut pos = start
+  while true {
+    if pos >= end {
+      return Err(RespError::Incomplete)
+    }
+    if data[pos].to_int() != 59 { // ';'
+      return Err(RespError::InvalidChunkLength(pos))
+    }
+    let cr = find_crlf(data, pos + 1, end)
+    if cr < 0 {
+      return Err(RespError::Incomplete)
+    }
+    let chunk_len64 = match parse_int64_slice(data, pos + 1, cr, pos) {
+      Ok(v) => v
+      Err(_) => return Err(RespError::InvalidChunkLength(pos))
+    }
+    if chunk_len64 < 0L {
+      return Err(RespError::InvalidChunkLength(pos))
+    }
+    if chunk_len64 > limits.max_bulk_len.to_int64() {
+      return Err(RespError::MaxBulkLenExceeded(limits.max_bulk_len))
+    }
+    let chunk_len = chunk_len64.to_int()
+    pos = cr + 2
+    if chunk_len == 0 {
+      return Ok((out.to_bytes(), pos))
+    }
+    if out.len + chunk_len > limits.max_bulk_len {
+      return Err(RespError::MaxBulkLenExceeded(limits.max_bulk_len))
+    }
+    if pos + chunk_len + 2 > end {
+      return Err(RespError::Incomplete)
+    }
+    if data[pos + chunk_len].to_int() != 13 || data[pos + chunk_len + 1].to_int() != 10 {
+      return Err(RespError::InvalidCrlf(pos + chunk_len))
+    }
+    out.push_bytes_slice(data, pos, chunk_len)
+    pos = pos + chunk_len + 2
+  }
+  Err(RespError::Incomplete)
+}
+
+///| Hex digit value or -1.
+fn hex_nibble(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else {
+    -1
+  }
+}
+
+///| Check whether a byte is one of the 15 RESP2/RESP3 frame prefix bytes.
+fn is_resp_prefix(b : Int) -> Bool {
+  b == 43 || // '+'
+  b == 45 || // '-'
+  b == 58 || // ':'
+  b == 36 || // '$'
+  b == 42 || // '*'
+  b == 95 || // '_'
+  b == 35 || // '#'
+  b == 44 || // ','
+  b == 40 || // '('
+  b == 33 || // '!'
+  b == 61 || // '='
+  b == 37 || // '%'
+  b == 126 || // '~'
+  b == 124 || // '|'
+  b == 62 // '>'
+}
+
+///| Parse a Redis inline command line (with double/single quotes and escapes, matching sdssplitargs).
+pub fn decode_inline(line : Bytes, limits : RespLimits) -> Result[Array[Bytes], RespError] {
+  let n = line.length()
+  let mut end = n
+  if end > 0 && line[end - 1].to_int() == 10 {
+    end = end - 1
+    if end > 0 && line[end - 1].to_int() == 13 {
+      end = end - 1
+    }
+  }
+  let args : Array[Bytes] = []
+  let mut i = 0
+  while i < end {
+    // Skip ASCII whitespace
+    while i < end {
+      let c = line[i].to_int()
+      if c == 32 || c == 9 || c == 13 || c == 10 {
+        i = i + 1
+      } else {
+        break
+      }
+    }
+    if i >= end {
+      break
+    }
+    if args.length() >= limits.max_collection_len {
+      return Err(RespError::MaxCollectionLenExceeded(limits.max_collection_len))
+    }
+    let cur = ByteBuf::with_capacity(16)
+    let mut in_dquote = false
+    let mut in_squote = false
+    let mut done = false
+    while i < end && !done {
+      let c = line[i].to_int()
+      if in_dquote {
+        if c == 92 && i + 1 < end { // '\'
+          let nx = line[i + 1].to_int()
+          if nx == 120 && i + 3 < end { // \xHH
+            let h1 = hex_nibble(line[i + 2].to_int())
+            let h2 = hex_nibble(line[i + 3].to_int())
+            if h1 >= 0 && h2 >= 0 {
+              cur.push_byte((h1 << 4) | h2)
+              i = i + 4
+              continue
+            }
+          }
+          if nx == 110 { // \n
+            cur.push_byte(10)
+          } else if nx == 114 { // \r
+            cur.push_byte(13)
+          } else if nx == 116 { // \t
+            cur.push_byte(9)
+          } else if nx == 98 { // \b
+            cur.push_byte(8)
+          } else if nx == 97 { // \a
+            cur.push_byte(7)
+          } else {
+            cur.push_byte(nx)
+          }
+          i = i + 2
+        } else if c == 34 { // '"'
+          if i + 1 < end {
+            let after = line[i + 1].to_int()
+            if after != 32 && after != 9 && after != 13 && after != 10 {
+              return Err(RespError::InvalidInlineQuote(i))
+            }
+          }
+          in_dquote = false
+          i = i + 1
+          done = true
+        } else {
+          cur.push_byte(c)
+          i = i + 1
+        }
+      } else if in_squote {
+        if c == 92 && i + 1 < end && line[i + 1].to_int() == 39 { // \'
+          cur.push_byte(39)
+          i = i + 2
+        } else if c == 92 && i + 1 < end && line[i + 1].to_int() == 92 { // \\
+          cur.push_byte(92)
+          i = i + 2
+        } else if c == 39 { // '\''
+          if i + 1 < end {
+            let after = line[i + 1].to_int()
+            if after != 32 && after != 9 && after != 13 && after != 10 {
+              return Err(RespError::InvalidInlineQuote(i))
+            }
+          }
+          in_squote = false
+          i = i + 1
+          done = true
+        } else {
+          cur.push_byte(c)
+          i = i + 1
+        }
+      } else {
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+          done = true
+        } else if c == 34 { // '"'
+          if cur.len > 0 {
+            return Err(RespError::InvalidInlineQuote(i))
+          }
+          in_dquote = true
+          i = i + 1
+        } else if c == 39 { // '\''
+          if cur.len > 0 {
+            return Err(RespError::InvalidInlineQuote(i))
+          }
+          in_squote = true
+          i = i + 1
+        } else {
+          cur.push_byte(c)
+          i = i + 1
+        }
+      }
+      if cur.len > limits.max_bulk_len {
+        return Err(RespError::MaxBulkLenExceeded(limits.max_bulk_len))
+      }
+    }
+    if in_dquote || in_squote {
+      return Err(RespError::InvalidInlineQuote(i))
+    }
+    args.push(cur.to_bytes())
+  }
+  Ok(args)
+}
+
+///| Internal container state for iterative stack-safe RESP2/RESP3 decoding.
+///| `kind`:
+///|   0 = Array, 1 = Set, 2 = Push, 3 = Map, 4 = Attribute (collecting pairs),
+///|   5 = AttributeTarget (waiting for the single target frame after pairs are collected)
+struct DecodeContainer {
+  kind : Int
+  streamed : Bool
+  remaining : Int
+  items : Array[RespFrame]
+  pairs : Array[(RespFrame, RespFrame)]
+  mut pending_key : Option[RespFrame]
+}
+
+///| Iterative RESP2/RESP3 prefix decoder over `data[offset .. end]`.
+fn decode_prefix_range(
+  data : Bytes,
+  offset : Int,
+  end : Int,
+  limits : RespLimits,
+  allow_inline : Bool,
+) -> Result[(RespFrame, Int), RespError] {
+  if offset >= end {
+    return Err(RespError::Incomplete)
+  }
+
+  // Inline command fast check (only at top level when enabled and first byte is not a RESP prefix)
+  let first_b = data[offset].to_int()
+  if allow_inline && !is_resp_prefix(first_b) {
+    // Find line terminator (\r\n or \n)
+    let mut lf = offset
+    while lf < end && data[lf].to_int() != 10 {
+      lf = lf + 1
+    }
+    if lf >= end {
+      return Err(RespError::Incomplete)
+    }
+    let line = slice_bytes(data, offset, lf - offset + 1)
+    let args = match decode_inline(line, limits) {
+      Ok(a) => a
+      Err(e) => return Err(e)
+    }
+    let frames : Array[RespFrame] = []
+    let mut ai = 0
+    while ai < args.length() {
+      frames.push(RespFrame::BulkString(args[ai]))
+      ai = ai + 1
+    }
+    return Ok((RespFrame::Array(frames), lf + 1))
+  }
+
+  let stack : Array[DecodeContainer] = []
+  let mut pos = offset
+  let mut total_nodes = 0
+
+  while true {
+    // Before reading the next frame, check if top container is a streamed container
+    // seeing the `.` end marker `.\r\n`.
+    if stack.length() > 0 {
+      let top = stack[stack.length() - 1]
+      if top.streamed && top.kind != 5 {
+        if pos >= end {
+          return Err(RespError::Incomplete)
+        }
+        if data[pos].to_int() == 46 { // '.'
+          if pos + 2 >= end {
+            return Err(RespError::Incomplete)
+          }
+          if data[pos + 1].to_int() != 13 || data[pos + 2].to_int() != 10 {
+            return Err(RespError::InvalidCrlf(pos + 1))
+          }
+          // For Map or Attribute, `.` cannot appear when a value is expected for a pending key
+          if (top.kind == 3 || top.kind == 4) {
+            match top.pending_key {
+              Some(_) => return Err(RespError::UnexpectedEndMarker(pos))
+              None => ()
+            }
+          }
+          pos = pos + 3
+          let finished = match stack.pop() {
+            Some(c) => c
+            None => return Err(RespError::UnexpectedEndMarker(pos))
+          }
+          if finished.kind == 4 {
+            // Streamed Attribute pairs finished -> push AttributeTarget waiting for the target frame
+            stack.push(DecodeContainer::{
+              kind: 5,
+              streamed: false,
+              remaining: 1,
+              items: [],
+              pairs: finished.pairs,
+              pending_key: None,
+            })
+            continue
+          }
+          let mut completed = if finished.kind == 0 {
+            RespFrame::Array(finished.items)
+          } else if finished.kind == 1 {
+            RespFrame::Set(finished.items)
+          } else if finished.kind == 2 {
+            RespFrame::Push(finished.items)
+          } else {
+            RespFrame::Map(finished.pairs)
+          }
+          // Propagate `completed` up the stack
+          let mut done_root = false
+          while true {
+            if stack.length() == 0 {
+              return Ok((completed, pos))
+            }
+            let parent = stack[stack.length() - 1]
+            if parent.kind == 5 {
+              let attr_c = match stack.pop() {
+                Some(c) => c
+                None => break
+              }
+              completed = RespFrame::Attribute(attr_c.pairs, completed)
+              continue
+            }
+            if parent.kind == 3 || parent.kind == 4 {
+              match parent.pending_key {
+                None => {
+                  parent.pending_key = Some(completed)
+                  done_root = true
+                  break
+                }
+                Some(k) => {
+                  parent.pending_key = None
+                  parent.pairs.push((k, completed))
+                  if !parent.streamed && parent.pairs.length() == parent.remaining {
+                    let p_fin = match stack.pop() {
+                      Some(c) => c
+                      None => break
+                    }
+                    if p_fin.kind == 4 {
+                      stack.push(DecodeContainer::{
+                        kind: 5,
+                        streamed: false,
+                        remaining: 1,
+                        items: [],
+                        pairs: p_fin.pairs,
+                        pending_key: None,
+                      })
+                      done_root = true
+                      break
+                    }
+                    completed = RespFrame::Map(p_fin.pairs)
+                    continue
+                  }
+                  if parent.streamed && parent.pairs.length() > limits.max_collection_len {
+                    return Err(RespError::MaxCollectionLenExceeded(limits.max_collection_len))
+                  }
+                  done_root = true
+                  break
+                }
+              }
+            } else {
+              parent.items.push(completed)
+              if !parent.streamed && parent.items.length() == parent.remaining {
+                let p_fin = match stack.pop() {
+                  Some(c) => c
+                  None => break
+                }
+                completed = if p_fin.kind == 0 {
+                  RespFrame::Array(p_fin.items)
+                } else if p_fin.kind == 1 {
+                  RespFrame::Set(p_fin.items)
+                } else {
+                  RespFrame::Push(p_fin.items)
+                }
+                continue
+              }
+              if parent.streamed && parent.items.length() > limits.max_collection_len {
+                return Err(RespError::MaxCollectionLenExceeded(limits.max_collection_len))
+              }
+              done_root = true
+              break
+            }
+          }
+          if done_root {
+            continue
+          }
+        }
+      }
+    }
+
+    if pos >= end {
+      return Err(RespError::Incomplete)
+    }
+
+    total_nodes = total_nodes + 1
+    if total_nodes > limits.max_total_nodes {
+      return Err(RespError::MaxTotalNodesExceeded(limits.max_total_nodes))
+    }
+
+    let prefix = data[pos].to_int()
+    if prefix == 46 { // '.' outside streamed container (e.g. dangling attribute before '.')
+      if stack.length() > 0 && stack[stack.length() - 1].kind == 5 {
+        return Err(RespError::DanglingAttribute(pos))
+      }
+      return Err(RespError::UnexpectedEndMarker(pos))
+    }
+
+    let cr = find_crlf(data, pos + 1, end)
+    if cr < 0 {
+      return Err(RespError::Incomplete)
+    }
+
+    let mut frame_opt : Option[RespFrame] = None
+    let line_start = pos + 1
+    let next_after_line = cr + 2
+
+    if prefix == 43 { // '+' SimpleString
+      frame_opt = Some(RespFrame::SimpleString(slice_bytes(data, line_start, cr - line_start).to_string()))
+      pos = next_after_line
+    } else if prefix == 45 { // '-' SimpleError
+      frame_opt = Some(RespFrame::SimpleError(slice_bytes(data, line_start, cr - line_start).to_string()))
+      pos = next_after_line
+    } else if prefix == 58 { // ':' Integer
+      let iv = match parse_int64_slice(data, line_start, cr, pos) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      frame_opt = Some(RespFrame::Integer(iv))
+      pos = next_after_line
+    } else if prefix == 95 { // '_' Null
+      if cr != line_start {
+        return Err(RespError::InvalidCrlf(line_start))
+      }
+      frame_opt = Some(RespFrame::Null)
+      pos = next_after_line
+    } else if prefix == 35 { // '#' Boolean
+      if cr - line_start != 1 {
+        return Err(RespError::InvalidBoolean(pos))
+      }
+      let bc = data[line_start].to_int()
+      if bc == 116 { // 't'
+        frame_opt = Some(RespFrame::Boolean(true))
+      } else if bc == 102 { // 'f'
+        frame_opt = Some(RespFrame::Boolean(false))
+      } else {
+        return Err(RespError::InvalidBoolean(pos))
+      }
+      pos = next_after_line
+    } else if prefix == 44 { // ',' Double
+      let dv = match parse_double_slice(data, line_start, cr, pos) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      frame_opt = Some(RespFrame::Double(dv))
+      pos = next_after_line
+    } else if prefix == 40 { // '(' BigNumber
+      let bn = match validate_bignum_slice(data, line_start, cr, pos) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      frame_opt = Some(RespFrame::BigNumber(bn))
+      pos = next_after_line
+    } else if prefix == 36 || prefix == 33 || prefix == 61 {
+      // '$' BulkString (or streamed `$?`), '!' BulkError, '=' VerbatimString
+      if prefix == 36 && cr - line_start == 1 && data[line_start].to_int() == 63 { // '?'
+        let (bs, npos) = match decode_streamed_bulk(data, next_after_line, end, limits) {
+          Ok(r) => r
+          Err(e) => return Err(e)
+        }
+        frame_opt = Some(RespFrame::BulkString(bs))
+        pos = npos
+      } else {
+        let len64 = match parse_int64_slice(data, line_start, cr, pos) {
+          Ok(v) => v
+          Err(_) => return Err(RespError::InvalidBulkLength(-1L, pos))
+        }
+        if prefix == 36 && len64 == -1L {
+          frame_opt = Some(RespFrame::NullBulk)
+          pos = next_after_line
+        } else if len64 < 0L {
+          return Err(RespError::InvalidBulkLength(len64, pos))
+        } else if len64 > limits.max_bulk_len.to_int64() {
+          return Err(RespError::MaxBulkLenExceeded(limits.max_bulk_len))
+        } else {
+          let blen = len64.to_int()
+          if prefix == 61 && blen < 4 {
+            return Err(RespError::InvalidVerbatimFormat(pos))
+          }
+          if next_after_line + blen + 2 > end {
+            return Err(RespError::Incomplete)
+          }
+          if data[next_after_line + blen].to_int() != 13 || data[next_after_line + blen + 1].to_int() != 10 {
+            return Err(RespError::InvalidCrlf(next_after_line + blen))
+          }
+          if prefix == 36 {
+            frame_opt = Some(RespFrame::BulkString(slice_bytes(data, next_after_line, blen)))
+          } else if prefix == 33 {
+            frame_opt = Some(RespFrame::BulkError(slice_bytes(data, next_after_line, blen)))
+          } else {
+            if data[next_after_line + 3].to_int() != 58 { // ':'
+              return Err(RespError::InvalidVerbatimFormat(next_after_line))
+            }
+            let enc_tag = slice_bytes(data, next_after_line, 3).to_string()
+            let payload = slice_bytes(data, next_after_line + 4, blen - 4)
+            frame_opt = Some(RespFrame::VerbatimString(enc_tag, payload))
+          }
+          pos = next_after_line + blen + 2
+        }
+      }
+    } else if prefix == 42 || prefix == 126 || prefix == 62 || prefix == 37 || prefix == 124 {
+      // Containers: '*' Array, '~' Set, '>' Push, '%' Map, '|' Attribute
+      let kind = if prefix == 42 {
+        0
+      } else if prefix == 126 {
+        1
+      } else if prefix == 62 {
+        2
+      } else if prefix == 37 {
+        3
+      } else {
+        4
+      }
+      let is_streamed = cr - line_start == 1 && data[line_start].to_int() == 63 // '?'
+      if is_streamed {
+        if stack.length() >= limits.max_depth {
+          return Err(RespError::MaxDepthExceeded(limits.max_depth))
+        }
+        stack.push(DecodeContainer::{
+          kind: kind,
+          streamed: true,
+          remaining: 0,
+          items: [],
+          pairs: [],
+          pending_key: None,
+        })
+        pos = next_after_line
+        continue
+      }
+      let len64 = match parse_int64_slice(data, line_start, cr, pos) {
+        Ok(v) => v
+        Err(_) => return Err(RespError::InvalidCollectionLength(-1L, pos))
+      }
+      if prefix == 42 && len64 == -1L {
+        frame_opt = Some(RespFrame::NullArray)
+        pos = next_after_line
+      } else if len64 < 0L {
+        return Err(RespError::InvalidCollectionLength(len64, pos))
+      } else if len64 > limits.max_collection_len.to_int64() {
+        return Err(RespError::MaxCollectionLenExceeded(limits.max_collection_len))
+      } else {
+        let clen = len64.to_int()
+        pos = next_after_line
+        if clen == 0 {
+          if kind == 4 {
+            // Empty attribute `|0\r\n` still attaches to the following target frame
+            if stack.length() >= limits.max_depth {
+              return Err(RespError::MaxDepthExceeded(limits.max_depth))
+            }
+            stack.push(DecodeContainer::{
+              kind: 5,
+              streamed: false,
+              remaining: 1,
+              items: [],
+              pairs: [],
+              pending_key: None,
+            })
+            continue
+          }
+          frame_opt = Some(
+            if kind == 0 {
+              RespFrame::Array([])
+            } else if kind == 1 {
+              RespFrame::Set([])
+            } else if kind == 2 {
+              RespFrame::Push([])
+            } else {
+              RespFrame::Map([])
+            },
+          )
+        } else {
+          if stack.length() >= limits.max_depth {
+            return Err(RespError::MaxDepthExceeded(limits.max_depth))
+          }
+          stack.push(DecodeContainer::{
+            kind: kind,
+            streamed: false,
+            remaining: clen,
+            items: [],
+            pairs: [],
+            pending_key: None,
+          })
+          continue
+        }
+      }
+    } else {
+      return Err(RespError::InvalidPrefix(prefix, pos))
+    }
+
+    // We have a completed scalar or empty container in `frame_opt`; unwind stack as needed
+    let mut completed = match frame_opt {
+      Some(f) => f
+      None => continue
+    }
+    while true {
+      if stack.length() == 0 {
+        return Ok((completed, pos))
+      }
+      let parent = stack[stack.length() - 1]
+      if parent.kind == 5 {
+        let attr_c = match stack.pop() {
+          Some(c) => c
+          None => break
+        }
+        completed = RespFrame::Attribute(attr_c.pairs, completed)
+        continue
+      }
+      if parent.kind == 3 || parent.kind == 4 {
+        match parent.pending_key {
+          None => {
+            parent.pending_key = Some(completed)
+            break
+          }
+          Some(k) => {
+            parent.pending_key = None
+            parent.pairs.push((k, completed))
+            if !parent.streamed && parent.pairs.length() == parent.remaining {
+              let p_fin = match stack.pop() {
+                Some(c) => c
+                None => break
+              }
+              if p_fin.kind == 4 {
+                stack.push(DecodeContainer::{
+                  kind: 5,
+                  streamed: false,
+                  remaining: 1,
+                  items: [],
+                  pairs: p_fin.pairs,
+                  pending_key: None,
+                })
+                break
+              }
+              completed = RespFrame::Map(p_fin.pairs)
+              continue
+            }
+            if parent.streamed && parent.pairs.length() > limits.max_collection_len {
+              return Err(RespError::MaxCollectionLenExceeded(limits.max_collection_len))
+            }
+            break
+          }
+        }
+      } else {
+        parent.items.push(completed)
+        if !parent.streamed && parent.items.length() == parent.remaining {
+          let p_fin = match stack.pop() {
+            Some(c) => c
+            None => break
+          }
+          completed = if p_fin.kind == 0 {
+            RespFrame::Array(p_fin.items)
+          } else if p_fin.kind == 1 {
+            RespFrame::Set(p_fin.items)
+          } else {
+            RespFrame::Push(p_fin.items)
+          }
+          continue
+        }
+        if parent.streamed && parent.items.length() > limits.max_collection_len {
+          return Err(RespError::MaxCollectionLenExceeded(limits.max_collection_len))
+        }
+        break
+      }
+    }
+  }
+  Err(RespError::Incomplete)
+}
 
 ///| Decode a single complete `RespFrame` from `data` starting at `offset`.
 ///| Returns `(frame, next_offset)`.
@@ -7,17 +798,19 @@ pub fn decode_prefix(
   offset : Int,
   limits : RespLimits,
 ) -> Result[(RespFrame, Int), RespError] {
-  let _ = data
-  let _ = offset
-  let _ = limits
-  Err(RespError::Incomplete)
+  decode_prefix_range(data, offset, data.length(), limits, false)
 }
 
 ///| Decode a single complete `RespFrame` from `data`, rejecting trailing bytes.
 pub fn decode(data : Bytes, limits : RespLimits) -> Result[RespFrame, RespError] {
-  let _ = data
-  let _ = limits
-  Err(RespError::Incomplete)
+  let (frame, next_off) = match decode_prefix_range(data, 0, data.length(), limits, false) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  if next_off < data.length() {
+    return Err(RespError::TrailingBytes(next_off))
+  }
+  Ok(frame)
 }
 
 ///| Decode a single complete `RespFrame` using `RespLimits::default()`.
@@ -25,22 +818,24 @@ pub fn decode_default(data : Bytes) -> Result[RespFrame, RespError] {
   decode(data, RespLimits::default())
 }
 
-///| Parse a Redis inline command line (with double/single quote and escape handling).
-pub fn decode_inline(line : Bytes, limits : RespLimits) -> Result[Array[Bytes], RespError] {
-  let _ = line
-  let _ = limits
-  Err(RespError::Incomplete)
-}
-
-///| Sans-IO streaming RESP2/RESP3 pipeline decoder with bounded buffer and compaction.
+///| Sans-IO streaming RESP2/RESP3 pipeline decoder with bounded buffer and automatic compaction.
 pub struct StreamDecoder {
   limits : RespLimits
   mut allow_inline : Bool
+  mut buf : Bytes
+  mut read_pos : Int
+  mut write_pos : Int
 }
 
 ///| Create a new `StreamDecoder` with explicit `RespLimits`.
 pub fn StreamDecoder::new(limits : RespLimits) -> StreamDecoder {
-  StreamDecoder::{ limits: limits, allow_inline: true }
+  StreamDecoder::{
+    limits: limits,
+    allow_inline: true,
+    buf: Bytes::new(256),
+    read_pos: 0,
+    write_pos: 0,
+  }
 }
 
 ///| Create a new `StreamDecoder` with `RespLimits::default()`.
@@ -53,38 +848,128 @@ pub fn StreamDecoder::set_allow_inline(self : StreamDecoder, allow : Bool) -> Un
   self.allow_inline = allow
 }
 
+///| Compact the internal buffer to reclaim consumed prefix bytes and shrink if oversized.
+fn StreamDecoder::maybe_compact(self : StreamDecoder) -> Unit {
+  let unread = self.write_pos - self.read_pos
+  if unread == 0 {
+    self.read_pos = 0
+    self.write_pos = 0
+    if self.buf.length() > 65536 {
+      self.buf = Bytes::new(4096)
+    }
+    return ()
+  }
+  if self.read_pos >= 4096 && self.read_pos * 2 >= self.buf.length() {
+    copy_bytes(self.buf, 0, self.buf, self.read_pos, unread)
+    self.read_pos = 0
+    self.write_pos = unread
+  }
+}
+
 ///| Append raw bytes from the network into the internal stream buffer.
 pub fn StreamDecoder::feed(self : StreamDecoder, chunk : Bytes) -> Result[Unit, RespError] {
-  let _ = self
-  let _ = chunk
-  Err(RespError::Incomplete)
+  let clen = chunk.length()
+  if clen == 0 {
+    return Ok(())
+  }
+  let unread = self.write_pos - self.read_pos
+  if unread + clen > self.limits.max_buffer_bytes {
+    return Err(RespError::MaxBufferBytesExceeded(self.limits.max_buffer_bytes))
+  }
+  // If unread == 0, reset cursors to 0 immediately
+  if unread == 0 {
+    self.read_pos = 0
+    self.write_pos = 0
+  }
+  // If tail space is insufficient, first compact if that makes room
+  if self.write_pos + clen > self.buf.length() {
+    if self.read_pos > 0 && unread + clen <= self.buf.length() {
+      if unread > 0 {
+        copy_bytes(self.buf, 0, self.buf, self.read_pos, unread)
+      }
+      self.read_pos = 0
+      self.write_pos = unread
+    } else {
+      let need = unread + clen
+      let mut next_cap = self.buf.length()
+      if next_cap < 256 {
+        next_cap = 256
+      }
+      while next_cap < need {
+        if next_cap > 1073741823 {
+          next_cap = need
+          break
+        }
+        next_cap = next_cap * 2
+      }
+      if next_cap > self.limits.max_buffer_bytes {
+        next_cap = self.limits.max_buffer_bytes
+      }
+      let next_buf = Bytes::new(next_cap)
+      if unread > 0 {
+        copy_bytes(next_buf, 0, self.buf, self.read_pos, unread)
+      }
+      self.buf = next_buf
+      self.read_pos = 0
+      self.write_pos = unread
+    }
+  }
+  copy_bytes(self.buf, self.write_pos, chunk, 0, clen)
+  self.write_pos = self.write_pos + clen
+  Ok(())
 }
 
 ///| Decode the next complete frame from the buffer, or `Ok(None)` if more bytes are needed.
 pub fn StreamDecoder::next_frame(self : StreamDecoder) -> Result[Option[RespFrame], RespError] {
-  let _ = self
-  Err(RespError::Incomplete)
+  if self.read_pos >= self.write_pos {
+    return Ok(None)
+  }
+  match decode_prefix_range(self.buf, self.read_pos, self.write_pos, self.limits, self.allow_inline) {
+    Ok((frame, next_off)) => {
+      self.read_pos = next_off
+      self.maybe_compact()
+      Ok(Some(frame))
+    }
+    Err(Incomplete) => Ok(None)
+    Err(e) => Err(e)
+  }
 }
 
 ///| Drain all currently complete frames from the buffer.
 pub fn StreamDecoder::drain_frames(self : StreamDecoder) -> Result[Array[RespFrame], RespError] {
-  let _ = self
-  Err(RespError::Incomplete)
+  let out : Array[RespFrame] = []
+  while self.read_pos < self.write_pos {
+    match decode_prefix_range(self.buf, self.read_pos, self.write_pos, self.limits, self.allow_inline) {
+      Ok((frame, next_off)) => {
+        self.read_pos = next_off
+        out.push(frame)
+      }
+      Err(Incomplete) => break
+      Err(e) => {
+        self.maybe_compact()
+        return Err(e)
+      }
+    }
+  }
+  self.maybe_compact()
+  Ok(out)
 }
 
 ///| Return the number of unread bytes currently buffered.
 pub fn StreamDecoder::buffered_len(self : StreamDecoder) -> Int {
-  let _ = self
-  0
+  self.write_pos - self.read_pos
 }
 
 ///| Return the current backing buffer capacity in bytes.
 pub fn StreamDecoder::buffer_capacity(self : StreamDecoder) -> Int {
-  let _ = self
-  0
+  self.buf.length()
 }
 
 ///| Reset the stream decoder, discarding buffered bytes.
 pub fn StreamDecoder::reset(self : StreamDecoder) -> Unit {
-  let _ = self
+  self.read_pos = 0
+  self.write_pos = 0
+  if self.buf.length() > 65536 {
+    self.buf = Bytes::new(256)
+  }
 }
