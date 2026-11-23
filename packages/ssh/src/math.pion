@@ -1,0 +1,653 @@
+///| Internal big-integer arithmetic, P-256 on-curve validation, RSA-SHA2-512 verification,
+///| and RSA CRT private-key consistency validation for `packages/ssh`.
+///| Zero `World` dependencies, no panics.
+
+import "crypto"
+
+///|
+struct SshBigUint {
+  limbs : FixedArray[UInt64]
+  len : Int
+}
+
+///|
+fn sbig_trim(limbs : FixedArray[UInt64], raw_len : Int) -> SshBigUint {
+  let mut n = raw_len
+  while n > 0 && limbs[n - 1] == 0UL {
+    n = n - 1
+  }
+  SshBigUint::{ limbs, len: n }
+}
+
+///|
+fn sbig_zero() -> SshBigUint {
+  SshBigUint::{ limbs: FixedArray::make(1, 0UL), len: 0 }
+}
+
+///|
+fn sbig_from_u64(v : UInt64) -> SshBigUint {
+  if v == 0UL {
+    return sbig_zero()
+  }
+  let limbs = FixedArray::make(2, 0UL)
+  limbs[0] = v & 0xFFFFFFFFUL
+  limbs[1] = v >> 32UL
+  sbig_trim(limbs, 2)
+}
+
+///|
+fn sbig_is_zero(a : SshBigUint) -> Bool {
+  a.len == 0
+}
+
+///|
+fn sbig_is_odd(a : SshBigUint) -> Bool {
+  a.len > 0 && (a.limbs[0] & 1UL) == 1UL
+}
+
+///|
+fn sbig_cmp(a : SshBigUint, b : SshBigUint) -> Int {
+  if a.len < b.len {
+    return -1
+  }
+  if a.len > b.len {
+    return 1
+  }
+  let mut i = a.len - 1
+  while i >= 0 {
+    if a.limbs[i] < b.limbs[i] {
+      return -1
+    }
+    if a.limbs[i] > b.limbs[i] {
+      return 1
+    }
+    i = i - 1
+  }
+  0
+}
+
+///|
+fn sbig_eq(a : SshBigUint, b : SshBigUint) -> Bool {
+  sbig_cmp(a, b) == 0
+}
+
+///|
+fn sbig_bit_len(a : SshBigUint) -> Int {
+  if a.len == 0 {
+    return 0
+  }
+  let mut top = a.limbs[a.len - 1]
+  let mut bits = 0
+  while top > 0UL {
+    top = top >> 1UL
+    bits = bits + 1
+  }
+  (a.len - 1) * 32 + bits
+}
+
+///|
+fn sbig_get_bit(a : SshBigUint, bit : Int) -> Int {
+  let limb_idx = bit / 32
+  if limb_idx < 0 || limb_idx >= a.len {
+    return 0
+  }
+  let shift = (bit % 32).to_int64().to_uint64()
+  ((a.limbs[limb_idx] >> shift) & 1UL).to_int()
+}
+
+///|
+fn sbig_from_be_slice(data : Bytes, offset : Int, len : Int) -> SshBigUint {
+  if len <= 0 {
+    return sbig_zero()
+  }
+  let num_limbs = (len + 3) / 4
+  let limbs = FixedArray::make(num_limbs, 0UL)
+  let mut i = 0
+  while i < len {
+    let b = (data[offset + len - 1 - i].to_int() & 0xFF).to_int64().to_uint64()
+    let limb_idx = i / 4
+    let shift = ((i % 4) * 8).to_int64().to_uint64()
+    limbs[limb_idx] = limbs[limb_idx] | (b << shift)
+    i = i + 1
+  }
+  sbig_trim(limbs, num_limbs)
+}
+
+///|
+fn sbig_from_be(data : Bytes) -> SshBigUint {
+  sbig_from_be_slice(data, 0, data.length())
+}
+
+///|
+fn sbig_to_be(a : SshBigUint, size : Int) -> Bytes {
+  let mut out = Bytes::new(size)
+  let mut i = 0
+  while i < size {
+    let limb_idx = i / 4
+    let shift = ((i % 4) * 8).to_int64().to_uint64()
+    let v = if limb_idx < a.len { (a.limbs[limb_idx] >> shift) & 0xFFUL } else { 0UL }
+    out[size - 1 - i] = v.to_int().to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn sbig_add(a : SshBigUint, b : SshBigUint) -> SshBigUint {
+  let max_len = if a.len > b.len { a.len } else { b.len }
+  let out = FixedArray::make(max_len + 1, 0UL)
+  let mut carry = 0UL
+  let mut i = 0
+  while i < max_len {
+    let av = if i < a.len { a.limbs[i] } else { 0UL }
+    let bv = if i < b.len { b.limbs[i] } else { 0UL }
+    let s = av + bv + carry
+    out[i] = s & 0xFFFFFFFFUL
+    carry = s >> 32UL
+    i = i + 1
+  }
+  out[max_len] = carry
+  sbig_trim(out, max_len + 1)
+}
+
+///| Assumes `a >= b`.
+fn sbig_sub(a : SshBigUint, b : SshBigUint) -> SshBigUint {
+  let out = FixedArray::make(a.len, 0UL)
+  let mut borrow = 0UL
+  let mut i = 0
+  while i < a.len {
+    let av = a.limbs[i]
+    let bv = if i < b.len { b.limbs[i] } else { 0UL }
+    let diff = (av + 0x100000000UL) - bv - borrow
+    out[i] = diff & 0xFFFFFFFFUL
+    borrow = 1UL - (diff >> 32UL)
+    i = i + 1
+  }
+  sbig_trim(out, a.len)
+}
+
+///|
+fn sbig_mul(a : SshBigUint, b : SshBigUint) -> SshBigUint {
+  if a.len == 0 || b.len == 0 {
+    return sbig_zero()
+  }
+  let out_len = a.len + b.len
+  let out = FixedArray::make(out_len, 0UL)
+  let mut i = 0
+  while i < a.len {
+    let av = a.limbs[i]
+    let mut carry = 0UL
+    let mut j = 0
+    while j < b.len {
+      let prod = av * b.limbs[j] + out[i + j] + carry
+      out[i + j] = prod & 0xFFFFFFFFUL
+      carry = prod >> 32UL
+      j = j + 1
+    }
+    out[i + b.len] = out[i + b.len] + carry
+    i = i + 1
+  }
+  sbig_trim(out, out_len)
+}
+
+///|
+fn sbig_shl1_add_bit(a : SshBigUint, bit : UInt64) -> SshBigUint {
+  let out = FixedArray::make(a.len + 1, 0UL)
+  let mut carry = bit
+  let mut i = 0
+  while i < a.len {
+    let v = (a.limbs[i] << 1UL) | carry
+    out[i] = v & 0xFFFFFFFFUL
+    carry = v >> 32UL
+    i = i + 1
+  }
+  out[a.len] = carry
+  sbig_trim(out, a.len + 1)
+}
+
+///| Compute `a mod m` (assumes `m > 0`).
+fn sbig_mod(a : SshBigUint, m : SshBigUint) -> SshBigUint {
+  if sbig_cmp(a, m) < 0 {
+    return a
+  }
+  let bits = sbig_bit_len(a)
+  let mut rem = sbig_zero()
+  let mut bit = bits - 1
+  while bit >= 0 {
+    let b = sbig_get_bit(a, bit).to_int64().to_uint64()
+    rem = sbig_shl1_add_bit(rem, b)
+    if sbig_cmp(rem, m) >= 0 {
+      rem = sbig_sub(rem, m)
+    }
+    bit = bit - 1
+  }
+  rem
+}
+
+///|
+fn sbig_mul_mod(a : SshBigUint, b : SshBigUint, m : SshBigUint) -> SshBigUint {
+  sbig_mod(sbig_mul(a, b), m)
+}
+
+///|
+fn sbig_to_fixed_limbs(a : SshBigUint, k : Int) -> FixedArray[UInt64] {
+  let out = FixedArray::make(k, 0UL)
+  let lim = if a.len < k { a.len } else { k }
+  let mut i = 0
+  while i < lim {
+    out[i] = a.limbs[i]
+    i = i + 1
+  }
+  out
+}
+
+///| `-m0^(-1) mod 2^32` for odd `m0`.
+fn smont_n0_inv(m0 : UInt64) -> UInt64 {
+  let mut inv = 1UL
+  let mut i = 0
+  while i < 5 {
+    inv = (inv * (2UL - m0 * inv)) & 0xFFFFFFFFUL
+    i = i + 1
+  }
+  (0x100000000UL - inv) & 0xFFFFFFFFUL
+}
+
+///| Compute `R^2 mod m` where `R = 2^(32 * m.len)`.
+fn smont_r2(m : SshBigUint) -> SshBigUint {
+  let k = m.len
+  let mut r = sbig_from_u64(1UL)
+  let total_bits = 64 * k
+  let mut i = 0
+  while i < total_bits {
+    r = sbig_shl1_add_bit(r, 0UL)
+    if sbig_cmp(r, m) >= 0 {
+      r = sbig_sub(r, m)
+    }
+    i = i + 1
+  }
+  r
+}
+
+///| Montgomery CIOS multiplication `a * b * R^(-1) mod m`.
+fn smont_mul_limbs(
+  a : FixedArray[UInt64],
+  b : FixedArray[UInt64],
+  m : FixedArray[UInt64],
+  k : Int,
+  n0_inv : UInt64,
+) -> FixedArray[UInt64] {
+  let t = FixedArray::make(k + 2, 0UL)
+  let mut i = 0
+  while i < k {
+    let ai = a[i]
+    let mut c = 0UL
+    let mut j = 0
+    while j < k {
+      let s = t[j] + ai * b[j] + c
+      t[j] = s & 0xFFFFFFFFUL
+      c = s >> 32UL
+      j = j + 1
+    }
+    let s1 = t[k] + c
+    t[k] = s1 & 0xFFFFFFFFUL
+    t[k + 1] = t[k + 1] + (s1 >> 32UL)
+
+    let u = (t[0] * n0_inv) & 0xFFFFFFFFUL
+    let s0 = t[0] + u * m[0]
+    let mut mc = s0 >> 32UL
+    j = 1
+    while j < k {
+      let sm = t[j] + u * m[j] + mc
+      t[j - 1] = sm & 0xFFFFFFFFUL
+      mc = sm >> 32UL
+      j = j + 1
+    }
+    let sk = t[k] + mc
+    t[k - 1] = sk & 0xFFFFFFFFUL
+    t[k] = t[k + 1] + (sk >> 32UL)
+    t[k + 1] = 0UL
+    i = i + 1
+  }
+  let mut ge = t[k] > 0UL
+  if !ge {
+    let mut idx = k - 1
+    while idx >= 0 {
+      if t[idx] > m[idx] {
+        ge = true
+        break
+      }
+      if t[idx] < m[idx] {
+        break
+      }
+      idx = idx - 1
+    }
+    if idx < 0 {
+      ge = true
+    }
+  }
+  let out = FixedArray::make(k, 0UL)
+  if ge {
+    let mut borrow = 0UL
+    let mut j = 0
+    while j < k {
+      let d = (t[j] + 0x100000000UL) - m[j] - borrow
+      out[j] = d & 0xFFFFFFFFUL
+      borrow = 1UL - (d >> 32UL)
+      j = j + 1
+    }
+  } else {
+    let mut j = 0
+    while j < k {
+      out[j] = t[j]
+      j = j + 1
+    }
+  }
+  out
+}
+
+///| Modular exponentiation `base^exp mod m` for odd `m > 1`.
+fn sbig_mod_pow_odd(base : SshBigUint, exp : SshBigUint, m : SshBigUint) -> SshBigUint {
+  let k = m.len
+  let m_limbs = sbig_to_fixed_limbs(m, k)
+  let n0_inv = smont_n0_inv(m_limbs[0])
+  let r2 = sbig_to_fixed_limbs(smont_r2(m), k)
+  let one = FixedArray::make(k, 0UL)
+  one[0] = 1UL
+  let mut acc = smont_mul_limbs(one, r2, m_limbs, k, n0_inv)
+  let base_red = sbig_mod(base, m)
+  let base_m = smont_mul_limbs(sbig_to_fixed_limbs(base_red, k), r2, m_limbs, k, n0_inv)
+  let bits = sbig_bit_len(exp)
+  let mut bit = bits - 1
+  while bit >= 0 {
+    acc = smont_mul_limbs(acc, acc, m_limbs, k, n0_inv)
+    if sbig_get_bit(exp, bit) == 1 {
+      acc = smont_mul_limbs(acc, base_m, m_limbs, k, n0_inv)
+    }
+    bit = bit - 1
+  }
+  let res = smont_mul_limbs(acc, one, m_limbs, k, n0_inv)
+  sbig_trim(res, k)
+}
+
+///| Modular addition `(a + b) mod p` over 8-limb P-256 prime.
+fn sp256_add(a : FixedArray[UInt64], b : FixedArray[UInt64], p : FixedArray[UInt64]) -> FixedArray[UInt64] {
+  let sum = FixedArray::make(8, 0UL)
+  let mut carry = 0UL
+  let mut i = 0
+  while i < 8 {
+    let s = a[i] + b[i] + carry
+    sum[i] = s & 0xFFFFFFFFUL
+    carry = s >> 32UL
+    i = i + 1
+  }
+  let mut ge = carry > 0UL
+  if !ge {
+    let mut idx = 7
+    while idx >= 0 {
+      if sum[idx] > p[idx] {
+        ge = true
+        break
+      }
+      if sum[idx] < p[idx] {
+        break
+      }
+      idx = idx - 1
+    }
+    if idx < 0 {
+      ge = true
+    }
+  }
+  if ge {
+    let out = FixedArray::make(8, 0UL)
+    let mut borrow = 0UL
+    i = 0
+    while i < 8 {
+      let d = (sum[i] + 0x100000000UL) - p[i] - borrow
+      out[i] = d & 0xFFFFFFFFUL
+      borrow = 1UL - (d >> 32UL)
+      i = i + 1
+    }
+    out
+  } else {
+    sum
+  }
+}
+
+///| Modular subtraction `(a - b) mod p` over 8-limb P-256 prime.
+fn sp256_sub(a : FixedArray[UInt64], b : FixedArray[UInt64], p : FixedArray[UInt64]) -> FixedArray[UInt64] {
+  let diff = FixedArray::make(8, 0UL)
+  let mut borrow = 0UL
+  let mut i = 0
+  while i < 8 {
+    let d = (a[i] + 0x100000000UL) - b[i] - borrow
+    diff[i] = d & 0xFFFFFFFFUL
+    borrow = 1UL - (d >> 32UL)
+    i = i + 1
+  }
+  if borrow > 0UL {
+    let out = FixedArray::make(8, 0UL)
+    let mut carry = 0UL
+    i = 0
+    while i < 8 {
+      let s = diff[i] + p[i] + carry
+      out[i] = s & 0xFFFFFFFFUL
+      carry = s >> 32UL
+      i = i + 1
+    }
+    out
+  } else {
+    diff
+  }
+}
+
+///| Validate an uncompressed NIST P-256 public key point `0x04 || X || Y` in Montgomery form.
+///| Checks length 65, `0x04` prefix, `0 <= X, Y < p`, and `Y^2 == X^3 - 3X + b (mod p)`.
+fn p256_point_is_valid(pt : Bytes) -> Bool {
+  if pt.length() != 65 || (pt[0].to_int() & 0xFF) != 0x04 {
+    return false
+  }
+  let p_limbs : FixedArray[UInt64] = [
+    0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0x00000000UL,
+    0x00000000UL, 0x00000000UL, 0x00000001UL, 0xFFFFFFFFUL,
+  ]
+  let r2_limbs : FixedArray[UInt64] = [
+    0x00000003UL, 0x00000000UL, 0xFFFFFFFFUL, 0xFFFFFFFBUL,
+    0xFFFFFFFEUL, 0xFFFFFFFFUL, 0xFFFFFFFDUL, 0x00000004UL,
+  ]
+  let b_mont : FixedArray[UInt64] = [
+    0x29C4BDDFUL, 0xD89CDF62UL, 0x78843090UL, 0xACF005CDUL,
+    0xF7212ED6UL, 0xE5A220ABUL, 0x04874834UL, 0xDC30061DUL,
+  ]
+  let x_limbs = FixedArray::make(8, 0UL)
+  let y_limbs = FixedArray::make(8, 0UL)
+  let mut i = 0
+  while i < 8 {
+    let xo = 1 + (7 - i) * 4
+    let yo = 33 + (7 - i) * 4
+    x_limbs[i] = ((pt[xo].to_int() & 0xFF).to_int64().to_uint64() << 24UL) |
+    ((pt[xo + 1].to_int() & 0xFF).to_int64().to_uint64() << 16UL) |
+    ((pt[xo + 2].to_int() & 0xFF).to_int64().to_uint64() << 8UL) |
+    (pt[xo + 3].to_int() & 0xFF).to_int64().to_uint64()
+    y_limbs[i] = ((pt[yo].to_int() & 0xFF).to_int64().to_uint64() << 24UL) |
+    ((pt[yo + 1].to_int() & 0xFF).to_int64().to_uint64() << 16UL) |
+    ((pt[yo + 2].to_int() & 0xFF).to_int64().to_uint64() << 8UL) |
+    (pt[yo + 3].to_int() & 0xFF).to_int64().to_uint64()
+    i = i + 1
+  }
+  // Check x < p and y < p
+  let mut x_lt = false
+  let mut idx = 7
+  while idx >= 0 {
+    if x_limbs[idx] < p_limbs[idx] {
+      x_lt = true
+      break
+    }
+    if x_limbs[idx] > p_limbs[idx] {
+      return false
+    }
+    idx = idx - 1
+  }
+  if !x_lt {
+    return false
+  }
+  let mut y_lt = false
+  idx = 7
+  while idx >= 0 {
+    if y_limbs[idx] < p_limbs[idx] {
+      y_lt = true
+      break
+    }
+    if y_limbs[idx] > p_limbs[idx] {
+      return false
+    }
+    idx = idx - 1
+  }
+  if !y_lt {
+    return false
+  }
+  let xm = smont_mul_limbs(x_limbs, r2_limbs, p_limbs, 8, 1UL)
+  let ym = smont_mul_limbs(y_limbs, r2_limbs, p_limbs, 8, 1UL)
+  let lhs = smont_mul_limbs(ym, ym, p_limbs, 8, 1UL)
+  let x2m = smont_mul_limbs(xm, xm, p_limbs, 8, 1UL)
+  let x3m = smont_mul_limbs(x2m, xm, p_limbs, 8, 1UL)
+  let two_xm = sp256_add(xm, xm, p_limbs)
+  let three_xm = sp256_add(two_xm, xm, p_limbs)
+  let rhs = sp256_add(sp256_sub(x3m, three_xm, p_limbs), b_mont, p_limbs)
+  i = 0
+  while i < 8 {
+    if lhs[i] != rhs[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Validate RSA public key parameters at parse time (`e >= 3`, `e` odd, `n` odd, `e < n`).
+fn rsa_public_key_params_valid(e_bytes : Bytes, n_bytes : Bytes) -> Bool {
+  if e_bytes.length() == 0 || n_bytes.length() == 0 {
+    return false
+  }
+  let e_last = e_bytes[e_bytes.length() - 1].to_int() & 0xFF
+  if (e_last & 1) == 0 {
+    return false
+  }
+  let n_last = n_bytes[n_bytes.length() - 1].to_int() & 0xFF
+  if (n_last & 1) == 0 {
+    return false
+  }
+  let e = sbig_from_be(e_bytes)
+  let n = sbig_from_be(n_bytes)
+  let two = sbig_from_u64(2UL)
+  if sbig_cmp(e, two) <= 0 || sbig_cmp(e, n) >= 0 {
+    return false
+  }
+  true
+}
+
+///| Validate mathematical consistency of an OpenSSH RSA private key (`n, e, d, iqmp, p, q`).
+///| Checks `p * q == n`, `e * d == 1 (mod p-1)`, `e * d == 1 (mod q-1)`, `q * iqmp == 1 (mod p)`.
+fn rsa_private_key_params_valid(
+  n_bytes : Bytes,
+  e_bytes : Bytes,
+  d_bytes : Bytes,
+  iqmp_bytes : Bytes,
+  p_bytes : Bytes,
+  q_bytes : Bytes,
+) -> Bool {
+  if !rsa_public_key_params_valid(e_bytes, n_bytes) {
+    return false
+  }
+  let n = sbig_from_be(n_bytes)
+  let e = sbig_from_be(e_bytes)
+  let d = sbig_from_be(d_bytes)
+  let iqmp = sbig_from_be(iqmp_bytes)
+  let p = sbig_from_be(p_bytes)
+  let q = sbig_from_be(q_bytes)
+  let one = sbig_from_u64(1UL)
+  let two = sbig_from_u64(2UL)
+  if sbig_cmp(d, one) <= 0 || sbig_cmp(d, n) >= 0 {
+    return false
+  }
+  if sbig_cmp(p, two) <= 0 || sbig_cmp(q, two) <= 0 || sbig_eq(p, q) || !sbig_is_odd(p) || !sbig_is_odd(q) {
+    return false
+  }
+  if !sbig_eq(sbig_mul(p, q), n) {
+    return false
+  }
+  let pm1 = sbig_sub(p, one)
+  let qm1 = sbig_sub(q, one)
+  if !sbig_eq(sbig_mul_mod(e, d, pm1), one) || !sbig_eq(sbig_mul_mod(e, d, qm1), one) {
+    return false
+  }
+  if sbig_is_zero(iqmp) || sbig_cmp(iqmp, p) >= 0 || !sbig_eq(sbig_mul_mod(q, iqmp, p), one) {
+    return false
+  }
+  true
+}
+
+///| Build canonical RFC 8017 EMSA-PKCS1-v1_5 SHA-512 encoded message block:
+///| `0x00 || 0x01 || 0xFF...(size - 86 bytes, >= 8B) || 0x00 || 19B SHA-512 DigestInfo || 64B digest`.
+fn rsa_pkcs1_sha512_em(msg : Bytes, size : Int) -> Bytes {
+  let prefix : Array[Int] = [
+    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+    0x00, 0x04, 0x40,
+  ]
+  let digest = crypto::sha512(msg)
+  let pad_len = size - 86
+  let mut out = Bytes::new(size)
+  out[0] = (0x00).to_byte()
+  out[1] = (0x01).to_byte()
+  let mut i = 0
+  while i < pad_len {
+    out[2 + i] = (0xFF).to_byte()
+    i = i + 1
+  }
+  out[2 + pad_len] = (0x00).to_byte()
+  let p_off = 3 + pad_len
+  i = 0
+  while i < prefix.length() {
+    out[p_off + i] = prefix[i].to_byte()
+    i = i + 1
+  }
+  let d_off = p_off + prefix.length()
+  i = 0
+  while i < 64 {
+    out[d_off + i] = digest[i]
+    i = i + 1
+  }
+  out
+}
+
+///| Strictly verify an RSA PKCS#1 v1.5 SHA-512 (`rsa-sha2-512`) signature.
+fn rsa_verify_rs512(
+  n_bytes : Bytes,
+  e_bytes : Bytes,
+  msg : Bytes,
+  sig_bytes : Bytes,
+) -> Result[Unit, SshError] {
+  let n = sbig_from_be(n_bytes)
+  let e = sbig_from_be(e_bytes)
+  let n_bits = sbig_bit_len(n)
+  let two = sbig_from_u64(2UL)
+  if n_bits < 2048 || n_bits > 8192 || !sbig_is_odd(n) || sbig_cmp(e, two) <= 0 || !sbig_is_odd(e) ||
+  sbig_cmp(e, n) >= 0 || sbig_bit_len(e) > 33 {
+    return Err(SshError::InvalidKey("invalid RSA public key components"))
+  }
+  let size = (n_bits + 7) / 8
+  let sig_padded = match left_pad_be(sig_bytes, size) {
+    Ok(b) => b
+    Err(_) => return Err(SshError::SignatureVerificationFailed)
+  }
+  let s = sbig_from_be(sig_padded)
+  if sbig_cmp(s, n) >= 0 {
+    return Err(SshError::SignatureVerificationFailed)
+  }
+  let recovered = sbig_to_be(sbig_mod_pow_odd(s, e, n), size)
+  let expected = rsa_pkcs1_sha512_em(msg, size)
+  if crypto::constant_time_eq(recovered, expected) {
+    Ok(())
+  } else {
+    Err(SshError::SignatureVerificationFailed)
+  }
+}

@@ -49,7 +49,7 @@ pub fn CertOption::value_string(self : CertOption) -> Result[String, SshError] {
 }
 
 ///|
-fn parse_cert_options(blob : Bytes) -> Result[Array[CertOption], SshError] {
+fn parse_cert_options(blob : Bytes, reject_duplicates : Bool) -> Result[Array[CertOption], SshError] {
   let r = SshReader::new(blob)
   let out : Array[CertOption] = []
   while !r.is_empty() {
@@ -57,9 +57,33 @@ fn parse_cert_options(blob : Bytes) -> Result[Array[CertOption], SshError] {
       Ok(s) => s
       Err(e) => return Err(e)
     }
+    if name.length() == 0 {
+      return Err(SshError::InvalidCertificate("empty certificate option name"))
+    }
+    if reject_duplicates {
+      let mut j = 0
+      while j < out.length() {
+        if out[j].name == name {
+          return Err(SshError::InvalidCertificate("duplicate critical option: " + name))
+        }
+        j = j + 1
+      }
+    }
     let value = match r.read_bytes() {
       Ok(b) => b
       Err(e) => return Err(e)
+    }
+    if value.length() > 0 {
+      // PROTOCOL.certkeys: non-empty option data is a single packed SSH string with no trailing bytes.
+      let vr = SshReader::new(value)
+      match vr.read_bytes() {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      match vr.expect_eof() {
+        Ok(_) => ()
+        Err(_) => return Err(SshError::InvalidCertificate("trailing data in certificate option: " + name))
+      }
     }
     out.push(CertOption::{ name, value })
   }
@@ -151,7 +175,7 @@ pub fn Certificate::from_wire(blob : Bytes) -> Result[Certificate, SshError] {
     Ok(b) => b
     Err(e) => return Err(e)
   }
-  let critical_options = match parse_cert_options(crit_blob) {
+  let critical_options = match parse_cert_options(crit_blob, false) {
     Ok(xs) => xs
     Err(e) => return Err(e)
   }
@@ -159,7 +183,7 @@ pub fn Certificate::from_wire(blob : Bytes) -> Result[Certificate, SshError] {
     Ok(b) => b
     Err(e) => return Err(e)
   }
-  let extensions = match parse_cert_options(ext_blob) {
+  let extensions = match parse_cert_options(ext_blob, false) {
     Ok(xs) => xs
     Err(e) => return Err(e)
   }
@@ -280,10 +304,11 @@ pub fn Certificate::from_openssh(line : String) -> Result[(Certificate, String),
 ///|
 pub fn Certificate::to_openssh(self : Certificate, comment : String) -> String {
   let head = self.cert_type_name + " " + base64::encode(self.to_wire())
-  if comment.length() == 0 {
+  let clean_comment = sanitize_openssh_comment(comment)
+  if clean_comment.length() == 0 {
     head
   } else {
-    head + " " + comment
+    head + " " + clean_comment
   }
 }
 
@@ -301,13 +326,55 @@ fn cert_type_eq(a : CertType, b : CertType) -> Bool {
   }
 }
 
+///| Verification options for `Certificate::verify_with_options`.
+pub struct CertVerifyOptions {
+  client_ip : Option[String]
+  supported_critical_options : Array[String]
+  require_principal : Bool
+}
+
+///| Default strict verification options (PROTOCOL.certkeys / OpenSSH sshd semantics):
+///| - Recognizes `force-command` as a supported critical option;
+///| - Rejects `source-address` unless `client_ip` is provided and matches;
+///| - Rejects any other critical option (including `verify-required`) unless caller explicitly enables it;
+///| - Requires non-empty `valid_principals` for User certificates.
+pub fn CertVerifyOptions::default() -> CertVerifyOptions {
+  CertVerifyOptions::{
+    client_ip: None,
+    supported_critical_options: ["force-command"],
+    require_principal: true,
+  }
+}
+
+///| Convenience constructor enabling `source-address` enforcement for a known client IPv4/IPv6 address.
+pub fn CertVerifyOptions::with_client_ip(client_ip : String) -> CertVerifyOptions {
+  CertVerifyOptions::{
+    client_ip: Some(client_ip),
+    supported_critical_options: ["force-command"],
+    require_principal: true,
+  }
+}
+
 ///|
-pub fn Certificate::verify(
+fn array_contains_string(xs : Array[String], target : String) -> Bool {
+  let mut i = 0
+  while i < xs.length() {
+    if xs[i] == target {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+pub fn Certificate::verify_with_options(
   self : Certificate,
   ca_key : PublicKey,
   expected_type : CertType,
   principal : String,
   now_unix : UInt64,
+  opts : CertVerifyOptions,
 ) -> Result[Unit, SshError] {
   if !cert_type_eq(self.cert_type, expected_type) {
     return Err(SshError::CertTypeMismatch)
@@ -321,7 +388,74 @@ pub fn Certificate::verify(
   if self.valid_before != 0xFFFFFFFFFFFFFFFFUL && now_unix >= self.valid_before {
     return Err(SshError::CertificateExpired)
   }
-  if self.valid_principals.length() > 0 {
+  // Validate critical_options (PROTOCOL.certkeys): reject duplicates, unknown options, malformed values,
+  // and enforce source-address CIDR restrictions.
+  let mut ci = 0
+  while ci < self.critical_options.length() {
+    let opt = self.critical_options[ci]
+    if opt.name.length() == 0 {
+      return Err(SshError::InvalidCertificate("empty critical option name"))
+    }
+    let mut cj = 0
+    while cj < ci {
+      if self.critical_options[cj].name == opt.name {
+        return Err(SshError::InvalidCertificate("duplicate critical option: " + opt.name))
+      }
+      cj = cj + 1
+    }
+    if opt.name == "source-address" {
+      if opt.value.length() == 0 {
+        return Err(SshError::InvalidCertificate("empty source-address critical option"))
+      }
+      let csv = match opt.value_string() {
+        Ok(s) => s
+        Err(_) => return Err(SshError::InvalidCertificate("malformed source-address option value"))
+      }
+      let cidrs = match parse_source_address_list(csv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      match opts.client_ip {
+        Some(ip_str) => match parse_ip_addr(ip_str) {
+          Some(ip) => {
+            if !ip_matches_cidrs(ip, cidrs) {
+              return Err(SshError::InvalidCertificate("client IP not permitted by source-address"))
+            }
+          }
+          None => return Err(SshError::InvalidCertificate("invalid client IP address: " + ip_str))
+        }
+        None => return Err(SshError::InvalidCertificate("certificate requires source-address verification"))
+      }
+    } else if opt.name == "force-command" {
+      if !array_contains_string(opts.supported_critical_options, "force-command") {
+        return Err(SshError::InvalidCertificate("unsupported critical option: force-command"))
+      }
+      if opt.value.length() == 0 {
+        return Err(SshError::InvalidCertificate("empty force-command critical option"))
+      }
+      match opt.value_string() {
+        Ok(_) => ()
+        Err(_) => return Err(SshError::InvalidCertificate("malformed force-command option value"))
+      }
+    } else if opt.name == "verify-required" {
+      if !array_contains_string(opts.supported_critical_options, "verify-required") {
+        return Err(SshError::InvalidCertificate("unsupported critical option: verify-required"))
+      }
+      if opt.value.length() != 0 {
+        return Err(SshError::InvalidCertificate("verify-required must have empty value"))
+      }
+    } else {
+      if !array_contains_string(opts.supported_critical_options, opt.name) {
+        return Err(SshError::InvalidCertificate("unsupported critical option: " + opt.name))
+      }
+    }
+    ci = ci + 1
+  }
+  if self.valid_principals.length() == 0 {
+    if cert_type_eq(self.cert_type, CertType::User) && opts.require_principal {
+      return Err(SshError::PrincipalMismatch)
+    }
+  } else {
     let mut matched = false
     let mut i = 0
     while i < self.valid_principals.length() {
@@ -341,6 +475,17 @@ pub fn Certificate::verify(
     }
   }
   public_key_verify(ca_key, self.tbs_bytes(), self.signature)
+}
+
+///|
+pub fn Certificate::verify(
+  self : Certificate,
+  ca_key : PublicKey,
+  expected_type : CertType,
+  principal : String,
+  now_unix : UInt64,
+) -> Result[Unit, SshError] {
+  self.verify_with_options(ca_key, expected_type, principal, now_unix, CertVerifyOptions::default())
 }
 
 ///|
