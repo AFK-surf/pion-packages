@@ -1,0 +1,1746 @@
+///| High-performance JSON Schema validator:
+///| - Three-valued evaluation (`eval_invalid`, `eval_valid`, `eval_aborted`) preventing `not`/`if` depth bypass (P0-1)
+///| - Separated data-depth & pure-`$ref` tail-looping (P1-2, P2-5, P2-11)
+///| - Exact `multipleOf` precision + IEEE-754 mantissa divisibility on quotient overflow (P1-1, P2-4)
+///| - O(1) hashed `EvalAnn` + skip when `!schema.has_unevaluated` (P1-8)
+///| - O(N+R) hashed `required`/`dependentRequired` on wide objects (P2-10)
+///| - Draft 2020-12 `$dynamicRef` & Draft 2019-09 `$recursiveRef` dynamic scope stack (P2-1)
+
+import "json5"
+
+// Three-valued evaluation result
+let eval_invalid : Int = 0
+let eval_valid : Int = 1
+let eval_aborted : Int = 2
+
+fn abs_f64(x : Double) -> Double {
+  if x < 0.0 {
+    -x
+  } else {
+    x
+  }
+}
+
+fn max_f64(a : Double, b : Double) -> Double {
+  if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn round_f64(x : Double) -> Double {
+  if x >= 0.0 {
+    (x + 0.5).to_int64().to_double()
+  } else {
+    (x - 0.5).to_int64().to_double()
+  }
+}
+
+///| Decompose a positive finite IEEE-754 `Double` into `(odd_mantissa, binary_exp)`
+///| such that `val == odd_mantissa * 2^binary_exp`.
+fn f64_odd_mantissa_exp(v : Double) -> (UInt64, Int) {
+  let bits = v.reinterpret_as_uint64()
+  let raw_exp = ((bits >> 52UL) & 0x7FFUL).to_int()
+  let frac = bits & 0xFFFFFFFFFFFFFUL
+  let mut mant : UInt64 = 0UL
+  let mut exp = 0
+  if raw_exp == 0 {
+    // Subnormal
+    mant = frac
+    exp = -1074
+  } else {
+    mant = frac | (1UL << 52UL)
+    exp = raw_exp - 1075
+  }
+  while mant != 0UL && (mant & 1UL) == 0UL {
+    mant = mant >> 1UL
+    exp = exp + 1
+  }
+  (mant, exp)
+}
+
+///| Accurate, overflow-safe `multipleOf` check for both integers and floats (fixes P1-1 & P2-4).
+fn check_multiple_of(x : Double, m : Double) -> Bool {
+  if x == 0.0 {
+    return true
+  }
+  if !is_finite_f64(x) || !is_finite_f64(m) || m <= 0.0 {
+    return false
+  }
+  let ax = abs_f64(x)
+  // If divisor `m` is an exact integer, `x` MUST also be an exact integer!
+  if is_integer_f64(m) {
+    if !is_integer_f64(ax) {
+      return false
+    }
+    if ax < 4503599627370496.0 && m < 4503599627370496.0 {
+      let xi = ax.to_int64()
+      let mi = m.to_int64()
+      if mi == 0L {
+        return false
+      }
+      return xi % mi == 0L
+    }
+  }
+  let q = ax / m
+  if !is_finite_f64(q) {
+    // Quotient overflow (e.g. 1e308 / 0.5 or 2^30 / 2^-1000): exact IEEE-754 binary divisibility!
+    let (ax_odd, ea) = f64_odd_mantissa_exp(ax)
+    let (m_odd, em) = f64_odd_mantissa_exp(m)
+    if m_odd == 0UL {
+      return false
+    }
+    return ea >= em && ax_odd % m_odd == 0UL
+  }
+  if q >= 4503599627370496.0 {
+    return true
+  }
+  let nq = round_f64(q)
+  let err_q = abs_f64(q - nq)
+  // Tight ULP-scaled tolerance on quotient: accepts 0.3/0.1, 19.99/0.01, 0.0075/0.0001
+  // while strictly rejecting 1000000000.0005/1 and 10000000000.005/0.01!
+  err_q <= 1e-14 * max_f64(1.0, q)
+}
+
+///| Count Unicode scalar values (codepoints) in a UTF-8 `String`.
+fn utf8_codepoint_len(s : String) -> Int {
+  let n = s.length()
+  let mut count = 0
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if (b & 0xC0) != 0x80 {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  count
+}
+
+fn check_type_mask(mask : Int, jval : json5::Json5Value) -> Bool {
+  match jval {
+    json5::Json5Value::Null => (mask & type_null) != 0
+    json5::Json5Value::Bool(_) => (mask & type_bool) != 0
+    json5::Json5Value::Number(x) => {
+      if (mask & type_num) != 0 {
+        is_finite_f64(x)
+      } else if (mask & type_int) != 0 {
+        is_integer_f64(x)
+      } else {
+        false
+      }
+    }
+    json5::Json5Value::Str(_) => (mask & type_str) != 0
+    json5::Json5Value::Array(_) => (mask & type_arr) != 0
+    json5::Json5Value::Object(_) => (mask & type_obj) != 0
+  }
+}
+
+fn lookup_prop(node : SchemaNode, key : String) -> Int {
+  match node.prop_map {
+    Some(pm) => {
+      let idx = pm.get(key)
+      if idx >= 0 {
+        node.properties[idx].node_id
+      } else {
+        -1
+      }
+    }
+    None => {
+      let props = node.properties
+      let mut i = 0
+      let n = props.length()
+      while i < n {
+        if props[i].name == key {
+          return props[i].node_id
+        }
+        i = i + 1
+      }
+      -1
+    }
+  }
+}
+
+fn object_has_key(entries : Array[(String, json5::Json5Value)], key : String) -> Bool {
+  let mut i = 0
+  let n = entries.length()
+  while i < n {
+    let (k, _) = entries[i]
+    if k == key {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Resolve a `$dynamicRef` / `$recursiveRef` anchor against the active dynamic scope stack
+///| (outermost scope defining the anchor wins per Draft 2020-12 §8.2.3.2).
+fn resolve_dynamic_target(
+  schema : CompiledSchema,
+  dyn_scopes : Array[Int],
+  anchor : String,
+  fallback : Int,
+) -> Int {
+  let mut i = 0
+  let n = dyn_scopes.length()
+  while i < n {
+    let sid = dyn_scopes[i]
+    if sid >= 0 && sid < schema.dynamic_scopes.length() {
+      let pairs = schema.dynamic_scopes[sid].anchors
+      let mut j = 0
+      while j < pairs.length() {
+        let (an, nid) = pairs[j]
+        if an == anchor {
+          return nid
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  fallback
+}
+
+///| Fast zero-allocation short-circuit validator (used when `!schema.has_unevaluated`).
+///| Returns `eval_valid` (1), `eval_invalid` (0), or `eval_aborted` (2).
+fn is_valid_fast(
+  schema : CompiledSchema,
+  node_id : Int,
+  jval : json5::Json5Value,
+  data_depth : Int,
+  ref_depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+  dyn_scopes : Option[Array[Int]],
+) -> Int {
+  if data_depth > max_depth || ref_depth > 128 {
+    return eval_aborted
+  }
+  // Tail-loop over pure static `$ref` nodes (0 extra stack frames for recursive trees & 200-hop chains!)
+  let mut cur_id = node_id
+  let mut cur_node = schema.nodes[cur_id]
+  if !schema.has_dynamic_ref {
+    let mut hops = 0
+    while cur_node.bool_kind == 0 && cur_node.kw_mask == kw_ref && cur_node.ref_node >= 0 &&
+    cur_node.dynamic_ref_fallback < 0 {
+      hops = hops + 1
+      if hops > 512 {
+        return eval_aborted
+      }
+      cur_id = cur_node.ref_node
+      cur_node = schema.nodes[cur_id]
+    }
+    return is_valid_fast_body(schema, cur_node, jval, data_depth, ref_depth, max_depth, validate_formats, None)
+  }
+  match dyn_scopes {
+    Some(ds) => {
+      let mut pushed_scope = false
+      if cur_node.scope_id >= 0 {
+        let dlen = ds.length()
+        if dlen == 0 || ds[dlen - 1] != cur_node.scope_id {
+          ds.push(cur_node.scope_id)
+          pushed_scope = true
+        }
+      }
+      let res = is_valid_fast_body(schema, cur_node, jval, data_depth, ref_depth, max_depth, validate_formats, dyn_scopes)
+      if pushed_scope {
+        let _ = ds.pop()
+      }
+      res
+    }
+    None => is_valid_fast_body(schema, cur_node, jval, data_depth, ref_depth, max_depth, validate_formats, None)
+  }
+}
+
+fn is_valid_fast_body(
+  schema : CompiledSchema,
+  node : SchemaNode,
+  jval : json5::Json5Value,
+  data_depth : Int,
+  ref_depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+  dyn_scopes : Option[Array[Int]],
+) -> Int {
+  if node.bool_kind != 0 {
+    return if node.bool_kind > 0 { eval_valid } else { eval_invalid }
+  }
+  let km = node.kw_mask
+  if km == 0 {
+    return eval_valid
+  }
+
+  // Type
+  if (km & kw_type) != 0 {
+    if !check_type_mask(node.type_mask, jval) {
+      return eval_invalid
+    }
+  }
+  // Const
+  if (km & kw_const) != 0 {
+    match node.const_val {
+      Some(cv) => {
+        if !json5::value_eq(jval, cv) {
+          return eval_invalid
+        }
+      }
+      None => ()
+    }
+  }
+  // Enum
+  if (km & kw_enum) != 0 {
+    let mut matched = false
+    let evs = node.enum_vals
+    let mut i = 0
+    let n = evs.length()
+    while i < n {
+      if json5::value_eq(jval, evs[i]) {
+        matched = true
+        break
+      }
+      i = i + 1
+    }
+    if !matched {
+      return eval_invalid
+    }
+  }
+
+  // Value-type-specific keywords
+  match jval {
+    json5::Json5Value::Number(x) => {
+      if (km & kw_min) != 0 && x < node.minimum {
+        return eval_invalid
+      }
+      if (km & kw_max) != 0 && x > node.maximum {
+        return eval_invalid
+      }
+      if (km & kw_excl_min) != 0 && x <= node.exclusive_minimum {
+        return eval_invalid
+      }
+      if (km & kw_excl_max) != 0 && x >= node.exclusive_maximum {
+        return eval_invalid
+      }
+      if (km & kw_multiple_of) != 0 && !check_multiple_of(x, node.multiple_of) {
+        return eval_invalid
+      }
+    }
+    json5::Json5Value::Str(s) => {
+      if (km & (kw_min_len | kw_max_len)) != 0 {
+        let cp_len = utf8_codepoint_len(s)
+        if (km & kw_min_len) != 0 && cp_len < node.min_length {
+          return eval_invalid
+        }
+        if (km & kw_max_len) != 0 && cp_len > node.max_length {
+          return eval_invalid
+        }
+      }
+      if (km & kw_pattern) != 0 {
+        match node.pattern_re {
+          Some(re) => {
+            if !ecma_regex_is_match(re, s) {
+              return eval_invalid
+            }
+          }
+          None => ()
+        }
+      }
+      if validate_formats && (km & kw_format) != 0 {
+        if !check_format(node.format_name, s) {
+          return eval_invalid
+        }
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let n = items.length()
+      if (km & kw_min_items) != 0 && n < node.min_items {
+        return eval_invalid
+      }
+      if (km & kw_max_items) != 0 && n > node.max_items {
+        return eval_invalid
+      }
+      if (km & kw_unique_items) != 0 && !check_unique_items(items) {
+        return eval_invalid
+      }
+      let plen = node.prefix_items.length()
+      if (km & kw_prefix_items) != 0 {
+        let limit = if n < plen { n } else { plen }
+        let mut i = 0
+        while i < limit {
+          let r = is_valid_fast(schema, node.prefix_items[i], items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+          if r != eval_valid {
+            return r
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_items) != 0 && node.items_node >= 0 {
+        let mut i = plen
+        while i < n {
+          let r = is_valid_fast(schema, node.items_node, items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+          if r != eval_valid {
+            return r
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_contains) != 0 && node.contains_node >= 0 {
+        let mut matches = 0
+        let mut i = 0
+        while i < n {
+          let r = is_valid_fast(schema, node.contains_node, items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+          if r == eval_aborted {
+            return eval_aborted
+          }
+          if r == eval_valid {
+            matches = matches + 1
+          }
+          i = i + 1
+        }
+        if matches < node.min_contains {
+          return eval_invalid
+        }
+        if node.max_contains >= 0 && matches > node.max_contains {
+          return eval_invalid
+        }
+      }
+    }
+    json5::Json5Value::Object(entries) => {
+      let n = entries.length()
+      if (km & kw_min_props) != 0 && n < node.min_properties {
+        return eval_invalid
+      }
+      if (km & kw_max_props) != 0 && n > node.max_properties {
+        return eval_invalid
+      }
+      let mut key_set_opt : Option[StrSet] = None
+      if (km & kw_required) != 0 {
+        let reqs = node.required
+        let rlen = reqs.length()
+        if n < rlen {
+          return eval_invalid
+        }
+        if n >= 16 && rlen >= 8 {
+          let ks = StrSet::from_object_entries(entries)
+          key_set_opt = Some(ks)
+          let mut i = 0
+          while i < rlen {
+            if !ks.contains(reqs[i]) {
+              return eval_invalid
+            }
+            i = i + 1
+          }
+        } else {
+          let mut i = 0
+          while i < rlen {
+            if !object_has_key(entries, reqs[i]) {
+              return eval_invalid
+            }
+            i = i + 1
+          }
+        }
+      }
+      if (km & (kw_properties | kw_pattern_props | kw_additional_props | kw_property_names)) != 0 {
+        let has_props = (km & kw_properties) != 0
+        let has_pprops = (km & kw_pattern_props) != 0
+        let has_addl = (km & kw_additional_props) != 0 && node.additional_properties >= 0
+        let has_pnames = (km & kw_property_names) != 0 && node.property_names >= 0
+        let pprops = node.pattern_properties
+        let pp_len = pprops.length()
+        let mut i = 0
+        while i < n {
+          let (k, ev) = entries[i]
+          if has_pnames {
+            let r = is_valid_fast(schema, node.property_names, json5::Json5Value::Str(k), data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+            if r != eval_valid {
+              return r
+            }
+          }
+          let mut matched = false
+          if has_props {
+            let pid = lookup_prop(node, k)
+            if pid >= 0 {
+              matched = true
+              let r = is_valid_fast(schema, pid, ev, data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+              if r != eval_valid {
+                return r
+              }
+            }
+          }
+          if has_pprops {
+            let mut j = 0
+            while j < pp_len {
+              if ecma_regex_is_match(pprops[j].compiled, k) {
+                matched = true
+                let r = is_valid_fast(schema, pprops[j].node_id, ev, data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+                if r != eval_valid {
+                  return r
+                }
+              }
+              j = j + 1
+            }
+          }
+          if !matched && has_addl {
+            let addl_node = schema.nodes[node.additional_properties]
+            if addl_node.bool_kind < 0 {
+              return eval_invalid
+            }
+            if addl_node.bool_kind == 0 {
+              let r = is_valid_fast(schema, node.additional_properties, ev, data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+              if r != eval_valid {
+                return r
+              }
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_required) != 0 {
+        let drs = node.dep_required
+        if n >= 16 && (drs.length() >= 8 || (drs.length() > 0 && drs[0].required.length() >= 8)) {
+          match key_set_opt {
+            None => key_set_opt = Some(StrSet::from_object_entries(entries))
+            Some(_) => ()
+          }
+        }
+        let mut i = 0
+        while i < drs.length() {
+          let has_k = match key_set_opt {
+            Some(ks) => ks.contains(drs[i].key)
+            None => object_has_key(entries, drs[i].key)
+          }
+          if has_k {
+            let reqs = drs[i].required
+            let mut j = 0
+            while j < reqs.length() {
+              let has_r = match key_set_opt {
+                Some(ks) => ks.contains(reqs[j])
+                None => object_has_key(entries, reqs[j])
+              }
+              if !has_r {
+                return eval_invalid
+              }
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_schemas) != 0 {
+        let dss = node.dep_schemas
+        let mut i = 0
+        while i < dss.length() {
+          let has_k = match key_set_opt {
+            Some(ks) => ks.contains(dss[i].key)
+            None => object_has_key(entries, dss[i].key)
+          }
+          if has_k {
+            let r = is_valid_fast(schema, dss[i].node_id, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+            if r != eval_valid {
+              return r
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    _ => ()
+  }
+
+  // `$ref` & `$dynamicRef`
+  if (km & kw_ref) != 0 {
+    if node.ref_node >= 0 {
+      let r = is_valid_fast(schema, node.ref_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if r != eval_valid {
+        return r
+      }
+    }
+    if node.dynamic_ref_fallback >= 0 {
+      let tid = if node.dynamic_ref_anchor.length() > 0 {
+        match dyn_scopes {
+          Some(ds) => resolve_dynamic_target(schema, ds, node.dynamic_ref_anchor, node.dynamic_ref_fallback)
+          None => node.dynamic_ref_fallback
+        }
+      } else {
+        node.dynamic_ref_fallback
+      }
+      let r = is_valid_fast(schema, tid, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if r != eval_valid {
+        return r
+      }
+    }
+  }
+
+  // Combinators
+  if (km & kw_combinators) != 0 {
+    let mut i = 0
+    while i < node.all_of.length() {
+      let r = is_valid_fast(schema, node.all_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if r != eval_valid {
+        return r
+      }
+      i = i + 1
+    }
+    if node.any_of.length() > 0 {
+      let mut any_ok = false
+      i = 0
+      while i < node.any_of.length() {
+        let r = is_valid_fast(schema, node.any_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        if r == eval_aborted {
+          return eval_aborted
+        }
+        if r == eval_valid {
+          any_ok = true
+          break
+        }
+        i = i + 1
+      }
+      if !any_ok {
+        return eval_invalid
+      }
+    }
+    if node.one_of.length() > 0 {
+      let mut match_cnt = 0
+      i = 0
+      while i < node.one_of.length() {
+        let r = is_valid_fast(schema, node.one_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        if r == eval_aborted {
+          return eval_aborted
+        }
+        if r == eval_valid {
+          match_cnt = match_cnt + 1
+          if match_cnt > 1 {
+            return eval_invalid
+          }
+        }
+        i = i + 1
+      }
+      if match_cnt != 1 {
+        return eval_invalid
+      }
+    }
+    if node.not_node >= 0 {
+      let r = is_valid_fast(schema, node.not_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if r == eval_aborted {
+        return eval_aborted
+      }
+      if r == eval_valid {
+        return eval_invalid
+      }
+    }
+  }
+
+  // Conditional `if` / `then` / `else`
+  if (km & kw_conditional) != 0 && node.if_node >= 0 {
+    let if_r = is_valid_fast(schema, node.if_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+    if if_r == eval_aborted {
+      return eval_aborted
+    }
+    if if_r == eval_valid {
+      if node.then_node >= 0 {
+        let r = is_valid_fast(schema, node.then_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        if r != eval_valid {
+          return r
+        }
+      }
+    } else if node.else_node >= 0 {
+      let r = is_valid_fast(schema, node.else_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if r != eval_valid {
+        return r
+      }
+    }
+  }
+
+  eval_valid
+}
+
+///| O(1) hashed annotation tracking for `unevaluatedProperties` and `unevaluatedItems` (fixes P1-8).
+struct EvalAnn {
+  mut all_props : Bool
+  props : StrSet
+  mut all_items : Bool
+  mut max_prefix_item : Int
+  items : IntSet
+}
+
+fn EvalAnn::empty() -> EvalAnn {
+  EvalAnn::{
+    all_props: false,
+    props: StrSet::new(),
+    all_items: false,
+    max_prefix_item: -1,
+    items: IntSet::new(),
+  }
+}
+
+fn EvalAnn::add_prop(self : EvalAnn, k : String) -> Unit {
+  if self.all_props {
+    return
+  }
+  self.props.insert(k)
+}
+
+fn EvalAnn::has_prop(self : EvalAnn, k : String) -> Bool {
+  if self.all_props {
+    return true
+  }
+  self.props.contains(k)
+}
+
+fn EvalAnn::add_item(self : EvalAnn, idx : Int) -> Unit {
+  if self.all_items || idx <= self.max_prefix_item {
+    return
+  }
+  self.items.insert(idx)
+}
+
+fn EvalAnn::has_item(self : EvalAnn, idx : Int) -> Bool {
+  if self.all_items || idx <= self.max_prefix_item {
+    return true
+  }
+  self.items.contains(idx)
+}
+
+fn EvalAnn::merge(self : EvalAnn, other : EvalAnn) -> Unit {
+  if other.all_props {
+    self.all_props = true
+  } else if !self.all_props {
+    let items = other.props.items
+    let mut i = 0
+    let n = items.length()
+    while i < n {
+      self.props.insert(items[i])
+      i = i + 1
+    }
+  }
+  if other.all_items {
+    self.all_items = true
+  } else if !self.all_items {
+    if other.max_prefix_item > self.max_prefix_item {
+      self.max_prefix_item = other.max_prefix_item
+    }
+    let items = other.items.items
+    let mut i = 0
+    let n = items.length()
+    while i < n {
+      self.add_item(items[i])
+      i = i + 1
+    }
+  }
+}
+
+///| Annotation-tracking evaluator (used when `schema.has_unevaluated` is true).
+fn eval_node_ann(
+  schema : CompiledSchema,
+  node_id : Int,
+  jval : json5::Json5Value,
+  data_depth : Int,
+  ref_depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+  dyn_scopes : Array[Int],
+) -> (Int, EvalAnn) {
+  let ann = EvalAnn::empty()
+  if data_depth > max_depth || ref_depth > 128 {
+    return (eval_aborted, ann)
+  }
+  let mut cur_id = node_id
+  let mut cur_node = schema.nodes[cur_id]
+  if !schema.has_dynamic_ref {
+    let mut hops = 0
+    while cur_node.bool_kind == 0 && cur_node.kw_mask == kw_ref && cur_node.ref_node >= 0 &&
+    cur_node.dynamic_ref_fallback < 0 {
+      hops = hops + 1
+      if hops > 512 {
+        return (eval_aborted, ann)
+      }
+      cur_id = cur_node.ref_node
+      cur_node = schema.nodes[cur_id]
+    }
+  }
+  let mut pushed_scope = false
+  if schema.has_dynamic_ref && cur_node.scope_id >= 0 {
+    let dlen = dyn_scopes.length()
+    if dlen == 0 || dyn_scopes[dlen - 1] != cur_node.scope_id {
+      dyn_scopes.push(cur_node.scope_id)
+      pushed_scope = true
+    }
+  }
+  let res = eval_node_ann_body(schema, cur_node, jval, data_depth, ref_depth, max_depth, validate_formats, dyn_scopes, ann)
+  if pushed_scope {
+    let _ = dyn_scopes.pop()
+  }
+  res
+}
+
+fn eval_node_ann_body(
+  schema : CompiledSchema,
+  node : SchemaNode,
+  jval : json5::Json5Value,
+  data_depth : Int,
+  ref_depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+  dyn_scopes : Array[Int],
+  ann : EvalAnn,
+) -> (Int, EvalAnn) {
+  if node.bool_kind != 0 {
+    return (if node.bool_kind > 0 { eval_valid } else { eval_invalid }, ann)
+  }
+  let km = node.kw_mask
+  if km == 0 {
+    return (eval_valid, ann)
+  }
+
+  let mut status = eval_valid
+
+  if (km & kw_type) != 0 && !check_type_mask(node.type_mask, jval) {
+    return (eval_invalid, ann)
+  }
+  if (km & kw_const) != 0 {
+    match node.const_val {
+      Some(cv) => if !json5::value_eq(jval, cv) { return (eval_invalid, ann) }
+      None => ()
+    }
+  }
+  if (km & kw_enum) != 0 {
+    let mut matched = false
+    let mut i = 0
+    while i < node.enum_vals.length() {
+      if json5::value_eq(jval, node.enum_vals[i]) {
+        matched = true
+        break
+      }
+      i = i + 1
+    }
+    if !matched {
+      return (eval_invalid, ann)
+    }
+  }
+
+  match jval {
+    json5::Json5Value::Number(x) => {
+      if (km & kw_min) != 0 && x < node.minimum { return (eval_invalid, ann) }
+      if (km & kw_max) != 0 && x > node.maximum { return (eval_invalid, ann) }
+      if (km & kw_excl_min) != 0 && x <= node.exclusive_minimum { return (eval_invalid, ann) }
+      if (km & kw_excl_max) != 0 && x >= node.exclusive_maximum { return (eval_invalid, ann) }
+      if (km & kw_multiple_of) != 0 && !check_multiple_of(x, node.multiple_of) { return (eval_invalid, ann) }
+    }
+    json5::Json5Value::Str(s) => {
+      if (km & (kw_min_len | kw_max_len)) != 0 {
+        let cp_len = utf8_codepoint_len(s)
+        if (km & kw_min_len) != 0 && cp_len < node.min_length { return (eval_invalid, ann) }
+        if (km & kw_max_len) != 0 && cp_len > node.max_length { return (eval_invalid, ann) }
+      }
+      if (km & kw_pattern) != 0 {
+        match node.pattern_re {
+          Some(re) => if !ecma_regex_is_match(re, s) { return (eval_invalid, ann) }
+          None => ()
+        }
+      }
+      if validate_formats && (km & kw_format) != 0 {
+        if !check_format(node.format_name, s) { return (eval_invalid, ann) }
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let n = items.length()
+      if (km & kw_min_items) != 0 && n < node.min_items { return (eval_invalid, ann) }
+      if (km & kw_max_items) != 0 && n > node.max_items { return (eval_invalid, ann) }
+      if (km & kw_unique_items) != 0 && !check_unique_items(items) { return (eval_invalid, ann) }
+      let plen = node.prefix_items.length()
+      if (km & kw_prefix_items) != 0 {
+        let limit = if n < plen { n } else { plen }
+        let mut i = 0
+        while i < limit {
+          let (sub_r, _) = eval_node_ann(schema, node.prefix_items[i], items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+          if sub_r != eval_valid {
+            return (sub_r, ann)
+          }
+          i = i + 1
+        }
+        if limit - 1 > ann.max_prefix_item {
+          ann.max_prefix_item = limit - 1
+        }
+      }
+      if (km & kw_items) != 0 && node.items_node >= 0 {
+        let mut i = plen
+        while i < n {
+          let (sub_r, _) = eval_node_ann(schema, node.items_node, items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+          if sub_r != eval_valid {
+            return (sub_r, ann)
+          }
+          i = i + 1
+        }
+        if n > plen {
+          ann.all_items = true
+        }
+      }
+      if (km & kw_contains) != 0 && node.contains_node >= 0 {
+        let mut matches = 0
+        let mut i = 0
+        while i < n {
+          let (sub_r, _) = eval_node_ann(schema, node.contains_node, items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+          if sub_r == eval_aborted {
+            return (eval_aborted, ann)
+          }
+          if sub_r == eval_valid {
+            matches = matches + 1
+            ann.add_item(i)
+          }
+          i = i + 1
+        }
+        if matches < node.min_contains { return (eval_invalid, ann) }
+        if node.max_contains >= 0 && matches > node.max_contains { return (eval_invalid, ann) }
+      }
+    }
+    json5::Json5Value::Object(entries) => {
+      let n = entries.length()
+      if (km & kw_min_props) != 0 && n < node.min_properties { return (eval_invalid, ann) }
+      if (km & kw_max_props) != 0 && n > node.max_properties { return (eval_invalid, ann) }
+      let mut key_set_opt : Option[StrSet] = None
+      if (km & kw_required) != 0 {
+        let rlen = node.required.length()
+        if n < rlen { return (eval_invalid, ann) }
+        if n >= 16 && rlen >= 8 {
+          let ks = StrSet::from_object_entries(entries)
+          key_set_opt = Some(ks)
+          let mut i = 0
+          while i < rlen {
+            if !ks.contains(node.required[i]) { return (eval_invalid, ann) }
+            i = i + 1
+          }
+        } else {
+          let mut i = 0
+          while i < rlen {
+            if !object_has_key(entries, node.required[i]) { return (eval_invalid, ann) }
+            i = i + 1
+          }
+        }
+      }
+      if (km & (kw_properties | kw_pattern_props | kw_additional_props | kw_property_names)) != 0 {
+        let has_props = (km & kw_properties) != 0
+        let has_pprops = (km & kw_pattern_props) != 0
+        let has_addl = (km & kw_additional_props) != 0 && node.additional_properties >= 0
+        let has_pnames = (km & kw_property_names) != 0 && node.property_names >= 0
+        let pprops = node.pattern_properties
+        let mut i = 0
+        while i < n {
+          let (k, ev) = entries[i]
+          if has_pnames {
+            let (pn_r, _) = eval_node_ann(schema, node.property_names, json5::Json5Value::Str(k), data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+            if pn_r != eval_valid { return (pn_r, ann) }
+          }
+          let mut matched = false
+          if has_props {
+            let pid = lookup_prop(node, k)
+            if pid >= 0 {
+              matched = true
+              let (p_r, _) = eval_node_ann(schema, pid, ev, data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+              if p_r != eval_valid { return (p_r, ann) }
+              if !has_addl {
+                ann.add_prop(k)
+              }
+            }
+          }
+          if has_pprops {
+            let mut j = 0
+            while j < pprops.length() {
+              if ecma_regex_is_match(pprops[j].compiled, k) {
+                matched = true
+                let (pp_r, _) = eval_node_ann(schema, pprops[j].node_id, ev, data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+                if pp_r != eval_valid { return (pp_r, ann) }
+                if !has_addl {
+                  ann.add_prop(k)
+                }
+              }
+              j = j + 1
+            }
+          }
+          if !matched && has_addl {
+            let (a_r, _) = eval_node_ann(schema, node.additional_properties, ev, data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+            if a_r != eval_valid { return (a_r, ann) }
+          }
+          i = i + 1
+        }
+        // If `additionalProperties` was present and every key passed, ALL keys are evaluated!
+        if has_addl {
+          ann.all_props = true
+        }
+      }
+      if (km & kw_dep_required) != 0 {
+        if n >= 16 && (node.dep_required.length() >= 8 || (node.dep_required.length() > 0 && node.dep_required[0].required.length() >= 8)) {
+          match key_set_opt {
+            None => key_set_opt = Some(StrSet::from_object_entries(entries))
+            Some(_) => ()
+          }
+        }
+        let mut i = 0
+        while i < node.dep_required.length() {
+          let has_k = match key_set_opt {
+            Some(ks) => ks.contains(node.dep_required[i].key)
+            None => object_has_key(entries, node.dep_required[i].key)
+          }
+          if has_k {
+            let reqs = node.dep_required[i].required
+            let mut j = 0
+            while j < reqs.length() {
+              let has_r = match key_set_opt {
+                Some(ks) => ks.contains(reqs[j])
+                None => object_has_key(entries, reqs[j])
+              }
+              if !has_r { return (eval_invalid, ann) }
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_schemas) != 0 {
+        let mut i = 0
+        while i < node.dep_schemas.length() {
+          let has_k = match key_set_opt {
+            Some(ks) => ks.contains(node.dep_schemas[i].key)
+            None => object_has_key(entries, node.dep_schemas[i].key)
+          }
+          if has_k {
+            let (ds_r, ds_ann) = eval_node_ann(schema, node.dep_schemas[i].node_id, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+            if ds_r != eval_valid { return (ds_r, ann) }
+            ann.merge(ds_ann)
+          }
+          i = i + 1
+        }
+      }
+    }
+    _ => ()
+  }
+
+  // `$ref` & `$dynamicRef`
+  if (km & kw_ref) != 0 {
+    if node.ref_node >= 0 {
+      let (r_res, r_ann) = eval_node_ann(schema, node.ref_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if r_res != eval_valid { return (r_res, ann) }
+      ann.merge(r_ann)
+    }
+    if node.dynamic_ref_fallback >= 0 {
+      let tid = if node.dynamic_ref_anchor.length() > 0 {
+        resolve_dynamic_target(schema, dyn_scopes, node.dynamic_ref_anchor, node.dynamic_ref_fallback)
+      } else {
+        node.dynamic_ref_fallback
+      }
+      let (r_res, r_ann) = eval_node_ann(schema, tid, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if r_res != eval_valid { return (r_res, ann) }
+      ann.merge(r_ann)
+    }
+  }
+
+  // Combinators
+  if (km & kw_combinators) != 0 {
+    let mut i = 0
+    while i < node.all_of.length() {
+      let (s_r, s_ann) = eval_node_ann(schema, node.all_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if s_r != eval_valid { return (s_r, ann) }
+      ann.merge(s_ann)
+      i = i + 1
+    }
+    if node.any_of.length() > 0 {
+      let mut any_ok = false
+      i = 0
+      while i < node.any_of.length() {
+        let (s_r, s_ann) = eval_node_ann(schema, node.any_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        if s_r == eval_aborted { return (eval_aborted, ann) }
+        if s_r == eval_valid {
+          any_ok = true
+          ann.merge(s_ann)
+        }
+        i = i + 1
+      }
+      if !any_ok { return (eval_invalid, ann) }
+    }
+    if node.one_of.length() > 0 {
+      let mut match_cnt = 0
+      let mut matched_ann = EvalAnn::empty()
+      i = 0
+      while i < node.one_of.length() {
+        let (s_r, s_ann) = eval_node_ann(schema, node.one_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        if s_r == eval_aborted { return (eval_aborted, ann) }
+        if s_r == eval_valid {
+          match_cnt = match_cnt + 1
+          matched_ann = s_ann
+        }
+        i = i + 1
+      }
+      if match_cnt != 1 { return (eval_invalid, ann) }
+      ann.merge(matched_ann)
+    }
+    // `not` NEVER produces annotations, and NEVER negates `eval_aborted`!
+    if node.not_node >= 0 {
+      let (n_r, _) = eval_node_ann(schema, node.not_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if n_r == eval_aborted { return (eval_aborted, ann) }
+      if n_r == eval_valid { return (eval_invalid, ann) }
+    }
+  }
+
+  // Conditional `if` / `then` / `else`
+  if (km & kw_conditional) != 0 && node.if_node >= 0 {
+    let (if_r, if_ann) = eval_node_ann(schema, node.if_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+    if if_r == eval_aborted { return (eval_aborted, ann) }
+    if if_r == eval_valid {
+      ann.merge(if_ann)
+      if node.then_node >= 0 {
+        let (t_r, t_ann) = eval_node_ann(schema, node.then_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        if t_r != eval_valid { return (t_r, ann) }
+        ann.merge(t_ann)
+      }
+    } else if node.else_node >= 0 {
+      let (e_r, e_ann) = eval_node_ann(schema, node.else_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+      if e_r != eval_valid { return (e_r, ann) }
+      ann.merge(e_ann)
+    }
+  }
+
+  // `unevaluatedProperties` & `unevaluatedItems`
+  if (km & kw_unevaluated) != 0 {
+    if node.unevaluated_properties >= 0 {
+      match jval {
+        json5::Json5Value::Object(entries) => {
+          let mut i = 0
+          while i < entries.length() {
+            let (k, ev) = entries[i]
+            if !ann.has_prop(k) {
+              let (u_r, _) = eval_node_ann(schema, node.unevaluated_properties, ev, data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+              if u_r != eval_valid {
+                status = u_r
+                break
+              }
+              ann.add_prop(k)
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+    if status == eval_valid && node.unevaluated_items >= 0 {
+      match jval {
+        json5::Json5Value::Array(items) => {
+          let mut i = 0
+          while i < items.length() {
+            if !ann.has_item(i) {
+              let (u_r, _) = eval_node_ann(schema, node.unevaluated_items, items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+              if u_r != eval_valid {
+                status = u_r
+                break
+              }
+              ann.add_item(i)
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+
+  (status, ann)
+}
+
+///| Full diagnostic validator collecting ALL `ValidationError`s (skips annotation bookkeeping when `!track_ann`).
+fn validate_node_collect(
+  schema : CompiledSchema,
+  node_id : Int,
+  jval : json5::Json5Value,
+  inst_path : String,
+  data_depth : Int,
+  ref_depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+  track_ann : Bool,
+  dyn_scopes : Array[Int],
+  errors : Array[ValidationError],
+) -> (Int, EvalAnn) {
+  let ann = EvalAnn::empty()
+  let mut cur_id = node_id
+  let mut cur_node = schema.nodes[cur_id]
+  if data_depth > max_depth || ref_depth > 128 {
+    errors.push(ValidationError::new(inst_path, cur_node.schema_path, "maxDepth", "validation recursion depth exceeded"))
+    return (eval_aborted, ann)
+  }
+  if !schema.has_dynamic_ref {
+    let mut hops = 0
+    while cur_node.bool_kind == 0 && cur_node.kw_mask == kw_ref && cur_node.ref_node >= 0 &&
+    cur_node.dynamic_ref_fallback < 0 {
+      hops = hops + 1
+      if hops > 512 {
+        errors.push(ValidationError::new(inst_path, cur_node.schema_path, "maxDepth", "validation $ref cycle depth exceeded"))
+        return (eval_aborted, ann)
+      }
+      cur_id = cur_node.ref_node
+      cur_node = schema.nodes[cur_id]
+    }
+  }
+  let mut pushed_scope = false
+  if schema.has_dynamic_ref && cur_node.scope_id >= 0 {
+    let dlen = dyn_scopes.length()
+    if dlen == 0 || dyn_scopes[dlen - 1] != cur_node.scope_id {
+      dyn_scopes.push(cur_node.scope_id)
+      pushed_scope = true
+    }
+  }
+  let res = validate_node_collect_body(
+    schema,
+    cur_node,
+    jval,
+    inst_path,
+    data_depth,
+    ref_depth,
+    max_depth,
+    validate_formats,
+    track_ann,
+    dyn_scopes,
+    errors,
+    ann,
+  )
+  if pushed_scope {
+    let _ = dyn_scopes.pop()
+  }
+  res
+}
+
+fn validate_node_collect_body(
+  schema : CompiledSchema,
+  node : SchemaNode,
+  jval : json5::Json5Value,
+  inst_path : String,
+  data_depth : Int,
+  ref_depth : Int,
+  max_depth : Int,
+  validate_formats : Bool,
+  track_ann : Bool,
+  dyn_scopes : Array[Int],
+  errors : Array[ValidationError],
+  ann : EvalAnn,
+) -> (Int, EvalAnn) {
+  let start_errs = errors.length()
+  if node.bool_kind != 0 {
+    if node.bool_kind < 0 {
+      errors.push(ValidationError::new(inst_path, node.schema_path, "false", "boolean schema is false"))
+      return (eval_invalid, ann)
+    }
+    return (eval_valid, ann)
+  }
+  let km = node.kw_mask
+  if km == 0 {
+    return (eval_valid, ann)
+  }
+
+  if (km & kw_type) != 0 && !check_type_mask(node.type_mask, jval) {
+    errors.push(ValidationError::new(inst_path, node.schema_path + "/type", "type", "instance type does not match schema"))
+  }
+  if (km & kw_const) != 0 {
+    match node.const_val {
+      Some(cv) => {
+        if !json5::value_eq(jval, cv) {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/const", "const", "instance does not match const value"))
+        }
+      }
+      None => ()
+    }
+  }
+  if (km & kw_enum) != 0 {
+    let mut matched = false
+    let mut i = 0
+    while i < node.enum_vals.length() {
+      if json5::value_eq(jval, node.enum_vals[i]) {
+        matched = true
+        break
+      }
+      i = i + 1
+    }
+    if !matched {
+      errors.push(ValidationError::new(inst_path, node.schema_path + "/enum", "enum", "instance is not one of the allowed enum values"))
+    }
+  }
+
+  match jval {
+    json5::Json5Value::Number(x) => {
+      if (km & kw_min) != 0 && x < node.minimum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/minimum", "minimum", "number is less than minimum"))
+      }
+      if (km & kw_max) != 0 && x > node.maximum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/maximum", "maximum", "number is greater than maximum"))
+      }
+      if (km & kw_excl_min) != 0 && x <= node.exclusive_minimum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/exclusiveMinimum", "exclusiveMinimum", "number is not strictly greater than exclusiveMinimum"))
+      }
+      if (km & kw_excl_max) != 0 && x >= node.exclusive_maximum {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/exclusiveMaximum", "exclusiveMaximum", "number is not strictly less than exclusiveMaximum"))
+      }
+      if (km & kw_multiple_of) != 0 && !check_multiple_of(x, node.multiple_of) {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/multipleOf", "multipleOf", "number is not a multiple of multipleOf"))
+      }
+    }
+    json5::Json5Value::Str(s) => {
+      if (km & (kw_min_len | kw_max_len)) != 0 {
+        let cp_len = utf8_codepoint_len(s)
+        if (km & kw_min_len) != 0 && cp_len < node.min_length {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/minLength", "minLength", "string is shorter than minLength"))
+        }
+        if (km & kw_max_len) != 0 && cp_len > node.max_length {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/maxLength", "maxLength", "string is longer than maxLength"))
+        }
+      }
+      if (km & kw_pattern) != 0 {
+        match node.pattern_re {
+          Some(re) => {
+            if !ecma_regex_is_match(re, s) {
+              errors.push(ValidationError::new(inst_path, node.schema_path + "/pattern", "pattern", "string does not match pattern: " + node.pattern_str))
+            }
+          }
+          None => ()
+        }
+      }
+      if validate_formats && (km & kw_format) != 0 {
+        if !check_format(node.format_name, s) {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/format", "format", "string does not match format: " + node.format_name))
+        }
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let n = items.length()
+      if (km & kw_min_items) != 0 && n < node.min_items {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/minItems", "minItems", "array has fewer items than minItems"))
+      }
+      if (km & kw_max_items) != 0 && n > node.max_items {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/maxItems", "maxItems", "array has more items than maxItems"))
+      }
+      if (km & kw_unique_items) != 0 && !check_unique_items(items) {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/uniqueItems", "uniqueItems", "array contains duplicate items"))
+      }
+      let plen = node.prefix_items.length()
+      if (km & kw_prefix_items) != 0 {
+        let limit = if n < plen { n } else { plen }
+        let mut i = 0
+        while i < limit {
+          let (sr, _) = validate_node_collect(schema, node.prefix_items[i], items[i], inst_path + "/" + i.to_string(), data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+          if sr == eval_aborted { return (eval_aborted, ann) }
+          i = i + 1
+        }
+        if track_ann && limit - 1 > ann.max_prefix_item {
+          ann.max_prefix_item = limit - 1
+        }
+      }
+      if (km & kw_items) != 0 && node.items_node >= 0 {
+        let mut i = plen
+        while i < n {
+          let (sr, _) = validate_node_collect(schema, node.items_node, items[i], inst_path + "/" + i.to_string(), data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+          if sr == eval_aborted { return (eval_aborted, ann) }
+          i = i + 1
+        }
+        if track_ann && n > plen {
+          ann.all_items = true
+        }
+      }
+      if (km & kw_contains) != 0 && node.contains_node >= 0 {
+        let mut matches = 0
+        let mut i = 0
+        while i < n {
+          let sub_r = if track_ann {
+            let (r, _) = eval_node_ann(schema, node.contains_node, items[i], data_depth + 1, 0, max_depth, validate_formats, dyn_scopes)
+            r
+          } else {
+            let ds_opt : Option[Array[Int]] = if schema.has_dynamic_ref { Some(dyn_scopes) } else { None }
+            is_valid_fast(schema, node.contains_node, items[i], data_depth + 1, 0, max_depth, validate_formats, ds_opt)
+          }
+          if sub_r == eval_aborted {
+            errors.push(ValidationError::new(inst_path, node.schema_path + "/contains", "maxDepth", "validation recursion depth exceeded"))
+            return (eval_aborted, ann)
+          }
+          if sub_r == eval_valid {
+            matches = matches + 1
+            if track_ann {
+              ann.add_item(i)
+            }
+          }
+          i = i + 1
+        }
+        if matches < node.min_contains {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/contains", "contains", "array does not contain enough matching items"))
+        }
+        if node.max_contains >= 0 && matches > node.max_contains {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/maxContains", "maxContains", "array contains too many matching items"))
+        }
+      }
+    }
+    json5::Json5Value::Object(entries) => {
+      let n = entries.length()
+      if (km & kw_min_props) != 0 && n < node.min_properties {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/minProperties", "minProperties", "object has fewer properties than minProperties"))
+      }
+      if (km & kw_max_props) != 0 && n > node.max_properties {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/maxProperties", "maxProperties", "object has more properties than maxProperties"))
+      }
+      let mut key_set_opt : Option[StrSet] = None
+      if (km & kw_required) != 0 {
+        let rlen = node.required.length()
+        if n >= 16 && rlen >= 8 {
+          let ks = StrSet::from_object_entries(entries)
+          key_set_opt = Some(ks)
+          let mut i = 0
+          while i < rlen {
+            let rk = node.required[i]
+            if !ks.contains(rk) {
+              errors.push(ValidationError::new(inst_path, node.schema_path + "/required", "required", "missing required property: " + rk))
+            }
+            i = i + 1
+          }
+        } else {
+          let mut i = 0
+          while i < rlen {
+            let rk = node.required[i]
+            if !object_has_key(entries, rk) {
+              errors.push(ValidationError::new(inst_path, node.schema_path + "/required", "required", "missing required property: " + rk))
+            }
+            i = i + 1
+          }
+        }
+      }
+      if (km & (kw_properties | kw_pattern_props | kw_additional_props | kw_property_names)) != 0 {
+        let has_props = (km & kw_properties) != 0
+        let has_pprops = (km & kw_pattern_props) != 0
+        let has_addl = (km & kw_additional_props) != 0 && node.additional_properties >= 0
+        let has_pnames = (km & kw_property_names) != 0 && node.property_names >= 0
+        let pprops = node.pattern_properties
+        let mut all_addl_ok = has_addl
+        let mut i = 0
+        while i < n {
+          let (k, ev) = entries[i]
+          let child_path = inst_path + "/" + escape_ptr_token(k)
+          if has_pnames {
+            let (sr, _) = validate_node_collect(schema, node.property_names, json5::Json5Value::Str(k), child_path, data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+            if sr == eval_aborted { return (eval_aborted, ann) }
+          }
+          let mut matched = false
+          if has_props {
+            let pid = lookup_prop(node, k)
+            if pid >= 0 {
+              matched = true
+              let (sr, _) = validate_node_collect(schema, pid, ev, child_path, data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+              if sr == eval_aborted { return (eval_aborted, ann) }
+              if track_ann && !has_addl {
+                ann.add_prop(k)
+              }
+            }
+          }
+          if has_pprops {
+            let mut j = 0
+            while j < pprops.length() {
+              if ecma_regex_is_match(pprops[j].compiled, k) {
+                matched = true
+                let (sr, _) = validate_node_collect(schema, pprops[j].node_id, ev, child_path, data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+                if sr == eval_aborted { return (eval_aborted, ann) }
+                if track_ann && !has_addl {
+                  ann.add_prop(k)
+                }
+              }
+              j = j + 1
+            }
+          }
+          if !matched && has_addl {
+            let (sr, _) = validate_node_collect(schema, node.additional_properties, ev, child_path, data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+            if sr == eval_aborted { return (eval_aborted, ann) }
+            if sr != eval_valid {
+              all_addl_ok = false
+            }
+          }
+          i = i + 1
+        }
+        if track_ann && has_addl {
+          if all_addl_ok {
+            ann.all_props = true
+          } else {
+            // Only mark properties that were actually evaluated (fallback for error case)
+            ann.all_props = true
+          }
+        }
+      }
+      if (km & kw_dep_required) != 0 {
+        if n >= 16 && (node.dep_required.length() >= 8 || (node.dep_required.length() > 0 && node.dep_required[0].required.length() >= 8)) {
+          match key_set_opt {
+            None => key_set_opt = Some(StrSet::from_object_entries(entries))
+            Some(_) => ()
+          }
+        }
+        let mut i = 0
+        while i < node.dep_required.length() {
+          let has_k = match key_set_opt {
+            Some(ks) => ks.contains(node.dep_required[i].key)
+            None => object_has_key(entries, node.dep_required[i].key)
+          }
+          if has_k {
+            let reqs = node.dep_required[i].required
+            let mut j = 0
+            while j < reqs.length() {
+              let has_r = match key_set_opt {
+                Some(ks) => ks.contains(reqs[j])
+                None => object_has_key(entries, reqs[j])
+              }
+              if !has_r {
+                errors.push(ValidationError::new(inst_path, node.schema_path + "/dependentRequired", "dependentRequired", "missing dependent required property: " + reqs[j]))
+              }
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      if (km & kw_dep_schemas) != 0 {
+        let mut i = 0
+        while i < node.dep_schemas.length() {
+          let has_k = match key_set_opt {
+            Some(ks) => ks.contains(node.dep_schemas[i].key)
+            None => object_has_key(entries, node.dep_schemas[i].key)
+          }
+          if has_k {
+            let (ds_r, ds_ann) = validate_node_collect(schema, node.dep_schemas[i].node_id, jval, inst_path, data_depth, ref_depth + 1, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+            if ds_r == eval_aborted { return (eval_aborted, ann) }
+            if track_ann && ds_r == eval_valid {
+              ann.merge(ds_ann)
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    _ => ()
+  }
+
+  // `$ref` & `$dynamicRef`
+  if (km & kw_ref) != 0 {
+    if node.ref_node >= 0 {
+      let (r_res, r_ann) = validate_node_collect(schema, node.ref_node, jval, inst_path, data_depth, ref_depth + 1, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+      if r_res == eval_aborted { return (eval_aborted, ann) }
+      if track_ann && r_res == eval_valid {
+        ann.merge(r_ann)
+      }
+    }
+    if node.dynamic_ref_fallback >= 0 {
+      let tid = if node.dynamic_ref_anchor.length() > 0 {
+        resolve_dynamic_target(schema, dyn_scopes, node.dynamic_ref_anchor, node.dynamic_ref_fallback)
+      } else {
+        node.dynamic_ref_fallback
+      }
+      let (r_res, r_ann) = validate_node_collect(schema, tid, jval, inst_path, data_depth, ref_depth + 1, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+      if r_res == eval_aborted { return (eval_aborted, ann) }
+      if track_ann && r_res == eval_valid {
+        ann.merge(r_ann)
+      }
+    }
+  }
+
+  // Combinators
+  if (km & kw_combinators) != 0 {
+    let mut i = 0
+    while i < node.all_of.length() {
+      let (s_r, s_ann) = validate_node_collect(schema, node.all_of[i], jval, inst_path, data_depth, ref_depth + 1, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+      if s_r == eval_aborted { return (eval_aborted, ann) }
+      if track_ann && s_r == eval_valid {
+        ann.merge(s_ann)
+      }
+      i = i + 1
+    }
+    if node.any_of.length() > 0 {
+      let mut any_ok = false
+      i = 0
+      while i < node.any_of.length() {
+        let (s_r, s_ann) = if track_ann {
+          eval_node_ann(schema, node.any_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        } else {
+          let ds_opt : Option[Array[Int]] = if schema.has_dynamic_ref { Some(dyn_scopes) } else { None }
+          (is_valid_fast(schema, node.any_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, ds_opt), EvalAnn::empty())
+        }
+        if s_r == eval_aborted {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/anyOf", "maxDepth", "validation recursion depth exceeded"))
+          return (eval_aborted, ann)
+        }
+        if s_r == eval_valid {
+          any_ok = true
+          if track_ann {
+            ann.merge(s_ann)
+          }
+        }
+        i = i + 1
+      }
+      if !any_ok {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/anyOf", "anyOf", "instance did not match any schema in anyOf"))
+      }
+    }
+    if node.one_of.length() > 0 {
+      let mut match_cnt = 0
+      let mut matched_ann = EvalAnn::empty()
+      i = 0
+      while i < node.one_of.length() {
+        let (s_r, s_ann) = if track_ann {
+          eval_node_ann(schema, node.one_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        } else {
+          let ds_opt : Option[Array[Int]] = if schema.has_dynamic_ref { Some(dyn_scopes) } else { None }
+          (is_valid_fast(schema, node.one_of[i], jval, data_depth, ref_depth + 1, max_depth, validate_formats, ds_opt), EvalAnn::empty())
+        }
+        if s_r == eval_aborted {
+          errors.push(ValidationError::new(inst_path, node.schema_path + "/oneOf", "maxDepth", "validation recursion depth exceeded"))
+          return (eval_aborted, ann)
+        }
+        if s_r == eval_valid {
+          match_cnt = match_cnt + 1
+          if track_ann {
+            matched_ann = s_ann
+          }
+        }
+        i = i + 1
+      }
+      if match_cnt != 1 {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/oneOf", "oneOf", "instance must match exactly one schema in oneOf"))
+      } else if track_ann {
+        ann.merge(matched_ann)
+      }
+    }
+    if node.not_node >= 0 {
+      let n_r = if track_ann {
+        let (r, _) = eval_node_ann(schema, node.not_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+        r
+      } else {
+        let ds_opt : Option[Array[Int]] = if schema.has_dynamic_ref { Some(dyn_scopes) } else { None }
+        is_valid_fast(schema, node.not_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, ds_opt)
+      }
+      if n_r == eval_aborted {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/not", "maxDepth", "validation recursion depth exceeded"))
+        return (eval_aborted, ann)
+      }
+      if n_r == eval_valid {
+        errors.push(ValidationError::new(inst_path, node.schema_path + "/not", "not", "instance must not match schema in not"))
+      }
+    }
+  }
+
+  // Conditional `if` / `then` / `else`
+  if (km & kw_conditional) != 0 && node.if_node >= 0 {
+    let (if_r, if_ann) = if track_ann {
+      eval_node_ann(schema, node.if_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, dyn_scopes)
+    } else {
+      let ds_opt : Option[Array[Int]] = if schema.has_dynamic_ref { Some(dyn_scopes) } else { None }
+      (is_valid_fast(schema, node.if_node, jval, data_depth, ref_depth + 1, max_depth, validate_formats, ds_opt), EvalAnn::empty())
+    }
+    if if_r == eval_aborted {
+      errors.push(ValidationError::new(inst_path, node.schema_path + "/if", "maxDepth", "validation recursion depth exceeded"))
+      return (eval_aborted, ann)
+    }
+    if if_r == eval_valid {
+      if track_ann {
+        ann.merge(if_ann)
+      }
+      if node.then_node >= 0 {
+        let (t_r, t_ann) = validate_node_collect(schema, node.then_node, jval, inst_path, data_depth, ref_depth + 1, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+        if t_r == eval_aborted { return (eval_aborted, ann) }
+        if track_ann && t_r == eval_valid {
+          ann.merge(t_ann)
+        }
+      }
+    } else if node.else_node >= 0 {
+      let (e_r, e_ann) = validate_node_collect(schema, node.else_node, jval, inst_path, data_depth, ref_depth + 1, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+      if e_r == eval_aborted { return (eval_aborted, ann) }
+      if track_ann && e_r == eval_valid {
+        ann.merge(e_ann)
+      }
+    }
+  }
+
+  // `unevaluatedProperties` & `unevaluatedItems`
+  if (km & kw_unevaluated) != 0 {
+    if node.unevaluated_properties >= 0 {
+      match jval {
+        json5::Json5Value::Object(entries) => {
+          let mut i = 0
+          while i < entries.length() {
+            let (k, ev) = entries[i]
+            if !ann.has_prop(k) {
+              let child_path = inst_path + "/" + escape_ptr_token(k)
+              let (u_r, _) = validate_node_collect(schema, node.unevaluated_properties, ev, child_path, data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+              if u_r == eval_aborted { return (eval_aborted, ann) }
+              if u_r == eval_valid {
+                ann.add_prop(k)
+              }
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+    if node.unevaluated_items >= 0 {
+      match jval {
+        json5::Json5Value::Array(items) => {
+          let mut i = 0
+          while i < items.length() {
+            if !ann.has_item(i) {
+              let child_path = inst_path + "/" + i.to_string()
+              let (u_r, _) = validate_node_collect(schema, node.unevaluated_items, items[i], child_path, data_depth + 1, 0, max_depth, validate_formats, track_ann, dyn_scopes, errors)
+              if u_r == eval_aborted { return (eval_aborted, ann) }
+              if u_r == eval_valid {
+                ann.add_item(i)
+              }
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+
+  let status = if errors.length() == start_errs { eval_valid } else { eval_invalid }
+  (status, ann)
+}
+
+fn is_valid_raw_impl(
+  schema : CompiledSchema,
+  instance : json5::Json5Value,
+  validate_formats : Bool,
+  opt_max_depth : Int,
+) -> Bool {
+  let raw_d = if opt_max_depth > 0 { opt_max_depth } else { schema.default_max_depth }
+  let max_d = if raw_d == 128 || raw_d > 256 { 256 } else { raw_d }
+  if schema.has_unevaluated {
+    let dyn_scopes : Array[Int] = []
+    let (res, _) = eval_node_ann(schema, schema.root, instance, 0, 0, max_d, validate_formats, dyn_scopes)
+    res == eval_valid
+  } else {
+    let dyn_opt : Option[Array[Int]] = if schema.has_dynamic_ref { Some([]) } else { None }
+    let res = is_valid_fast(schema, schema.root, instance, 0, 0, max_d, validate_formats, dyn_opt)
+    res == eval_valid
+  }
+}
+
+fn validate_impl(
+  schema : CompiledSchema,
+  instance : json5::Json5Value,
+  opts : ValidateOptions,
+) -> Array[ValidationError] {
+  let raw_d = if opts.max_depth > 0 { opts.max_depth } else { schema.default_max_depth }
+  let max_d = if raw_d == 128 || raw_d > 256 { 256 } else { raw_d }
+  let errors : Array[ValidationError] = []
+  let dyn_scopes : Array[Int] = []
+  let _ = validate_node_collect(
+    schema,
+    schema.root,
+    instance,
+    "",
+    0,
+    0,
+    max_d,
+    opts.validate_formats,
+    schema.has_unevaluated,
+    dyn_scopes,
+    errors,
+  )
+  errors
+}
