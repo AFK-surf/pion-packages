@@ -1,0 +1,459 @@
+///| Red-team regression tests for packages/avro @ 79be97f (branch feat/pkg-avro).
+///
+/// Every `redteam_*` test asserts the behaviour required by the Apache Avro 1.11.1
+/// specification and shared by the reference implementations (Java avro 1.11.1 and/or
+/// Go github.com/hamba/avro/v2 v2.28.0) -- a FAILURE here is the evidence of a finding.
+/// `control_*` tests are attacks that Pion survived; they must keep passing.
+/// Crash / memory findings that cannot live in a unit test that must finish
+/// (SIGSEGV, wasm RangeError, Memory.grow trap) are reproduced by ../run_audit.sh.
+
+import "avro"
+
+// ---------------------------------------------------------------------------
+// F-01 (P1) Schema resolution compares FULL names of record / enum / fixed.
+// Avro 1.11.1 "Schema Resolution": "both schemas are records with the same (unqualified)
+// name", "enums with the same (unqualified) name", "fixed with same size and (unqualified)
+// name". hamba checkSchemaName compares Name() (unqualified). Moving a type to another
+// namespace therefore breaks every reader in Pion (ResolutionError at compile time).
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_resolve_record_unqualified_name_match" {
+  let w = ps("{\"type\":\"record\",\"name\":\"a.X\",\"fields\":[{\"name\":\"f\",\"type\":\"int\"}]}")
+  let r = ps("{\"type\":\"record\",\"name\":\"b.X\",\"fields\":[{\"name\":\"f\",\"type\":\"int\"}]}")
+  match avro::decode_datum_resolved(w, r, hx("0e")) {
+    Ok(v) =>
+    debug_assert(
+      avro::avro_value_eq(v, avro::AvroValue::Record([("f", avro::AvroValue::Int(7))])),
+      "a.X -> b.X must decode to {f: 7}",
+    )
+    Err(e) => debug_assert(false, "a.X -> b.X must resolve (unqualified names match): " + avro::error_message(e))
+  }
+}
+
+///|
+test "redteam_resolve_enum_unqualified_name_match" {
+  let w = ps("{\"type\":\"enum\",\"name\":\"a.E\",\"symbols\":[\"A\"]}")
+  let r = ps("{\"type\":\"enum\",\"name\":\"b.E\",\"symbols\":[\"A\"]}")
+  debug_assert(is_ok_value(avro::decode_datum_resolved(w, r, hx("00"))), "enum a.E -> b.E must resolve")
+}
+
+///|
+test "redteam_resolve_fixed_unqualified_name_match" {
+  let w = ps("{\"type\":\"fixed\",\"name\":\"a.F\",\"size\":1}")
+  let r = ps("{\"type\":\"fixed\",\"name\":\"b.F\",\"size\":1}")
+  debug_assert(is_ok_value(avro::decode_datum_resolved(w, r, hx("05"))), "fixed a.F -> b.F must resolve")
+}
+
+// ---------------------------------------------------------------------------
+// F-02 (P1) write_ocf stores the Parsing Canonical Form as `avro.schema`.
+// PCF strips logicalType / doc / default / aliases / order, so every .avro file written
+// by Pion silently loses its logical types (timestamp-millis, decimal, uuid...). Java and
+// hamba write the full schema. A Go/Java reader then sees `long` instead of a timestamp and
+// raw bytes instead of a decimal; Pion's own read_ocf cannot get them back either.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_write_ocf_keeps_logical_types" {
+  let s = ps(
+    "{\"type\":\"record\",\"name\":\"Ev\",\"fields\":[{\"name\":\"at\",\"type\":{\"type\":\"long\",\"logicalType\":\"timestamp-millis\"}}]}",
+  )
+  let rec = avro::AvroValue::Record([("at", avro::AvroValue::Long(1700000000123L))])
+  let file = match avro::write_ocf(s, [rec], avro::OcfOptions::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "write_ocf: " + avro::error_message(e))
+      return
+    }
+  }
+  match avro::read_ocf(file) {
+    Ok(f) => {
+      let mut stored = ""
+      let mut i = 0
+      while i < f.metadata.length() {
+        let (k, v) = f.metadata[i]
+        if k == "avro.schema" {
+          stored = v.to_string()
+        }
+        i = i + 1
+      }
+      debug_assert(
+        stored.contains("timestamp-millis"),
+        "avro.schema written by write_ocf lost the logical type: " + stored,
+      )
+    }
+    Err(e) => debug_assert(false, "read_ocf: " + avro::error_message(e))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-03 (P1) AvroLimits.max_elements is a per-OCF-BLOCK budget (a fresh BinReader per block),
+// not a per-file one, and read_ocf has no streaming API: a 1,493-byte file of 64 blocks,
+// each one array<null> of 1,000,000 items, materialises 64,000,000 values (494 MiB RSS);
+// the amplification is linear in the block count (see run_audit.sh section 4). Here: a
+// 1,000-element budget lets 4 x 1,000 elements through.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_ocf_max_elements_is_per_file_not_per_block" {
+  let body = cat([lng(1000L), hx("00")])
+  let blk = ocf_block(1L, body)
+  let file = cat([ocf_header("{\"type\":\"array\",\"items\":\"null\"}", "null"), blk, blk, blk, blk])
+  let limits = avro::AvroLimits::default().with_max_elements(1000)
+  match avro::read_ocf_with_limits(file, limits) {
+    Ok(f) =>
+    debug_assert(
+      false,
+      "max_elements=1000 but read_ocf materialised " + f.records.length().to_string() +
+      " arrays of 1000 items (4000 elements)",
+    )
+    Err(_) => ()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-04 (P2) long -> float promotion rounds twice (Int64 -> Double -> binary32).
+// 2^60 + 2^36 + 1 must round to 0x5d800001 (Java `(float) long`, Go `float32(int64)`);
+// via Double it first becomes 2^60 + 2^36 (exact tie) and then ties-to-even to 0x5d800000.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_long_to_float_single_rounding" {
+  let v = (1L << 60) + (1L << 36) + 1L
+  match avro::decode_datum_resolved(ps("\"long\""), ps("\"float\""), lng(v)) {
+    Ok(avro::AvroValue::Float32(f)) => {
+      let bits = avro::double_to_float32_bits(f)
+      debug_assert(bits == 0x5d800001L, "long->float of 2^60+2^36+1 must be 0x5d800001, got bits=" + bits.to_string())
+    }
+    _ => debug_assert(false, "long->float must resolve")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-05 (P2) float -> double promotion keeps a signalling NaN signalling.
+// IEEE 754 conversion (Java f2d, Go float64(float32)) quiets it: 0x7f800001 -> 0x7ff8000020000000.
+// Pion produces 0x7ff0000020000000 (sNaN), which differs from every reference decoder.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_float_to_double_quiets_snan" {
+  match avro::decode_datum_resolved(ps("\"float\""), ps("\"double\""), hx("0100807f")) {
+    Ok(avro::AvroValue::Float64(d)) =>
+    debug_assert(d.to_bits() == 0x7ff8000020000000L, "float sNaN -> double must be quiet NaN 0x7ff8000020000000")
+    _ => debug_assert(false, "float->double must resolve")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-06 (P2) Named-type reference in object form `{"type": "F"}` is rejected.
+// Java 1.11.1 Schema.parse ("For unions with self reference") and hamba resolve it.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_object_form_named_reference" {
+  let src = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+  "{\"name\":\"a\",\"type\":{\"type\":\"fixed\",\"name\":\"F\",\"size\":2}}," +
+  "{\"name\":\"b\",\"type\":{\"type\":\"F\"}}]}"
+  match avro::parse_schema(src) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "{\"type\":\"F\"} must reference fixed F: " + avro::error_message(e))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-07 (P2) Reader field alias collides with an exact writer field name: last writer field wins.
+// Writer [b=1, a=2], reader field `b` with aliases ["a"]: Pion maps BOTH writer fields onto
+// reader slot b and silently returns 2 (the alias), dropping the exact-name value 1.
+// Java applyAliases renames writer `a` to `b` and rejects the duplicate; either the exact
+// match (1) or an error is acceptable -- silently returning the aliased value is not.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_alias_does_not_override_exact_field" {
+  let w = ps("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"int\"},{\"name\":\"a\",\"type\":\"int\"}]}")
+  let r = ps("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"int\",\"aliases\":[\"a\"]}]}")
+  match avro::decode_datum_resolved(w, r, cat([lng(1L), lng(2L)])) {
+    Ok(v) =>
+    debug_assert(
+      !avro::avro_value_eq(v, avro::AvroValue::Record([("b", avro::AvroValue::Int(2))])),
+      "reader b received the aliased writer field a (2) instead of writer b (1)",
+    )
+    Err(_) => ()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-08 (P2) Avro JSON encoding of doubles does not round-trip.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_json_negative_zero_roundtrip" {
+  let d = ps("\"double\"")
+  let neg0 = Double::from_bits(0x8000000000000000L)
+  match avro::encode_json(d, avro::AvroValue::Float64(neg0)) {
+    Ok(js) =>
+    match avro::decode_json(d, js) {
+      Ok(avro::AvroValue::Float64(x)) =>
+      debug_assert(x.to_bits() == 0x8000000000000000L, "-0.0 encoded as " + js + " decodes to +0.0")
+      _ => debug_assert(false, "decode_json of " + js + " failed")
+    }
+    Err(e) => debug_assert(false, "encode_json(-0.0): " + avro::error_message(e))
+  }
+}
+
+///|
+test "redteam_json_nan_infinity_roundtrip" {
+  let d = ps("\"double\"")
+  let vals = [Double::from_bits(0x7ff8000000000000L), Double::from_bits(0x7ff0000000000000L), Double::from_bits(0xfff0000000000000L)]
+  let mut i = 0
+  while i < vals.length() {
+    match avro::encode_json(d, avro::AvroValue::Float64(vals[i])) {
+      Ok(js) =>
+      // Java JsonEncoder writes "NaN"/"Infinity"/"-Infinity" (quoted) and JsonDecoder reads them back
+      debug_assert(is_ok_value(avro::decode_json(d, js)), "encode_json produced " + js + " which decode_json rejects")
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-09 (P2) decode_json keeps duplicate map keys; the datum then binary-encodes a map with
+// duplicate keys. Java (Jackson ObjectNode / HashMap) and Go keep exactly one entry.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_json_map_duplicate_keys_collapse" {
+  let m = ps("{\"type\":\"map\",\"values\":\"int\"}")
+  match avro::decode_json(m, "{\"a\":1,\"a\":2}") {
+    Ok(avro::AvroValue::Map(es)) =>
+    debug_assert(es.length() == 1, "map has " + es.length().to_string() + " entries for one key")
+    _ => ()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F-10 (P2) Default limits reject legitimate data/schemas that Java and hamba accept.
+// ---------------------------------------------------------------------------
+
+///|
+test "redteam_default_depth_allows_100_node_recursive_list" {
+  // 100-node linked list: 202 bytes. Go hamba decodes 1,000,000 nodes; Pion's default
+  // max_depth = 64 (record + union frames) stops at 32 nodes.
+  let s = ps("{\"type\":\"record\",\"name\":\"Node\",\"fields\":[{\"name\":\"v\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"Node\"]}]}")
+  let data = Bytes::new(202)
+  let mut i = 0
+  while i < 100 {
+    data[2 * i + 1] = (2).to_byte()
+    i = i + 1
+  }
+  match avro::decode_datum(s, data) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "100-node list rejected by default limits: " + avro::error_message(e))
+  }
+}
+
+///|
+test "redteam_default_schema_limit_allows_1500_nullable_fields" {
+  // 1,500 x ["null","string"] = 4,501 arena nodes > max_schema_types 4,096 (counts every
+  // primitive leaf and Ref node, not distinct types). Wide nullable tables are common.
+  let sb = StringBuilder::new()
+  sb.write_string("{\"type\":\"record\",\"name\":\"Wide\",\"fields\":[")
+  let mut i = 0
+  while i < 1500 {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("{\"name\":\"c" + i.to_string() + "\",\"type\":[\"null\",\"string\"]}")
+    i = i + 1
+  }
+  sb.write_string("]}")
+  match avro::parse_schema(sb.to_string()) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "1500-column nullable record rejected: " + avro::error_message(e))
+  }
+}
+
+///|
+test "redteam_read_ocf_default_allows_more_than_1m_rows" {
+  // One block of 1,000,001 `null` rows (0 payload bytes). read_ocf caps the TOTAL number of
+  // rows of a file at max_elements = 1,000,000, so ordinary multi-million-row files fail.
+  let file = cat([ocf_header("\"null\"", "null"), ocf_block(1000001L, Bytes::new(0))])
+  match avro::read_ocf(file) {
+    Ok(f) => debug_assert(f.records.length() == 1000001, "row count")
+    Err(e) => debug_assert(false, "1,000,001-row file rejected: " + avro::error_message(e))
+  }
+}
+
+///|
+test "redteam_empty_union_schema_accepted" {
+  // Java Schema.parse("[]") and hamba accept an empty union (it just has no values).
+  match avro::parse_schema("[]") {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "[] rejected: " + avro::error_message(e))
+  }
+}
+
+// ===========================================================================
+// Controls: attacks Pion survives (must keep passing)
+// ===========================================================================
+
+///|
+test "control_block_count_int64_min_rejected" {
+  let a = ps("{\"type\":\"array\",\"items\":\"int\"}")
+  debug_assert(!is_ok_value(avro::decode_datum(a, cat([lng(-9223372036854775807L - 1L), lng(0L), hx("00")]))), "Int64::MIN block")
+}
+
+///|
+test "control_huge_lengths_rejected_without_allocation" {
+  let s = ps("\"string\"")
+  let b = ps("\"bytes\"")
+  debug_assert(!is_ok_value(avro::decode_datum(s, lng(1L << 40))), "2^40 string length")
+  debug_assert(!is_ok_value(avro::decode_datum(b, lng(-5L))), "negative bytes length")
+  let a = ps("{\"type\":\"array\",\"items\":\"long\"}")
+  debug_assert(!is_ok_value(avro::decode_datum(a, lng(1L << 50))), "2^50 array count")
+  let m = ps("{\"type\":\"map\",\"values\":\"null\"}")
+  debug_assert(!is_ok_value(avro::decode_datum(m, cat([lng(-3L), lng(1L << 40)]))), "map byte_size beyond input")
+}
+
+///|
+test "control_varint_overflow_rejected" {
+  let l = ps("\"long\"")
+  let i = ps("\"int\"")
+  debug_assert(!is_ok_value(avro::decode_datum(l, hx("ffffffffffffffffff7f"))), "10th byte > 1")
+  debug_assert(!is_ok_value(avro::decode_datum(l, hx("8080808080808080808000"))), "11-byte varint")
+  debug_assert(!is_ok_value(avro::decode_datum(i, hx("ffffffff1f"))), "int > 32 bits")
+  debug_assert(!is_ok_value(avro::decode_datum(l, hx("ff"))), "truncated varint")
+  match avro::decode_datum(i, hx("feffffff0f")) {
+    Ok(avro::AvroValue::Int(v)) => debug_assert(v == 2147483647, "Int32::MAX")
+    _ => debug_assert(false, "Int32::MAX must decode")
+  }
+  match avro::decode_datum(l, hx("ffffffffffffffffff01")) {
+    Ok(avro::AvroValue::Long(v)) => debug_assert(v == -9223372036854775807L - 1L, "Int64::MIN")
+    _ => debug_assert(false, "Int64::MIN must decode")
+  }
+}
+
+///|
+test "control_strict_boolean_and_utf8" {
+  debug_assert(!is_ok_value(avro::decode_datum(ps("\"boolean\""), hx("02"))), "boolean 0x02")
+  debug_assert(!is_ok_value(avro::decode_datum(ps("\"string\""), hx("04eda080"))), "UTF-16 surrogate in UTF-8")
+  debug_assert(!is_ok_value(avro::decode_datum(ps("\"string\""), hx("04c0af"))), "overlong UTF-8")
+}
+
+///|
+test "control_ocf_header_and_block_validation" {
+  let good = cat([ocf_header("\"int\"", "null"), ocf_block(1L, lng(5L))])
+  match avro::read_ocf(good) {
+    Ok(f) => debug_assert(f.records.length() == 1, "one record")
+    Err(e) => debug_assert(false, "baseline OCF: " + avro::error_message(e))
+  }
+  let bad_magic = cat([hx("4f626a02"), good.slice(4, good.length())])
+  let unknown_codec = cat([ocf_header("\"int\"", "snappy"), ocf_block(1L, lng(5L))])
+  let bad_sync = cat([ocf_header("\"int\"", "null"), lng(1L), lng(1L), lng(5L), Bytes::new(16)])
+  let truncated = good.slice(0, good.length() - 3)
+  let zero_count = cat([ocf_header("\"int\"", "null"), ocf_block(0L, Bytes::new(0))])
+  let neg_count = cat([ocf_header("\"int\"", "null"), ocf_block(-1L, lng(5L))])
+  let huge_count = cat([ocf_header("\"int\"", "null"), ocf_block(1L << 40, lng(5L))])
+  let huge_size = cat([ocf_header("\"int\"", "null"), lng(1L), lng(1L << 40), lng(5L), sync16()])
+  let no_schema = cat([hx("4f626a01"), lng(1L), lbytes("avro.codec".to_bytes()), lbytes("null".to_bytes()), hx("00"), sync16()])
+  let trailing = cat([ocf_header("\"int\"", "null"), ocf_block(1L, cat([lng(5L), lng(6L)]))])
+  let cases = [bad_magic, unknown_codec, bad_sync, truncated, zero_count, neg_count, huge_count, huge_size, no_schema, trailing]
+  let names = ["bad magic", "unknown codec", "bad sync", "truncated", "zero count", "negative count", "2^40 count", "2^40 byte size", "missing avro.schema", "trailing bytes in block"]
+  let mut k = 0
+  while k < cases.length() {
+    match avro::read_ocf(cases[k]) {
+      Ok(_) => debug_assert(false, "OCF must be rejected: " + names[k])
+      Err(_) => ()
+    }
+    k = k + 1
+  }
+}
+
+///|
+test "control_namespace_rules" {
+  // explicit "" namespace clears the enclosing namespace; dotted names ignore `namespace`
+  let s = ps(
+    "{\"type\":\"record\",\"name\":\"R\",\"namespace\":\"a\",\"fields\":[" +
+    "{\"name\":\"e\",\"type\":{\"type\":\"enum\",\"name\":\"E\",\"namespace\":\"\",\"symbols\":[\"X\"]}}," +
+    "{\"name\":\"f\",\"type\":{\"type\":\"fixed\",\"name\":\"x.y.F\",\"namespace\":\"ignored\",\"size\":1}}," +
+    "{\"name\":\"g\",\"type\":\"E\"}]}",
+  )
+  debug_assert(
+    avro::canonical_form(s) ==
+    "{\"name\":\"a.R\",\"type\":\"record\",\"fields\":[{\"name\":\"e\",\"type\":{\"name\":\"E\",\"type\":\"enum\",\"symbols\":[\"X\"]}},{\"name\":\"f\",\"type\":{\"name\":\"x.y.F\",\"type\":\"fixed\",\"size\":1}},{\"name\":\"g\",\"type\":\"E\"}]}",
+    "PCF: " + avro::canonical_form(s),
+  )
+  let bad = [
+    "[\"null\",[\"int\"]]", "[\"int\",\"int\"]", "{\"type\":\"fixed\",\"name\":\"1F\",\"size\":1}",
+    "{\"type\":\"array\",\"items\":\"Nope\"}", "[{\"type\":\"fixed\",\"name\":\"F\",\"size\":1},{\"type\":\"fixed\",\"name\":\"F\",\"size\":1}]",
+    "{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"],\"default\":\"B\"}",
+    "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":[\"null\",\"int\"],\"default\":1}]}",
+  ]
+  let mut i = 0
+  while i < bad.length() {
+    match avro::parse_schema(bad[i]) {
+      Ok(_) => debug_assert(false, "invalid schema accepted: " + bad[i])
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+test "control_resolution_skip_and_defaults" {
+  let w = ps(
+    "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"drop\",\"type\":{\"type\":\"map\",\"values\":{\"type\":\"array\",\"items\":\"string\"}}},{\"name\":\"k\",\"type\":\"int\"}]}",
+  )
+  let r = ps(
+    "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"k\",\"type\":\"long\"},{\"name\":\"n\",\"type\":{\"type\":\"record\",\"name\":\"S\",\"fields\":[{\"name\":\"b\",\"type\":\"bytes\"}]},\"default\":{\"b\":\"\\u00ff\"}}]}",
+  )
+  // drop = {"m": ["z"]} written with a negative block count + byte_size, then k = 4
+  let data = cat([lng(-1L), lng(6L), lbytes("m".to_bytes()), lng(1L), lbytes("z".to_bytes()), hx("00"), hx("00"), lng(4L)])
+  match avro::decode_datum_resolved(w, r, data) {
+    Ok(v) =>
+    debug_assert(
+      avro::avro_value_eq(
+        v,
+        avro::AvroValue::Record([
+          ("k", avro::AvroValue::Long(4L)),
+          ("n", avro::AvroValue::Record([("b", avro::AvroValue::Bytes(hx("ff")))])),
+        ]),
+      ),
+      "skip + default",
+    )
+    Err(e) => debug_assert(false, "resolution: " + avro::error_message(e))
+  }
+  // enum fallback to reader default; missing default -> error only when the symbol is read
+  let we = ps("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\",\"B\"]}")
+  let re = ps("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"A\"]}")
+  debug_assert(is_ok_value(avro::decode_datum_resolved(we, re, lng(0L))), "symbol A")
+  debug_assert(!is_ok_value(avro::decode_datum_resolved(we, re, lng(1L))), "symbol B without default")
+}
+
+///|
+test "control_json_bytes_and_union_encoding" {
+  let s = ps("[\"null\",{\"type\":\"fixed\",\"name\":\"ns.F\",\"size\":2},\"bytes\"]")
+  match avro::encode_json(s, avro::AvroValue::Union(1, avro::AvroValue::Fixed(hx("00ff")))) {
+    Ok(js) => debug_assert(js == "{\"ns.F\":\"\\u0000\\u00ff\"}", "fixed in union: " + js)
+    Err(e) => debug_assert(false, avro::error_message(e))
+  }
+  debug_assert(!is_ok_value(avro::decode_json(s, "{\"bytes\":\"\\u0100\"}")), "code point > U+00FF in bytes")
+  debug_assert(!is_ok_value(avro::decode_json(s, "{\"ns.F\":\"\\u00ff\"}")), "wrong fixed length")
+}
+
+///|
+test "control_skip_depth_is_bounded" {
+  // writer field `drop` holds a 1,000-node recursive list; reader drops it. Default limits must
+  // stop the recursive skip with an error, not a crash.
+  let list = "{\"type\":\"record\",\"name\":\"Node\",\"fields\":[{\"name\":\"v\",\"type\":\"long\"},{\"name\":\"next\",\"type\":[\"null\",\"Node\"]}]}"
+  let w = ps("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"drop\",\"type\":" + list + "},{\"name\":\"k\",\"type\":\"int\"}]}")
+  let r = ps("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"k\",\"type\":\"int\"}]}")
+  let data = Bytes::new(2003)
+  let mut i = 0
+  while i < 1000 {
+    data[2 * i + 1] = (2).to_byte()
+    i = i + 1
+  }
+  debug_assert(!is_ok_value(avro::decode_datum_resolved(w, r, data)), "1000-deep skip must hit max_depth")
+}
