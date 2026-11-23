@@ -1,0 +1,1262 @@
+///| Complete RFC 6386 VP8 lossy keyframe decoder:
+///| - Frame header, segmentation, loop filter params, quantization, token probs, 1..8 partitions
+///| - Macroblock reconstruction (I16x16, I4x4, C8x8, WHT16, IDCT4/DC-only)
+///| - Simple & Normal loop filtering and BT.601 YUV420 -> RGBA8888 output.
+
+let vp8_plane_y1_with_y2 : Int = 0
+let vp8_plane_y2 : Int = 1
+let vp8_plane_uv : Int = 2
+let vp8_plane_y1_sans_y2 : Int = 3
+
+let vp8_b_coeff_base : Int = 256
+let vp8_r_coeff_base : Int = 320
+let vp8_wht_coeff_base : Int = 384
+
+///| Parse 10-byte VP8 keyframe header at `data[start..end)`.
+///| Returns `(width, height, first_partition_len)`.
+fn vp8_parse_frame_header(data : Bytes, start : Int, end : Int) -> Result[(Int, Int, Int), WebpError] {
+  if end - start < 10 {
+    return Err(WebpError::UnexpectedEof("VP8 keyframe header requires 10 bytes"))
+  }
+  let b0 = data[start].to_int()
+  let b1 = data[start + 1].to_int()
+  let b2 = data[start + 2].to_int()
+  let is_keyframe = (b0 & 1) == 0
+  if !is_keyframe {
+    return Err(WebpError::UnsupportedFeature("VP8 interframes are not supported in WebP"))
+  }
+  let fp_len = (b0 >> 5) | (b1 << 3) | (b2 << 11)
+  if data[start + 3].to_int() != 0x9D ||
+  data[start + 4].to_int() != 0x01 ||
+  data[start + 5].to_int() != 0x2A {
+    return Err(WebpError::InvalidHeader("invalid VP8 keyframe sync code"))
+  }
+  let w = data[start + 6].to_int() | ((data[start + 7].to_int() & 0x3F) << 8)
+  let h = data[start + 8].to_int() | ((data[start + 9].to_int() & 0x3F) << 8)
+  Ok((w, h, fp_len))
+}
+
+///| Per-macroblock top/left neighbor state (flat arrays for zero allocation).
+struct Vp8State {
+  width : Int
+  height : Int
+  mbw : Int
+  mbh : Int
+  y_stride : Int
+  c_stride : Int
+  mut y_plane : Bytes
+  mut cb_plane : Bytes
+  mut cr_plane : Bytes
+  fp : BoolDecoder
+  op : Array[BoolDecoder]
+  mut n_op : Int
+
+  // Segment header
+  mut use_segment : Bool
+  mut update_map : Bool
+  mut relative_delta : Bool
+  seg_quant : FixedArray[Int]
+  seg_lf : FixedArray[Int]
+  seg_prob : FixedArray[Int]
+
+  // Filter header
+  mut lf_simple : Bool
+  mut lf_level : Int
+  mut lf_sharpness : Int
+  mut lf_use_delta : Bool
+  ref_lf_delta : FixedArray[Int]
+  mode_lf_delta : FixedArray[Int]
+  // Flattened [4][2] filter params: level, ilevel, hlevel, inner (4 ints per slot -> 32 ints)
+  filter_params : FixedArray[Int]
+  // Per-MB filter params: 4 ints per MB (level, ilevel, hlevel, inner)
+  per_mb_lf : FixedArray[Int]
+
+  // Quantization factors: 6 ints per segment [y1_dc, y1_ac, y2_dc, y2_ac, uv_dc, uv_ac] -> 24 ints
+  quant : FixedArray[Int]
+
+  // Token probabilities (1056 ints)
+  token_prob : FixedArray[Int]
+  mut use_skip_prob : Bool
+  mut skip_prob : Int
+
+  // Current macroblock state
+  mut segment : Int
+  // left_pred[4], up_pred[mbw * 4]
+  left_pred : FixedArray[Int]
+  up_pred : FixedArray[Int]
+  mut left_nz_mask : Int
+  up_nz_mask : FixedArray[Int]
+  mut left_nz_y16 : Int
+  up_nz_y16 : FixedArray[Int]
+
+  mut nz_dc_mask : Int
+  mut nz_ac_mask : Int
+  mut use_pred_y16 : Bool
+  mut pred_y16 : Int
+  mut pred_c8 : Int
+  pred_y4 : FixedArray[Int] // 16 ints
+
+  // Workspace
+  coeff : FixedArray[Int] // 400 ints
+  ybr : FixedArray[Int] // 26 * 32 = 832 ints
+  idct_tmp : FixedArray[Int] // 16 ints
+  nz_scratch : FixedArray[Int] // 12 ints (4 unz + 4 lc + 4 uc, zero per-MB alloc)
+}
+
+fn Vp8State::new(w : Int, h : Int, fp : BoolDecoder) -> Vp8State {
+  let mbw = (w + 15) >> 4
+  let mbh = (h + 15) >> 4
+  let y_stride = mbw * 16
+  let c_stride = mbw * 8
+  let token_prob = FixedArray::make(1056, 0)
+  let mut i = 0
+  while i < 1056 {
+    token_prob[i] = vp8_default_token_prob[i]
+    i = i + 1
+  }
+  let seg_prob = FixedArray::make(3, 255)
+  let op : Array[BoolDecoder] = []
+  i = 0
+  while i < 8 {
+    op.push(BoolDecoder::empty())
+    i = i + 1
+  }
+  Vp8State::{
+    width: w,
+    height: h,
+    mbw: mbw,
+    mbh: mbh,
+    y_stride: y_stride,
+    c_stride: c_stride,
+    y_plane: Bytes::new(y_stride * mbh * 16),
+    cb_plane: Bytes::new(c_stride * mbh * 8),
+    cr_plane: Bytes::new(c_stride * mbh * 8),
+    fp: fp,
+    op: op,
+    n_op: 1,
+    use_segment: false,
+    update_map: false,
+    relative_delta: false,
+    seg_quant: FixedArray::make(4, 0),
+    seg_lf: FixedArray::make(4, 0),
+    seg_prob: seg_prob,
+    lf_simple: false,
+    lf_level: 0,
+    lf_sharpness: 0,
+    lf_use_delta: false,
+    ref_lf_delta: FixedArray::make(4, 0),
+    mode_lf_delta: FixedArray::make(4, 0),
+    filter_params: FixedArray::make(32, 0),
+    per_mb_lf: FixedArray::make(mbw * mbh * 4, 0),
+    quant: FixedArray::make(24, 0),
+    token_prob: token_prob,
+    use_skip_prob: false,
+    skip_prob: 0,
+    segment: 0,
+    left_pred: FixedArray::make(4, 0),
+    up_pred: FixedArray::make(mbw * 4, 0),
+    left_nz_mask: 0,
+    up_nz_mask: FixedArray::make(mbw, 0),
+    left_nz_y16: 0,
+    up_nz_y16: FixedArray::make(mbw, 0),
+    nz_dc_mask: 0,
+    nz_ac_mask: 0,
+    use_pred_y16: false,
+    pred_y16: 0,
+    pred_c8: 0,
+    pred_y4: FixedArray::make(16, 0),
+    coeff: FixedArray::make(400, 0),
+    ybr: FixedArray::make(832, 0),
+    idct_tmp: FixedArray::make(16, 0),
+    nz_scratch: FixedArray::make(12, 0),
+  }
+}
+
+fn vp8_parse_segment_header(st : Vp8State) -> Unit {
+  st.use_segment = st.fp.read_bit(vp8_uniform_prob)
+  if !st.use_segment {
+    st.update_map = false
+    return
+  }
+  st.update_map = st.fp.read_bit(vp8_uniform_prob)
+  if st.fp.read_bit(vp8_uniform_prob) {
+    st.relative_delta = !st.fp.read_bit(vp8_uniform_prob)
+    let mut i = 0
+    while i < 4 {
+      st.seg_quant[i] = st.fp.read_optional_int(vp8_uniform_prob, 7)
+      i = i + 1
+    }
+    i = 0
+    while i < 4 {
+      st.seg_lf[i] = st.fp.read_optional_int(vp8_uniform_prob, 6)
+      i = i + 1
+    }
+  }
+  if !st.update_map {
+    return
+  }
+  let mut i = 0
+  while i < 3 {
+    if st.fp.read_bit(vp8_uniform_prob) {
+      st.seg_prob[i] = st.fp.read_uint(vp8_uniform_prob, 8)
+    } else {
+      st.seg_prob[i] = 255
+    }
+    i = i + 1
+  }
+}
+
+fn vp8_compute_filter_params(st : Vp8State) -> Unit {
+  let mut i = 0
+  while i < 4 {
+    let mut base_level = st.lf_level
+    if st.use_segment {
+      base_level = st.seg_lf[i]
+      if st.relative_delta {
+        base_level = base_level + st.lf_level
+      }
+    }
+    let mut j = 0
+    while j < 2 {
+      let slot = (i * 2 + j) * 4
+      st.filter_params[slot + 3] = j // inner = j != 0
+      let mut level = base_level
+      if st.lf_use_delta {
+        level = level + st.ref_lf_delta[0]
+        if j != 0 {
+          level = level + st.mode_lf_delta[0]
+        }
+      }
+      if level <= 0 {
+        st.filter_params[slot] = 0
+        st.filter_params[slot + 1] = 0
+        st.filter_params[slot + 2] = 0
+      } else {
+        if level > 63 {
+          level = 63
+        }
+        let mut ilevel = level
+        if st.lf_sharpness > 0 {
+          if st.lf_sharpness > 4 {
+            ilevel = ilevel >> 2
+          } else {
+            ilevel = ilevel >> 1
+          }
+          let cap = 9 - st.lf_sharpness
+          if ilevel > cap {
+            ilevel = cap
+          }
+        }
+        if ilevel < 1 {
+          ilevel = 1
+        }
+        st.filter_params[slot] = 2 * level + ilevel
+        st.filter_params[slot + 1] = ilevel
+        // KeyFrame hlevel thresholds
+        let hlevel = if level < 15 {
+          0
+        } else if level < 40 {
+          1
+        } else {
+          2
+        }
+        st.filter_params[slot + 2] = hlevel
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+fn vp8_parse_filter_header(st : Vp8State) -> Unit {
+  st.lf_simple = st.fp.read_bit(vp8_uniform_prob)
+  st.lf_level = st.fp.read_uint(vp8_uniform_prob, 6)
+  st.lf_sharpness = st.fp.read_uint(vp8_uniform_prob, 3)
+  st.lf_use_delta = st.fp.read_bit(vp8_uniform_prob)
+  if st.lf_use_delta && st.fp.read_bit(vp8_uniform_prob) {
+    let mut i = 0
+    while i < 4 {
+      st.ref_lf_delta[i] = st.fp.read_optional_int(vp8_uniform_prob, 6)
+      i = i + 1
+    }
+    i = 0
+    while i < 4 {
+      st.mode_lf_delta[i] = st.fp.read_optional_int(vp8_uniform_prob, 6)
+      i = i + 1
+    }
+  }
+  if st.lf_level != 0 {
+    vp8_compute_filter_params(st)
+  }
+}
+
+fn vp8_parse_other_partitions(st : Vp8State, data : Bytes, part_start : Int, end : Int) -> Result[Unit, WebpError] {
+  let log2_n = st.fp.read_uint(vp8_uniform_prob, 2)
+  st.n_op = 1 << log2_n
+  let sizes_bytes = 3 * (st.n_op - 1)
+  let rem = end - part_start
+  if rem < sizes_bytes {
+    return Err(WebpError::UnexpectedEof("VP8 partition size table truncated"))
+  }
+  let part_lens = FixedArray::make(8, 0)
+  let mut last_len = rem - sizes_bytes
+  let mut i = 0
+  while i < st.n_op - 1 {
+    let off = part_start + 3 * i
+    let pl = data[off].to_int() | (data[off + 1].to_int() << 8) | (data[off + 2].to_int() << 16)
+    if pl > last_len {
+      return Err(WebpError::UnexpectedEof("VP8 partition length exceeds payload"))
+    }
+    part_lens[i] = pl
+    last_len = last_len - pl
+    i = i + 1
+  }
+  if last_len >= (1 << 24) {
+    return Err(WebpError::LimitExceeded("VP8 final partition exceeds 16 MiB"))
+  }
+  part_lens[st.n_op - 1] = last_len
+  let mut cur = part_start + sizes_bytes
+  i = 0
+  while i < st.n_op {
+    let pl = part_lens[i]
+    st.op[i] = BoolDecoder::new(data, cur, cur + pl)
+    cur = cur + pl
+    i = i + 1
+  }
+  Ok(())
+}
+
+fn vp8_parse_quant(st : Vp8State) -> Unit {
+  let base_q0 = st.fp.read_uint(vp8_uniform_prob, 7)
+  let dqy1_dc = st.fp.read_optional_int(vp8_uniform_prob, 4)
+  let dqy2_dc = st.fp.read_optional_int(vp8_uniform_prob, 4)
+  let dqy2_ac = st.fp.read_optional_int(vp8_uniform_prob, 4)
+  let dquv_dc = st.fp.read_optional_int(vp8_uniform_prob, 4)
+  let dquv_ac = st.fp.read_optional_int(vp8_uniform_prob, 4)
+  let mut i = 0
+  while i < 4 {
+    let mut q = base_q0
+    if st.use_segment {
+      if st.relative_delta {
+        q = q + st.seg_quant[i]
+      } else {
+        q = st.seg_quant[i]
+      }
+    }
+    let off = i * 6
+    st.quant[off] = vp8_dequant_dc[vp8_clip(q + dqy1_dc, 0, 127)]
+    st.quant[off + 1] = vp8_dequant_ac[vp8_clip(q, 0, 127)]
+    st.quant[off + 2] = vp8_dequant_dc[vp8_clip(q + dqy2_dc, 0, 127)] * 2
+    let mut y2_ac = (vp8_dequant_ac[vp8_clip(q + dqy2_ac, 0, 127)] * 155) / 100
+    if y2_ac < 8 {
+      y2_ac = 8
+    }
+    st.quant[off + 3] = y2_ac
+    st.quant[off + 4] = vp8_dequant_dc[vp8_clip(q + dquv_dc, 0, 117)]
+    st.quant[off + 5] = vp8_dequant_ac[vp8_clip(q + dquv_ac, 0, 127)]
+    i = i + 1
+  }
+}
+
+fn vp8_parse_token_prob(st : Vp8State) -> Unit {
+  let mut idx = 0
+  while idx < 1056 {
+    if st.fp.read_bit(vp8_token_prob_update[idx]) {
+      st.token_prob[idx] = st.fp.read_uint(vp8_uniform_prob, 8)
+    }
+    idx = idx + 1
+  }
+}
+
+fn vp8_prepare_ybr(st : Vp8State, mbx : Int, mby : Int) -> Unit {
+  let ybr = st.ybr
+  if mbx == 0 {
+    let mut y = 0
+    while y < 17 {
+      ybr[y * 32 + 7] = 0x81
+      y = y + 1
+    }
+    y = 17
+    while y < 26 {
+      ybr[y * 32 + 7] = 0x81
+      ybr[y * 32 + 23] = 0x81
+      y = y + 1
+    }
+  } else {
+    let mut y = 0
+    while y < 17 {
+      ybr[y * 32 + 7] = ybr[y * 32 + 23]
+      y = y + 1
+    }
+    y = 17
+    while y < 26 {
+      ybr[y * 32 + 7] = ybr[y * 32 + 15]
+      ybr[y * 32 + 23] = ybr[y * 32 + 31]
+      y = y + 1
+    }
+  }
+  if mby == 0 {
+    let mut x = 7
+    while x < 28 {
+      ybr[x] = 0x7F
+      x = x + 1
+    }
+    x = 7
+    while x < 16 {
+      ybr[17 * 32 + x] = 0x7F
+      x = x + 1
+    }
+    x = 23
+    while x < 32 {
+      ybr[17 * 32 + x] = 0x7F
+      x = x + 1
+    }
+  } else {
+    let y_row = (16 * mby - 1) * st.y_stride + 16 * mbx
+    let mut i = 0
+    while i < 16 {
+      ybr[8 + i] = st.y_plane[y_row + i].to_int()
+      i = i + 1
+    }
+    let c_row = (8 * mby - 1) * st.c_stride + 8 * mbx
+    i = 0
+    while i < 8 {
+      ybr[17 * 32 + 8 + i] = st.cb_plane[c_row + i].to_int()
+      ybr[17 * 32 + 24 + i] = st.cr_plane[c_row + i].to_int()
+      i = i + 1
+    }
+    if mbx == st.mbw - 1 {
+      let last_y = st.y_plane[y_row + 15].to_int()
+      ybr[24] = last_y
+      ybr[25] = last_y
+      ybr[26] = last_y
+      ybr[27] = last_y
+    } else {
+      ybr[24] = st.y_plane[y_row + 16].to_int()
+      ybr[25] = st.y_plane[y_row + 17].to_int()
+      ybr[26] = st.y_plane[y_row + 18].to_int()
+      ybr[27] = st.y_plane[y_row + 19].to_int()
+    }
+  }
+  let mut y = 4
+  while y < 16 {
+    let r = y * 32
+    ybr[r + 24] = ybr[24]
+    ybr[r + 25] = ybr[25]
+    ybr[r + 26] = ybr[26]
+    ybr[r + 27] = ybr[27]
+    y = y + 4
+  }
+}
+
+fn vp8_parse_pred_y16(st : Vp8State, mbx : Int) -> Unit {
+  let p = if !st.fp.read_bit(156) {
+    if !st.fp.read_bit(163) { vp8_pred_dc } else { vp8_pred_ve }
+  } else if !st.fp.read_bit(128) {
+    vp8_pred_he
+  } else {
+    vp8_pred_tm
+  }
+  let up_base = mbx * 4
+  let mut i = 0
+  while i < 4 {
+    st.up_pred[up_base + i] = p
+    st.left_pred[i] = p
+    i = i + 1
+  }
+  st.pred_y16 = p
+}
+
+fn vp8_parse_pred_c8(st : Vp8State) -> Unit {
+  st.pred_c8 = if !st.fp.read_bit(142) {
+    vp8_pred_dc
+  } else if !st.fp.read_bit(114) {
+    vp8_pred_ve
+  } else if !st.fp.read_bit(183) {
+    vp8_pred_he
+  } else {
+    vp8_pred_tm
+  }
+}
+
+fn vp8_parse_pred_y4(st : Vp8State, mbx : Int) -> Unit {
+  let up_base = mbx * 4
+  let mut j = 0
+  while j < 4 {
+    let mut p = st.left_pred[j]
+    let mut i = 0
+    while i < 4 {
+      let up_p = st.up_pred[up_base + i]
+      let pb = (up_p * 10 + p) * 9
+      p = if !st.fp.read_bit(vp8_pred_prob[pb]) {
+        vp8_pred_dc
+      } else if !st.fp.read_bit(vp8_pred_prob[pb + 1]) {
+        vp8_pred_tm
+      } else if !st.fp.read_bit(vp8_pred_prob[pb + 2]) {
+        vp8_pred_ve
+      } else if !st.fp.read_bit(vp8_pred_prob[pb + 3]) {
+        if !st.fp.read_bit(vp8_pred_prob[pb + 4]) {
+          vp8_pred_he
+        } else if !st.fp.read_bit(vp8_pred_prob[pb + 5]) {
+          vp8_pred_rd
+        } else {
+          vp8_pred_vr
+        }
+      } else if !st.fp.read_bit(vp8_pred_prob[pb + 6]) {
+        vp8_pred_ld
+      } else if !st.fp.read_bit(vp8_pred_prob[pb + 7]) {
+        vp8_pred_vl
+      } else if !st.fp.read_bit(vp8_pred_prob[pb + 8]) {
+        vp8_pred_hd
+      } else {
+        vp8_pred_hu
+      }
+      st.pred_y4[j * 4 + i] = p
+      st.up_pred[up_base + i] = p
+      i = i + 1
+    }
+    st.left_pred[j] = p
+    j = j + 1
+  }
+}
+
+///| Parse 4x4 residual coefficients (RFC 6386 §13.3). Returns 1 if any non-zero coeff, else 0.
+///| Keeps BoolDecoder state in local registers for the 5 hottest bit decisions (EOB, 0, 1, sign, next-EOB).
+fn vp8_parse_residuals4(
+  st : Vp8State,
+  r : BoolDecoder,
+  plane : Int,
+  ctx : Int,
+  q_dc : Int,
+  q_ac : Int,
+  skip_first : Bool,
+  coeff_base : Int,
+) -> Int {
+  let tp = st.token_prob
+  let coeff = st.coeff
+  let data = r.data
+  let end = r.end
+  let mut pos = r.pos
+  let mut range_m1 = r.range_m1
+  let mut bits = r.bits
+  let mut nbits = r.nbits
+  let lut_sh = vp8_lut_shift
+  let lut_rm1 = vp8_lut_range_m1
+
+  let plane_off = plane * 264 // 8 * 3 * 11
+  let mut n = if skip_first { 1 } else { 0 }
+  let mut p_off = plane_off + vp8_bands[n] * 33 + ctx * 11
+
+  // Hot bit 1: initial EOB check (tp[p_off])
+  if nbits < 8 {
+    if pos + 2 <= end {
+      bits = bits | (((data[pos].to_int() << 8) | data[pos + 1].to_int()) << (8 - nbits))
+      pos = pos + 2
+      nbits = nbits + 16
+    } else if pos < end {
+      bits = bits | (data[pos].to_int() << (16 - nbits))
+      pos = pos + 1
+      nbits = nbits + 8
+    } else {
+      r.eof = true
+      return 0
+    }
+  }
+  let split0 = ((range_m1 * tp[p_off]) >> 8) + 1
+  let split0_16 = split0 << 16
+  let bit0 = bits >= split0_16
+  if bit0 {
+    range_m1 = range_m1 - split0
+    bits = bits - split0_16
+  } else {
+    range_m1 = split0 - 1
+  }
+  if range_m1 < 127 {
+    let sh = lut_sh[range_m1]
+    range_m1 = lut_rm1[range_m1]
+    bits = bits << sh
+    nbits = nbits - sh
+  }
+  if !bit0 {
+    r.pos = pos
+    r.range_m1 = range_m1
+    r.bits = bits
+    r.nbits = nbits
+    return 0
+  }
+
+  while n != 16 {
+    n = n + 1
+    // Hot bit 2: zero-token check (tp[p_off + 1])
+    if nbits < 8 {
+      if pos + 2 <= end {
+        bits = bits | (((data[pos].to_int() << 8) | data[pos + 1].to_int()) << (8 - nbits))
+        pos = pos + 2
+        nbits = nbits + 16
+      } else if pos < end {
+        bits = bits | (data[pos].to_int() << (16 - nbits))
+        pos = pos + 1
+        nbits = nbits + 8
+      } else {
+        r.pos = pos
+        r.range_m1 = range_m1
+        r.bits = bits
+        r.nbits = nbits
+        r.eof = true
+        return 1
+      }
+    }
+    let sp1 = ((range_m1 * tp[p_off + 1]) >> 8) + 1
+    let sp1_16 = sp1 << 16
+    let b1 = bits >= sp1_16
+    if b1 {
+      range_m1 = range_m1 - sp1
+      bits = bits - sp1_16
+    } else {
+      range_m1 = sp1 - 1
+    }
+    if range_m1 < 127 {
+      let sh = lut_sh[range_m1]
+      range_m1 = lut_rm1[range_m1]
+      bits = bits << sh
+      nbits = nbits - sh
+    }
+    if !b1 {
+      p_off = plane_off + vp8_bands[n] * 33
+      continue
+    }
+
+    // Hot bit 3: one-token check (tp[p_off + 2])
+    if nbits < 8 {
+      if pos + 2 <= end {
+        bits = bits | (((data[pos].to_int() << 8) | data[pos + 1].to_int()) << (8 - nbits))
+        pos = pos + 2
+        nbits = nbits + 16
+      } else if pos < end {
+        bits = bits | (data[pos].to_int() << (16 - nbits))
+        pos = pos + 1
+        nbits = nbits + 8
+      } else {
+        r.pos = pos
+        r.range_m1 = range_m1
+        r.bits = bits
+        r.nbits = nbits
+        r.eof = true
+        return 1
+      }
+    }
+    let sp2 = ((range_m1 * tp[p_off + 2]) >> 8) + 1
+    let sp2_16 = sp2 << 16
+    let b2 = bits >= sp2_16
+    if b2 {
+      range_m1 = range_m1 - sp2
+      bits = bits - sp2_16
+    } else {
+      range_m1 = sp2 - 1
+    }
+    if range_m1 < 127 {
+      let sh = lut_sh[range_m1]
+      range_m1 = lut_rm1[range_m1]
+      bits = bits << sh
+      nbits = nbits - sh
+    }
+
+    let mut v = 1
+    if !b2 {
+      p_off = plane_off + vp8_bands[n] * 33 + 11
+    } else {
+      // Cold path: v >= 2, sync to r and use BoolDecoder::read_bit
+      r.pos = pos
+      r.range_m1 = range_m1
+      r.bits = bits
+      r.nbits = nbits
+      if !r.read_bit(tp[p_off + 3]) {
+        if !r.read_bit(tp[p_off + 4]) {
+          v = 2
+        } else {
+          v = 3 + (if r.read_bit(tp[p_off + 5]) { 1 } else { 0 })
+        }
+      } else if !r.read_bit(tp[p_off + 6]) {
+        if !r.read_bit(tp[p_off + 7]) {
+          v = 5 + (if r.read_bit(159) { 1 } else { 0 })
+        } else {
+          let cb1 = if r.read_bit(165) { 2 } else { 0 }
+          let cb0 = if r.read_bit(145) { 1 } else { 0 }
+          v = 7 + cb1 + cb0
+        }
+      } else {
+        let cb1 = if r.read_bit(tp[p_off + 8]) { 1 } else { 0 }
+        let cb0 = if r.read_bit(tp[p_off + 9 + cb1]) { 1 } else { 0 }
+        let cat = 2 * cb1 + cb0
+        let tab_off = cat * 12
+        v = 0
+        let mut ci = 0
+        while vp8_cat3456[tab_off + ci] != 0 {
+          v = (v << 1) + (if r.read_bit(vp8_cat3456[tab_off + ci]) { 1 } else { 0 })
+          ci = ci + 1
+        }
+        v = v + 3 + (8 << cat)
+      }
+      pos = r.pos
+      range_m1 = r.range_m1
+      bits = r.bits
+      nbits = r.nbits
+      p_off = plane_off + vp8_bands[n] * 33 + 22
+    }
+
+    let z = vp8_zigzag[n - 1]
+    let q = if z > 0 { q_ac } else { q_dc }
+    let mut c = v * q
+
+    // Hot bit 4: sign bit (prob = 128 => split = (range_m1 >> 1) + 1)
+    if nbits < 8 {
+      if pos + 2 <= end {
+        bits = bits | (((data[pos].to_int() << 8) | data[pos + 1].to_int()) << (8 - nbits))
+        pos = pos + 2
+        nbits = nbits + 16
+      } else if pos < end {
+        bits = bits | (data[pos].to_int() << (16 - nbits))
+        pos = pos + 1
+        nbits = nbits + 8
+      } else {
+        r.pos = pos
+        r.range_m1 = range_m1
+        r.bits = bits
+        r.nbits = nbits
+        r.eof = true
+        return 1
+      }
+    }
+    let sps = (range_m1 >> 1) + 1
+    let sps_16 = sps << 16
+    if bits >= sps_16 {
+      range_m1 = range_m1 - sps
+      bits = bits - sps_16
+      c = -c
+    } else {
+      range_m1 = sps - 1
+    }
+    if range_m1 < 127 {
+      let sh = lut_sh[range_m1]
+      range_m1 = lut_rm1[range_m1]
+      bits = bits << sh
+      nbits = nbits - sh
+    }
+    coeff[coeff_base + z] = c
+
+    if n == 16 {
+      r.pos = pos
+      r.range_m1 = range_m1
+      r.bits = bits
+      r.nbits = nbits
+      return 1
+    }
+
+    // Hot bit 5: next EOB check (tp[p_off])
+    if nbits < 8 {
+      if pos + 2 <= end {
+        bits = bits | (((data[pos].to_int() << 8) | data[pos + 1].to_int()) << (8 - nbits))
+        pos = pos + 2
+        nbits = nbits + 16
+      } else if pos < end {
+        bits = bits | (data[pos].to_int() << (16 - nbits))
+        pos = pos + 1
+        nbits = nbits + 8
+      } else {
+        r.pos = pos
+        r.range_m1 = range_m1
+        r.bits = bits
+        r.nbits = nbits
+        r.eof = true
+        return 1
+      }
+    }
+    let spe = ((range_m1 * tp[p_off]) >> 8) + 1
+    let spe_16 = spe << 16
+    let be = bits >= spe_16
+    if be {
+      range_m1 = range_m1 - spe
+      bits = bits - spe_16
+    } else {
+      range_m1 = spe - 1
+    }
+    if range_m1 < 127 {
+      let sh = lut_sh[range_m1]
+      range_m1 = lut_rm1[range_m1]
+      bits = bits << sh
+      nbits = nbits - sh
+    }
+    if !be {
+      r.pos = pos
+      r.range_m1 = range_m1
+      r.bits = bits
+      r.nbits = nbits
+      return 1
+    }
+  }
+  r.pos = pos
+  r.range_m1 = range_m1
+  r.bits = bits
+  r.nbits = nbits
+  1
+}
+
+fn vp8_parse_residuals(st : Vp8State, mbx : Int, mby : Int) -> Bool {
+  let part = st.op[mby & (st.n_op - 1)]
+  let q_off = st.segment * 6
+  let y1_dc = st.quant[q_off]
+  let y1_ac = st.quant[q_off + 1]
+  let y2_dc = st.quant[q_off + 2]
+  let y2_ac = st.quant[q_off + 3]
+  let uv_dc = st.quant[q_off + 4]
+  let uv_ac = st.quant[q_off + 5]
+
+  let mut plane = vp8_plane_y1_sans_y2
+  if st.use_pred_y16 {
+    let nz = vp8_parse_residuals4(
+      st,
+      part,
+      vp8_plane_y2,
+      st.left_nz_y16 + st.up_nz_y16[mbx],
+      y2_dc,
+      y2_ac,
+      false,
+      vp8_wht_coeff_base,
+    )
+    st.left_nz_y16 = nz
+    st.up_nz_y16[mbx] = nz
+    vp8_iwht16(st.coeff, st.idct_tmp)
+    plane = vp8_plane_y1_with_y2
+  }
+
+  let mut nz_dc_mask = 0
+  let mut nz_ac_mask = 0
+  let mut coeff_base = 0
+
+  // Luma 4x4 blocks (zero per-MB heap allocations using st.nz_scratch)
+  let mut l0 = st.left_nz_mask & 1
+  let mut l1 = (st.left_nz_mask >> 1) & 1
+  let mut l2 = (st.left_nz_mask >> 2) & 1
+  let mut l3 = (st.left_nz_mask >> 3) & 1
+  let unz_in = st.up_nz_mask[mbx]
+  let nzs = st.nz_scratch
+  nzs[0] = unz_in & 1
+  nzs[1] = (unz_in >> 1) & 1
+  nzs[2] = (unz_in >> 2) & 1
+  nzs[3] = (unz_in >> 3) & 1
+
+  let mut y = 0
+  while y < 4 {
+    let mut nz = if y == 0 { l0 } else if y == 1 { l1 } else if y == 2 { l2 } else { l3 }
+    let mut x = 0
+    while x < 4 {
+      nz = vp8_parse_residuals4(st, part, plane, nz + nzs[x], y1_dc, y1_ac, st.use_pred_y16, coeff_base)
+      nzs[x] = nz
+      let bit = 1 << (y * 4 + x)
+      if nz != 0 {
+        nz_ac_mask = nz_ac_mask | bit
+      }
+      if st.coeff[coeff_base] != 0 {
+        nz_dc_mask = nz_dc_mask | bit
+      }
+      coeff_base = coeff_base + 16
+      x = x + 1
+    }
+    if y == 0 {
+      l0 = nz
+    } else if y == 1 {
+      l1 = nz
+    } else if y == 2 {
+      l2 = nz
+    } else {
+      l3 = nz
+    }
+    y = y + 1
+  }
+  let mut new_lnz = l0 | (l1 << 1) | (l2 << 2) | (l3 << 3)
+  let mut new_unz = nzs[0] | (nzs[1] << 1) | (nzs[2] << 2) | (nzs[3] << 3)
+
+  // Chroma 2x2x2 blocks (Cb then Cr)
+  let l_hi = st.left_nz_mask >> 4
+  let u_hi = unz_in >> 4
+  nzs[4] = l_hi & 1
+  nzs[5] = (l_hi >> 1) & 1
+  nzs[6] = (l_hi >> 2) & 1
+  nzs[7] = (l_hi >> 3) & 1
+  nzs[8] = u_hi & 1
+  nzs[9] = (u_hi >> 1) & 1
+  nzs[10] = (u_hi >> 2) & 1
+  nzs[11] = (u_hi >> 3) & 1
+
+  let mut c = 0
+  while c < 4 {
+    let mut cy = 0
+    while cy < 2 {
+      let mut nz = nzs[4 + cy + c]
+      let mut cx = 0
+      while cx < 2 {
+        nz = vp8_parse_residuals4(st, part, vp8_plane_uv, nz + nzs[8 + cx + c], uv_dc, uv_ac, false, coeff_base)
+        nzs[8 + cx + c] = nz
+        let bit = 1 << (16 + c * 2 + cy * 2 + cx)
+        if nz != 0 {
+          nz_ac_mask = nz_ac_mask | bit
+        }
+        if st.coeff[coeff_base] != 0 {
+          nz_dc_mask = nz_dc_mask | bit
+        }
+        coeff_base = coeff_base + 16
+        cx = cx + 1
+      }
+      nzs[4 + cy + c] = nz
+      cy = cy + 1
+    }
+    c = c + 2
+  }
+  new_lnz = new_lnz | ((nzs[4] | (nzs[5] << 1) | (nzs[6] << 2) | (nzs[7] << 3)) << 4)
+  new_unz = new_unz | ((nzs[8] | (nzs[9] << 1) | (nzs[10] << 2) | (nzs[11] << 3)) << 4)
+  st.left_nz_mask = new_lnz
+  st.up_nz_mask[mbx] = new_unz
+  st.nz_dc_mask = nz_dc_mask
+  st.nz_ac_mask = nz_ac_mask
+  nz_dc_mask == 0 && nz_ac_mask == 0
+}
+
+fn vp8_reconstruct_mb(st : Vp8State, mbx : Int, mby : Int) -> Unit {
+  if st.use_pred_y16 {
+    let p = vp8_check_top_left_pred(mbx, mby, st.pred_y16)
+    vp8_pred16(st.ybr, p, 1, 8)
+    let mut j = 0
+    while j < 4 {
+      let mut i = 0
+      while i < 4 {
+        let n = 4 * j + i
+        let y = 4 * j + 1
+        let x = 4 * i + 8
+        let mask = 1 << n
+        if (st.nz_ac_mask & mask) != 0 {
+          vp8_idct4(st.ybr, st.coeff, st.idct_tmp, y, x, 16 * n)
+        } else if (st.nz_dc_mask & mask) != 0 {
+          vp8_idct4_dc(st.ybr, st.coeff, y, x, 16 * n)
+        }
+        i = i + 1
+      }
+      j = j + 1
+    }
+  } else {
+    let mut j = 0
+    while j < 4 {
+      let mut i = 0
+      while i < 4 {
+        let n = 4 * j + i
+        let y = 4 * j + 1
+        let x = 4 * i + 8
+        vp8_pred4(st.ybr, st.pred_y4[n], y, x)
+        let mask = 1 << n
+        if (st.nz_ac_mask & mask) != 0 {
+          vp8_idct4(st.ybr, st.coeff, st.idct_tmp, y, x, 16 * n)
+        } else if (st.nz_dc_mask & mask) != 0 {
+          vp8_idct4_dc(st.ybr, st.coeff, y, x, 16 * n)
+        }
+        i = i + 1
+      }
+      j = j + 1
+    }
+  }
+  let cp = vp8_check_top_left_pred(mbx, mby, st.pred_c8)
+  vp8_pred8(st.ybr, cp, 18, 8)
+  if (st.nz_ac_mask & 0x0F0000) != 0 {
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 18, 8, vp8_b_coeff_base)
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 18, 12, vp8_b_coeff_base + 16)
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 22, 8, vp8_b_coeff_base + 32)
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 22, 12, vp8_b_coeff_base + 48)
+  } else if (st.nz_dc_mask & 0x0F0000) != 0 {
+    vp8_idct4_dc(st.ybr, st.coeff, 18, 8, vp8_b_coeff_base)
+    vp8_idct4_dc(st.ybr, st.coeff, 18, 12, vp8_b_coeff_base + 16)
+    vp8_idct4_dc(st.ybr, st.coeff, 22, 8, vp8_b_coeff_base + 32)
+    vp8_idct4_dc(st.ybr, st.coeff, 22, 12, vp8_b_coeff_base + 48)
+  }
+  vp8_pred8(st.ybr, cp, 18, 24)
+  if (st.nz_ac_mask & 0xF00000) != 0 {
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 18, 24, vp8_r_coeff_base)
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 18, 28, vp8_r_coeff_base + 16)
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 22, 24, vp8_r_coeff_base + 32)
+    vp8_idct4(st.ybr, st.coeff, st.idct_tmp, 22, 28, vp8_r_coeff_base + 48)
+  } else if (st.nz_dc_mask & 0xF00000) != 0 {
+    vp8_idct4_dc(st.ybr, st.coeff, 18, 24, vp8_r_coeff_base)
+    vp8_idct4_dc(st.ybr, st.coeff, 18, 28, vp8_r_coeff_base + 16)
+    vp8_idct4_dc(st.ybr, st.coeff, 22, 24, vp8_r_coeff_base + 32)
+    vp8_idct4_dc(st.ybr, st.coeff, 22, 28, vp8_r_coeff_base + 48)
+  }
+}
+
+fn vp8_decode_mb(st : Vp8State, mbx : Int, mby : Int) -> Bool {
+  if st.update_map {
+    if !st.fp.read_bit(st.seg_prob[0]) {
+      st.segment = if st.fp.read_bit(st.seg_prob[1]) { 1 } else { 0 }
+    } else {
+      st.segment = (if st.fp.read_bit(st.seg_prob[2]) { 1 } else { 0 }) + 2
+    }
+  }
+  let mut skip = false
+  if st.use_skip_prob {
+    skip = st.fp.read_bit(st.skip_prob)
+  }
+  // st.coeff is kept zeroed lazily by vp8_idct4 / vp8_idct4_dc / vp8_iwht16
+  vp8_prepare_ybr(st, mbx, mby)
+  st.use_pred_y16 = st.fp.read_bit(145)
+  if st.use_pred_y16 {
+    vp8_parse_pred_y16(st, mbx)
+  } else {
+    vp8_parse_pred_y4(st, mbx)
+  }
+  vp8_parse_pred_c8(st)
+  if !skip {
+    skip = vp8_parse_residuals(st, mbx, mby)
+  } else {
+    if st.use_pred_y16 {
+      st.left_nz_y16 = 0
+      st.up_nz_y16[mbx] = 0
+    }
+    st.left_nz_mask = 0
+    st.up_nz_mask[mbx] = 0
+    st.nz_dc_mask = 0
+    st.nz_ac_mask = 0
+  }
+  vp8_reconstruct_mb(st, mbx, mby)
+
+  // Copy reconstructed Y, Cb, Cr blocks into frame planes (hoisted refs + 4x unrolled)
+  let ybr = st.ybr
+  let mut yp = st.y_plane
+  let y_stride = st.y_stride
+  let mut y_dst = (mby * y_stride + mbx) * 16
+  let mut y = 0
+  while y < 16 {
+    let src = (1 + y) * 32 + 8
+    yp[y_dst] = ybr[src].to_byte()
+    yp[y_dst + 1] = ybr[src + 1].to_byte()
+    yp[y_dst + 2] = ybr[src + 2].to_byte()
+    yp[y_dst + 3] = ybr[src + 3].to_byte()
+    yp[y_dst + 4] = ybr[src + 4].to_byte()
+    yp[y_dst + 5] = ybr[src + 5].to_byte()
+    yp[y_dst + 6] = ybr[src + 6].to_byte()
+    yp[y_dst + 7] = ybr[src + 7].to_byte()
+    yp[y_dst + 8] = ybr[src + 8].to_byte()
+    yp[y_dst + 9] = ybr[src + 9].to_byte()
+    yp[y_dst + 10] = ybr[src + 10].to_byte()
+    yp[y_dst + 11] = ybr[src + 11].to_byte()
+    yp[y_dst + 12] = ybr[src + 12].to_byte()
+    yp[y_dst + 13] = ybr[src + 13].to_byte()
+    yp[y_dst + 14] = ybr[src + 14].to_byte()
+    yp[y_dst + 15] = ybr[src + 15].to_byte()
+    y_dst = y_dst + y_stride
+    y = y + 1
+  }
+  let mut cbp = st.cb_plane
+  let mut crp = st.cr_plane
+  let c_stride = st.c_stride
+  let mut c_dst = (mby * c_stride + mbx) * 8
+  y = 0
+  while y < 8 {
+    let b_src = (18 + y) * 32 + 8
+    let r_src = (18 + y) * 32 + 24
+    cbp[c_dst] = ybr[b_src].to_byte()
+    cbp[c_dst + 1] = ybr[b_src + 1].to_byte()
+    cbp[c_dst + 2] = ybr[b_src + 2].to_byte()
+    cbp[c_dst + 3] = ybr[b_src + 3].to_byte()
+    cbp[c_dst + 4] = ybr[b_src + 4].to_byte()
+    cbp[c_dst + 5] = ybr[b_src + 5].to_byte()
+    cbp[c_dst + 6] = ybr[b_src + 6].to_byte()
+    cbp[c_dst + 7] = ybr[b_src + 7].to_byte()
+    crp[c_dst] = ybr[r_src].to_byte()
+    crp[c_dst + 1] = ybr[r_src + 1].to_byte()
+    crp[c_dst + 2] = ybr[r_src + 2].to_byte()
+    crp[c_dst + 3] = ybr[r_src + 3].to_byte()
+    crp[c_dst + 4] = ybr[r_src + 4].to_byte()
+    crp[c_dst + 5] = ybr[r_src + 5].to_byte()
+    crp[c_dst + 6] = ybr[r_src + 6].to_byte()
+    crp[c_dst + 7] = ybr[r_src + 7].to_byte()
+    c_dst = c_dst + c_stride
+    y = y + 1
+  }
+  skip
+}
+
+fn vp8_apply_simple_filter(st : Vp8State) -> Unit {
+  let mut mby = 0
+  while mby < st.mbh {
+    let mut mbx = 0
+    while mbx < st.mbw {
+      let off = (st.mbw * mby + mbx) * 4
+      let l = st.per_mb_lf[off]
+      if l != 0 {
+        let inner = st.per_mb_lf[off + 3] != 0
+        let yi = (mby * st.y_stride + mbx) * 16
+        if mbx > 0 {
+          vp8_filter2(st.y_plane, l + 4, yi, st.y_stride, 1)
+        }
+        if inner {
+          vp8_filter2(st.y_plane, l, yi + 4, st.y_stride, 1)
+          vp8_filter2(st.y_plane, l, yi + 8, st.y_stride, 1)
+          vp8_filter2(st.y_plane, l, yi + 12, st.y_stride, 1)
+        }
+        if mby > 0 {
+          vp8_filter2(st.y_plane, l + 4, yi, 1, st.y_stride)
+        }
+        if inner {
+          vp8_filter2(st.y_plane, l, yi + st.y_stride * 4, 1, st.y_stride)
+          vp8_filter2(st.y_plane, l, yi + st.y_stride * 8, 1, st.y_stride)
+          vp8_filter2(st.y_plane, l, yi + st.y_stride * 12, 1, st.y_stride)
+        }
+      }
+      mbx = mbx + 1
+    }
+    mby = mby + 1
+  }
+}
+
+fn vp8_apply_normal_filter(st : Vp8State) -> Unit {
+  let mut mby = 0
+  while mby < st.mbh {
+    let mut mbx = 0
+    while mbx < st.mbw {
+      let off = (st.mbw * mby + mbx) * 4
+      let l = st.per_mb_lf[off]
+      if l != 0 {
+        let il = st.per_mb_lf[off + 1]
+        let hl = st.per_mb_lf[off + 2]
+        let inner = st.per_mb_lf[off + 3] != 0
+        let yi = (mby * st.y_stride + mbx) * 16
+        let ci = (mby * st.c_stride + mbx) * 8
+        if mbx > 0 {
+          vp8_filter246(st.y_plane, 16, l + 4, il, hl, yi, st.y_stride, 1, false)
+          vp8_filter246(st.cb_plane, 8, l + 4, il, hl, ci, st.c_stride, 1, false)
+          vp8_filter246(st.cr_plane, 8, l + 4, il, hl, ci, st.c_stride, 1, false)
+        }
+        if inner {
+          vp8_filter246(st.y_plane, 16, l, il, hl, yi + 4, st.y_stride, 1, true)
+          vp8_filter246(st.y_plane, 16, l, il, hl, yi + 8, st.y_stride, 1, true)
+          vp8_filter246(st.y_plane, 16, l, il, hl, yi + 12, st.y_stride, 1, true)
+          vp8_filter246(st.cb_plane, 8, l, il, hl, ci + 4, st.c_stride, 1, true)
+          vp8_filter246(st.cr_plane, 8, l, il, hl, ci + 4, st.c_stride, 1, true)
+        }
+        if mby > 0 {
+          vp8_filter246(st.y_plane, 16, l + 4, il, hl, yi, 1, st.y_stride, false)
+          vp8_filter246(st.cb_plane, 8, l + 4, il, hl, ci, 1, st.c_stride, false)
+          vp8_filter246(st.cr_plane, 8, l + 4, il, hl, ci, 1, st.c_stride, false)
+        }
+        if inner {
+          vp8_filter246(st.y_plane, 16, l, il, hl, yi + st.y_stride * 4, 1, st.y_stride, true)
+          vp8_filter246(st.y_plane, 16, l, il, hl, yi + st.y_stride * 8, 1, st.y_stride, true)
+          vp8_filter246(st.y_plane, 16, l, il, hl, yi + st.y_stride * 12, 1, st.y_stride, true)
+          vp8_filter246(st.cb_plane, 8, l, il, hl, ci + st.c_stride * 4, 1, st.c_stride, true)
+          vp8_filter246(st.cr_plane, 8, l, il, hl, ci + st.c_stride * 4, 1, st.c_stride, true)
+        }
+      }
+      mbx = mbx + 1
+    }
+    mby = mby + 1
+  }
+}
+
+///| Decode a VP8 keyframe payload `data[start..end)` into RGBA8888, compositing `alpha` if `has_alpha`.
+fn vp8_decode_internal(
+  data : Bytes,
+  start : Int,
+  end : Int,
+  limits : DecodeLimits,
+  alpha : Bytes,
+  has_alpha : Bool,
+) -> Result[(Int, Int, Bytes), WebpError] {
+  let (w, h, fp_len) = match vp8_parse_frame_header(data, start, end) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match check_dimensions(w, h, limits) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+  let fp_start = start + 10
+  let fp_end = fp_start + fp_len
+  if fp_end > end {
+    return Err(WebpError::UnexpectedEof("VP8 first partition truncated"))
+  }
+
+  let st = Vp8State::new(w, h, BoolDecoder::new(data, fp_start, fp_end))
+  // KeyFrame color space and clamp bits (section 9.2)
+  let _ = st.fp.read_bit(vp8_uniform_prob)
+  let _ = st.fp.read_bit(vp8_uniform_prob)
+  vp8_parse_segment_header(st)
+  vp8_parse_filter_header(st)
+  match vp8_parse_other_partitions(st, data, fp_end, end) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+  vp8_parse_quant(st)
+  // Refresh entropy probs bit (section 9.8)
+  let _ = st.fp.read_bit(vp8_uniform_prob)
+  vp8_parse_token_prob(st)
+  st.use_skip_prob = st.fp.read_bit(vp8_uniform_prob)
+  if st.use_skip_prob {
+    st.skip_prob = st.fp.read_uint(vp8_uniform_prob, 8)
+  }
+  if st.fp.eof {
+    return Err(WebpError::UnexpectedEof("VP8 header partition truncated"))
+  }
+
+  // Decode all macroblocks
+  let mut mby = 0
+  while mby < st.mbh {
+    st.left_pred[0] = 0
+    st.left_pred[1] = 0
+    st.left_pred[2] = 0
+    st.left_pred[3] = 0
+    st.left_nz_mask = 0
+    st.left_nz_y16 = 0
+    let mut mbx = 0
+    while mbx < st.mbw {
+      let skip = vp8_decode_mb(st, mbx, mby)
+      let is_i4 = if st.use_pred_y16 { 0 } else { 1 }
+      let fp_slot = (st.segment * 2 + is_i4) * 4
+      let mb_off = (st.mbw * mby + mbx) * 4
+      st.per_mb_lf[mb_off] = st.filter_params[fp_slot]
+      st.per_mb_lf[mb_off + 1] = st.filter_params[fp_slot + 1]
+      st.per_mb_lf[mb_off + 2] = st.filter_params[fp_slot + 2]
+      let base_inner = st.filter_params[fp_slot + 3] != 0
+      st.per_mb_lf[mb_off + 3] = if base_inner || !skip { 1 } else { 0 }
+      mbx = mbx + 1
+    }
+    mby = mby + 1
+  }
+
+  if st.fp.eof {
+    return Err(WebpError::UnexpectedEof("VP8 first partition unexpected EOF"))
+  }
+  let mut pi = 0
+  while pi < st.n_op {
+    if st.op[pi].eof {
+      return Err(WebpError::UnexpectedEof("VP8 coefficient partition unexpected EOF"))
+    }
+    pi = pi + 1
+  }
+
+  if st.lf_level != 0 {
+    if st.lf_simple {
+      vp8_apply_simple_filter(st)
+    } else {
+      vp8_apply_normal_filter(st)
+    }
+  }
+
+  let rgba = vp8_yuv420_to_rgba(
+    st.y_plane,
+    st.cb_plane,
+    st.cr_plane,
+    st.y_stride,
+    st.c_stride,
+    w,
+    h,
+    alpha,
+    has_alpha,
+  )
+  Ok((w, h, rgba))
+}
