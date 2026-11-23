@@ -1,202 +1,184 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/base64`.
-# All Lake build artifacts stay in /private/tmp/pion-lean-shared (single shared Mathlib .lake, zero git worktree pollution).
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="base64"
+LEAN_MOD="Base64"
+PROOF_MOD="Base64Proofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/base64 ==="
-rm -rf "$PROJ/Base64"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Base64/$f.lean" ]; then
-    echo "FAIL: missing Base64/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/Base64Proofs"
-cp -R "$SCRIPT_DIR/Base64Proofs" "$PROJ/Base64Proofs"
-cp "$SCRIPT_DIR/Base64Proofs.lean" "$PROJ/Base64Proofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Base64 where\n  globs := #[.submodules `Base64]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib Base64Proofs where\n  globs := #[.andSubmodules `Base64Proofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/Base64Proofs.lean" "$SCRIPT_DIR/Base64Proofs" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Base64 Base64Proofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Base64 Base64Proofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
-  exit 1
-fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Base64 Base64Proofs: exit 0, 0 errors"
-
-echo "=== [5/7] #print axioms audit ==="
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-echo "$AXIOMS_OUT"
-BAD_AXIOMS=$(printf '%s\n' "$AXIOMS_OUT" | grep -E "depends on axioms:" | sed 's/.*\[//;s/\].*//;s/,/\n/g' | tr -d ' ' | sort -u | grep -v -E '^(propext|Classical\.choice|Quot\.sound)$' || true)
-if [ -n "$BAD_AXIOMS" ]; then
-  echo "FAIL: unexpected axioms found: $BAD_AXIOMS" >&2
-  exit 1
-fi
-if printf '%s\n' "$AXIOMS_OUT" | grep -q "error:"; then
-  echo "FAIL: CheckAxioms.lean reported errors" >&2
-  exit 1
-fi
-echo "Axioms audit: ONLY standard axioms (propext, Classical.choice, Quot.sound)"
-
-echo "=== [6/7] EvalDiff.lean (#eval) ==="
-EVAL_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" --run EvalDiff.lean 2>&1)
-echo "$EVAL_OUT"
-if printf '%s\n' "$EVAL_OUT" | grep -q "error:"; then
-  echo "FAIL: EvalDiff.lean reported errors" >&2
-  exit 1
-fi
-if printf '%s\n' "$EVAL_OUT" | grep -q ': FAIL$'; then
-  echo "FAIL: EvalDiff.lean had a FAIL check" >&2
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$WORK/native-diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "base64_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 base64 = { path = "$PKG_DIR" }
 EOF
-
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "base64"
 
-fn report(w : World, label : String, passed : Bool) -> Unit {
-  if passed {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
-
-pub fn main(w : World) -> Int {
-  report(w, "b64_enc_pad_0", base64::encoded_len(0, true) == 0)
-  report(w, "b64_enc_pad_1", base64::encoded_len(1, true) == 4)
-  report(w, "b64_enc_pad_2", base64::encoded_len(2, true) == 4)
-  report(w, "b64_enc_pad_3", base64::encoded_len(3, true) == 4)
-  report(w, "b64_enc_nopad_1", base64::encoded_len(1, false) == 2)
-  report(w, "b64_enc_nopad_2", base64::encoded_len(2, false) == 3)
-  report(w, "b64_enc_nopad_10", base64::encoded_len(10, false) == 14)
-  report(w, "b64_dec_len_0", base64::b64_decoded_len(0) == 0)
-  report(w, "b64_dec_len_1_bad", base64::b64_decoded_len(1) == -1)
-  report(w, "b64_dec_len_2", base64::b64_decoded_len(2) == 1)
-  report(w, "b64_dec_len_3", base64::b64_decoded_len(3) == 2)
-  report(w, "b64_dec_len_14", base64::b64_decoded_len(14) == 10)
-  report(w, "b64_pack3_abc", base64::b64_pack3(97, 98, 99) == 6382179)
-  report(w, "b64_pack4_ok", base64::b64_pack4_sextets(24, 22, 9, 35) == 6382179)
-  report(w, "b64_pack4_bad", base64::b64_pack4_sextets(0, -1, 0, 0) < 0)
-  report(w, "b64_mask_2", base64::b64_tail_canonical_mask(2) == 15)
-  report(w, "b64_mask_3", base64::b64_tail_canonical_mask(3) == 3)
-  report(w, "b64_pad_0", base64::b64_expected_pad(0) == 0)
-  report(w, "b64_pad_2", base64::b64_expected_pad(2) == 2)
-  report(w, "b64_pad_3", base64::b64_expected_pad(3) == 1)
-
-  report(w, "b32_tsym_0", base64::b32_tail_symbols(0) == 0)
-  report(w, "b32_tsym_1", base64::b32_tail_symbols(1) == 2)
-  report(w, "b32_tsym_2", base64::b32_tail_symbols(2) == 4)
-  report(w, "b32_tsym_3", base64::b32_tail_symbols(3) == 5)
-  report(w, "b32_tsym_4", base64::b32_tail_symbols(4) == 7)
-  report(w, "b32_tbyt_1_bad", base64::b32_tail_bytes(1) == -1)
-  report(w, "b32_tbyt_3_bad", base64::b32_tail_bytes(3) == -1)
-  report(w, "b32_tbyt_6_bad", base64::b32_tail_bytes(6) == -1)
-  report(w, "b32_tbyt_7", base64::b32_tail_bytes(7) == 4)
-  report(w, "b32_enc_pad_6", base64::b32_encoded_len(6, true) == 16)
-  report(w, "b32_enc_nopad_6", base64::b32_encoded_len(6, false) == 10)
-  report(w, "b32_spare_2", base64::b32_spare_mask(2) == 3)
-  report(w, "b32_spare_4", base64::b32_spare_mask(4) == 15)
-  report(w, "b32_spare_5", base64::b32_spare_mask(5) == 1)
-  report(w, "b32_spare_7", base64::b32_spare_mask(7) == 7)
-
-  report(w, "hex_enc_7", base64::hex_encoded_len(7) == 14)
-  report(w, "hex_dec_14", base64::hex_decoded_len(14) == 7)
-  report(w, "hex_dec_odd", base64::hex_decoded_len(15) == -1)
-  report(w, "hex_pack_ab", base64::hex_pack_byte(10, 11) == 171)
-  report(w, "hex_pack_bad", base64::hex_pack_byte(10, -1) < 0)
+pub fn main(world : World) -> Int {
+  io_println(world, "b64_enc_0_t=" + base64::encoded_len(0, true).to_string())
+  io_println(world, "b64_enc_neg1_f=" + base64::encoded_len(-1, false).to_string())
+  io_println(world, "b64_enc_min_t=" + base64::encoded_len(-2147483648, true).to_string())
+  io_println(world, "b64_enc_512m_f=" + base64::encoded_len(536870912, false).to_string())
+  io_println(world, "b64_enc_512m_t=" + base64::encoded_len(536870912, true).to_string())
+  io_println(world, "b64_enc_fit_f=" + base64::encoded_len(1610612734, false).to_string())
+  io_println(world, "b64_enc_sat_f=" + base64::encoded_len(1610612735, false).to_string())
+  io_println(world, "b64_enc_max_t=" + base64::encoded_len(2147483647, true).to_string())
+  io_println(world, "b64_dec_512m=" + base64::b64_decoded_len(715827883).to_string())
+  io_println(world, "b64_dec_mod1=" + base64::b64_decoded_len(5).to_string())
+  io_println(world, "b64_dec_neg1=" + base64::b64_decoded_len(-1).to_string())
+  io_println(world, "b64_dec_min=" + base64::b64_decoded_len(-2147483648).to_string())
+  io_println(world, "b64_pack3_abc=" + base64::b64_pack3(0x4D, 0x61, 0x6E).to_string())
+  io_println(world, "b64_pack4_ok=" + base64::b64_pack4_sextets(19, 22, 5, 46).to_string())
+  io_println(world, "b64_pack4_err=" + base64::b64_pack4_sextets(0, -1, 0, 0).to_string())
+  io_println(world, "hex_enc_0=" + base64::hex_encoded_len(0).to_string())
+  io_println(world, "hex_enc_min=" + base64::hex_encoded_len(-2147483648).to_string())
+  io_println(world, "hex_enc_fit=" + base64::hex_encoded_len(1073741823).to_string())
+  io_println(world, "hex_enc_1g=" + base64::hex_encoded_len(1073741824).to_string())
+  io_println(world, "hex_enc_max=" + base64::hex_encoded_len(2147483647).to_string())
+  io_println(world, "hex_dec_fit=" + base64::hex_decoded_len(2147483646).to_string())
+  io_println(world, "hex_dec_odd=" + base64::hex_decoded_len(2147483647).to_string())
+  io_println(world, "hex_dec_neg=" + base64::hex_decoded_len(-2).to_string())
+  io_println(world, "hex_pack_ab=" + base64::hex_pack_byte(10, 11).to_string())
+  io_println(world, "hex_pack_err=" + base64::hex_pack_byte(-1, 0).to_string())
+  io_println(world, "b32_enc_0_t=" + base64::b32_encoded_len(0, true).to_string())
+  io_println(world, "b32_enc_min_f=" + base64::b32_encoded_len(-2147483648, false).to_string())
+  io_println(world, "b32_enc_1g_f=" + base64::b32_encoded_len(1073741824, false).to_string())
+  io_println(world, "b32_enc_1g_t=" + base64::b32_encoded_len(1073741824, true).to_string())
+  io_println(world, "b32_enc_fit_f=" + base64::b32_encoded_len(1342177279, false).to_string())
+  io_println(world, "b32_enc_sat_f=" + base64::b32_encoded_len(1342177280, false).to_string())
+  io_println(world, "b32_enc_max_t=" + base64::b32_encoded_len(2147483647, true).to_string())
   0
 }
 EOF
-
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
 echo "PASS: packages/base64 Lean 4 proofs"
