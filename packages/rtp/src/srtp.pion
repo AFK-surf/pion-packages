@@ -38,9 +38,8 @@ fn kdf_derive(aes_k : Aes128Key, master_salt : Bytes, label : Int, out_len : Int
     iv[i] = master_salt[i].to_int() & 0xFF
     i = i + 1
   }
-  // key_id = label || r (56 bits) XORed right-aligned with master_salt (14B -> index 7, 12B -> index 5)
-  // Wait: RFC 3711 §4.3.1 puts label at byte 7 for 14B salt; RFC 7714 §13 pads 12B salt with
-  // 2 zero bytes on the right to 14B (so label is at byte 7 in libsrtp & webrtc-rs/srtp).
+  // RFC 3711 §4.3.1 puts label at byte 7 for 14B salt; RFC 7714 §13 right-pads 12B salt
+  // with 2 zero bytes to 14B (matching libsrtp & webrtc-rs/srtp).
   iv[7] = iv[7] ^ (label & 0xFF)
   aes128_ctr_keystream(aes_k, iv, out_len)
 }
@@ -137,6 +136,13 @@ pub fn SrtpContext::from_session_keys(
   if srtp_keys.salt.length() != want_salt || srtcp_keys.salt.length() != want_salt {
     return Err(RtpError::InvalidSaltLength("session salt length mismatch for profile"))
   }
+  match profile {
+    ProtectionProfile::AeadAes128Gcm => ()
+    _ =>
+    if srtp_keys.auth_key.length() != 20 || srtcp_keys.auth_key.length() != 20 {
+      return Err(RtpError::InvalidKeyLength("HMAC-SHA1 session auth key must be 20 bytes"))
+    }
+  }
   let srtp_aes = aes128_expand_key(srtp_keys.enc_key)
   let srtcp_aes = aes128_expand_key(srtcp_keys.enc_key)
   let srtp_ghash = ghash_table_new(srtp_aes)
@@ -156,71 +162,135 @@ pub fn SrtpContext::from_session_keys(
     srtcp_hmac_ipad: srtcp_hmac_ipad,
     srtcp_hmac_opad: srtcp_hmac_opad,
     ssrc_states: [],
+    ssrc_buckets: FixedArray::make(64, -1),
     srtcp_index: 0U,
-    srtcp_max_index: 0U,
-    srtcp_has_index: false,
-    srtcp_replay_mask: 0UL,
   })
 }
 
-///|
-fn get_or_create_ssrc_state(ctx : SrtpContext, ssrc : UInt) -> SsrcState {
+///| Maximum number of distinct authenticated SSRCs tracked per SrtpContext (bounds memory).
+fn max_tracked_ssrcs() -> Int {
+  4096
+}
+
+///| Mix 32-bit SSRC for open-addressed hash table indexing (power-of-two capacity).
+fn ssrc_hash_slot(ssrc : UInt, mask : Int) -> Int {
+  let h = (ssrc * 2654435761U) ^ (ssrc >> 16U)
+  (h.to_int() & mask)
+}
+
+///| O(1) read-only lookup of existing SSRC state (never inserts or mutates).
+fn find_ssrc_state(ctx : SrtpContext, ssrc : UInt) -> Option[SsrcState] {
+  let cap = ctx.ssrc_buckets.length()
+  let mask = cap - 1
+  let mut slot = ssrc_hash_slot(ssrc, mask)
+  let mut probes = 0
+  while probes < cap {
+    let idx = ctx.ssrc_buckets[slot]
+    if idx < 0 {
+      return None
+    }
+    let st = ctx.ssrc_states[idx]
+    if st.ssrc == ssrc {
+      return Some(st)
+    }
+    slot = (slot + 1) & mask
+    probes = probes + 1
+  }
+  None
+}
+
+///| Double the hash bucket table and re-insert all existing SSRC indices.
+fn rehash_ssrc_buckets(ctx : SrtpContext) -> Unit {
+  let new_cap = ctx.ssrc_buckets.length() << 1
+  let new_buckets = FixedArray::make(new_cap, -1)
+  let mask = new_cap - 1
   let mut i = 0
   while i < ctx.ssrc_states.length() {
-    if ctx.ssrc_states[i].ssrc == ssrc {
-      return ctx.ssrc_states[i]
+    let ssrc = ctx.ssrc_states[i].ssrc
+    let mut slot = ssrc_hash_slot(ssrc, mask)
+    while new_buckets[slot] >= 0 {
+      slot = (slot + 1) & mask
     }
+    new_buckets[slot] = i
     i = i + 1
   }
+  ctx.ssrc_buckets = new_buckets
+}
+
+///| Insert a new SSRC state (call ONLY for authenticated packets or local send/set_roc).
+fn get_or_create_ssrc_state(ctx : SrtpContext, ssrc : UInt) -> Result[SsrcState, RtpError] {
+  match find_ssrc_state(ctx, ssrc) {
+    Some(st) => return Ok(st)
+    None => ()
+  }
+  if ctx.ssrc_states.length() >= max_tracked_ssrcs() {
+    return Err(RtpError::LimitExceeded("maximum tracked SSRCs (4096) exceeded"))
+  }
+  if (ctx.ssrc_states.length() + 1) * 2 > ctx.ssrc_buckets.length() {
+    rehash_ssrc_buckets(ctx)
+  }
+  let idx = ctx.ssrc_states.length()
   let st = SsrcState::{
     ssrc: ssrc,
     roc: 0U,
     s_l: 0,
     has_seq: false,
     replay_mask: 0UL,
+    srtcp_send_index: ctx.srtcp_index & 0x7FFFFFFFU,
+    srtcp_send_exhausted: false,
+    srtcp_max_index: 0U,
+    srtcp_has_index: false,
+    srtcp_replay_mask: 0UL,
   }
   ctx.ssrc_states.push(st)
-  st
+  let mask = ctx.ssrc_buckets.length() - 1
+  let mut slot = ssrc_hash_slot(ssrc, mask)
+  while ctx.ssrc_buckets[slot] >= 0 {
+    slot = (slot + 1) & mask
+  }
+  ctx.ssrc_buckets[slot] = idx
+  Ok(st)
 }
 
 ///|
 pub fn SrtpContext::get_roc(self : SrtpContext, ssrc : UInt) -> UInt {
-  let mut i = 0
-  while i < self.ssrc_states.length() {
-    if self.ssrc_states[i].ssrc == ssrc {
-      return self.ssrc_states[i].roc
-    }
-    i = i + 1
+  match find_ssrc_state(self, ssrc) {
+    Some(st) => st.roc
+    None => 0U
   }
-  0U
 }
 
 ///|
 pub fn SrtpContext::set_roc(self : SrtpContext, ssrc : UInt, roc : UInt) -> Unit {
-  let st = get_or_create_ssrc_state(self, ssrc)
-  st.roc = roc
+  match get_or_create_ssrc_state(self, ssrc) {
+    Ok(st) => st.roc = roc
+    Err(_) => ()
+  }
 }
 
-///| RFC 3711 Appendix A: estimate ROC `v` for incoming sequence number `seq`.
-fn estimate_roc(st : SsrcState, seq : Int) -> UInt {
-  if !st.has_seq {
-    return st.roc
+///| RFC 3711 Appendix A: estimate ROC `v` for incoming sequence number `seq`,
+///| returning an error if `roc` would wrap past `0xFFFFFFFFU` (re-key required).
+fn estimate_roc_checked(has_seq : Bool, roc : UInt, s_l : Int, seq : Int) -> Result[UInt, RtpError] {
+  if !has_seq {
+    return Ok(roc)
   }
-  let s_l = st.s_l
   if s_l < 32768 {
     if seq - s_l > 32768 {
-      if st.roc > 0U {
-        st.roc - 1U
+      if roc > 0U {
+        Ok(roc - 1U)
       } else {
-        0U
+        Ok(0U)
       }
     } else {
-      st.roc
+      Ok(roc)
     }
   } else if s_l - 32768 > seq {
-    st.roc + 1U
+    if roc == 0xFFFFFFFFU {
+      return Err(RtpError::LimitExceeded("SRTP 32-bit ROC exhausted; re-key required"))
+    }
+    Ok(roc + 1U)
   } else {
-    st.roc
+    Ok(roc)
   }
 }
 
@@ -324,18 +394,25 @@ pub fn SrtpContext::encrypt_rtp(self : SrtpContext, plaintext_rtp : Bytes) -> Re
   }
   let seq = read_u16_be(plaintext_rtp, 2)
   let ssrc = read_u32_be(plaintext_rtp, 8)
-  let st = get_or_create_ssrc_state(self, ssrc)
-  let v = estimate_roc(st, seq)
-  if !st.has_seq {
-    st.has_seq = true
-    st.s_l = seq
-    st.roc = v
-  } else {
-    let est_idx = (v.to_int64() << 16) | seq.to_int64()
-    let top_idx = (st.roc.to_int64() << 16) | st.s_l.to_int64()
-    if est_idx > top_idx {
-      st.roc = v
-      st.s_l = seq
+  let st = match get_or_create_ssrc_state(self, ssrc) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let v = match estimate_roc_checked(st.has_seq, st.roc, st.s_l, seq) {
+    Ok(roc_v) => roc_v
+    Err(e) => return Err(e)
+  }
+  let est_idx = (v.to_int64() << 16) | seq.to_int64()
+  let top_idx = (st.roc.to_int64() << 16) | st.s_l.to_int64()
+  let delta = est_idx - top_idx
+
+  // Send-side replay/nonce-reuse guard (RFC 3711 §9.2): refuse already-encrypted index
+  if st.has_seq && delta <= 0L {
+    let age = -delta
+    if age >= 64L || ((st.replay_mask >> age.to_int()) & 1UL) != 0UL {
+      return Err(
+        RtpError::ReplayDetected("SRTP packet index already encrypted; refusing keystream/nonce reuse"),
+      )
     }
   }
 
@@ -359,7 +436,6 @@ pub fn SrtpContext::encrypt_rtp(self : SrtpContext, plaintext_rtp : Bytes) -> Re
         out[hdr_len + payload_len + ti] = tag[ti]
         ti = ti + 1
       }
-      Ok(out)
     }
     _ => {
       let iv = build_srtp_cm_iv(self.srtp_keys.salt, ssrc, v, seq)
@@ -377,9 +453,29 @@ pub fn SrtpContext::encrypt_rtp(self : SrtpContext, plaintext_rtp : Bytes) -> Re
         out[plaintext_rtp.length() + ti] = mac[ti]
         ti = ti + 1
       }
-      Ok(out)
     }
   }
+
+  // Commit send-side ROC and 64-packet window
+  if !st.has_seq {
+    st.has_seq = true
+    st.roc = v
+    st.s_l = seq
+    st.replay_mask = 1UL
+  } else if delta > 0L {
+    if delta >= 64L {
+      st.replay_mask = 1UL
+    } else {
+      st.replay_mask = (st.replay_mask << delta.to_int()) | 1UL
+    }
+    st.roc = v
+    st.s_l = seq
+  } else {
+    let age = (-delta).to_int()
+    st.replay_mask = st.replay_mask | (1UL << age)
+  }
+
+  Ok(out)
 }
 
 ///|
@@ -400,19 +496,28 @@ pub fn SrtpContext::decrypt_rtp(self : SrtpContext, srtp_packet : Bytes) -> Resu
   let payload_len = ct_end - hdr_len
   let seq = read_u16_be(srtp_packet, 2)
   let ssrc = read_u32_be(srtp_packet, 8)
-  let st = get_or_create_ssrc_state(self, ssrc)
-  let v = estimate_roc(st, seq)
+
+  // Read-only lookup BEFORE authentication (never insert state for unauthenticated SSRCs)
+  let existing = find_ssrc_state(self, ssrc)
+  let (cur_has_seq, cur_roc, cur_s_l, cur_mask) = match existing {
+    Some(st) => (st.has_seq, st.roc, st.s_l, st.replay_mask)
+    None => (false, 0U, 0, 0UL)
+  }
+  let v = match estimate_roc_checked(cur_has_seq, cur_roc, cur_s_l, seq) {
+    Ok(roc_v) => roc_v
+    Err(e) => return Err(e)
+  }
 
   // Replay window check BEFORE auth/decrypt
   let est_idx = (v.to_int64() << 16) | seq.to_int64()
-  let top_idx = (st.roc.to_int64() << 16) | st.s_l.to_int64()
+  let top_idx = (cur_roc.to_int64() << 16) | cur_s_l.to_int64()
   let delta = est_idx - top_idx
-  if st.has_seq && delta <= 0L {
+  if cur_has_seq && delta <= 0L {
     let age = -delta
     if age >= 64L {
       return Err(RtpError::ReplayDetected("SRTP packet older than 64-packet replay window"))
     }
-    if ((st.replay_mask >> age.to_int()) & 1UL) != 0UL {
+    if ((cur_mask >> age.to_int()) & 1UL) != 0UL {
       return Err(RtpError::ReplayDetected("duplicate SRTP packet"))
     }
   }
@@ -463,7 +568,15 @@ pub fn SrtpContext::decrypt_rtp(self : SrtpContext, srtp_packet : Bytes) -> Resu
     }
   }
 
-  // Commit ROC & replay window only AFTER authentication succeeds
+  // Create/commit SSRC state ONLY AFTER authentication succeeds
+  let st = match existing {
+    Some(s) => s
+    None =>
+    match get_or_create_ssrc_state(self, ssrc) {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+  }
   if !st.has_seq {
     st.has_seq = true
     st.roc = v
@@ -495,13 +608,19 @@ pub fn SrtpContext::encrypt_rtcp(
     return Err(RtpError::Truncated("RTCP packet shorter than 8-byte header"))
   }
   let ssrc = read_u32_be(plaintext_rtcp, 4)
-  let idx = self.srtcp_index & 0x7FFFFFFFU
-  self.srtcp_index = (idx + 1U) & 0x7FFFFFFFU
+  let st = match get_or_create_ssrc_state(self, ssrc) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if st.srtcp_send_exhausted {
+    return Err(RtpError::LimitExceeded("SRTCP 31-bit index space exhausted; re-key required"))
+  }
+  let idx = st.srtcp_send_index & 0x7FFFFFFFU
   let e_idx = 0x80000000U | idx
   let body_len = n - 8
   let aes_k = self.srtcp_aes
 
-  match self.profile {
+  let res = match self.profile {
     ProtectionProfile::AeadAes128Gcm => {
       // RFC 7714 §10: Header (8B) || Ciphertext || Tag (16B) || (E || idx) (4B)
       // AAD = Header (8B) || (E || idx) (4B)
@@ -531,7 +650,7 @@ pub fn SrtpContext::encrypt_rtcp(
       out[n + 17] = e_bytes[1]
       out[n + 18] = e_bytes[2]
       out[n + 19] = e_bytes[3]
-      Ok(out)
+      out
     }
     _ => {
       // RFC 3711 §3.4: Header (8B) || Encrypted Body || (E || idx) (4B) || HMAC-SHA1-80 (10B)
@@ -562,9 +681,16 @@ pub fn SrtpContext::encrypt_rtcp(
         out[n + 4 + ti] = mac[ti]
         ti = ti + 1
       }
-      Ok(out)
+      out
     }
   }
+
+  if idx == 0x7FFFFFFFU {
+    st.srtcp_send_exhausted = true
+  } else {
+    st.srtcp_send_index = idx + 1U
+  }
+  Ok(res)
 }
 
 ///|
@@ -587,14 +713,19 @@ pub fn SrtpContext::decrypt_rtcp(
   let is_encrypted = (e_idx & 0x80000000U) != 0U
   let idx = e_idx & 0x7FFFFFFFU
 
-  // SRTCP replay window check
-  let delta = idx.to_int64() - self.srtcp_max_index.to_int64()
-  if self.srtcp_has_index && delta <= 0L {
+  // Per-SSRC read-only SRTCP replay check BEFORE authentication
+  let existing = find_ssrc_state(self, ssrc)
+  let (cur_has_idx, cur_max_idx, cur_mask) = match existing {
+    Some(st) => (st.srtcp_has_index, st.srtcp_max_index, st.srtcp_replay_mask)
+    None => (false, 0U, 0UL)
+  }
+  let delta = idx.to_int64() - cur_max_idx.to_int64()
+  if cur_has_idx && delta <= 0L {
     let age = -delta
     if age >= 64L {
       return Err(RtpError::ReplayDetected("SRTCP packet older than 64-packet replay window"))
     }
-    if ((self.srtcp_replay_mask >> age.to_int()) & 1UL) != 0UL {
+    if ((cur_mask >> age.to_int()) & 1UL) != 0UL {
       return Err(RtpError::ReplayDetected("duplicate SRTCP packet"))
     }
   }
@@ -695,21 +826,29 @@ pub fn SrtpContext::decrypt_rtcp(
     }
   }
 
-  // Commit SRTCP replay window after authentication succeeds
-  if !self.srtcp_has_index {
-    self.srtcp_has_index = true
-    self.srtcp_max_index = idx
-    self.srtcp_replay_mask = 1UL
+  // Create/commit per-SSRC SRTCP replay window ONLY AFTER authentication succeeds
+  let st = match existing {
+    Some(s) => s
+    None =>
+    match get_or_create_ssrc_state(self, ssrc) {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+  }
+  if !st.srtcp_has_index {
+    st.srtcp_has_index = true
+    st.srtcp_max_index = idx
+    st.srtcp_replay_mask = 1UL
   } else if delta > 0L {
     if delta >= 64L {
-      self.srtcp_replay_mask = 1UL
+      st.srtcp_replay_mask = 1UL
     } else {
-      self.srtcp_replay_mask = (self.srtcp_replay_mask << delta.to_int()) | 1UL
+      st.srtcp_replay_mask = (st.srtcp_replay_mask << delta.to_int()) | 1UL
     }
-    self.srtcp_max_index = idx
+    st.srtcp_max_index = idx
   } else {
     let age = (-delta).to_int()
-    self.srtcp_replay_mask = self.srtcp_replay_mask | (1UL << age)
+    st.srtcp_replay_mask = st.srtcp_replay_mask | (1UL << age)
   }
 
   Ok(out)
