@@ -1,0 +1,880 @@
+///| RT-proxy probe: deterministic fuzzing with streaming invariants, corpus runners for the
+///| differential oracles, and the 1-byte drip DoS probe. Output is pure function of the
+///| arguments, so the four build modes must print byte-identical streams.
+///|
+///|   probe fuzz <seed> <iters>      mutational fuzz of all 9 decoders + URL + NO_PROXY
+///|   probe urls <file>              one hex-encoded proxy URL per line -> parse summary
+///|   probe noproxy <file>           `rules_hex<TAB>host_hex<TAB>port` -> 0/1
+///|   probe drip <n>                 forward-proxy head of ~n bytes fed 1 byte at a time
+///|   probe whole <n>                same head decoded once, repeated n/64 times
+
+import "proxy"
+
+// ---------------------------------------------------------------------------
+// small utilities
+// ---------------------------------------------------------------------------
+
+///| Park-Miller PRNG state (Int64 arithmetic never overflows: 48271 * 2^31 < 2^47).
+struct Rng {
+  mut s : Int64
+}
+
+///|
+fn Rng::next(self : Rng) -> Int {
+  self.s = self.s * 48271L % 2147483647L
+  self.s.to_int()
+}
+
+///| Uniform-ish integer in 0..n-1.
+fn Rng::below(self : Rng, n : Int) -> Int {
+  if n <= 1 {
+    return 0
+  }
+  self.next() % n
+}
+
+///|
+fn hexd(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else {
+    0
+  }
+}
+
+///|
+fn from_hex(buf : Bytes, s : Int, e : Int) -> Bytes {
+  let out = Bytes::new((e - s) / 2)
+  let mut i = 0
+  while i < out.length() {
+    out[i] = (hexd(buf[s + 2 * i].to_int()) * 16 + hexd(buf[s + 2 * i + 1].to_int())).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///| Escape a string for single-line output (non-printable / backslash -> \xNN).
+fn esc(s : String) -> String {
+  let b = s.to_bytes()
+  let sb = StringBuilder::new()
+  let hx = "0123456789abcdef"
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int()
+    if c < 32 || c >= 127 || c == 92 {
+      sb.write_string("\\x")
+      sb.write_string(hx.to_bytes().slice(c / 16, c / 16 + 1).to_string())
+      sb.write_string(hx.to_bytes().slice(c % 16, c % 16 + 1).to_string())
+    } else {
+      sb.write_string(b.slice(i, i + 1).to_string())
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| FNV-1a 32-bit over bytes (Int64, kept below 2^32 before each multiply).
+fn fnv(h0 : Int64, b : Bytes) -> Int64 {
+  let mut h = h0
+  let mut i = 0
+  while i < b.length() {
+    h = (h ^ b[i].to_int().to_int64()) * 16777619L % 4294967296L
+    i = i + 1
+  }
+  h
+}
+
+///|
+fn cat(a : Bytes, b : Bytes) -> Bytes {
+  let out = Bytes::new(a.length() + b.length())
+  let mut i = 0
+  while i < a.length() {
+    out[i] = a[i]
+    i = i + 1
+  }
+  let mut j = 0
+  while j < b.length() {
+    out[a.length() + j] = b[j]
+    j = j + 1
+  }
+  out
+}
+
+///|
+fn find_byte(buf : Bytes, from : Int, end : Int, c : Int) -> Int {
+  let mut i = from
+  while i < end && buf[i].to_int() != c {
+    i = i + 1
+  }
+  i
+}
+
+///|
+fn contains(h : String, n : String) -> Bool {
+  let hb = h.to_bytes()
+  let nb = n.to_bytes()
+  let mut i = 0
+  while i + nb.length() <= hb.length() {
+    let mut j = 0
+    while j < nb.length() && hb[i + j] == nb[j] {
+      j = j + 1
+    }
+    if j == nb.length() {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// ---------------------------------------------------------------------------
+// uniform decode summary: (tag, n, desc). tag 0 = Complete(consumed=n), 1 = NeedMore(n), 2 = Err
+// ---------------------------------------------------------------------------
+
+///|
+struct Sum {
+  tag : Int
+  n : Int
+  desc : String
+}
+
+///|
+fn sum_str(s : Sum) -> String {
+  if s.tag == 0 {
+    "C" + s.n.to_string() + "{" + s.desc + "}"
+  } else if s.tag == 1 {
+    "N" + s.n.to_string()
+  } else {
+    "E{" + s.desc + "}"
+  }
+}
+
+///|
+fn addr_str(a : proxy::SocksAddr) -> String {
+  match a {
+    proxy::SocksAddr::Ipv4(b) => "v4:" + fnv(2166136261L, b).to_string()
+    proxy::SocksAddr::Ipv6(b) => "v6:" + fnv(2166136261L, b).to_string()
+    proxy::SocksAddr::Domain(d) => "d:" + esc(d)
+  }
+}
+
+///|
+fn hdrs_str(hs : Array[proxy::HttpHeader]) -> String {
+  let mut h = 2166136261L
+  let mut i = 0
+  while i < hs.length() {
+    h = fnv(h, hs[i].name.to_bytes())
+    h = fnv(h, ":".to_bytes())
+    h = fnv(h, hs[i].value.to_bytes())
+    h = fnv(h, "\n".to_bytes())
+    i = i + 1
+  }
+  hs.length().to_string() + "#" + h.to_string()
+}
+
+///|
+fn auth_str(a : Option[proxy::ProxyAuth]) -> String {
+  match a {
+    Some(x) => "auth=" + esc(x.username) + ":" + esc(x.password)
+    None => "noauth"
+  }
+}
+
+///| Decoder ids: 0 greeting, 1 method, 2 userpass_req, 3 userpass_resp, 4 request, 5 reply,
+///| 6 connect_req, 7 connect_resp, 8 forward.
+fn decode(kind : Int, b : Bytes) -> Sum {
+  let lim = proxy::ProxyLimits::default()
+  if kind == 0 {
+    match proxy::socks5_decode_greeting(b) {
+      Ok(proxy::DecodeStatus::Complete(g, c)) => {
+        let sb = StringBuilder::new()
+        let mut i = 0
+        while i < g.methods.length() {
+          sb.write_string(g.methods[i].to_byte().to_int().to_string())
+          sb.write_string(",")
+          i = i + 1
+        }
+        Sum::{ tag: 0, n: c, desc: sb.to_string() }
+      }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else if kind == 1 {
+    match proxy::socks5_decode_method_selection(b) {
+      Ok(proxy::DecodeStatus::Complete(m, c)) =>
+      Sum::{ tag: 0, n: c, desc: m.to_byte().to_int().to_string() }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else if kind == 2 {
+    match proxy::socks5_decode_userpass_request(b) {
+      Ok(proxy::DecodeStatus::Complete(u, c)) =>
+      Sum::{ tag: 0, n: c, desc: esc(u.username) + ":" + esc(u.password) }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else if kind == 3 {
+    match proxy::socks5_decode_userpass_response(b) {
+      Ok(proxy::DecodeStatus::Complete(ok, c)) => Sum::{ tag: 0, n: c, desc: ok.to_string() }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else if kind == 4 {
+    match proxy::socks5_decode_request(b) {
+      Ok(proxy::DecodeStatus::Complete(r, c)) =>
+      Sum::{
+        tag: 0,
+        n: c,
+        desc: r.command.to_byte().to_int().to_string() +
+        " " +
+        addr_str(r.addr) +
+        " " +
+        r.port.to_string(),
+      }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else if kind == 5 {
+    match proxy::socks5_decode_reply(b) {
+      Ok(proxy::DecodeStatus::Complete(r, c)) =>
+      Sum::{
+        tag: 0,
+        n: c,
+        desc: r.reply.to_byte().to_int().to_string() +
+        " " +
+        addr_str(r.bind_addr) +
+        " " +
+        r.bind_port.to_string(),
+      }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else if kind == 6 {
+    match proxy::decode_connect_request(b, lim) {
+      Ok(proxy::DecodeStatus::Complete(r, c)) =>
+      Sum::{
+        tag: 0,
+        n: c,
+        desc: esc(r.host) +
+        " " +
+        r.port.to_string() +
+        " " +
+        r.version +
+        " " +
+        auth_str(r.auth) +
+        " " +
+        hdrs_str(r.headers),
+      }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else if kind == 7 {
+    match proxy::decode_connect_response(b, lim) {
+      Ok(proxy::DecodeStatus::Complete(r, c)) => {
+        let pa = match r.proxy_authenticate {
+          Some(v) => esc(v)
+          None => "-"
+        }
+        Sum::{
+          tag: 0,
+          n: c,
+          desc: r.status.to_string() +
+          " " +
+          esc(r.reason) +
+          " pa=" +
+          pa +
+          " " +
+          hdrs_str(r.headers),
+        }
+      }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  } else {
+    match proxy::parse_and_sanitize_forward_request(b, lim) {
+      Ok(proxy::DecodeStatus::Complete(r, c)) => {
+        let cl = match r.content_length {
+          Some(v) => v.to_string()
+          None => "-"
+        }
+        Sum::{
+          tag: 0,
+          n: c,
+          desc: esc(r.target_host) +
+          " " +
+          r.target_port.to_string() +
+          " cl=" +
+          cl +
+          " ch=" +
+          r.is_chunked.to_string() +
+          " " +
+          auth_str(r.proxy_auth) +
+          " wire=" +
+          fnv(2166136261L, r.wire_head).to_string(),
+        }
+      }
+      Ok(proxy::DecodeStatus::NeedMore(k)) => Sum::{ tag: 1, n: k, desc: "" }
+      Err(e) => Sum::{ tag: 2, n: 0, desc: e.message() }
+    }
+  }
+}
+
+///| Streaming invariants for buffer `b` under decoder `kind`. Returns "" or a violation text.
+///|  - whole Complete(c): every prefix < c is NeedMore (SOCKS: with k + need <= c), every prefix
+///|    >= c and b + 32 B tail give the identical Complete(c);
+///|  - whole Err / NeedMore: no prefix (and no tail-extended buffer for Err) is Complete;
+///|  - errors are sticky: once a prefix errors, every longer prefix errors.
+fn check_stream(kind : Int, b : Bytes, whole : Sum, tail : Bytes) -> String {
+  let socks = kind <= 5
+  let mut errored = false
+  let mut k = 0
+  while k < b.length() {
+    let r = decode(kind, b.slice(0, k))
+    if errored && r.tag != 2 {
+      return "error not sticky at prefix " + k.to_string()
+    }
+    if r.tag == 2 {
+      errored = true
+    }
+    if whole.tag == 0 {
+      if k < whole.n {
+        if r.tag != 1 {
+          return "prefix " + k.to_string() + " gave " + sum_str(r) + " before consumed=" + whole.n.to_string()
+        }
+        if socks && (r.n < 1 || k + r.n > whole.n) {
+          return "prefix " + k.to_string() + " NeedMore(" + r.n.to_string() + ") overshoots consumed=" + whole.n.to_string()
+        }
+      } else if sum_str(r) != sum_str(whole) {
+        return "prefix " + k.to_string() + " gave " + sum_str(r) + " vs whole " + sum_str(whole)
+      }
+    } else if r.tag == 0 {
+      return "prefix " + k.to_string() + " Complete but whole buffer is " + sum_str(whole)
+    }
+    k = k + 1
+  }
+  let t = decode(kind, cat(b, tail))
+  if whole.tag == 0 && sum_str(t) != sum_str(whole) {
+    return "tail-extended gave " + sum_str(t)
+  }
+  if whole.tag == 2 && t.tag != 2 {
+    return "tail-extended un-errored: " + sum_str(t)
+  }
+  ""
+}
+
+///| ASCII-lowercase copy.
+fn lower(s : String) -> String {
+  let b = s.to_bytes()
+  let out = Bytes::new(b.length())
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int()
+    out[i] = (if c >= 65 && c <= 90 { c + 32 } else { c }).to_byte()
+    i = i + 1
+  }
+  out.to_string()
+}
+
+///| REPORT.md P0 invariant: the framing written to `wire_head` must match the framing the
+///| sanitizer reports (`content_length` / `is_chunked`) and the caller forwards the body with.
+fn forward_framing_violation(b : Bytes) -> String {
+  match proxy::parse_and_sanitize_forward_request(b, proxy::ProxyLimits::default()) {
+    Ok(proxy::DecodeStatus::Complete(r, _)) => {
+      let w = lower(r.wire_head.to_string())
+      let has_cl = contains(w, "\r\ncontent-length:")
+      let has_te = contains(w, "\r\ntransfer-encoding:")
+      let cl_some = match r.content_length {
+        Some(_) => true
+        None => false
+      }
+      if cl_some != has_cl || r.is_chunked != has_te {
+        "framing desync: cl=" + cl_some.to_string() + " wire_cl=" + has_cl.to_string() + " chunked=" + r.is_chunked.to_string() + " wire_te=" + has_te.to_string()
+      } else {
+        ""
+      }
+    }
+    _ => ""
+  }
+}
+
+// ---------------------------------------------------------------------------
+// generators
+// ---------------------------------------------------------------------------
+
+///|
+fn rand_bytes(r : Rng, n : Int) -> Bytes {
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = r.below(256).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn pick(r : Rng, xs : Array[String]) -> String {
+  xs[r.below(xs.length())]
+}
+
+///|
+fn rand_domain(r : Rng) -> String {
+  let parts = [
+    "api.github.com", "a", "例子.cn", "x y", "localhost", "evil.example", "a\tb", "%00", "[::1]",
+    "a:b", "a@b", "",
+  ]
+  let d = pick(r, parts)
+  if r.below(4) == 0 {
+    rand_bytes(r, 1 + r.below(40)).to_string()
+  } else {
+    d
+  }
+}
+
+///|
+fn rand_addr(r : Rng) -> proxy::SocksAddr {
+  let t = r.below(3)
+  if t == 0 {
+    proxy::SocksAddr::Ipv4(rand_bytes(r, 4))
+  } else if t == 1 {
+    proxy::SocksAddr::Ipv6(rand_bytes(r, 16))
+  } else {
+    proxy::SocksAddr::Domain(rand_domain(r))
+  }
+}
+
+///|
+fn http_header_pool() -> Array[String] {
+  [
+    "Host: a.example", "Host: [::1]:8080", "Host: b.example:81", "Content-Length: 5", "Content-Length: 5, 5",
+    "Content-Length: 7", "Transfer-Encoding: chunked", "Transfer-Encoding: gzip, chunked", "Transfer-Encoding: gzip",
+    "Connection: keep-alive", "Connection: X-A, close", "Connection: host", "Connection: content-length",
+    "Connection: transfer-encoding", "Proxy-Connection: keep-alive", "Proxy-Authorization: Basic YWxpY2U6c2VjcmV0",
+    "Proxy-Authorization: Basic !!!", "Proxy-Authorization: Bearer x", "Proxy-Authenticate: Basic realm=\"r\"",
+    "Keep-Alive: 5", "TE: trailers", "Trailer: X", "Upgrade: h2c", "X-A: drop", "Accept: */*", "X-Trace: t",
+    "Expect: 100-continue", "X-Obs: \u{00ff}\u{0080}", "X-Empty:", "x-case: V  ",
+  ]
+}
+
+///|
+fn gen_http(r : Rng, kind : Int) -> Bytes {
+  let sb = StringBuilder::new()
+  if kind == 6 {
+    let hosts = ["a.example:443", "[::1]:443", "[2001:db8::1]:8443", "A.EXAMPLE:1", "a.example", "u@a:1", "a:65535"]
+    sb.write_string("CONNECT " + pick(r, hosts) + " " + pick(r, ["HTTP/1.1", "HTTP/1.0"]) + "\r\n")
+  } else if kind == 7 {
+    let lines = [
+      "HTTP/1.1 200 Connection Established", "HTTP/1.1 200", "HTTP/1.0 407 Proxy Authentication Required",
+      "HTTP/1.1 502 Bad Gateway", "HTTP/1.1 100 Continue", "HTTP/1.1 999 x",
+    ]
+    sb.write_string(pick(r, lines) + "\r\n")
+  } else {
+    let targets = [
+      "http://a.example/", "http://A.Example:8080/p?q=1", "http://[::1]:81", "/index.html", "/", "http://a.example?x",
+      "*",
+    ]
+    sb.write_string(pick(r, ["GET", "POST", "PUT", "OPTIONS"]) + " " + pick(r, targets) + " " + pick(r, ["HTTP/1.1", "HTTP/1.0"]) + "\r\n")
+  }
+  let pool = http_header_pool()
+  let nh = r.below(7)
+  let mut i = 0
+  while i < nh {
+    sb.write_string(pick(r, pool) + "\r\n")
+    i = i + 1
+  }
+  sb.write_string("\r\n")
+  sb.to_string().to_bytes()
+}
+
+///| A valid-ish message for `kind`, built through the encoders where they exist.
+fn gen_msg(r : Rng, kind : Int) -> Bytes {
+  if kind == 0 {
+    let ms : Array[proxy::SocksAuthMethod] = []
+    let n = 1 + r.below(6)
+    let mut i = 0
+    while i < n {
+      ms.push(proxy::socks_auth_method_from_byte(r.below(256).to_byte()))
+      i = i + 1
+    }
+    match proxy::socks5_encode_greeting(ms) {
+      Ok(w) => w
+      Err(_) => Bytes::new(0)
+    }
+  } else if kind == 1 {
+    proxy::socks5_encode_method_selection(proxy::socks_auth_method_from_byte(r.below(256).to_byte()))
+  } else if kind == 2 {
+    match proxy::socks5_encode_userpass_request(
+      rand_bytes(r, 1 + r.below(24)).to_string(),
+      rand_bytes(r, 1 + r.below(24)).to_string(),
+    ) {
+      Ok(w) => w
+      Err(_) => Bytes::new(0)
+    }
+  } else if kind == 3 {
+    proxy::socks5_encode_userpass_response(r.below(2) == 0)
+  } else if kind == 4 {
+    let cmds = [proxy::SocksCommand::Connect, proxy::SocksCommand::Bind, proxy::SocksCommand::UdpAssociate]
+    match proxy::socks5_encode_request(cmds[r.below(3)], rand_addr(r), r.below(65536)) {
+      Ok(w) => w
+      Err(_) => Bytes::new(0)
+    }
+  } else if kind == 5 {
+    match proxy::socks5_encode_reply(
+      proxy::socks_reply_code_from_byte(r.below(10).to_byte()),
+      rand_addr(r),
+      r.below(65536),
+    ) {
+      Ok(w) => w
+      Err(_) => Bytes::new(0)
+    }
+  } else {
+    gen_http(r, kind)
+  }
+}
+
+///| Byte-level mutations: flip, set, delete, insert, truncate, duplicate.
+fn mutate(r : Rng, b : Bytes) -> Bytes {
+  let mut cur = b
+  let rounds = 1 + r.below(3)
+  let mut t = 0
+  while t < rounds {
+    let n = cur.length()
+    let op = r.below(6)
+    if n == 0 {
+      cur = rand_bytes(r, 1 + r.below(8))
+    } else if op == 0 {
+      let out = cat(cur, Bytes::new(0))
+      let p = r.below(n)
+      out[p] = (out[p].to_int() ^ (1 << r.below(8))).to_byte()
+      cur = out
+    } else if op == 1 {
+      let out = cat(cur, Bytes::new(0))
+      let specials = [0, 1, 2, 3, 4, 5, 9, 10, 13, 32, 44, 58, 64, 127, 255]
+      out[r.below(n)] = specials[r.below(specials.length())].to_byte()
+      cur = out
+    } else if op == 2 {
+      let p = r.below(n)
+      cur = cat(cur.slice(0, p), cur.slice(p + 1, n))
+    } else if op == 3 {
+      let p = r.below(n + 1)
+      cur = cat(cat(cur.slice(0, p), rand_bytes(r, 1 + r.below(4))), cur.slice(p, n))
+    } else if op == 4 {
+      cur = cur.slice(0, r.below(n))
+    } else {
+      cur = cat(cur, cur)
+    }
+    t = t + 1
+  }
+  cur
+}
+
+///| Structured proxy URL with secret markers only inside the userinfo / identity query.
+fn gen_url(r : Rng) -> (String, Bool) {
+  let schemes = ["http", "https", "socks5", "socks5h", "ssh", "HTTP", "ftp"]
+  let hosts = [
+    "proxy.example", "127.0.0.1", "[::1]", "[2001:db8::1]", "Proxy.Example.", "station-us", "",
+    "[fe80::1%25en0]", "a_b.example",
+  ]
+  let ports = ["", ":8080", ":0", ":65535", ":65536", ":1080", ":", ":99999999999"]
+  let users = ["", "SECRETU", "SECRETU%40x", "SECRETU:", ":SECRETP", "SECRETU:SECRETP", "SECRETU:SE%3ACRETP",
+    "SECRETU:SECRETP%ZZ", "SECRETU:SECRETP%0D%0A", "SECRETU:SECRETP@SECRETQ", "%53ECRETU:SECRETP"]
+  let tails = ["", "/", "/path", "?identity=/SECRETK/key", "?identity=%2FSECRETK", "#frag", "?a=b&identity=/SECRETK#f"]
+  let s = pick(r, schemes)
+  let u = pick(r, users)
+  let sb = StringBuilder::new()
+  sb.write_string(s)
+  sb.write_string("://")
+  if u.length() > 0 {
+    sb.write_string(u)
+    sb.write_string("@")
+  }
+  sb.write_string(pick(r, hosts))
+  sb.write_string(pick(r, ports))
+  sb.write_string(pick(r, tails))
+  (sb.to_string(), s == "ssh")
+}
+
+///| Leak check matching REPORT.md P1 (and nothing stricter): errors never contain a secret
+///| marker; `redacted()` never contains a password / identity marker, nor (non-ssh) the user.
+fn url_case(raw : String, is_ssh : Bool) -> (String, String) {
+  match proxy::parse_proxy_url(raw) {
+    Ok(u) => {
+      let red = u.redacted()
+      let mut v = ""
+      if contains(red, "SECRETP") || contains(red, "SECRETK") || contains(red, "SECRETQ") {
+        v = "redacted leaks password/identity: " + esc(red)
+      } else if !is_ssh && (contains(red, "SECRETU") || contains(red, "%53ECRETU")) {
+        v = "redacted leaks username: " + esc(red)
+      }
+      ("ok " + esc(red) + " " + esc(u.host) + " " + u.port.to_string(), v)
+    }
+    Err(e) => {
+      let m = e.message()
+      let mut v = ""
+      if contains(m, "SECRET") {
+        v = "error leaks secret: " + esc(m)
+      }
+      ("err " + esc(m), v)
+    }
+  }
+}
+
+///|
+fn run_fuzz(world : World, seed : Int, iters : Int) -> Int {
+  let r = Rng::{ s: (seed % 2147483646 + 1).to_int64() }
+  let tail = Bytes::new(32)
+  let mut t = 0
+  while t < 32 {
+    tail[t] = (0x16 + t * 7 % 200).to_byte()
+    t = t + 1
+  }
+  let names = [
+    "greeting", "method", "userpass_req", "userpass_resp", "request", "reply", "connect_req", "connect_resp",
+    "forward",
+  ]
+  let per_kind_cases = Array::make(9, 0)
+  let per_kind_viol = Array::make(9, 0)
+  let mut url_cases = 0
+  let mut url_viol = 0
+  let mut np_cases = 0
+  let mut violations = 0
+  let mut h = 2166136261L
+  let out = StringBuilder::new()
+  let mut i = 0
+  while i < iters {
+    let sel = r.below(11)
+    if sel < 9 {
+      let kind = sel
+      let base = gen_msg(r, kind)
+      let b = if r.below(3) == 0 { base } else { mutate(r, base) }
+      let whole = decode(kind, b)
+      let v0 = check_stream(kind, b, whole, tail)
+      let v = if v0.length() == 0 && kind == 8 { forward_framing_violation(b) } else { v0 }
+      let line = i.to_string() + " " + names[kind] + " len=" + b.length().to_string() + " " + sum_str(whole)
+      h = fnv(h, line.to_bytes())
+      out.write_string(line)
+      out.write_string("\n")
+      per_kind_cases[kind] = per_kind_cases[kind] + 1
+      if v.length() > 0 {
+        violations = violations + 1
+        per_kind_viol[kind] = per_kind_viol[kind] + 1
+        out.write_string("VIOLATION " + names[kind] + " #" + i.to_string() + ": " + v + "\n")
+      }
+    } else if sel == 9 {
+      let (raw, is_ssh) = gen_url(r)
+      let mutated = r.below(4) == 0
+      let raw2 = if mutated { mutate(r, raw.to_bytes()).to_string() } else { raw }
+      let (line, v) = url_case(raw2, is_ssh)
+      let full = i.to_string() + " url " + esc(raw2) + " -> " + line
+      h = fnv(h, full.to_bytes())
+      out.write_string(full)
+      out.write_string("\n")
+      url_cases = url_cases + 1
+      // markers can land outside userinfo after a byte mutation: only score structured URLs
+      if v.length() > 0 && !mutated {
+        violations = violations + 1
+        url_viol = url_viol + 1
+        out.write_string("VIOLATION url #" + i.to_string() + ": " + v + "\n")
+      }
+    } else {
+      let rules = [
+        "*", "example.com", ".example.com", "*.example.com", "10.0.0.0/8", "::1", "[::1]:8080", "fd00::/8",
+        "a.example:443", "EXAMPLE.COM.", "127.0.0.1", "0.0.0.0/0", "1.2.3.4/33", " , ,", "::ffff:10.0.0.1",
+      ]
+      let targets = [
+        "example.com", "evil-example.com", "a.example.com", "EXAMPLE.com.", "10.1.1.1", "::1", "[::1]", "fd00::5",
+        "::ffff:10.0.0.1", "10.0.0.1", "a.example", "127.0.0.1", "", "例子.example.com",
+      ]
+      let rs = StringBuilder::new()
+      let nr = 1 + r.below(3)
+      let mut q = 0
+      while q < nr {
+        rs.write_string(pick(r, rules))
+        rs.write_string(",")
+        q = q + 1
+      }
+      let tg = pick(r, targets)
+      let port = [0, 443, 8080, 80][r.below(4)]
+      let m = proxy::NoProxyMatcher::parse(rs.to_string())
+      let full = i.to_string() + " noproxy " + esc(rs.to_string()) + " " + esc(tg) + ":" + port.to_string() + " -> " + m.matches(tg, port).to_string()
+      h = fnv(h, full.to_bytes())
+      out.write_string(full)
+      out.write_string("\n")
+      np_cases = np_cases + 1
+    }
+    i = i + 1
+  }
+  io_print(world, out.to_string())
+  let sb = StringBuilder::new()
+  let mut k = 0
+  while k < 9 {
+    sb.write_string(names[k] + "=" + per_kind_cases[k].to_string() + "/" + per_kind_viol[k].to_string() + " ")
+    k = k + 1
+  }
+  io_println(world, "SUMMARY cases(kind=n/violations): " + sb.to_string() + "url=" + url_cases.to_string() + "/" + url_viol.to_string() + " noproxy=" + np_cases.to_string())
+  io_println(world, "SUMMARY iters=" + iters.to_string() + " violations=" + violations.to_string() + " fnv=" + h.to_string())
+  if violations > 0 { 1 } else { 0 }
+}
+
+///| One hex URL per line -> `ok|err <tab> host <tab> port <tab> user? <tab> pass? <tab> redacted|message`.
+fn run_urls(world : World, path : String) -> Int {
+  let buf = match fs_read_bytes(world, path) {
+    Ok(b) => b
+    Err(_) => {
+      io_eprintln(world, "cannot read " + path)
+      return 2
+    }
+  }
+  let sb = StringBuilder::new()
+  let mut pos = 0
+  while pos < buf.length() {
+    let le = find_byte(buf, pos, buf.length(), 10)
+    let raw = from_hex(buf, pos, le).to_string()
+    match proxy::parse_proxy_url(raw) {
+      Ok(u) => {
+        let us = match u.username {
+          Some(x) => "u=" + esc(x)
+          None => "u-"
+        }
+        let ps = match u.password {
+          Some(x) => "p=" + esc(x)
+          None => "p-"
+        }
+        sb.write_string("ok\t" + esc(u.host) + "\t" + u.port.to_string() + "\t" + us + "\t" + ps + "\t" + esc(u.redacted()) + "\n")
+      }
+      Err(e) => sb.write_string("err\t\t\t\t\t" + esc(e.message()) + "\n")
+    }
+    pos = le + 1
+  }
+  io_print(world, sb.to_string())
+  0
+}
+
+///| `rules_hex <tab> host_hex <tab> port` per line -> `0|1`.
+fn run_noproxy(world : World, path : String) -> Int {
+  let buf = match fs_read_bytes(world, path) {
+    Ok(b) => b
+    Err(_) => {
+      io_eprintln(world, "cannot read " + path)
+      return 2
+    }
+  }
+  let sb = StringBuilder::new()
+  let mut pos = 0
+  while pos < buf.length() {
+    let le = find_byte(buf, pos, buf.length(), 10)
+    let t1 = find_byte(buf, pos, le, 9)
+    let t2 = find_byte(buf, t1 + 1, le, 9)
+    let rules = from_hex(buf, pos, t1).to_string()
+    let host = from_hex(buf, t1 + 1, t2).to_string()
+    let mut port = 0
+    let mut j = t2 + 1
+    while j < le {
+      port = port * 10 + buf[j].to_int() - 48
+      j = j + 1
+    }
+    let m = proxy::NoProxyMatcher::parse(rules)
+    sb.write_string(if m.matches(host, port) { "1\n" } else { "0\n" })
+    pos = le + 1
+  }
+  io_print(world, sb.to_string())
+  0
+}
+
+///| Forward-proxy request head of about n bytes (64-byte header lines), unterminated until the end.
+fn drip_head(n : Int) -> Bytes {
+  let sb = StringBuilder::new()
+  sb.write_string("GET http://a.example/ HTTP/1.1\r\n")
+  let mut len = 32
+  let mut k = 0
+  while len + 64 + 2 <= n {
+    let name = "X-" + (1000 + k).to_string() + ": "
+    sb.write_string(name)
+    let mut j = name.length()
+    while j < 62 {
+      sb.write_string("a")
+      j = j + 1
+    }
+    sb.write_string("\r\n")
+    len = len + 64
+    k = k + 1
+  }
+  sb.write_string("\r\n")
+  sb.to_string().to_bytes()
+}
+
+///|
+fn run_drip(world : World, n : Int, whole_only : Bool) -> Int {
+  let lim = proxy::ProxyLimits::{ max_header_bytes: n + 1024, max_headers: 100000, max_line_bytes: 8192 }
+  let head = drip_head(n)
+  let mut calls = 0
+  let mut done = 0
+  if whole_only {
+    let reps = if n / 64 < 1 { 1 } else { n / 64 }
+    let mut i = 0
+    while i < reps {
+      match proxy::parse_and_sanitize_forward_request(head, lim) {
+        Ok(proxy::DecodeStatus::Complete(_, c)) => done = c
+        _ => ()
+      }
+      calls = calls + 1
+      i = i + 1
+    }
+  } else {
+    let mut k = 1
+    while k <= head.length() {
+      calls = calls + 1
+      match proxy::parse_and_sanitize_forward_request(head.slice(0, k), lim) {
+        Ok(proxy::DecodeStatus::Complete(_, c)) => done = c
+        Ok(proxy::DecodeStatus::NeedMore(_)) => ()
+        Err(e) => {
+          io_println(world, "drip err " + e.message())
+          return 1
+        }
+      }
+      k = k + 1
+    }
+  }
+  io_println(world, (if whole_only { "whole" } else { "drip" }) + " head_bytes=" + head.length().to_string() + " decode_calls=" + calls.to_string() + " consumed=" + done.to_string())
+  0
+}
+
+///|
+fn parse_int(s : String) -> Int {
+  let b = s.to_bytes()
+  let mut v = 0
+  let mut i = 0
+  while i < b.length() {
+    v = v * 10 + b[i].to_int() - 48
+    i = i + 1
+  }
+  v
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 3 {
+    io_println(world, "usage: probe fuzz <seed> <iters> | urls <file> | noproxy <file> | drip <n> | whole <n>")
+    return 2
+  }
+  let mode = args[1]
+  if mode == "fuzz" && args.length() >= 4 {
+    run_fuzz(world, parse_int(args[2]), parse_int(args[3]))
+  } else if mode == "urls" {
+    run_urls(world, args[2])
+  } else if mode == "noproxy" {
+    run_noproxy(world, args[2])
+  } else if mode == "drip" {
+    run_drip(world, parse_int(args[2]), false)
+  } else if mode == "whole" {
+    run_drip(world, parse_int(args[2]), true)
+  } else {
+    io_println(world, "unknown mode " + mode)
+    2
+  }
+}
