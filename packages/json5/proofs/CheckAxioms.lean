@@ -1,0 +1,26 @@
+import Json5Proofs
+
+#print axioms Json5Proofs.surrogate_ranges_disjoint
+#print axioms Json5Proofs.decode_surrogate_pair_bounds
+#print axioms Json5Proofs.decode_surrogate_pair_injective
+#print axioms Json5Proofs.pack_hex2_bounds
+#print axioms Json5Proofs.pack_hex4_bounds
+#print axioms Json5Proofs.is_unicode_j5_ws_non_ascii
+#print axioms Json5Proofs.is_unicode_j5_ws_line_seps
+#print axioms Json5Proofs.utf8_valid_3byte_rejects_overlong
+#print axioms Json5Proofs.utf8_valid_3byte_rejects_surrogate
+#print axioms Json5Proofs.utf8_valid_4byte_rejects_overlong
+#print axioms Json5Proofs.utf8_valid_4byte_rejects_above_max
+#print axioms Json5Proofs.utf8_valid_3byte_requires_cont
+#print axioms Json5Proofs.hash_ensure_nonzero_ne_zero
+#print axioms Json5Proofs.hash_ensure_nonzero_idempotent
+#print axioms Json5Proofs.splitmix64_zero_nonzero
+#print axioms Json5Proofs.hash_needs_grow_guarantees_empty_slot
+#print axioms Json5Proofs.hash_needs_grow_full
+#print axioms Json5Proofs.hash_next_slot_bounds
+#print axioms Json5Proofs.pointer_escape_unescape_tilde
+#print axioms Json5Proofs.pointer_escape_unescape_slash
+#print axioms Json5Proofs.pointer_unescape_roundtrip
+#print axioms Json5Proofs.json_needs_escape_ctrl
+#print axioms Json5Proofs.json_needs_escape_printable_safe
+#print axioms Json5Proofs.ascii_lut_flags_bounds
