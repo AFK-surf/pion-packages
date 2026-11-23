@@ -96,3 +96,11 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000` | SHA-256: `
 | `go_msgauth` | 121.817 | 119.132 | 123.446 | 60908.71 | 16.98 MiB | 1.00x (baseline) |
 
 > **Honest Assessment**: `packages/email` outperforms Go `net/mail` by **1.73x** (with 7.3x lower RSS) on complex RFC 5322 address-list and date parsing (W2), reaches **130.95 MB/s** (0.52x of Rust `mail-parser`, up from 113 MB/s) on full multi-part MIME tree parsing + charset validation + QP/Base64 decoding (W1), and runs at **0.21x** of `github.com/emersion/go-msgauth v0.7.0` (with 7.1x lower RSS) on full end-to-end DKIM sign/re-parse/verify (W3) because `packages/crypto` uses portable pure-Pion Ed25519 curve arithmetic versus Go's assembly implementation.
+
+## Formal Verification (Lean 4)
+
+The RFC 5322 / 6532 limits, header-injection/folding guards, address character classes (`atext`/`dtext`/`qtext`), and date/timezone/Euclidean-epoch arithmetic kernels (`EmailLimits`, `hdr_ascii_lower`, `email_is_ftext`, `email_is_injection_byte`, `email_effective_fold_limit`, `addr_is_atext`, `addr_is_dtext`, `addr_is_qtext_char`, `dt_is_digit`, `dt_lower`, `dt_normalize_year`, `dt_is_valid_offset_seconds`, `dt_numeric_offset_seconds`, `dt_clamp_leap_second`, `dt_epoch_floor_day`, `dt_epoch_rem_sec`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (24 `0-sorry` theorems, standard axioms only, 44-case native-vs-Lean differential cross-check):
+
+```bash
+bash packages/email/proofs/run_proofs.sh
+```
