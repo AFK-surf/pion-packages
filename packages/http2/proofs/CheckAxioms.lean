@@ -1,0 +1,28 @@
+import Http2Proofs
+
+#print axioms Http2Proofs.hpack_entry_size_spec
+#print axioms Http2Proofs.stream_state_eq_iff
+#print axioms Http2Proofs.is_remote_stream_parity_complement
+#print axioms Http2Proofs.flow_window_add_ok_bounds
+#print axioms Http2Proofs.can_recv_data_in_state_spec
+#print axioms Http2Proofs.recv_end_stream_blocks_further_data
+#print axioms Http2Proofs.u24_pack_bytes_range
+#print axioms Http2Proofs.u24_roundtrip
+#print axioms Http2Proofs.u31_pack_bytes_range
+#print axioms Http2Proofs.u31_roundtrip
+#print axioms Http2Proofs.u31_ignores_reserved_bit
+#print axioms Http2Proofs.u31_unpack_nonneg
+#print axioms Http2Proofs.priority_dep_roundtrip
+#print axioms Http2Proofs.priority_dep_unpack_nonneg
+#print axioms Http2Proofs.encode_headers_flags_roundtrip
+#print axioms Http2Proofs.is_valid_window_increment_iff
+#print axioms Http2Proofs.setting_enable_push_iff
+#print axioms Http2Proofs.setting_initial_window_size_iff
+#print axioms Http2Proofs.setting_max_frame_size_iff
+#print axioms Http2Proofs.setting_enable_connect_iff
+#print axioms Http2Proofs.setting_unknown_ignored
+#print axioms Http2Proofs.h2_name_forbids_uppercase
+#print axioms Http2Proofs.h2_name_allows_lower_and_digit
+#print axioms Http2Proofs.h2_name_forbids_ctl_and_space
+#print axioms Http2Proofs.h2_value_ctl_spec
+#print axioms Http2Proofs.is_ascii_digit_and_edge_ws_spec
