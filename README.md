@@ -64,8 +64,9 @@ pionc add <package-name>
 | [`graph`](packages/graph) | `0.1.0` | `DiGraph` / `UnGraph` 邻接表与不可变 `CsrGraph`，全迭代 BFS / DFS、Tarjan / Kosaraju SCC、桥与割点、二分图、拓扑排序与环检测，Cooper-Harvey-Kennedy 支配树与支配边界、传递规约 / 闭包，Dijkstra / A* / Bellman-Ford / Floyd-Warshall（128-bit 精确回退）、Kruskal / Prim MST、Dinic 最大流与 DOT 导出 | Rust [`petgraph`](https://github.com/petgraph/petgraph) `=0.8.3` | 29 / 29 | ✅ `wasm_smoke` | [Dijkstra CSR 1.34× · SCC + 拓扑 0.60× · Kruskal 1.27× · 支配树 1.68–1.92×（vs `petgraph`）](BENCHMARKS.md#graph) | `pionc add graph --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`css`](packages/css) | `0.1.0` | W3C CSS Syntax Level 3 分词、单遍流式样式表 / 声明块容错解析（保持 CSS Nesting 声明顺序）、Selectors Level 4 校验与优先级、Media Queries Level 4、CSS Color Level 4（148 命名色、`lab` / `lch` / `oklab` / `oklch` / `color()`），格式化与单遍流式压缩，全程零递归与 `max_depth` / `max_tokens` / `max_rules` 预算 | Rust [`cssparser`](https://github.com/servo/rust-cssparser) `=0.35.0` + [`lightningcss`](https://github.com/parcel-bundler/lightningcss) `=1.0.0-alpha.72`；另对照 Node `css-tree@3.1.0` | 32 / 32 | ✅ `wasm_smoke` | [`count_tokens` 1.28–1.63× · `parse` 0.79–1.18×（vs `cssparser`）· `minify` 1.26–4.55×（vs `lightningcss`）](BENCHMARKS.md#css) | `pionc add css --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`base64`](packages/base64) | `0.1.0` | RFC 4648 Base64 / Base64URL / Base32 / Base32hex / Hex（Base16）编解码：查表单缓冲编码、256 项表严格解码（拒绝非规范尾位、错误填充、异字母表与空白，错误带精确偏移）与 MIME 宽松 `decode_loose`，零依赖、无 `World` | Rust [`base64`](https://github.com/marshallpierce/rust-base64) `=0.22.1` + [`data-encoding`](https://github.com/ia0/data-encoding) `=2.11.1` + [`hex`](https://github.com/KokaKiwi/rust-hex) `=0.4.3`；Go `encoding/base64` / `base32` / `hex`（go1.27.3） | 23 / 23 | ✅ `wasm_smoke` | [hex 编解码 1.70× / 4.59×（vs Rust `hex`）· Base32 解码 2.54×（vs Go）· Base64 0.42–0.54×](BENCHMARKS.md#base64) | `pionc add base64 --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`effect`](packages/effect) | `0.1.0` | 确定性单线程协作式结构化并发运行时：虚拟 / 注入宿主时钟、FIFO 或种子化打乱调度、`EffectScope` 作用域纤程与 LIFO finalizer、协作式中断，`Deferred` / `Queue`（有界背压、`shutdown`）/ `Semaphore` 与 `race_k` / `all_k` / `timeout_k` 组合子，六档优先级抢占式 `Scheduler`（`urgent_room`、按键去重、`foreground_begin` 计数、前缀提权、空闲抢占），`SimNet` / `SimFiles` 确定性仿真服务与 `for_seeds` 重放；零 `World` 依赖 | 头对头对照 Go（goroutine / channel）与 Node.js（Promise / 微任务）同语义基线 | 19 / 19 | ✅ `wasm_smoke` | [队列乒乓 0.95× · 扇出汇合 0.93× · 虚拟时钟定时器 0.39×（vs Go）](BENCHMARKS.md#effect) | `pionc add effect --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 33 个包合计 **4,310 / 4,310** 单测通过（`sh scripts/verify.sh`）。
+全仓 34 个包合计 **4,329 / 4,329** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -94,6 +95,10 @@ Wave 8 新增的 4 个包按 Red → Green → 红队审计 → 修复流程交�
 ### `base64` `v0.1.0`
 
 `base64` 由 Monoid / Invar 团队交付，按 Red → Green → Bench 三段提交合入：RFC 4648 §10 全部五种编码测试向量、Go `encoding/base64` / `encoding/base32` 用例与错误偏移、4,096 个 2 符号与 262,144 个 3 符号 Base64 尾部及每种 Base32 尾长的规范性穷举（严格解码器仅接受编码器能产出的字符串），23 / 23 单测通过；`wasm_smoke` Native / Wasm32 × debug / `--release` 4 模式 stdout SHA-256 逐字节一致。头对头基准如实记录：hex 编码 / 解码为 Rust `hex` 的 1.70× / 4.59×，Base32 解码为 Go 的 2.54×；Base64 / Base64URL / Base32 其余模式为 Rust 与 Go 的 0.42–0.54×（参考实现按机器字批量解码，本包逐字节查表）。见 [`BENCHMARKS.md`](BENCHMARKS.md#base64)。
+
+### `effect` `v0.1.0`
+
+`effect` 由 Monoid / Invar 团队交付：确定性单线程协作式结构化并发运行时与六档优先级抢占式调度器，19 / 19 单测（作用域嵌套取消与 LIFO finalizer、`fork_quiet` / `fork_daemon` 失败归属、30 种子重放、`Queue` / `Semaphore` 唤醒取消不泄漏许可与元素、`race_k` 立即中断败者、注入宿主时钟与 `host_call_k` 取消、调度器 `urgent_room` / 前缀提权 / 空闲抢占 / 单键串行）通过；`wasm_smoke` Native / Wasm32 × debug / `--release` 4 模式 stdout SHA-256 逐字节一致（`3a81d545…`）。头对头基准以 Go 为基线如实记录：W1 有界队列乒乓 0.95×（Node 的 3.12×），W3 结构化扇出汇合 0.93×（Node 的 2.62×）；W2 虚拟时钟定时器调度为 Go 的 0.39×（Node 的 1.23×），Pion 侧每个定时器是完整结构化纤程（`Task` + `Fiber` + `sleep_k` 定时器 + 作用域监视），Go / Node 基线只往最小堆压 `{at, seq, idx}` 结构体，两侧工作量并不对等。见 [`BENCHMARKS.md`](BENCHMARKS.md#effect)。
 
 ## 贡献与移植流程
 

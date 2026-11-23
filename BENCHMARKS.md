@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 的数据取自包 README，未记录 pion commit，发布验证使用 2026-11-23 安装的 `pionc 0.1.0`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7 + Wave 8 + `base64`）
+## 基准总榜（v0.2.0 + Wave 4 + Wave 5 + Wave 6 + Wave 7 + Wave 8 + `base64` + `effect`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0`。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js）。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -174,6 +174,9 @@
 | `base64` | `b32_decode` Base32 严格解码 4 MiB × 64 | 268,435,456 B | 253.1 ms | 110.9 ms (Rust) / 642.3 ms (Go) | 0.44x (vs Rust) · **2.54x** (vs Go) | 22.6 MiB | 16.2 / 49.1 MiB (Rust / Go) |
 | `base64` | `hex_encode` Hex 编码 4 MiB × 64 | 268,435,456 B | 300.7 ms | 511.6 ms (Rust) / 209.7 ms (Go) | **1.70x** (vs Rust) · 0.70x (vs Go) | 21.8 MiB | 13.8 / 66.3 MiB (Rust / Go) |
 | `base64` | `hex_decode` Hex 解码 4 MiB × 64 | 268,435,456 B | 315.7 ms | 1449.4 ms (Rust) / 185.1 ms (Go) | **4.59x** (vs Rust) · 0.59x (vs Go) | 25.8 MiB | 20.0 / 31.4 MiB (Rust / Go) |
+| `effect` | W1 有界队列乒乓（cap = 16） | 50,000 msgs | 18.318 ms | 17.479 ms (Go) / 57.203 ms (Node) | 0.95x (vs Go) · **3.12x** (vs Node) | **1.83 MiB** | 4.59 / 48.62 MiB (Go / Node) |
+| `effect` | W2 虚拟时钟定时器调度（Pion 为完整结构化纤程，基线为裸最小堆，见明细） | 20,000 timers | 47.402 ms | 18.574 ms (Go) / 58.455 ms (Node) | 0.39x (vs Go) · **1.23x** (vs Node) | 28.23 MiB | 5.95 / 49.86 MiB (Go / Node) |
+| `effect` | W3 结构化扇出汇合（2,500 × 4） | 10,000 fibers | 19.481 ms | 18.090 ms (Go) / 51.110 ms (Node) | 0.93x (vs Go) · **2.62x** (vs Node) | **1.84 MiB** | 5.42 / 45.16 MiB (Go / Node) |
 
 ## 各包明细
 
@@ -1357,3 +1360,15 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 | `hex_decode` | 315.7 (850) | 185.1 (1450) | 1449.4 (185) | **4.59x** | 0.59x | 25.8 / 31.4 / 20.0 |
 
 23/23 单测（RFC 4648 §10 五种编码向量、Go 用例与错误偏移、Base64 2 / 3 符号尾部与 Base32 各尾长规范性穷举、0–64 全长度与 64 KiB / 1 MiB 往返）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `b9babfa55084789669b9487724ff5d938cbc2517d10008490c09b9310df19539`。领先项：hex 编码 / 解码为 Rust `hex` 的 1.70x / 4.59x，Base32 解码为 Go 的 2.54x（Go 按组处理填充与换行）。落后项：Base64 / Base64URL 编解码与 Base32 编码为 Rust 与 Go 的 0.42x–0.54x，Base32 解码为 Rust `data-encoding` 的 0.44x，hex 为 Go 的 0.70x / 0.59x（参考实现按机器字批量处理，本包逐字节经边界检查 `Bytes` 索引查表；4,096 项双符号表与展开索引实测无收益）。峰值 RSS 每个模式都介于 Rust 与 Go 之间。
+
+### effect
+
+参考实现：同语义 Go（`go1.27.3`，goroutine / channel / `container/heap`）与 Node.js（`v24.22.2`，Promise / 微任务）基线，源码见 [`packages/effect/bench/`](packages/effect/bench/)。`sh packages/effect/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对三个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5 --baseline go`，三方 stdout SHA-256 逐字节一致。详见 [`packages/effect/README.md`](packages/effect/README.md)。
+
+| Workload | Pion Median / Peak RSS | Go Median / Peak RSS | Node Median / Peak RSS | Pion vs Go | Pion vs Node |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| W1 有界队列乒乓（50k msgs，cap = 16） | 18.318 ms / 1.83 MiB | 17.479 ms / 4.59 MiB | 57.203 ms / 48.62 MiB | 0.95x | **3.12x** |
+| W2 虚拟时钟定时器调度（20k fibers / timers） | 47.402 ms / 28.23 MiB | 18.574 ms / 5.95 MiB | 58.455 ms / 49.86 MiB | 0.39x | **1.23x** |
+| W3 结构化扇出汇合（2,500 × 4 = 10k fibers） | 19.481 ms / 1.84 MiB | 18.090 ms / 5.42 MiB | 51.110 ms / 45.16 MiB | 0.93x | **2.62x** |
+
+19 / 19 单测；`wasm_smoke` 4 模式 stdout SHA-256 均为 `3a81d54555c2f572d5dcf8c3cc934a5a8d02606e41cf0a42bc4e2600b671d57a`。领先项：三个负载均快于 Node（1.23x–3.12x），W1 / W3 峰值 RSS 低于 Go 与 Node。落后项：W1 / W3 为 Go 的 0.95x / 0.93x；W2 为 Go 的 0.39x，峰值 RSS 28.23 MiB 高于 Go 的 5.95 MiB——两侧结构不对等：Pion 同时创建 20,000 个完整结构化纤程（`Task` + `Fiber` + `sleep_k` 定时器 + 作用域监视），Go 与 Node 基线只往最小堆压入裸 `{at, seq, idx}` 结构体，该比值反映的是结构化纤程的固定开销而非堆本身。
