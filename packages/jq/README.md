@@ -50,6 +50,14 @@ let out = jq::eval_json(q, doc)
 - **4-Mode `wasm_smoke`** (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`, clean `PION_CACHE_DIR`): all 4 exit `0` with identical stdout SHA-256:
   `5eaaff3ac9da8e31981e51a9742ea4eb4c8b8998b79b7d062afe3c03fae52a00`.
 
+## Formal Verification (Lean 4)
+
+Production `#verify` kernels (1 type, 14 functions, 0 externals) across `src/types.pion`, `src/lexer.pion`, `src/value.pion`, and `src/json_parser.pion` are extracted via `pionc extract-lean` and formally verified in `packages/jq/proofs/` (**22 theorems**, 0 `sorry`, 0 `admit`, 0 custom axioms, 0 `bv_decide`, 0 `native_decide`):
+
+- **`JqProofs/LexerAndUtf8.lean` (11 theorems)**: RFC 8259 §2 `is_json_ws` exact 4-byte whitespace spec, `is_json_str_fast_byte` exact spec & escape disjointness, `is_ascii_alpha`/`is_ascii_digit` disjointness, `is_ident_char` spec, `hex_val` range & exact nibble decoding, `sanitize_utf8_cp` RFC 3629 scalar-value safety & idempotence, UTF-16 `is_high_surrogate`/`is_low_surrogate` disjoint partition of `[0xD800, 0xDFFF]`, and `decode_surrogate_pair` exact supplementary scalar value (`[0x10000, 0x10FFFF]`), preservation under `sanitize_utf8_cp`, and injectivity.
+- **`JqProofs/SliceAndLimits.lean` (11 theorems)**: `JqLimits::default` positivity & `jq_limits_is_valid` iff characterization, `clamp_slice_idx` total `[0, len]` bounds (including `I32.min`), identity on `[0, len]`, negative-offset resolution, underflow/overflow clamping, idempotence, non-negative monotonicity, and `clamp_slice_i64` full 64-bit overflow-free clamping into `[0, len]`.
+- **Reproduce**: `packages/jq/proofs/run_proofs.sh` (verifies extraction, static scan, `lake build`, `CheckAxioms.lean` standard-axioms-only check, and 35-case Native Pion vs Lean `EvalDiff` `diff -u` cross-check).
+
 ## Head-to-Head Benchmarks vs Go `github.com/itchyny/gojq` (`v0.12.17`)
 
 ### Standard Workloads (`sh packages/jq/bench/run_bench.sh`)
