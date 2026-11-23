@@ -76,8 +76,9 @@ pionc add <package-name>
 | [`protobuf`](packages/protobuf) | `0.1.0` | Protocol Buffers v2 / v3 / Edition 2023：零拷贝 `WireReader` / `WireWriter`（严格 varint、ZigZag、packed、group）、`.proto` 词法 / 校验 / 按作用域链接（`parse_schema` / `parse_schemas`，含内置 well-known types）、`DynamicMessage` 动态反射（未知字段保留、oneof、map last-wins）与 Proto3 JSON，零 `protoc` / C 依赖、无 `World` | Go [`google.golang.org/protobuf`](https://github.com/protocolbuffers/protobuf-go) `v1.36.6`（`protowire` / `dynamicpb` / `protojson`）+ Rust [`prost`](https://github.com/tokio-rs/prost) `0.13.5` | 29 / 29 | ✅ `wasm_smoke` | [`DynamicMessage` **1.61–2.03×**（vs Go `dynamicpb`）· packed 往返 0.91× · Span 编解码 0.47×（vs Rust）](BENCHMARKS.md#protobuf) | `pionc add protobuf --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`graphql`](packages/graphql) | `0.1.0` | GraphQL（October 2021）词法、全迭代显式栈 AST 解析（Executable + SDL + 扩展）、无损幂等格式化 `print_document`、与 `stripIgnoredCharacters` 逐字节一致的流式 `minify_query`，以及 13 条无 schema 可执行规则的 O(V + E) 静态校验与深度 / 别名 / 字段预算，`ParseOptions` 防 DoS（`max_depth` 硬上限 500），零依赖无 `World` | Rust [`apollo-parser`](https://github.com/apollographql/apollo-rs) `=0.8.4` + Node [`graphql-js`](https://github.com/graphql/graphql-js) `16.10.0` | 33 / 33 | ✅ `wasm_smoke` | [SDL 解析 **1.34×** · 查询解析 + 校验 **1.85×** · 压缩 + 打印往返 **1.23×**（vs Rust）](BENCHMARKS.md#graphql) | `pionc add graphql --registry https://github.com/AFK-surf/pion-packages.git` |
 | [`woff2`](packages/woff2) | `0.1.0` | W3C WOFF 2.0（`wOF2`，复用 `brotli`）与 WOFF 1.0（`wOFF`，复用 `flate`）字体容器解码至 TrueType/OpenType（SFNT）：全 63 已知表标签 + 自定义标签、`glyf` / `loca` / `hmtx` 变换重建、整字体校验和 `0xB1B0AFBA` 与 `DecodeLimits` 防字体炸弹，零 C 依赖无 `World` | Rust [`wuff`](https://github.com/googlefonts/wuff) `0.2.10` + W3C WOFF2 Conformance（`google/woff2`） | 35 / 35 | ✅ `wasm_smoke` | [Arial.woff2 0.55× · Monaco.woff2 0.59× · Arial.woff 0.67×（vs `wuff`，含 `glyf`/`loca` 逐字节一致）](BENCHMARKS.md#woff2) | `pionc add woff2 --registry https://github.com/AFK-surf/pion-packages.git` |
+| [`mp4`](packages/mp4) | `0.1.0` | ISO/IEC 14496-12（ISO BMFF / MP4 / fMP4）与 W3C MSE 字节流零拷贝解复用器：完整 `moov`（`elst`/`stbl`/`stsd` 含 H.264/HEVC/AV1/VP9/AAC/Opus/FLAC/MP3）与 fMP4（`sidx`/`moof`/`traf`/`trun` 多 `trun`）解析、RFC 6381 codec 字符串探测、非单调 B 帧安全 seek 与 `DecodeLimits` 防样本放大炸弹，零依赖无 `World` | Rust [`symphonia-format-isomp4`](https://github.com/pdeljanov/Symphonia) `0.5.5` + `ffprobe` 真值 | 8 / 8 | ✅ `wasm_smoke` | [MP4 18.04 µs/iter (**49.60×**) · fMP4 视频 11.05–13.99 µs/iter (**26.68–35.50×**) · 音频 7.35 µs/iter (**2.97×**)](BENCHMARKS.md#mp4) | `pionc add mp4 --registry https://github.com/AFK-surf/pion-packages.git` |
 
-全仓 45 个包合计 **4,587 / 4,587** 单测通过（`sh scripts/verify.sh`）。
+全仓 46 个包合计 **4,595 / 4,595** 单测通过（`sh scripts/verify.sh`）。
 
 ### v0.2.0：红队对抗审计
 
@@ -145,6 +146,10 @@ Wave 9 发布验证在 `AFK-surf/pion@c375cee` 上完成：`sh scripts/verify.sh
 
 - **`woff2` `v0.1.0`**：复用 `brotli` 与 `flate` 的纯 Pion WOFF 2.0 / WOFF 1.0 字体容器解码器，经独立红队审计与热路径加速后合入（`run_audit.sh all` 退出码 0、35 / 35 单测全绿、110 / 110 真实字体含 `glyf`/`loca` 与 Rust `wuff 0.2.10` 逐字节一致、12k `--release` fuzz 0 crash）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`e0122b97…`）。头对头基准如实记录：`Arial.woff2` 66.423 ms（0.55× `wuff`，峰值 RSS 7.84 vs 9.80 MiB 更低）、`Monaco.woff2` 33.235 ms（0.59×）、`Arial.woff` 43.867 ms（0.67×）。详见 [`BENCHMARKS.md`](BENCHMARKS.md#woff2)。
 - **`url` `v0.1.1` 与 `html` `v0.1.1`**：递增版本并发布不可变 tag（`url-v0.1.1` / `html-v0.1.1`，原 `v0.1.0` tag 保持不变），使 `parse_data_url` 与 `parse_srcset` 正式可通过 `pionc add` 从内置 Git-Index Registry 安装。
+
+### Farview 生态沉淀波 3（多媒体生态首包）：`mp4` `v0.1.0`
+
+- **`mp4` `v0.1.0`**：零依赖纯 Pion ISO/IEC 14496-12（MP4 / fMP4 / W3C MSE）零拷贝解复用器，经独立红队审计与全量修复后合入（8 / 8 单测，`redteam_test` 22 / 22 全绿，`compare` 37 / 37 与 `ffprobe` 逐样本对齐且 31 条 `elst` 偏移归零，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 分歧，`trun`/`stco` 放大炸弹在 1.9 MiB 峰值 RSS 下 0 ms 拒收）；`wasm_smoke` 四模式 stdout SHA-256 逐字节一致（`4c1fad12…`）。头对头基准对照 Rust `symphonia-format-isomp4 0.5.5`（含 `ffprobe` 真值校验，以 `µs/iter` 计）：标准 MP4 18.04 µs/iter（**49.60×**）、MSE fMP4 视频 13.99 µs/iter（**26.68×**）、多 `trun` fMP4 视频 11.05 µs/iter（**35.50×**）、MSE fMP4 音频 7.35 µs/iter（**2.97×**）；进程内微基准 `parse_init_segment` 0.83 µs/iter、`parse_media_segment` 0.87 µs/iter（详见 [`BENCHMARKS.md`](BENCHMARKS.md#mp4)，含零拷贝 vs `next_packet()` 拷贝口径说明）。
 
 ## 贡献与移植流程
 
