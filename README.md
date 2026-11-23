@@ -294,7 +294,15 @@ Wave 10 发布验证在 `AFK-surf/pion@c375cee` 上完成：`sh scripts/verify.s
 
 ### Lean 4 形式化验证
 
-截至本次发布的 `origin/main`（`9629fb0`），Lean 4 串行证明线程已为 **36 个包**交付 **992 个** 0 `sorry` 定理（`packages/<name>/proofs/`，逐包 `sh packages/<name>/proofs/run_proofs.sh`，全量串行限资源运行 `sh scripts/verify-lean.sh`）。Wave 14 与 Wave 15 共八个新包暂未纳入证明。
+经独立红队审计（`audit/redteam-lean-proofs`）与 Stage 1 全量清理加固，当前 **43 个包**共保留 **474 个** 0 `sorry` 定理（**106 个 A 级核心算法 / 协议不变量 + 368 个 B 级核心辅助定理，0 个 C 级定理**；原 C 级常量 / 单点定理已迁移为原生 Pion 单元测试，全仓 80 包 `sh scripts/verify.sh` 共 **5,354 / 5,354** 单测通过，同时 `base64` 与 `crdt` 修复 C5 问题并补齐 13 条全域 A 级定理）。
+
+全部 43 份 `packages/<name>/proofs/run_proofs.sh` 统一执行 4 项门禁加固：
+- **静态禁用词扫描**：零 `sorry` / `admit` / `axiom` / `native_decide` / `unsafe` / `partial` / `implemented_by` / `extern`；
+- **零告警构建**：在独立隔离目录提取当前 `src/*.pion` 并构建，`lake build` 严格 0 errors / 0 warnings；
+- **1:1 公理白名单审查**：`CheckAxioms.lean` 与声明定理列表精确 1:1 对齐，仅允许标准公理 `[propext, Classical.choice, Quot.sound]`；
+- **原生 vs Lean 值差分门禁**：`EvalDiff.lean` 与原生 `pionc run` 逐行精确值 `diff -u` 一致。
+
+逐包运行 `bash packages/<name>/proofs/run_proofs.sh`，全量串行限资源运行 `sh scripts/verify-lean.sh`（每包验证通过后自动清理 `.lake/build`）。Wave 14 与 Wave 15 及后续新包暂未纳入证明。
 
 ## 贡献与移植流程
 

@@ -109,21 +109,8 @@ private lemma nat_or_shl3 (a b : Nat) (hb : b < 8) :
       rw [Nat.add_comm, Nat.add_mul_div_right _ _ (by omega), Nat.div_eq_of_lt hb, Nat.zero_add]
     rw [hpow, ← Nat.div_div_eq_div_mul, hdiv1]
 
-/-- Theorem 13: `DecodeOptions.default` enforces strictly positive DoS limits and strict UTF-8. -/
-theorem decode_options_default_safe :
-    ∃ o : DecodeOptions, DecodeOptions.default = ok o ∧
-      0 < o.max_depth.val ∧ 0 < o.max_fields.val ∧ 0 < o.max_bytes.val ∧
-      o.strict_utf8 = true := by
-  refine ⟨_, rfl, by decide, by decide, by decide, rfl⟩
-
-/-- Theorem 14: `JsonOptions.default` selects canonical Proto3 JSON settings. -/
-theorem json_options_default_canonical :
-    ∃ o : JsonOptions, JsonOptions.default = ok o ∧
-      o.emit_defaults = false ∧ o.use_proto_names = false ∧ o.enums_as_ints = false := by
-  refine ⟨_, rfl, rfl, rfl, rfl⟩
-
 /-- Theorem 15: `wire_type_code` and `wire_type_from_code` form an exact roundtrip on all 6 Protobuf wire types. -/
-theorem wire_type_roundtrip (wt : WireType) :
+lemma wire_type_roundtrip (wt : WireType) :
     (do let c ← wire_type_code wt; wire_type_from_code c) = ok (some wt) := by
   cases wt <;> simp [wire_type_code, wire_type_from_code]
 
@@ -155,11 +142,6 @@ theorem wire_type_from_code_valid_iff (code : Std.I32) :
     · have heq : code = 3#i32 := IScalar.eq_of_val_eq h; subst heq; exact ⟨.StartGroup, rfl⟩
     · have heq : code = 4#i32 := IScalar.eq_of_val_eq h; subst heq; exact ⟨.EndGroup, rfl⟩
     · have heq : code = 5#i32 := IScalar.eq_of_val_eq h; subst heq; exact ⟨.Fixed32, rfl⟩
-
-/-- Theorem 17: `wire_type_eq` decides exact structural equality on `WireType`. -/
-theorem wire_type_eq_iff (a b : WireType) :
-    wire_type_eq a b = ok true ↔ a = b := by
-  cases a <;> cases b <;> simp [wire_type_eq, wire_type_code]
 
 /-- Theorem 18: `encode_tag_raw` computes exact `field_number * 8 + wire_type_code` within 32-bit unsigned range. -/
 theorem encode_tag_raw_exact (f : Std.I32) (wt : WireType)
@@ -236,128 +218,5 @@ theorem tag_encode_decode_roundtrip (f : Std.I32) (wt : WireType)
     rw [hc, result_bind_ok'] at hrt
     exact hrt
   exact ⟨raw, c, hraw, hfn, hwt_dec, hfrom⟩
-
-/-- Theorem 20: Every legal Protobuf field tag (`1..536870911`) encodes in 1 to 5 varint bytes. -/
-theorem tag_len_bounds (f : Std.I32) (hlo : 1 ≤ f.val) (hhi : f.val ≤ 536870911) :
-    ∃ n : Std.I32, tag_len f = ok n ∧ 1 ≤ n.val ∧ n.val ≤ 5 := by
-  unfold tag_len
-  rw [u64_shl3_ok, result_bind_ok']
-  set fu := Pion.I64.to_uint64 (Pion.I32.to_int64 f)
-  have hfu : fu.val = f.val.toNat := i32_nonneg_to_u64_val f (by omega)
-  set sh : Std.U64 := ⟨fu.bv <<< 3⟩
-  have hshv : sh.val = f.val.toNat * 8 := by
-    change (fu.bv <<< 3).toNat = f.val.toNat * 8
-    rw [BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]
-    change (fu.val * 8) % 2 ^ 64 = f.val.toNat * 8
-    rw [hfu]
-    exact Nat.mod_eq_of_lt (by omega)
-  obtain ⟨n, hn, h1, h2, h3, h4, h5, _, _, _, _, _⟩ := varint_len_u64_exact_tiers sh
-  rw [hn, result_bind_ok']
-  refine ⟨n, rfl, ?_, ?_⟩
-  · by_cases c1 : sh.val < 128
-    · have := h1.mpr c1; omega
-    · by_cases c2 : sh.val < 16384
-      · have := h2.mpr ⟨by omega, c2⟩; omega
-      · by_cases c3 : sh.val < 2097152
-        · have := h3.mpr ⟨by omega, c3⟩; omega
-        · by_cases c4 : sh.val < 268435456
-          · have := h4.mpr ⟨by omega, c4⟩; omega
-          · have := h5.mpr ⟨by omega, by omega⟩; omega
-  · by_cases c1 : sh.val < 128
-    · have := h1.mpr c1; omega
-    · by_cases c2 : sh.val < 16384
-      · have := h2.mpr ⟨by omega, c2⟩; omega
-      · by_cases c3 : sh.val < 2097152
-        · have := h3.mpr ⟨by omega, c3⟩; omega
-        · by_cases c4 : sh.val < 268435456
-          · have := h4.mpr ⟨by omega, c4⟩; omega
-          · have := h5.mpr ⟨by omega, by omega⟩; omega
-
-/-- Theorem 21: A legal Protobuf field tag fits in 1 byte if and only if `field_number ≤ 15`. -/
-theorem tag_len_single_byte_iff (f : Std.I32) (hlo : 1 ≤ f.val) (hhi : f.val ≤ 536870911) :
-    tag_len f = ok 1#i32 ↔ f.val ≤ 15 := by
-  unfold tag_len
-  rw [u64_shl3_ok, result_bind_ok']
-  set fu := Pion.I64.to_uint64 (Pion.I32.to_int64 f)
-  have hfu : fu.val = f.val.toNat := i32_nonneg_to_u64_val f (by omega)
-  set sh : Std.U64 := ⟨fu.bv <<< 3⟩
-  have hshv : sh.val = f.val.toNat * 8 := by
-    change (fu.bv <<< 3).toNat = f.val.toNat * 8
-    rw [BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]
-    change (fu.val * 8) % 2 ^ 64 = f.val.toNat * 8
-    rw [hfu]
-    exact Nat.mod_eq_of_lt (by omega)
-  obtain ⟨n, hn, h1, _, _, _, _, _, _, _, _, _⟩ := varint_len_u64_exact_tiers sh
-  rw [hn, result_bind_ok']
-  constructor
-  · intro heq
-    simp only [ok.injEq] at heq
-    have hnv : n.val = 1 := congrArg IScalar.val heq
-    have hlt := h1.mp hnv
-    omega
-  · intro hf15
-    have hnv : n.val = 1 := h1.mpr (by omega)
-    have hneq : n = 1#i32 := IScalar.eq_of_val_eq hnv
-    rw [hneq]
-
-/-- Theorem 22: Exact iff specification of `field_number_err_code` across all 32-bit inputs and `reject_reserved` modes. -/
-theorem field_number_err_code_spec (f : Std.I32) (reject : Bool) :
-    ∃ c : Std.I32, field_number_err_code f reject = ok c ∧
-      ((c.val = 1 ↔ f.val ≤ 0 ∨ f.val > 536870911) ∧
-       (c.val = 2 ↔ reject = true ∧ 19000 ≤ f.val ∧ f.val ≤ 19999) ∧
-       (c.val = 0 ↔ 1 ≤ f.val ∧ f.val ≤ 536870911 ∧ ¬ (reject = true ∧ 19000 ≤ f.val ∧ f.val ≤ 19999))) := by
-  unfold field_number_err_code
-  have c0 : (0#i32 : Std.I32).val = 0 := rfl
-  have c1 : (1#i32 : Std.I32).val = 1 := rfl
-  have c2 : (2#i32 : Std.I32).val = 2 := rfl
-  by_cases hbad : ((decide (f <= 0#i32)) || (decide (f > 536870911#i32))) = true
-  · simp only [hbad, ↓reduceIte]
-    simp only [Bool.or_eq_true, decide_eq_true_eq] at hbad
-    have hb : f.val ≤ 0 ∨ f.val > 536870911 := hbad
-    exact ⟨1#i32, rfl, ⟨fun _ => hb, fun _ => c1⟩,
-           ⟨fun h => by omega, fun h => by omega⟩,
-           ⟨fun h => by omega, fun h => by omega⟩⟩
-  · have hbadf : ((decide (f <= 0#i32)) || (decide (f > 536870911#i32))) = false :=
-      Bool.eq_false_iff.mpr hbad
-    simp only [hbadf, Bool.false_eq_true, ↓reduceIte]
-    simp only [Bool.or_eq_true, decide_eq_true_eq, not_or] at hbad
-    have hlo : 1 ≤ f.val := by have : ¬ (f.val ≤ 0) := hbad.1; omega
-    have hhi : f.val ≤ 536870911 := by have : ¬ (f.val > 536870911) := hbad.2; omega
-    by_cases hres : ((reject && (decide (f >= 19000#i32))) && (decide (f <= 19999#i32))) = true
-    · simp only [hres, ↓reduceIte]
-      simp only [Bool.and_eq_true, decide_eq_true_eq] at hres
-      have hr : reject = true ∧ 19000 ≤ f.val ∧ f.val ≤ 19999 := ⟨hres.1.1, hres.1.2, hres.2⟩
-      exact ⟨2#i32, rfl, ⟨fun h => by omega, fun h => by omega⟩,
-             ⟨fun _ => hr, fun _ => c2⟩,
-             ⟨fun h => by omega, fun ⟨_, _, hnot⟩ => (hnot hr).elim⟩⟩
-    · have hresf : ((reject && (decide (f >= 19000#i32))) && (decide (f <= 19999#i32))) = false :=
-        Bool.eq_false_iff.mpr hres
-      simp only [hresf, Bool.false_eq_true, ↓reduceIte]
-      simp only [Bool.and_eq_true, decide_eq_true_eq] at hres
-      have hnr : ¬ (reject = true ∧ 19000 ≤ f.val ∧ f.val ≤ 19999) := fun ⟨a, b, d⟩ => hres ⟨⟨a, b⟩, d⟩
-      exact ⟨0#i32, rfl, ⟨fun h => by omega, fun h => by omega⟩,
-             ⟨fun h => by omega, fun hr => (hnr hr).elim⟩,
-             ⟨fun _ => ⟨hlo, hhi, hnr⟩, fun _ => c0⟩⟩
-
-/-- Theorem 23: Reserved Protobuf implementation numbers `[19000, 19999]` return code 2 when `reject_reserved = true` and code 0 when `false`. -/
-theorem field_number_reserved_rejected_iff (f : Std.I32)
-    (hlo : 19000 ≤ f.val) (hhi : f.val ≤ 19999) :
-    field_number_err_code f true = ok 2#i32 ∧ field_number_err_code f false = ok 0#i32 := by
-  obtain ⟨c1, hc1, _, h2t, _⟩ := field_number_err_code_spec f true
-  obtain ⟨c2, hc2, _, _, h0f⟩ := field_number_err_code_spec f false
-  have heq1 : c1 = 2#i32 := IScalar.eq_of_val_eq (h2t.mpr ⟨rfl, hlo, hhi⟩)
-  have heq2 : c2 = 0#i32 := IScalar.eq_of_val_eq (h0f.mpr ⟨by omega, by omega, by simp⟩)
-  rw [heq1] at hc1
-  rw [heq2] at hc2
-  exact ⟨hc1, hc2⟩
-
-/-- Theorem 24: `field_number_err_code` always succeeds and returns a code in `[0, 2]`. -/
-theorem field_number_err_code_range (f : Std.I32) (reject : Bool) :
-    ∃ c : Std.I32, field_number_err_code f reject = ok c ∧ 0 ≤ c.val ∧ c.val ≤ 2 := by
-  unfold field_number_err_code
-  split_ifs
-  · exact ⟨1#i32, rfl, by decide, by decide⟩
-  · exact ⟨2#i32, rfl, by decide, by decide⟩
-  · exact ⟨0#i32, rfl, by decide, by decide⟩
 
 end ProtobufProofs

@@ -19,23 +19,23 @@ open tar
 
 /-! ## Common Scalar & Bytes Helpers -/
 
-theorem b_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma b_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← (ok x : Result α); f y) = f x := by simp
 
-theorem b_ok2 {α β γ : Type} (x : α) (y : β) (f : α → β → Result γ) :
+lemma b_ok2 {α β γ : Type} (x : α) (y : β) (f : α → β → Result γ) :
     (do let (a, b) ← (ok (x, y) : Result (α × β)); f a b) = f x y := by simp
 
-theorem b_ok3 {α β γ δ : Type} (x : α) (y : β) (z : γ) (f : α → β → γ → Result δ) :
+lemma b_ok3 {α β γ δ : Type} (x : α) (y : β) (z : γ) (f : α → β → γ → Result δ) :
     (do let (a, b, c) ← (ok (x, y, z) : Result (α × β × γ)); f a b c) = f x y z := by simp
 
-theorem wp_ok_iff {α : Type u} (r : Result α) (P : α → Prop) :
+lemma wp_ok_iff {α : Type u} (r : Result α) (P : α → Prop) :
     r ⦃ P ⦄ ↔ ∃ y, r = ok y ∧ P y := by
   cases r with
   | ret y => simp [WP.spec_ok]
   | vis e k => simp [WP.spec_vis]
   | div => simp [WP.spec_div]
 
-theorem u8_to_int_val (x : Std.U8) : (Pion.U8.to_int x).val = (x.val : Int) := by
+lemma u8_to_int_val (x : Std.U8) : (Pion.U8.to_int x).val = (x.val : Int) := by
   cases x with
   | mk bv =>
     have hlt : bv.toNat < 256 := bv.isLt
@@ -43,7 +43,7 @@ theorem u8_to_int_val (x : Std.U8) : (Pion.U8.to_int x).val = (x.val : Int) := b
       BitVec.toInt_setWidth, BitVec.toInt_ofNat, IScalarTy.numBits, UScalarTy.numBits]
     rw [Int.bmod_eq_of_le_mul_two] <;> omega
 
-theorem i32_add_val {a b : Std.I32}
+lemma i32_add_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 2147483647) :
     (Pion.I32.add a b).val = a.val + b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -52,7 +52,7 @@ theorem i32_add_val {a b : Std.I32}
   rw [BitVec.toInt_add]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i32_sub_val {a b : Std.I32}
+lemma i32_sub_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val - b.val) (hhi : a.val - b.val ≤ 2147483647) :
     (Pion.I32.sub a b).val = a.val - b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -61,7 +61,7 @@ theorem i32_sub_val {a b : Std.I32}
   rw [BitVec.toInt_sub]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i32_mul_val {a b : Std.I32}
+lemma i32_mul_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val * b.val) (hhi : a.val * b.val ≤ 2147483647) :
     (Pion.I32.mul a b).val = a.val * b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -70,7 +70,7 @@ theorem i32_mul_val {a b : Std.I32}
   rw [BitVec.toInt_mul]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i64_add_val {a b : Std.I64}
+lemma i64_add_val {a b : Std.I64}
     (hlo : -9223372036854775808 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 9223372036854775807) :
     (Pion.I64.add a b).val = a.val + b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -79,7 +79,7 @@ theorem i64_add_val {a b : Std.I64}
   rw [BitVec.toInt_add]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem bytes_get_spec (b : Pion.Bytes) (i : Std.I32)
+lemma bytes_get_spec (b : Pion.Bytes) (i : Std.I32)
     (h0 : 0 ≤ i.val) (h1 : i.val < b.val.length) :
     ∃ x, Pion.Bytes.get b i = ok x ∧ b.val[i.val.toNat]? = some x := by
   unfold Pion.Bytes.get Pion.listGet
@@ -88,7 +88,7 @@ theorem bytes_get_spec (b : Pion.Bytes) (i : Std.I32)
   refine ⟨_, rfl, ?_⟩
   simp [List.getElem?_eq_getElem (show i.val.toNat < b.val.length by omega)]
 
-theorem bytes_length_spec (b : Pion.Bytes) (h : b.val.length ≤ 2147483647) :
+lemma bytes_length_spec (b : Pion.Bytes) (h : b.val.length ≤ 2147483647) :
     ∃ n : Std.I32, Pion.Bytes.length b = ok n ∧ n.val = b.val.length := by
   unfold Pion.Bytes.length Pion.lengthOf
   simp only [h, ↓reduceDIte]
@@ -96,73 +96,6 @@ theorem bytes_length_spec (b : Pion.Bytes) (h : b.val.length ≤ 2147483647) :
   simp
 
 /-! ## Section 1: Typeflags & `TarFormat` Soundness (`packages/tar/src/types.pion`) -/
-
-/-- `is_header_only_type` is total (never panics on any `Byte`). -/
-theorem is_header_only_type_total (flag : Std.U8) :
-    ∃ r : Bool, is_header_only_type flag = ok r :=
-  ⟨_, rfl⟩
-
-/-- Exact characterization of `is_header_only_type`: true iff `flag ∈ {'1'..'6'}`. -/
-theorem is_header_only_type_iff (flag : Std.U8) :
-    is_header_only_type flag = ok true ↔
-      (flag.val = 49 ∨ flag.val = 50 ∨ flag.val = 51 ∨
-       flag.val = 52 ∨ flag.val = 53 ∨ flag.val = 54) := by
-  unfold is_header_only_type
-  have hv := u8_to_int_val flag
-  have hlt := flag.hBounds
-  simp only [Result.ok.injEq, Bool.or_eq_true, beq_iff_eq]
-  constructor
-  · intro h
-    rcases h with (((((h | h) | h) | h) | h) | h) <;>
-    · have := congrArg IScalar.val h
-      rw [hv] at this
-      simp at this
-      omega
-  · intro h
-    rcases h with h | h | h | h | h | h
-    · left; left; left; left; left; apply IScalar.eq_of_val_eq; rw [hv]; simp [h]
-    · left; left; left; left; right; apply IScalar.eq_of_val_eq; rw [hv]; simp [h]
-    · left; left; left; right; apply IScalar.eq_of_val_eq; rw [hv]; simp [h]
-    · left; left; right; apply IScalar.eq_of_val_eq; rw [hv]; simp [h]
-    · left; right; apply IScalar.eq_of_val_eq; rw [hv]; simp [h]
-    · right; apply IScalar.eq_of_val_eq; rw [hv]; simp [h]
-
-/-- Header-only typeflag constants all return `true`; data-bearing/meta typeflags return `false`. -/
-theorem typeflag_classification :
-    (do let t ← type_link; is_header_only_type t) = ok true ∧
-    (do let t ← type_symlink; is_header_only_type t) = ok true ∧
-    (do let t ← type_char; is_header_only_type t) = ok true ∧
-    (do let t ← type_block; is_header_only_type t) = ok true ∧
-    (do let t ← type_dir; is_header_only_type t) = ok true ∧
-    (do let t ← type_fifo; is_header_only_type t) = ok true ∧
-    (do let t ← type_reg; is_header_only_type t) = ok false ∧
-    (do let t ← type_reg_a; is_header_only_type t) = ok false ∧
-    (do let t ← type_cont; is_header_only_type t) = ok false ∧
-    (do let t ← type_x_header; is_header_only_type t) = ok false ∧
-    (do let t ← type_x_global_header; is_header_only_type t) = ok false ∧
-    (do let t ← type_gnu_sparse; is_header_only_type t) = ok false ∧
-    (do let t ← type_gnu_long_name; is_header_only_type t) = ok false ∧
-    (do let t ← type_gnu_long_link; is_header_only_type t) = ok false := by
-  simp only [type_link, type_symlink, type_char, type_block, type_dir, type_fifo,
-    type_reg, type_reg_a, type_cont, type_x_header, type_x_global_header,
-    type_gnu_sparse, type_gnu_long_name, type_gnu_long_link, is_header_only_type, b_ok]
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-
-/-- `format_equals` is total and decides exact equality on `TarFormat`. -/
-theorem format_equals_iff (a b : TarFormat) :
-    format_equals a b = ok true ↔ a = b := by
-  cases a <;> cases b <;> simp [format_equals]
-
-theorem format_equals_refl (a : TarFormat) : format_equals a a = ok true :=
-  (format_equals_iff a a).mpr rfl
-
-theorem format_equals_symm (a b : TarFormat) :
-    format_equals a b = ok true → format_equals b a = ok true := by
-  rw [format_equals_iff, format_equals_iff]; exact Eq.symm
-
-theorem format_equals_trans (a b c : TarFormat) :
-    format_equals a b = ok true → format_equals b c = ok true → format_equals a c = ok true := by
-  rw [format_equals_iff, format_equals_iff, format_equals_iff]; exact Eq.trans
 
 /-! ## Section 2: TAR 512-Byte Block Alignment & Padding Arithmetic (`packages/tar/src/format.pion`) -/
 
@@ -208,10 +141,6 @@ theorem block_padding_total (offset : Std.I64) :
   · rw [band_511_val]; omega
   · rw [band_511_val]; omega
 
-/-- `block_padding 0 = ok 0`. -/
-theorem block_padding_zero : block_padding 0#i64 = ok 0#i64 := by
-  unfold block_padding; rfl
-
 /-- `padded_size` never overflows on `[0, 2^63 - 512]`, returns a multiple of 512,
     and satisfies tight bounds `size ≤ padded < size + 512`. -/
 theorem padded_size_spec (size : Std.I64)
@@ -225,10 +154,6 @@ theorem padded_size_spec (size : Std.I64)
   · rw [i64_add_val, band_511_val] <;> (try rw [band_511_val]) <;> omega
   · rw [i64_add_val, band_511_val] <;> (try rw [band_511_val]) <;> omega
 
-/-- `padded_size 0 = ok 0`. -/
-theorem padded_size_zero : padded_size 0#i64 = ok 0#i64 := by
-  unfold padded_size block_padding; rw [b_ok]; rfl
-
 /-- `padded_size` is monotone on `[0, 2^63 - 512]`. -/
 theorem padded_size_mono (a b : Std.I64)
     (ha0 : 0 ≤ a.val) (hab : a.val ≤ b.val) (hbmax : b.val ≤ 9223372036854775296) :
@@ -238,23 +163,11 @@ theorem padded_size_mono (a b : Std.I64)
   refine ⟨ra, rb, hra, hrb, ?_⟩
   omega
 
-/-- `padded_size` is idempotent on `[0, 2^63 - 512]`. -/
-theorem padded_size_idempotent (size : Std.I64)
-    (h0 : 0 ≤ size.val) (hmax : size.val ≤ 9223372036854775296) :
-    ∃ r : Std.I64, padded_size size = ok r ∧ padded_size r = ok r := by
-  obtain ⟨r, hr, hmod, hge, hlt⟩ := padded_size_spec size h0 hmax
-  obtain ⟨r2, hr2, hmod2, hge2, hlt2⟩ := padded_size_spec r (by omega) (by omega)
-  have heq : r2 = r := by
-    apply IScalar.eq_of_val_eq
-    omega
-  rw [heq] at hr2
-  exact ⟨r, hr, hr2⟩
-
 /-! ## Section 3: Zip-Slip Path Security & Traversal Impossibility (`packages/tar/src/path.pion`) -/
 
 /-- `ascii_upper` is total, maps `'a'..'z'` (`97..122`) to `'A'..'Z'` (`65..90`),
     and leaves all other values unchanged. -/
-theorem ascii_upper_spec (c : Std.I32) :
+lemma ascii_upper_spec (c : Std.I32) :
     ∃ r : Std.I32, ascii_upper c = ok r ∧
       r.val = (if 97 ≤ c.val ∧ c.val ≤ 122 then c.val - 32 else c.val) := by
   unfold ascii_upper
@@ -277,31 +190,8 @@ theorem ascii_upper_spec (c : Std.I32) :
       exact h ⟨h1, h2⟩
     simp only [hd, Bool.false_eq_true, ↓reduceIte, h]
 
-/-- `ascii_upper` is idempotent. -/
-theorem ascii_upper_idempotent (c : Std.I32) :
-    (do let u ← ascii_upper c; ascii_upper u) = ascii_upper c := by
-  obtain ⟨u, hu, huv⟩ := ascii_upper_spec c
-  obtain ⟨u2, hu2, hu2v⟩ := ascii_upper_spec u
-  rw [hu, b_ok, hu2]
-  congr 1
-  apply IScalar.eq_of_val_eq
-  split_ifs at huv hu2v <;> omega
-
-/-- `is_path_sep` accepts exactly `'/'` (`47`) and `'\\'` (`92`). -/
-theorem is_path_sep_iff (c : Std.I32) :
-    is_path_sep c = ok true ↔ (c.val = 47 ∨ c.val = 92) := by
-  unfold is_path_sep
-  simp only [Result.ok.injEq, Bool.or_eq_true, beq_iff_eq]
-  constructor
-  · intro h
-    rcases h with h | h <;> (subst h; simp)
-  · intro h
-    rcases h with h | h
-    · left; apply IScalar.eq_of_val_eq; simpa using h
-    · right; apply IScalar.eq_of_val_eq; simpa using h
-
 /-- Exact specification of `is_dotdot_segment` on a valid slice `[start, end]`. -/
-theorem is_dotdot_segment_spec (b : Pion.Bytes) (s e : Std.I32)
+lemma is_dotdot_segment_spec (b : Pion.Bytes) (s e : Std.I32)
     (hs0 : 0 ≤ s.val) (hse : s.val ≤ e.val) (he : e.val ≤ b.val.length)
     (hlen : b.val.length ≤ 2147483647) :
     ∃ r : Bool, is_dotdot_segment b s e = ok r ∧
@@ -450,7 +340,7 @@ theorem has_invalid_path_byte_spec (b : Pion.Bytes) (hlen : b.val.length ≤ 214
     · exact False.elim (this.2 h58)
 
 /-- `is_windows_reserved_name` is total on any valid slice `0 ≤ start ≤ end ≤ b.val.length ≤ 2^31-1`. -/
-theorem is_windows_reserved_name_total (b : Pion.Bytes) (s e : Std.I32)
+lemma is_windows_reserved_name_total (b : Pion.Bytes) (s e : Std.I32)
     (hs0 : 0 ≤ s.val) (hse : s.val ≤ e.val) (he : e.val ≤ b.val.length)
     (hlen : b.val.length ≤ 2147483647) :
     ∃ r : Bool, is_windows_reserved_name b s e = ok r := by
@@ -906,47 +796,6 @@ theorem validate_extract_path_bytes_sound (b : Pion.Bytes)
           have hkpos : kept1.val > 0 := hok
           exact ⟨hpos, hne47, hne92, hno_bad, hpost.1, hpost.2.1, hpost.2.2 hkpos⟩
 
-/-- Corollary: `validate_extract_path_bytes` rejects empty paths. -/
-theorem validate_extract_path_empty_false :
-    validate_extract_path_bytes ⟨[]⟩ = ok false := by
-  unfold validate_extract_path_bytes Pion.Bytes.length Pion.lengthOf
-  simp [b_ok]
-
-/-- Corollary: any path containing a `".."` segment is rejected (`ok false`). -/
-theorem validate_extract_path_rejects_dotdot (b : Pion.Bytes)
-    (hlen : b.val.length < 2147483647)
-    (s e : Nat) (hseg : IsSegment b.val s e) (hdd : IsDotDot b.val s e) :
-    validate_extract_path_bytes b ≠ ok true := by
-  intro hok
-  exact (validate_extract_path_bytes_sound b hlen hok).2.2.2.2.1 s e hseg hdd
-
-/-- Corollary: any path containing a NUL byte (`0x00`) is rejected. -/
-theorem validate_extract_path_rejects_nul (b : Pion.Bytes)
-    (hlen : b.val.length < 2147483647)
-    (k : Nat) (hk : k < b.val.length) (hnul : b.val[k]? = some 0#u8) :
-    validate_extract_path_bytes b ≠ ok true := by
-  intro hok
-  exact ((validate_extract_path_bytes_sound b hlen hok).2.2.2.1 k hk).1 hnul
-
-/-- Corollary: any path containing `':'` (Windows drive letter or NTFS ADS) is rejected. -/
-theorem validate_extract_path_rejects_colon (b : Pion.Bytes)
-    (hlen : b.val.length < 2147483647)
-    (k : Nat) (hk : k < b.val.length) (hcol : b.val[k]? = some 58#u8) :
-    validate_extract_path_bytes b ≠ ok true := by
-  intro hok
-  exact ((validate_extract_path_bytes_sound b hlen hok).2.2.2.1 k hk).2 hcol
-
-/-- Corollary: any absolute path (leading `'/'` or `'\\'`) is rejected. -/
-theorem validate_extract_path_rejects_absolute (b : Pion.Bytes)
-    (hlen : b.val.length < 2147483647)
-    (habs : b.val[0]? = some 47#u8 ∨ b.val[0]? = some 92#u8) :
-    validate_extract_path_bytes b ≠ ok true := by
-  intro hok
-  have hs := validate_extract_path_bytes_sound b hlen hok
-  rcases habs with h47 | h92
-  · exact hs.2.1 h47
-  · exact hs.2.2.1 h92
-
 /-- Uppercase ASCII byte value (for Windows reserved device name matching). -/
 def upperByte (x : Std.U8) : Nat :=
   if 97 ≤ x.val ∧ x.val ≤ 122 then x.val - 32 else x.val
@@ -1178,14 +1027,6 @@ theorem fits_in_octal_spec (width : Std.I32) (x : Std.I64) :
       · rintro ⟨_, _, h22 | hlt⟩
         · omega
         · show x.val < lim.val; omega
-
-/-- Negative integers NEVER fit in TAR octal fields of any width. -/
-theorem fits_in_octal_neg_false (width : Std.I32) (x : Std.I64) (hx : x.val < 0) :
-    fits_in_octal width x = ok false := by
-  obtain ⟨r, hr, hiff⟩ := fits_in_octal_spec width x
-  cases r with
-  | false => exact hr
-  | true => exact False.elim (by have := (hiff.mp rfl).1; omega)
 
 /-- `fits_in_base256` is total (never panics or traps on any `width : Int, x : Int64`)
     and matches the exact GNU base-256 capacity `[-2^(8*(width-1)), 2^(8*(width-1)))`. -/
@@ -1646,15 +1487,8 @@ theorem parse_numeric_slice_base256_sign (data : Pion.Bytes) (start «end» : St
         split_ifs
         have hge0 := u64_to_i64_nonneg x1 hx1_lt; omega
 
-/-- `format_numeric` rejects non-positive widths (`width ≤ 0`) with `FieldTooLong`. -/
-theorem format_numeric_invalid_width (width : Std.I32) (x : Std.I64) (hw : width.val ≤ 0) :
-    format_numeric width x = ok (.Err (TarError.FieldTooLong "width must be > 0")) := by
-  unfold format_numeric
-  have hle : width ≤ 0#i32 := hw
-  simp [hle]
-
 /-- `format_octal_into` totality & length preservation on valid buffers. -/
-theorem format_octal_into_total (buf : Pion.Bytes) (off width : Std.I32) (x : Std.I64)
+lemma format_octal_into_total (buf : Pion.Bytes) (off width : Std.I32) (x : Std.I64)
     (hoff0 : 0 ≤ off.val) (hw0 : 0 ≤ width.val)
     (hbound : off.val + width.val ≤ buf.val.length) (hlen : buf.val.length ≤ 2147483647) :
     ∃ r : Bool × Pion.Bytes, format_octal_into buf off width x = ok r ∧

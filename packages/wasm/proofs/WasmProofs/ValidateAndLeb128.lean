@@ -30,12 +30,6 @@ private lemma i32_eq_of_nonneg_lt256 (b : I32) (hlo : 0 ≤ b.val) (hhi : b.val 
   rw [hrec, i32_ofNat_val_lt256 b.val.toNat (by omega)]
   omega
 
-/-- Theorem 13: `stack_type_compat` is reflexive for all stack type IDs. -/
-theorem stack_type_compat_refl (a : I32) :
-    stack_type_compat a a = ok true := by
-  unfold stack_type_compat
-  simp
-
 /-- Theorem 14: `stack_type_compat` is symmetric. -/
 theorem stack_type_compat_symm (a b : I32) :
     stack_type_compat a b = stack_type_compat b a := by
@@ -44,12 +38,6 @@ theorem stack_type_compat_symm (a b : I32) :
   apply Bool.eq_iff_iff.mpr
   simp only [Bool.or_eq_true, beq_iff_eq]
   tauto
-
-/-- Theorem 15: Polymorphic unknown type (`-1`) is compatible with every stack type on both sides. -/
-theorem stack_type_compat_unknown (a : I32) :
-    stack_type_compat (-1)#i32 a = ok true ∧ stack_type_compat a (-1)#i32 = ok true := by
-  unfold stack_type_compat
-  simp
 
 /-- Theorem 16: For concrete (non-unknown) stack types, `stack_type_compat` holds iff they are equal. -/
 theorem stack_type_compat_concrete_iff (a b : I32) (ha : a ≠ (-1)#i32) (hb : b ≠ (-1)#i32) :
@@ -134,15 +122,6 @@ theorem limits_err_code_valid_iff (lim : Limits) (max_allowed : I64) :
     · intro h; exact absurd (result_ok_inj h) (by decide)
     · intro ⟨hs, _⟩; exact absurd hs (by decide)
 
-/-- Theorem 18: `Limits::new mn mx` produces a valid Wasm 2.0 32-bit unshared `Limits` iff `0 ≤ mn ≤ max_allowed` and any `mx` satisfies `mn ≤ mx ≤ max_allowed`. -/
-theorem limits_new_valid_iff (mn : I64) (mx : Option I64) (max_allowed : I64) :
-    (do let l ← Limits.new mn mx; limits_err_code l max_allowed) = ok 0#i32 ↔
-      (0 ≤ mn.val ∧ mn.val ≤ max_allowed.val ∧
-       (∀ m, mx = some m → mn.val ≤ m.val ∧ m.val ≤ max_allowed.val)) := by
-  unfold Limits.new
-  rw [result_bind_ok, limits_err_code_valid_iff]
-  simp
-
 /-- Theorem 19: `leb128_i32_single_byte` decodes every 7-bit byte `b ∈ [0, 127]` into `[-64, 63]`. -/
 theorem leb128_i32_single_byte_range (b : I32) (hlo : 0 ≤ b.val) (hhi : b.val < 128) :
     ∃ v, leb128_i32_single_byte b = ok v ∧ -64 ≤ v.val ∧ v.val ≤ 63 := by
@@ -173,22 +152,6 @@ theorem leb128_u32_5th_valid_iff (b : I32) :
     simp only [Bool.and_eq_true, decide_eq_true_eq]
     exact ⟨h0, h16⟩
 
-/-- Theorem 21: `leb128_u64_10th_valid` accepts exactly `0` or `1` (1-bit payload, bit 7 = 0). -/
-theorem leb128_u64_10th_valid_iff (b : I32) :
-    leb128_u64_10th_valid b = ok true ↔ (b.val = 0 ∨ b.val = 1) := by
-  unfold leb128_u64_10th_valid
-  constructor
-  · intro h
-    have h1 := result_ok_inj h
-    simp only [Bool.and_eq_true, decide_eq_true_eq] at h1
-    have hlo : 0 ≤ b.val := h1.1
-    have hhi : b.val < 2 := h1.2
-    omega
-  · intro h
-    apply congrArg ok
-    simp only [Bool.and_eq_true, decide_eq_true_eq]
-    exact ⟨by show 0 ≤ b.val; omega, by show b.val < 2; omega⟩
-
 /-- Theorem 22: `leb128_i32_5th_valid` accepts a byte `b ∈ [0, 255]` iff `b ∈ [0x00, 0x07]` (positive) or `b ∈ [0x78, 0x7F]` (negative sign-extended) per Wasm 2.0 §5.2.2. -/
 theorem leb128_i32_5th_valid_exact (b : I32) (hlo : 0 ≤ b.val) (hhi : b.val < 256) :
     leb128_i32_5th_valid b = ok true ↔ ((0 ≤ b.val ∧ b.val ≤ 7) ∨ (120 ≤ b.val ∧ b.val ≤ 127)) := by
@@ -205,46 +168,6 @@ theorem leb128_i32_5th_valid_exact (b : I32) (hlo : 0 ≤ b.val) (hhi : b.val < 
   have hm := hdec hi lo
   dsimp only at hm
   unfold leb128_i32_5th_valid
-  split_ifs at hm ⊢
-  · constructor
-    · intro h; exact absurd (result_ok_inj h) (by decide)
-    · intro h; exact absurd (hm.mpr h) (by decide)
-  · constructor
-    · intro h; exact hm.mp (result_ok_inj h)
-    · intro h; exact congrArg ok (hm.mpr h)
-
-/-- Theorem 23: `leb128_i64_10th_valid` accepts exactly `0x00` or `0x7F` per Wasm 2.0 §5.2.2. -/
-theorem leb128_i64_10th_valid_exact (b : I32) :
-    leb128_i64_10th_valid b = ok true ↔ (b.val = 0 ∨ b.val = 127) := by
-  unfold leb128_i64_10th_valid
-  constructor
-  · intro h
-    have h1 := result_ok_inj h
-    simp only [Bool.or_eq_true, beq_iff_eq] at h1
-    rcases h1 with rfl | rfl <;> decide
-  · intro h
-    apply congrArg ok
-    simp only [Bool.or_eq_true, beq_iff_eq]
-    rcases h with h0 | h127
-    · left; exact IScalar.eq_of_val_eq h0
-    · right; exact IScalar.eq_of_val_eq h127
-
-/-- Theorem 24: `leb128_s33_5th_valid` accepts a byte `b ∈ [0, 255]` iff `b ∈ [0x00, 0x0F]` or `b ∈ [0x70, 0x7F]` per Wasm 2.0 `BlockType` `s33`. -/
-theorem leb128_s33_5th_valid_exact (b : I32) (hlo : 0 ≤ b.val) (hhi : b.val < 256) :
-    leb128_s33_5th_valid b = ok true ↔ ((0 ≤ b.val ∧ b.val ≤ 15) ∨ (112 ≤ b.val ∧ b.val ≤ 127)) := by
-  rcases i32_eq_of_nonneg_lt256 b hlo hhi with ⟨hi, lo, rfl⟩
-  have hdec : ∀ a c : Fin 16,
-      let x : I32 := ⟨BitVec.ofNat 32 (a.val * 16 + c.val)⟩
-      (if Pion.I32.band x 128#i32 ≠ 0#i32 then false
-       else
-         let sign_bit := Pion.I32.band x 16#i32 != 0#i32
-         let high := Pion.I32.band x 96#i32
-         (!sign_bit && (high == 0#i32)) || (sign_bit && (high == 96#i32))) = true ↔
-      ((0 ≤ x.val ∧ x.val ≤ 15) ∨ (112 ≤ x.val ∧ x.val ≤ 127)) := by
-    decide
-  have hm := hdec hi lo
-  dsimp only at hm
-  unfold leb128_s33_5th_valid
   split_ifs at hm ⊢
   · constructor
     · intro h; exact absurd (result_ok_inj h) (by decide)

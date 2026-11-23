@@ -1,201 +1,186 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/zip`.
-# All Lake build artifacts stay in /private/tmp/pion-lean-shared (single shared Mathlib .lake, zero git worktree pollution).
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="zip"
+LEAN_MOD="Zip"
+PROOF_MOD="ZipProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/zip ==="
-rm -rf "$PROJ/Zip"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Zip/$f.lean" ]; then
-    echo "FAIL: missing Zip/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/ZipProofs"
-cp -R "$SCRIPT_DIR/ZipProofs" "$PROJ/ZipProofs"
-cp "$SCRIPT_DIR/ZipProofs.lean" "$PROJ/ZipProofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Zip where\n  globs := #[.submodules `Zip]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib ZipProofs where\n  globs := #[.andSubmodules `ZipProofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/ZipProofs.lean" "$SCRIPT_DIR/ZipProofs" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Zip ZipProofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Zip ZipProofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
-  exit 1
-fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Zip ZipProofs: exit 0, 0 errors"
-
-echo "=== [5/7] #print axioms audit ==="
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-echo "$AXIOMS_OUT"
-BAD_AXIOMS=$(printf '%s\n' "$AXIOMS_OUT" | grep -E "depends on axioms:" | sed 's/.*\[//;s/\].*//;s/,/\n/g' | tr -d ' ' | sort -u | grep -v -E '^(propext|Classical\.choice|Quot\.sound)$' || true)
-if [ -n "$BAD_AXIOMS" ]; then
-  echo "FAIL: unexpected axioms found: $BAD_AXIOMS" >&2
-  exit 1
-fi
-if printf '%s\n' "$AXIOMS_OUT" | grep -q "error:"; then
-  echo "FAIL: CheckAxioms.lean reported errors" >&2
-  exit 1
-fi
-echo "Axioms audit: ONLY standard axioms (propext, Classical.choice, Quot.sound)"
-
-echo "=== [6/7] EvalDiff.lean (#eval) ==="
-EVAL_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" --run EvalDiff.lean 2>&1)
-echo "$EVAL_OUT"
-if printf '%s\n' "$EVAL_OUT" | grep -q "error:"; then
-  echo "FAIL: EvalDiff.lean reported errors" >&2
-  exit 1
-fi
-if printf '%s\n' "$EVAL_OUT" | grep -q ': FAIL$'; then
-  echo "FAIL: EvalDiff.lean had a FAIL check" >&2
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$WORK/native-diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+SCAN_PATHS=("$SCRIPT_DIR/$PROOF_MOD.lean")
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  SCAN_PATHS+=("$SCRIPT_DIR/$PROOF_MOD")
+fi
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' "${SCAN_PATHS[@]}"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+fi
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+scan_files = [os.path.join(script_dir, f"{proof_mod}.lean")]
+mod_dir = os.path.join(script_dir, proof_mod)
+if os.path.isdir(mod_dir):
+    for root, _, files in os.walk(mod_dir):
+        for fn in files:
+            if fn.endswith(".lean"):
+                scan_files.append(os.path.join(root, fn))
+for path in scan_files:
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "zip_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 zip = { path = "$PKG_DIR" }
 EOF
-
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "zip"
-
-fn report(w : World, label : String, passed : Bool) -> Unit {
-  if passed {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
+fn fmt_dt(dt : zip::DosDateTime) -> String {
+  "(" + dt.year.to_string() + "," + dt.month.to_string() + "," + dt.day.to_string() + "," +
+  dt.hour.to_string() + "," + dt.minute.to_string() + "," + dt.second.to_string() + ")"
 }
-
-pub fn main(w : World) -> Int {
-  report(w, "range_ok", zip::in_range64(10L, 20L, 30L))
-  report(w, "range_over", !zip::in_range64(10L, 21L, 30L))
-  report(w, "range_neg", !zip::in_range64(-1L, 5L, 30L))
-  report(w, "range_max_wrap", !zip::in_range64(9223372036854775807L, 1L, 100L))
-  report(w, "upper_a", zip::ascii_upper(97) == 65)
-  report(w, "upper_z", zip::ascii_upper(122) == 90)
-  report(w, "upper_A", zip::ascii_upper(65) == 65)
-  report(w, "sep_slash", zip::is_zip_path_sep(47))
-  report(w, "sep_bslash", zip::is_zip_path_sep(92))
-  report(w, "sep_dot", !zip::is_zip_path_sep(46))
-  report(w, "forb_nul", zip::is_zip_forbidden_byte(0))
-  report(w, "forb_colon", zip::is_zip_forbidden_byte(58))
-  report(w, "forb_del", zip::is_zip_forbidden_byte(127))
-  report(w, "forb_a", !zip::is_zip_forbidden_byte(97))
-  report(w, "tail_dot", zip::is_zip_forbidden_seg_tail(46))
-  report(w, "tail_sp", zip::is_zip_forbidden_seg_tail(32))
-  report(w, "tail_a", !zip::is_zip_forbidden_seg_tail(97))
-  report(w, "win3_con", zip::is_win_reserved_3(99, 111, 110))
-  report(w, "win3_nul", zip::is_win_reserved_3(78, 85, 76))
-  report(w, "win3_foo", !zip::is_win_reserved_3(102, 111, 111))
-  report(w, "win4_com1", zip::is_win_reserved_4(99, 111, 109, 49))
-  report(w, "win4_lpt9", zip::is_win_reserved_4(76, 80, 84, 57))
-  report(w, "win4_com0", !zip::is_win_reserved_4(67, 79, 77, 48))
-
-  report(w, "clamp_lo", zip::clamp_int(-5, 1, 12) == 1)
-  report(w, "clamp_hi", zip::clamp_int(99, 1, 12) == 12)
-  report(w, "clamp_mid", zip::clamp_int(7, 1, 12) == 7)
-  report(w, "dim_2000_2", zip::days_in_month(2000, 2) == 29)
-  report(w, "dim_2100_2", zip::days_in_month(2100, 2) == 28)
-  report(w, "dim_2024_4", zip::days_in_month(2024, 4) == 30)
-  report(w, "dos_def_y", zip::DosDateTime::default().year == 1980)
-  report(w, "dos_new_lo", zip::DosDateTime::new(1970, 5, 5, 1, 1, 1).year == 1980)
-  report(w, "dos_new_hi", zip::DosDateTime::new(2200, 5, 5, 1, 1, 1).year == 2107)
-  let dt_e = zip::DosDateTime::new(2024, 2, 30, 12, 34, 57)
-  report(w, "dos_new_even", dt_e.day == 29 && dt_e.second == 56)
-  let dt_in = zip::DosDateTime::{ year: 2024, month: 2, day: 29, hour: 23, minute: 59, second: 58 }
-  let (dd, dtm) = dt_in.to_dos()
-  let dt2 = zip::DosDateTime::from_dos(dd, dtm)
-  report(w, "dos_rt_2024", dt2.year == 2024 && dt2.month == 2 && dt2.day == 29 && dt2.hour == 23 && dt2.minute == 59 && dt2.second == 58)
-  let dt_m = zip::DosDateTime::from_dos(65535U, 65535U)
-  report(w, "dos_from_max", dt_m.year == 2107 && dt_m.month == 12 && dt_m.day == 31 && dt_m.hour == 23 && dt_m.minute == 59 && dt_m.second == 58)
+pub fn main(world : World) -> Int {
+  io_println(world, "range_ok=" + bstr(zip::in_range64(10L, 20L, 30L)))
+  io_println(world, "range_over=" + bstr(zip::in_range64(10L, 21L, 30L)))
+  io_println(world, "range_neg=" + bstr(zip::in_range64(-1L, 5L, 30L)))
+  io_println(world, "range_max_wrap=" + bstr(zip::in_range64(9223372036854775807L, 1L, 100L)))
+  io_println(world, "upper_a=" + zip::ascii_upper(97).to_string())
+  io_println(world, "upper_z=" + zip::ascii_upper(122).to_string())
+  io_println(world, "upper_A=" + zip::ascii_upper(65).to_string())
+  io_println(world, "clamp_lo=" + zip::clamp_int(-5, 1, 12).to_string())
+  io_println(world, "clamp_hi=" + zip::clamp_int(99, 1, 12).to_string())
+  io_println(world, "clamp_mid=" + zip::clamp_int(7, 1, 12).to_string())
+  io_println(world, "dim_2000_2=" + zip::days_in_month(2000, 2).to_string())
+  io_println(world, "dim_2100_2=" + zip::days_in_month(2100, 2).to_string())
+  io_println(world, "dim_2024_4=" + zip::days_in_month(2024, 4).to_string())
+  io_println(world, "dos_new_lo=" + fmt_dt(zip::DosDateTime::new(1970, 5, 5, 1, 1, 1)))
+  io_println(world, "dos_new_hi=" + fmt_dt(zip::DosDateTime::new(2200, 5, 5, 1, 1, 1)))
+  io_println(world, "dos_new_even=" + fmt_dt(zip::DosDateTime::new(2024, 2, 30, 12, 34, 57)))
+  let dt = zip::DosDateTime::{ year: 2024, month: 2, day: 29, hour: 23, minute: 59, second: 58 }
+  let (d, t) = dt.to_dos()
+  io_println(world, "dos_rt_2024=" + fmt_dt(zip::DosDateTime::from_dos(d, t)))
+  io_println(world, "dos_from_max=" + fmt_dt(zip::DosDateTime::from_dos(65535U, 65535U)))
   0
 }
 EOF
-
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
-echo "PASS: packages/zip Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

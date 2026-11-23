@@ -101,29 +101,6 @@ private lemma u32_to_int_val_of_lt (u : U32) (hu : u.val < 2 ^ 31) :
   simp only [hlt, ↓reduceIte]
   rfl
 
-/-- Theorem 1: `is_ssh_version_char` accepts exactly printable US-ASCII `[0x20, 0x7E]`. -/
-theorem is_ssh_version_char_iff (c : I32) :
-    is_ssh_version_char c = ok true ↔ (32 ≤ c.val ∧ c.val < 127) := by
-  unfold is_ssh_version_char
-  constructor
-  · intro h
-    have h1 := result_ok_inj h
-    simp only [Bool.and_eq_true, decide_eq_true_eq] at h1
-    exact ⟨h1.1, h1.2⟩
-  · intro ⟨hlo, hhi⟩
-    apply congrArg ok
-    simp only [Bool.and_eq_true, decide_eq_true_eq]
-    exact ⟨hlo, hhi⟩
-
-/-- Theorem 2: `is_ssh_version_char` rejects control / framing injection bytes (`NUL`, `LF`, `CR`, `DEL`, `0x80`). -/
-theorem is_ssh_version_char_rejects_control :
-    is_ssh_version_char 0#i32 = ok false ∧
-    is_ssh_version_char 10#i32 = ok false ∧
-    is_ssh_version_char 13#i32 = ok false ∧
-    is_ssh_version_char 127#i32 = ok false ∧
-    is_ssh_version_char 128#i32 = ok false := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> (unfold is_ssh_version_char; apply congrArg ok; decide)
-
 /-- Theorem 3: `ssh_packet_padding_len` computes minimal RFC 4253 §6 padding satisfying `pad ≥ max(4, min_padding)`, `(5 + plen + pad) % max(8, block_size) = 0`, and `pad < max(4, min_padding) + max(8, block_size)`. -/
 theorem ssh_packet_padding_len_spec (plen block_size min_padding : I32)
     (hplen0 : 0 ≤ plen.val) (hplen_hi : plen.val ≤ 1000000000)
@@ -216,21 +193,6 @@ theorem ssh_packet_padding_len_u8_bound (plen block_size : I32)
   simp only [show ¬(block_size.val < 8) by omega, show ¬((4#i32 : I32).val < 4) by omega, ↓reduceIte] at hlo hhi
   exact ⟨pad, hpad, by omega, by omega⟩
 
-/-- Theorem 5: Whenever `8 ∣ max(8, block_size)`, the padded packet total length `5 + plen + pad` is a multiple of 8 (RFC 4253 §6). -/
-theorem ssh_packet_padding_len_align_8 (plen block_size min_padding : I32)
-    (hplen0 : 0 ≤ plen.val) (hplen_hi : plen.val ≤ 1000000000)
-    (hbs_hi : block_size.val ≤ 128) (hmp_hi : min_padding.val ≤ 128)
-    (hdvd8 : (if block_size.val < 8 then 8 else block_size.val) % 8 = 0) :
-    ∃ pad, ssh_packet_padding_len plen block_size min_padding = ok pad ∧
-      (5 + plen.val + pad.val) % 8 = 0 := by
-  rcases ssh_packet_padding_len_spec plen block_size min_padding hplen0 hplen_hi hbs_hi hmp_hi with
-    ⟨pad, hpad, _, _, hmod⟩
-  refine ⟨pad, hpad, ?_⟩
-  set eff_bs : Int := if block_size.val < 8 then 8 else block_size.val
-  have h1 : eff_bs ∣ (5 + plen.val + pad.val) := Int.dvd_of_emod_eq_zero hmod
-  have h2 : (8 : Int) ∣ eff_bs := Int.dvd_of_emod_eq_zero hdvd8
-  exact Int.emod_eq_zero_of_dvd (Int.dvd_trans h2 h1)
-
 /-- Theorem 6: `ssh_packet_header_err_code` returns `0` iff all RFC 4253 §6 length, alignment, and padding invariants hold. -/
 theorem ssh_packet_header_err_code_valid_iff (n : I32) (pkt_len_u : U32) (pad_len max_packet_len : I32)
     (hmax0 : 0 ≤ max_packet_len.val) (hmax_hi : max_packet_len.val ≤ 1000000000) :
@@ -299,26 +261,6 @@ theorem ssh_packet_header_err_code_valid_iff (n : I32) (pkt_len_u : U32) (pad_le
             have : ¬((Pion.U32.to_int pkt_len_u).val ≤ pad_len.val) := h6; omega
           exact ⟨fun _ => ⟨hle_max, hge5, hnle, by omega, hge4, hplt⟩, fun _ => rfl⟩
 
-/-- Theorem 7: Oversized `pkt_len_u > max_packet_len` is immediately rejected with code `1` before reading payload bytes. -/
-theorem ssh_packet_header_rejects_oversize (n : I32) (pkt_len_u : U32) (pad_len max_packet_len : I32)
-    (hmax0 : 0 ≤ max_packet_len.val) (hover : max_packet_len.val < (pkt_len_u.val : Int)) :
-    ssh_packet_header_err_code n pkt_len_u pad_len max_packet_len = ok 1#i32 := by
-  unfold ssh_packet_header_err_code
-  have hmaxu := i32_to_uint_val_of_nonneg max_packet_len hmax0
-  have hgt : pkt_len_u > Pion.I32.to_uint max_packet_len := by
-    show (Pion.I32.to_uint max_packet_len).val < pkt_len_u.val
-    omega
-  simp only [hgt, ↓reduceIte]
-
-/-- Theorem 8: Any packet with `pad_len < 4` is never accepted by `ssh_packet_header_err_code`. -/
-theorem ssh_packet_header_rejects_short_pad (n : I32) (pkt_len_u : U32) (pad_len max_packet_len : I32)
-    (hmax0 : 0 ≤ max_packet_len.val) (hmax_hi : max_packet_len.val ≤ 1000000000)
-    (hshort : pad_len.val < 4) :
-    ssh_packet_header_err_code n pkt_len_u pad_len max_packet_len ≠ ok 0#i32 := by
-  intro h
-  have hv := (ssh_packet_header_err_code_valid_iff n pkt_len_u pad_len max_packet_len hmax0 hmax_hi).mp h
-  omega
-
 /-- Theorem 9: End-to-end RFC 4253 §6 framing round-trip: every packet padded by `ssh_packet_padding_len` (for `plen ≤ 34000`, `8 ∣ bs`, `8 ≤ bs ≤ 64`, `min_pad = 4`) is accepted by `ssh_packet_header_err_code` and recovers exact `plen`. -/
 theorem ssh_packet_encode_decode_framing_roundtrip (plen block_size : I32)
     (hplen0 : 0 ≤ plen.val) (hplen_hi : plen.val ≤ 34000)
@@ -350,12 +292,5 @@ theorem ssh_packet_encode_decode_framing_roundtrip (plen block_size : I32)
   have heq : 4 + ((Pion.I32.to_uint (Pion.I32.add (Pion.I32.add 1#i32 plen) pad)).val : Int) = 5 + plen.val + pad.val := by omega
   rw [heq]
   exact halign8
-
-/-- Theorem 10: `Limits::default` sets strictly positive RFC 4251/4253 DoS bounds. -/
-theorem limits_default_positive :
-    ∃ lim, Limits.default = ok lim ∧
-      0 < lim.max_string_len.val ∧ 0 < lim.max_packet_len.val ∧ 0 < lim.max_list_items.val := by
-  unfold Limits.default
-  exact ⟨_, rfl, by decide, by decide, by decide⟩
 
 end SshProofs

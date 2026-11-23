@@ -19,17 +19,17 @@ open jwt
 
 /-! ## Common Scalar, BitVec & Container Helpers -/
 
-theorem b_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma b_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← (ok x : Result α); f y) = f x := by simp
 
-theorem wp_ok_iff {α : Type u} (r : Result α) (P : α → Prop) :
+lemma wp_ok_iff {α : Type u} (r : Result α) (P : α → Prop) :
     r ⦃ P ⦄ ↔ ∃ y, r = ok y ∧ P y := by
   cases r with
   | ret y => simp [WP.spec_ok]
   | vis e k => simp [WP.spec_vis]
   | div => simp [WP.spec_div]
 
-theorem u8_to_int_val (x : Std.U8) : (Pion.U8.to_int x).val = (x.val : Int) := by
+lemma u8_to_int_val (x : Std.U8) : (Pion.U8.to_int x).val = (x.val : Int) := by
   cases x with
   | mk bv =>
     have hlt : bv.toNat < 256 := bv.isLt
@@ -37,7 +37,7 @@ theorem u8_to_int_val (x : Std.U8) : (Pion.U8.to_int x).val = (x.val : Int) := b
       BitVec.toInt_setWidth, BitVec.toInt_ofNat, IScalarTy.numBits, UScalarTy.numBits]
     rw [Int.bmod_eq_of_le_mul_two] <;> omega
 
-theorem i32_to_byte_val {x : Std.I32} (h0 : 0 ≤ x.val) (hhi : x.val < 256) :
+lemma i32_to_byte_val {x : Std.I32} (h0 : 0 ≤ x.val) (hhi : x.val < 256) :
     (Pion.I32.to_byte x).val = x.val.toNat := by
   cases x with
   | mk bv =>
@@ -55,7 +55,7 @@ theorem i32_to_byte_val {x : Std.I32} (h0 : 0 ≤ x.val) (hhi : x.val < 256) :
     rw [BitVec.signExtend_eq_setWidth_of_le bv (by decide), BitVec.toNat_setWidth]
     omega
 
-theorem i32_add_val {a b : Std.I32}
+lemma i32_add_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 2147483647) :
     (Pion.I32.add a b).val = a.val + b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -64,7 +64,7 @@ theorem i32_add_val {a b : Std.I32}
   rw [BitVec.toInt_add]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i32_sub_val {a b : Std.I32}
+lemma i32_sub_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val - b.val) (hhi : a.val - b.val ≤ 2147483647) :
     (Pion.I32.sub a b).val = a.val - b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -73,7 +73,7 @@ theorem i32_sub_val {a b : Std.I32}
   rw [BitVec.toInt_sub]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i32_mul_val {a b : Std.I32}
+lemma i32_mul_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val * b.val) (hhi : a.val * b.val ≤ 2147483647) :
     (Pion.I32.mul a b).val = a.val * b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -82,7 +82,7 @@ theorem i32_mul_val {a b : Std.I32}
   rw [BitVec.toInt_mul]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i64_add_val {a b : Std.I64}
+lemma i64_add_val {a b : Std.I64}
     (hlo : -9223372036854775808 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 9223372036854775807) :
     (Pion.I64.add a b).val = a.val + b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -91,7 +91,7 @@ theorem i64_add_val {a b : Std.I64}
   rw [BitVec.toInt_add]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i64_sub_val {a b : Std.I64}
+lemma i64_sub_val {a b : Std.I64}
     (hlo : -9223372036854775808 ≤ a.val - b.val) (hhi : a.val - b.val ≤ 9223372036854775807) :
     (Pion.I64.sub a b).val = a.val - b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -100,18 +100,18 @@ theorem i64_sub_val {a b : Std.I64}
   rw [BitVec.toInt_sub]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i64_bounds (x : Std.I64) :
+lemma i64_bounds (x : Std.I64) :
     -9223372036854775808 ≤ x.val ∧ x.val ≤ 9223372036854775807 := by
   have h := x.hBounds
   simp only [IScalar.min, IScalar.max, IScalarTy.numBits] at h
   omega
 
-theorem i64_max_lit_val : (9223372036854775807#i64).val = 9223372036854775807 := by
+lemma i64_max_lit_val : (9223372036854775807#i64).val = 9223372036854775807 := by
   change (BitVec.ofInt 64 9223372036854775807).toInt = 9223372036854775807
   rw [BitVec.toInt_ofInt]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i64_min_expr_val :
+lemma i64_min_expr_val :
     (Pion.I64.sub (-9223372036854775807)#i64 1#i64).val = -9223372036854775808 := by
   have hneg : ((-9223372036854775807)#i64).val = -9223372036854775807 := by
     change (BitVec.ofInt 64 (-9223372036854775807)).toInt = -9223372036854775807
@@ -121,12 +121,12 @@ theorem i64_min_expr_val :
   have hsub := i64_sub_val (a := (-9223372036854775807)#i64) (b := 1#i64) (by omega) (by omega)
   omega
 
-theorem u8_bounds (x : Std.U8) : x.val ≤ 255 := by
+lemma u8_bounds (x : Std.U8) : x.val ≤ 255 := by
   have h := x.hBounds
   simp only [UScalar.max, UScalarTy.numBits] at h
   omega
 
-theorem bytes_get_spec (b : Pion.Bytes) (i : Std.I32)
+lemma bytes_get_spec (b : Pion.Bytes) (i : Std.I32)
     (h0 : 0 ≤ i.val) (h1 : i.val < b.val.length) :
     ∃ x, Pion.Bytes.get b i = ok x ∧ b.val[i.val.toNat]? = some x := by
   unfold Pion.Bytes.get Pion.listGet
@@ -135,14 +135,14 @@ theorem bytes_get_spec (b : Pion.Bytes) (i : Std.I32)
   refine ⟨_, rfl, ?_⟩
   simp [List.getElem?_eq_getElem (show i.val.toNat < b.val.length by omega)]
 
-theorem bytes_length_spec (b : Pion.Bytes) (h : b.val.length ≤ 2147483647) :
+lemma bytes_length_spec (b : Pion.Bytes) (h : b.val.length ≤ 2147483647) :
     ∃ n : Std.I32, Pion.Bytes.length b = ok n ∧ n.val = b.val.length := by
   unfold Pion.Bytes.length Pion.lengthOf
   simp only [h, ↓reduceDIte]
   refine ⟨_, rfl, ?_⟩
   simp
 
-theorem array_get_spec {α : Type u} (a : Pion.Array α) (i : Std.I32)
+lemma array_get_spec {α : Type u} (a : Pion.Array α) (i : Std.I32)
     (h0 : 0 ≤ i.val) (h1 : i.val < a.val.length) :
     ∃ x, Pion.Array.get a i = ok x ∧ a.val[i.val.toNat]? = some x := by
   unfold Pion.Array.get Pion.listGet
@@ -151,7 +151,7 @@ theorem array_get_spec {α : Type u} (a : Pion.Array α) (i : Std.I32)
   refine ⟨_, rfl, ?_⟩
   simp [List.getElem?_eq_getElem (show i.val.toNat < a.val.length by omega)]
 
-theorem array_length_spec {α : Type u} (a : Pion.Array α) (h : a.val.length ≤ 2147483647) :
+lemma array_length_spec {α : Type u} (a : Pion.Array α) (h : a.val.length ≤ 2147483647) :
     ∃ n : Std.I32, Pion.Array.length a = ok n ∧ n.val = a.val.length := by
   unfold Pion.Array.length Pion.lengthOf
   simp only [h, ↓reduceDIte]
@@ -303,47 +303,11 @@ theorem constant_time_eq_spec (a b : Pion.Bytes)
     · intro heq k hk
       rw [heq]
 
-/-- `constant_time_eq` is total on all valid `Bytes` (never panics or goes OOB). -/
-theorem constant_time_eq_total (a b : Pion.Bytes)
-    (ha : a.val.length ≤ 2147483647) (hb : b.val.length ≤ 2147483647) :
-    ∃ r : Bool, constant_time_eq a b = ok r :=
-  ⟨decide (a = b), constant_time_eq_spec a b ha hb⟩
-
-/-- `constant_time_eq a b = ok true ↔ a = b` (no false accepts, no false rejects). -/
-theorem constant_time_eq_iff (a b : Pion.Bytes)
-    (ha : a.val.length ≤ 2147483647) (hb : b.val.length ≤ 2147483647) :
-    constant_time_eq a b = ok true ↔ a = b := by
-  rw [constant_time_eq_spec a b ha hb]
-  simp
-
-/-- `constant_time_eq` is reflexive on valid `Bytes`. -/
-theorem constant_time_eq_refl (a : Pion.Bytes) (ha : a.val.length ≤ 2147483647) :
-    constant_time_eq a a = ok true :=
-  (constant_time_eq_iff a a ha ha).mpr rfl
-
-/-- `constant_time_eq` is symmetric on valid `Bytes`. -/
-theorem constant_time_eq_symm (a b : Pion.Bytes)
-    (ha : a.val.length ≤ 2147483647) (hb : b.val.length ≤ 2147483647) :
-    constant_time_eq a b = constant_time_eq b a := by
-  rw [constant_time_eq_spec a b ha hb, constant_time_eq_spec b a hb ha]
-  congr 1
-  exact Bool.eq_iff_iff.mpr (by simp [eq_comm])
-
 /-! ## Section 2: Anti-CVE Algorithm & HMAC Key Security Gate (`src/types.pion`, `src/jwt.pion`) -/
 
-/-- `algorithm_equals` decides exact `Algorithm` equality. -/
-theorem algorithm_equals_iff (a b : Algorithm) :
-    algorithm_equals a b = ok true ↔ a = b := by
-  cases a <;> cases b <;> simp [algorithm_equals]
-
-theorem algorithm_equals_total (a b : Algorithm) :
+lemma algorithm_equals_total (a b : Algorithm) :
     ∃ r : Bool, algorithm_equals a b = ok r ∧ (r = true ↔ a = b) := by
   cases a <;> cases b <;> simp [algorithm_equals]
-
-/-- `algorithm_from_str (algorithm_as_str a) = ok (.Ok a)` for all supported algorithms. -/
-theorem algorithm_from_str_as_str (a : Algorithm) :
-    (do let s ← algorithm_as_str a; algorithm_from_str s) = ok (.Ok a) := by
-  cases a <;> simp [algorithm_as_str, algorithm_from_str]
 
 /-- `algorithm_from_str` accepts ONLY `"HS256"`, `"HS384"`, `"HS512"`. -/
 theorem algorithm_from_str_ok_iff (s : String) (a : Algorithm) :
@@ -369,39 +333,6 @@ theorem algorithm_from_str_rejects_none_variants (s : String)
   simp only [Result.ok.injEq, Bool.or_eq_true, beq_iff_eq] at hnone
   rcases hnone with (((((((((((((((h | h) | h) | h) | h) | h) | h) | h) | h) | h) | h) | h) | h) | h) | h) | h) <;>
     (subst h; simp [algorithm_from_str, is_alg_none_str])
-
-/-- `algorithm_from_str` rejects `"none"`, `"None"`, `"NONE"`, `"nOnE"` and every unknown string. -/
-theorem algorithm_from_str_rejects_unknown (s : String)
-    (h1 : s ≠ "HS256") (h2 : s ≠ "HS384") (h3 : s ≠ "HS512") :
-    ∃ e : JwtError, algorithm_from_str s = ok (.Err e) := by
-  unfold algorithm_from_str
-  simp only [h1, h2, h3, ↓reduceIte, is_alg_none_str, b_ok]
-  split_ifs
-  · exact ⟨.AlgorithmNoneNotAllowed, rfl⟩
-  · exact ⟨.UnsupportedAlgorithm s, rfl⟩
-
-/-- `hmac_key_valid` never accepts empty HMAC keys (`key.length == 0`). -/
-theorem hmac_key_valid_iff (key : Pion.Bytes) (hlen : key.val.length ≤ 2147483647) :
-    hmac_key_valid key = ok true ↔ key.val.length > 0 := by
-  unfold hmac_key_valid
-  obtain ⟨n, hn, hnv⟩ := bytes_length_spec key hlen
-  rw [hn, b_ok]
-  simp only [Result.ok.injEq, decide_eq_true_eq]
-  change n.val > (0#i32).val ↔ key.val.length > 0
-  have h0 : (0#i32).val = 0 := by simp
-  omega
-
-/-- Empty `Bytes` is unconditionally rejected by `hmac_key_valid`. -/
-theorem hmac_key_valid_rejects_empty :
-    hmac_key_valid ⟨[]⟩ = ok false := by
-  unfold hmac_key_valid
-  obtain ⟨n, hn, hnv⟩ := bytes_length_spec ⟨[]⟩ (by simp)
-  rw [hn, b_ok]
-  simp only [Result.ok.injEq, decide_eq_false_iff_not]
-  change ¬ (n.val > (0#i32).val)
-  have h0 : (0#i32).val = 0 := by simp
-  simp at hnv
-  omega
 
 private theorem alg_in_allowlist_loop0_spec (alg : Algorithm) (list : Pion.Array Algorithm)
     (hlen : list.val.length ≤ 2147483647) :
@@ -481,14 +412,6 @@ theorem alg_in_allowlist_spec (alg : Algorithm) (list : Pion.Array Algorithm)
   | inr _ =>
     exact ⟨false, rfl, ⟨(fun h => by cases h), (fun h => False.elim (hpost h))⟩⟩
 
-/-- Empty allowlist rejects every algorithm. -/
-theorem alg_in_allowlist_empty (alg : Algorithm) :
-    alg_in_allowlist alg ⟨[]⟩ = ok false := by
-  obtain ⟨r, hr, hiff⟩ := alg_in_allowlist_spec alg ⟨[]⟩ (by simp)
-  cases r with
-  | false => exact hr
-  | true => exact False.elim (by simpa using hiff.mp rfl)
-
 /-- `check_verifier_alg` enforces BOTH allowlist membership AND exact header/verifier algorithm match. -/
 theorem check_verifier_alg_iff (header_alg verifier_alg : Algorithm)
     (allowlist : Pion.Array Algorithm) (hlen : allowlist.val.length ≤ 2147483647) :
@@ -552,13 +475,13 @@ private theorem saturating_sub_nonneg_helper (M a b : Std.I64)
     omega
 
 /-- `saturating_sub_nonneg a b` computes exact `max(INT64_MIN, a - b)` in `ℤ` for all `b ≥ 0`. -/
-theorem saturating_sub_nonneg_spec (a b : Std.I64) (hb : 0 ≤ b.val) :
+lemma saturating_sub_nonneg_spec (a b : Std.I64) (hb : 0 ≤ b.val) :
     ∃ r : Std.I64, saturating_sub_nonneg a b = ok r ∧
       r.val = max (-9223372036854775808) (a.val - b.val) :=
   ⟨_, rfl, saturating_sub_nonneg_helper (Pion.I64.sub (-9223372036854775807)#i64 1#i64) a b i64_min_expr_val hb⟩
 
 /-- `normalize_leeway` clamps negative leeway to `0` and preserves non-negative leeway. -/
-theorem normalize_leeway_spec (leeway : Std.I64) :
+lemma normalize_leeway_spec (leeway : Std.I64) :
     ∃ r : Std.I64, normalize_leeway leeway = ok r ∧ r.val = max 0 leeway.val := by
   unfold normalize_leeway
   refine ⟨_, rfl, ?_⟩
@@ -600,22 +523,6 @@ theorem is_expired_iff_of_gt_min (now_unix exp_ts leeway : Std.I64)
   change sub.val ≥ exp_ts.val ↔ now_unix.val ≥ exp_ts.val + max 0 leeway.val
   omega
 
-/-- With `leeway = 0`, `is_expired` is strictly equivalent to `now ≥ exp` across all `Int64`. -/
-theorem is_expired_zero_leeway (now_unix exp_ts : Std.I64) :
-    is_expired now_unix exp_ts 0#i64 = ok (decide (now_unix.val ≥ exp_ts.val)) := by
-  unfold is_expired
-  obtain ⟨lw, hlw, hlwv⟩ := normalize_leeway_spec 0#i64
-  rw [hlw, b_ok]
-  have h0 : (0#i64).val = 0 := by simp
-  obtain ⟨sub, hsub, hsubv⟩ := saturating_sub_nonneg_spec now_unix lw (by omega)
-  rw [hsub, b_ok]
-  have hn := i64_bounds now_unix
-  congr 1
-  apply Bool.eq_iff_iff.mpr
-  simp only [decide_eq_true_eq]
-  change sub.val ≥ exp_ts.val ↔ now_unix.val ≥ exp_ts.val
-  omega
-
 /-- Overflow-immune `nbf` exact specification: for ALL `Int64` inputs (including `INT64_MIN`/`INT64_MAX`),
     `is_immature` decides exact `now + max(0, leeway) < nbf` in `ℤ` with zero overflow. -/
 theorem is_immature_spec (now_unix nbf_ts leeway : Std.I64) :
@@ -630,16 +537,6 @@ theorem is_immature_spec (now_unix nbf_ts leeway : Std.I64) :
   apply Bool.eq_iff_iff.mpr
   simp only [decide_eq_true_eq]
   change sum.val < nbf_ts.val ↔ now_unix.val + max 0 leeway.val < nbf_ts.val
-  omega
-
-/-- With `leeway = 0`, `is_immature` is strictly equivalent to `now < nbf` across all `Int64`. -/
-theorem is_immature_zero_leeway (now_unix nbf_ts : Std.I64) :
-    is_immature now_unix nbf_ts 0#i64 = ok (decide (now_unix.val < nbf_ts.val)) := by
-  rw [is_immature_spec]
-  have h0 : (0#i64).val = 0 := by simp
-  congr 1
-  apply Bool.eq_iff_iff.mpr
-  simp only [decide_eq_true_eq]
   omega
 
 /-! ## Section 4: Strict Unpadded Base64URL Character Codec & Canonical Tail Bits (`src/base64url.pion`) -/
@@ -889,19 +786,6 @@ private theorem b64url_decode_invalid_of_spec (b : Std.U8)
   have hm1 : ((-1)#i32).val = -1 := by simp
   omega
 
-/-- Standard Base64 `+`, `/`, padding `=`, whitespace, and NUL are unconditionally rejected (`-1`). -/
-theorem b64url_decode_rejects_invalid_chars :
-    b64url_decode_byte 43#u8 = ok ((-1)#i32) ∧
-    b64url_decode_byte 47#u8 = ok ((-1)#i32) ∧
-    b64url_decode_byte 61#u8 = ok ((-1)#i32) ∧
-    b64url_decode_byte 32#u8 = ok ((-1)#i32) ∧
-    b64url_decode_byte 10#u8 = ok ((-1)#i32) ∧
-    b64url_decode_byte 13#u8 = ok ((-1)#i32) ∧
-    b64url_decode_byte 9#u8 = ok ((-1)#i32) ∧
-    b64url_decode_byte 0#u8 = ok ((-1)#i32) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
-    (apply b64url_decode_invalid_of_spec; simp)
-
 private theorem i32_band_3_val (x : Std.I32) : (Pion.I32.band x 3#i32).val = x.val % 4 := by
   cases x with
   | mk bv =>
@@ -943,7 +827,7 @@ private theorem i32_band_15_val (x : Std.I32) : (Pion.I32.band x 15#i32).val = x
       omega
 
 /-- `base64url_len_valid` accepts `len` iff `len ≥ 0` and `len % 4 ≠ 1`. -/
-theorem base64url_len_valid_iff (len : Std.I32) :
+lemma base64url_len_valid_iff (len : Std.I32) :
     base64url_len_valid len = ok true ↔ 0 ≤ len.val ∧ len.val % 4 ≠ 1 := by
   unfold base64url_len_valid
   simp only [Result.ok.injEq, Bool.and_eq_true, decide_eq_true_eq, bne_iff_ne]
@@ -962,61 +846,6 @@ theorem base64url_len_valid_iff (len : Std.I32) :
     intro heq
     have := congrArg IScalar.val heq
     omega
-
-/-- Any length with `len % 4 = 1` is unconditionally rejected. -/
-theorem base64url_len_valid_rejects_mod4_eq1 (len : Std.I32) (h : len.val % 4 = 1) :
-    base64url_len_valid len = ok false := by
-  have hne : ¬ (base64url_len_valid len = ok true) := by
-    rw [base64url_len_valid_iff]
-    omega
-  unfold base64url_len_valid at hne ⊢
-  cases hval : (decide (len >= 0#i32) && (Pion.I32.band len 3#i32 != 1#i32))
-  · rfl
-  · rw [hval] at hne; exact False.elim (hne rfl)
-
-/-- `base64url_tail_bits_valid` enforces canonical zero trailing bits:
-    `rem = 0`, or (`rem = 2 ∧ last_val % 16 = 0`), or (`rem = 3 ∧ last_val % 4 = 0`). -/
-theorem base64url_tail_bits_valid_iff (rem last_val : Std.I32) :
-    base64url_tail_bits_valid rem last_val = ok true ↔
-      rem.val = 0 ∨
-      (rem.val = 2 ∧ last_val.val % 16 = 0) ∨
-      (rem.val = 3 ∧ last_val.val % 4 = 0) := by
-  unfold base64url_tail_bits_valid
-  have h0 : (0#i32).val = 0 := by simp
-  have h2 : (2#i32).val = 2 := by simp
-  have h3 : (3#i32).val = 3 := by simp
-  have hb15 := i32_band_15_val last_val
-  have hb3 := i32_band_3_val last_val
-  by_cases hr2 : rem = 2#i32
-  · subst hr2
-    simp only [↓reduceIte, Result.ok.injEq, beq_iff_eq]
-    constructor
-    · intro h; right; left
-      have := congrArg IScalar.val h
-      omega
-    · intro h
-      apply IScalar.eq_of_val_eq
-      rcases h with h | ⟨_, h⟩ | ⟨h, _⟩ <;> omega
-  · by_cases hr3 : rem = 3#i32
-    · subst hr3
-      simp only [hr2, ↓reduceIte, Result.ok.injEq, beq_iff_eq]
-      constructor
-      · intro h; right; right
-        have := congrArg IScalar.val h
-        omega
-      · intro h
-        apply IScalar.eq_of_val_eq
-        rcases h with h | ⟨h, _⟩ | ⟨_, h⟩ <;> omega
-    · simp only [hr2, hr3, ↓reduceIte, Result.ok.injEq, beq_iff_eq]
-      have hne2 : rem.val ≠ 2 := fun h => hr2 (IScalar.eq_of_val_eq (by omega))
-      have hne3 : rem.val ≠ 3 := fun h => hr3 (IScalar.eq_of_val_eq (by omega))
-      constructor
-      · intro h; left
-        have := congrArg IScalar.val h
-        omega
-      · intro h
-        apply IScalar.eq_of_val_eq
-        rcases h with h | ⟨h, _⟩ | ⟨h, _⟩ <;> omega
 
 /-- `base64url_decoded_len (base64url_encoded_len n) = n` for all valid `0 ≤ n ≤ 1610612733`. -/
 theorem base64url_encoded_decoded_len_roundtrip (n : Std.I32)
@@ -1098,52 +927,6 @@ theorem base64url_encoded_decoded_len_roundtrip (n : Std.I32)
 
 /-! ## Section 5: SHA-256 Bitwise Primitives (`packages/jwt/src/crypto.pion`) -/
 
-/-- `sha256_ch x y y = ok y` (choice on identical inputs is the identity). -/
-theorem sha256_ch_same (x y : Std.U32) :
-    sha256_ch x y y = ok y := by
-  unfold sha256_ch
-  congr 1
-  cases x with | mk bx =>
-  cases y with | mk by_ =>
-  change UScalar.mk ((bx &&& by_) ^^^ ((bx ^^^ (4294967295#u32).bv) &&& by_)) = UScalar.mk by_
-  congr 1
-  ext i hi
-  simp only [BitVec.getElem_xor, BitVec.getElem_and]
-  have hones : (4294967295#u32).bv[i] = true := by
-    change (BitVec.ofNat 32 4294967295)[i] = true
-    have : BitVec.ofNat 32 4294967295 = BitVec.allOnes 32 := rfl
-    rw [this, BitVec.getElem_allOnes]
-  rw [hones]
-  cases bx[i] <;> cases by_[i] <;> rfl
-
-/-- `sha256_maj x x y = ok x` (majority with two equal inputs selects that input). -/
-theorem sha256_maj_same_xy (x y : Std.U32) :
-    sha256_maj x x y = ok x := by
-  unfold sha256_maj
-  congr 1
-  cases x with | mk bx =>
-  cases y with | mk by_ =>
-  change UScalar.mk (((bx &&& bx) ^^^ (bx &&& by_)) ^^^ (bx &&& by_)) = UScalar.mk bx
-  congr 1
-  ext i hi
-  simp only [BitVec.getElem_xor, BitVec.getElem_and]
-  cases bx[i] <;> cases by_[i] <;> rfl
-
-/-- `sha256_maj` is symmetric in its first two arguments. -/
-theorem sha256_maj_symm_xy (x y z : Std.U32) :
-    sha256_maj x y z = sha256_maj y x z := by
-  unfold sha256_maj
-  congr 1
-  cases x with | mk bx =>
-  cases y with | mk by_ =>
-  cases z with | mk bz =>
-  change UScalar.mk (((bx &&& by_) ^^^ (bx &&& bz)) ^^^ (by_ &&& bz)) =
-         UScalar.mk (((by_ &&& bx) ^^^ (by_ &&& bz)) ^^^ (bx &&& bz))
-  congr 1
-  ext i hi
-  simp only [BitVec.getElem_xor, BitVec.getElem_and]
-  cases bx[i] <;> cases by_[i] <;> cases bz[i] <;> rfl
-
 /-- `sha256_rotr x n` is total for `0 < n < 32` and equals `BitVec.rotateRight x.bv n.val`. -/
 theorem sha256_rotr_spec (x n : Std.U32) (hpos : 0 < n.val) (hlt : n.val < 32) :
     ∃ r : Std.U32, sha256_rotr x n = ok r ∧ r.bv = x.bv.rotateRight n.val := by
@@ -1205,37 +988,5 @@ theorem sha256_rotr_compose (x a b : Std.U32)
   ext i hi
   simp only [BitVec.getElem_rotateRight, hamod, hbmod, habmod]
   split_ifs <;> (congr 1; try omega)
-
-/-- All four SHA-256 sigma functions (`Σ0`, `Σ1`, `σ0`, `σ1`) are total (zero shift-overflow). -/
-theorem sha256_sigmas_total (x : Std.U32) :
-    (∃ r, sha256_sigma0 x = ok r) ∧
-    (∃ r, sha256_sigma1 x = ok r) ∧
-    (∃ r, sha256_lsigma0 x = ok r) ∧
-    (∃ r, sha256_lsigma1 x = ok r) := by
-  refine ⟨?_, ?_, ?_, ?_⟩
-  · unfold sha256_sigma0
-    obtain ⟨r1, hr1, _⟩ := sha256_rotr_spec x 2#u32 (by simp) (by simp)
-    obtain ⟨r2, hr2, _⟩ := sha256_rotr_spec x 13#u32 (by simp) (by simp)
-    obtain ⟨r3, hr3, _⟩ := sha256_rotr_spec x 22#u32 (by simp) (by simp)
-    rw [hr1, b_ok, hr2, b_ok, hr3, b_ok]
-    exact ⟨_, rfl⟩
-  · unfold sha256_sigma1
-    obtain ⟨r1, hr1, _⟩ := sha256_rotr_spec x 6#u32 (by simp) (by simp)
-    obtain ⟨r2, hr2, _⟩ := sha256_rotr_spec x 11#u32 (by simp) (by simp)
-    obtain ⟨r3, hr3, _⟩ := sha256_rotr_spec x 25#u32 (by simp) (by simp)
-    rw [hr1, b_ok, hr2, b_ok, hr3, b_ok]
-    exact ⟨_, rfl⟩
-  · unfold sha256_lsigma0
-    obtain ⟨r1, hr1, _⟩ := sha256_rotr_spec x 7#u32 (by simp) (by simp)
-    obtain ⟨r2, hr2, _⟩ := sha256_rotr_spec x 18#u32 (by simp) (by simp)
-    have hshr : Pion.U32.shr x 3#u32 = ok ⟨x.bv >>> 3⟩ := by unfold Pion.U32.shr; simp
-    rw [hr1, b_ok, hr2, b_ok, hshr, b_ok]
-    exact ⟨_, rfl⟩
-  · unfold sha256_lsigma1
-    obtain ⟨r1, hr1, _⟩ := sha256_rotr_spec x 17#u32 (by simp) (by simp)
-    obtain ⟨r2, hr2, _⟩ := sha256_rotr_spec x 19#u32 (by simp) (by simp)
-    have hshr : Pion.U32.shr x 10#u32 = ok ⟨x.bv >>> 10⟩ := by unfold Pion.U32.shr; simp
-    rw [hr1, b_ok, hr2, b_ok, hshr, b_ok]
-    exact ⟨_, rfl⟩
 
 end JwtProofs

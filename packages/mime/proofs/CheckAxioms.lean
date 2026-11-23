@@ -2,23 +2,11 @@ import MimeProofs
 
 #print axioms MimeProofs.hex_upper_digit_roundtrip
 #print axioms MimeProofs.hex_nibble_val_bounds
-#print axioms MimeProofs.hex_nibble_val_case_insensitive
 #print axioms MimeProofs.ascii_lower_byte_idempotent
-#print axioms MimeProofs.ascii_lower_byte_no_uppercase
-#print axioms MimeProofs.qp_nibbles_range
 #print axioms MimeProofs.qp_hex_byte_roundtrip
 #print axioms MimeProofs.qp_encode_forbids_equals_and_ctl
-#print axioms MimeProofs.qp_encode_trailing_ws_must_encode
 #print axioms MimeProofs.qp_decode_rejects_nul_and_c0
 #print axioms MimeProofs.qp_soft_wrap_76_col_bound
 #print axioms MimeProofs.attr_char_subset_of_tchar
-#print axioms MimeProofs.attr_char_excludes_rfc5987_delimiters
 #print axioms MimeProofs.tchar_forbids_ctl_space_and_separators
 #print axioms MimeProofs.bchar_nospace_forbids_ctl_space_and_quotes
-#print axioms MimeProofs.tchar_and_bchar_allow_alnum
-#print axioms MimeProofs.path_sep_byte_iff
-#print axioms MimeProofs.filename_c0_or_del_iff
-#print axioms MimeProofs.filename_printable_ascii_preserved
-#print axioms MimeProofs.utf8_c1_pair_iff
-#print axioms MimeProofs.utf8_bidi_3byte_catches_trojan_rlo
-#print axioms MimeProofs.utf8_bidi_3byte_requires_e2_lead

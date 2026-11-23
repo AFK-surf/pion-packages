@@ -145,58 +145,6 @@ private theorem f64_to_f32_concrete (bits : Std.I64) (out : Option Std.I64)
   · exfalso; exact hnsub ⟨h1, Bool.eq_false_iff.mpr h4, Bool.eq_false_iff.mpr h5, h7⟩
   · simp only [h1, h4, h5, Bool.false_eq_true, ↓reduceIte] at hres; exact congrArg ok hres
 
-/-- IEEE-754 binary32 `+0.0` (`0x00000000`) and `-0.0` (`0x80000000`) roundtrip cleanly. -/
-theorem float32_zero_roundtrip :
-    (do let d ← float32_to_double_bits 0#i64; double_bits_to_float32_exact d) = ok (some 0#i64) ∧
-    (do let d ← float32_to_double_bits 2147483648#i64; double_bits_to_float32_exact d) = ok (some 2147483648#i64) := by
-  constructor
-  · rw [eval_f32_rt]
-    exact ⟨0#i64, f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-  · rw [eval_f32_rt]
-    exact ⟨⟨(1#i64).bv <<< 63⟩, f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-
-/-- IEEE-754 binary32 `+Inf` (`0x7F800000`) and `-Inf` (`0xFF800000`) roundtrip cleanly. -/
-theorem float32_inf_roundtrip :
-    (do let d ← float32_to_double_bits 2139095040#i64; double_bits_to_float32_exact d) = ok (some 2139095040#i64) ∧
-    (do let d ← float32_to_double_bits 4286578688#i64; double_bits_to_float32_exact d) = ok (some 4286578688#i64) := by
-  constructor
-  · rw [eval_f32_rt]
-    exact ⟨⟨(2047#i64).bv <<< 52⟩, f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-  · rw [eval_f32_rt]
-    exact ⟨Pion.I64.bor ⟨(1#i64).bv <<< 63⟩ ⟨(2047#i64).bv <<< 52⟩,
-      f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-
-/-- IEEE-754 binary32 normal spots (`1.0`, `-2.5`, `100000.0`, max finite) roundtrip cleanly. -/
-theorem float32_normal_spots_roundtrip :
-    (do let d ← float32_to_double_bits 1065353216#i64; double_bits_to_float32_exact d) = ok (some 1065353216#i64) ∧
-    (do let d ← float32_to_double_bits 3223322624#i64; double_bits_to_float32_exact d) = ok (some 3223322624#i64) ∧
-    (do let d ← float32_to_double_bits 1203982336#i64; double_bits_to_float32_exact d) = ok (some 1203982336#i64) ∧
-    (do let d ← float32_to_double_bits 2139095039#i64; double_bits_to_float32_exact d) = ok (some 2139095039#i64) := by
-  refine ⟨?_, ?_, ?_, ?_⟩
-  · rw [eval_f32_rt]
-    exact ⟨⟨(1023#i64).bv <<< 52⟩, f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-  · rw [eval_f32_rt]
-    exact ⟨Pion.I64.bor (Pion.I64.bor ⟨(1#i64).bv <<< 63⟩ ⟨(1024#i64).bv <<< 52⟩) ⟨(2097152#i64).bv <<< 29⟩,
-      f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-  · rw [eval_f32_rt]
-    exact ⟨Pion.I64.bor ⟨(1039#i64).bv <<< 52⟩ ⟨(4411392#i64).bv <<< 29⟩,
-      f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-  · rw [eval_f32_rt]
-    exact ⟨Pion.I64.bor ⟨(1150#i64).bv <<< 52⟩ ⟨(8388607#i64).bv <<< 29⟩,
-      f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-
-/-- MessagePack NaN bit-exactness: quiet & custom-payload binary32 NaNs preserve sign and all 23 payload bits through binary64. -/
-theorem float32_nan_payload_roundtrip :
-    (do let d ← float32_to_double_bits 2143289344#i64; double_bits_to_float32_exact d) = ok (some 2143289344#i64) ∧
-    (do let d ← float32_to_double_bits 2139095041#i64; double_bits_to_float32_exact d) = ok (some 2139095041#i64) := by
-  constructor
-  · rw [eval_f32_rt]
-    exact ⟨Pion.I64.bor ⟨(2047#i64).bv <<< 52⟩ ⟨(4194304#i64).bv <<< 29⟩,
-      f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-  · rw [eval_f32_rt]
-    exact ⟨Pion.I64.bor ⟨(2047#i64).bv <<< 52⟩ ⟨(1#i64).bv <<< 29⟩,
-      f32_to_f64_concrete _ _ (by decide) (by decide), f64_to_f32_concrete _ _ (by decide) (by decide)⟩
-
 /-- `double_bits_to_float32_exact` never silently loses precision on normal-range values with non-zero low 29 mantissa bits. -/
 theorem double_bits_to_float32_rejects_excess_precision (bits : Std.I64)
     (hexp_lo : 897 ≤ (Pion.I64.to_int (Pion.I64.band (⟨bits.bv.sshiftRight 52⟩ : Std.I64) 2047#i64)).val)

@@ -20,56 +20,56 @@ open uuid
 
 /-! ## Core BitVec & Scalar Helpers -/
 
-theorem b_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma b_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← (ok x : Result α); f y) = f x := by simp
 
-theorem u64_ext {a b : Std.U64} (h : a.val = b.val) : a = b := by
+lemma u64_ext {a b : Std.U64} (h : a.val = b.val) : a = b := by
   cases a; cases b
   congr 1
   exact BitVec.eq_of_toNat_eq h
 
-theorem u64_ext_bv {a b : Std.U64} (h : a.bv = b.bv) : a = b := by
+lemma u64_ext_bv {a b : Std.U64} (h : a.bv = b.bv) : a = b := by
   cases a; cases b
   congr 1
 
-theorem i64_ext_bv {a b : Std.I64} (h : a.bv = b.bv) : a = b := by
+lemma i64_ext_bv {a b : Std.I64} (h : a.bv = b.bv) : a = b := by
   cases a; cases b
   congr 1
 
-theorem i32_ext_val {a b : Std.I32} (h : a.val = b.val) : a = b := by
+lemma i32_ext_val {a b : Std.I32} (h : a.val = b.val) : a = b := by
   cases a; cases b
   congr 1
   exact BitVec.eq_of_toInt_eq h
 
-theorem i64_to_u64_bv (x : Std.I64) : (Pion.I64.to_uint64 x).bv = x.bv := by
+lemma i64_to_u64_bv (x : Std.I64) : (Pion.I64.to_uint64 x).bv = x.bv := by
   simp only [Pion.I64.to_uint64, IScalar.hcast_bv_eq]
   apply BitVec.eq_of_toNat_eq
   rw [BitVec.signExtend_eq_setWidth_of_le x.bv (by decide), BitVec.toNat_setWidth]
   exact Nat.mod_eq_of_lt x.bv.isLt
 
-theorem u64_to_i64_bv (x : Std.U64) : (Pion.U64.to_int64 x).bv = x.bv := by
+lemma u64_to_i64_bv (x : Std.U64) : (Pion.U64.to_int64 x).bv = x.bv := by
   simp only [Pion.U64.to_int64, UScalar.hcast_bv_eq]
   apply BitVec.eq_of_toNat_eq
   rw [BitVec.toNat_setWidth]
   exact Nat.mod_eq_of_lt x.bv.isLt
 
-theorem u64_to_i64_to_u64 (x : Std.U64) :
+lemma u64_to_i64_to_u64 (x : Std.U64) :
     Pion.I64.to_uint64 (Pion.U64.to_int64 x) = x := by
   apply u64_ext_bv
   rw [i64_to_u64_bv, u64_to_i64_bv]
 
-theorem i64_to_u64_to_i64 (x : Std.I64) :
+lemma i64_to_u64_to_i64 (x : Std.I64) :
     Pion.U64.to_int64 (Pion.I64.to_uint64 x) = x := by
   apply i64_ext_bv
   rw [u64_to_i64_bv, i64_to_u64_bv]
 
-theorem i64_to_u64_inj {a b : Std.I64}
+lemma i64_to_u64_inj {a b : Std.I64}
     (h : Pion.I64.to_uint64 a = Pion.I64.to_uint64 b) : a = b := by
   have hbv : a.bv = b.bv := by
     rw [← i64_to_u64_bv a, ← i64_to_u64_bv b, h]
   exact i64_ext_bv hbv
 
-theorem i64_nonneg_to_u64_val {x : Std.I64} (h0 : 0 ≤ x.val) :
+lemma i64_nonneg_to_u64_val {x : Std.I64} (h0 : 0 ≤ x.val) :
     ((Pion.I64.to_uint64 x).val : Int) = x.val := by
   have hbv : (Pion.I64.to_uint64 x).bv = x.bv := i64_to_u64_bv x
   change ((Pion.I64.to_uint64 x).bv.toNat : Int) = x.bv.toInt
@@ -83,7 +83,7 @@ theorem i64_nonneg_to_u64_val {x : Std.I64} (h0 : 0 ≤ x.val) :
       omega
   rw [BitVec.toInt_eq_toNat_of_lt hlt]
 
-theorem u64_lt_2p63_to_i64_val {x : Std.U64} (hlt : x.val < 2 ^ 63) :
+lemma u64_lt_2p63_to_i64_val {x : Std.U64} (hlt : x.val < 2 ^ 63) :
     (Pion.U64.to_int64 x).val = (x.val : Int) := by
   have hbv : (Pion.U64.to_int64 x).bv = x.bv := u64_to_i64_bv x
   change (Pion.U64.to_int64 x).bv.toInt = (x.bv.toNat : Int)
@@ -93,20 +93,20 @@ theorem u64_lt_2p63_to_i64_val {x : Std.U64} (hlt : x.val < 2 ^ 63) :
     omega
   exact BitVec.toInt_eq_toNat_of_lt h2
 
-theorem u64_val_lt (x : Std.U64) : x.val < 2 ^ 64 := x.bv.isLt
+lemma u64_val_lt (x : Std.U64) : x.val < 2 ^ 64 := x.bv.isLt
 
-theorem u64_zero_val : (Pion.I64.to_uint64 0#i64).val = 0 := by decide
+lemma u64_zero_val : (Pion.I64.to_uint64 0#i64).val = 0 := by decide
 
-theorem u64_max_val : (Pion.I64.to_uint64 (-1)#i64).val = 2 ^ 64 - 1 := by decide
+lemma u64_max_val : (Pion.I64.to_uint64 (-1)#i64).val = 2 ^ 64 - 1 := by decide
 
-theorem i32_neg_one : Pion.I32.neg 1#i32 = (-1)#i32 := by decide
-theorem i32_neg_neg_one : Pion.I32.neg (-1)#i32 = 1#i32 := by decide
-theorem i32_neg_zero : Pion.I32.neg 0#i32 = 0#i32 := by decide
+lemma i32_neg_one : Pion.I32.neg 1#i32 = (-1)#i32 := by decide
+lemma i32_neg_neg_one : Pion.I32.neg (-1)#i32 = 1#i32 := by decide
+lemma i32_neg_zero : Pion.I32.neg 0#i32 = 0#i32 := by decide
 
-theorem result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
+lemma result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
   simpa using h
 
-theorem res_ok_inj {α β : Type} {a b : α} (h : (Pion.Res.Ok a : Pion.Res α β) = Pion.Res.Ok b) : a = b :=
+lemma res_ok_inj {α β : Type} {a b : α} (h : (Pion.Res.Ok a : Pion.Res α β) = Pion.Res.Ok b) : a = b :=
   Pion.Res.Ok.inj h
 
 /-- Mathematical 128-bit unsigned integer value of a `(hi, lo)` pair. -/
@@ -119,7 +119,7 @@ def uuidVal (u : Uuid) : Nat := u128Val u.hi u.lo
 /-- Mathematical 128-bit unsigned value of a `Ulid`. -/
 def ulidVal (u : Ulid) : Nat := u128Val u.hi u.lo
 
-theorem u128Val_lt_iff (ah al bh bl : Std.I64) :
+lemma u128Val_lt_iff (ah al bh bl : Std.I64) :
     u128Val ah al < u128Val bh bl ↔
       (Pion.I64.to_uint64 ah < Pion.I64.to_uint64 bh) ∨
       (Pion.I64.to_uint64 ah = Pion.I64.to_uint64 bh ∧
@@ -144,7 +144,7 @@ theorem u128Val_lt_iff (ah al bh bl : Std.I64) :
       have h2 : (Pion.I64.to_uint64 al).val < (Pion.I64.to_uint64 bl).val := hlt
       omega
 
-theorem u128Val_eq_iff (ah al bh bl : Std.I64) :
+lemma u128Val_eq_iff (ah al bh bl : Std.I64) :
     u128Val ah al = u128Val bh bl ↔ ah = bh ∧ al = bl := by
   unfold u128Val
   have hal := u64_val_lt (Pion.I64.to_uint64 al)
@@ -157,20 +157,20 @@ theorem u128Val_eq_iff (ah al bh bl : Std.I64) :
   · rintro ⟨rfl, rfl⟩
     rfl
 
-theorem uuid_ext {a b : Uuid} (hhi : a.hi = b.hi) (hlo : a.lo = b.lo) : a = b := by
+lemma uuid_ext {a b : Uuid} (hhi : a.hi = b.hi) (hlo : a.lo = b.lo) : a = b := by
   cases a; cases b; simp_all
 
-theorem ulid_ext {a b : Ulid} (hhi : a.hi = b.hi) (hlo : a.lo = b.lo) : a = b := by
+lemma ulid_ext {a b : Ulid} (hhi : a.hi = b.hi) (hlo : a.lo = b.lo) : a = b := by
   cases a; cases b; simp_all
 
-theorem uuidVal_eq_iff (a b : Uuid) : uuidVal a = uuidVal b ↔ a = b := by
+lemma uuidVal_eq_iff (a b : Uuid) : uuidVal a = uuidVal b ↔ a = b := by
   unfold uuidVal
   rw [u128Val_eq_iff]
   constructor
   · rintro ⟨h1, h2⟩; exact uuid_ext h1 h2
   · rintro rfl; exact ⟨rfl, rfl⟩
 
-theorem ulidVal_eq_iff (a b : Ulid) : ulidVal a = ulidVal b ↔ a = b := by
+lemma ulidVal_eq_iff (a b : Ulid) : ulidVal a = ulidVal b ↔ a = b := by
   unfold ulidVal
   rw [u128Val_eq_iff]
   constructor
@@ -186,52 +186,7 @@ theorem uuid_from_as_u64_pair (u : Uuid) :
   change ok (Uuid.mk (Pion.U64.to_int64 (Pion.I64.to_uint64 u.hi)) (Pion.U64.to_int64 (Pion.I64.to_uint64 u.lo))) = ok u
   rw [i64_to_u64_to_i64, i64_to_u64_to_i64]
 
-theorem uuid_as_from_u64_pair (hi lo : Std.U64) :
-    (do let u ← Uuid.from_u64_pair hi lo; Uuid.as_u64_pair u) = ok (hi, lo) := by
-  unfold Uuid.from_u64_pair Uuid.as_u64_pair
-  rw [b_ok]
-  dsimp only
-  rw [u64_to_i64_to_u64, u64_to_i64_to_u64]
-
-theorem ulid_from_as_u64_pair (u : Ulid) :
-    (do let (hi, lo) ← Ulid.as_u64_pair u; Ulid.from_u64_pair hi lo) = ok u := by
-  unfold Ulid.as_u64_pair Ulid.from_u64_pair
-  rw [b_ok]
-  change ok (Ulid.mk (Pion.U64.to_int64 (Pion.I64.to_uint64 u.hi)) (Pion.U64.to_int64 (Pion.I64.to_uint64 u.lo))) = ok u
-  rw [i64_to_u64_to_i64, i64_to_u64_to_i64]
-
-theorem ulid_as_from_u64_pair (hi lo : Std.U64) :
-    (do let u ← Ulid.from_u64_pair hi lo; Ulid.as_u64_pair u) = ok (hi, lo) := by
-  unfold Ulid.from_u64_pair Ulid.as_u64_pair
-  rw [b_ok]
-  dsimp only
-  rw [u64_to_i64_to_u64, u64_to_i64_to_u64]
-
-theorem ulid_uuid_roundtrip (u : Ulid) :
-    (do let x ← Ulid.to_uuid u; Ulid.from_uuid x) = ok u := by
-  unfold Ulid.to_uuid Ulid.from_uuid
-  rw [b_ok]
-
-theorem uuid_ulid_roundtrip (u : Uuid) :
-    (do let x ← Ulid.from_uuid u; Ulid.to_uuid x) = ok u := by
-  unfold Ulid.from_uuid Ulid.to_uuid
-  rw [b_ok]
-
-theorem uuid_eq_iff (a b : Uuid) : Uuid.eq a b = ok true ↔ a = b := by
-  unfold Uuid.eq
-  simp only [ok.injEq, Bool.and_eq_true, beq_iff_eq]
-  constructor
-  · rintro ⟨h1, h2⟩; exact uuid_ext h1 h2
-  · rintro rfl; exact ⟨rfl, rfl⟩
-
-theorem ulid_eq_iff (a b : Ulid) : Ulid.eq a b = ok true ↔ a = b := by
-  unfold Ulid.eq
-  simp only [ok.injEq, Bool.and_eq_true, beq_iff_eq]
-  constructor
-  · rintro ⟨h1, h2⟩; exact ulid_ext h1 h2
-  · rintro rfl; exact ⟨rfl, rfl⟩
-
-theorem uuid_compare_total (a b : Uuid) :
+lemma uuid_compare_total (a b : Uuid) :
     ∃ r : Std.I32, Uuid.compare a b = ok r ∧
       (r = (-1)#i32 ∨ r = 0#i32 ∨ r = 1#i32) := by
   unfold Uuid.compare
@@ -264,7 +219,7 @@ theorem uuid_compare_spec_lt (a b : Uuid) :
   · simp only [ok.injEq, show (0#i32 = (-1)#i32) ↔ False by decide, false_iff, not_or, not_and]
     exact ⟨h1, fun _ => h3⟩
 
-theorem uuid_compare_spec_gt (a b : Uuid) :
+lemma uuid_compare_spec_gt (a b : Uuid) :
     Uuid.compare a b = ok 1#i32 ↔ uuidVal b < uuidVal a := by
   unfold Uuid.compare uuidVal
   rw [u128Val_lt_iff]
@@ -316,102 +271,12 @@ theorem uuid_compare_spec_eq (a b : Uuid) :
     · rfl
     · have := (uuid_compare_spec_gt a b).mp hr; omega
 
-theorem uuid_compare_refl (a : Uuid) : Uuid.compare a a = ok 0#i32 :=
-  (uuid_compare_spec_eq a a).mpr rfl
-
-theorem uuid_compare_antisymm (a b : Uuid) (r : Std.I32)
-    (h : Uuid.compare a b = ok r) :
-    Uuid.compare b a = ok (Pion.I32.neg r) := by
-  rcases uuid_compare_total a b with ⟨r', hr', hcases⟩
-  have heq : r = r' := result_ok_inj (h.symm.trans hr')
-  subst heq
-  rcases hcases with rfl | rfl | rfl
-  · rw [i32_neg_neg_one, uuid_compare_spec_gt]
-    exact (uuid_compare_spec_lt a b).mp h
-  · rw [i32_neg_zero, uuid_compare_spec_eq]
-    exact ((uuid_compare_spec_eq a b).mp h).symm
-  · rw [i32_neg_one, uuid_compare_spec_lt]
-    exact (uuid_compare_spec_gt a b).mp h
-
-theorem uuid_compare_trans (a b c : Uuid)
-    (hab : Uuid.compare a b = ok (-1)#i32)
-    (hbc : Uuid.compare b c = ok (-1)#i32) :
-    Uuid.compare a c = ok (-1)#i32 := by
-  rw [uuid_compare_spec_lt] at hab hbc ⊢
-  exact Nat.lt_trans hab hbc
-
-theorem uuid_lt_iff_compare (a b : Uuid) :
-    uuid_lt a b = ok true ↔ Uuid.compare a b = ok (-1)#i32 := by
-  rw [uuid_compare_spec_lt]
-  unfold uuid_lt uuidVal
-  rw [u128Val_lt_iff]
-  dsimp only
-  split_ifs with hne
-  · simp only [ok.injEq, decide_eq_true_eq]
-    constructor
-    · intro h; left; exact h
-    · rintro (h | ⟨heq, _⟩)
-      · exact h
-      · exact absurd heq hne
-  · simp only [not_not] at hne
-    simp only [ok.injEq, decide_eq_true_eq, hne]
-    constructor
-    · intro h; right; exact ⟨trivial, h⟩
-    · rintro (h | ⟨_, h⟩)
-      · exact absurd h (Nat.lt_irrefl _)
-      · exact h
-
-theorem ulid_compare_eq_uuid_compare (a b : Ulid) :
+lemma ulid_compare_eq_uuid_compare (a b : Ulid) :
     Ulid.compare a b = Uuid.compare (Uuid.mk a.hi a.lo) (Uuid.mk b.hi b.lo) := rfl
 
-theorem ulid_compare_total (a b : Ulid) :
-    ∃ r : Std.I32, Ulid.compare a b = ok r ∧
-      (r = (-1)#i32 ∨ r = 0#i32 ∨ r = 1#i32) :=
-  uuid_compare_total (Uuid.mk a.hi a.lo) (Uuid.mk b.hi b.lo)
-
-theorem ulid_compare_spec_lt (a b : Ulid) :
+lemma ulid_compare_spec_lt (a b : Ulid) :
     Ulid.compare a b = ok (-1)#i32 ↔ ulidVal a < ulidVal b :=
   uuid_compare_spec_lt (Uuid.mk a.hi a.lo) (Uuid.mk b.hi b.lo)
-
-theorem ulid_compare_spec_gt (a b : Ulid) :
-    Ulid.compare a b = ok 1#i32 ↔ ulidVal b < ulidVal a :=
-  uuid_compare_spec_gt (Uuid.mk a.hi a.lo) (Uuid.mk b.hi b.lo)
-
-theorem ulid_compare_spec_eq (a b : Ulid) :
-    Ulid.compare a b = ok 0#i32 ↔ a = b := by
-  rw [ulid_compare_eq_uuid_compare, uuid_compare_spec_eq]
-  cases a; cases b
-  simp
-
-theorem ulid_compare_refl (a : Ulid) : Ulid.compare a a = ok 0#i32 :=
-  (ulid_compare_spec_eq a a).mpr rfl
-
-theorem ulid_compare_antisymm (a b : Ulid) (r : Std.I32)
-    (h : Ulid.compare a b = ok r) :
-    Ulid.compare b a = ok (Pion.I32.neg r) :=
-  uuid_compare_antisymm (Uuid.mk a.hi a.lo) (Uuid.mk b.hi b.lo) r h
-
-theorem ulid_compare_trans (a b c : Ulid)
-    (hab : Ulid.compare a b = ok (-1)#i32)
-    (hbc : Ulid.compare b c = ok (-1)#i32) :
-    Ulid.compare a c = ok (-1)#i32 :=
-  uuid_compare_trans (Uuid.mk a.hi a.lo) (Uuid.mk b.hi b.lo) (Uuid.mk c.hi c.lo) hab hbc
-
-theorem ulid_lt_iff_compare (a b : Ulid) :
-    ulid_lt a b = ok true ↔ Ulid.compare a b = ok (-1)#i32 :=
-  uuid_lt_iff_compare (Uuid.mk a.hi a.lo) (Uuid.mk b.hi b.lo)
-
-theorem uuid_is_nil_iff (u : Uuid) :
-    Uuid.is_nil u = ok true ↔ u = Uuid.mk 0#i64 0#i64 := by
-  unfold Uuid.is_nil
-  simp only [ok.injEq, Bool.and_eq_true, beq_iff_eq]
-  cases u; simp
-
-theorem uuid_is_max_iff (u : Uuid) :
-    Uuid.is_max u = ok true ↔ u = Uuid.mk (-1)#i64 (-1)#i64 := by
-  unfold Uuid.is_max
-  simp only [ok.injEq, Bool.and_eq_true, beq_iff_eq]
-  cases u; simp
 
 theorem uuid_nil_min (u : Uuid) :
     ∃ r : Std.I32, (do let n ← Uuid.nil; Uuid.compare n u) = ok r ∧ r.val ≤ 0 := by
@@ -445,35 +310,17 @@ theorem uuid_max_max (u : Uuid) :
     have h2 := u64_val_lt (Pion.I64.to_uint64 u.lo)
     omega
 
-theorem ulid_nil_min (u : Ulid) :
-    ∃ r : Std.I32, (do let n ← Ulid.nil; Ulid.compare n u) = ok r ∧ r.val ≤ 0 := by
-  unfold Ulid.nil
-  rw [b_ok, ulid_compare_eq_uuid_compare]
-  have h := uuid_nil_min (Uuid.mk u.hi u.lo)
-  unfold Uuid.nil at h
-  rw [b_ok] at h
-  exact h
-
-theorem ulid_max_max (u : Ulid) :
-    ∃ r : Std.I32, (do let m ← Ulid.max; Ulid.compare u m) = ok r ∧ r.val ≤ 0 := by
-  unfold Ulid.max
-  rw [b_ok, ulid_compare_eq_uuid_compare]
-  have h := uuid_max_max (Uuid.mk u.hi u.lo)
-  unfold Uuid.max at h
-  rw [b_ok] at h
-  exact h
-
 /-! ## 2. RFC 9562 UUID Version & Variant Bitfield Invariants -/
 
 private theorem u64_shr_ok (x : Std.U64) (s : Std.U64) (n : Nat) (heq : s.val = n) (hn : n < 64) :
     Pion.U64.shr x s = ok ⟨x.bv >>> n⟩ := by
   unfold Pion.U64.shr
-  rw [heq, if_pos hn]
+  rw [heq, ite_eq_left hn]
 
 private theorem u64_shl_ok (x : Std.U64) (s : Std.U64) (n : Nat) (heq : s.val = n) (hn : n < 64) :
     Pion.U64.shl x s = ok ⟨x.bv <<< n⟩ := by
   unfold Pion.U64.shl
-  rw [heq, if_pos hn]
+  rw [heq, ite_eq_left hn]
 
 private theorem bv64_and_le_right (x y : BitVec 64) : (x &&& y).toNat ≤ y.toNat := by
   rw [BitVec.toNat_and]
@@ -749,28 +596,10 @@ private theorem set_version_and_variant_version_aux (hi lo v : Std.U64) (ev : Uu
   rw [hu, b_ok] at hmax
   have hvnum := set_version_and_variant_version_num hi lo v
   rw [hu, b_ok, hvi] at hvnum
-  rw [hnil, b_ok, if_neg (by decide), hmax, b_ok, if_neg (by decide), hvnum, b_ok, hev]
-
-/-- `Uuid.new_v4_from_u64_pair` always produces RFC 4122 variant and `Random` (v4) version across all `2^128` inputs. -/
-theorem new_v4_from_u64_pair_spec (hi lo : Std.U64) :
-    ∃ u : Uuid,
-      Uuid.new_v4_from_u64_pair hi lo = ok u ∧
-      Uuid.variant u = ok UuidVariant.Rfc4122 ∧
-      Uuid.version u = ok UuidVersion.Random := by
-  have hok : ∃ u, set_version_and_variant hi lo 4#u64 = ok u := by
-    unfold set_version_and_variant
-    rw [u64_shl_ok _ 12#u64 12 (by decide) (by decide), b_ok]
-    exact ⟨_, rfl⟩
-  rcases hok with ⟨u, hu⟩
-  refine ⟨u, ?_, ?_, ?_⟩
-  · unfold Uuid.new_v4_from_u64_pair; rw [hu, b_ok]
-  · have hv := set_version_and_variant_variant hi lo 4#u64
-    rw [hu, b_ok] at hv; exact hv
-  · have hv := set_version_and_variant_version_aux hi lo 4#u64 .Random 4#i32 (by decide) (by simp)
-    rw [hu, b_ok] at hv; exact hv
+  rw [hnil, b_ok, ite_eq_right (by decide), hmax, b_ok, ite_eq_right (by decide), hvnum, b_ok, hev]
 
 /-- RFC 9562 v3/v5/v8 tagging via `set_version_and_variant` always yields `Rfc4122` and the exact expected version. -/
-theorem set_version_and_variant_v3_v5_v8 (hi lo : Std.U64) :
+lemma set_version_and_variant_v3_v5_v8 (hi lo : Std.U64) :
     (do let u ← set_version_and_variant hi lo 3#u64; Uuid.version u) = ok UuidVersion.Md5 ∧
     (do let u ← set_version_and_variant hi lo 5#u64; Uuid.version u) = ok UuidVersion.Sha1 ∧
     (do let u ← set_version_and_variant hi lo 8#u64; Uuid.version u) = ok UuidVersion.Custom :=
@@ -789,7 +618,7 @@ theorem new_v8_spec (custom : Pion.Bytes) (hlen : custom.val.length = 16) :
     simp only [hlen, show (16 : Nat) ≤ 2147483647 by omega, ↓reduceDIte]
     rw [b_ok]
     have h16 : (Std.I32.ofIntCore (16 : Nat) ⟨by simp [IScalarTy.numBits], by simp [IScalarTy.numBits]⟩) = 16#i32 := by decide
-    rw [h16, if_neg (by decide)]
+    rw [h16, ite_eq_right (by decide)]
     have hget : ∀ (k : Std.I32), 0 ≤ k.val → k.val < 16 → ∃ b, Pion.Bytes.get custom k = ok b := by
       intro k hk0 hk1
       unfold Pion.Bytes.get Pion.listGet
@@ -858,7 +687,7 @@ theorem new_v7_from_parts_spec (ts_ms : Std.I64) (rand_a : Std.I32) (rand_b : St
   set u : Uuid := Uuid.mk (Pion.U64.to_int64 hi_u) (Pion.U64.to_int64 lo_u)
   have hnew : Uuid.new_v7_from_parts ts_ms rand_a rand_b = ok (.Ok u) := by
     unfold Uuid.new_v7_from_parts
-    rw [hcond, if_neg (by decide), u64_shl_ok _ 16#u64 16 (by decide) (by decide), b_ok]
+    rw [hcond, ite_eq_right (by decide), u64_shl_ok _ 16#u64 16 (by decide) (by decide), b_ok]
   have hvar : Uuid.variant u = ok UuidVariant.Rfc4122 := by
     unfold Uuid.variant
     simp only [u, u64_to_i64_to_u64, lo_u]
@@ -890,7 +719,7 @@ theorem new_v7_from_parts_spec (ts_ms : Std.I64) (rand_a : Std.I32) (rand_b : St
     rw [h7]; rfl
   have hver : Uuid.version u = ok UuidVersion.SortRand := by
     unfold Uuid.version
-    rw [hnotnil, b_ok, if_neg (by decide), hnotmax, b_ok, if_neg (by decide), hvnum, b_ok]
+    rw [hnotnil, b_ok, ite_eq_right (by decide), hnotmax, b_ok, ite_eq_right (by decide), hvnum, b_ok]
     simp
   have hts_eq : Uuid.timestamp_ms u = ok (some ts_ms) := by
     unfold Uuid.timestamp_ms
@@ -971,16 +800,6 @@ theorem new_v7_from_parts_strict_monotonic
   change (Pion.I64.to_uint64 u1.hi).val < (Pion.I64.to_uint64 u2.hi).val
   omega
 
-theorem uuid_nil_version :
-    (do let u ← Uuid.nil; Uuid.version u) = ok UuidVersion.Nil := by
-  unfold Uuid.nil Uuid.version Uuid.is_nil
-  rw [b_ok]; simp
-
-theorem uuid_max_version :
-    (do let u ← Uuid.max; Uuid.version u) = ok UuidVersion.Max := by
-  unfold Uuid.max Uuid.version Uuid.is_nil Uuid.is_max
-  rw [b_ok]; simp
-
 /-! ## 3. ULID 48-bit Timestamp + 80-bit Random Bijection, Monotonicity & Increment -/
 
 /-- `Ulid.from_parts` roundtrips `timestamp_ms` and `random_parts` for all `0 ≤ ts_ms ≤ 2^48 - 1`. -/
@@ -999,7 +818,7 @@ theorem ulid_from_parts_roundtrip (ts_ms rand_hi rand_lo : Std.I64)
   set u : Ulid := Ulid.mk (Pion.U64.to_int64 hi_u) rand_lo
   refine ⟨u, ?_, ?_, ?_⟩
   · unfold Ulid.from_parts
-    rw [hcond, if_neg (by decide), u64_shl_ok _ 16#u64 16 (by decide) (by decide), b_ok]
+    rw [hcond, ite_eq_right (by decide), u64_shl_ok _ 16#u64 16 (by decide) (by decide), b_ok]
   · unfold Ulid.timestamp_ms
     simp only [u, u64_to_i64_to_u64, hi_u]
     rw [u64_shr_ok _ 16#u64 16 (by decide) (by decide), b_ok]
@@ -1030,19 +849,6 @@ theorem ulid_from_parts_roundtrip (ts_ms rand_hi rand_lo : Std.I64)
         omega)
       simp [hb]
 
-/-- `Ulid.from_parts` rejects any timestamp outside `[0, 2^48 - 1]`. -/
-theorem ulid_from_parts_reject_invalid (ts_ms rand_hi rand_lo : Std.I64)
-    (hbad : ts_ms.val < 0 ∨ ts_ms.val > 281474976710655) :
-    Ulid.from_parts ts_ms rand_hi rand_lo = ok (.Err (UlidError.InvalidTimestamp ts_ms)) := by
-  unfold Ulid.from_parts
-  have hcond : ((decide (ts_ms < 0#i64)) || (decide (ts_ms > 281474976710655#i64))) = true := by
-    rcases hbad with hlt | hgt
-    · have : ts_ms < 0#i64 := hlt
-      rw [decide_eq_true this]; rfl
-    · have : ts_ms > 281474976710655#i64 := hgt
-      rw [decide_eq_true this]; simp
-  rw [hcond, if_pos rfl]
-
 /-- **ULID Bijection**: decomposing ANY `Ulid` into `(timestamp_ms, random_parts)` and passing back to
     `Ulid.from_parts` reconstructs the exact original `Ulid`. -/
 theorem ulid_parts_bijection (u : Ulid) :
@@ -1070,7 +876,7 @@ theorem ulid_parts_bijection (u : Ulid) :
       let __t ← Pion.U64.shl (Pion.I64.to_uint64 (Pion.U64.to_int64 ts_u)) 16#u64
       let hi := Pion.U64.bor __t (Pion.U64.band (Pion.I64.to_uint64 (Pion.U64.to_int64 (Pion.U64.band (Pion.I64.to_uint64 u.hi) 65535#u64))) 65535#u64)
       ok (Pion.Res.Ok (Ulid.mk (Pion.U64.to_int64 hi) u.lo))) = ok (.Ok u)
-  rw [hcond, if_neg (by decide), u64_to_i64_to_u64, u64_shl_ok _ 16#u64 16 (by decide) (by decide), b_ok, u64_to_i64_to_u64]
+  rw [hcond, ite_eq_right (by decide), u64_to_i64_to_u64, u64_shl_ok _ 16#u64 16 (by decide) (by decide), b_ok, u64_to_i64_to_u64]
   change ok (Pion.Res.Ok (Ulid.mk (Pion.U64.to_int64 (Pion.U64.bor ⟨ts_u.bv <<< 16⟩ (Pion.U64.band (Pion.U64.band (Pion.I64.to_uint64 u.hi) 65535#u64) 65535#u64))) u.lo)) = ok (.Ok u)
   congr 2
   cases u with | mk uhi ulo =>
@@ -1143,7 +949,7 @@ theorem ulid_increment_ok (u : Ulid)
       rcases hnot_sat with h | h
       · exact absurd hlo h
       · exact h
-    rw [if_pos hlo, if_neg hrhi]
+    rw [ite_eq_left hlo, ite_eq_right hrhi]
     set hi := Pion.I64.to_uint64 u.hi
     set rhi := Pion.U64.band hi 65535#u64
     set next_hi := Pion.U64.bor (Pion.U64.band hi 18446744073709486080#u64) (Pion.U64.add rhi 1#u64)
@@ -1233,7 +1039,7 @@ theorem ulid_increment_ok (u : Ulid)
     refine ⟨u', rfl, hval, hts, ?_⟩
     rw [ulid_compare_spec_lt, hval]
     omega
-  · rw [if_neg hlo]
+  · rw [ite_eq_right hlo]
     set lo := Pion.I64.to_uint64 u.lo
     set u' := Ulid.mk u.hi (Pion.U64.to_int64 (Pion.U64.add lo 1#u64))
     have hlo_lt : lo.val < 2 ^ 64 - 1 := by
@@ -1257,15 +1063,6 @@ theorem ulid_increment_ok (u : Ulid)
     refine ⟨u', rfl, hval, rfl, ?_⟩
     rw [ulid_compare_spec_lt, hval]
     omega
-
-/-- When all 80 random bits are 1, `Ulid.increment` returns `Err(UlidError.Overflow)` without wrapping into the timestamp. -/
-theorem ulid_increment_overflow (u : Ulid)
-    (hlo : Pion.I64.to_uint64 u.lo = 18446744073709551615#u64)
-    (hrhi : Pion.U64.band (Pion.I64.to_uint64 u.hi) 65535#u64 = 65535#u64) :
-    Ulid.increment u = ok (.Err UlidError.Overflow) := by
-  unfold Ulid.increment
-  dsimp only
-  rw [if_pos hlo, if_pos hrhi]
 
 /-! ## 4. Hex & Crockford Base32 Single-Character Codecs -/
 
@@ -1322,39 +1119,11 @@ theorem hex_lower_roundtrip (d : Std.I32) (h0 : 0 ≤ d.val) (h1 : d.val < 16) :
     match k with
     | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 =>
       unfold hex_char_lower Pion.I32.shr
-      rw [if_pos (by decide), b_ok, b_ok]
+      rw [ite_eq_left (by decide), b_ok, b_ok]
       rfl
     | _ + 16 => omega
   rw [i32_eq_i32OfNat d h0 (by omega)]
   exact hall d.val.toNat (by omega)
-
-/-- Uppercase hex encode → decode roundtrip for all 4-bit nibbles `0..15`. -/
-theorem hex_upper_roundtrip (d : Std.I32) (h0 : 0 ≤ d.val) (h1 : d.val < 16) :
-    (do let b ← hex_char_upper d; hex_val_char (Pion.U8.to_int b)) = ok d := by
-  have hall : ∀ k : Nat, k < 16 →
-      (do let b ← hex_char_upper (i32OfNat k); hex_val_char (Pion.U8.to_int b)) =
-        ok (i32OfNat k) := by
-    intro k hk
-    match k with
-    | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 =>
-      unfold hex_char_upper Pion.I32.shr
-      rw [if_pos (by decide), b_ok, b_ok]
-      rfl
-    | _ + 16 => omega
-  rw [i32_eq_i32OfNat d h0 (by omega)]
-  exact hall d.val.toNat (by omega)
-
-/-- `hex_val_char` is case-insensitive on ASCII letters `A..Z` / `a..z`. -/
-theorem hex_val_char_case_insensitive (c : Std.I32) (h0 : 65 ≤ c.val) (h1 : c.val ≤ 90) :
-    hex_val_char (Pion.I32.add c 32#i32) = hex_val_char c := by
-  have hall : (List.range 26).all (fun k =>
-      resI32Eq (hex_val_char (Pion.I32.add (i32OfNat (65 + k)) 32#i32))
-               (hex_val_char (i32OfNat (65 + k)))) = true := by
-    decide
-  rw [i32_eq_i32OfNat c (by omega) (by omega)]
-  have heq : c.val.toNat = 65 + (c.val.toNat - 65) := by omega
-  rw [heq]
-  exact resI32Eq_eq (forall_nat_of_all _ hall (c.val.toNat - 65) (by omega))
 
 /-- `hex_val_char` always succeeds and returns either a valid nibble `0..15` or `-1`. -/
 theorem hex_val_char_range (c : Std.I32) :
@@ -1395,134 +1164,5 @@ theorem hex_val_char_range (c : Std.I32) :
     rw [heq]
     exact hall ⟨c.val.toNat - 97, by omega⟩
   · exact ⟨(-1)#i32, rfl, Or.inr rfl⟩
-
-/-- **Crockford Base32 Roundtrip**: every 5-bit value `0..31` encoded by `crockford_encode_digit`
-    decodes back to itself via both `crockford_val` and `crockford_val_strict`. -/
-theorem crockford_encode_decode_roundtrip (d : Std.I32) (h0 : 0 ≤ d.val) (h1 : d.val < 32) :
-    (do let b ← crockford_encode_digit d; crockford_val (Pion.U8.to_int b)) = ok d := by
-  have hall : ∀ k : Nat, k < 32 →
-      (do let b ← crockford_encode_digit (i32OfNat k); crockford_val (Pion.U8.to_int b)) =
-        ok (i32OfNat k) := by
-    intro k hk
-    match k with
-    | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15
-    | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 =>
-      unfold crockford_encode_digit
-      rw [b_ok]
-      rfl
-    | _ + 32 => omega
-  rw [i32_eq_i32OfNat d h0 (by omega)]
-  exact hall d.val.toNat (by omega)
-
-theorem crockford_encode_decode_strict_roundtrip (d : Std.I32) (h0 : 0 ≤ d.val) (h1 : d.val < 32) :
-    (do let b ← crockford_encode_digit d; crockford_val_strict (Pion.U8.to_int b)) = ok d := by
-  have hall : ∀ k : Nat, k < 32 →
-      (do let b ← crockford_encode_digit (i32OfNat k); crockford_val_strict (Pion.U8.to_int b)) =
-        ok (i32OfNat k) := by
-    intro k hk
-    match k with
-    | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15
-    | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 =>
-      unfold crockford_encode_digit
-      rw [b_ok]
-      rfl
-    | _ + 32 => omega
-  rw [i32_eq_i32OfNat d h0 (by omega)]
-  exact hall d.val.toNat (by omega)
-
-/-- Crockford Base32 alias rules: `I`/`i`/`L`/`l` → `1`, `O`/`o` → `0`. -/
-theorem crockford_aliases :
-    crockford_val 73#i32 = ok 1#i32 ∧
-    crockford_val 105#i32 = ok 1#i32 ∧
-    crockford_val 76#i32 = ok 1#i32 ∧
-    crockford_val 108#i32 = ok 1#i32 ∧
-    crockford_val 79#i32 = ok 0#i32 ∧
-    crockford_val 111#i32 = ok 0#i32 :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
-
-/-- Strict Crockford Base32 rejects `I`/`i`/`L`/`l`/`O`/`o` aliases (matching Rust `ulid 1.2.1`). -/
-theorem crockford_strict_rejects_aliases :
-    crockford_val_strict 73#i32 = ok (-1)#i32 ∧
-    crockford_val_strict 105#i32 = ok (-1)#i32 ∧
-    crockford_val_strict 76#i32 = ok (-1)#i32 ∧
-    crockford_val_strict 108#i32 = ok (-1)#i32 ∧
-    crockford_val_strict 79#i32 = ok (-1)#i32 ∧
-    crockford_val_strict 111#i32 = ok (-1)#i32 :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
-
-/-- Crockford Base32 decoding is case-insensitive on ASCII letters `A..Z` / `a..z`. -/
-theorem crockford_case_insensitive (c : Std.I32) (h0 : 65 ≤ c.val) (h1 : c.val ≤ 90) :
-    crockford_val (Pion.I32.add c 32#i32) = crockford_val c ∧
-    crockford_val_strict (Pion.I32.add c 32#i32) = crockford_val_strict c := by
-  have hall1 : (List.range 26).all (fun k =>
-      resI32Eq (crockford_val (Pion.I32.add (i32OfNat (65 + k)) 32#i32))
-               (crockford_val (i32OfNat (65 + k)))) = true := by decide
-  have hall2 : (List.range 26).all (fun k =>
-      resI32Eq (crockford_val_strict (Pion.I32.add (i32OfNat (65 + k)) 32#i32))
-               (crockford_val_strict (i32OfNat (65 + k)))) = true := by decide
-  rw [i32_eq_i32OfNat c (by omega) (by omega)]
-  have heq : c.val.toNat = 65 + (c.val.toNat - 65) := by omega
-  rw [heq]
-  exact ⟨resI32Eq_eq (forall_nat_of_all _ hall1 (c.val.toNat - 65) (by omega)),
-         resI32Eq_eq (forall_nat_of_all _ hall2 (c.val.toNat - 65) (by omega))⟩
-
-/-- Crockford Base32 rejects `'U'`/`'u'`, all control characters, symbols, punctuation, non-ASCII, and negative values. -/
-theorem crockford_rejects_invalid (c : Std.I32)
-    (hbad : c.val < 48 ∨ (57 < c.val ∧ c.val < 65) ∨ c.val = 85 ∨
-            (90 < c.val ∧ c.val < 97) ∨ c.val = 117 ∨ 122 < c.val) :
-    crockford_val c = ok (-1)#i32 := by
-  unfold crockford_val
-  dsimp only
-  by_cases h117 : c.val = 117
-  · have hc : c = 117#i32 := i32_ext_val h117
-    subst hc; rfl
-  · by_cases h85 : c.val = 85
-    · have hc : c = 85#i32 := i32_ext_val h85
-      subst hc; rfl
-    · have hnotlow : ((decide (c >= 97#i32)) && (decide (c <= 122#i32))) = false := by
-        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
-        by_cases h97 : 97 ≤ c.val
-        · right; change ¬ c.val ≤ 122; omega
-        · left; change ¬ c.val ≥ 97; omega
-      have hu : (if ((decide (c >= 97#i32)) && (decide (c <= 122#i32))) = true then Pion.I32.sub c 32#i32 else c) = c := by
-        rw [hnotlow]; rfl
-      rw [hu]
-      have h1 : ((decide (c >= 48#i32)) && (decide (c <= 57#i32))) = false := by
-        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
-        by_cases h : 48 ≤ c.val
-        · right; change ¬ c.val ≤ 57; omega
-        · left; change ¬ c.val ≥ 48; omega
-      have h2 : ((decide (c >= 65#i32)) && (decide (c <= 72#i32))) = false := by
-        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
-        by_cases h : 65 ≤ c.val
-        · right; change ¬ c.val ≤ 72; omega
-        · left; change ¬ c.val ≥ 65; omega
-      have h3 : ((c == 73#i32) || (c == 76#i32)) = false := by
-        simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne]
-        exact ⟨fun h => by have := congrArg IScalar.val h; change c.val = 73 at this; omega,
-               fun h => by have := congrArg IScalar.val h; change c.val = 76 at this; omega⟩
-      have h4 : ((c == 74#i32) || (c == 75#i32)) = false := by
-        simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne]
-        exact ⟨fun h => by have := congrArg IScalar.val h; change c.val = 74 at this; omega,
-               fun h => by have := congrArg IScalar.val h; change c.val = 75 at this; omega⟩
-      have h5 : ((c == 77#i32) || (c == 78#i32)) = false := by
-        simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne]
-        exact ⟨fun h => by have := congrArg IScalar.val h; change c.val = 77 at this; omega,
-               fun h => by have := congrArg IScalar.val h; change c.val = 78 at this; omega⟩
-      have h6 : ¬ c = 79#i32 := fun h => by
-        have := congrArg IScalar.val h; change c.val = 79 at this; omega
-      have h7 : ((decide (c >= 80#i32)) && (decide (c <= 84#i32))) = false := by
-        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
-        by_cases h : 80 ≤ c.val
-        · right; change ¬ c.val ≤ 84; omega
-        · left; change ¬ c.val ≥ 80; omega
-      have h8 : ((decide (c >= 86#i32)) && (decide (c <= 90#i32))) = false := by
-        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
-        by_cases h : 86 ≤ c.val
-        · right; change ¬ c.val ≤ 90; omega
-        · left; change ¬ c.val ≥ 86; omega
-      rw [h1, if_neg (by decide), h2, if_neg (by decide), h3, if_neg (by decide),
-          h4, if_neg (by decide), h5, if_neg (by decide), if_neg h6,
-          h7, if_neg (by decide), h8, if_neg (by decide)]
 
 end UuidProofs

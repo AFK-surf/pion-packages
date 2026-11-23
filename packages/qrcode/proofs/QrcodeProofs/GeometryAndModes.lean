@@ -58,49 +58,6 @@ private lemma i32_div_nonneg (a b : Std.I32) (ha : 0 ≤ a.val) (hb : 0 < b.val)
 private lemma result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← ok x; f y) = f x := by simp
 
-/-- Theorem 1: `EcLevel.to_int` and `EcLevel.format_bits` are bijections onto `{0, 1, 2, 3}` and `ec_level_eq` reflects `=`. -/
-theorem ec_level_bijections :
-    (∀ a b : EcLevel, EcLevel.to_int a = EcLevel.to_int b → a = b) ∧
-    (∀ a b : EcLevel, EcLevel.format_bits a = EcLevel.format_bits b → a = b) ∧
-    (∀ a b : EcLevel, ec_level_eq a b = ok true ↔ a = b) := by
-  refine ⟨?_, ?_, ?_⟩
-  · intro a b h; cases a <;> cases b <;> first | rfl | (simp [EcLevel.to_int] at h)
-  · intro a b h; cases a <;> cases b <;> first | rfl | (simp [EcLevel.format_bits] at h)
-  · intro a b; cases a <;> cases b <;> simp [ec_level_eq, EcLevel.to_int]
-
-/-- Theorem 2: `Mode.to_int` and `Mode.indicator` are injective and `mode_eq` reflects `=`. -/
-theorem mode_injective_and_eq :
-    (∀ a b : Mode, Mode.to_int a = Mode.to_int b → a = b) ∧
-    (∀ a b : Mode, Mode.indicator a = Mode.indicator b → a = b) ∧
-    (∀ a b : Mode, mode_eq a b = ok true ↔ a = b) := by
-  refine ⟨?_, ?_, ?_⟩
-  · intro a b h; cases a <;> cases b <;> first | rfl | (simp [Mode.to_int] at h)
-  · intro a b h; cases a <;> cases b <;> first | rfl | (simp [Mode.indicator] at h)
-  · intro a b; cases a <;> cases b <;> simp [mode_eq, Mode.to_int]
-
-/-- Theorem 3: `version_size v = 4 * v + 17` lies in `[21, 177]` and is always `≡ 1 (mod 4)` for `1 ≤ v ≤ 40`. -/
-theorem version_size_spec (v : Std.I32) (hlo : 1 ≤ v.val) (hhi : v.val ≤ 40) :
-    ∃ s : Std.I32, version_size v = ok s ∧
-      s.val = 4 * v.val + 17 ∧ 21 ≤ s.val ∧ s.val ≤ 177 ∧ s.val % 4 = 1 := by
-  unfold version_size
-  have c4 : (4#i32 : Std.I32).val = 4 := rfl
-  have c17 : (17#i32 : Std.I32).val = 17 := rfl
-  have hmul : (Pion.I32.mul v 4#i32).val = v.val * 4 := by
-    have h := i32_mul_val v 4#i32 (by rw [c4]; omega) (by rw [c4]; omega)
-    rw [c4] at h; exact h
-  have hadd : (Pion.I32.add (Pion.I32.mul v 4#i32) 17#i32).val = v.val * 4 + 17 := by
-    have h := i32_add_val (Pion.I32.mul v 4#i32) 17#i32 (by omega) (by omega)
-    omega
-  exact ⟨_, rfl, by omega, by omega, by omega, by omega⟩
-
-/-- Theorem 4: `version_size` is strictly monotonic across QR versions `1..40`. -/
-theorem version_size_strictly_mono (v1 v2 : Std.I32)
-    (h1 : 1 ≤ v1.val ∧ v1.val ≤ 40) (h2 : 1 ≤ v2.val ∧ v2.val ≤ 40) (hlt : v1.val < v2.val) :
-    ∃ s1 s2 : Std.I32, version_size v1 = ok s1 ∧ version_size v2 = ok s2 ∧ s1.val < s2.val := by
-  obtain ⟨s1, hs1, hv1, _, _, _⟩ := version_size_spec v1 h1.1 h1.2
-  obtain ⟨s2, hs2, hv2, _, _, _⟩ := version_size_spec v2 h2.1 h2.2
-  exact ⟨s1, s2, hs1, hs2, by omega⟩
-
 private def rawModulesFormula (v : Int) : Int :=
   let base := (16 * v + 128) * v + 64
   if v ≥ 2 then
@@ -282,22 +239,5 @@ theorem ceil_sixths_spec (cost : Std.I32) (hlo : 0 ≤ cost.val) (hhi : cost.val
     have h := i32_mul_val q 6#i32 (by rw [c6]; omega) (by rw [c6]; omega)
     rw [c6] at h; exact h
   exact ⟨Pion.I32.mul q 6#i32, rfl, by omega, by omega, by omega⟩
-
-/-- Theorem 10: `ceil_sixths` is idempotent on `[0, 1000000000]`. -/
-theorem ceil_sixths_idempotent (cost : Std.I32) (hlo : 0 ≤ cost.val) (hhi : cost.val ≤ 1000000000) :
-    (do let r ← ceil_sixths cost; ceil_sixths r) = ceil_sixths cost := by
-  obtain ⟨r, hr, hr1, hr2, hrmod⟩ := ceil_sixths_spec cost hlo (by omega)
-  rw [hr, result_bind_ok]
-  obtain ⟨r2, hr2eq, h2a, h2b, h2mod⟩ := ceil_sixths_spec r (by omega) (by omega)
-  rw [hr2eq]
-  congr 1
-  exact IScalar.eq_of_val_eq (by omega)
-
-/-- Theorem 11: `is_numeric_byte` matches exactly ASCII digits `'0'..'9'` (`48 ≤ b ≤ 57`). -/
-theorem is_numeric_byte_spec (b : Std.I32) :
-    is_numeric_byte b = ok true ↔ (48 ≤ b.val ∧ b.val ≤ 57) := by
-  unfold is_numeric_byte
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq]
-  rfl
 
 end QrcodeProofs

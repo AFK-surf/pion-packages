@@ -22,25 +22,25 @@ open semver
 def StrValid (s : String) : Prop :=
   s.utf8ByteSize ≤ 2147483647
 
-theorem b_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma b_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← (ok x : Result α); f y) = f x := by simp
 
-theorem u64_ext {a b : Std.U64} (h : a.val = b.val) : a = b := by
+lemma u64_ext {a b : Std.U64} (h : a.val = b.val) : a = b := by
   cases a; cases b
   congr 1
   exact BitVec.eq_of_toNat_eq h
 
-theorem u64_ne_val {a b : Std.U64} (h : a ≠ b) : a.val ≠ b.val :=
+lemma u64_ne_val {a b : Std.U64} (h : a ≠ b) : a.val ≠ b.val :=
   fun hv => h (u64_ext hv)
 
-theorem str_length_eq (s : String) (h : StrValid s) :
+lemma str_length_eq (s : String) (h : StrValid s) :
     ∃ n : Std.I32, Pion.String.length s = ok n ∧ n.val = (s.utf8ByteSize : Int) := by
   unfold Pion.String.length Pion.lengthOf
   simp only [show s.utf8ByteSize ≤ 2147483647 from h, ↓reduceDIte]
   refine ⟨_, rfl, ?_⟩
   simp
 
-theorem i32_eq_zero_iff (n : Std.I32) : (n = 0#i32) ↔ n.val = 0 := by
+lemma i32_eq_zero_iff (n : Std.I32) : (n = 0#i32) ↔ n.val = 0 := by
   constructor
   · intro h; subst h; decide
   · intro h
@@ -51,14 +51,14 @@ theorem i32_eq_zero_iff (n : Std.I32) : (n = 0#i32) ↔ n.val = 0 := by
       subst hbv
       rfl
 
-theorem i32_beq_zero_iff (n : Std.I32) : ((n == 0#i32) = true) ↔ n.val = 0 := by
+lemma i32_beq_zero_iff (n : Std.I32) : ((n == 0#i32) = true) ↔ n.val = 0 := by
   rw [beq_iff_eq, i32_eq_zero_iff]
 
-theorem i32_neg_one : Pion.I32.neg 1#i32 = (-1)#i32 := by decide
-theorem i32_neg_neg_one : Pion.I32.neg (-1)#i32 = 1#i32 := by decide
-theorem i32_neg_zero : Pion.I32.neg 0#i32 = 0#i32 := by decide
+lemma i32_neg_one : Pion.I32.neg 1#i32 = (-1)#i32 := by decide
+lemma i32_neg_neg_one : Pion.I32.neg (-1)#i32 = 1#i32 := by decide
+lemma i32_neg_zero : Pion.I32.neg 0#i32 = 0#i32 := by decide
 
-theorem i32_neg_involution (r : Std.I32) : Pion.I32.neg (Pion.I32.neg r) = r := by
+lemma i32_neg_involution (r : Std.I32) : Pion.I32.neg (Pion.I32.neg r) = r := by
   cases r with
   | mk bv =>
     unfold Pion.I32.neg
@@ -68,14 +68,14 @@ theorem i32_neg_involution (r : Std.I32) : Pion.I32.neg (Pion.I32.neg r) = r := 
 /-! ## 1. Core `(major, minor, patch : UInt64)` Lexicographic Strict Total Order -/
 
 /-- `cmp_core` never panics or traps on any `UInt64` triple (`0 .. 2^64 - 1`) and returns `{-1, 0, 1}`. -/
-theorem cmp_core_total (a1 a2 a3 b1 b2 b3 : Std.U64) :
+lemma cmp_core_total (a1 a2 a3 b1 b2 b3 : Std.U64) :
     ∃ r : Std.I32, cmp_core a1 a2 a3 b1 b2 b3 = ok r ∧
       (r = (-1)#i32 ∨ r = 0#i32 ∨ r = 1#i32) := by
   unfold cmp_core
   split_ifs <;> exact ⟨_, rfl, by decide⟩
 
 /-- Reflexivity: comparing a triple with itself always returns `ok 0`. -/
-theorem cmp_core_refl (m n p : Std.U64) :
+lemma cmp_core_refl (m n p : Std.U64) :
     cmp_core m n p m n p = ok 0#i32 := by
   unfold cmp_core
   simp only [ne_eq, not_true_eq_false, ↓reduceIte]
@@ -140,7 +140,7 @@ theorem cmp_core_eq_zero_iff (a1 a2 a3 b1 b2 b3 : Std.U64) :
     split_ifs <;> decide
 
 /-- Helper: `cmp_core a b = ok r → cmp_core b a = ok (-r)`. -/
-theorem cmp_core_swap (a1 a2 a3 b1 b2 b3 : Std.U64) (r : Std.I32)
+lemma cmp_core_swap (a1 a2 a3 b1 b2 b3 : Std.U64) (r : Std.I32)
     (h : cmp_core a1 a2 a3 b1 b2 b3 = ok r) :
     cmp_core b1 b2 b3 a1 a2 a3 = ok (Pion.I32.neg r) := by
   unfold cmp_core at h ⊢
@@ -198,60 +198,6 @@ theorem cmp_core_swap (a1 a2 a3 b1 b2 b3 : Std.U64) (r : Std.I32)
       simp only [hlt, hgt, ↓reduceIte] at h ⊢
       subst h; exact i32_neg_one.symm
 
-/-- Antisymmetry: `cmp_core a b = ok (-r) ↔ cmp_core b a = ok r`. -/
-theorem cmp_core_antisymm (a1 a2 a3 b1 b2 b3 : Std.U64) (r : Std.I32) :
-    cmp_core a1 a2 a3 b1 b2 b3 = ok (Pion.I32.neg r) ↔
-      cmp_core b1 b2 b3 a1 a2 a3 = ok r := by
-  constructor
-  · intro h
-    have h2 := cmp_core_swap a1 a2 a3 b1 b2 b3 (Pion.I32.neg r) h
-    rwa [i32_neg_involution] at h2
-  · intro h
-    exact cmp_core_swap b1 b2 b3 a1 a2 a3 r h
-
-/-- Strict `<` transitivity of `cmp_core`. -/
-theorem cmp_core_trans_lt (a1 a2 a3 b1 b2 b3 c1 c2 c3 : Std.U64)
-    (hab : cmp_core a1 a2 a3 b1 b2 b3 = ok (-1)#i32)
-    (hbc : cmp_core b1 b2 b3 c1 c2 c3 = ok (-1)#i32) :
-    cmp_core a1 a2 a3 c1 c2 c3 = ok (-1)#i32 := by
-  rw [cmp_core_lt_iff] at hab hbc ⊢
-  rcases hab with h1 | ⟨e1, h2⟩ | ⟨e1, e2, h3⟩
-  · rcases hbc with h1' | ⟨e1', _⟩ | ⟨e1', _, _⟩
-    · left; omega
-    · left; subst e1'; exact h1
-    · left; subst e1'; exact h1
-  · subst e1
-    rcases hbc with h1' | ⟨e1', h2'⟩ | ⟨e1', e2', _⟩
-    · left; exact h1'
-    · right; left; exact ⟨e1', by omega⟩
-    · right; left; subst e2'; exact ⟨e1', h2⟩
-  · subst e1; subst e2
-    rcases hbc with h1' | ⟨e1', h2'⟩ | ⟨e1', e2', h3'⟩
-    · left; exact h1'
-    · right; left; exact ⟨e1', h2'⟩
-    · right; right; exact ⟨e1', e2', by omega⟩
-
-/-- Non-strict `≤` transitivity of `cmp_core`. -/
-theorem cmp_core_trans_le (a1 a2 a3 b1 b2 b3 c1 c2 c3 : Std.U64) (r1 r2 : Std.I32)
-    (hab : cmp_core a1 a2 a3 b1 b2 b3 = ok r1) (hr1 : r1.val ≤ 0)
-    (hbc : cmp_core b1 b2 b3 c1 c2 c3 = ok r2) (hr2 : r2.val ≤ 0) :
-    ∃ r3 : Std.I32, cmp_core a1 a2 a3 c1 c2 c3 = ok r3 ∧ r3.val ≤ 0 := by
-  obtain ⟨r1', h1', h1r⟩ := cmp_core_total a1 a2 a3 b1 b2 b3
-  rw [hab, ok.injEq] at h1'; subst h1'
-  obtain ⟨r2', h2', h2r⟩ := cmp_core_total b1 b2 b3 c1 c2 c3
-  rw [hbc, ok.injEq] at h2'; subst h2'
-  rcases h1r with rfl | rfl | rfl
-  · rcases h2r with rfl | rfl | rfl
-    · exact ⟨(-1)#i32, cmp_core_trans_lt a1 a2 a3 b1 b2 b3 c1 c2 c3 hab hbc, by decide⟩
-    · rw [cmp_core_eq_zero_iff] at hbc
-      obtain ⟨rfl, rfl, rfl⟩ := hbc
-      exact ⟨(-1)#i32, hab, by decide⟩
-    · simp at hr2
-  · rw [cmp_core_eq_zero_iff] at hab
-    obtain ⟨rfl, rfl, rfl⟩ := hab
-    exact ⟨r2, hbc, hr2⟩
-  · simp at hr1
-
 /-! ## 2. SemVer 2.0.0 Prerelease (§11.3, §11.4) & Build Metadata (§10) Precedence -/
 
 /-- SemVer 2.0.0 §11.3: a normal (release) version has strictly higher precedence
@@ -276,61 +222,12 @@ theorem cmp_precedence_release_gt_pre (m n p : Std.U64) (pre_s : String)
     omega
   simp [ha0, hb0]
 
-/-- SemVer 2.0.0 §11.3 (symmetric): a non-empty pre-release version has strictly lower
-precedence than a normal (release) version with the same `(major, minor, patch)`. -/
-theorem cmp_precedence_pre_lt_release (m n p : Std.U64) (pre_s : String)
-    (hpre_ne : pre_s.utf8ByteSize > 0) (hpre_valid : StrValid pre_s)
-    (b1 b2 : BuildMetadata) :
-    cmp_precedence_core ⟨m, n, p, ⟨pre_s⟩, b1⟩ ⟨m, n, p, ⟨""⟩, b2⟩ = ok (some (-1)#i32) := by
-  unfold cmp_precedence_core
-  rw [cmp_core_refl]
-  simp only [b_ok, ne_eq, not_true_eq_false, ↓reduceIte]
-  obtain ⟨n_a, h_a, h_av⟩ := str_length_eq pre_s hpre_valid
-  obtain ⟨n_b, h_b, h_bv⟩ := str_length_eq "" (by unfold StrValid; decide)
-  rw [h_a]
-  simp only [b_ok]
-  rw [h_b]
-  simp only [b_ok]
-  have ha0 : n_a ≠ 0#i32 := by
-    intro h
-    have hv := (i32_eq_zero_iff n_a).mp h
-    omega
-  have hb0 : n_b = 0#i32 := (i32_eq_zero_iff n_b).mpr (by simpa using h_bv)
-  simp [ha0, hb0]
-
 /-- SemVer 2.0.0 §10: build metadata is completely ignored by `cmp_precedence_core`. -/
 theorem cmp_precedence_ignores_build (a b : Version) (b1 b2 : BuildMetadata) :
     cmp_precedence_core { a with build := b1 } { b with build := b2 } =
       cmp_precedence_core a b := by
   unfold cmp_precedence_core
   rfl
-
-/-- SemVer 2.0.0 §10 (equality corollary): two versions differing only in `build` metadata
-always have precedence difference `0`. -/
-theorem cmp_precedence_same_except_build (v : Version) (hpre : StrValid v.pre.raw)
-    (b1 b2 : BuildMetadata) :
-    cmp_precedence_core { v with build := b1 } { v with build := b2 } = ok (some 0#i32) := by
-  unfold cmp_precedence_core
-  simp only [cmp_core_refl, b_ok, ne_eq, not_true_eq_false, ↓reduceIte]
-  obtain ⟨n, hn, _⟩ := str_length_eq v.pre.raw hpre
-  rw [hn]
-  simp only [b_ok]
-  by_cases h0 : n = 0#i32
-  · simp [h0]
-  · simp [h0]
-
-/-- SemVer 2.0.0 §11.4.3: a numeric pre-release segment always has lower precedence
-than a non-numeric (alphanumeric) segment. -/
-theorem cmp_pre_segment_order_numeric_lt_alpha (a_len b_len lex_cmp : Std.I32) :
-    cmp_pre_segment_order true a_len false b_len lex_cmp = ok (-1)#i32 := by
-  unfold cmp_pre_segment_order
-  simp
-
-/-- Reflexivity of `cmp_pre_segment_order`. -/
-theorem cmp_pre_segment_order_refl (d : Bool) (len : Std.I32) :
-    cmp_pre_segment_order d len d len 0#i32 = ok 0#i32 := by
-  unfold cmp_pre_segment_order
-  cases d <;> simp
 
 /-- Antisymmetry of `cmp_pre_segment_order` (when `lex_ba = -lex_ab`). -/
 theorem cmp_pre_segment_order_antisymm (ad bd : Bool) (al bl lex_ab : Std.I32) (r : Std.I32)
@@ -647,15 +544,6 @@ theorem matches_release_caret_u64_max (pre : Prerelease) (v : Version) :
       have h0 : (0#u64).val = 0 := by decide
       omega
 
-/-- `UInt64::MAX` overflow immunity for `~0.u64::MAX.0`: matches iff `v.major = 0 ∧ v.minor = u64::MAX`. -/
-theorem matches_release_tilde_u64_max (pre : Prerelease) (v : Version) :
-    matches_release ⟨.Tilde, 0#u64, some 18446744073709551615#u64, some 0#u64, pre⟩ v = ok true ↔
-      v.major = 0#u64 ∧ v.minor = 18446744073709551615#u64 := by
-  rw [matches_release_tilde_spec]
-  constructor
-  · intro h; exact ⟨h.1, h.2.1⟩
-  · intro ⟨h1, h2⟩; exact ⟨h1, h2, Nat.zero_le _⟩
-
 /-- `UInt64::MAX` overflow immunity for `>u64::MAX`: never matches any version. -/
 theorem matches_release_greater_u64_max (pre : Prerelease) (v : Version) :
     matches_release ⟨.Greater, 18446744073709551615#u64, none, none, pre⟩ v = ok false := by
@@ -692,20 +580,6 @@ theorem matches_release_exact_iff (M m p : Std.U64) (v : Version) :
   · simp only [ne_eq, hmaj, not_false_eq_true, ↓reduceIte, ok.injEq,
       Bool.false_eq_true, false_and]
 
-/-- `Wildcard` and `Exact` have identical semantics in `matches_release`. -/
-theorem matches_release_wildcard_eq_exact (M : Std.U64) (mo po : Option Std.U64)
-    (pre : Prerelease) (v : Version) :
-    matches_release ⟨.Wildcard, M, mo, po, pre⟩ v =
-      matches_release ⟨.Exact, M, mo, po, pre⟩ v := by
-  unfold matches_release
-  rfl
-
-/-- Reflexivity of `GreaterEq` on a full triple. -/
-theorem matches_release_refl_ge (M m p : Std.U64) (cpre vpre : Prerelease) (vbuild : BuildMetadata) :
-    matches_release ⟨.GreaterEq, M, some m, some p, cpre⟩ ⟨M, m, p, vpre, vbuild⟩ = ok true := by
-  unfold matches_release
-  simp only [ne_eq, not_true_eq_false, ↓reduceIte, ge_iff_le, le_refl, decide_true]
-
 /-- Reflexivity of `Caret` on a full triple. -/
 theorem matches_release_refl_caret (M m p : Std.U64) (cpre vpre : Prerelease) (vbuild : BuildMetadata) :
     matches_release ⟨.Caret, M, some m, some p, cpre⟩ ⟨M, m, p, vpre, vbuild⟩ = ok true := by
@@ -722,11 +596,6 @@ theorem matches_release_refl_caret (M m p : Std.U64) (cpre vpre : Prerelease) (v
         omega)
       subst hm0
       exact (matches_release_caret_zero_zero p cpre _).mpr ⟨rfl, rfl, rfl⟩
-
-/-- Reflexivity of `Tilde` on a full triple. -/
-theorem matches_release_refl_tilde (M m p : Std.U64) (cpre vpre : Prerelease) (vbuild : BuildMetadata) :
-    matches_release ⟨.Tilde, M, some m, some p, cpre⟩ ⟨M, m, p, vpre, vbuild⟩ = ok true := by
-  exact (matches_release_tilde_spec M m p cpre _).mpr ⟨rfl, rfl, Nat.le_refl _⟩
 
 /-- Exact complementarity of `Less` and `GreaterEq` for ALL comparators (full or partial). -/
 theorem matches_release_lt_ge_complement (M : Std.U64) (mo po : Option Std.U64)

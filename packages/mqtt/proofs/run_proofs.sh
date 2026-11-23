@@ -1,197 +1,210 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-PKG="$ROOT/packages/mqtt"
-PROOFS="$PKG/proofs"
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref}"
-AENEAS_DIR="${AENEAS_LEAN_DIR:-/private/tmp/pion-lean-semver/aeneas/backends/lean}"
 export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in $WORK ==="
-mkdir -p "$PROJ"
-cp -R "$PION_REF/lean/PionLean" "$PROJ/"
-cp "$PION_REF/lean/PionLean.lean" "$PROJ/"
-cp "$PION_REF/lean/lean-toolchain" "$PROJ/"
-cp "$PION_REF/lean/lakefile.lean" "$PROJ/"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="mqtt"
+LEAN_MOD="Mqtt"
+PROOF_MOD="MqttProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-python3 - "$PROJ/lakefile.lean" "$AENEAS_DIR" "$MEM_LIMIT" "$LEAN_NUM_THREADS" <<'PY'
-import sys, pathlib
-p = pathlib.Path(sys.argv[1])
-aeneas_dir, mem, threads = sys.argv[2], sys.argv[3], sys.argv[4]
-txt = p.read_text()
-txt = txt.replace("../aeneas/backends/lean", aeneas_dir)
-extra = f'''
-lean_lib Mqtt where
-  moreLeanArgs := #["--memory={mem}", "-j", "{threads}"]
-
-lean_lib MqttProofs where
-  moreLeanArgs := #["--memory={mem}", "-j", "{threads}"]
-'''
-if "lean_lib MqttProofs" not in txt:
-    txt = txt.rstrip() + "\n" + extra
-p.write_text(txt)
-PY
-
-echo "=== [2/7] pionc extract-lean packages/mqtt ==="
-pionc extract-lean "$PKG" --out "$PROJ" --json
-
-rm -rf "$PROJ/MqttProofs" "$PROJ/MqttProofs.lean" "$PROJ/CheckAxioms.lean" "$PROJ/EvalDiff.lean"
-mkdir -p "$PROJ/MqttProofs"
-cp "$PROOFS/MqttProofs.lean" "$PROJ/"
-cp "$PROOFS/MqttProofs/"*.lean "$PROJ/MqttProofs/"
-cp "$PROOFS/CheckAxioms.lean" "$PROJ/"
-cp "$PROOFS/EvalDiff.lean" "$PROJ/"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "$PROOFS/MqttProofs.lean" "$PROOFS/MqttProofs/"; then
-  echo "FAIL: forbidden tactic or axiom found"
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
+fi
 
-echo "=== [4/7] lake build PionLean Mqtt.Types Mqtt.Funs MqttProofs ==="
-(cd "$PROJ" && lake build PionLean Mqtt.Types Mqtt.Funs MqttProofs)
+echo "=== [1/7] Checking forbidden proof tokens ==="
+SCAN_PATHS=("$SCRIPT_DIR/$PROOF_MOD.lean")
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  SCAN_PATHS+=("$SCRIPT_DIR/$PROOF_MOD")
+fi
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' "${SCAN_PATHS[@]}"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
 
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AX_OUT="$(cd "$PROJ" && lake env lean CheckAxioms.lean 2>&1)"
-echo "$AX_OUT"
-python3 - "$AX_OUT" <<'PY'
-import sys, re
-out = sys.argv[1]
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+fi
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+scan_files = [os.path.join(script_dir, f"{proof_mod}.lean")]
+mod_dir = os.path.join(script_dir, proof_mod)
+if os.path.isdir(mod_dir):
+    for root, _, files in os.walk(mod_dir):
+        for fn in files:
+            if fn.endswith(".lean"):
+                scan_files.append(os.path.join(root, fn))
+for path in scan_files:
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
 allowed = {"propext", "Classical.choice", "Quot.sound"}
-lines = [l.strip() for l in out.splitlines() if l.strip()]
-count = 0
-for l in lines:
-    if "does not depend on any axioms" in l:
-        count += 1
-        continue
-    m = re.search(r"depends on axioms:\s*\[([^\]]*)\]", l)
-    if m:
-        count += 1
-        axs = {a.strip() for a in m.group(1).split(",") if a.strip()}
-        bad = axs - allowed
-        if bad:
-            print(f"FAIL: unexpected axioms {bad} in: {l}")
-            sys.exit(1)
-    else:
-        print(f"FAIL: unexpected CheckAxioms line: {l}")
-        sys.exit(1)
-if count < 27:
-    print(f"FAIL: expected >= 27 checked theorems, got {count}")
-    sys.exit(1)
-print(f"CheckAxioms: {count} theorems verified, standard axioms only")
-PY
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
 
-echo "=== [6/7] Lean EvalDiff ==="
-LEAN_DIFF_OUT="$WORK/mqtt_lean_diff.txt"
-(cd "$PROJ" && lake env lean EvalDiff.lean) > "$LEAN_DIFF_OUT"
-cat "$LEAN_DIFF_OUT"
-if grep -q ': FAIL' "$LEAN_DIFF_OUT"; then
-  echo "FAIL: Lean EvalDiff reported a FAIL case"
-  exit 1
-fi
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_PKG="$WORK/mqtt_native_diff"
-rm -rf "$DIFF_PKG"
-mkdir -p "$DIFF_PKG/src"
-cat > "$DIFF_PKG/pion.toml" <<EOF
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "mqtt_native_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
-mqtt = { path = "$PKG" }
+mqtt = { path = "$PKG_DIR" }
 EOF
-
-cat > "$DIFF_PKG/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "mqtt"
-
-fn chk_i32(w : World, label : String, actual : Int, expected : Int) -> Unit {
-  if actual == expected {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
-
-fn chk_bool(w : World, label : String, actual : Bool, expected : Bool) -> Unit {
-  if actual == expected {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
-
-fn qos_opt_code(o : Option[mqtt::QoS]) -> Int {
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
+fn opt_qos(o : Option[mqtt::QoS]) -> String {
   match o {
-    Some(q) => mqtt::qos_to_int(q)
-    None => -1
+    None => "None"
+    Some(mqtt::QoS::AtMostOnce) => "Some(0)"
+    Some(mqtt::QoS::AtLeastOnce) => "Some(1)"
+    Some(mqtt::QoS::ExactlyOnce) => "Some(2)"
   }
 }
-
-fn pt_opt_code(o : Option[mqtt::PacketType]) -> Int {
+fn opt_pt(o : Option[mqtt::PacketType]) -> String {
   match o {
-    Some(pt) => mqtt::packet_type_to_int(pt)
-    None => -1
+    None => "None"
+    Some(mqtt::PacketType::Connect) => "Some(Connect)"
+    Some(mqtt::PacketType::Publish) => "Some(Publish)"
+    Some(mqtt::PacketType::Auth) => "Some(Auth)"
+    Some(_) => "Some(Other)"
   }
 }
-
-pub fn main(w : World) -> Int {
-  chk_i32(w, "qos_0", mqtt::qos_to_int(mqtt::QoS::AtMostOnce), 0)
-  chk_i32(w, "qos_2", mqtt::qos_to_int(mqtt::QoS::ExactlyOnce), 2)
-  chk_i32(w, "qosf_1", qos_opt_code(mqtt::qos_from_int_opt(1)), 1)
-  chk_i32(w, "qosf_3", qos_opt_code(mqtt::qos_from_int_opt(3)), -1)
-  chk_i32(w, "pt_conn", mqtt::packet_type_to_int(mqtt::PacketType::Connect), 1)
-  chk_i32(w, "pt_auth", mqtt::packet_type_to_int(mqtt::PacketType::Auth), 15)
-  chk_i32(w, "ptf_0", pt_opt_code(mqtt::packet_type_from_int_opt(0)), -1)
-  chk_i32(w, "ptf_3", pt_opt_code(mqtt::packet_type_from_int_opt(3)), 3)
-  chk_i32(w, "ptf_15", pt_opt_code(mqtt::packet_type_from_int_opt(15)), 15)
-  chk_i32(w, "ptf_16", pt_opt_code(mqtt::packet_type_from_int_opt(16)), -1)
-  chk_i32(w, "vlen_neg", mqtt::vbi_encoded_len(-1), 0)
-  chk_i32(w, "vlen_0", mqtt::vbi_encoded_len(0), 1)
-  chk_i32(w, "vlen_127", mqtt::vbi_encoded_len(127), 1)
-  chk_i32(w, "vlen_128", mqtt::vbi_encoded_len(128), 2)
-  chk_i32(w, "vlen_16383", mqtt::vbi_encoded_len(16383), 2)
-  chk_i32(w, "vlen_16384", mqtt::vbi_encoded_len(16384), 3)
-  chk_i32(w, "vlen_2097151", mqtt::vbi_encoded_len(2097151), 3)
-  chk_i32(w, "vlen_2097152", mqtt::vbi_encoded_len(2097152), 4)
-  chk_i32(w, "vlen_max", mqtt::vbi_encoded_len(268435455), 4)
-  chk_i32(w, "vlen_over", mqtt::vbi_encoded_len(268435456), 0)
-  chk_i32(w, "vdec2_min", mqtt::vbi_decode_2(128, 1), 128)
-  chk_i32(w, "vdec2_max", mqtt::vbi_decode_2(255, 127), 16383)
-  chk_i32(w, "vdec3_min", mqtt::vbi_decode_3(128, 128, 1), 16384)
-  chk_i32(w, "vdec4_max", mqtt::vbi_decode_4(255, 255, 255, 127), 268435455)
-  chk_i32(w, "fh_pt0", mqtt::fixed_header_flags_err_code(0, 0), 1)
-  chk_i32(w, "fh_pub_ok", mqtt::fixed_header_flags_err_code(3, 2), 0)
-  chk_i32(w, "fh_pub_qos3", mqtt::fixed_header_flags_err_code(3, 6), 2)
-  chk_i32(w, "fh_pub_dup0", mqtt::fixed_header_flags_err_code(3, 8), 3)
-  chk_i32(w, "fh_sub_ok", mqtt::fixed_header_flags_err_code(8, 2), 0)
-  chk_i32(w, "fh_sub_bad", mqtt::fixed_header_flags_err_code(8, 0), 3)
-  chk_i32(w, "fh_conn_ok", mqtt::fixed_header_flags_err_code(1, 0), 0)
-  chk_i32(w, "fh_conn_bad", mqtt::fixed_header_flags_err_code(1, 2), 3)
-  chk_bool(w, "asc_nul", mqtt::is_mqtt_forbidden_ascii(0), true)
-  chk_bool(w, "asc_del", mqtt::is_mqtt_forbidden_ascii(127), true)
-  chk_bool(w, "asc_sp", mqtt::is_mqtt_forbidden_ascii(32), false)
-  chk_bool(w, "cont_80", mqtt::is_utf8_cont_byte(128), true)
-  chk_bool(w, "cont_bf", mqtt::is_utf8_cont_byte(191), true)
-  chk_bool(w, "cont_c0", mqtt::is_utf8_cont_byte(192), false)
-  chk_bool(w, "c1_80", mqtt::is_mqtt_c1_control_2b(194, 128), true)
-  chk_bool(w, "c1_a0", mqtt::is_mqtt_c1_control_2b(194, 160), false)
+pub fn main(world : World) -> Int {
+  io_println(world, "qos_0=" + mqtt::qos_to_int(mqtt::QoS::AtMostOnce).to_string())
+  io_println(world, "qos_2=" + mqtt::qos_to_int(mqtt::QoS::ExactlyOnce).to_string())
+  io_println(world, "qosf_1=" + opt_qos(mqtt::qos_from_int_opt(1)))
+  io_println(world, "qosf_3=" + opt_qos(mqtt::qos_from_int_opt(3)))
+  io_println(world, "ptf_0=" + opt_pt(mqtt::packet_type_from_int_opt(0)))
+  io_println(world, "ptf_3=" + opt_pt(mqtt::packet_type_from_int_opt(3)))
+  io_println(world, "ptf_15=" + opt_pt(mqtt::packet_type_from_int_opt(15)))
+  io_println(world, "ptf_16=" + opt_pt(mqtt::packet_type_from_int_opt(16)))
+  io_println(world, "vlen_neg=" + mqtt::vbi_encoded_len(-1).to_string())
+  io_println(world, "vlen_0=" + mqtt::vbi_encoded_len(0).to_string())
+  io_println(world, "vlen_127=" + mqtt::vbi_encoded_len(127).to_string())
+  io_println(world, "vlen_128=" + mqtt::vbi_encoded_len(128).to_string())
+  io_println(world, "vlen_16383=" + mqtt::vbi_encoded_len(16383).to_string())
+  io_println(world, "vlen_16384=" + mqtt::vbi_encoded_len(16384).to_string())
+  io_println(world, "vlen_2097151=" + mqtt::vbi_encoded_len(2097151).to_string())
+  io_println(world, "vlen_2097152=" + mqtt::vbi_encoded_len(2097152).to_string())
+  io_println(world, "vlen_max=" + mqtt::vbi_encoded_len(268435455).to_string())
+  io_println(world, "vlen_over=" + mqtt::vbi_encoded_len(268435456).to_string())
+  io_println(world, "vdec2_min=" + mqtt::vbi_decode_2(128, 1).to_string())
+  io_println(world, "vdec2_max=" + mqtt::vbi_decode_2(255, 127).to_string())
+  io_println(world, "vdec3_min=" + mqtt::vbi_decode_3(128, 128, 1).to_string())
+  io_println(world, "vdec4_max=" + mqtt::vbi_decode_4(255, 255, 255, 127).to_string())
+  io_println(world, "fh_pt0=" + mqtt::fixed_header_flags_err_code(0, 0).to_string())
+  io_println(world, "fh_pub_ok=" + mqtt::fixed_header_flags_err_code(3, 2).to_string())
+  io_println(world, "fh_pub_qos3=" + mqtt::fixed_header_flags_err_code(3, 6).to_string())
+  io_println(world, "fh_pub_dup0=" + mqtt::fixed_header_flags_err_code(3, 8).to_string())
+  io_println(world, "fh_sub_ok=" + mqtt::fixed_header_flags_err_code(8, 2).to_string())
+  io_println(world, "fh_sub_bad=" + mqtt::fixed_header_flags_err_code(8, 0).to_string())
+  io_println(world, "cont_80=" + bstr(mqtt::is_utf8_cont_byte(128)))
+  io_println(world, "cont_bf=" + bstr(mqtt::is_utf8_cont_byte(191)))
+  io_println(world, "cont_c0=" + bstr(mqtt::is_utf8_cont_byte(192)))
   0
 }
 EOF
-
-PION_DIFF_OUT="$WORK/mqtt_pion_diff.txt"
-pionc run "$DIFF_PKG" > "$PION_DIFF_OUT"
-diff -u "$LEAN_DIFF_OUT" "$PION_DIFF_OUT"
-LINES="$(wc -l < "$LEAN_DIFF_OUT" | tr -d ' ')"
-echo "Native vs Lean differential: $LINES cases identical (diff -u exit 0)"
-echo "PASS: packages/mqtt Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

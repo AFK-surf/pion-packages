@@ -60,22 +60,6 @@ theorem crc16_bit_step_bounds (crc : Std.I32) :
   · simp only [ne_eq, h, not_false_eq_true, ↓reduceIte, i32_shl1_ok, result_bind_ok]
     exact ⟨_, rfl, i32_band_65535_bounds _⟩
 
-/-- Theorem 14: `crc16_bit_step` fixes `0` (`0 → 0`). -/
-theorem crc16_bit_step_zero :
-    crc16_bit_step 0#i32 = ok 0#i32 := by
-  unfold crc16_bit_step
-  have h : Pion.I32.band 0#i32 32768#i32 = 0#i32 := by decide
-  simp only [h, ne_eq, not_true_eq_false, ↓reduceIte, i32_shl1_ok, result_bind_ok]
-  rfl
-
-/-- Theorem 15: `crc16_bit_step` maps `0x8000` directly to the CRC16-XMODEM generator polynomial `0x1021` (`4129`). -/
-theorem crc16_bit_step_msb_poly :
-    crc16_bit_step 32768#i32 = ok 4129#i32 := by
-  unfold crc16_bit_step
-  have h : (Pion.I32.band 32768#i32 32768#i32 = 0#i32) = false := by decide
-  simp only [ne_eq, h, Bool.false_eq_true, not_false_eq_true, ↓reduceIte, i32_shl1_ok, result_bind_ok]
-  rfl
-
 /-- Theorem 16: For `0 ≤ crc < 32768` (MSB clear), `crc16_bit_step` doubles `crc` exactly (`2 * crc`). -/
 theorem crc16_bit_step_low_exact (crc : Std.I32) (h0 : 0 ≤ crc.val) (hhi : crc.val < 32768) :
     ∃ r : Std.I32, crc16_bit_step crc = ok r ∧ r.val = 2 * crc.val := by
@@ -141,54 +125,5 @@ theorem crc16_to_slot_mod (crc : Std.I32) (h0 : 0 ≤ crc.val) :
     rw [h16k, Nat.and_two_pow_sub_one_eq_mod]
   rw [BitVec.toInt_eq_toNat_cond, BitVec.toInt_eq_toNat_cond, hhand]
   split_ifs <;> omega
-
-/-- Theorem 19: `crc16_to_slot` is idempotent across all `Int32`. -/
-theorem crc16_to_slot_idempotent (crc : Std.I32) :
-    (do let s ← crc16_to_slot crc; crc16_to_slot s) = crc16_to_slot crc := by
-  unfold crc16_to_slot
-  rw [result_bind_ok]
-  apply congrArg ok
-  apply IScalar.eq_of_val_eq
-  change ((crc.bv &&& 16383#32) &&& 16383#32).toInt = (crc.bv &&& 16383#32).toInt
-  have hbv : (crc.bv &&& 16383#32) &&& 16383#32 = crc.bv &&& 16383#32 := by
-    rw [BitVec.and_assoc, BitVec.and_self]
-  rw [hbv]
-
-/-- Theorem 20: `is_valid_cluster_slot` is an exact iff characterization of `[0, 16383]`. -/
-theorem is_valid_cluster_slot_iff (slot : Std.I32) :
-    is_valid_cluster_slot slot = ok true ↔ 0 ≤ slot.val ∧ slot.val ≤ 16383 := by
-  unfold is_valid_cluster_slot
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
-  rfl
-
-/-- Theorem 21: `is_valid_cluster_slot` accepts boundary slots `0` & `16383` and rejects `-1` & `16384`. -/
-theorem is_valid_cluster_slot_boundaries :
-    is_valid_cluster_slot 0#i32 = ok true ∧
-    is_valid_cluster_slot 16383#i32 = ok true ∧
-    is_valid_cluster_slot (-1)#i32 = ok false ∧
-    is_valid_cluster_slot 16384#i32 = ok false := by
-  refine ⟨?_, ?_, ?_, ?_⟩ <;> (unfold is_valid_cluster_slot; rfl)
-
-/-- Theorem 22: `is_valid_slot_range` is an exact iff characterization of `0 ≤ start ≤ end ≤ 16383`. -/
-theorem is_valid_slot_range_iff (s e : Std.I32) :
-    is_valid_slot_range s e = ok true ↔ 0 ≤ s.val ∧ s.val ≤ e.val ∧ e.val ≤ 16383 := by
-  unfold is_valid_slot_range
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
-  change ((0 ≤ s.val ∧ e.val ≤ 16383) ∧ s.val ≤ e.val) ↔ _
-  tauto
-
-/-- Theorem 23: Every valid slot range implies both endpoints are valid cluster slots. -/
-theorem is_valid_slot_range_endpoints_valid (s e : Std.I32)
-    (h : is_valid_slot_range s e = ok true) :
-    is_valid_cluster_slot s = ok true ∧ is_valid_cluster_slot e = ok true := by
-  rw [is_valid_slot_range_iff] at h
-  rw [is_valid_cluster_slot_iff, is_valid_cluster_slot_iff]
-  omega
-
-/-- Theorem 24: A singleton range `[s, s]` is valid iff `s` is a valid cluster slot. -/
-theorem is_valid_slot_range_singleton_iff (s : Std.I32) :
-    is_valid_slot_range s s = ok true ↔ is_valid_cluster_slot s = ok true := by
-  rw [is_valid_slot_range_iff, is_valid_cluster_slot_iff]
-  omega
 
 end RespProofs

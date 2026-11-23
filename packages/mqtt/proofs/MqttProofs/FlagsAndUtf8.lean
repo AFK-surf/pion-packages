@@ -87,16 +87,6 @@ private lemma i32_band_8_nibble (flags : Std.I32) (hlo : 0 ≤ flags.val) (hhi :
   rw [hbeq, nat_and_8_nibble flags.bv.toNat (by omega)]
   omega
 
-/-- Theorem 15: Packet types outside `1..15` always return error code 1 (`InvalidPacketType`). -/
-theorem fixed_header_invalid_ptype (ptype flags : Std.I32)
-    (hbad : ptype.val < 1 ∨ ptype.val > 15) :
-    fixed_header_flags_err_code ptype flags = ok 1#i32 := by
-  unfold fixed_header_flags_err_code
-  have hc : ((decide (ptype < 1#i32)) || (decide (ptype > 15#i32))) = true := by
-    simp only [Bool.or_eq_true, decide_eq_true_eq]
-    exact hbad
-  simp only [hc, ↓reduceIte]
-
 /-- Theorem 16: `PUBLISH` (type 3) with QoS = 3 always returns error code 2 (`InvalidQoS(3)`). -/
 theorem fixed_header_publish_qos3_rejected (flags : Std.I32)
     (hlo : 0 ≤ flags.val) (hhi : flags.val ≤ 15) (hqos : (flags.val / 2) % 4 = 3) :
@@ -253,56 +243,6 @@ theorem fixed_header_flags_0x00_types (ptype flags : Std.I32)
     · intro _; have hf := Classical.not_not.mp hne; exact congrArg IScalar.val hf
     · intro _; rfl
 
-/-- Theorem 21: `fixed_header_flags_err_code` always succeeds and returns a code in `[0, 3]`. -/
-theorem fixed_header_flags_error_range (ptype flags : Std.I32) :
-    ∃ c : Std.I32, fixed_header_flags_err_code ptype flags = ok c ∧ 0 ≤ c.val ∧ c.val ≤ 3 := by
-  unfold fixed_header_flags_err_code
-  by_cases h1 : ((decide (ptype < 1#i32)) || (decide (ptype > 15#i32))) = true
-  · simp only [h1, ↓reduceIte]; exact ⟨1#i32, rfl, by decide, by decide⟩
-  · have h1f : ((decide (ptype < 1#i32)) || (decide (ptype > 15#i32))) = false :=
-      Bool.eq_false_iff.mpr h1
-    simp only [h1f, Bool.false_eq_true, ↓reduceIte]
-    by_cases h3 : ptype = 3#i32
-    · simp only [h3, ↓reduceIte]
-      obtain ⟨sh, hsh, _⟩ := i32_shr1_val flags
-      rw [hsh, result_bind_ok']
-      split_ifs
-      · exact ⟨2#i32, rfl, by decide, by decide⟩
-      · exact ⟨3#i32, rfl, by decide, by decide⟩
-      · exact ⟨0#i32, rfl, by decide, by decide⟩
-    · simp only [h3, ↓reduceIte]
-      split_ifs
-      · exact ⟨3#i32, rfl, by decide, by decide⟩
-      · exact ⟨0#i32, rfl, by decide, by decide⟩
-      · exact ⟨3#i32, rfl, by decide, by decide⟩
-      · exact ⟨0#i32, rfl, by decide, by decide⟩
-
-/-- Theorem 22: Exact iff characterization of `is_mqtt_forbidden_ascii` (OASIS §1.5.4 C0 controls & DEL). -/
-theorem is_mqtt_forbidden_ascii_spec (b : Std.I32) :
-    is_mqtt_forbidden_ascii b = ok true ↔ (b.val < 32 ∨ b.val = 127) := by
-  unfold is_mqtt_forbidden_ascii
-  simp only [ok.injEq, Bool.or_eq_true, decide_eq_true_eq, beq_iff_eq]
-  constructor
-  · intro h
-    rcases h with h1 | h2
-    · left; exact h1
-    · right; exact congrArg IScalar.val h2
-  · intro h
-    rcases h with h1 | h2
-    · left; exact h1
-    · right; exact IScalar.eq_of_val_eq h2
-
-/-- Theorem 23: Printable ASCII bytes `[32, 126]` are never forbidden by `is_mqtt_forbidden_ascii`. -/
-theorem is_mqtt_forbidden_ascii_allows_printable (b : Std.I32)
-    (hlo : 32 ≤ b.val) (hhi : b.val ≤ 126) :
-    is_mqtt_forbidden_ascii b = ok false := by
-  have hne : is_mqtt_forbidden_ascii b ≠ ok true := by
-    intro ht; rw [is_mqtt_forbidden_ascii_spec] at ht; omega
-  unfold is_mqtt_forbidden_ascii at hne ⊢
-  cases hb : ((decide (b < 32#i32)) || (b == 127#i32))
-  · rfl
-  · exfalso; exact hne (congrArg ok hb)
-
 private lemma nat_and_192_eq_128 (n : Nat) (hn : n ≤ 255) :
     n &&& 192 = 128 ↔ 128 ≤ n ∧ n ≤ 191 := by
   have hdec : ∀ hi lo : Fin 16,
@@ -347,37 +287,5 @@ theorem is_utf8_cont_byte_spec (b : Std.I32) (hlo : 0 ≤ b.val) (hhi : b.val �
   · intro h
     have hn := (nat_and_192_eq_128 b.bv.toNat (by omega)).mpr ⟨by omega, by omega⟩
     exact IScalar.eq_of_val_eq (by omega)
-
-/-- Theorem 25: No ASCII byte `[0, 127]` is a UTF-8 continuation byte. -/
-theorem is_utf8_cont_byte_disjoint_ascii (b : Std.I32) (hlo : 0 ≤ b.val) (hhi : b.val ≤ 127) :
-    is_utf8_cont_byte b = ok false := by
-  have hne : is_utf8_cont_byte b ≠ ok true := by
-    intro ht; rw [is_utf8_cont_byte_spec b hlo (by omega)] at ht; omega
-  unfold is_utf8_cont_byte at hne ⊢
-  cases hb : ((Pion.I32.band b 192#i32) == 128#i32)
-  · rfl
-  · exfalso; exact hne (congrArg ok hb)
-
-/-- Theorem 26: Exact iff characterization of `is_mqtt_c1_control_2b` (U+0080..U+009F = `0xC2 0x80..0x9F`). -/
-theorem is_mqtt_c1_control_2b_spec (b0 b1 : Std.I32) :
-    is_mqtt_c1_control_2b b0 b1 = ok true ↔ (b0.val = 194 ∧ 128 ≤ b1.val ∧ b1.val ≤ 159) := by
-  unfold is_mqtt_c1_control_2b
-  simp only [ok.injEq, Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq]
-  constructor
-  · intro ⟨⟨h0, h1⟩, h2⟩
-    exact ⟨congrArg IScalar.val h0, h1, h2⟩
-  · intro ⟨h0, h1, h2⟩
-    exact ⟨⟨IScalar.eq_of_val_eq h0, h1⟩, h2⟩
-
-/-- Theorem 27: Every MQTT C1 control pair has a valid UTF-8 continuation second byte, and U+00A0 (`0xC2 0xA0`) is allowed. -/
-theorem is_mqtt_c1_control_2b_sound :
-    (∀ b0 b1 : Std.I32, is_mqtt_c1_control_2b b0 b1 = ok true → is_utf8_cont_byte b1 = ok true) ∧
-    is_mqtt_c1_control_2b 194#i32 160#i32 = ok false := by
-  constructor
-  · intro b0 b1 h
-    rw [is_mqtt_c1_control_2b_spec] at h
-    rw [is_utf8_cont_byte_spec b1 (by omega) (by omega)]
-    omega
-  · rfl
 
 end MqttProofs

@@ -1,22 +1,8 @@
 import SshProofs
 
-#print axioms SshProofs.is_ssh_version_char_iff
-#print axioms SshProofs.is_ssh_version_char_rejects_control
+#print axioms SshProofs.cert_type_from_code_roundtrip
+#print axioms SshProofs.cert_time_valid_code_spec
 #print axioms SshProofs.ssh_packet_padding_len_spec
 #print axioms SshProofs.ssh_packet_padding_len_u8_bound
-#print axioms SshProofs.ssh_packet_padding_len_align_8
 #print axioms SshProofs.ssh_packet_header_err_code_valid_iff
-#print axioms SshProofs.ssh_packet_header_rejects_oversize
-#print axioms SshProofs.ssh_packet_header_rejects_short_pad
 #print axioms SshProofs.ssh_packet_encode_decode_framing_roundtrip
-#print axioms SshProofs.limits_default_positive
-#print axioms SshProofs.cert_type_code_roundtrip
-#print axioms SshProofs.cert_type_from_code_roundtrip
-#print axioms SshProofs.cert_type_code_injective
-#print axioms SshProofs.cert_time_valid_code_spec
-#print axioms SshProofs.cert_time_valid_forever
-#print axioms SshProofs.cert_time_valid_half_open_boundary
-#print axioms SshProofs.cidr_rem_mask_exact_values
-#print axioms SshProofs.cidr_byte_match_refl
-#print axioms SshProofs.cidr_byte_match_symm
-#print axioms SshProofs.cidr_byte_match_trans

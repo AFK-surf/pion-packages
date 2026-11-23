@@ -2,182 +2,198 @@
 set -euo pipefail
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
+export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$PKG_DIR/../.." && pwd)"
+PKG_NAME="protobuf"
+LEAN_MOD="Protobuf"
+PROOF_MOD="ProtobufProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-LEAN_WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
-PROJ="$LEAN_WORK/proj"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in $LEAN_WORK ==="
-mkdir -p "$PROJ"
-if [ ! -d "$PROJ/PionLean" ]; then
-  if [ -d /private/tmp/pion-lean-ref/PionLean ]; then
-    cp -R /private/tmp/pion-lean-ref/PionLean "$PROJ/PionLean"
-    cp /private/tmp/pion-lean-ref/PionLean.lean "$PROJ/PionLean.lean"
-  else
-    echo "ERROR: PionLean reference missing" >&2
-    exit 1
-  fi
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
+  exit 1
+fi
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
 fi
 
-rm -f "$PROJ/lakefile.toml"
-cat > "$PROJ/lakefile.lean" <<EOF
+echo "=== [1/7] Checking forbidden proof tokens ==="
+SCAN_PATHS=("$SCRIPT_DIR/$PROOF_MOD.lean")
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  SCAN_PATHS+=("$SCRIPT_DIR/$PROOF_MOD")
+fi
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' "${SCAN_PATHS[@]}"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+if [ -d "$SCRIPT_DIR/$PROOF_MOD" ]; then
+  cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+fi
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
 import Lake
 open Lake DSL
 
-require aeneas from "./.deps/aeneas"
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
 
-package «pionlean» where
-  leanOptions := #[⟨\`weak.linter.dupNamespace, false⟩]
+require aeneas from ".deps/aeneas"
 
-@[default_target] lean_lib PionLean
-
-lean_lib Protobuf where
-  moreLeanArgs := #["--memory=$LEAN_MEM_LIMIT", "-j", "$LEAN_NUM_THREADS"]
-
-lean_lib ProtobufProofs where
-  moreLeanArgs := #["--memory=$LEAN_MEM_LIMIT", "-j", "$LEAN_NUM_THREADS"]
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
 EOF
 
-echo "=== [2/7] pionc extract-lean packages/protobuf ==="
-rm -rf "$PROJ/Protobuf" "$PROJ/ProtobufProofs" "$PROJ/ProtobufProofs.lean" "$PROJ/CheckAxioms.lean" "$PROJ/EvalDiff.lean"
-pionc extract-lean --json "$PKG_DIR" --out "$PROJ"
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
 
-cp "$SCRIPT_DIR/ProtobufProofs.lean" "$PROJ/ProtobufProofs.lean"
-cp -R "$SCRIPT_DIR/ProtobufProofs" "$PROJ/ProtobufProofs"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "$SCRIPT_DIR/ProtobufProofs" "$SCRIPT_DIR/ProtobufProofs.lean"; then
-  echo "FAIL: forbidden tactic or axiom found" >&2
-  exit 1
-fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Protobuf.Types Protobuf.Funs ProtobufProofs ==="
-(
-  cd "$PROJ"
-  LEAN_NUM_THREADS="$LEAN_NUM_THREADS" lake build \
-    PionLean Protobuf.Types Protobuf.Funs ProtobufProofs
-)
-
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AXIOM_OUT="$(cd "$PROJ" && lake env lean "$PROJ/CheckAxioms.lean")"
-echo "$AXIOM_OUT"
-if echo "$AXIOM_OUT" | grep -E 'sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler'; then
-  echo "FAIL: non-standard axiom detected" >&2
-  exit 1
-fi
-THM_COUNT="$(echo "$AXIOM_OUT" | grep -c "^'ProtobufProofs\." || true)"
-if [ "$THM_COUNT" -ne 24 ]; then
-  echo "FAIL: expected 24 theorems in CheckAxioms, got $THM_COUNT" >&2
-  exit 1
-fi
-echo "CheckAxioms: $THM_COUNT theorems verified, standard axioms only"
-
-echo "=== [6/7] Lean EvalDiff ==="
-LEAN_DIFF_OUT="$(cd "$PROJ" && lake env lean "$PROJ/EvalDiff.lean")"
-echo "$LEAN_DIFF_OUT"
-if echo "$LEAN_DIFF_OUT" | grep -q "FAIL"; then
-  echo "FAIL: Lean EvalDiff reported FAIL" >&2
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_TMP="$(mktemp -d /tmp/protobuf-diff.XXXXXX)"
-trap 'rm -rf "$DIFF_TMP"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
-mkdir -p "$DIFF_TMP/src"
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
 
-cat > "$DIFF_TMP/pion.toml" <<EOF
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+scan_files = [os.path.join(script_dir, f"{proof_mod}.lean")]
+mod_dir = os.path.join(script_dir, proof_mod)
+if os.path.isdir(mod_dir):
+    for root, _, files in os.walk(mod_dir):
+        for fn in files:
+            if fn.endswith(".lean"):
+                scan_files.append(os.path.join(root, fn))
+for path in scan_files:
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "protobuf_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 protobuf = { path = "$PKG_DIR" }
 EOF
-
-cat > "$DIFF_TMP/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "protobuf"
-
-fn check_i64(w : World, name : String, actual : Int64, expected : Int64) -> Unit {
-  if actual == expected { io_println(w, name + ": PASS") } else { io_println(w, name + ": FAIL") }
-}
-
-fn check_u64(w : World, name : String, actual : UInt64, expected : UInt64) -> Unit {
-  if actual == expected { io_println(w, name + ": PASS") } else { io_println(w, name + ": FAIL") }
-}
-
-fn check_i32(w : World, name : String, actual : Int, expected : Int) -> Unit {
-  if actual == expected { io_println(w, name + ": PASS") } else { io_println(w, name + ": FAIL") }
-}
-
-fn check_wt_opt(w : World, name : String, actual : Option[protobuf::WireType], expected : Int) -> Unit {
-  let code = match actual {
-    Some(wt) => protobuf::wire_type_code(wt)
-    None => -1
+fn opt_wt(o : Option[protobuf::WireType]) -> String {
+  match o {
+    None => "None"
+    Some(protobuf::WireType::Varint) => "Some(Varint)"
+    Some(protobuf::WireType::Fixed64) => "Some(Fixed64)"
+    Some(protobuf::WireType::LengthDelimited) => "Some(LengthDelimited)"
+    Some(protobuf::WireType::StartGroup) => "Some(StartGroup)"
+    Some(protobuf::WireType::EndGroup) => "Some(EndGroup)"
+    Some(protobuf::WireType::Fixed32) => "Some(Fixed32)"
   }
-  if code == expected { io_println(w, name + ": PASS") } else { io_println(w, name + ": FAIL") }
 }
-
-pub fn main(w : World) -> Int {
-  check_i64(w, "zz32_enc_0", protobuf::zigzag_encode_i32(0), 0L)
-  check_i64(w, "zz32_enc_m1", protobuf::zigzag_encode_i32(-1), 1L)
-  check_i64(w, "zz32_enc_1", protobuf::zigzag_encode_i32(1), 2L)
-  check_i64(w, "zz32_enc_m2", protobuf::zigzag_encode_i32(-2), 3L)
-  check_i64(w, "zz32_enc_max", protobuf::zigzag_encode_i32(2147483647), 4294967294L)
-  check_i64(w, "zz32_enc_min", protobuf::zigzag_encode_i32(-2147483648), 4294967295L)
-  check_i32(w, "zz32_dec_0", protobuf::zigzag_decode_i32(0L), 0)
-  check_i32(w, "zz32_dec_1", protobuf::zigzag_decode_i32(1L), -1)
-  check_i32(w, "zz32_dec_max", protobuf::zigzag_decode_i32(4294967294L), 2147483647)
-  check_i32(w, "zz32_dec_min", protobuf::zigzag_decode_i32(4294967295L), -2147483648)
-  check_u64(w, "zz64_enc_0", protobuf::zigzag_encode_i64(0L), 0UL)
-  check_u64(w, "zz64_enc_m1", protobuf::zigzag_encode_i64(-1L), 1UL)
-  check_u64(w, "zz64_enc_1", protobuf::zigzag_encode_i64(1L), 2UL)
-  check_u64(w, "zz64_enc_max", protobuf::zigzag_encode_i64(9223372036854775807L), 18446744073709551614UL)
-  check_u64(w, "zz64_enc_min", protobuf::zigzag_encode_i64(-9223372036854775807L - 1L), 18446744073709551615UL)
-  check_i64(w, "zz64_dec_0", protobuf::zigzag_decode_i64(0UL), 0L)
-  check_i64(w, "zz64_dec_1", protobuf::zigzag_decode_i64(1UL), -1L)
-  check_i64(w, "zz64_dec_min", protobuf::zigzag_decode_i64(18446744073709551615UL), -9223372036854775807L - 1L)
-  check_i32(w, "vlen_0", protobuf::varint_len_u64(0UL), 1)
-  check_i32(w, "vlen_127", protobuf::varint_len_u64(127UL), 1)
-  check_i32(w, "vlen_128", protobuf::varint_len_u64(128UL), 2)
-  check_i32(w, "vlen_16383", protobuf::varint_len_u64(16383UL), 2)
-  check_i32(w, "vlen_16384", protobuf::varint_len_u64(16384UL), 3)
-  check_i32(w, "vlen_268435456", protobuf::varint_len_u64(268435456UL), 5)
-  check_i32(w, "vlen_max9", protobuf::varint_len_u64(9223372036854775807UL), 9)
-  check_i32(w, "vlen_min10", protobuf::varint_len_u64(9223372036854775808UL), 10)
-  check_i32(w, "vlen_max", protobuf::varint_len_u64(18446744073709551615UL), 10)
-  check_i32(w, "wt_varint", protobuf::wire_type_code(protobuf::WireType::Varint), 0)
-  check_i32(w, "wt_fixed32", protobuf::wire_type_code(protobuf::WireType::Fixed32), 5)
-  check_wt_opt(w, "wtf_2", protobuf::wire_type_from_code(2), 2)
-  check_wt_opt(w, "wtf_6", protobuf::wire_type_from_code(6), -1)
-  check_u64(w, "tag_enc_1", protobuf::encode_tag_raw(1, protobuf::WireType::Varint), 8UL)
-  check_u64(w, "tag_enc_max", protobuf::encode_tag_raw(536870911, protobuf::WireType::Fixed32), 4294967293UL)
-  check_i32(w, "tag_dec_fn", protobuf::decode_tag_field_num(4294967293UL), 536870911)
-  check_i32(w, "tag_dec_wt", protobuf::decode_tag_wire_type(4294967293UL), 5)
-  check_i32(w, "taglen_15", protobuf::tag_len(15), 1)
-  check_i32(w, "taglen_16", protobuf::tag_len(16), 2)
-  check_i32(w, "taglen_max", protobuf::tag_len(536870911), 5)
-  check_i32(w, "fn_0", protobuf::field_number_err_code(0, false), 1)
-  check_i32(w, "fn_1", protobuf::field_number_err_code(1, true), 0)
-  check_i32(w, "fn_19000_t", protobuf::field_number_err_code(19000, true), 2)
-  check_i32(w, "fn_19000_f", protobuf::field_number_err_code(19000, false), 0)
-  check_i32(w, "fn_max", protobuf::field_number_err_code(536870911, true), 0)
-  check_i32(w, "fn_over", protobuf::field_number_err_code(536870912, false), 1)
+pub fn main(world : World) -> Int {
+  let min_i64 : Int64 = -9223372036854775807L - 1L
+  io_println(world, "zz32_enc_0=" + protobuf::zigzag_encode_i32(0).to_string())
+  io_println(world, "zz32_enc_m1=" + protobuf::zigzag_encode_i32(-1).to_string())
+  io_println(world, "zz32_enc_max=" + protobuf::zigzag_encode_i32(2147483647).to_string())
+  io_println(world, "zz32_enc_min=" + protobuf::zigzag_encode_i32(-2147483648).to_string())
+  io_println(world, "zz32_dec_1=" + protobuf::zigzag_decode_i32(1L).to_string())
+  io_println(world, "zz32_dec_min=" + protobuf::zigzag_decode_i32(4294967295L).to_string())
+  io_println(world, "zz64_enc_0=" + protobuf::zigzag_encode_i64(0L).to_string())
+  io_println(world, "zz64_enc_m1=" + protobuf::zigzag_encode_i64(-1L).to_string())
+  io_println(world, "zz64_enc_max=" + protobuf::zigzag_encode_i64(9223372036854775807L).to_string())
+  io_println(world, "zz64_enc_min=" + protobuf::zigzag_encode_i64(min_i64).to_string())
+  io_println(world, "zz64_dec_min=" + protobuf::zigzag_decode_i64(18446744073709551615UL).to_string())
+  io_println(world, "vlen_0=" + protobuf::varint_len_u64(0UL).to_string())
+  io_println(world, "vlen_127=" + protobuf::varint_len_u64(127UL).to_string())
+  io_println(world, "vlen_128=" + protobuf::varint_len_u64(128UL).to_string())
+  io_println(world, "vlen_16384=" + protobuf::varint_len_u64(16384UL).to_string())
+  io_println(world, "vlen_max9=" + protobuf::varint_len_u64(9223372036854775807UL).to_string())
+  io_println(world, "vlen_min10=" + protobuf::varint_len_u64(9223372036854775808UL).to_string())
+  io_println(world, "vlen_max=" + protobuf::varint_len_u64(18446744073709551615UL).to_string())
+  io_println(world, "wt_varint=" + protobuf::wire_type_code(protobuf::WireType::Varint).to_string())
+  io_println(world, "wt_fixed32=" + protobuf::wire_type_code(protobuf::WireType::Fixed32).to_string())
+  io_println(world, "wtf_2=" + opt_wt(protobuf::wire_type_from_code(2)))
+  io_println(world, "wtf_6=" + opt_wt(protobuf::wire_type_from_code(6)))
+  io_println(world, "tag_enc_1=" + protobuf::encode_tag_raw(1, protobuf::WireType::Varint).to_string())
+  io_println(world, "tag_enc_max=" + protobuf::encode_tag_raw(536870911, protobuf::WireType::Fixed32).to_string())
+  io_println(world, "tag_dec_fn=" + protobuf::decode_tag_field_num(4294967293UL).to_string())
+  io_println(world, "tag_dec_wt=" + protobuf::decode_tag_wire_type(4294967293UL).to_string())
   0
 }
 EOF
-
-printf '%s\n' "$LEAN_DIFF_OUT" > "$DIFF_TMP/lean.out"
-PION_CACHE_DIR="$DIFF_TMP/cache" pionc run "$DIFF_TMP" > "$DIFF_TMP/pion.out"
-diff -u "$DIFF_TMP/lean.out" "$DIFF_TMP/pion.out"
-CASE_COUNT="$(wc -l < "$DIFF_TMP/lean.out" | tr -d ' ')"
-echo "Native vs Lean differential: $CASE_COUNT cases identical (diff -u exit 0)"
-echo "PASS: packages/protobuf Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

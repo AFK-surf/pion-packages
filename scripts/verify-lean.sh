@@ -61,7 +61,7 @@ import os, signal, subprocess, sys, time
 
 pkg, script, timeout_s = sys.argv[1], sys.argv[2], int(sys.argv[3])
 proc = subprocess.Popen(
-    ["/bin/sh", script],
+    ["/usr/bin/env", "bash", script],
     start_new_session=True,
 )
 pgid = proc.pid
@@ -123,6 +123,7 @@ for pkg in $PKGS; do
   echo "==> [verify-lean] package=$pkg threads=$LEAN_NUM_THREADS mem=${LEAN_MEM_LIMIT}MB timeout=${TIMEOUT_SEC}s"
   echo "============================================================"
   run_with_pgroup_guard "$pkg" "$script" "$TIMEOUT_SEC"
+  rm -rf "${LEAN_WORK:-/private/tmp/pion-lean-work}/$pkg/.lake/build"
   TOTAL=$((TOTAL + 1))
 done
 
