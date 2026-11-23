@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` `v0.2.0` 的数据取自包 README（未记录 pion commit），发布验证（`verify.sh` 44 包、`ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`（`v0.1.0` 为 `AFK-surf/pion@8d110a3`）；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` `v0.2.0` 的数据取自包 README（未记录 pion commit），发布验证（`verify.sh` 44 包、`ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`（`v0.1.0` 为 `AFK-surf/pion@8d110a3`）；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`；Wave 10 四个包（`http2` / `jsonschema` / `mime` / `asn1`）的数据取自各包 README（未记录 pion commit），发布验证（`verify.sh` 51 包 4,706 / 4,706、4 个 `audit` 套件与 51 × 4 `wasm_smoke`，后者在逐包隔离的 `PION_CACHE_DIR` 下运行，以规避上游 `pionc` Wasm32 CAS 跨包污染缺陷）使用 `AFK-surf/pion@c375cee`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–4 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–4 + `fts`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -226,6 +226,22 @@
 | `glsl` | Three.js PBR ES 1.00 Frag（parse + reflect + 410 转译，4.77 KB × 500） | 2.39 MB | **63.358 ms** (37.61 MB/s) | 1,505.716 ms (`rust_glsl 7.0.0`) | **23.77x** | **2.25 MiB** | 2.75 MiB |
 | `glsl` | WebGL2 Shadertoy ES 3.00 Frag（parse + reflect + 410 转译，2.88 KB × 500） | 1.44 MB | **38.506 ms** (37.33 MB/s) | 1,502.805 ms (`rust_glsl 7.0.0`) | **39.03x** | **2.12 MiB** | 2.67 MiB |
 | `glsl` | 2D Post-Process ES 1.00 Frag（parse + reflect + 410 转译，1.44 KB × 500） | 0.72 MB | **35.911 ms** (20.08 MB/s) | 910.515 ms (`rust_glsl 7.0.0`) | **25.35x** | **2.05 MiB** | 2.56 MiB |
+| `http2` | HPACK 头块流解码（100,000 块，Huffman + 动态表） | 3,445,400 B | 145.847 ms (23.62 MB/s) | 116.742 ms (`rust_h2_0.4.20`) | 0.80x | **2.16 MiB** | 2.17 MiB |
+| `http2` | HPACK 批量编码（100,000 块，Huffman ON + 动态表） | 28,562,500 B | 55.688 ms (512.90 MB/s) | 40.547 ms (`rust_h2_0.4.20`) | 0.73x | **3.56 MiB** | 5.28 MiB |
+| `http2` | 混合 HTTP/2 帧引擎（200,000 帧：解帧 + CONTINUATION + HPACK） | 5,689,500 B | 82.564 ms (68.91 MB/s) | 72.177 ms (`rust_h2_0.4.20`) | 0.87x | **2.17 MiB** | 2.28 MiB |
+| `jsonschema` | W1 MCP 工具调用批量校验（含启动 + 解析 + 编译） | 50,000 ops | 30.346 ms | 21.039 ms (`rust_jsonschema_0.29.1`) | 0.69x | **4.12 MiB** | 34.73 MiB |
+| `jsonschema` | W2 清单 / 工作流批量校验（含启动 + 解析 + 编译） | 20,000 ops | 28.730 ms | 21.832 ms (`rust_jsonschema_0.29.1`) | 0.76x | **4.03 MiB** | 40.70 MiB |
+| `jsonschema` | W3 编译 + 校验 E2E | 2,000 schemas | **29.104 ms** | 30.392 ms (`rust_jsonschema_0.29.1`) | **1.04x** | **4.50 MiB** | 30.92 MiB |
+| `jsonschema` | W1 稳态校验斜率（去除固定开销，2,000 次） | — | 396 ns/op | 116 ns/op (`rust_jsonschema_0.29.1`) | 0.29x | — | — |
+| `jsonschema` | W2 稳态校验斜率（去除固定开销，2,000 次） | — | 977 ns/op | 268 ns/op (`rust_jsonschema_0.29.1`) | 0.27x | — | — |
+| `mime` | 50 MB `multipart/form-data` 解析（10 × 5 MiB 附件 + 200 字段） | 52,453,980 B | 39.383 ms (1331.88 MB/s) | 34.855 ms (`go_stdlib`) | 0.89x | **101.88 MiB** | 120.06 MiB |
+| `mime` | 20 万混合 `Content-Type` / `Content-Disposition` / RFC 2047 头部解析 | 11,900,000 B | 124.604 ms (95.50 MB/s) | 74.173 ms (`go_stdlib`) | 0.60x | **2.33 MiB** | 12.14 MiB |
+| `mime` | 20 万 `Content-Type` 媒体类型解析 | 6,060,000 B | 79.984 ms (75.76 MB/s) | 31.236 ms (`rust_mime`) | 0.39x | 2.06 MiB | 1.97 MiB |
+| `mime` | 16 MB Quoted-Printable 解码 | 16,777,217 B | **40.049 ms** (418.91 MB/s) | 69.042 ms (`go_stdlib`) | **1.72x** | **48.25 MiB** | 55.42 MiB |
+| `mime` | 10 万次魔数 MIME 嗅探 | 4,770,000 B | 20.325 ms (234.68 MB/s) | 16.937 ms (`rust_infer`) | 0.83x | 1.86 MiB | 1.80 MiB |
+| `asn1` | 真实 PEM 证书链完整解析（10,000 张多算法 X.509 v3） | 11,010,800 B | 68.050 ms (161.80 MB/s) | 60.654 ms (`go_x509`) | 0.89x | **3.08 MiB** | 16.55 MiB |
+| `asn1` | 纯 DER X.509 v3 解析 + 3× SAN 主机名校验（50,000 张） | 38,604,000 B | 215.075 ms (179.49 MB/s) | 182.652 ms (`go_x509`) | 0.85x | **2.56 MiB** | 18.91 MiB |
+| `asn1` | 通用 ASN.1 DER TLV 编码 + 解码往返（100,000 结构） | 7,635,000 B | **120.671 ms** (63.27 MB/s) | 178.035 ms (`go_asn1`) | **1.48x** | **1.94 MiB** | 16.34 MiB |
 
 ## 各包明细
 
@@ -1718,3 +1734,254 @@ _SHA-256: `bd519a5b90095c9523b1d7ca8d114f327f4b87d62b2eec8f11c1560c84c5ca6b`._
 | 2D Post-Process ES 1.00 Frag (`1.44 KB × 500`) | **35.911 ms (20.08 MB/s)** | 910.515 ms (0.79 MB/s) | **2.05 MiB** | 2.56 MiB | **25.35x** | `6afda6cb4886d4b6...` |
 
 真值编译与红队验证：真实 macOS OpenGL 4.1 Core（`4.1 Metal - 91.7 | GLSL: 4.10`）`judge` **75 / 75 PASS**（74 / 74 有效 WebGL1/WebGL2 着色器对编译链接全过 + 1 / 1 非法 UTF-8 BOM 拒收），`verify_gl41.c` 基准语料 **5 / 5 PASS**；`audit unit` **26 / 26** 全绿，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 差异，50k `#define` 由 2 s 降至 49 ms。**口径说明**：本基准对比 **parse + reflect** 吞吐（Pion 侧同时完成 ES→410 Core 转译，且支持函数体内 `#ifdef`/`#if`）；Rust `glsl 7.0.0` 通过 `nom` 构造完整递归下降表达式 AST 并按原 ES 方言打印，不做 ES→410 转译，倍率同时反映前端架构定位差异。
+
+### http2
+
+参考实现：Rust `h2` `0.4.20`（`--release --locked`，基线）与 Go `golang.org/x/net` `v0.62.0`（`http2.Framer` + `ReadMetaHeaders` + `http2/hpack`）。以下内容如实摘录自 [`packages/http2/README.md`](packages/http2/README.md)；红队审计与公平基准证据见 `packages/http2/audit/`。
+
+Run with `sh packages/http2/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `go.sum` / `Cargo.lock`, mandatory full-content stdout SHA-256 verification) on **Darwin arm64** against modern production HTTP/2 engines:
+- **Go 1.27.3** `golang.org/x/net` **v0.62.0** (`http2.Framer` + `ReadMetaHeaders` + `http2/hpack`, `-mod=readonly`)
+- **Rust 1.100.0** **`h2` 0.4.20** (its own `hpack` engine + `h2::Codec`, `--release --locked`, Huffman ON)
+
+#### 1. HPACK Header Stream Decode (100,000 header blocks, Huffman + Dynamic Table)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `66 B` (`sha256:1612b3b496634b49...`) | Input: `3445400 B` | Ops: `100000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_h2_0.4.20) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 145.847 | 144.318 | 148.793 | 23.62 | 1458.47 | 2.16 MiB | 0.80x |
+| `go_x_net_v0.62` | 135.819 | 135.606 | 136.535 | 25.37 | 1358.19 | 16.70 MiB | 0.86x |
+| `rust_h2_0.4.20` | 116.742 | 113.514 | 117.552 | 29.51 | 1167.42 | 2.17 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `1612b3b496634b49335a3f0368965080d2bd520bc4b686084ac5736acfaf2294`._
+
+#### 2. HPACK Batch Header Encode (100,000 header blocks, Huffman ON + Dynamic Table)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `73 B` (`sha256:d966eddf243ed850...`) | Input: `28562500 B` | Ops: `100000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_h2_0.4.20) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 55.688 | 54.932 | 55.860 | 512.90 | 556.88 | 3.56 MiB | 0.73x |
+| `go_x_net_v0.62` | 59.137 | 58.811 | 60.249 | 482.99 | 591.37 | 14.31 MiB | 0.69x |
+| `rust_h2_0.4.20` | 40.547 | 40.198 | 40.835 | 704.43 | 405.47 | 5.28 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `d966eddf243ed850ad2685fd406e46937173b02817e5dd9293ddbced9d986693`._
+
+#### 3. Mixed HTTP/2 Frame Engine (200,000 frames: Deframe + CONTINUATION + HPACK)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `59 B` (`sha256:e96a6c442cacb947...`) | Input: `5689500 B` | Ops: `200000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_h2_0.4.20) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 82.564 | 81.492 | 83.443 | 68.91 | 412.82 | 2.17 MiB | 0.87x |
+| `go_x_net_v0.62` | 84.889 | 83.337 | 85.383 | 67.02 | 424.44 | 16.41 MiB | 0.85x |
+| `rust_h2_0.4.20` | 72.177 | 71.340 | 72.691 | 78.83 | 360.88 | 2.28 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `e96a6c442cacb947bdf20398303b9c673a6c0d0b90c43b0bc60b5bb80bfd910c`._
+
+#### Objective Analysis
+- **HPACK Encode (Huffman ON)**: With the $O(1)$ open-addressing dynamic-table hash index and zero-copy string Huffman encoding, Pion (`55.7 ms`, `512.9 MB/s`) is **faster than Go `x/net v0.62.0`** (`59.1 ms`, `483.0 MB/s`) and reaches **0.73×** of Rust `h2 0.4.20` (`40.5 ms`), at `3.56 MiB` peak RSS (vs `5.28 MiB` Rust / `14.31 MiB` Go).
+- **Frame Engine (200k frames)**: Pion (`82.6 ms`, `68.9 MB/s`) is **faster than Go `x/net v0.62.0` `Framer + ReadMetaHeaders`** (`84.9 ms`, `67.0 MB/s`) and reaches **0.87×** of Rust `h2::Codec` (`72.2 ms`), at `2.17 MiB` peak RSS (level with Rust `2.28 MiB`).
+- **HPACK Decode (100k blocks)**: With reusable Huffman scratch buffers and zero `to_bytes()` length copies, Pion (`145.8 ms`, `23.6 MB/s`) reaches **0.80×** of Rust `h2 0.4.20` (`116.7 ms`) and stays within 7% of Go `x/net v0.62.0` (`135.8 ms`, `0.86×`).
+
+### jsonschema
+
+参考实现：Rust `jsonschema =0.29.1`（基线）与 Node `ajv@8.17.1`。端到端负载含进程启动、JSON 解析与编译；稳态斜率由 `audit/bench/steady_state.py` 去除固定开销后测得。以下内容如实摘录自 [`packages/jsonschema/README.md`](packages/jsonschema/README.md)。
+
+Measured on `Darwin arm64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
+
+- **Pion**: `packages/jsonschema` compiled with `pionc build --release`
+- **Rust**: `jsonschema =0.29.1` (`Cargo.lock` locked, `cargo build --locked --release`)
+- **Node.js**: `ajv@8.17.1` (`ajv/dist/2020`, single reused `Ajv2020` instance in all workloads)
+
+Reproduce via:
+```sh
+sh packages/jsonschema/bench/run_bench.sh
+sh packages/jsonschema/audit/run_audit.sh bench
+```
+
+#### End-to-End Workloads (`run_bench.sh`, includes process start-up + JSON parse + compile)
+
+| Workload | Pion Median (ms) | Rust Median (ms) | Node `ajv` Median (ms) | Pion RSS | Rust RSS | Pion vs Rust | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **W1**: MCP tool call batch (50,000 ops) | 30.346 | 21.039 | 77.882 | 4.12 MiB | 34.73 MiB | 0.69x | `719e1b73...` |
+| **W2**: Manifest / workflow batch (20,000 ops) | 28.730 | 21.832 | 83.605 | 4.03 MiB | 40.70 MiB | 0.76x | `2b436286...` |
+| **W3**: Compile + validate E2E (2,000 schemas) | **29.104** | 30.392 | 201.044 | **4.50 MiB** | 30.92 MiB | **1.04x** | `561dcae3...` |
+
+#### Steady-State Validation Slope (Fixed Start-up Removed, 2,000 Iterations)
+
+Because short batch runs (20–85 ms) include fixed process start-up, file I/O, JSON parsing, and schema compilation, `audit/bench/steady_state.py` measures the pure validation slope (`ns/op`) between `0` and `2,000` iterations:
+
+| Workload | Pion fixed / steady | Rust fixed / steady | Node `ajv` fixed / steady | Pion steady vs Rust |
+| --- | ---: | ---: | ---: | ---: |
+| **W1** (MCP tool call) | 4.5 ms / **396 ns/op** | 10.1 ms / 116 ns/op | 68.7 ms / 91 ns/op | 0.29x |
+| **W2** (Manifest / workflow) | 3.6 ms / **977 ns/op** | 12.5 ms / 268 ns/op | 68.5 ms / 421 ns/op | 0.27x |
+
+#### Adversarial Head-to-Head Benchmarks (`audit/run_audit.sh bench`)
+
+| Workload | Pion Median (ms) | Rust Median (ms) | Node `ajv` Median (ms) | Pion RSS | Rust RSS | Pion vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **a1**: Wide objects (1,000 keys, `additionalProperties`) | 34.108 | 17.558 | 127.740 | 10.83 MiB | 18.25 MiB | 0.51x |
+| **a2**: `unevaluatedProperties`, 300-key objects | 45.313 | 36.359 | 103.189 | **5.25 MiB** | 22.47 MiB | 0.80x |
+| **a3**: `uniqueItems`, 2,000-element arrays of objects | 67.332 | 41.414 | 22,487.369 | 20.19 MiB | 41.62 MiB | 0.62x |
+| **a4**: Recursive `$ref` tree depth 40 | 31.425 | 28.071 | 73.028 | **5.53 MiB** | 21.34 MiB | 0.89x |
+| **a5**: W1 MCP schema, 5,000 distinct instances | 57.743 | 33.913 | 85.902 | 14.03 MiB | 45.75 MiB | 0.59x |
+
+#### Benchmark Takeaways
+
+- **Compile + Validate (W3)** & **Cold/CLI latency**: Pion leads Rust slightly (`1.04x`) and is `6.9x` faster than reused-instance `ajv` while keeping Peak RSS at **4–5 MiB** (7–10x lower than Rust and 15–19x lower than Node).
+- **Steady-state throughput (W1/W2/a1/a5)**: Once start-up is amortized, Rust `jsonschema` (per-keyword compiled trait objects over `serde_json::Map`) and V8-JIT'd `ajv` are ~3–4x faster per call than Pion's interpreter-style node dispatch.
+- **Adversarial complexity (`a2`, `a3`, `run_audit.sh dos`)**: All quadratic paths are eliminated (`unevaluatedProperties` 50k keys in 4–6 ms, `uniqueItems` 4k deep-colliding arrays in 4–5 ms, `compile_refs_8000` in 6 ms vs Rust 15 ms, `$ref` DAG 2^22 in 91 ms / 3 MB vs Rust 7.0 s / 15.8 GB).
+
+### mime
+
+参考实现：Go 1.27.3 标准库（`mime` / `mime/multipart` / `mime/quotedprintable`）与 Rust `mime 0.3.18` + `infer 0.16.0`。以下内容如实摘录自 [`packages/mime/README.md`](packages/mime/README.md)。
+
+Run with `sh packages/mime/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `go.sum` / `Cargo.lock`, mandatory stdout SHA-256 verification) on **Darwin arm64** against:
+- **Go 1.27.3** stdlib (`mime`, `mime/multipart`, `mime/quotedprintable`, `-mod=readonly`)
+- **Rust 1.100.0** (`mime 0.3.18` + `infer 0.16.0`, `--release --locked`)
+
+#### 1. 50 MB `multipart/form-data` Parse (10 × 5 MiB binary attachments + 200 form fields)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `63 B` (`sha256:792007fefaba0ec5...`) | Input: `52453980 B`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs go_stdlib) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 39.383 | 38.959 | 41.377 | 1331.88 | 101.88 MiB | 0.89x |
+| `go_stdlib` | 34.855 | 32.817 | 37.470 | 1504.94 | 120.06 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `792007fefaba0ec5c328a7a9142c02d667d6ddd0dc58658935440ecc48101e39`._
+
+#### 2a. 200k Mixed `Content-Type` / `Content-Disposition` / RFC 2047 Header Parse
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `48 B` (`sha256:549e031f7958ce5e...`) | Input: `11900000 B` | Ops: `200000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs go_stdlib) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 124.604 | 117.952 | 125.890 | 95.50 | 623.02 | 2.33 MiB | 0.60x |
+| `go_stdlib` | 74.173 | 68.211 | 77.216 | 160.44 | 370.87 | 12.14 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `549e031f7958ce5eb731bb7517877082c7bc83ba1a3de8b1eea76fe6b0f5e55c`._
+
+#### 2b. 200k `Content-Type` Media-Type Parse (Pion vs Go 1.27 vs Rust `mime 0.3`)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `46 B` (`sha256:b8e823b81e6f5cca...`) | Input: `6060000 B` | Ops: `200000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_mime) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 79.984 | 78.698 | 83.950 | 75.76 | 399.92 | 2.06 MiB | 0.39x |
+| `go_stdlib` | 44.954 | 42.894 | 46.320 | 134.80 | 224.77 | 11.98 MiB | 0.69x |
+| `rust_mime` | 31.236 | 29.393 | 34.145 | 194.00 | 156.18 | 1.97 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `b8e823b81e6f5cca03be4d98c61a840d24916cdf331841e2cf064cffbc7a7bb6`._
+
+#### 3a. 16 MB Quoted-Printable Decode
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `50 B` (`sha256:7680fc8584f4cf31...`) | Input: `16777217 B`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs go_stdlib) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 40.049 | 37.152 | 41.652 | 418.91 | 48.25 MiB | 1.72x |
+| `go_stdlib` | 69.042 | 66.728 | 72.467 | 243.00 | 55.42 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `7680fc8584f4cf31ba330eeed449ffca494efff3c06efee79d148707bd1862bd`._
+
+#### 3b. 100k Magic-Byte MIME Sniffing (Pion vs Rust `infer 0.16`)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `40 B` (`sha256:58428bd96f470754...`) | Input: `4770000 B` | Ops: `100000`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_infer) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 20.325 | 16.584 | 23.947 | 234.68 | 203.25 | 1.86 MiB | 0.83x |
+| `rust_infer` | 16.937 | 16.623 | 19.214 | 281.64 | 169.37 | 1.80 MiB | 1.00x (baseline) |
+
+_SHA-256 verified identical across all implementations and rounds: `58428bd96f4707549477eb91fc02e793a497fabf19415d34b2c81cabdd3d7526`._
+
+#### 4. Red-Team Adversarial Performance Probes (`sh packages/mime/audit/run_audit.sh perf`)
+
+All probes verified with identical stdout SHA-256 against Go 1.27 (`--warmup 1 --rounds 5`):
+
+| Adversarial Probe | Pion Before | Pion After | Go 1.27 | Pion/Go (After) |
+| --- | ---: | ---: | ---: | ---: |
+| 8 MiB random body (typical) | 19.7 ms | **13.2 ms** | 19.1 ms | **0.7x** (faster) |
+| 8 MiB near-miss (`--boundary1234567890`) | 19.6 ms | **14.5 ms** | 17.1 ms | **0.9x** (faster) |
+| **P1-4**: 8 MiB periodic worst case (`a`×70) | 576.7 ms | **16.8 ms** | 20.4 ms | **0.8x** (faster, **34× speedup**) |
+| 1000 tiny parts fan-out | — | **10.8 ms** | 14.4 ms | **0.7x** (faster) |
+| **P0-1**: 64 × 60 KiB plain-param bomb | 4,646 ms | **75.8 ms** | 50.5 ms | **1.5x** (**61× speedup**) |
+| **P0-1**: 64 × 60 KiB RFC 2231 param bomb | 13,171 ms | **136.4 ms** | 184.0 ms | **0.7x** (faster, **96× speedup**) |
+| Wasm32 release: `bmh_worst_8.bin` | 2.43 s | **0.09 s** | — | **27× speedup** |
+| Wasm32 release: `mp_cont_bomb.bin` | 12.02 s | **0.31 s** | — | **39× speedup** |
+
+#### Honest Performance Analysis
+
+- **Wins**:
+  - **Quoted-Printable Decode (16 MB)**: Pion (`418.91 MB/s`) is **1.72x faster** than Go 1.27 `mime/quotedprintable` (`243.00 MB/s`) with lower peak RSS (`48.25 MiB` vs `55.42 MiB`).
+  - **Adversarial Multipart & RFC 2231 Bombs**: Pion beats Go 1.27 on 8 MiB periodic worst-case boundary search (`0.8x` time), 8 MiB random/near-miss bodies (`0.7–0.9x`), 1000-part fan-out (`0.7x`), and 64 × 60 KiB RFC 2231 parameter bombs (`0.7x`). Note that Go reads multipart through a streaming `io.Reader` and copies part bodies, whereas Pion slices an in-memory `Bytes` buffer.
+  - **50 MB `multipart/form-data` Parse**: Pion (`1,331.88 MB/s`) achieves **0.89x** of Go 1.27 (`1,504.94 MB/s`) while consuming **15% less peak RSS** (`101.88 MiB` vs `120.06 MiB`).
+- **Gaps**:
+  - **Short Header Parsing (`headers_full` / `headers_mt`) & Plain-Param Bomb**: Pion (`399.92 ns/op` on `Content-Type`, `623.02 ns/op` on mixed headers, `1.5x` time on 64 × 60 KiB plain params) trails Go 1.27 (`224.77 / 370.87 ns/op`) and Rust `mime 0.3` (`156.18 ns/op`), though Pion uses **5–6x less peak RSS** than Go (`2.06–2.33 MiB` vs `11.98–12.14 MiB`) because Pion allocates per-component `String` slices instead of keeping a single backing buffer with index spans.
+  - **Magic-Byte Sniffing (100k ops)**: After expanding coverage to 40+ formats (matching `infer 0.16`), Pion (`203.25 ns/op`) is **0.83x** of Rust `infer 0.16` (`169.37 ns/op`) with near-identical ~1.8 MiB peak RSS.
+
+### asn1
+
+参考实现：Go `go1.27.3` 标准库（`crypto/x509` + `encoding/pem` + `encoding/asn1`）与 Rust（`x509-parser 0.16.0`、`der 0.7.10`、`pem 3.0.6`）。以下内容如实摘录自 [`packages/asn1/README.md`](packages/asn1/README.md)。
+
+Measured on `Darwin arm64` via `sh packages/asn1/bench/run_bench.sh` and `sh packages/asn1/audit/run_audit.sh bench` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) comparing:
+- **`pion`**: `packages/asn1` (`pionc 0.1.0 --release`)
+- **`go_x509` / `go_asn1`**: Go `go1.27.3` stdlib (`crypto/x509` + `encoding/pem` + `encoding/asn1`)
+- **`rust_x509` / `rust_der`**: Rust (`x509-parser 0.16.0`, `der 0.7.10`, `pem 3.0.6`, `--release --locked`)
+
+#### 1. Real PEM Cert Chain Full Parse (100 multi-algo X.509 v3 certs × 100 = 10,000 certs, 11,010,800 B)
+
+_SHA-256 verified identical across all implementations and rounds: `3ab4b31423628fc3545d5a72b7f0da1ba3412305cd485e56ac37a732545cd923`._
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_x509`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 68.050 | 67.790 | 69.271 | 161.80 | 6804.99 | 3.08 MiB | 0.89x |
+| `go_x509` | 60.654 | 59.571 | 62.331 | 181.54 | 6065.36 | 16.55 MiB | 1.00x (baseline) |
+| `rust_x509` | 59.519 | 59.284 | 65.117 | 185.00 | 5951.85 | 2.66 MiB | 1.02x |
+
+#### 2. Pure DER X.509 v3 Parse + 3× SAN Hostname Verify (50,000 certs, 38,604,000 B)
+
+_SHA-256 verified identical across all implementations and rounds: `63790b358ff1381909ec8b61dab2061b036ac91dfeb24a6b1d608ede566fa33e`._
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_x509`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 215.075 | 210.849 | 226.265 | 179.49 | 4301.50 | 2.56 MiB | 0.85x |
+| `go_x509` | 182.652 | 177.559 | 199.655 | 211.35 | 3653.04 | 18.91 MiB | 1.00x (baseline) |
+| `rust_x509` | 95.695 | 94.139 | 98.284 | 403.41 | 1913.90 | 2.30 MiB | 1.91x |
+
+#### 3. Generic ASN.1 DER TLV Encode + Decode Roundtrip (100,000 structures, 7,635,000 B)
+
+_SHA-256 verified identical across all implementations and rounds: `19093852fc5c5b2e675595878a529fd55915f8af43d6e897ef276720d041cd86`._
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_asn1`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 120.671 | 119.352 | 122.347 | 63.27 | 1206.71 | 1.94 MiB | **1.48x** |
+| `go_asn1` | 178.035 | 176.802 | 181.341 | 42.88 | 1780.35 | 16.34 MiB | 1.00x (baseline) |
+| `rust_der` | 41.362 | 40.861 | 47.660 | 184.59 | 413.62 | 1.94 MiB | 4.30x |
+
+#### 4. Adversarial-Shape X.509 Benchmarks (`audit/run_audit.sh bench`)
+
+_All stdout SHA-256 hashes verified identical across Pion, Go 1.27, and Rust in every round._
+
+| Shape | Work | `pion` (ms) | `go_x509` (ms) | `rust_x509` (ms) | `pion` vs Go | `pion` vs Rust | Peak RSS pion / go / rust (MiB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `real` | 8 OpenSSL certs × 20,000 | 600.539 | 471.353 | 291.890 | 0.78x | 0.49x | 2.39 / 17.41 / 2.27 |
+| `big_rsa_cert` | RSA-4096 cert × 100,000 | 410.845 | 306.991 | 192.480 | 0.75x | 0.47x | 2.23 / 16.91 / 2.22 |
+| `many_rdn` | 1 cert, 4,000-RDN subject × 300 | 182.252 | 140.372 | 122.758 | 0.77x | 0.67x | 2.64 / 16.81 / 3.95 |
+| `many_san` | 1 cert, 4,000 dNSName SANs × 300 | 50.075 | 42.320 | 35.189 | 0.85x | 0.70x | 2.83 / 16.08 / 2.64 |
+| `many_ext` | 1 cert, 4,000 extensions × 20 | 25.863 | 26.475 | 13.979 | **1.02x** | 0.54x | 3.14 / 15.36 / 2.83 |
+
+Single-certificate extension cliff (`N = 64,000` distinct extensions, `1.2 MB` DER): **Pion `0.01 s` CPU** vs Go `0.02 s` vs Rust `0.00 s` (down from `4.10 s` prior to O(1) duplicate-OID hashing).
+
+#### Honest Performance Notes
+
+- **Strengths**:
+  - **Generic DER TLV Roundtrip (`1.48×` Go `encoding/asn1`)**: Direct `DerWriter` / `DerReader` encoding and cursor-based decoding avoid Go's reflection overhead (`120.7 ms` vs `178.0 ms`) while using **8.4× less peak RSS** (`1.94 MiB` vs `16.34 MiB`).
+  - **Adversarial Extensions (`1.02×` Go `crypto/x509`)**: Hybrid O(1) duplicate-OID hashing over raw DER slices and single-buffer OID formatting eliminate the O(N²) cliff (`many_ext` improved `16.6×`, from `0.08×` to `1.02×` Go; 64k-extension cert runs in `0.01 s` vs Go's `0.02 s`).
+  - **Low Memory Footprint Across All Workloads**: Peak RSS stays at `1.94–3.14 MiB` across all benign and adversarial workloads — matching Rust (`1.94–3.95 MiB`) and using **5×–8.5× less memory** than Go (`15.36–18.91 MiB`).
+  - **PEM + X.509 Pipeline**: Reaching `0.89×` Go `crypto/x509` (`161.8 MB/s`) and `0.87×` Rust `x509-parser` while strictly enforcing DER canonicality, inner/outer algorithm matching, duplicate-extension rejection, and full extension decoding.
+- **Remaining Gaps**:
+  - **Pure DER X.509 Parse (`0.85×` Go, `0.44×` Rust `x509-parser`)**: `Bytes::slice` copies into owned buffers for returned fields (`tbs_bytes`, `raw`, keys, signatures, DN/SAN strings), and `x509-parser` borrows `&[u8]` slices directly and lazily parses extensions without DER canonicality or duplicate-extension checks.
+  - **Generic DER vs Rust `der` (`0.34×` Rust)**: Rust `der` reuses pre-allocated `Vec<u8>` buffers and pre-parsed `ObjectIdentifier` constants across iterations, whereas `DerWriter` in Workload 3 allocates per-record sequence buffers and re-encodes the OID string per iteration.
