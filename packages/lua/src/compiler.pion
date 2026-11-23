@@ -1,0 +1,1199 @@
+///| Bytecode compiler from Lua 5.4 AST to compact 64-bit register instructions (`Proto`).
+///| Supports lexical closures with multi-level open/closed upvalues, `_ENV` upvalue 0,
+///| multi-return expansion, tail-call optimization (`OP_TAILCALL`), and `break` patching.
+
+///|
+struct LocalVar {
+  name : String
+  reg : Int
+  depth : Int
+  mut is_captured : Bool
+}
+
+///|
+struct LoopCtx {
+  depth : Int
+  base_reg : Int
+  break_jumps : Array[Int]
+}
+
+///|
+struct FuncCompiler {
+  parent : Option[FuncCompiler]
+  code : Array[Int64]
+  lines : Array[Int]
+  consts : Array[LuaValue]
+  protos : Array[Proto]
+  upvals : Array[UpvalDesc]
+  upval_names : Array[String]
+  locals : Array[LocalVar]
+  loops : Array[LoopCtx]
+  mut scope_depth : Int
+  mut free_reg : Int
+  mut max_stack : Int
+  num_params : Int
+  is_vararg : Bool
+}
+
+///|
+fn FuncCompiler::new(
+  parent : Option[FuncCompiler],
+  num_params : Int,
+  is_vararg : Bool,
+) -> FuncCompiler {
+  FuncCompiler::{
+    parent: parent,
+    code: [],
+    lines: [],
+    consts: [],
+    protos: [],
+    upvals: [],
+    upval_names: [],
+    locals: [],
+    loops: [],
+    scope_depth: 0,
+    free_reg: 0,
+    max_stack: 2,
+    num_params: num_params,
+    is_vararg: is_vararg,
+  }
+}
+
+///|
+fn FuncCompiler::reserve_reg(self : FuncCompiler, r : Int) -> Unit {
+  if r + 1 > self.max_stack {
+    self.max_stack = r + 1
+  }
+}
+
+///|
+fn FuncCompiler::alloc_reg(self : FuncCompiler) -> Int {
+  let r = self.free_reg
+  self.free_reg = r + 1
+  self.reserve_reg(r)
+  r
+}
+
+///|
+fn FuncCompiler::emit(self : FuncCompiler, inst : Int64, line : Int) -> Int {
+  let idx = self.code.length()
+  self.code.push(inst)
+  self.lines.push(line)
+  idx
+}
+
+///|
+fn FuncCompiler::emit_jmp(self : FuncCompiler, close_a : Int, line : Int) -> Int {
+  self.emit(enc_asbx(OP_JMP, close_a, 0), line)
+}
+
+///|
+fn FuncCompiler::patch_jmp(self : FuncCompiler, jmp_pc : Int, target_pc : Int) -> Unit {
+  let old = self.code[jmp_pc]
+  let op = dec_op(old)
+  let a = dec_a(old)
+  let offset = target_pc - (jmp_pc + 1)
+  self.code[jmp_pc] = enc_asbx(op, a, offset)
+}
+
+///|
+fn FuncCompiler::add_const(self : FuncCompiler, v : LuaValue) -> Int {
+  let mut i = 0
+  let n = self.consts.length()
+  while i < n {
+    if value_strict_eq(self.consts[i], v) {
+      return i
+    }
+    i = i + 1
+  }
+  self.consts.push(v)
+  n
+}
+
+///|
+fn FuncCompiler::declare_local(self : FuncCompiler, name : String) -> Int {
+  let r = self.alloc_reg()
+  self.locals.push(LocalVar::{ name: name, reg: r, depth: self.scope_depth, is_captured: false })
+  r
+}
+
+///|
+fn FuncCompiler::enter_scope(self : FuncCompiler) -> Unit {
+  self.scope_depth = self.scope_depth + 1
+}
+
+///|
+fn FuncCompiler::leave_scope(self : FuncCompiler, line : Int) -> Unit {
+  let mut need_close = false
+  let mut lowest_reg = self.free_reg
+  while self.locals.length() > 0 && self.locals[self.locals.length() - 1].depth == self.scope_depth {
+    let lv = self.locals[self.locals.length() - 1]
+    if lv.is_captured {
+      need_close = true
+    }
+    if lv.reg < lowest_reg {
+      lowest_reg = lv.reg
+    }
+    let _ = self.locals.pop()
+  }
+  if need_close {
+    let _ = self.emit(enc_abc(OP_CLOSE, lowest_reg, 0, 0), line)
+  }
+  self.free_reg = lowest_reg
+  self.scope_depth = self.scope_depth - 1
+}
+
+///|
+fn FuncCompiler::resolve_local(self : FuncCompiler, name : String) -> Int {
+  let mut i = self.locals.length() - 1
+  while i >= 0 {
+    if self.locals[i].name == name {
+      return self.locals[i].reg
+    }
+    i = i - 1
+  }
+  -1
+}
+
+///|
+fn FuncCompiler::mark_local_captured(self : FuncCompiler, reg : Int) -> Unit {
+  let mut i = self.locals.length() - 1
+  while i >= 0 {
+    if self.locals[i].reg == reg {
+      self.locals[i].is_captured = true
+      return
+    }
+    i = i - 1
+  }
+}
+
+///|
+fn FuncCompiler::add_upval(self : FuncCompiler, name : String, in_stack : Bool, index : Int) -> Int {
+  let mut i = 0
+  while i < self.upvals.length() {
+    let u = self.upvals[i]
+    if u.in_stack == in_stack && u.index == index {
+      return i
+    }
+    i = i + 1
+  }
+  self.upvals.push(UpvalDesc::{ in_stack: in_stack, index: index })
+  self.upval_names.push(name)
+  self.upvals.length() - 1
+}
+
+///|
+fn FuncCompiler::resolve_upval(self : FuncCompiler, name : String) -> Int {
+  match self.parent {
+    None => {
+      // Top-level chunk has `_ENV` at upval 0
+      if name == "_ENV" {
+        0
+      } else {
+        -1
+      }
+    }
+    Some(p) => {
+      let local_reg = p.resolve_local(name)
+      if local_reg >= 0 {
+        p.mark_local_captured(local_reg)
+        return self.add_upval(name, true, local_reg)
+      }
+      let parent_uv = p.resolve_upval(name)
+      if parent_uv >= 0 {
+        return self.add_upval(name, false, parent_uv)
+      }
+      -1
+    }
+  }
+}
+
+///| Check whether an expression can return multiple values when in last position.
+fn is_multiret_expr(e : Expr) -> Bool {
+  match e {
+    Expr::Call(_, _, _) | Expr::MethodCall(_, _, _, _) | Expr::Vararg(_) => true
+    _ => false
+  }
+}
+
+///| Compile a single expression into target register `dst`.
+fn FuncCompiler::compile_expr_to(self : FuncCompiler, e : Expr, dst : Int) -> Result[Unit, LuaError] {
+  self.reserve_reg(dst)
+  let saved_free = self.free_reg
+  if self.free_reg <= dst {
+    self.free_reg = dst + 1
+  }
+  let res = self.compile_expr_inner(e, dst, 1)
+  self.free_reg = saved_free
+  res
+}
+
+///| Compile an expression expecting `nresults` values into `dst..dst+nresults-1`
+///| (`nresults == 0` means all available values, updating VM `top`).
+fn FuncCompiler::compile_expr_inner(
+  self : FuncCompiler,
+  e : Expr,
+  dst : Int,
+  nresults : Int,
+) -> Result[Unit, LuaError] {
+  self.reserve_reg(dst)
+  match e {
+    Expr::Nil(line) => {
+      let _ = self.emit(enc_abc(OP_LOADNIL, dst, 0, 0), line)
+    }
+    Expr::Bool(b, line) => {
+      let _ = self.emit(enc_abc(OP_LOADBOOL, dst, if b { 1 } else { 0 }, 0), line)
+    }
+    Expr::Int(n, line) => {
+      if n >= -8000000L && n <= 8000000L {
+        let _ = self.emit(enc_asbx(OP_LOADI, dst, n.to_int()), line)
+      } else {
+        let k = self.add_const(LuaValue::Int(n))
+        let _ = self.emit(enc_abc(OP_LOADK, dst, k, 0), line)
+      }
+    }
+    Expr::Float(f, line) => {
+      let k = self.add_const(LuaValue::Float(f))
+      let _ = self.emit(enc_abc(OP_LOADK, dst, k, 0), line)
+    }
+    Expr::Str(s, line) => {
+      let k = self.add_const(LuaValue::Str(s))
+      let _ = self.emit(enc_abc(OP_LOADK, dst, k, 0), line)
+    }
+    Expr::Vararg(line) => {
+      if !self.is_vararg {
+        return Err(LuaError::new(LuaErrorKind::SyntaxError, "cannot use '...' outside a vararg function", line))
+      }
+      let b = if nresults == 0 { 0 } else { nresults + 1 }
+      let _ = self.emit(enc_abc(OP_VARARG, dst, b, 0), line)
+    }
+    Expr::Paren(inner, _line) => {
+      match self.compile_expr_to(inner, dst) {
+        Ok(_) => ()
+        Err(err) => return Err(err)
+      }
+    }
+    Expr::Ident(name, line) => {
+      let lreg = self.resolve_local(name)
+      if lreg >= 0 {
+        if lreg != dst {
+          let _ = self.emit(enc_abc(OP_MOVE, dst, lreg, 0), line)
+        }
+      } else {
+        let uv = self.resolve_upval(name)
+        if uv >= 0 {
+          let _ = self.emit(enc_abc(OP_GETUPVAL, dst, uv, 0), line)
+        } else {
+          let env_uv = self.resolve_upval("_ENV")
+          let k = self.add_const(LuaValue::Str(name))
+          let _ = self.emit(enc_abc(OP_GETTABUP, dst, env_uv, k), line)
+        }
+      }
+    }
+    Expr::Field(obj, field, line) => {
+      let saved = self.free_reg
+      let obj_reg = self.alloc_reg()
+      match self.compile_expr_to(obj, obj_reg) {
+        Ok(_) => ()
+        Err(err) => return Err(err)
+      }
+      let k = self.add_const(LuaValue::Str(field))
+      let _ = self.emit(enc_abc(OP_GETFIELD, dst, obj_reg, k), line)
+      self.free_reg = saved
+    }
+    Expr::Index(obj, idx, line) => {
+      let saved = self.free_reg
+      let obj_reg = self.alloc_reg()
+      match self.compile_expr_to(obj, obj_reg) {
+        Ok(_) => ()
+        Err(err) => return Err(err)
+      }
+      let idx_reg = self.alloc_reg()
+      match self.compile_expr_to(idx, idx_reg) {
+        Ok(_) => ()
+        Err(err) => return Err(err)
+      }
+      let _ = self.emit(enc_abc(OP_GETTABLE, dst, obj_reg, idx_reg), line)
+      self.free_reg = saved
+    }
+    Expr::Unary(op, sub, line) => {
+      let saved = self.free_reg
+      let sub_reg = self.alloc_reg()
+      match self.compile_expr_to(sub, sub_reg) {
+        Ok(_) => ()
+        Err(err) => return Err(err)
+      }
+      let opc = match op {
+        UnOp::Neg => OP_UNM
+        UnOp::BNot => OP_BNOT
+        UnOp::Not => OP_NOT
+        UnOp::Len => OP_LEN
+      }
+      let _ = self.emit(enc_abc(opc, dst, sub_reg, 0), line)
+      self.free_reg = saved
+    }
+    Expr::Binary(op, lhs, rhs, line) => {
+      match op {
+        BinOp::And => {
+          match self.compile_expr_to(lhs, dst) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          // If R[dst] is falsy, skip rhs
+          let _ = self.emit(enc_abc(OP_TEST, dst, 0, 1), line)
+          let jmp = self.emit_jmp(0, line)
+          match self.compile_expr_to(rhs, dst) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          self.patch_jmp(jmp, self.code.length())
+        }
+        BinOp::Or => {
+          match self.compile_expr_to(lhs, dst) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          // If R[dst] is truthy, skip rhs
+          let _ = self.emit(enc_abc(OP_TEST, dst, 0, 0), line)
+          let jmp = self.emit_jmp(0, line)
+          match self.compile_expr_to(rhs, dst) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          self.patch_jmp(jmp, self.code.length())
+        }
+        BinOp::Concat => {
+          let saved = self.free_reg
+          let r1 = self.alloc_reg()
+          let r2 = self.alloc_reg()
+          match self.compile_expr_to(lhs, r1) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          match self.compile_expr_to(rhs, r2) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          let _ = self.emit(enc_abc(OP_CONCAT, dst, r1, r2), line)
+          self.free_reg = saved
+        }
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+          let saved = self.free_reg
+          let r1 = self.alloc_reg()
+          let r2 = self.alloc_reg()
+          match self.compile_expr_to(lhs, r1) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          match self.compile_expr_to(rhs, r2) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          match op {
+            BinOp::Eq => {
+              let _ = self.emit(enc_abc(OP_EQ, 1, r1, r2), line)
+            }
+            BinOp::Ne => {
+              let _ = self.emit(enc_abc(OP_EQ, 0, r1, r2), line)
+            }
+            BinOp::Lt => {
+              let _ = self.emit(enc_abc(OP_LT, 1, r1, r2), line)
+            }
+            BinOp::Le => {
+              let _ = self.emit(enc_abc(OP_LE, 1, r1, r2), line)
+            }
+            BinOp::Gt => {
+              let _ = self.emit(enc_abc(OP_LT, 1, r2, r1), line)
+            }
+            BinOp::Ge => {
+              let _ = self.emit(enc_abc(OP_LE, 1, r2, r1), line)
+            }
+            _ => ()
+          }
+          // If comparison matched, fall through to JMP -> LOADBOOL true; else skip JMP -> LOADBOOL false
+          let _ = self.emit(enc_asbx(OP_JMP, 0, 1), line)
+          let _ = self.emit(enc_abc(OP_LOADBOOL, dst, 0, 1), line)
+          let _ = self.emit(enc_abc(OP_LOADBOOL, dst, 1, 0), line)
+          self.free_reg = saved
+        }
+        _ => {
+          let saved = self.free_reg
+          let r1 = self.alloc_reg()
+          let r2 = self.alloc_reg()
+          match self.compile_expr_to(lhs, r1) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          match self.compile_expr_to(rhs, r2) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          let opc = match op {
+            BinOp::Add => OP_ADD
+            BinOp::Sub => OP_SUB
+            BinOp::Mul => OP_MUL
+            BinOp::Div => OP_DIV
+            BinOp::IDiv => OP_IDIV
+            BinOp::Mod => OP_MOD
+            BinOp::Pow => OP_POW
+            BinOp::BAnd => OP_BAND
+            BinOp::BOr => OP_BOR
+            BinOp::BXor => OP_BXOR
+            BinOp::Shl => OP_SHL
+            BinOp::Shr => OP_SHR
+            _ => OP_ADD
+          }
+          let _ = self.emit(enc_abc(opc, dst, r1, r2), line)
+          self.free_reg = saved
+        }
+      }
+    }
+    Expr::Call(callee, args, line) => {
+      let saved = self.free_reg
+      let base = dst
+      if self.free_reg <= base {
+        self.free_reg = base + 1
+      }
+      self.reserve_reg(base)
+      match self.compile_expr_to(callee, base) {
+        Ok(_) => ()
+        Err(err) => return Err(err)
+      }
+      let nargs = args.length()
+      let mut last_is_multi = false
+      let mut i = 0
+      while i < nargs {
+        let arg_reg = base + 1 + i
+        self.reserve_reg(arg_reg)
+        self.free_reg = arg_reg + 1
+        if i == nargs - 1 && is_multiret_expr(args[i]) {
+          match self.compile_expr_inner(args[i], arg_reg, 0) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          last_is_multi = true
+        } else {
+          match self.compile_expr_to(args[i], arg_reg) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+        }
+        i = i + 1
+      }
+      let b = if last_is_multi { 0 } else { nargs + 1 }
+      let c = if nresults == 0 { 0 } else { nresults + 1 }
+      let _ = self.emit(enc_abc(OP_CALL, base, b, c), line)
+      self.free_reg = saved
+    }
+    Expr::MethodCall(obj, method_name, args, line) => {
+      let saved = self.free_reg
+      let base = dst
+      self.reserve_reg(base + 1)
+      self.free_reg = base + 2
+      let obj_tmp = self.alloc_reg()
+      match self.compile_expr_to(obj, obj_tmp) {
+        Ok(_) => ()
+        Err(err) => return Err(err)
+      }
+      let mk = self.add_const(LuaValue::Str(method_name))
+      let _ = self.emit(enc_abc(OP_SELF, base, obj_tmp, mk), line)
+      let nargs = args.length()
+      let mut last_is_multi = false
+      let mut i = 0
+      while i < nargs {
+        let arg_reg = base + 2 + i
+        self.reserve_reg(arg_reg)
+        self.free_reg = arg_reg + 1
+        if i == nargs - 1 && is_multiret_expr(args[i]) {
+          match self.compile_expr_inner(args[i], arg_reg, 0) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+          last_is_multi = true
+        } else {
+          match self.compile_expr_to(args[i], arg_reg) {
+            Ok(_) => ()
+            Err(err) => return Err(err)
+          }
+        }
+        i = i + 1
+      }
+      let b = if last_is_multi { 0 } else { nargs + 2 }
+      let c = if nresults == 0 { 0 } else { nresults + 1 }
+      let _ = self.emit(enc_abc(OP_CALL, base, b, c), line)
+      self.free_reg = saved
+    }
+    Expr::TableCtor(fields, line) => {
+      let saved = self.free_reg
+      let tbl_reg = dst
+      if self.free_reg <= tbl_reg {
+        self.free_reg = tbl_reg + 1
+      }
+      self.reserve_reg(tbl_reg)
+      let _ = self.emit(enc_abc(OP_NEWTABLE, tbl_reg, 0, 0), line)
+      let mut array_batch = 0
+      let mut batch_num = 1
+      let mut i = 0
+      let n = fields.length()
+      while i < n {
+        let f = fields[i]
+        match f.key {
+          Some(kexpr) => {
+            let kreg = self.alloc_reg()
+            match self.compile_expr_to(kexpr, kreg) {
+              Ok(_) => ()
+              Err(err) => return Err(err)
+            }
+            let vreg = self.alloc_reg()
+            match self.compile_expr_to(f.val_expr, vreg) {
+              Ok(_) => ()
+              Err(err) => return Err(err)
+            }
+            let _ = self.emit(enc_abc(OP_SETTABLE, tbl_reg, kreg, vreg), line)
+            self.free_reg = tbl_reg + 1 + array_batch
+          }
+          None => {
+            let elem_reg = tbl_reg + 1 + array_batch
+            self.reserve_reg(elem_reg)
+            self.free_reg = elem_reg + 1
+            if i == n - 1 && is_multiret_expr(f.val_expr) {
+              match self.compile_expr_inner(f.val_expr, elem_reg, 0) {
+                Ok(_) => ()
+                Err(err) => return Err(err)
+              }
+              let _ = self.emit(enc_abc(OP_SETLIST, tbl_reg, 0, batch_num), line)
+              array_batch = 0
+              self.free_reg = tbl_reg + 1
+            } else {
+              match self.compile_expr_to(f.val_expr, elem_reg) {
+                Ok(_) => ()
+                Err(err) => return Err(err)
+              }
+              array_batch = array_batch + 1
+              if array_batch == 50 {
+                let _ = self.emit(enc_abc(OP_SETLIST, tbl_reg, 50, batch_num), line)
+                batch_num = batch_num + 1
+                array_batch = 0
+                self.free_reg = tbl_reg + 1
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+      if array_batch > 0 {
+        let _ = self.emit(enc_abc(OP_SETLIST, tbl_reg, array_batch, batch_num), line)
+      }
+      self.free_reg = saved
+    }
+    Expr::FuncExpr(fb) => {
+      let child_proto = match self.compile_func_body(fb) {
+        Ok(p) => p
+        Err(err) => return Err(err)
+      }
+      let p_idx = self.protos.length()
+      self.protos.push(child_proto)
+      let _ = self.emit(enc_abc(OP_CLOSURE, dst, p_idx, 0), fb.line)
+    }
+  }
+  Ok(())
+}
+
+///|
+fn FuncCompiler::compile_func_body(self : FuncCompiler, fb : FuncBody) -> Result[Proto, LuaError] {
+  let fc = FuncCompiler::new(Some(self), fb.params.length(), fb.is_vararg)
+  fc.enter_scope()
+  let mut i = 0
+  while i < fb.params.length() {
+    let _ = fc.declare_local(fb.params[i])
+    i = i + 1
+  }
+  match fc.compile_stmts(fb.body) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let _ = fc.emit(enc_abc(OP_RETURN, 0, 1, 0), fb.line)
+  Ok(
+    Proto::{
+      code: fc.code,
+      lines: fc.lines,
+      consts: fc.consts,
+      protos: fc.protos,
+      upvals: fc.upvals,
+      num_params: fc.num_params,
+      is_vararg: fc.is_vararg,
+      max_stack: fc.max_stack,
+    },
+  )
+}
+
+///|
+fn FuncCompiler::compile_stmts(self : FuncCompiler, stmts : Array[Stmt]) -> Result[Unit, LuaError] {
+  let mut i = 0
+  while i < stmts.length() {
+    match self.compile_stmt(stmts[i]) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+///| Compile a list of RHS expressions into contiguous registers `base .. base+count-1`.
+fn FuncCompiler::compile_rhs_list(
+  self : FuncCompiler,
+  exprs : Array[Expr],
+  base : Int,
+  count : Int,
+  line : Int,
+) -> Result[Unit, LuaError] {
+  let n = exprs.length()
+  let mut i = 0
+  while i < n {
+    let reg = base + i
+    self.reserve_reg(reg)
+    if self.free_reg <= reg {
+      self.free_reg = reg + 1
+    }
+    if i == n - 1 && is_multiret_expr(exprs[i]) && count > i {
+      let want = count - i
+      match self.compile_expr_inner(exprs[i], reg, want) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      return Ok(())
+    } else if i < count {
+      match self.compile_expr_to(exprs[i], reg) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    } else {
+      // Extra RHS expression evaluated for side effects
+      let tmp = self.alloc_reg()
+      match self.compile_expr_to(exprs[i], tmp) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    i = i + 1
+  }
+  if n < count {
+    let _ = self.emit(enc_abc(OP_LOADNIL, base + n, count - n - 1, 0), line)
+  }
+  Ok(())
+}
+
+///|
+fn FuncCompiler::compile_stmt(self : FuncCompiler, st : Stmt) -> Result[Unit, LuaError] {
+  match st {
+    Stmt::Empty => Ok(())
+    Stmt::Block(body, line) => {
+      self.enter_scope()
+      match self.compile_stmts(body) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      self.leave_scope(line)
+      Ok(())
+    }
+    Stmt::ExprCall(call_e, _line) => {
+      let saved = self.free_reg
+      let tmp = self.alloc_reg()
+      match self.compile_expr_inner(call_e, tmp, 1) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      self.free_reg = saved
+      Ok(())
+    }
+    Stmt::LocalDecl(names, init_exprs, line) => {
+      let count = names.length()
+      let base = self.free_reg
+      let mut i = 0
+      while i < count {
+        self.reserve_reg(base + i)
+        i = i + 1
+      }
+      // Evaluate RHS before declaring new local names (so `local x = x` sees outer `x`)
+      self.free_reg = base + count
+      match self.compile_rhs_list(init_exprs, base, count, line) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      self.free_reg = base
+      i = 0
+      while i < count {
+        let _ = self.declare_local(names[i])
+        i = i + 1
+      }
+      Ok(())
+    }
+    Stmt::LocalFunc(name, fb, line) => {
+      // Declare local BEFORE compiling body so recursive `local function f()` captures itself!
+      let reg = self.declare_local(name)
+      match self.compile_expr_to(Expr::FuncExpr(fb), reg) {
+        Ok(_) => Ok(())
+        Err(e) => Err(e)
+      }
+    }
+    Stmt::Assign(lhs, rhs, line) => {
+      let saved = self.free_reg
+      let n = lhs.length()
+      // Evaluate any table/index subexpressions of LHS first, then RHS into temp regs, then assign right-to-left
+      let obj_regs : Array[Int] = []
+      let key_regs : Array[Int] = []
+      let mut i = 0
+      while i < n {
+        match lhs[i] {
+          Expr::Index(obj, idx, _) => {
+            let oreg = self.alloc_reg()
+            match self.compile_expr_to(obj, oreg) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let kreg = self.alloc_reg()
+            match self.compile_expr_to(idx, kreg) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            obj_regs.push(oreg)
+            key_regs.push(kreg)
+          }
+          Expr::Field(obj, _, _) => {
+            let oreg = self.alloc_reg()
+            match self.compile_expr_to(obj, oreg) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            obj_regs.push(oreg)
+            key_regs.push(-1)
+          }
+          _ => {
+            obj_regs.push(-1)
+            key_regs.push(-1)
+          }
+        }
+        i = i + 1
+      }
+      let rhs_base = self.free_reg
+      self.free_reg = rhs_base + n
+      self.reserve_reg(rhs_base + n - 1)
+      match self.compile_rhs_list(rhs, rhs_base, n, line) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      // Perform assignments
+      i = n - 1
+      while i >= 0 {
+        let vreg = rhs_base + i
+        match lhs[i] {
+          Expr::Ident(name, l) => {
+            let lreg = self.resolve_local(name)
+            if lreg >= 0 {
+              if lreg != vreg {
+                let _ = self.emit(enc_abc(OP_MOVE, lreg, vreg, 0), l)
+              }
+            } else {
+              let uv = self.resolve_upval(name)
+              if uv >= 0 {
+                let _ = self.emit(enc_abc(OP_SETUPVAL, vreg, uv, 0), l)
+              } else {
+                let env_uv = self.resolve_upval("_ENV")
+                let k = self.add_const(LuaValue::Str(name))
+                let _ = self.emit(enc_abc(OP_SETTABUP, env_uv, k, vreg), l)
+              }
+            }
+          }
+          Expr::Field(_, field, l) => {
+            let k = self.add_const(LuaValue::Str(field))
+            let _ = self.emit(enc_abc(OP_SETFIELD, obj_regs[i], k, vreg), l)
+          }
+          Expr::Index(_, _, l) => {
+            let _ = self.emit(enc_abc(OP_SETTABLE, obj_regs[i], key_regs[i], vreg), l)
+          }
+          _ => ()
+        }
+        i = i - 1
+      }
+      self.free_reg = saved
+      Ok(())
+    }
+    Stmt::If(branches, else_body, line) => {
+      let end_jumps : Array[Int] = []
+      let mut i = 0
+      while i < branches.length() {
+        let br = branches[i]
+        let saved = self.free_reg
+        let creg = self.alloc_reg()
+        match self.compile_expr_to(br.cond, creg) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let _ = self.emit(enc_abc(OP_TEST, creg, 0, 1), br.line)
+        let false_jmp = self.emit_jmp(0, br.line)
+        self.free_reg = saved
+
+        self.enter_scope()
+        match self.compile_stmts(br.body) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        self.leave_scope(br.line)
+
+        if i + 1 < branches.length() || else_body.is_some() {
+          end_jumps.push(self.emit_jmp(0, br.line))
+        }
+        self.patch_jmp(false_jmp, self.code.length())
+        i = i + 1
+      }
+      match else_body {
+        Some(eb) => {
+          self.enter_scope()
+          match self.compile_stmts(eb) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          self.leave_scope(line)
+        }
+        None => ()
+      }
+      let end_pc = self.code.length()
+      i = 0
+      while i < end_jumps.length() {
+        self.patch_jmp(end_jumps[i], end_pc)
+        i = i + 1
+      }
+      Ok(())
+    }
+    Stmt::While(cond, body, line) => {
+      let loop_start = self.code.length()
+      let saved = self.free_reg
+      let creg = self.alloc_reg()
+      match self.compile_expr_to(cond, creg) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let _ = self.emit(enc_abc(OP_TEST, creg, 0, 1), line)
+      let exit_jmp = self.emit_jmp(0, line)
+      self.free_reg = saved
+
+      self.enter_scope()
+      self.loops.push(LoopCtx::{ depth: self.scope_depth, base_reg: self.free_reg, break_jumps: [] })
+      match self.compile_stmts(body) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let lctx = match self.loops.pop() {
+        Some(lc) => lc
+        None => LoopCtx::{ depth: 0, base_reg: 0, break_jumps: [] }
+      }
+      self.leave_scope(line)
+
+      let back_jmp = self.emit_jmp(0, line)
+      self.patch_jmp(back_jmp, loop_start)
+      let after_pc = self.code.length()
+      self.patch_jmp(exit_jmp, after_pc)
+      let mut j = 0
+      while j < lctx.break_jumps.length() {
+        self.patch_jmp(lctx.break_jumps[j], after_pc)
+        j = j + 1
+      }
+      Ok(())
+    }
+    Stmt::Repeat(body, cond, line) => {
+      let loop_start = self.code.length()
+      self.enter_scope()
+      self.loops.push(LoopCtx::{ depth: self.scope_depth, base_reg: self.free_reg, break_jumps: [] })
+      match self.compile_stmts(body) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let lctx = match self.loops.pop() {
+        Some(lc) => lc
+        None => LoopCtx::{ depth: 0, base_reg: 0, break_jumps: [] }
+      }
+      // `until` condition sees locals declared inside `repeat`!
+      let saved = self.free_reg
+      let creg = self.alloc_reg()
+      match self.compile_expr_to(cond, creg) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      self.free_reg = saved
+      // Check if any locals in repeat scope were captured
+      let mut close_reg = -1
+      let mut li = self.locals.length() - 1
+      while li >= 0 && self.locals[li].depth == self.scope_depth {
+        if self.locals[li].is_captured {
+          close_reg = self.locals[li].reg
+        }
+        li = li - 1
+      }
+      let _ = self.emit(enc_abc(OP_TEST, creg, 0, 1), line)
+      let back_jmp = self.emit_jmp(if close_reg >= 0 { close_reg + 1 } else { 0 }, line)
+      self.patch_jmp(back_jmp, loop_start)
+      self.leave_scope(line)
+      let after_pc = self.code.length()
+      let mut j = 0
+      while j < lctx.break_jumps.length() {
+        self.patch_jmp(lctx.break_jumps[j], after_pc)
+        j = j + 1
+      }
+      Ok(())
+    }
+    Stmt::ForNum(var_name, init_e, limit_e, step_opt, body, line) => {
+      self.enter_scope()
+      let base = self.free_reg
+      let r_idx = self.declare_local("(for index)")
+      let r_lim = self.declare_local("(for limit)")
+      let r_stp = self.declare_local("(for step)")
+      match self.compile_expr_to(init_e, r_idx) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      match self.compile_expr_to(limit_e, r_lim) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      match step_opt {
+        Some(se) => {
+          match self.compile_expr_to(se, r_stp) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        None => {
+          let _ = self.emit(enc_asbx(OP_LOADI, r_stp, 1), line)
+        }
+      }
+      let prep_pc = self.emit(enc_asbx(OP_FORPREP, base, 0), line)
+
+      self.enter_scope()
+      let _ = self.declare_local(var_name) // base + 3
+      self.loops.push(LoopCtx::{ depth: self.scope_depth, base_reg: base + 3, break_jumps: [] })
+      match self.compile_stmts(body) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let lctx = match self.loops.pop() {
+        Some(lc) => lc
+        None => LoopCtx::{ depth: 0, base_reg: 0, break_jumps: [] }
+      }
+      self.leave_scope(line)
+
+      let loop_pc = self.code.length()
+      self.patch_jmp(prep_pc, loop_pc)
+      let _ = self.emit(enc_asbx(OP_FORLOOP, base, prep_pc + 1 - (loop_pc + 1)), line)
+      let after_pc = self.code.length()
+      let mut j = 0
+      while j < lctx.break_jumps.length() {
+        self.patch_jmp(lctx.break_jumps[j], after_pc)
+        j = j + 1
+      }
+      self.leave_scope(line)
+      Ok(())
+    }
+    Stmt::ForGen(names, iters, body, line) => {
+      self.enter_scope()
+      let base = self.free_reg
+      let _ = self.declare_local("(for generator)")
+      let _ = self.declare_local("(for state)")
+      let _ = self.declare_local("(for control)")
+      match self.compile_rhs_list(iters, base, 3, line) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let prep_jmp = self.emit_jmp(0, line)
+      let body_start = self.code.length()
+
+      self.enter_scope()
+      let mut i = 0
+      while i < names.length() {
+        let _ = self.declare_local(names[i])
+        i = i + 1
+      }
+      self.loops.push(LoopCtx::{ depth: self.scope_depth, base_reg: base + 3, break_jumps: [] })
+      match self.compile_stmts(body) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let lctx = match self.loops.pop() {
+        Some(lc) => lc
+        None => LoopCtx::{ depth: 0, base_reg: 0, break_jumps: [] }
+      }
+      self.leave_scope(line)
+
+      let call_pc = self.code.length()
+      self.patch_jmp(prep_jmp, call_pc)
+      let _ = self.emit(enc_abc(OP_TFORCALL, base, 0, names.length()), line)
+      let tloop_pc = self.code.length()
+      let _ = self.emit(enc_asbx(OP_TFORLOOP, base, body_start - (tloop_pc + 1)), line)
+      let after_pc = self.code.length()
+      let mut j = 0
+      while j < lctx.break_jumps.length() {
+        self.patch_jmp(lctx.break_jumps[j], after_pc)
+        j = j + 1
+      }
+      self.leave_scope(line)
+      Ok(())
+    }
+    Stmt::Break(line) => {
+      if self.loops.length() == 0 {
+        return Err(LuaError::new(LuaErrorKind::SyntaxError, "no loop to break", line))
+      }
+      let lctx = self.loops[self.loops.length() - 1]
+      // Close any captured locals at or above loop base_reg
+      let mut close_a = 0
+      let mut li = self.locals.length() - 1
+      while li >= 0 && self.locals[li].depth >= lctx.depth {
+        if self.locals[li].is_captured {
+          close_a = self.locals[li].reg + 1
+        }
+        li = li - 1
+      }
+      let jmp = self.emit_jmp(close_a, line)
+      lctx.break_jumps.push(jmp)
+      Ok(())
+    }
+    Stmt::Return(exprs, line) => {
+      let n = exprs.length()
+      if n == 0 {
+        let _ = self.emit(enc_abc(OP_RETURN, 0, 1, 0), line)
+        return Ok(())
+      }
+      // Tail-call optimization: `return f(...)` or `return obj:m(...)` (not parenthesized!)
+      if n == 1 {
+        match exprs[0] {
+          Expr::Call(callee, args, cl) => {
+            let base = self.free_reg
+            self.reserve_reg(base)
+            match self.compile_expr_to(callee, base) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let nargs = args.length()
+            let mut last_multi = false
+            let mut i = 0
+            while i < nargs {
+              let ar = base + 1 + i
+              self.reserve_reg(ar)
+              self.free_reg = ar + 1
+              if i == nargs - 1 && is_multiret_expr(args[i]) {
+                match self.compile_expr_inner(args[i], ar, 0) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+                last_multi = true
+              } else {
+                match self.compile_expr_to(args[i], ar) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+              }
+              i = i + 1
+            }
+            let b = if last_multi { 0 } else { nargs + 1 }
+            let _ = self.emit(enc_abc(OP_TAILCALL, base, b, 0), cl)
+            let _ = self.emit(enc_abc(OP_RETURN, base, 0, 0), cl)
+            self.free_reg = base
+            return Ok(())
+          }
+          Expr::MethodCall(obj, method_name, args, cl) => {
+            let base = self.free_reg
+            self.reserve_reg(base + 1)
+            self.free_reg = base + 2
+            let obj_tmp = self.alloc_reg()
+            match self.compile_expr_to(obj, obj_tmp) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let mk = self.add_const(LuaValue::Str(method_name))
+            let _ = self.emit(enc_abc(OP_SELF, base, obj_tmp, mk), cl)
+            let nargs = args.length()
+            let mut last_multi = false
+            let mut i = 0
+            while i < nargs {
+              let ar = base + 2 + i
+              self.reserve_reg(ar)
+              self.free_reg = ar + 1
+              if i == nargs - 1 && is_multiret_expr(args[i]) {
+                match self.compile_expr_inner(args[i], ar, 0) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+                last_multi = true
+              } else {
+                match self.compile_expr_to(args[i], ar) {
+                  Ok(_) => ()
+                  Err(e) => return Err(e)
+                }
+              }
+              i = i + 1
+            }
+            let b = if last_multi { 0 } else { nargs + 2 }
+            let _ = self.emit(enc_abc(OP_TAILCALL, base, b, 0), cl)
+            let _ = self.emit(enc_abc(OP_RETURN, base, 0, 0), cl)
+            self.free_reg = base
+            return Ok(())
+          }
+          _ => ()
+        }
+      }
+      let base = self.free_reg
+      let mut last_multi = false
+      let mut i = 0
+      while i < n {
+        let r = base + i
+        self.reserve_reg(r)
+        self.free_reg = r + 1
+        if i == n - 1 && is_multiret_expr(exprs[i]) {
+          match self.compile_expr_inner(exprs[i], r, 0) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          last_multi = true
+        } else {
+          match self.compile_expr_to(exprs[i], r) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        i = i + 1
+      }
+      let b = if last_multi { 0 } else { n + 1 }
+      let _ = self.emit(enc_abc(OP_RETURN, base, b, 0), line)
+      self.free_reg = base
+      Ok(())
+    }
+  }
+}
+
+///| Compile Lua 5.4 source code into a top-level `Proto`.
+fn compile_lua_proto(source : String, max_depth : Int) -> Result[Proto, LuaError] {
+  let stmts = match parse_lua(source, max_depth) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let fc = FuncCompiler::new(None, 0, true)
+  // Top-level chunk has `_ENV` at upvalue 0
+  let _ = fc.add_upval("_ENV", false, 0)
+  fc.enter_scope()
+  match fc.compile_stmts(stmts) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let _ = fc.emit(enc_abc(OP_RETURN, 0, 1, 0), 0)
+  Ok(
+    Proto::{
+      code: fc.code,
+      lines: fc.lines,
+      consts: fc.consts,
+      protos: fc.protos,
+      upvals: fc.upvals,
+      num_params: 0,
+      is_vararg: true,
+      max_stack: fc.max_stack,
+    },
+  )
+}
