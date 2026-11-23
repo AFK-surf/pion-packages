@@ -127,7 +127,7 @@ fn build_complex_cli() -> Command {
 }
 
 fn bench_w1() {
-    let base_cmd = build_complex_cli();
+    let mut base_cmd = build_complex_cli();
     let samples: [&[&str]; 5] = [
         &[
             "cloudctl", "-vv", "--region", "ap-northeast-1", "--str-0=alpha", "--flag-2", "cloud",
@@ -159,8 +159,7 @@ fn bench_w1() {
     for _ in 0..10000 {
         for sample in &samples {
             let m = base_cmd
-                .clone()
-                .try_get_matches_from(sample.iter().copied())
+                .try_get_matches_from_mut(sample.iter().copied())
                 .expect("w1 parse");
             sum_verbose += m.get_count("verbose") as i64;
             sum_str_len += m.get_one::<String>("region").unwrap().len() as i64;
@@ -260,7 +259,7 @@ fn bench_w2() {
 }
 
 fn bench_w3() {
-    let base_cmd = build_complex_cli();
+    let mut base_cmd = build_complex_cli();
     let typos: [(&[&str], &str); 5] = [
         (&["cloudctl", "--outptu"], "--output"),
         (&["cloudctl", "--confgi"], "--config"),
@@ -272,10 +271,13 @@ fn bench_w3() {
     let mut typo_hits = 0usize;
     for _ in 0..2000 {
         for (args, expected) in &typos {
-            if let Err(err) = base_cmd.clone().try_get_matches_from(args.iter().copied()) {
-                let rendered = err.to_string();
-                if rendered.contains(expected) {
-                    typo_hits += 1;
+            if let Err(err) = base_cmd.try_get_matches_from_mut(args.iter().copied()) {
+                if let Some(clap::error::ContextValue::String(s)) =
+                    err.get(clap::error::ContextKind::SuggestedArg)
+                {
+                    if s == expected {
+                        typo_hits += 1;
+                    }
                 }
             }
         }
@@ -283,8 +285,7 @@ fn bench_w3() {
 
     let mut help_ok = 0usize;
     for _ in 0..10000 {
-        let mut c = base_cmd.clone();
-        let txt = c.render_help().to_string();
+        let txt = base_cmd.render_help().to_string();
         if txt.contains("Usage:") {
             help_ok += 1;
         }

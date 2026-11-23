@@ -80,16 +80,16 @@ node "$HOME/.pion/share/pion/pion_wasm_rt.mjs" /private/tmp/cli-smoke/smoke_rele
 Measured via `sh packages/cli/bench/run_bench.sh` using `scripts/bench_compare.py` (strictly interleaved rounds, mandatory byte-identical stdout SHA-256 verification across all implementations):
 
 - **Pion**: `packages/cli` (`pionc build --release`, precompiled `CompiledCommand`)
-- **Rust**: `clap = "=4.5.32"` (`features = ["suggestions", "usage", "help", "error-context"]`, `cargo build --release`)
+- **Rust**: `clap = "=4.5.32"` (`features = ["suggestions", "usage", "help", "error-context"]`, `cargo build --release`, using `try_get_matches_from_mut(&mut cmd)` with zero per-parse `Command::clone()` and structured `ContextKind::SuggestedArg` matching)
 - **Go**: `github.com/spf13/pflag v1.0.6` (`go build`)
 
 ### W1: Complex CLI (30 Options + 5-Level Subcommand) × 50,000 Parses
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_clap`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 198.846 | 176.033 | 308.399 | 3976.93 | 1.94 MiB | 14.48x |
-| `rust_clap` | 2880.160 | 1938.051 | 4999.441 | 57603.19 | 3.03 MiB | 1.00x (baseline) |
-| `go_pflag` | 302.830 | 253.811 | 516.880 | 6056.60 | 16.50 MiB | 9.51x |
+| `pion` | 182.972 | 165.857 | 189.389 | 3659.45 | 1.95 MiB | 7.21x |
+| `rust_clap` | 1318.488 | 1289.462 | 1410.804 | 26369.77 | 2.81 MiB | 1.00x (baseline) |
+| `go_pflag` | 360.676 | 258.459 | 407.668 | 7213.51 | 17.84 MiB | 3.66x |
 
 _SHA-256 verified identical across all implementations and rounds: `77494c5de5dede8eafd6b0d39b6df2500dea64184b2685fb02b72be7c4ddeb36`._
 
@@ -97,9 +97,9 @@ _SHA-256 verified identical across all implementations and rounds: `77494c5de5de
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_clap`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 11.569 | 10.848 | 11.789 | 115.69 | 4.78 MiB | 3.89x |
-| `rust_clap` | 45.055 | 42.907 | 48.950 | 450.55 | 45.58 MiB | 1.00x (baseline) |
-| `go_pflag` | 13.582 | 12.486 | 14.590 | 135.82 | 10.28 MiB | 3.32x |
+| `pion` | 14.085 | 11.652 | 17.057 | 140.85 | 4.78 MiB | 2.97x |
+| `rust_clap` | 41.769 | 40.426 | 53.805 | 417.69 | 45.55 MiB | 1.00x (baseline) |
+| `go_pflag` | 13.829 | 12.530 | 15.538 | 138.29 | 10.33 MiB | 3.02x |
 
 _SHA-256 verified identical across all implementations and rounds: `b83a9179ea608dbf1a8cfaab9274634be69bc0249e0da4a65b327edb524699c9`._
 
@@ -107,14 +107,38 @@ _SHA-256 verified identical across all implementations and rounds: `b83a9179ea60
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_clap`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 69.625 | 68.383 | 72.855 | 3481.27 | 2.02 MiB | 8.91x |
-| `rust_clap` | 620.544 | 608.200 | 664.191 | 31027.22 | 3.17 MiB | 1.00x (baseline) |
+| `pion` | 62.663 | 59.457 | 64.428 | 3133.17 | 2.03 MiB | 6.34x |
+| `rust_clap` | 397.137 | 381.026 | 401.087 | 19856.85 | 2.95 MiB | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `27bb597df1373cec45fce02623cc473dd3417a75b082e219db750b1b25dd96e4`._
 
+### Cold-Start & Adversarial Complexity Benchmarks (`run_audit.sh bench`, `--warmup 1 --rounds 5`, SHA-256 gated)
+
+| Workload | Pion (Before Fix) | Pion (After Fix) | Rust `clap` (fair) | Speedup (vs `rust_clap`) |
+| --- | ---: | ---: | ---: | ---: |
+| W1 cold (build + parse × 50k) | 949 ms | 763.516 ms | 3872.762 ms | **5.07x** |
+| ADV 16k chained `.arg()` | 628 ms | 10.792 ms | 13.743 ms | **1.27x** |
+| ADV 16k chained `.subcommand()` | 691 ms | 10.358 ms | 12.569 ms | **1.21x** |
+| ADV 16k `.args(list)` + parse | 17.4 ms | 15.792 ms | 16.410 ms | **1.04x** |
+| ADV 3k options × 1k typos | 647 ms | 233.640 ms | 1620.184 ms | **6.93x** |
+| ADV 1 MB unknown flag | 11.5 ms | 14.775 ms | 136.869 ms | **9.26x** |
+| ADV 4 KB-name typo suggestion | 472 ms | 15.166 ms | 178.246 ms | **11.75x** |
+
+### Semantic Divergences from `clap 4.5.32`
+
+| Behaviour | `clap 4.5.32` | `pflag 1.0.6` | Pion `cli` | Rationale |
+| --- | --- | --- | --- | --- |
+| Negative numeric literals (`-3`, `-3.14`, `-1e5`, `-.5`) as positionals | Error (requires `allow_negative_numbers`) | Error | Accepted by default when first char is not a defined short flag | Intentional ergonomics & backwards compatibility with existing `cli` suite |
+| Repeated single-value option (`-o a -o b`) or `SetTrue` (`-ff`) | Error (`cannot be used multiple times`) | Last wins | Last wins | Intentional `pflag`/GNU convention & backwards compatibility |
+| Global `ArgAction::Count` across levels (`-v run -v`) | Overwritten to `1` per level | n/a | Accumulates across levels (`2`) | Strictly more consistent for nested global verbosity flags |
+| Subcommand nesting depth | Unbounded (1,000+ levels) | n/a | Bounded by `MAX_SUBCOMMAND_DEPTH = 64` (`InvalidDefinition`) | Explicit stack-safety guard against deeply nested DoS trees |
+| `SetTrue` inline `=VALUE` & env bools | Error on `=VALUE`; env accepts `true`/`false` only | `=true/1` ok | Aligned with `clap`: rejects `=VALUE`, env accepts `true`/`false` only | Prevents silent/ambiguous flag values |
+| `get_double` for `inf` / `-inf` / `infinity` / `NaN` | Accepted (IEEE-754) | Accepted | Aligned with Rust `f64::from_str` (exact IEEE-754 rounding + `inf`/`NaN`) | 0/54 differences vs Rust `str::parse` |
+
 ### Honest Benchmark Notes & Scope Boundaries
 
-- **Why Pion is faster on W1–W3**: `CompiledCommand` precompiles the command tree once into O(1) ASCII short-flag `FixedArray[Int]` lookup tables and `Map` indices, and parses into flat per-argument state arrays without cloning the command graph on every invocation. By contrast, Rust `clap` requires cloning `Command` per `try_get_matches_from` call and constructs rich styled error/context structures (`StyledStr`, ANSI styling), while Go `spf13/pflag` allocates a fresh `FlagSet` per parse and manages Go reflection/pointer bindings.
+- **Why Pion is faster on W1–W3**: `CompiledCommand` precompiles the command tree once into O(1) ASCII short-flag `FixedArray[Int]` lookup tables and `Map` indices, and parses into flat per-argument state arrays. Even after removing `Command::clone()` from `clap` (`try_get_matches_from_mut`) and using structured `ContextKind::SuggestedArg`, Pion remains 7.21x faster on W1, 5.07x faster on W1 cold start, and 6.34x faster on W3.
+- **Builder & Typo Complexity**: Builders (`Command::arg`, `subcommand`, `alias`, `Arg::conflicts_with`, `requires`) append in amortized O(1) (32k chained `.arg()` completes in ~8 ms vs 3,292 ms previously), and typo suggestions use banded Damerau-Levenshtein DP (`O(n * max_dist)`) with length-difference pruning.
 - **Methodology parity notes**:
   - **W1 (`go_pflag`)**: `spf13/pflag` is a flag parser without a built-in subcommand router, so the Go harness uses a thin 5-level subcommand dispatch paired with two `pflag.FlagSet` instances (root + leaf).
   - **W2 (`rust_clap`)**: `clap::ArgAction::Count` stores a saturating `u8` (capped at 255), so to match the exact `30,000` `-v` count across 10,000 `-vvv` tokens, the Rust harness uses `ArgAction::Append` with `num_args(0).default_missing_value("1")` and `args_override_self(true)`.
