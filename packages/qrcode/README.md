@@ -62,6 +62,14 @@ pionc run --target wasm32 --release packages/qrcode/wasm_smoke
 
 - Verified stdout SHA-256 across all 4 modes: `e19b626d6e7669a7487f8f6ce5d2a7b4fc26a780bc7ae46e27608e15d6f6095c`
 
+## Formal Verification (Lean 4)
+
+Existing production `#verify` kernels (2 types, 15 functions, 0 externals) across `src/types.pion`, `src/tables.pion`, `src/segment.pion`, and `src/encode.pion` are extracted via `pionc extract-lean` and formally verified in `packages/qrcode/proofs/` (**22 theorems**, 0 `sorry`, 0 `admit`, 0 custom axioms, 0 `bv_decide`, 0 `native_decide`):
+
+- **`QrcodeProofs/GeometryAndModes.lean` (11 theorems)**: `EcLevel::to_int`/`format_bits` bijections & `ec_level_eq` reflection, `Mode::to_int`/`indicator` injectivity & `mode_eq` reflection, `version_size` exact `4*v+17` in `[21, 177]` (`≡ 1 mod 4`) & strict monotonicity, `raw_data_modules` exact `[208, 29648]` bounds & strict monotonicity across all 40 versions, `total_codewords` `[26, 3706]`, `char_count_bits` version monotonicity across all 5 modes, `ceil_sixths` rounding & idempotence, and `is_numeric_byte` exact ASCII digit spec.
+- **`QrcodeProofs/MaskAndKanji.lean` (11 theorems)**: Exact ISO/IEC 18004 specifications for all **8 QR mask patterns (`0..7`)** on `0 ≤ x, y ≤ 176`, `kanji_value` 13-bit range `[0, 8191]`, `kanji_from_value` Shift-JIS validity (excluding `0x7F`), and end-to-end `kanji_encode_decode_roundtrip`.
+- **Reproduce**: `packages/qrcode/proofs/run_proofs.sh` (verifies extraction, static scan, `lake build`, `CheckAxioms.lean` standard-axioms-only check, and 40-case Native Pion vs Lean `EvalDiff` `diff -u` cross-check).
+
 ## Head-to-Head Multi-Baseline Benchmarks (`pion` vs `qrcode 0.14.1` / `qrcodegen 1.8.0` / `fast_qr 0.14.0`)
 
 Measured with `packages/qrcode/audit/run_audit.sh bench` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, mandatory byte-identical stdout SHA-256 across all implementations and rounds). All Rust baselines are built with `cargo build --release --locked`; Pion is built with `pionc build --release`.
