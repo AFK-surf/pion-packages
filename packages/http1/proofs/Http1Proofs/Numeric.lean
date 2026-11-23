@@ -4,12 +4,12 @@ open Aeneas Aeneas.Std Result Pion http1
 
 namespace Http1Proofs
 
-/-- RFC 9112: `parse_http_minor` maps `'0'` to `Http10`, `'1'..'9'` to `Http11`,
-    and rejects all other bytes with `InvalidVersion`. -/
+/-- RFC 9112: `parse_http_minor` maps `'0'` to `0` (`Http10`), `'1'..'9'` to `1` (`Http11`),
+    and rejects all other bytes with `-1` (`InvalidVersion`). -/
 theorem parse_http_minor_spec (v : Std.I32) :
-    (v.val = 48 → parse_http_minor v = ok (Res.Ok Version.Http10)) ∧
-    (49 ≤ v.val ∧ v.val ≤ 57 → parse_http_minor v = ok (Res.Ok Version.Http11)) ∧
-    ((v.val < 48 ∨ 57 < v.val) → parse_http_minor v = ok (Res.Err HttpError.InvalidVersion)) := by
+    (v.val = 48 → parse_http_minor v = ok 0#i32) ∧
+    (49 ≤ v.val ∧ v.val ≤ 57 → parse_http_minor v = ok 1#i32) ∧
+    ((v.val < 48 ∨ 57 < v.val) → parse_http_minor v = ok (-1)#i32) := by
   have h48 : (48#i32).val = 48 := by norm_num
   have h49 : (49#i32).val = 49 := by norm_num
   have h57 : (57#i32).val = 57 := by norm_num
@@ -36,7 +36,7 @@ theorem parse_status_digits_ok (d0 d1 d2 : Std.I32)
     (h0 : 48 ≤ d0.val ∧ d0.val ≤ 57)
     (h1 : 48 ≤ d1.val ∧ d1.val ≤ 57)
     (h2 : 48 ≤ d2.val ∧ d2.val ≤ 57) :
-    ∃ s : Std.I32, parse_status_digits d0 d1 d2 = ok (Res.Ok s) ∧
+    ∃ s : Std.I32, parse_status_digits d0 d1 d2 = ok s ∧
       s.val = (d0.val - 48) * 100 + (d1.val - 48) * 10 + (d2.val - 48) ∧
       0 ≤ s.val ∧ s.val ≤ 999 := by
   have h48 : (48#i32).val = 48 := by norm_num
@@ -72,10 +72,10 @@ theorem parse_status_digits_ok (d0 d1 d2 : Std.I32)
     rw [i32_add_val, ha0, hs2] <;> omega
   exact ⟨s, rfl, hs, by omega, by omega⟩
 
-/-- `parse_status_digits` rejects any non-digit byte with `InvalidStatus`. -/
+/-- `parse_status_digits` rejects any non-digit byte with `-1` (`InvalidStatus`). -/
 theorem parse_status_digits_rejects_nondigit (d0 d1 d2 : Std.I32)
     (h : d0.val < 48 ∨ 57 < d0.val ∨ d1.val < 48 ∨ 57 < d1.val ∨ d2.val < 48 ∨ 57 < d2.val) :
-    parse_status_digits d0 d1 d2 = ok (Res.Err HttpError.InvalidStatus) := by
+    parse_status_digits d0 d1 d2 = ok (-1)#i32 := by
   have h48 : (48#i32).val = 48 := by norm_num
   have h57 : (57#i32).val = 57 := by norm_num
   unfold parse_status_digits
@@ -87,33 +87,20 @@ theorem parse_status_digits_rejects_nondigit (d0 d1 d2 : Std.I32)
   rw [hcond]
   rfl
 
-/-- `validate_encode_status` accepts iff `100 <= status <= 999`. -/
-theorem validate_encode_status_spec (status : Std.I32) :
-    (100 ≤ status.val ∧ status.val ≤ 999 → validate_encode_status status = ok (Res.Ok ())) ∧
-    ((status.val < 100 ∨ 999 < status.val) →
-      validate_encode_status status = ok (Res.Err HttpError.InvalidStatus)) := by
-  have h100 : (100#i32).val = 100 := by norm_num
-  have h999 : (999#i32).val = 999 := by norm_num
-  refine ⟨?_, ?_⟩
-  · intro h
-    unfold validate_encode_status
-    have hcond : ((decide (status < 100#i32)) || (decide (status > 999#i32))) = false := by
-      simp only [Bool.or_eq_false_iff, decide_eq_false_iff_not, iscalar_lt_iff]; omega
-    rw [hcond]; rfl
-  · intro h
-    unfold validate_encode_status
-    have hcond : ((decide (status < 100#i32)) || (decide (status > 999#i32))) = true := by
-      simp only [Bool.or_eq_true, decide_eq_true_eq, iscalar_lt_iff]; omega
-    rw [hcond]; rfl
+/-- `is_valid_encode_status` accepts iff `100 <= status <= 999`. -/
+theorem is_valid_encode_status_spec (status : Std.I32) :
+    is_valid_encode_status status = ok (decide (100 ≤ status.val ∧ status.val ≤ 999)) := by
+  unfold is_valid_encode_status
+  congr 1
 
 /-- Overflow immunity and exact arithmetic for `u63_decimal_step` (Content-Length & SSE retry):
     when `acc >= 0`, `b` is an ASCII digit, and `acc * 10 + (b - 48) <= INT64_MAX`,
-    it returns `some res` with exact mathematical value `acc * 10 + (b - 48)` (no wraparound). -/
+    it returns `res >= 0` with exact mathematical value `acc * 10 + (b - 48)` (no wraparound). -/
 theorem u63_decimal_step_ok (acc : Std.I64) (b : Std.I32)
     (hacc : 0 ≤ acc.val)
     (hb : 48 ≤ b.val ∧ b.val ≤ 57)
     (hfit : acc.val * 10 + (b.val - 48) ≤ 9223372036854775807) :
-    ∃ res : Std.I64, u63_decimal_step acc b = ok (some res) ∧
+    ∃ res : Std.I64, u63_decimal_step acc b = ok res ∧
       res.val = acc.val * 10 + (b.val - 48) ∧ 0 ≤ res.val := by
   have h48 : (48#i32).val = 48 := by norm_num
   have h57 : (57#i32).val = 57 := by norm_num
@@ -161,10 +148,10 @@ theorem u63_decimal_step_ok (acc : Std.I64) (b : Std.I32)
   exact ⟨res, rfl, hres, by omega⟩
 
 /-- `u63_decimal_step` rejects any overflow (`acc * 10 + (b - 48) > INT64_MAX`),
-    negative accumulator, or non-digit byte with `none`. -/
+    negative accumulator, or non-digit byte with `-1L`. -/
 theorem u63_decimal_step_rejects_overflow_or_invalid (acc : Std.I64) (b : Std.I32)
     (h : b.val < 48 ∨ 57 < b.val ∨ acc.val < 0 ∨ 9223372036854775807 < acc.val * 10 + (b.val - 48)) :
-    u63_decimal_step acc b = ok none := by
+    u63_decimal_step acc b = ok (-1)#i64 := by
   have h48 : (48#i32).val = 48 := by norm_num
   have h57 : (57#i32).val = 57 := by norm_num
   have h0v : (0#i64).val = 0 := by norm_num
@@ -285,10 +272,10 @@ lemma i64_shl4_bor_eq (size : Std.I64) (v : Std.I32)
   rw [ite_eq_left hlt]
   omega
 
-/-- RFC 9112 §7.1: `chunk_size_hex_step` rejects 17+ hex digits (`digits >= 16`) with `InvalidChunkSize`. -/
+/-- RFC 9112 §7.1: `chunk_size_hex_step` rejects 17+ hex digits (`digits >= 16`) with `-1L` (`InvalidChunkSize`). -/
 theorem chunk_size_hex_step_rejects_too_many_digits (size : Std.I64) (digits v : Std.I32)
     (h : 16 ≤ digits.val) :
-    chunk_size_hex_step size digits v = ok (Res.Err HttpError.InvalidChunkSize) := by
+    chunk_size_hex_step size digits v = ok (-1)#i64 := by
   have h16 : (16#i32).val = 16 := by norm_num
   unfold chunk_size_hex_step
   have hc : ((((decide (digits < 0#i32)) || (decide (digits ≥ 16#i32))) ||
@@ -298,13 +285,13 @@ theorem chunk_size_hex_step_rejects_too_many_digits (size : Std.I64) (digits v :
 
 /-- Overflow immunity and exact arithmetic for `chunk_size_hex_step`:
     for `0 <= digits < 16`, `0 <= v <= 15`, `0 <= size`, and `size * 16 + v <= INT64_MAX`,
-    it returns `Ok res` with exact value `size * 16 + v` (zero signed 64-bit wraparound). -/
+    it returns `res >= 0` with exact value `size * 16 + v` (zero signed 64-bit wraparound). -/
 theorem chunk_size_hex_step_ok (size : Std.I64) (digits v : Std.I32)
     (hsize : 0 ≤ size.val)
     (hdig : 0 ≤ digits.val ∧ digits.val < 16)
     (hv : 0 ≤ v.val ∧ v.val ≤ 15)
     (hfit : size.val * 16 + v.val ≤ 9223372036854775807) :
-    ∃ res : Std.I64, chunk_size_hex_step size digits v = ok (Res.Ok res) ∧
+    ∃ res : Std.I64, chunk_size_hex_step size digits v = ok res ∧
       res.val = size.val * 16 + v.val ∧ 0 ≤ res.val := by
   have h0i : (0#i32).val = 0 := by norm_num
   have h16i : (16#i32).val = 16 := by norm_num
@@ -341,12 +328,12 @@ theorem chunk_size_hex_step_ok (size : Std.I64) (digits v : Std.I32)
   rw [heq]
   exact ⟨r, rfl, hrv, by omega⟩
 
-/-- `chunk_size_hex_step` rejects any overflow (`size > (INT64_MAX - 15) / 16`) with `ChunkTooLarge`. -/
+/-- `chunk_size_hex_step` rejects any overflow (`size > (INT64_MAX - 15) / 16`) with `-2L` (`ChunkTooLarge`). -/
 theorem chunk_size_hex_step_rejects_overflow (size : Std.I64) (digits v : Std.I32)
     (hdig : 0 ≤ digits.val ∧ digits.val < 16)
     (hv : 0 ≤ v.val ∧ v.val ≤ 15)
     (hovf : 576460752303423487 < size.val) :
-    chunk_size_hex_step size digits v = ok (Res.Err HttpError.ChunkTooLarge) := by
+    chunk_size_hex_step size digits v = ok (-2)#i64 := by
   have h0i : (0#i32).val = 0 := by norm_num
   have h16i : (16#i32).val = 16 := by norm_num
   have h15i : (15#i32).val = 15 := by norm_num
@@ -364,13 +351,11 @@ theorem chunk_size_hex_step_rejects_overflow (size : Std.I64) (digits v : Std.I3
     exact Or.inl (Or.inr (decide_eq_true hgt))
   rw [hc2]; rfl
 
-/-- Exact specification of `chunk_size_check_limit`. -/
+/-- Exact specification of `chunk_size_check_limit` (`0` = ok, `1` = negative, `2` = exceeds limit). -/
 theorem chunk_size_check_limit_spec (size max_sz : Std.I64) :
-    (size.val < 0 → chunk_size_check_limit size max_sz = ok (Res.Err HttpError.InvalidChunkSize)) ∧
-    (0 ≤ size.val ∧ max_sz.val < size.val →
-      chunk_size_check_limit size max_sz = ok (Res.Err HttpError.ChunkTooLarge)) ∧
-    (0 ≤ size.val ∧ size.val ≤ max_sz.val →
-      chunk_size_check_limit size max_sz = ok (Res.Ok size)) := by
+    (size.val < 0 → chunk_size_check_limit size max_sz = ok 1#i32) ∧
+    (0 ≤ size.val ∧ max_sz.val < size.val → chunk_size_check_limit size max_sz = ok 2#i32) ∧
+    (0 ≤ size.val ∧ size.val ≤ max_sz.val → chunk_size_check_limit size max_sz = ok 0#i32) := by
   have h0l : (0#i64).val = 0 := by norm_num
   refine ⟨?_, ?_, ?_⟩
   · intro h

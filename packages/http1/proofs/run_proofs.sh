@@ -190,153 +190,24 @@ pub fn main(w : World) -> Int {
   )
   report(w, "te_after_chunked_neg1", http1::te_coding_step(1, true, false) == -1)
   report(w, "te_gzip_then_chunked", http1::te_coding_step(0, true, false) == 1)
-  report(
-    w,
-    "minor_0",
-    match http1::parse_http_minor(48) {
-      Ok(http1::Version::Http10) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "minor_1",
-    match http1::parse_http_minor(49) {
-      Ok(http1::Version::Http11) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "minor_x",
-    match http1::parse_http_minor(120) {
-      Err(http1::HttpError::InvalidVersion) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "status_200",
-    match http1::parse_status_digits(50, 48, 48) {
-      Ok(200) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "status_bad",
-    match http1::parse_status_digits(50, 65, 48) {
-      Err(http1::HttpError::InvalidStatus) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "u63_step_ok",
-    match http1::u63_decimal_step(123L, 52) {
-      Some(v) => v == 1234L
-      _ => false
-    },
-  )
-  report(
-    w,
-    "u63_step_max_ok",
-    match http1::u63_decimal_step(922337203685477580L, 55) {
-      Some(v) => v == 9223372036854775807L
-      _ => false
-    },
-  )
-  report(
-    w,
-    "u63_step_max_ovf",
-    match http1::u63_decimal_step(922337203685477580L, 56) {
-      None => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "chunk_hex_ok",
-    match http1::chunk_size_hex_step(16L, 2, 10) {
-      Ok(v) => v == 266L
-      _ => false
-    },
-  )
-  report(
-    w,
-    "chunk_hex_16dig_err",
-    match http1::chunk_size_hex_step(0L, 16, 1) {
-      Err(http1::HttpError::InvalidChunkSize) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "chunk_hex_ovf",
-    match http1::chunk_size_hex_step(576460752303423488L, 15, 0) {
-      Err(http1::HttpError::ChunkTooLarge) => true
-      _ => false
-    },
-  )
-  let st0 = http1::FramingState::new()
-  let st_cl = http1::FramingState::{ has_cl: true, cl_val: 10L, has_te: false, te_state: 0, host_count: 1 }
-  let st_te = http1::FramingState::{ has_cl: false, cl_val: 0L, has_te: true, te_state: 1, host_count: 1 }
-  report(
-    w,
-    "smuggle_cl_after_te",
-    match http1::framing_on_content_length(st_te, 5L) {
-      Err(http1::HttpError::AmbiguousFraming) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "smuggle_te_after_cl",
-    match http1::framing_on_transfer_encoding(st_cl, http1::Version::Http11, 1) {
-      Err(http1::HttpError::AmbiguousFraming) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "smuggle_http10_te",
-    match http1::framing_on_transfer_encoding(st0, http1::Version::Http10, 1) {
-      Err(http1::HttpError::InvalidTransferEncoding) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "smuggle_dup_host",
-    match http1::framing_on_host(st_cl, true) {
-      Err(http1::HttpError::InvalidHost) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "finalize_missing_host",
-    match http1::framing_finalize(st0, true, http1::Version::Http11) {
-      Err(http1::HttpError::InvalidHost) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "finalize_chunked_ok",
-    match http1::framing_finalize(st_te, true, http1::Version::Http11) {
-      Ok(http1::Framing::Chunked) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "finalize_cl_ok",
-    match http1::framing_finalize(st_cl, true, http1::Version::Http11) {
-      Ok(http1::Framing::ContentLength(v)) => v == 10L
-      _ => false
-    },
-  )
+  report(w, "minor_0", http1::parse_http_minor(48) == 0)
+  report(w, "minor_1", http1::parse_http_minor(49) == 1)
+  report(w, "minor_x", http1::parse_http_minor(120) == -1)
+  report(w, "status_200", http1::parse_status_digits(50, 48, 48) == 200)
+  report(w, "status_bad", http1::parse_status_digits(50, 65, 48) == -1)
+  report(w, "u63_step_ok", http1::u63_decimal_step(123L, 52) == 1234L)
+  report(w, "u63_step_max_ok", http1::u63_decimal_step(922337203685477580L, 55) == 9223372036854775807L)
+  report(w, "u63_step_max_ovf", http1::u63_decimal_step(922337203685477580L, 56) == -1L)
+  report(w, "chunk_hex_ok", http1::chunk_size_hex_step(16L, 2, 10) == 266L)
+  report(w, "chunk_hex_16dig_err", http1::chunk_size_hex_step(0L, 16, 1) == -1L)
+  report(w, "chunk_hex_ovf", http1::chunk_size_hex_step(576460752303423488L, 15, 0) == -2L)
+  report(w, "smuggle_cl_after_te", http1::check_framing_cl(true, false, 5L) == 1)
+  report(w, "smuggle_te_after_cl", http1::check_framing_te(true, http1::Version::Http11, 1) == 1)
+  report(w, "smuggle_http10_te", http1::check_framing_te(false, http1::Version::Http10, 1) == 2)
+  report(w, "smuggle_dup_host", http1::check_framing_host(1, true) == 1)
+  report(w, "finalize_missing_host", http1::check_framing_finalize(false, false, 0, 0, true, http1::Version::Http11) == -1)
+  report(w, "finalize_chunked_ok", http1::check_framing_finalize(false, true, 1, 1, true, http1::Version::Http11) == 2)
+  report(w, "finalize_cl_ok", http1::check_framing_finalize(true, false, 0, 1, true, http1::Version::Http11) == 1)
   0
 }
 EOF

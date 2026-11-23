@@ -19,34 +19,37 @@ import Http1Proofs
 #print axioms Http1Proofs.hex_digit_value_case_insensitive
 #print axioms Http1Proofs.is_host_byte_rejects_ctl_sp_nonascii
 
--- RFC 9112 framing & anti-smuggling state machine
+-- RFC 9112 framing & anti-smuggling scalar state checks
 #print axioms Http1Proofs.version_eq_iff
 #print axioms Http1Proofs.is_bodyless_status_spec
 #print axioms Http1Proofs.effective_response_framing_bodyless
 #print axioms Http1Proofs.effective_response_framing_body_allowed
 #print axioms Http1Proofs.te_coding_step_rejects_after_chunked
 #print axioms Http1Proofs.te_coding_step_rejects_unknown
-#print axioms Http1Proofs.framing_on_cl_rejects_after_te
-#print axioms Http1Proofs.framing_on_cl_rejects_duplicate
-#print axioms Http1Proofs.framing_on_cl_rejects_negative
-#print axioms Http1Proofs.framing_on_te_rejects_after_cl
-#print axioms Http1Proofs.framing_on_te_rejects_http10
-#print axioms Http1Proofs.framing_on_te_rejects_neg_state
-#print axioms Http1Proofs.framing_on_host_rejects_duplicate
-#print axioms Http1Proofs.framing_on_host_rejects_invalid
-#print axioms Http1Proofs.framing_new_inv
-#print axioms Http1Proofs.framing_on_cl_preserves_inv
-#print axioms Http1Proofs.framing_on_te_preserves_inv
-#print axioms Http1Proofs.framing_on_host_preserves_inv
-#print axioms Http1Proofs.framing_finalize_http11_requires_host
-#print axioms Http1Proofs.framing_finalize_request_te_requires_chunked
-#print axioms Http1Proofs.framing_finalize_cl_nonneg
+#print axioms Http1Proofs.check_framing_cl_rejects_after_te
+#print axioms Http1Proofs.check_framing_cl_rejects_duplicate
+#print axioms Http1Proofs.check_framing_cl_rejects_negative
+#print axioms Http1Proofs.check_framing_cl_accepts_valid
+#print axioms Http1Proofs.check_framing_te_rejects_after_cl
+#print axioms Http1Proofs.check_framing_te_rejects_http10
+#print axioms Http1Proofs.check_framing_te_rejects_neg_state
+#print axioms Http1Proofs.check_framing_te_accepts_valid
+#print axioms Http1Proofs.check_framing_host_rejects_duplicate
+#print axioms Http1Proofs.check_framing_host_rejects_invalid
+#print axioms Http1Proofs.check_framing_host_accepts_first
+#print axioms Http1Proofs.framing_init_inv
+#print axioms Http1Proofs.check_framing_cl_preserves_inv
+#print axioms Http1Proofs.check_framing_te_preserves_inv
+#print axioms Http1Proofs.check_framing_host_preserves_inv
+#print axioms Http1Proofs.check_framing_finalize_http11_requires_host
+#print axioms Http1Proofs.check_framing_finalize_request_te_requires_chunked
+#print axioms Http1Proofs.check_framing_finalize_cl_nonneg
 
 -- Numeric decoders & overflow immunity
 #print axioms Http1Proofs.parse_http_minor_spec
 #print axioms Http1Proofs.parse_status_digits_ok
 #print axioms Http1Proofs.parse_status_digits_rejects_nondigit
-#print axioms Http1Proofs.validate_encode_status_spec
+#print axioms Http1Proofs.is_valid_encode_status_spec
 #print axioms Http1Proofs.u63_decimal_step_ok
 #print axioms Http1Proofs.u63_decimal_step_rejects_overflow_or_invalid
 #print axioms Http1Proofs.chunk_size_hex_step_rejects_too_many_digits

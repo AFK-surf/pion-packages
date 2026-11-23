@@ -17,23 +17,6 @@ def framingEq (a b : Framing) : Bool :=
 
 instance : BEq Framing := ⟨framingEq⟩
 
-def resEq {α ε : Type} [BEq α] [BEq ε] (a b : Pion.Res α ε) : Bool :=
-  match a, b with
-  | .Ok x, .Ok y => x == y
-  | .Err x, .Err y => x == y
-  | _, _ => false
-
-instance {α ε : Type} [BEq α] [BEq ε] : BEq (Pion.Res α ε) := ⟨resEq⟩
-
-def stateEq (a b : FramingState) : Bool :=
-  a.has_cl == b.has_cl &&
-  a.cl_val == b.cl_val &&
-  a.has_te == b.has_te &&
-  a.te_state == b.te_state &&
-  a.host_count == b.host_count
-
-instance : BEq FramingState := ⟨stateEq⟩
-
 def report (label : String) (passed : Bool) : IO Unit :=
   IO.println s!"{label}: {if passed then "PASS" else "FAIL"}"
 
@@ -61,26 +44,23 @@ def report (label : String) (passed : Bool) : IO Unit :=
   report "eff_framing_200" (okIs (effective_response_framing 200#i32 (Framing.ContentLength 99#i64)) (Framing.ContentLength 99#i64))
   report "te_after_chunked_neg1" (okIs (te_coding_step 1#i32 true false) (-1)#i32)
   report "te_gzip_then_chunked" (okIs (te_coding_step 0#i32 true false) 1#i32)
-  report "minor_0" (okIs (parse_http_minor 48#i32) (Pion.Res.Ok Version.Http10))
-  report "minor_1" (okIs (parse_http_minor 49#i32) (Pion.Res.Ok Version.Http11))
-  report "minor_x" (okIs (parse_http_minor 120#i32) (Pion.Res.Err HttpError.InvalidVersion))
-  report "status_200" (okIs (parse_status_digits 50#i32 48#i32 48#i32) (Pion.Res.Ok 200#i32))
-  report "status_bad" (okIs (parse_status_digits 50#i32 65#i32 48#i32) (Pion.Res.Err HttpError.InvalidStatus))
-  report "u63_step_ok" (okIs (u63_decimal_step 123#i64 52#i32) (some 1234#i64))
-  report "u63_step_max_ok" (okIs (u63_decimal_step 922337203685477580#i64 55#i32) (some 9223372036854775807#i64))
-  report "u63_step_max_ovf" (okIs (u63_decimal_step 922337203685477580#i64 56#i32) none)
-  report "chunk_hex_ok" (okIs (chunk_size_hex_step 16#i64 2#i32 10#i32) (Pion.Res.Ok 266#i64))
-  report "chunk_hex_16dig_err" (okIs (chunk_size_hex_step 0#i64 16#i32 1#i32) (Pion.Res.Err HttpError.InvalidChunkSize))
-  report "chunk_hex_ovf" (okIs (chunk_size_hex_step 576460752303423488#i64 15#i32 0#i32) (Pion.Res.Err HttpError.ChunkTooLarge))
-  let st0 := FramingState.mk false 0#i64 false 0#i32 0#i32
-  let st_cl := FramingState.mk true 10#i64 false 0#i32 1#i32
-  let st_te := FramingState.mk false 0#i64 true 1#i32 1#i32
-  report "smuggle_cl_after_te" (okIs (framing_on_content_length st_te 5#i64) (Pion.Res.Err HttpError.AmbiguousFraming))
-  report "smuggle_te_after_cl" (okIs (framing_on_transfer_encoding st_cl .Http11 1#i32) (Pion.Res.Err HttpError.AmbiguousFraming))
-  report "smuggle_http10_te" (okIs (framing_on_transfer_encoding st0 .Http10 1#i32) (Pion.Res.Err HttpError.InvalidTransferEncoding))
-  report "smuggle_dup_host" (okIs (framing_on_host st_cl true) (Pion.Res.Err HttpError.InvalidHost))
-  report "finalize_missing_host" (okIs (framing_finalize st0 true .Http11) (Pion.Res.Err HttpError.InvalidHost))
-  report "finalize_chunked_ok" (okIs (framing_finalize st_te true .Http11) (Pion.Res.Ok Framing.Chunked))
-  report "finalize_cl_ok" (okIs (framing_finalize st_cl true .Http11) (Pion.Res.Ok (Framing.ContentLength 10#i64)))
+  report "minor_0" (okIs (parse_http_minor 48#i32) 0#i32)
+  report "minor_1" (okIs (parse_http_minor 49#i32) 1#i32)
+  report "minor_x" (okIs (parse_http_minor 120#i32) (-1)#i32)
+  report "status_200" (okIs (parse_status_digits 50#i32 48#i32 48#i32) 200#i32)
+  report "status_bad" (okIs (parse_status_digits 50#i32 65#i32 48#i32) (-1)#i32)
+  report "u63_step_ok" (okIs (u63_decimal_step 123#i64 52#i32) 1234#i64)
+  report "u63_step_max_ok" (okIs (u63_decimal_step 922337203685477580#i64 55#i32) 9223372036854775807#i64)
+  report "u63_step_max_ovf" (okIs (u63_decimal_step 922337203685477580#i64 56#i32) (-1)#i64)
+  report "chunk_hex_ok" (okIs (chunk_size_hex_step 16#i64 2#i32 10#i32) 266#i64)
+  report "chunk_hex_16dig_err" (okIs (chunk_size_hex_step 0#i64 16#i32 1#i32) (-1)#i64)
+  report "chunk_hex_ovf" (okIs (chunk_size_hex_step 576460752303423488#i64 15#i32 0#i32) (-2)#i64)
+  report "smuggle_cl_after_te" (okIs (check_framing_cl true false 5#i64) 1#i32)
+  report "smuggle_te_after_cl" (okIs (check_framing_te true .Http11 1#i32) 1#i32)
+  report "smuggle_http10_te" (okIs (check_framing_te false .Http10 1#i32) 2#i32)
+  report "smuggle_dup_host" (okIs (check_framing_host 1#i32 true) 1#i32)
+  report "finalize_missing_host" (okIs (check_framing_finalize false false 0#i32 0#i32 true .Http11) (-1)#i32)
+  report "finalize_chunked_ok" (okIs (check_framing_finalize false true 1#i32 1#i32 true .Http11) 2#i32)
+  report "finalize_cl_ok" (okIs (check_framing_finalize true false 0#i32 1#i32 true .Http11) 1#i32)
 
 end Http1EvalDiff
