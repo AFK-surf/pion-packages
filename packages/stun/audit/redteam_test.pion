@@ -1,0 +1,378 @@
+///| Red-team FINDING tests for `packages/stun` @ d31e5fd (feat/pkg-stun).
+///|
+///| Every `p1_*` / `p2_*` test asserts the behaviour RFC 8489 / RFC 8445 requires and therefore
+///| FAILS on the audited baseline: the failure (its assertion message) is the evidence.
+///| A fix is complete when the test turns green without weakening it. See README.md.
+
+import "stun"
+
+///|
+fn tx_of(wire : Bytes) -> Bytes {
+  let t = Bytes::new(12)
+  let mut i = 0
+  while i < 12 {
+    t[i] = wire[8 + i]
+    i = i + 1
+  }
+  t
+}
+
+///|
+fn nominated_local_addr(a : stun::IceAgent) -> Option[stun::SocketAddr] {
+  match a.selected_pair() {
+    Some(p) => Some(a.local_candidates[p.local_idx].addr)
+    None => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P1
+// ---------------------------------------------------------------------------
+
+///| P1-1 RFC 8489 §14.5: attributes after MESSAGE-INTEGRITY (except MI-SHA256 / FINGERPRINT) MUST be
+///| ignored. An on-path attacker appends USE-CANDIDATE after MI of a captured, ordinary check and
+///| re-computes the unkeyed FINGERPRINT: the Controlled agent nominates the pair (no key needed).
+test "p1_use_candidate_injected_after_message_integrity_forces_nomination" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlled, 0x20UL)
+  let w = check_wire(p.alice) // regular nomination: no USE-CANDIDATE in this check
+  debug_assert(w.length() > 0, "fixture")
+  let forged = inject_after_mi(w, tlv(0x0025, Bytes::new(0)))
+  // the forged packet still "verifies": MI only covers the prefix, FINGERPRINT is unkeyed
+  debug_assert(vt(stun::verify_message_integrity(forged, ascii(bob_pwd))) == "true", "fixture: MI still valid")
+  debug_assert(vt(stun::verify_fingerprint(forged)) == "true", "fixture: FP valid")
+  let k = inbound_kind(p.bob.handle_inbound(forged, p.alice_addr))
+  debug_assert(
+    is_none(p.bob.selected_pair()),
+    "P1-1: Controlled agent nominated a pair from USE-CANDIDATE placed AFTER MESSAGE-INTEGRITY (" + k + ")",
+  )
+}
+
+///| P1-1 (decoder half): decode_message hands attributes after MESSAGE-INTEGRITY to callers with no
+///| marker, so every consumer of `Message.attributes` inherits the bypass.
+test "p1_decode_message_exposes_unauthenticated_attributes_after_mi" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlled, 0x20UL)
+  let w = check_wire(p.alice)
+  let forged = inject_after_mi(w, tlv(0x0006, ascii("uBob:mallory")))
+  let n = match stun::decode_message(forged) {
+    Ok(m) => m.attributes.length()
+    Err(_) => -1
+  }
+  let n0 = match stun::decode_message(w) {
+    Ok(m) => m.attributes.length()
+    Err(_) => -1
+  }
+  debug_assert(n == n0, "P1-1: decoder returned " + n.to_string() + " attrs (authentic " + n0.to_string() + "): post-MI USERNAME surfaced as authenticated")
+}
+
+///| P1-2 RFC 8445 §7.3.1.1: both agents Controlling. Bob's tie-breaker is larger, so Bob MUST answer
+///| Alice's check with 487 (Role Conflict). The agent never looks at ICE-CONTROLLING/-CONTROLLED.
+test "p1_role_conflict_controlling_vs_controlling_no_487" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlling, 0xFFFFUL)
+  let w = check_wire(p.alice)
+  let k = inbound_kind(p.bob.handle_inbound(w, p.alice_addr))
+  debug_assert(k == "send:error:487", "P1-2: controlling/controlling glare answered with " + k + " instead of 487")
+}
+
+///| P1-2: both Controlled -> one side MUST switch to Controlling (or reply 487); with an immutable
+///| `role` neither side can ever nominate, ICE never completes.
+test "p1_role_conflict_controlled_vs_controlled_deadlock" {
+  let p = peers(stun::IceRole::Controlled, 0xFFFFUL, stun::IceRole::Controlled, 0x10UL)
+  let w = check_wire(p.alice)
+  let k = inbound_kind(p.bob.handle_inbound(w, p.alice_addr))
+  // Bob's tie-breaker is smaller: RFC says Bob replies 487.
+  debug_assert(k == "send:error:487", "P1-2: controlled/controlled glare answered with " + k + " instead of 487")
+}
+
+///| P1-2: a 487 response MUST make the agent switch role and retry the pair (RFC 8445 §7.2.5.1);
+///| the agent marks the pair Failed permanently.
+test "p1_role_conflict_487_response_fails_pair_instead_of_switching" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlling, 0xFFFFUL)
+  let w = check_wire(p.alice)
+  let resp = stun::Message::new(stun::MessageClass::ErrorResponse, stun::MessageMethod::Binding, tx_of(w))
+  resp.add(stun::Attribute::ErrorCode(stun::ErrorCode::new(487, "Role Conflict")))
+  let k = inbound_kind(p.alice.handle_inbound(sign(resp, bob_pwd), p.bob_addr))
+  let switched = stun::ice_role_eq(p.alice.role, stun::IceRole::Controlled)
+  let failed = stun::pair_state_eq(p.alice.pairs[0].state, stun::PairState::Failed)
+  debug_assert(switched && !failed, "P1-2: 487 -> " + k + ", role switched=" + switched.to_string() + ", pair Failed=" + failed.to_string())
+}
+
+///| P1-3 RFC 8445 §7.3.1.4/§7.3.1.5: a nominating check identifies the pair by (local, remote)
+///| transport address. The agent matches only the remote address and takes the first (highest
+///| priority) pair, so Alice nominating "Bob-wifi <-> Alice" makes Bob select "Bob-eth <-> Alice".
+test "p1_controlled_nominates_wrong_pair_ignoring_local_candidate" {
+  let alice_addr = stun::socket_addr_ipv4(192, 168, 1, 10, 50000)
+  let bob_eth = stun::socket_addr_ipv4(10, 0, 0, 2, 60000)
+  let bob_wifi = stun::socket_addr_ipv4(10, 1, 0, 2, 60001)
+  let alice = stun::IceAgent::new(stun::IceRole::Controlling, 1UL, "uAlice", alice_pwd, false)
+  let bob = stun::IceAgent::new(stun::IceRole::Controlled, 2UL, "uBob", bob_pwd, false)
+  alice.set_remote_credentials("uBob", bob_pwd)
+  bob.set_remote_credentials("uAlice", alice_pwd)
+  let _ = alice.add_local_candidate("a", 1, alice_addr, stun::CandidateType::Host, 65535)
+  let _ = bob.add_local_candidate("e", 1, bob_eth, stun::CandidateType::Host, 65535)
+  let _ = bob.add_local_candidate("w", 1, bob_wifi, stun::CandidateType::Host, 100)
+  let _ = alice.add_remote_candidate("e", 1, bob_eth, stun::CandidateType::Host, bob.local_candidates[0].priority)
+  let _ = alice.add_remote_candidate("w", 1, bob_wifi, stun::CandidateType::Host, bob.local_candidates[1].priority)
+  let _ = bob.add_remote_candidate("a", 1, alice_addr, stun::CandidateType::Host, alice.local_candidates[0].priority)
+  // Alice nominates the pair whose remote is bob_wifi (the one that works for her)
+  let mut wifi_pair = -1
+  let mut i = 0
+  while i < alice.pairs.length() {
+    if stun::socket_addr_eq(alice.remote_candidates[alice.pairs[i].remote_idx].addr, bob_wifi) {
+      wifi_pair = i
+    }
+    i = i + 1
+  }
+  let pkt = match alice.nominate_pair(wifi_pair) {
+    Ok(x) => x
+    Err(_) => {
+      debug_assert(false, "fixture nominate")
+      return
+    }
+  }
+  // the packet arrives on Bob's wifi socket
+  let _ = bob.handle_inbound(pkt.wire, alice_addr)
+  let sel = match nominated_local_addr(bob) {
+    Some(a) => if stun::socket_addr_eq(a, bob_wifi) { "wifi" } else if stun::socket_addr_eq(a, bob_eth) { "eth" } else { "?" }
+    None => "none"
+  }
+  debug_assert(sel == "wifi", "P1-3: Alice nominated Bob-wifi but Bob selected local=" + sel)
+}
+
+///| P1-3: the Controlled agent marks the pair Succeeded on receipt of USE-CANDIDATE although it never
+///| ran (nor got a response to) a check on it: RFC 8445 §7.3.1.5 requires a triggered check and
+///| selection only once the pair is Succeeded.
+test "p1_controlled_marks_pair_succeeded_without_its_own_check" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlled, 0x20UL)
+  let pkt = match p.alice.nominate_pair(0) {
+    Ok(x) => x
+    Err(_) => {
+      debug_assert(false, "fixture")
+      return
+    }
+  }
+  let _ = p.bob.handle_inbound(pkt.wire, p.alice_addr)
+  let st = stun::pair_state_eq(p.bob.pairs[0].state, stun::PairState::Succeeded)
+  debug_assert(!st, "P1-3: Bob's pair is Succeeded although Bob never completed a check on it")
+}
+
+///| P1-4 Pair indices are positions in an array that is re-sorted on every candidate add.
+///| After trickle-ICE adds a better remote candidate, `selected_pair()` silently points at a
+///| different (Waiting, never-checked) pair, and outstanding `IceCheckPacket.pair_idx` values are stale.
+test "p1_trickle_candidate_reorders_pairs_selected_pair_points_elsewhere" {
+  let alice_addr = stun::socket_addr_ipv4(192, 168, 1, 10, 50000)
+  let bob_relay = stun::socket_addr_ipv4(203, 0, 113, 9, 3478)
+  let bob_host = stun::socket_addr_ipv4(198, 51, 100, 20, 60000)
+  let alice = stun::IceAgent::new(stun::IceRole::Controlling, 1UL, "uAlice", alice_pwd, true)
+  let bob = stun::IceAgent::new(stun::IceRole::Controlled, 2UL, "uBob", bob_pwd, false)
+  alice.set_remote_credentials("uBob", bob_pwd)
+  bob.set_remote_credentials("uAlice", alice_pwd)
+  let _ = alice.add_local_candidate("a", 1, alice_addr, stun::CandidateType::Host, 65535)
+  let _ = bob.add_local_candidate("r", 1, bob_relay, stun::CandidateType::Relay, 65535)
+  let _ = bob.add_remote_candidate("a", 1, alice_addr, stun::CandidateType::Host, alice.local_candidates[0].priority)
+  let _ = alice.add_remote_candidate("r", 1, bob_relay, stun::CandidateType::Relay, bob.local_candidates[0].priority)
+  // aggressive nomination over the relay pair completes
+  let pkt = match alice.next_check() {
+    Ok(Some(x)) => x
+    _ => {
+      debug_assert(false, "fixture check")
+      return
+    }
+  }
+  let resp = match bob.handle_inbound(pkt.wire, alice_addr) {
+    Ok(stun::IceInboundResult::SendResponse(w, _)) => w
+    _ => {
+      debug_assert(false, "fixture resp")
+      return
+    }
+  }
+  let _ = alice.handle_inbound(resp, bob_relay)
+  debug_assert(!is_none(alice.selected_pair()), "fixture: relay pair selected")
+  // trickle: Bob's host candidate arrives late with a higher priority
+  let _ = alice.add_remote_candidate("h", 1, bob_host, stun::CandidateType::Host, 2130706431U)
+  let ok = match alice.selected_pair() {
+    Some(sp) => sp.nominated && stun::pair_state_eq(sp.state, stun::PairState::Succeeded) && stun::socket_addr_eq(alice.remote_candidates[sp.remote_idx].addr, bob_relay)
+    None => false
+  }
+  debug_assert(ok, "P1-4: after trickle add, selected_pair() no longer returns the nominated relay pair (index " + pkt.pair_idx.to_string() + " now names another pair)")
+}
+
+///| P1-5 RFC 8445 §6.1.2.5 / §14: the checklist MUST be bounded (default 100 pairs). Remote
+///| candidates arrive from untrusted signalling; the agent accepts any number and builds the full
+///| cross-product with O(P) dedup + O(P) insertion per pair (O(P^2) total). See `run_audit.sh dos`.
+test "p1_checklist_unbounded_remote_candidate_flood" {
+  let a = stun::IceAgent::new(stun::IceRole::Controlling, 1UL, "u", alice_pwd, false)
+  let _ = a.add_local_candidate("a", 1, stun::socket_addr_ipv4(10, 0, 0, 1, 1000), stun::CandidateType::Host, 65535)
+  let _ = a.add_local_candidate("b", 1, stun::socket_addr_ipv4(10, 0, 0, 2, 1000), stun::CandidateType::Host, 65000)
+  let mut accepted = 0
+  let mut i = 0
+  while i < 400 {
+    match a.add_remote_candidate("x", 1, stun::socket_addr_ipv4(1, 2, (i >> 8) & 0xFF, i & 0xFF, 9), stun::CandidateType::Host, (i + 1).to_uint()) {
+      Ok(_) => accepted = accepted + 1
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  debug_assert(a.pairs.length() <= 100, "P1-5: checklist grew to " + a.pairs.length().to_string() + " pairs from " + accepted.to_string() + " remote candidates (no limit)")
+}
+
+// ---------------------------------------------------------------------------
+// P2
+// ---------------------------------------------------------------------------
+
+///| P2-1 RFC 8445 §7.1.1-7.1.3 / §7.3: a check MUST carry PRIORITY and ICE-CONTROLLING or
+///| ICE-CONTROLLED (400 Bad Request otherwise). The agent answers success to a bare USERNAME+MI request.
+test "p2_check_without_priority_or_role_attribute_accepted" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlled, 0x20UL)
+  let m = stun::Message::new(stun::MessageClass::Request, stun::MessageMethod::Binding, hx("aabbccddeeff001122334455"))
+  m.add(stun::Attribute::Username("uBob:uAlice"))
+  let k = inbound_kind(p.bob.handle_inbound(sign(m, bob_pwd), p.alice_addr))
+  debug_assert(k == "send:error:400", "P2-1: check without PRIORITY / ICE-CONTROL* answered " + k)
+}
+
+///| P2-2 RFC 8489 §6.3.1 / §5: unknown comprehension-required attribute (type < 0x8000) in a request
+///| -> 420 + UNKNOWN-ATTRIBUTES. The agent processes the request as if it were absent.
+test "p2_unknown_comprehension_required_attribute_ignored" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlled, 0x20UL)
+  let m = stun::Message::new(stun::MessageClass::Request, stun::MessageMethod::Binding, hx("aabbccddeeff001122334455"))
+  m.add(stun::Attribute::Username("uBob:uAlice"))
+  m.add(stun::Attribute::Priority(1U))
+  m.add(stun::Attribute::IceControlling(0x10UL))
+  m.add(stun::Attribute::Unknown(0x7FFF, hx("01020304")))
+  let k = inbound_kind(p.bob.handle_inbound(sign(m, bob_pwd), p.alice_addr))
+  debug_assert(k == "send:error:420", "P2-2: unknown comprehension-required 0x7FFF answered " + k)
+}
+
+///| P2-3 RFC 8445 §7.2.5.2.1: a response whose source is not the check's destination (non-symmetric)
+///| MUST fail the pair. `from_addr` is ignored for responses.
+test "p2_response_from_wrong_source_address_succeeds_pair" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlled, 0x20UL)
+  let w = check_wire(p.alice)
+  let resp = match p.bob.handle_inbound(w, p.alice_addr) {
+    Ok(stun::IceInboundResult::SendResponse(r, _)) => r
+    _ => {
+      debug_assert(false, "fixture")
+      return
+    }
+  }
+  let k = inbound_kind(p.alice.handle_inbound(resp, stun::socket_addr_ipv4(6, 6, 6, 6, 6666)))
+  debug_assert(!starts(k, "succeeded"), "P2-3: response from 6.6.6.6:6666 (pair remote 198.51.100.20:60000) -> " + k)
+}
+
+///| P2-4 RFC 8445 §7.2.2: connectivity checks MUST include FINGERPRINT; stripping it is accepted
+///| (MI does not cover FINGERPRINT, so the strip needs no key).
+test "p2_check_without_fingerprint_accepted" {
+  let p = peers(stun::IceRole::Controlling, 0x10UL, stun::IceRole::Controlled, 0x20UL)
+  let w = strip_fp(check_wire(p.alice))
+  let k = inbound_kind(p.bob.handle_inbound(w, p.alice_addr))
+  debug_assert(!starts(k, "send:success"), "P2-4: ICE check with FINGERPRINT stripped answered " + k)
+}
+
+///| P2-5 RFC 8489 §6: transaction IDs MUST be uniformly random (SHOULD be CSPRNG). The agent uses
+///| tie_breaker(8 B, also sent in clear in ICE-CONTROL*) || 32-bit counter: fully predictable.
+test "p2_transaction_id_is_tie_breaker_plus_counter" {
+  let a = stun::IceAgent::new(stun::IceRole::Controlling, 0x1122334455667788UL, "u", alice_pwd, false)
+  a.set_remote_credentials("r", bob_pwd)
+  let _ = a.add_local_candidate("a", 1, stun::socket_addr_ipv4(10, 0, 0, 1, 1), stun::CandidateType::Host, 65535)
+  let _ = a.add_remote_candidate("b", 1, stun::socket_addr_ipv4(10, 0, 0, 2, 2), stun::CandidateType::Host, 1U)
+  let _ = a.add_remote_candidate("c", 1, stun::socket_addr_ipv4(10, 0, 0, 3, 3), stun::CandidateType::Host, 2U)
+  let t1 = tx_of(check_wire(a))
+  let t2 = tx_of(check_wire(a))
+  let predicted = hx("112233445566778800000002")
+  debug_assert(!beq(t2, predicted) && !beq(prefix(t1, 8), prefix(t2, 8)), "P2-5: transaction ids are tie_breaker||counter: second check tx id == 112233445566778800000002")
+}
+
+///| P2-6 compute_pair_priority is public and takes the full UInt range, but `MIN << 32` overflows
+///| Int64 for candidate priorities >= 2^31 (RFC range is 1..2^31-1, never enforced on remote input).
+test "p2_pair_priority_int64_overflow_and_unchecked_remote_priority" {
+  let hi = stun::compute_pair_priority(0xFFFFFFFFU, 0xFFFFFFFFU)
+  let lo = stun::compute_pair_priority(0x7FFFFFFFU, 0x7FFFFFFFU)
+  let a = stun::IceAgent::new(stun::IceRole::Controlling, 1UL, "u", alice_pwd, false)
+  let rejected = is_err(a.add_remote_candidate("b", 1, stun::socket_addr_ipv4(10, 0, 0, 2, 2), stun::CandidateType::Host, 0x80000000U)) &&
+  is_err(a.add_remote_candidate("c", 1, stun::socket_addr_ipv4(10, 0, 0, 3, 3), stun::CandidateType::Host, 0U))
+  debug_assert(hi > lo && rejected, "P2-6: pair_priority(2^32-1, 2^32-1)=" + hi.to_string() + " < pair_priority(2^31-1, 2^31-1)=" + lo.to_string() + "; out-of-range remote priority rejected=" + rejected.to_string())
+}
+
+///| P2-7 RFC 8445 §5.3: ice-pwd carries >= 128 bits (22+ chars). IceAgent::new takes "" and then
+///| authenticates any request HMAC'ed with the empty key.
+test "p2_empty_local_password_accepted_and_forgeable" {
+  let bob = stun::IceAgent::new(stun::IceRole::Controlled, 2UL, "uBob", "", false)
+  bob.set_remote_credentials("uAlice", alice_pwd)
+  let alice_addr = stun::socket_addr_ipv4(192, 168, 1, 10, 50000)
+  let _ = bob.add_local_candidate("1", 1, stun::socket_addr_ipv4(10, 0, 0, 2, 2), stun::CandidateType::Host, 65535)
+  let _ = bob.add_remote_candidate("1", 1, alice_addr, stun::CandidateType::Host, 1U)
+  let m = stun::Message::new(stun::MessageClass::Request, stun::MessageMethod::Binding, hx("aabbccddeeff001122334455"))
+  m.add(stun::Attribute::Username("uBob:uAlice"))
+  m.add(stun::Attribute::Priority(1U))
+  m.add(stun::Attribute::IceControlling(1UL))
+  m.add(stun::Attribute::UseCandidate)
+  let forged = match stun::encode_message_signed(m, Some(Bytes::new(0)), false, true) {
+    Ok(w) => w
+    Err(_) => Bytes::new(0)
+  }
+  let _ = bob.handle_inbound(forged, alice_addr)
+  debug_assert(is_none(bob.selected_pair()), "P2-7: agent with empty ice-pwd nominated a pair from an empty-key HMAC")
+}
+
+///| P2-8 RFC 8445 §7.3: USERNAME must be "<local ufrag>:<remote ufrag>". When the remote ufrag is not
+///| known yet (offer side before answer) the check is skipped entirely, not even the local prefix.
+test "p2_username_not_checked_before_remote_credentials" {
+  let bob = stun::IceAgent::new(stun::IceRole::Controlled, 2UL, "uBob", bob_pwd, false)
+  let m = stun::Message::new(stun::MessageClass::Request, stun::MessageMethod::Binding, hx("aabbccddeeff001122334455"))
+  m.add(stun::Attribute::Username("somebodyElse:x"))
+  m.add(stun::Attribute::Priority(1U))
+  m.add(stun::Attribute::IceControlling(1UL))
+  let k = inbound_kind(bob.handle_inbound(sign(m, bob_pwd), stun::socket_addr_ipv4(1, 1, 1, 1, 1)))
+  debug_assert(!starts(k, "send:success"), "P2-8: USERNAME 'somebodyElse:x' accepted by agent 'uBob' -> " + k)
+}
+
+///| P2-9 DecodeLimits::default().max_message_bytes = 65535 but the largest legal STUN message is
+///| 20 + 65532 = 65552 bytes; a legal max-size message is refused by `decode_message`.
+test "p2_default_limits_reject_largest_legal_message" {
+  let body = Bytes::new(65532)
+  // 16 x SOFTWARE-like comprehension-optional attributes of 4092 bytes: 16 * 4096 = 65536 > 65532,
+  // so use 15 x 4096 + one 4 + 4088 ... keep every attribute <= 4096 (default max_attribute_bytes)
+  let mut pos = 0
+  let mut k = 0
+  while k < 16 {
+    let vlen = if k < 15 { 4092 } else { 65532 - 15 * 4096 - 4 }
+    body[pos] = (0x80).to_byte()
+    body[pos + 1] = (0x22).to_byte()
+    body[pos + 2] = ((vlen >> 8) & 0xFF).to_byte()
+    body[pos + 3] = (vlen & 0xFF).to_byte()
+    pos = pos + 4 + vlen
+    k = k + 1
+  }
+  let w = raw_msg(1, hx("aabbccddeeff001122334455"), body)
+  let r = match stun::decode_message(w) {
+    Ok(_) => "ok"
+    Err(e) => stun::stun_error_message(e)
+  }
+  debug_assert(r == "ok", "P2-9: legal " + w.length().to_string() + "-byte message rejected by default limits: " + r)
+}
+
+///| P2-10 RFC 8489 §14.8: ERROR-CODE reason phrase < 128 chars, at most 509 bytes when encoding and 763
+///| when decoding. Both directions accept up to ~64 KiB; text attributes are not validated as UTF-8
+///| (§14.3 USERNAME / §14.14 SOFTWARE are UTF-8) and long-term passwords get no OpaqueString (§9.2.2).
+test "p2_error_reason_and_text_attributes_unbounded_unvalidated" {
+  let long = Bytes::new(2000)
+  let mut i = 0
+  while i < 2000 {
+    long[i] = (0x41).to_byte()
+    i = i + 1
+  }
+  let dec_ok = match stun::decode_message(raw_msg(0x0111, hx("aabbccddeeff001122334455"), tlv(0x0009, cat2(hx("00000401"), prefix(long, 900))))) {
+    Ok(_) => true
+    Err(_) => false
+  }
+  let m = stun::Message::new(stun::MessageClass::ErrorResponse, stun::MessageMethod::Binding, hx("aabbccddeeff001122334455"))
+  m.add(stun::Attribute::ErrorCode(stun::ErrorCode::new(401, long.to_string())))
+  let enc_ok = match stun::encode_message(m) {
+    Ok(_) => true
+    Err(_) => false
+  }
+  let bad_utf8 = match stun::decode_message(raw_msg(1, hx("aabbccddeeff001122334455"), tlv(0x0006, hx("fffec080")))) {
+    Ok(_) => true
+    Err(_) => false
+  }
+  debug_assert(!dec_ok && !enc_ok && !bad_utf8, "P2-10: 900-byte reason decoded=" + dec_ok.to_string() + ", 2000-byte reason encoded=" + enc_ok.to_string() + ", invalid-UTF-8 USERNAME decoded=" + bad_utf8.to_string())
+}
