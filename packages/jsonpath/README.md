@@ -76,3 +76,11 @@ sh packages/jsonpath/bench/run_bench.sh
 Notes on benchmark results:
 - **W1 (3.93x overall vs Rust — attribution breakdown)**: `serde_json_path 0.7.2` calls `regex::Regex::new` inside `match()` / `search()` **for every evaluated node** (rather than once per parse), whereas Pion precompiles constant I-Regexp patterns at query parse time. In the isolated query-class split (`audit/REPORT.md` §7), Pion is **3.25–6.08x faster** on the 2 queries using `match()`/`search()` and **1.12–1.16x faster** on the 4 non-regex queries.
 - **W2 (0.56x vs Rust) & W3 (0.75x vs Rust)**: On pure precompiled hot-path queries and small-document patch roundtrips, Rust's zero-copy borrowed `&Value` slices (`serde_json_path`) and in-place `&mut Value` mutation (`json-patch`) remain ahead, while Pion achieves comparable peak RSS (~2.6–3.0 MiB), O(N) linear scaling on 100k-key wide objects, and 100% byte-for-byte identical outputs.
+
+## Formal Verification (Lean 4)
+
+The RFC 9535 lexical/I-JSON/slice-bound kernels and RFC 6901 JSON Pointer escape kernels (`JsonPathLimits`, `is_rfc9535_ws`, `is_name_first`, `is_name_char`, `rfc9535_ijson_step_overflow`, `norm_name_byte_len`, `rfc9535_normalize_index`, `rfc9535_default_slice_start`, `rfc9535_default_slice_end`, `rfc9535_clamp_pos_slice`, `rfc9535_clamp_neg_slice`, `pointer_needs_escape`, `pointer_unescape_tilde`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (24 `0-sorry` theorems, standard axioms only, 44-case native-vs-Lean differential cross-check):
+
+```bash
+bash packages/jsonpath/proofs/run_proofs.sh
+```
