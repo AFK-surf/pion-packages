@@ -7,8 +7,14 @@ namespace CryptoEvalDiff
 
 private def i32 (x : Int) : Std.I32 := ⟨BitVec.ofInt 32 x⟩
 private def u32 (x : Nat) : Std.U32 := ⟨BitVec.ofNat 32 x⟩
+private def u64 (x : Nat) : Std.U64 := ⟨BitVec.ofNat 64 x⟩
 
 private def showI32 (label : String) (r : Result Std.I32) : String :=
+  match r.match with
+  | .ok v => s!"{label}={v.val}"
+  | _ => s!"{label}=TRAP"
+
+private def showI64 (label : String) (r : Result Std.I64) : String :=
   match r.match with
   | .ok v => s!"{label}={v.val}"
   | _ => s!"{label}=TRAP"
@@ -23,9 +29,19 @@ private def showFe0 (label : String) (r : Result Fe) : String :=
   | .ok f => s!"{label}={f.h0.val}"
   | _ => s!"{label}=TRAP"
 
+private def showFeAll (label : String) (r : Result Fe) : String :=
+  match r.match with
+  | .ok f => s!"{label}={f.h0.val},{f.h1.val},{f.h2.val},{f.h3.val},{f.h4.val},{f.h5.val},{f.h6.val},{f.h7.val},{f.h8.val},{f.h9.val}"
+  | _ => s!"{label}=TRAP"
+
 private def showCswap0 (label : String) (r : Result (Fe × Fe)) : String :=
   match r.match with
   | .ok p => s!"{label}={p.1.h0.val},{p.2.h0.val}"
+  | _ => s!"{label}=TRAP"
+
+private def showU64x5 (label : String) (r : Result (Std.U64 × Std.U64 × Std.U64 × Std.U64 × Std.U64)) : String :=
+  match r.match with
+  | .ok (a, b, c, d, e) => s!"{label}={a.val},{b.val},{c.val},{d.val},{e.val}"
   | _ => s!"{label}=TRAP"
 
 def feA : Fe := ⟨1#i64, 2#i64, 3#i64, 4#i64, 5#i64, 6#i64, 7#i64, 8#i64, 9#i64, 10#i64⟩
@@ -59,6 +75,15 @@ def runAll : List String :=
   , showI32 "hex_f" (hex_nibble_val 102#i32)
   , showI32 "hex_min" (hex_nibble_val (i32 (-2147483648)))
   , showI32 "hex_max" (hex_nibble_val (i32 2147483647))
+  , showFeAll "fe_add_ab" (fe_add feA feB)
+  , showFeAll "fe_sub_ba" (fe_sub feB feA)
+  , showFeAll "fe_mul_ab" (fe_mul feA feB)
+  , showFeAll "fe_sq_b" (fe_sq feB)
+  , showU64x5 "poly_clamp_allff" (poly1305_clamp_r (u64 0xFFFFFFFF) (u64 0xFFFFFFFF) (u64 0xFFFFFFFF) (u64 0xFFFFFFFF) (u64 0xFFFFFFFF))
+  , showU64x5 "poly_reduce_p" (poly1305_final_reduce (u64 67108859) (u64 67108863) (u64 67108863) (u64 67108863) (u64 67108863))
+  , showU64x5 "poly_reduce_pm1" (poly1305_final_reduce (u64 67108858) (u64 67108863) (u64 67108863) (u64 67108863) (u64 67108863))
+  , showI64 "ct_nib_eq" (ct_eq_nibble 7#i32 7#i32)
+  , showI64 "ct_nib_ne" (ct_eq_nibble 7#i32 8#i32)
   ]
 
 #eval IO.println (String.intercalate "\n" runAll)

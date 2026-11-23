@@ -113,8 +113,36 @@ Measured on `Darwin arm64` with `scripts/bench_compare.py --warmup 1 --rounds 5`
 
 ## Formal Verification (Lean 4)
 
-8 production cryptographic helper kernels (`Fe`, `fe_cmov`, `fe_cswap_pair`, `ct_diff_acc`, `x25519_clamp_low_byte`, `x25519_clamp_high_byte`, `cc_rotl32`, `hkdf_sha256_blocks`, `hex_nibble_val`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (**12** `0-sorry` theorems, strict standard-axiom whitelist, value-comparing native-vs-Lean differential cross-check including boundary extremes and shift-trap checks):
+15 production cryptographic kernels (`Fe`, `fe_cmov`, `fe_cswap_pair`, `fe_add`, `fe_sub`, `fe_mul`, `fe_sq`, `ct_eq_nibble`, `ct_diff_acc`, `x25519_clamp_low_byte`, `x25519_clamp_high_byte`, `cc_rotl32`, `poly1305_clamp_r`, `poly1305_final_reduce`, `hkdf_sha256_blocks`, `hex_nibble_val`; `types=1, funs=15, externals=0`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (**19** `0-sorry` theorems: **7 A-grade** algebraic/cryptographic core theorems + **12 B-grade** primitive/constant-time helper theorems, strict standard-axiom whitelist, 36-case value-comparing native-vs-Lean differential cross-check including boundary extremes and shift-trap checks):
+
+### Stage 2 A-Grade Core Theorems (`CryptoProofs/FieldAndPoly1305.lean`)
+
+| Theorem | Production Kernel | Property Proved |
+| --- | --- | --- |
+| `fe_add_mod_p_and_bounds` | `fe_add` | Exact integer sum mod $2^{255}-19$ + zero 64-bit overflow for $\|h_i\| \le 2^{61}$ |
+| `fe_sub_mod_p_and_bounds` | `fe_sub` | Exact integer difference mod $2^{255}-19$ + zero 64-bit overflow for $\|h_i\| \le 2^{61}$ |
+| `fe_mul_mod_p_and_bounds` | `fe_mul` | Real 100-term Ref10 $\mathrm{GF}(2^{255}-19)$ multiplication + 12-step carry chain: $p \mid (\mathrm{feVal}(r) - \mathrm{feVal}(f)\cdot\mathrm{feVal}(g))$, zero overflow, closed post-carry limb bounds |
+| `fe_sq_mod_p_and_bounds` | `fe_sq` | Real Ref10 $\mathrm{GF}(2^{255}-19)$ squaring + 12-step carry chain: $p \mid (\mathrm{feVal}(r) - \mathrm{feVal}(f)^2)$, zero overflow, closed post-carry limb bounds |
+| `poly1305_clamp_r_rfc8439_spec` | `poly1305_clamp_r` | RFC 8439 §2.5 `r` key clamping bit-for-bit (top 4 bits of bytes 3,7,11,15 = 0; bottom 2 bits of bytes 4,8,12 = 0; limb bounds & $R < 2^{124}$) |
+| `poly1305_final_reduce_canonical` | `poly1305_final_reduce` | Constant-time Poly1305 final carry + conditional subtraction mod $2^{130}-5$: unique canonical output $\mathrm{polyVal}(r) < 2^{130}-5$ and $\mathrm{polyVal}(r) \equiv \mathrm{polyVal}(h) \pmod{2^{130}-5}$ |
+| `ct_eq_nibble_spec` | `ct_eq_nibble` | Ed25519 branch-free 4-bit window selector exactness `ct_eq_nibble a b = ok (if a = b then 1 else 0)` for all non-negative 32-bit inputs |
+
+### Semantic Mutation Kill Gate (`mutation_check.sh`: 10 / 10 = 100%)
+
+| Mutant | Fault Injected | Result |
+| --- | --- | --- |
+| `M01_fe_mul_prime18` | `fe_mul`: wrong prime reduction `19 -> 18` | KILLED |
+| `M02_fe_mul_wrap20` | `fe_mul`: wrong carry wrap-around `19 -> 20` | KILLED |
+| `M03_fe_mul_shift25` | `fe_mul`: wrong radix-$2^{25.5}$ carry shift `26 -> 25` | KILLED |
+| `M04_fe_sq_cross19` | `fe_sq`: missing factor of 2 in cross-radix term | KILLED |
+| `M05_fe_sq_wrap17` | `fe_sq`: wrong carry wrap-around `19 -> 17` | KILLED |
+| `M06_fe_add_sign` | `fe_add`: limb sign flip `+ -> -` | KILLED |
+| `M07_fe_sub_sign` | `fe_sub`: limb sign flip `- -> +` | KILLED |
+| `M08_poly_clamp_bit` | `poly1305_clamp_r`: missed RFC 8439 §2.5 clamp bit | KILLED |
+| `M09_poly_reduce_thresh` | `poly1305_final_reduce`: wrong $2^{130}-5$ threshold `5 -> 4` | KILLED |
+| `M10_ct_nibble_off1` | `ct_eq_nibble`: off-by-one branch-free equality | KILLED |
 
 ```bash
 bash packages/crypto/proofs/run_proofs.sh
+bash packages/crypto/proofs/mutation_check.sh
 ```
