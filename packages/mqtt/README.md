@@ -74,6 +74,23 @@ sh scripts/verify.sh packages/mqtt
 - **Compliance & unit tests**: **22/22 PASS** (`wire_test.pion`, `packets_test.pion`, `decoder_test.pion`, `topic_trie_test.pion`, `session_test.pion`).
 - **Red-team adversarial suite**: **37/37 PASS** (`pionc test --json --only-pkg packages/mqtt/audit`: 25/25 defect tests + 12/12 control tests).
 
+## Formal Verification (Lean 4)
+
+Production pure kernels in `src/wire.pion` are annotated with `#verify` and extracted directly to Lean 4 via `pionc extract-lean` (**3 types**, **13 functions**, **0 externals**):
+
+- **Annotated types**: `ProtocolVersion`, `QoS`, `PacketType`, `MqttLimits`.
+- **Annotated hot-path functions**: `MqttLimits::default`, `qos_to_int`, `qos_from_int_opt`, `packet_type_to_int`, `packet_type_from_int_opt`, `vbi_encoded_len`, `vbi_decode_2`, `vbi_decode_3`, `vbi_decode_4`, `fixed_header_flags_err_code`, `is_mqtt_forbidden_ascii`, `is_utf8_cont_byte`, `is_mqtt_c1_control_2b`.
+- **Machine-checked proofs** (`proofs/MqttProofs/VbiAndCodec.lean`, `proofs/MqttProofs/FlagsAndUtf8.lean`): **27 theorems**, **0 `sorry` / `admit` / `axiom` / `bv_decide` / `native_decide`**, verified by `proofs/CheckAxioms.lean` to depend solely on standard Lean axioms (`[propext, Classical.choice, Quot.sound]`):
+  - `MqttLimits::default` strict positivity, `QoS` (`0..2`) and `PacketType` (`1..15`) exact roundtrip & domain bijections.
+  - OASIS §1.5.5 VBI byte-length exact 4-tier partition (`0`, `[0, 127]`, `[128, 16383]`, `[16384, 2097151]`, `[2097152, 268435455]`), monotonicity, exact bit-assembly formulas for 2/3/4-byte decoders, canonical range preservation, and pairwise disjointness of canonical tiers.
+  - OASIS §2.1.3 fixed-header reserved-flag validation across all 15 control packet types (out-of-range rejection, `PUBLISH` `QoS=3` and `QoS=0 ∧ DUP=1` rejection, exact `PUBLISH` validity iff, `0x02` requirement for `PUBREL`/`SUBSCRIBE`/`UNSUBSCRIBE`, `0x00` requirement for the remaining 11 types, total error-code range `[0, 3]`).
+  - OASIS §1.5.4 & RFC 3629 UTF-8 byte classifiers: forbidden ASCII C0/DEL exact iff & printable `[32, 126]` safety, continuation byte `[0x80, 0xBF]` exact iff & ASCII disjointness, and 2-byte C1 control (`U+0080..U+009F`) exact iff & continuation soundness.
+- **Differential cross-check**: `proofs/EvalDiff.lean` checks **40 cases** against native Pion execution via `diff -u` (0 differences).
+
+```sh
+packages/mqtt/proofs/run_proofs.sh
+```
+
 ### 4-Mode `wasm_smoke` Verification
 
 All four modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`) run with an isolated clean `PION_CACHE_DIR`, exit `0`, and emit byte-identical stdout SHA-256 (`171f20e34f0ce46aa0f50856a730786be53d1899d527983a8e1da196c638933e`):
