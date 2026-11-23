@@ -71,6 +71,14 @@ fn example() -> Result[Unit, ical::IcalError] {
   - All 4 modes exit `0` with byte-identical stdout SHA-256:
     `c3578280c103a1c71e96726e26bec2682ac90a92337c0986a99764e562269a5d`
 
+## Formal Verification (Lean 4)
+
+The core RFC 5545 calendar/RRULE arithmetic kernels and content-line syntax/token predicates in `packages/ical/src/` (`epoch_day_weekday_mon0`, `doy_of`, `neg_ordinal_day`, `floor_div_86400`, `week1_start_of`, `jump_grid_to`, `ascii_upper_byte`, `is_ical_name_byte`, `clamp_leap_second`, `parse_weekday_2_bytes`, `ParseLimits`, `ParseLimits::default`) are annotated with `#verify`, extracted directly into Lean 4 via `pionc extract-lean`, and mechanically proved in `packages/ical/proofs/` (**22 theorems, 0 `sorry` / `admit` / `bv_decide` / `native_decide`, standard axioms only**):
+
+- **`IcalProofs/RRuleCalendar.lean` (12 theorems)**: `epoch_day_weekday_mon0` exact `(ed + 3) mod 7` bounds, Unix epoch Thursday anchor, 7-day periodicity, and `+1 (mod 7)` step; `doy_of` `[1, 366]` bounds; `neg_ordinal_day` bijection into `[-total, -1]`; exact signed Euclidean floor division `floor_div_86400` and day bracketing; RFC 5545 §3.3.10 `week1_start_of` (`±3` days of Jan 1, ≥4 days in year, exact `WKST` weekday alignment); and sub-daily recurrence grid fast-forward `jump_grid_to` (strict progress, exact minimality, and exact `step` grid alignment).
+- **`IcalProofs/SyntaxAndTokens.lean` (10 theorems)**: `ascii_upper_byte` idempotence & lowercase elimination; RFC 5545 §3.1 `is_ical_name_byte` exact character set, uppercase closure, and rejection of content-line injection delimiters (`\r`, `\n`, `:`, `;`, space); leap-second clamping `[0, 60] → [0, 59]` and idempotence; `parse_weekday_2_bytes` range `[-1, 6]` and all 7 RFC 5545 weekdays (`MO`..`SU`, case-insensitive); and strictly positive `ParseLimits::default` DoS bounds.
+- **Differential Cross-Check**: `packages/ical/proofs/EvalDiff.lean` cross-checks 31 cases between Native Pion execution and Lean 4 `#eval` (`diff -u` exit `0`). Run `sh packages/ical/proofs/run_proofs.sh` to reproduce end-to-end.
+
 ## Head-to-Head Benchmarks (`pion --release` vs Rust `rrule 0.14.0` + `icalendar 0.16.17 --release --locked`)
 
 Run via `sh packages/ical/bench/run_bench.sh` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 equality check, Platform: `Darwin arm64`):
