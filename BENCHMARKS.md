@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–11 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–9 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–11 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–10 + `fts`）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。Wave 11 新增 `cel`（以 Go `cel-go v0.24.1` 为基线）、`wasm`（以 Rust `wasmparser` / `wasm-encoder` / `wasmprinter 0.221.3` 为基线）、`ical`（以 Rust `rrule 0.14.0` / `icalendar 0.16.17` 为基线）与 `ssh`（以 Go `golang.org/x/crypto/ssh v0.38.0` 为基线；Go 缺失的 `|1|` 哈希主机、RFC 4253 分包与 `SSHSIG` 由等价 Go 实现补齐）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -272,6 +272,7 @@
 | `ssh` | `SSHSIG` RSA-2048 `rsa-sha2-256`（200 次） | 200 sigs | 93.666 ms | **22.696 ms** (`go_x_crypto_ssh`，等价 Go SSHSIG) | 0.24x | **2.33 MiB** | 10.33 MiB |
 | `ssh` | `SSHSIG` ECDSA P-256 `sha512`（500 次） | 500 sigs | 977.063 ms | **40.443 ms** (`go_x_crypto_ssh`，等价 Go SSHSIG) | 0.04x | **2.38 MiB** | 11.61 MiB |
 | `ssh` | `SSHSIG` Ed25519 `sha512`（500 次） | 500 sigs | 77.757 ms | **36.629 ms** (`go_x_crypto_ssh`，等价 Go SSHSIG) | 0.47x | **2.25 MiB** | 10.33 MiB |
+| `http_cache` | RFC 9111 缓存策略 + Vary + 条件重验证 + 304 合并（12 场景 × 5,000） | 60,000 ops | **65.263 ms** (`1087.72 ns/op`) | 74.413 ms (`rust_http_cache_semantics 3.0.0` prebuilt) | **1.14x** | **2.05 MiB** | 2.50 MiB |
 
 ## 各包明细
 
@@ -2126,3 +2127,14 @@ Single-certificate extension cliff (`N = 64,000` distinct extensions, `1.2 MB` D
 | `SSHSIG` Ed25519 (`sha512`, 500×) | 77.757 ms (`155514.17`) | **36.629 ms (`73258.42`)** | 72.249 / 79.627 | 35.430 / 38.689 | **2.25 MiB** | 10.33 MiB | 0.47x | `b8ac5346e99ad98e…` |
 
 红队：19 / 19 单测（复用 `base64` + `crypto`），`audit/` 零改动且 `audit` **36 / 37**（16 / 16 control 全绿；2 P0 + 8 P1 + 11 P2 中仅保留 `p1_sshsig_verify_has_no_trust_anchor`：按已批准方案 `sshsig_verify` 保持 `ssh-keygen -Y check-novalidate` 语义，信任锚校验由 `sshsig_verify_with_key` / `sshsig_verify_allowed` 提供）。落后项：全部 6 项吞吐落后——Go `crypto/*` 使用 ARMv8 加密扩展与域运算汇编，`packages/crypto` 为纯标量可移植 Pion（ECDSA P-256 仅 0.04×，约慢 20–25×）。领先项：峰值 RSS 2.1–2.4 MiB vs Go 10.3–17.1 MiB；`known_hosts` 通配 `("a*" × n) + "b"` 在 `n = 20,000` 仍 0.03–0.05 s，而 Go `knownhosts`（`n = 11` 58.5 s）与 OpenSSH `ssh-keygen -F`（`n = 11` 17.0 s）指数回溯。
+
+### http_cache
+
+参考实现：纯 Rust [`http-cache-semantics`](https://crates.io/crates/http-cache-semantics) `3.0.0`（`--release`），在计时循环外预构建 `http::Request` / `http::Response` 对象以保持严格对等口径。`sh packages/http_cache/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替）运行于 12 组真实 YouTube / Twitter(X) / Cloudflare CDN / GitHub API 场景（`3,912 B × 5,000 = 60,000` 次策略 + `Vary` + 条件重验证 + 304 合并评估），双方完整规范决策摘要经 SHA-256 逐字节一致校验（`381d374237a9503d7bf37d00fce5073ac74741213a17cefb98a1264cc44f229e`）。详见 [`packages/http_cache/README.md`](packages/http_cache/README.md)。
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `http-cache-semantics 3.0.0` prebuilt) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`--release`) | **65.263** | 63.918 | 70.426 | **299.71** | **1,087.72** | **2.05 MiB** | **1.14x** |
+| `rust_http_cache_semantics_prebuilt` (`3.0.0`, `--release`) | 74.413 | 71.017 | 78.214 | 262.86 | 1,240.22 | 2.50 MiB | 1.00x (baseline) |
+
+红队：12 / 12 单测，`audit/` 零改动且 `audit unit` **30 / 30** 全绿（10 / 10 control + 20 / 20 redteam，全部 1 P0 + 6 P1 + 9 P2 根治：P0-1 `private="field"`/`no-cache="field"` 防跨用户 `Set-Cookie` 泄露、P1-2 禁 206 投毒、P1-3/4/5 304 严检、P1-6 Vary 哈希索引消 CPU DoS、P1-7 `max_total_bytes` 全额计入头字节）。领先项：严格对等预构建口径下快于 Rust `http-cache-semantics 3.0.0` **1.14×**，且峰值 RSS 更低（2.05 vs 2.50 MiB）。
