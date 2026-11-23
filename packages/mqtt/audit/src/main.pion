@@ -1,0 +1,547 @@
+///| RT-mqtt red-team driver for packages/mqtt.
+///| Modes:
+///|   diff <vectors.bin>        : decode every differential vector, one verdict line each
+///|   drip <frames>             : StreamDecoder 1-byte drip + sticky multi-frame stress
+///|   bigdecl                   : 5-byte header declaring 256 MiB remaining length
+///|   props <n>                 : PUBLISH with n user properties (limit raised), decode timing
+///|   deep <levels>             : TopicTrie / topic_matches with very deep topics and filters
+///|   churn <cycles>            : TopicTrie insert/remove churn of one subscription (memory retention)
+///|   phantom                   : Session fed PUBREC for packet ids it never used
+///|   selftest                  : deterministic summary for 4-mode (native/wasm x dbg/rel) parity
+
+import "mqtt"
+
+///|
+fn type_name(p : mqtt::Packet) -> String {
+  match p {
+    mqtt::Packet::Connect(_) => "CONNECT"
+    mqtt::Packet::ConnAck(_) => "CONNACK"
+    mqtt::Packet::Publish(_) => "PUBLISH"
+    mqtt::Packet::PubAck(_) => "PUBACK"
+    mqtt::Packet::PubRec(_) => "PUBREC"
+    mqtt::Packet::PubRel(_) => "PUBREL"
+    mqtt::Packet::PubComp(_) => "PUBCOMP"
+    mqtt::Packet::Subscribe(_) => "SUBSCRIBE"
+    mqtt::Packet::SubAck(_) => "SUBACK"
+    mqtt::Packet::Unsubscribe(_) => "UNSUBSCRIBE"
+    mqtt::Packet::UnsubAck(_) => "UNSUBACK"
+    mqtt::Packet::PingReq => "PINGREQ"
+    mqtt::Packet::PingResp => "PINGRESP"
+    mqtt::Packet::Disconnect(_) => "DISCONNECT"
+    mqtt::Packet::Auth(_) => "AUTH"
+  }
+}
+
+///|
+fn packet_id_of(p : mqtt::Packet) -> Int {
+  match p {
+    mqtt::Packet::Publish(x) =>
+    match x.packet_id {
+      Some(id) => id
+      None => 0
+    }
+    mqtt::Packet::PubAck(x) => x.packet_id
+    mqtt::Packet::PubRec(x) => x.packet_id
+    mqtt::Packet::PubRel(x) => x.packet_id
+    mqtt::Packet::PubComp(x) => x.packet_id
+    mqtt::Packet::Subscribe(x) => x.packet_id
+    mqtt::Packet::SubAck(x) => x.packet_id
+    mqtt::Packet::Unsubscribe(x) => x.packet_id
+    mqtt::Packet::UnsubAck(x) => x.packet_id
+    _ => 0
+  }
+}
+
+///|
+fn u32_at(b : Bytes, i : Int) -> Int {
+  (b[i].to_int() << 24) |
+  (b[i + 1].to_int() << 16) |
+  (b[i + 2].to_int() << 8) |
+  b[i + 3].to_int()
+}
+
+///| One verdict line per vector: `id <ok|reject|incomplete> <TYPE|-> <used> <pid>`.
+fn verdict_line(id : Int, ver : Int, pkt : Bytes) -> String {
+  let v = if ver == 4 {
+    mqtt::ProtocolVersion::V311
+  } else {
+    mqtt::ProtocolVersion::V5
+  }
+  match mqtt::decode_packet(pkt, v) {
+    Ok((p, used)) =>
+    id.to_string() +
+    " ok " +
+    type_name(p) +
+    " " +
+    used.to_string() +
+    " " +
+    packet_id_of(p).to_string()
+    Err(mqtt::MqttError::Incomplete) => id.to_string() + " incomplete - 0 0"
+    Err(e) => id.to_string() + " reject - 0 0 " + mqtt::mqtt_error_string(e)
+  }
+}
+
+///|
+fn run_diff(world : World, path : String) -> Int {
+  let data = match fs_read_bytes(world, path) {
+    Ok(b) => b
+    Err(_) => {
+      io_println(world, "cannot read " + path)
+      return 2
+    }
+  }
+  let sb = StringBuilder::new()
+  let mut pos = 0
+  let mut id = 0
+  while pos + 5 <= data.length() {
+    let ver = data[pos].to_int()
+    let n = u32_at(data, pos + 1)
+    let pkt = data.slice(pos + 5, pos + 5 + n)
+    sb.write_string(verdict_line(id, ver, pkt))
+    sb.write_byte((10).to_byte())
+    pos = pos + 5 + n
+    id = id + 1
+  }
+  io_print(world, sb.to_string())
+  0
+}
+
+///|
+fn must(r : Result[Bytes, mqtt::MqttError]) -> Bytes {
+  match r {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+}
+
+///| 1-byte drip of `frames` frames interleaved with sticky 64-frame chunks.
+fn run_drip(world : World, frames : Int) -> Int {
+  let dec = mqtt::StreamDecoder::default(mqtt::ProtocolVersion::V5)
+  let props = mqtt::Properties::empty()
+  props.user_properties.push(("k", "v"))
+  let one = must(
+    mqtt::encode_packet(
+      mqtt::Packet::Publish(mqtt::PublishPacket::{
+        dup: false,
+        qos: mqtt::QoS::AtLeastOnce,
+        retain: false,
+        topic: "drip/topic",
+        packet_id: Some(7),
+        properties: props,
+        payload: "0123456789abcdef0123456789abcdef".to_bytes(),
+      }),
+      mqtt::ProtocolVersion::V5,
+    ),
+  )
+  let n = one.length()
+  // The wire stream is `one` repeated forever; phases alternate between a 1-byte drip of
+  // one frame's worth of bytes and a sticky chunk of 64.5 frames, so the decoder almost
+  // always holds a partial packet across feeds.
+  let sticky_len = n * 64 + n / 2
+  let mut spos = 0
+  let mut decoded = 0
+  let mut max_buffered = 0
+  let mut f = 0
+  while f < frames {
+    if f % 2 == 0 {
+      let mut i = 0
+      while i < n {
+        let b = Bytes::new(1)
+        b[0] = one[spos % n]
+        spos = spos + 1
+        dec.feed(b)
+        match dec.next_packet() {
+          Ok(Some(_)) => decoded = decoded + 1
+          Ok(None) => ()
+          Err(e) => {
+            io_println(world, "drip error " + mqtt::mqtt_error_string(e))
+            return 1
+          }
+        }
+        if dec.buffered_len() > max_buffered {
+          max_buffered = dec.buffered_len()
+        }
+        i = i + 1
+      }
+    } else {
+      let sticky = Bytes::new(sticky_len)
+      let mut k = 0
+      while k < sticky_len {
+        sticky[k] = one[spos % n]
+        spos = spos + 1
+        k = k + 1
+      }
+      dec.feed(sticky)
+      match dec.drain() {
+        Ok(ps) => decoded = decoded + ps.length()
+        Err(e) => {
+          io_println(world, "sticky error " + mqtt::mqtt_error_string(e))
+          return 1
+        }
+      }
+      if dec.buffered_len() > max_buffered {
+        max_buffered = dec.buffered_len()
+      }
+    }
+    f = f + 1
+  }
+  io_println(
+    world,
+    "drip frames=" +
+    frames.to_string() +
+    " decoded=" +
+    decoded.to_string() +
+    " max_buffered=" +
+    max_buffered.to_string() +
+    " final_buffered=" +
+    dec.buffered_len().to_string(),
+  )
+  0
+}
+
+///|
+fn run_bigdecl(world : World) -> Int {
+  let hdr = Bytes::new(5)
+  hdr[0] = 0x30.to_byte()
+  hdr[1] = 0xFF.to_byte()
+  hdr[2] = 0xFF.to_byte()
+  hdr[3] = 0xFF.to_byte()
+  hdr[4] = 0x7F.to_byte()
+  let dec = mqtt::StreamDecoder::default(mqtt::ProtocolVersion::V5)
+  dec.feed(hdr)
+  let r = match dec.next_packet() {
+    Ok(None) => "incomplete(waits for 256MiB)"
+    Ok(Some(_)) => "ok?!"
+    Err(e) => "reject: " + mqtt::mqtt_error_string(e)
+  }
+  // Same header with limits raised to the protocol maximum: must still not pre-allocate.
+  let big = mqtt::MqttLimits::new(268435460, 65535, 256, 1024, 65535)
+  let dec2 = mqtt::StreamDecoder::new(mqtt::ProtocolVersion::V5, big)
+  dec2.feed(hdr)
+  let r2 = match dec2.next_packet() {
+    Ok(None) => "incomplete buffered=" + dec2.buffered_len().to_string()
+    Ok(Some(_)) => "ok?!"
+    Err(e) => "reject: " + mqtt::mqtt_error_string(e)
+  }
+  io_println(world, "bigdecl default=" + r + " | max_limits=" + r2)
+  0
+}
+
+///|
+fn run_props(world : World, n : Int) -> Int {
+  let props = mqtt::Properties::empty()
+  let mut i = 0
+  while i < n {
+    props.user_properties.push(("k", "v"))
+    i = i + 1
+  }
+  let wire = must(
+    mqtt::encode_packet(
+      mqtt::Packet::Publish(
+        mqtt::PublishPacket::{
+          dup: false,
+          qos: mqtt::QoS::AtMostOnce,
+          retain: false,
+          topic: "p",
+          packet_id: None,
+          properties: props,
+          payload: Bytes::new(0),
+        },
+      ),
+      mqtt::ProtocolVersion::V5,
+    ),
+  )
+  let lim = mqtt::MqttLimits::new(268435455, 65535, n + 1, 1024, 65535)
+  let t0 = clock_now_ms(world)
+  let r = mqtt::decode_packet_with_limits(wire, mqtt::ProtocolVersion::V5, lim)
+  let t1 = clock_now_ms(world)
+  let d = mqtt::decode_packet(wire, mqtt::ProtocolVersion::V5)
+  let got = match r {
+    Ok((mqtt::Packet::Publish(p), _)) => p.properties.user_properties.length()
+    _ => -1
+  }
+  let dflt = match d {
+    Ok(_) => "accepted"
+    Err(e) => mqtt::mqtt_error_string(e)
+  }
+  io_println(
+    world,
+    "props n=" +
+    n.to_string() +
+    " wire=" +
+    wire.length().to_string() +
+    " decoded=" +
+    got.to_string() +
+    " decode_ms=" +
+    (t1 - t0).to_string() +
+    " default_limits=" +
+    dflt,
+  )
+  0
+}
+
+///|
+fn deep_string(seg : String, levels : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < levels {
+    if i > 0 {
+      sb.write_byte((47).to_byte())
+    }
+    sb.write_string(seg)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn run_deep(world : World, levels : Int) -> Int {
+  let trie : mqtt::TopicTrie[Int] = mqtt::TopicTrie::new()
+  let lit = deep_string("a", levels)
+  let plus = deep_string("+", levels)
+  let mixed = deep_string("+", levels - 1) + "/#"
+  let t0 = clock_now_ms(world)
+  let ok1 = trie.insert_with_key(lit, 1, 1) is Ok(_)
+  let ok2 = trie.insert_with_key(plus, 2, 2) is Ok(_)
+  let ok3 = trie.insert_with_key(mixed, 3, 3) is Ok(_)
+  let hits = trie.match_topic(lit).length()
+  let m1 = mqtt::topic_matches(plus, lit)
+  let m2 = mqtt::topic_matches(mixed, lit)
+  let t1 = clock_now_ms(world)
+  io_println(
+    world,
+    "deep levels=" +
+    levels.to_string() +
+    " insert=" +
+    ok1.to_string() +
+    "," +
+    ok2.to_string() +
+    "," +
+    ok3.to_string() +
+    " trie_hits=" +
+    hits.to_string() +
+    " topic_matches=" +
+    m1.to_string() +
+    "," +
+    m2.to_string() +
+    " ms=" +
+    (t1 - t0).to_string(),
+  )
+  0
+}
+
+///|
+fn run_churn(world : World, cycles : Int) -> Int {
+  let trie : mqtt::TopicTrie[Bytes] = mqtt::TopicTrie::new()
+  let t0 = clock_now_ms(world)
+  let mut i = 0
+  while i < cycles {
+    let f = "churn/dev" + (i % 1000).to_string() + "/+"
+    let _ = trie.insert_with_key(f, i % 1000, Bytes::new(256))
+    let _ = trie.remove(f, i % 1000)
+    i = i + 1
+  }
+  let t1 = clock_now_ms(world)
+  io_println(
+    world,
+    "churn cycles=" +
+    cycles.to_string() +
+    " live=" +
+    trie.len().to_string() +
+    " ms=" +
+    (t1 - t0).to_string(),
+  )
+  0
+}
+
+///|
+fn run_phantom(world : World) -> Int {
+  let cfg = mqtt::SessionConfig::new("victim", mqtt::ProtocolVersion::V5)
+  let s = mqtt::Session::new(cfg)
+  let _ = s.connect(0L)
+  let _ = s.poll_transmit()
+  let ca = mqtt::Properties::empty()
+  ca.receive_maximum = Some(10)
+  let _ = s.feed(
+    must(
+      mqtt::encode_packet(
+        mqtt::Packet::ConnAck(mqtt::ConnAckPacket::{
+          session_present: false,
+          reason_code: 0,
+          properties: ca,
+        }),
+        mqtt::ProtocolVersion::V5,
+      ),
+    ),
+    1L,
+  )
+  let mut pid = 1000
+  while pid < 1010 {
+    let _ = s.feed(
+      must(
+        mqtt::encode_packet(
+          mqtt::Packet::PubRec(mqtt::PubRecPacket::{
+            packet_id: pid,
+            reason_code: 0,
+            properties: mqtt::Properties::empty(),
+          }),
+          mqtt::ProtocolVersion::V5,
+        ),
+      ),
+      2L,
+    )
+    pid = pid + 1
+  }
+  let r = match
+  s.publish(
+    "t",
+    "x".to_bytes(),
+    mqtt::QoS::AtLeastOnce,
+    false,
+    mqtt::Properties::empty(),
+    3L,
+  ) {
+    Ok(_) => "publish ok"
+    Err(e) => "publish blocked: " + mqtt::mqtt_error_string(e)
+  }
+  io_println(
+    world,
+    "phantom inflight=" + s.inflight_count().to_string() + " -> " + r,
+  )
+  0
+}
+
+///|
+fn run_selftest(world : World) -> Int {
+  // Deterministic cross-mode digest: decode a self-generated mutation corpus and hash verdicts.
+  let base : Array[Bytes] = []
+  let seeds = [
+    "3009000361 2f62000178", "4002 0001", "620200 01", "e000", "f000", "c000", "d000",
+    "8209 0001 00 0003 612f62 01", "9004 0001 00 00", "b004 0001 00 00",
+  ]
+  let mut si = 0
+  while si < seeds.length() {
+    let hex = seeds[si]
+    let bytes : Array[Int] = []
+    let mut hi = -1
+    let mut ci = 0
+    let hb = hex.to_bytes()
+    while ci < hb.length() {
+      let c = hb[ci].to_int()
+      let v = if c >= 48 && c <= 57 {
+        c - 48
+      } else if c >= 97 && c <= 102 {
+        c - 87
+      } else {
+        -1
+      }
+      if v >= 0 {
+        if hi < 0 {
+          hi = v
+        } else {
+          bytes.push(hi * 16 + v)
+          hi = -1
+        }
+      }
+      ci = ci + 1
+    }
+    let b = Bytes::new(bytes.length())
+    let mut k = 0
+    while k < bytes.length() {
+      b[k] = bytes[k].to_byte()
+      k = k + 1
+    }
+    base.push(b)
+    si = si + 1
+  }
+  let mut h : Int64 = 7L
+  let mut seed = 12345
+  let mut it = 0
+  let mut oks = 0
+  let mut rejects = 0
+  while it < 20000 {
+    let src = base[it % base.length()]
+    let m = Bytes::new(src.length())
+    let mut k = 0
+    while k < src.length() {
+      m[k] = src[k]
+      k = k + 1
+    }
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    if m.length() > 1 {
+      let j = 1 + seed % (m.length() - 1)
+      m[j] = ((seed >> 8) & 0xFF).to_byte()
+    }
+    let ver = if it % 2 == 0 {
+      mqtt::ProtocolVersion::V5
+    } else {
+      mqtt::ProtocolVersion::V311
+    }
+    match mqtt::decode_packet(m, ver) {
+      Ok((p, used)) => {
+        oks = oks + 1
+        h = (h * 131L + used.to_int64() + packet_id_of(p).to_int64()) %
+        1000000007L
+      }
+      Err(e) => {
+        rejects = rejects + 1
+        h = (h * 131L + mqtt::mqtt_error_string(e).length().to_int64()) %
+        1000000007L
+      }
+    }
+    it = it + 1
+  }
+  let trie : mqtt::TopicTrie[Int] = mqtt::TopicTrie::new()
+  let _ = trie.insert_with_key(deep_string("+", 3000), 1, 1)
+  let deep_hits = trie.match_topic(deep_string("a", 3000)).length()
+  io_println(
+    world,
+    "selftest ok=" +
+    oks.to_string() +
+    " reject=" +
+    rejects.to_string() +
+    " digest=" +
+    h.to_string() +
+    " deep_hits=" +
+    deep_hits.to_string(),
+  )
+  0
+}
+
+///|
+fn arg_int(args : Array[String], i : Int, dflt : Int) -> Int {
+  if args.length() <= i {
+    return dflt
+  }
+  let b = args[i].to_bytes()
+  let mut v = 0
+  let mut k = 0
+  while k < b.length() {
+    v = v * 10 + (b[k].to_int() - 48)
+    k = k + 1
+  }
+  v
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  let mode = if args.length() >= 2 { args[1] } else { "selftest" }
+  if mode == "diff" && args.length() >= 3 {
+    run_diff(world, args[2])
+  } else if mode == "drip" {
+    run_drip(world, arg_int(args, 2, 100000))
+  } else if mode == "bigdecl" {
+    run_bigdecl(world)
+  } else if mode == "props" {
+    run_props(world, arg_int(args, 2, 65535))
+  } else if mode == "deep" {
+    run_deep(world, arg_int(args, 2, 5000))
+  } else if mode == "churn" {
+    run_churn(world, arg_int(args, 2, 1000000))
+  } else if mode == "phantom" {
+    run_phantom(world)
+  } else {
+    run_selftest(world)
+  }
+}

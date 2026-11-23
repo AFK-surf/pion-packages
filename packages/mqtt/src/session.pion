@@ -1,0 +1,975 @@
+///| Sans-IO MQTT 3.1.1 & 5.0 Client Session State Machine (QoS 0/1/2, flow control, aliases, keepalive).
+
+///|
+pub enum SessionState {
+  Disconnected
+  Connecting
+  Connected
+  Closed
+}
+
+///|
+pub struct SessionConfig {
+  pub client_id : String
+  pub version : ProtocolVersion
+  pub clean_start : Bool
+  pub keep_alive_secs : Int
+  pub receive_maximum : Int
+  pub topic_alias_maximum : Int
+  pub username : Option[String]
+  pub password : Option[Bytes]
+  pub will : Option[Will]
+  pub connect_properties : Properties
+  pub limits : MqttLimits
+}
+
+///|
+pub fn SessionConfig::new(
+  client_id : String,
+  version : ProtocolVersion,
+) -> SessionConfig {
+  SessionConfig::{
+    client_id: client_id,
+    version: version,
+    clean_start: true,
+    keep_alive_secs: 60,
+    receive_maximum: 65535,
+    topic_alias_maximum: 0,
+    username: None,
+    password: None,
+    will: None,
+    connect_properties: Properties::empty(),
+    limits: MqttLimits::default(),
+  }
+}
+
+///|
+pub enum SessionEvent {
+  Connected(Bool, Int, Properties)
+  PublishReceived(PublishPacket)
+  PublishAcked(Int, Int)
+  PublishComplete(Int, Int)
+  SubAckReceived(Int, Array[Int])
+  UnsubAckReceived(Int, Array[Int])
+  PingRespReceived
+  Disconnected(Int, Properties)
+  AuthReceived(Int, Properties)
+}
+
+///|
+enum OutboundInflight {
+  Qos1Publish(PublishPacket)
+  Qos2Publish(PublishPacket)
+  Qos2PubRel(Int)
+}
+
+///|
+pub struct Session {
+  pub config : SessionConfig
+  mut st : SessionState
+  decoder : StreamDecoder
+  tx_queue : Array[Bytes]
+  mut tx_bytes : Int
+  mut next_pid : Int
+  used_pids : Map[Int, Bool]
+  outbound_inflight : Map[Int, OutboundInflight]
+  outbound_order : Array[Int]
+  inbound_qos2 : Map[Int, Bool]
+  inbound_aliases : Map[Int, String]
+  outbound_aliases : Map[Int, String]
+  mut effective_keep_alive_secs : Int
+  mut peer_receive_maximum : Int
+  mut peer_topic_alias_maximum : Int
+  mut peer_maximum_qos : Int
+  mut peer_retain_available : Bool
+  mut peer_maximum_packet_size : Option[UInt]
+  mut last_tx_ms : Int64
+  mut last_ping_ms : Int64
+  mut ping_outstanding : Bool
+}
+
+///|
+pub fn Session::new(config : SessionConfig) -> Session {
+  Session::{
+    config: config,
+    st: SessionState::Disconnected,
+    decoder: StreamDecoder::new(config.version, config.limits),
+    tx_queue: [],
+    tx_bytes: 0,
+    next_pid: 1,
+    used_pids: Map::new(),
+    outbound_inflight: Map::new(),
+    outbound_order: [],
+    inbound_qos2: Map::new(),
+    inbound_aliases: Map::new(),
+    outbound_aliases: Map::new(),
+    effective_keep_alive_secs: config.keep_alive_secs,
+    peer_receive_maximum: 65535,
+    peer_topic_alias_maximum: 0,
+    peer_maximum_qos: 2,
+    peer_retain_available: true,
+    peer_maximum_packet_size: None,
+    last_tx_ms: 0L,
+    last_ping_ms: 0L,
+    ping_outstanding: false,
+  }
+}
+
+///|
+pub fn Session::state(self : Session) -> SessionState {
+  self.st
+}
+
+///|
+pub fn Session::inflight_count(self : Session) -> Int {
+  self.outbound_inflight.length()
+}
+
+///|
+pub fn Session::pending_tx_len(self : Session) -> Int {
+  self.tx_bytes
+}
+
+///| Effective local Receive Maximum announced in CONNECT.
+fn Session::local_receive_maximum(self : Session) -> Int {
+  match self.config.connect_properties.receive_maximum {
+    Some(rm) => rm
+    None => self.config.receive_maximum
+  }
+}
+
+///| Effective local Topic Alias Maximum announced in CONNECT.
+fn Session::local_topic_alias_maximum(self : Session) -> Int {
+  match self.config.connect_properties.topic_alias_maximum {
+    Some(tam) => tam
+    None => self.config.topic_alias_maximum
+  }
+}
+
+///|
+fn Session::enqueue_tx(self : Session, wire : Bytes, now_ms : Int64) -> Unit {
+  if wire.length() > 0 {
+    self.tx_queue.push(wire)
+    self.tx_bytes = self.tx_bytes + wire.length()
+    self.last_tx_ms = now_ms
+  }
+}
+
+///|
+fn Session::check_peer_max_packet_size(
+  self : Session,
+  wire_len : Int,
+) -> Result[Unit, MqttError] {
+  match self.peer_maximum_packet_size {
+    Some(max_sz) =>
+    if wire_len.to_uint() > max_sz {
+      return Err(MqttError::PacketTooLarge(wire_len, max_sz.to_int()))
+    }
+    None => ()
+  }
+  Ok(())
+}
+
+///|
+fn Session::alloc_pid(self : Session) -> Result[Int, MqttError] {
+  let mut attempts = 0
+  while attempts < 65535 {
+    let pid = self.next_pid
+    self.next_pid = if pid >= 65535 { 1 } else { pid + 1 }
+    if !self.used_pids.contains(pid) {
+      self.used_pids.set(pid, true)
+      return Ok(pid)
+    }
+    attempts = attempts + 1
+  }
+  Err(MqttError::PacketIdExhausted)
+}
+
+///|
+fn Session::release_pid(self : Session, pid : Int) -> Unit {
+  let _ = self.used_pids.remove(pid)
+}
+
+///| Queue a `CONNECT` packet and transition to `Connecting`.
+pub fn Session::connect(self : Session, now_ms : Int64) -> Result[Unit, MqttError] {
+  let props = self.config.connect_properties.clone()
+  if self.config.version is ProtocolVersion::V5 {
+    if props.receive_maximum is None && self.config.receive_maximum < 65535 {
+      props.receive_maximum = Some(self.config.receive_maximum)
+    }
+    if props.topic_alias_maximum is None && self.config.topic_alias_maximum > 0 {
+      props.topic_alias_maximum = Some(self.config.topic_alias_maximum)
+    }
+  }
+  let pkt = Packet::Connect(ConnectPacket::{
+    protocol_version: self.config.version,
+    client_id: self.config.client_id,
+    clean_start: self.config.clean_start,
+    keep_alive: self.config.keep_alive_secs,
+    username: self.config.username,
+    password: self.config.password,
+    will: self.config.will,
+    properties: props,
+  })
+  let wire = match encode_packet(pkt, self.config.version) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  self.st = SessionState::Connecting
+  self.effective_keep_alive_secs = self.config.keep_alive_secs
+  self.peer_receive_maximum = 65535
+  self.peer_topic_alias_maximum = 0
+  self.peer_maximum_qos = 2
+  self.peer_retain_available = true
+  self.peer_maximum_packet_size = None
+  self.ping_outstanding = false
+  self.enqueue_tx(wire, now_ms)
+  Ok(())
+}
+
+///| Publish a message (QoS 0, 1, or 2), enforcing CONNACK capabilities, `Receive Maximum` flow control, and Topic Alias rules.
+pub fn Session::publish(
+  self : Session,
+  topic : String,
+  payload : Bytes,
+  qos : QoS,
+  retain : Bool,
+  props : Properties,
+  now_ms : Int64,
+) -> Result[Option[Int], MqttError] {
+  if !(self.st is SessionState::Connected) {
+    return Err(MqttError::SessionNotConnected)
+  }
+  let q = qos_to_int(qos)
+  // Enforce server CONNACK capabilities (MQTT 5.0 §3.2.2.3)
+  if q > self.peer_maximum_qos {
+    return Err(MqttError::ProtocolViolation("QoS exceeds server maximum_qos"))
+  }
+  if retain && !self.peer_retain_available {
+    return Err(MqttError::ProtocolViolation("retain not available on server"))
+  }
+  if q > 0 && self.outbound_inflight.length() >= self.peer_receive_maximum {
+    return Err(MqttError::FlowControlExceeded)
+  }
+  // Validate outbound topic alias mapping without mutating state until encode succeeds
+  let mut alias_to_register : Option[(Int, String)] = None
+  let mut resolved_alias_topic = topic
+  match props.topic_alias {
+    Some(alias) => {
+      if alias < 1 || alias > self.peer_topic_alias_maximum {
+        return Err(MqttError::UnknownTopicAlias(alias))
+      }
+      if topic.length() > 0 {
+        alias_to_register = Some((alias, topic))
+      } else {
+        match self.outbound_aliases.get(alias) {
+          Some(t) => resolved_alias_topic = t
+          None => return Err(MqttError::UnknownTopicAlias(alias))
+        }
+      }
+    }
+    None => ()
+  }
+  let pid_opt : Option[Int] = if q > 0 {
+    match self.alloc_pid() {
+      Ok(id) => Some(id)
+      Err(e) => return Err(e)
+    }
+  } else {
+    None
+  }
+  let pub_pkt = PublishPacket::{
+    dup: false,
+    qos: qos,
+    retain: retain,
+    topic: topic,
+    packet_id: pid_opt,
+    properties: props,
+    payload: payload,
+  }
+  let wire = match encode_packet(Packet::Publish(pub_pkt), self.config.version) {
+    Ok(b) => b
+    Err(e) => {
+      match pid_opt {
+        Some(id) => self.release_pid(id)
+        None => ()
+      }
+      return Err(e)
+    }
+  }
+  match self.check_peer_max_packet_size(wire.length()) {
+    Ok(_) => ()
+    Err(e) => {
+      match pid_opt {
+        Some(id) => self.release_pid(id)
+        None => ()
+      }
+      return Err(e)
+    }
+  }
+  match alias_to_register {
+    Some((alias, t)) => self.outbound_aliases.set(alias, t)
+    None => ()
+  }
+  match pid_opt {
+    Some(pid) => {
+      // Save full resolved topic and cloned properties (without topic_alias) for reconnect retransmission
+      let stored_props = props.clone()
+      stored_props.topic_alias = None
+      let stored = PublishPacket::{
+        dup: true,
+        qos: qos,
+        retain: retain,
+        topic: resolved_alias_topic,
+        packet_id: Some(pid),
+        properties: stored_props,
+        payload: payload,
+      }
+      let entry = if q == 1 {
+        OutboundInflight::Qos1Publish(stored)
+      } else {
+        OutboundInflight::Qos2Publish(stored)
+      }
+      self.outbound_inflight.set(pid, entry)
+      self.outbound_order.push(pid)
+    }
+    None => ()
+  }
+  self.enqueue_tx(wire, now_ms)
+  Ok(pid_opt)
+}
+
+///| Queue a `SUBSCRIBE` packet and return its allocated Packet ID.
+pub fn Session::subscribe(
+  self : Session,
+  topics : Array[SubscribeTopic],
+  props : Properties,
+  now_ms : Int64,
+) -> Result[Int, MqttError] {
+  if !(self.st is SessionState::Connected) {
+    return Err(MqttError::SessionNotConnected)
+  }
+  let pid = match self.alloc_pid() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  let wire = match encode_packet(
+    Packet::Subscribe(SubscribePacket::{
+      packet_id: pid,
+      properties: props,
+      topics: topics,
+    }),
+    self.config.version,
+  ) {
+    Ok(b) => b
+    Err(e) => {
+      self.release_pid(pid)
+      return Err(e)
+    }
+  }
+  match self.check_peer_max_packet_size(wire.length()) {
+    Ok(_) => ()
+    Err(e) => {
+      self.release_pid(pid)
+      return Err(e)
+    }
+  }
+  self.enqueue_tx(wire, now_ms)
+  Ok(pid)
+}
+
+///| Queue an `UNSUBSCRIBE` packet and return its allocated Packet ID.
+pub fn Session::unsubscribe(
+  self : Session,
+  topics : Array[String],
+  props : Properties,
+  now_ms : Int64,
+) -> Result[Int, MqttError] {
+  if !(self.st is SessionState::Connected) {
+    return Err(MqttError::SessionNotConnected)
+  }
+  let pid = match self.alloc_pid() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  let wire = match encode_packet(
+    Packet::Unsubscribe(UnsubscribePacket::{
+      packet_id: pid,
+      properties: props,
+      topics: topics,
+    }),
+    self.config.version,
+  ) {
+    Ok(b) => b
+    Err(e) => {
+      self.release_pid(pid)
+      return Err(e)
+    }
+  }
+  match self.check_peer_max_packet_size(wire.length()) {
+    Ok(_) => ()
+    Err(e) => {
+      self.release_pid(pid)
+      return Err(e)
+    }
+  }
+  self.enqueue_tx(wire, now_ms)
+  Ok(pid)
+}
+
+///| Queue a `DISCONNECT` packet and transition to `Closed`.
+pub fn Session::disconnect(
+  self : Session,
+  reason_code : Int,
+  props : Properties,
+) -> Result[Unit, MqttError] {
+  let wire = match encode_packet(
+    Packet::Disconnect(DisconnectPacket::{
+      reason_code: reason_code,
+      properties: props,
+    }),
+    self.config.version,
+  ) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  self.enqueue_tx(wire, self.last_tx_ms)
+  self.st = SessionState::Closed
+  Ok(())
+}
+
+///| Build wire frames for retransmitting all in-flight QoS 1/2 PUBLISH (`DUP=1`) and PUBREL packets in original order.
+fn Session::prepare_retransmit_inflight(
+  self : Session,
+  staged_tx : Array[Bytes],
+) -> Result[Array[Int], MqttError] {
+  let new_order : Array[Int] = []
+  let mut i = 0
+  while i < self.outbound_order.length() {
+    let pid = self.outbound_order[i]
+    match self.outbound_inflight.get(pid) {
+      Some(entry) => {
+        new_order.push(pid)
+        let pkt = match entry {
+          OutboundInflight::Qos1Publish(p) => Packet::Publish(p)
+          OutboundInflight::Qos2Publish(p) => Packet::Publish(p)
+          OutboundInflight::Qos2PubRel(id) =>
+          Packet::PubRel(PubRelPacket::{
+            packet_id: id,
+            reason_code: 0,
+            properties: Properties::empty(),
+          })
+        }
+        let wire = match encode_packet(pkt, self.config.version) {
+          Ok(b) => b
+          Err(e) => return Err(e)
+        }
+        staged_tx.push(wire)
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+  Ok(new_order)
+}
+
+///| Feed raw incoming bytes from the transport and process all decoded packets atomically.
+///| If any packet in the batch triggers a protocol error, no session state or tx queue is mutated.
+pub fn Session::feed(
+  self : Session,
+  data : Bytes,
+  now_ms : Int64,
+) -> Result[Array[SessionEvent], MqttError] {
+  self.decoder.feed(data)
+  let pkts = match self.decoder.drain() {
+    Ok(ps) => ps
+    Err(e) => return Err(e)
+  }
+  let local_rm = self.local_receive_maximum()
+  let local_tam = self.local_topic_alias_maximum()
+
+  // Staged state for atomic batch commit (prevents QoS 2 message loss on mid-batch error)
+  let mut staged_st = self.st
+  let mut staged_ka = self.effective_keep_alive_secs
+  let mut staged_peer_rm = self.peer_receive_maximum
+  let mut staged_peer_tam = self.peer_topic_alias_maximum
+  let mut staged_peer_max_qos = self.peer_maximum_qos
+  let mut staged_peer_retain = self.peer_retain_available
+  let mut staged_peer_max_pkt = self.peer_maximum_packet_size
+  let mut staged_ping_outstanding = self.ping_outstanding
+  let mut staged_clear_session = false
+  let mut staged_retransmit_order : Option[Array[Int]] = None
+  let staged_tx : Array[Bytes] = []
+  let staged_aliases : Map[Int, String] = Map::new()
+  let staged_alias_keys : Array[Int] = []
+  let staged_in_qos2_add : Map[Int, Bool] = Map::new()
+  let staged_in_qos2_del : Map[Int, Bool] = Map::new()
+  let staged_in_qos2_ops : Array[(Int, Bool)] = []
+  let mut staged_in_qos2_count = self.inbound_qos2.length()
+  let staged_out_removed : Map[Int, Bool] = Map::new()
+  let staged_out_pubrel : Map[Int, Bool] = Map::new()
+  let staged_out_ops : Array[(Int, Int)] = [] // (pid, 0=remove, 1=pubrel)
+  let staged_released_pids : Array[Int] = []
+  let events : Array[SessionEvent] = []
+
+  let mut i = 0
+  while i < pkts.length() {
+    let pkt = pkts[i]
+    // Enforce session state machine transitions (MQTT 5.0 §3.2.0-1/2)
+    match staged_st {
+      SessionState::Disconnected => return Err(MqttError::SessionNotConnected)
+      SessionState::Closed => return Err(MqttError::SessionNotConnected)
+      SessionState::Connecting =>
+      match pkt {
+        Packet::ConnAck(_) => ()
+        Packet::Auth(_) =>
+        if !(self.config.version is ProtocolVersion::V5) {
+          return Err(MqttError::ProtocolViolation("AUTH packet is MQTT 5.0 only"))
+        }
+        _ =>
+        return Err(
+          MqttError::ProtocolViolation("first packet from server MUST be CONNACK"),
+        )
+      }
+      SessionState::Connected =>
+      match pkt {
+        Packet::ConnAck(_) =>
+        return Err(
+          MqttError::ProtocolViolation("duplicate CONNACK on connected session"),
+        )
+        _ => ()
+      }
+    }
+
+    match pkt {
+      Packet::ConnAck(ca) => {
+        if self.config.clean_start && ca.session_present {
+          return Err(
+            MqttError::ProtocolViolation(
+              "CONNACK session_present=1 when clean_start=true",
+            ),
+          )
+        }
+        if ca.reason_code == 0 {
+          staged_st = SessionState::Connected
+          staged_ka = match ca.properties.server_keep_alive {
+            Some(ska) => ska
+            None => self.config.keep_alive_secs
+          }
+          staged_peer_rm = match ca.properties.receive_maximum {
+            Some(rm) => rm
+            None => 65535
+          }
+          staged_peer_tam = match ca.properties.topic_alias_maximum {
+            Some(tam) => tam
+            None => 0
+          }
+          staged_peer_max_qos = match ca.properties.maximum_qos {
+            Some(mq) => mq
+            None => 2
+          }
+          staged_peer_retain = match ca.properties.retain_available {
+            Some(ra) => ra != 0
+            None => true
+          }
+          staged_peer_max_pkt = ca.properties.maximum_packet_size
+          if ca.session_present {
+            match self.prepare_retransmit_inflight(staged_tx) {
+              Ok(order) => staged_retransmit_order = Some(order)
+              Err(e) => return Err(e)
+            }
+          } else {
+            staged_clear_session = true
+            staged_in_qos2_count = 0
+          }
+        } else {
+          staged_st = SessionState::Disconnected
+        }
+        events.push(SessionEvent::Connected(ca.session_present, ca.reason_code, ca.properties))
+      }
+      Packet::Publish(p) => {
+        // Resolve & validate inbound Topic Alias (MQTT 5.0 §3.3.2.3.4 / [MQTT-3.3.2-11])
+        let mut resolved_topic = p.topic
+        match p.properties.topic_alias {
+          Some(alias) => {
+            if alias < 1 || alias > local_tam {
+              return Err(
+                MqttError::ProtocolViolation(
+                  "inbound topic alias exceeds client topic_alias_maximum",
+                ),
+              )
+            }
+            if p.topic.length() > 0 {
+              staged_aliases.set(alias, p.topic)
+              staged_alias_keys.push(alias)
+            } else {
+              match staged_aliases.get(alias) {
+                Some(t) => resolved_topic = t
+                None =>
+                match self.inbound_aliases.get(alias) {
+                  Some(t) => resolved_topic = t
+                  None => return Err(MqttError::UnknownTopicAlias(alias))
+                }
+              }
+            }
+          }
+          None => ()
+        }
+        let delivered = PublishPacket::{
+          dup: p.dup,
+          qos: p.qos,
+          retain: p.retain,
+          topic: resolved_topic,
+          packet_id: p.packet_id,
+          properties: p.properties,
+          payload: p.payload,
+        }
+        let q = qos_to_int(p.qos)
+        if q == 0 {
+          events.push(SessionEvent::PublishReceived(delivered))
+        } else if q == 1 {
+          let pid = match p.packet_id {
+            Some(id) => id
+            None => return Err(MqttError::InvalidPacketId)
+          }
+          let ack = match encode_packet(
+            Packet::PubAck(PubAckPacket::{
+              packet_id: pid,
+              reason_code: 0,
+              properties: Properties::empty(),
+            }),
+            self.config.version,
+          ) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          staged_tx.push(ack)
+          events.push(SessionEvent::PublishReceived(delivered))
+        } else {
+          let pid = match p.packet_id {
+            Some(id) => id
+            None => return Err(MqttError::InvalidPacketId)
+          }
+          let already_in_qos2 = if staged_in_qos2_add.contains(pid) {
+            true
+          } else if staged_in_qos2_del.contains(pid) || staged_clear_session {
+            false
+          } else {
+            self.inbound_qos2.contains(pid)
+          }
+          if !already_in_qos2 {
+            // Enforce client Receive Maximum inbound (MQTT 5.0 §3.3.4-9)
+            if staged_in_qos2_count >= local_rm {
+              return Err(MqttError::FlowControlExceeded)
+            }
+          }
+          let rec = match encode_packet(
+            Packet::PubRec(PubRecPacket::{
+              packet_id: pid,
+              reason_code: 0,
+              properties: Properties::empty(),
+            }),
+            self.config.version,
+          ) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          staged_tx.push(rec)
+          if !already_in_qos2 {
+            staged_in_qos2_add.set(pid, true)
+            let _ = staged_in_qos2_del.remove(pid)
+            staged_in_qos2_ops.push((pid, true))
+            staged_in_qos2_count = staged_in_qos2_count + 1
+            events.push(SessionEvent::PublishReceived(delivered))
+          }
+        }
+      }
+      Packet::PubAck(a) => {
+        let pid = a.packet_id
+        let is_valid_qos1 = if staged_clear_session ||
+        staged_out_removed.contains(pid) ||
+        staged_out_pubrel.contains(pid) {
+          false
+        } else {
+          match self.outbound_inflight.get(pid) {
+            Some(OutboundInflight::Qos1Publish(_)) => true
+            _ => false
+          }
+        }
+        if !is_valid_qos1 {
+          return Err(
+            MqttError::ProtocolViolation(
+              "received PUBACK for non-QoS1 or unknown packet id",
+            ),
+          )
+        }
+        staged_out_removed.set(pid, true)
+        staged_out_ops.push((pid, 0))
+        staged_released_pids.push(pid)
+        events.push(SessionEvent::PublishAcked(pid, a.reason_code))
+      }
+      Packet::PubRec(r) => {
+        let pid = r.packet_id
+        let is_qos2_pub = if staged_clear_session || staged_out_removed.contains(pid) {
+          false
+        } else if staged_out_pubrel.contains(pid) {
+          false
+        } else {
+          match self.outbound_inflight.get(pid) {
+            Some(OutboundInflight::Qos2Publish(_)) => true
+            _ => false
+          }
+        }
+        let is_qos2_rel = if staged_clear_session || staged_out_removed.contains(pid) {
+          false
+        } else if staged_out_pubrel.contains(pid) {
+          true
+        } else {
+          match self.outbound_inflight.get(pid) {
+            Some(OutboundInflight::Qos2PubRel(_)) => true
+            _ => false
+          }
+        }
+        if !is_qos2_pub && !is_qos2_rel {
+          return Err(
+            MqttError::ProtocolViolation(
+              "received PUBREC for non-QoS2 or unknown packet id",
+            ),
+          )
+        }
+        if r.reason_code >= 0x80 {
+          // Rejected by peer: terminate QoS 2 exchange
+          staged_out_removed.set(pid, true)
+          let _ = staged_out_pubrel.remove(pid)
+          staged_out_ops.push((pid, 0))
+          staged_released_pids.push(pid)
+          events.push(SessionEvent::PublishComplete(pid, r.reason_code))
+        } else {
+          staged_out_pubrel.set(pid, true)
+          staged_out_ops.push((pid, 1))
+          let rel = match encode_packet(
+            Packet::PubRel(PubRelPacket::{
+              packet_id: pid,
+              reason_code: 0,
+              properties: Properties::empty(),
+            }),
+            self.config.version,
+          ) {
+            Ok(b) => b
+            Err(e) => return Err(e)
+          }
+          staged_tx.push(rel)
+        }
+      }
+      Packet::PubRel(rel) => {
+        let pid = rel.packet_id
+        let existed = if staged_in_qos2_add.contains(pid) {
+          true
+        } else if staged_in_qos2_del.contains(pid) || staged_clear_session {
+          false
+        } else {
+          self.inbound_qos2.contains(pid)
+        }
+        if existed {
+          let _ = staged_in_qos2_add.remove(pid)
+          staged_in_qos2_del.set(pid, true)
+          staged_in_qos2_ops.push((pid, false))
+          staged_in_qos2_count = staged_in_qos2_count - 1
+        }
+        let rc = if existed || self.config.version is ProtocolVersion::V311 {
+          0
+        } else {
+          0x92
+        }
+        let comp = match encode_packet(
+          Packet::PubComp(PubCompPacket::{
+            packet_id: pid,
+            reason_code: rc,
+            properties: Properties::empty(),
+          }),
+          self.config.version,
+        ) {
+          Ok(b) => b
+          Err(e) => return Err(e)
+        }
+        staged_tx.push(comp)
+      }
+      Packet::PubComp(c) => {
+        let pid = c.packet_id
+        let is_valid_pubrel = if staged_clear_session || staged_out_removed.contains(pid) {
+          false
+        } else if staged_out_pubrel.contains(pid) {
+          true
+        } else {
+          match self.outbound_inflight.get(pid) {
+            Some(OutboundInflight::Qos2PubRel(_)) => true
+            _ => false
+          }
+        }
+        if !is_valid_pubrel {
+          return Err(
+            MqttError::ProtocolViolation(
+              "received PUBCOMP for non-PUBREL or unknown packet id",
+            ),
+          )
+        }
+        staged_out_removed.set(pid, true)
+        let _ = staged_out_pubrel.remove(pid)
+        staged_out_ops.push((pid, 0))
+        staged_released_pids.push(pid)
+        events.push(SessionEvent::PublishComplete(pid, c.reason_code))
+      }
+      Packet::SubAck(sa) => {
+        staged_released_pids.push(sa.packet_id)
+        events.push(SessionEvent::SubAckReceived(sa.packet_id, sa.reason_codes))
+      }
+      Packet::UnsubAck(ua) => {
+        staged_released_pids.push(ua.packet_id)
+        events.push(SessionEvent::UnsubAckReceived(ua.packet_id, ua.reason_codes))
+      }
+      Packet::PingReq =>
+      return Err(MqttError::ProtocolViolation("server MUST NOT send PINGREQ"))
+      Packet::PingResp => {
+        staged_ping_outstanding = false
+        events.push(SessionEvent::PingRespReceived)
+      }
+      Packet::Disconnect(d) => {
+        staged_st = SessionState::Disconnected
+        events.push(SessionEvent::Disconnected(d.reason_code, d.properties))
+      }
+      Packet::Auth(a) => events.push(SessionEvent::AuthReceived(a.reason_code, a.properties))
+      _ => return Err(MqttError::ProtocolViolation("unexpected server-to-client packet"))
+    }
+    i = i + 1
+  }
+
+  // Phase 2: All packets in the batch succeeded — commit staged state atomically.
+  self.st = staged_st
+  self.effective_keep_alive_secs = staged_ka
+  self.peer_receive_maximum = staged_peer_rm
+  self.peer_topic_alias_maximum = staged_peer_tam
+  self.peer_maximum_qos = staged_peer_max_qos
+  self.peer_retain_available = staged_peer_retain
+  self.peer_maximum_packet_size = staged_peer_max_pkt
+  self.ping_outstanding = staged_ping_outstanding
+  if staged_clear_session {
+    self.outbound_inflight.clear()
+    self.outbound_order.clear()
+    self.inbound_qos2.clear()
+    self.used_pids.clear()
+  }
+  match staged_retransmit_order {
+    Some(new_order) => {
+      self.outbound_order.clear()
+      let mut j = 0
+      while j < new_order.length() {
+        self.outbound_order.push(new_order[j])
+        j = j + 1
+      }
+    }
+    None => ()
+  }
+  let mut ak = 0
+  while ak < staged_alias_keys.length() {
+    let alias = staged_alias_keys[ak]
+    match staged_aliases.get(alias) {
+      Some(t) => self.inbound_aliases.set(alias, t)
+      None => ()
+    }
+    ak = ak + 1
+  }
+  let mut qi = 0
+  while qi < staged_in_qos2_ops.length() {
+    let (pid, is_add) = staged_in_qos2_ops[qi]
+    if is_add {
+      self.inbound_qos2.set(pid, true)
+    } else {
+      let _ = self.inbound_qos2.remove(pid)
+    }
+    qi = qi + 1
+  }
+  let mut oi = 0
+  while oi < staged_out_ops.length() {
+    let (pid, op) = staged_out_ops[oi]
+    if op == 0 {
+      let _ = self.outbound_inflight.remove(pid)
+    } else {
+      self.outbound_inflight.set(pid, OutboundInflight::Qos2PubRel(pid))
+    }
+    oi = oi + 1
+  }
+  let mut ri = 0
+  while ri < staged_released_pids.length() {
+    self.release_pid(staged_released_pids[ri])
+    ri = ri + 1
+  }
+  let mut ti = 0
+  while ti < staged_tx.length() {
+    self.enqueue_tx(staged_tx[ti], now_ms)
+    ti = ti + 1
+  }
+  Ok(events)
+}
+
+///| Drain all queued outbound wire bytes ready to be written to the transport.
+pub fn Session::poll_transmit(self : Session) -> Bytes {
+  if self.tx_bytes == 0 {
+    return Bytes::new(0)
+  }
+  if self.tx_queue.length() == 1 {
+    let single = self.tx_queue[0]
+    self.tx_queue.clear()
+    self.tx_bytes = 0
+    return single
+  }
+  let out = Bytes::new(self.tx_bytes)
+  let mut pos = 0
+  let mut i = 0
+  while i < self.tx_queue.length() {
+    let chunk = self.tx_queue[i]
+    let n = chunk.length()
+    copy_bytes(out, pos, chunk, 0, n)
+    pos = pos + n
+    i = i + 1
+  }
+  self.tx_queue.clear()
+  self.tx_bytes = 0
+  out
+}
+
+///| Drive logical keepalive timer (`PINGREQ` generation and timeout detection).
+pub fn Session::tick(self : Session, now_ms : Int64) -> Result[Unit, MqttError] {
+  if !(self.st is SessionState::Connected) || self.effective_keep_alive_secs <= 0 {
+    return Ok(())
+  }
+  let ka_ms = self.effective_keep_alive_secs.to_int64() * 1000L
+  if self.ping_outstanding {
+    if now_ms - self.last_ping_ms >= ka_ms {
+      self.st = SessionState::Disconnected
+      return Err(MqttError::ProtocolViolation("keepalive timeout"))
+    }
+    return Ok(())
+  }
+  if now_ms - self.last_tx_ms >= ka_ms {
+    let ping = match encode_packet(Packet::PingReq, self.config.version) {
+      Ok(b) => b
+      Err(e) => return Err(e)
+    }
+    self.ping_outstanding = true
+    self.last_ping_ms = now_ms
+    self.enqueue_tx(ping, now_ms)
+  }
+  Ok(())
+}
+
+///| Notify the state machine that the underlying transport disconnected.
+///| Resets the decoder and clears Topic Aliases while preserving in-flight QoS 1/2 state.
+pub fn Session::on_transport_disconnected(self : Session) -> Unit {
+  self.st = SessionState::Disconnected
+  self.decoder.reset()
+  self.tx_queue.clear()
+  self.tx_bytes = 0
+  self.inbound_aliases.clear()
+  self.outbound_aliases.clear()
+  self.ping_outstanding = false
+}
