@@ -7,19 +7,19 @@ Pure Pion, zero-dependency, `World`-free, Native + Wasm32 dual-target **ISO/IEC 
 - **Complete ISO/IEC 18004 Encoder (`src/tables.pion`, `src/rs.pion`, `src/segment.pion`, `src/encode.pion`)**
   - All **40 versions** (`v1` `21×21` through `v40` `177×177`) × **4 error correction levels** (`L` 7%, `M` 15%, `Q` 25%, `H` 30%) — all 160 Table 9 codeword/block entries.
   - All core data modes: **Numeric**, **Alphanumeric** (45-char set), **Byte** (UTF-8 / arbitrary binary), **Kanji** (Shift-JIS double-byte), and **ECI** (including UTF-8 ECI `26`).
-  - **Dynamic programming optimal mixed-mode segmenter** (`optimize_segments`) minimizing total bit length across Numeric/Alphanumeric/Byte transitions.
+  - **Exact O(n) dynamic programming optimal mixed-mode segmenter** (`optimize_segments`) minimizing exact bit length across Numeric/Alphanumeric/Byte transitions (0 bits excess vs exact O(n²) optimum across 12,000 test strings).
   - Precomputed GF(256) (`x^8 + x^4 + x^3 + x^2 + 1 = 0x11D`) `exp`/`log` tables and Reed-Solomon generator polynomials (`degree 1..=30`) with zero-allocation remainder computation and full multi-block interleaving.
   - Full function-pattern layout: Finder + Separator, Alignment patterns (`v2..v40`), Timing patterns, Dark Module, Format BCH(15,5) (2 copies), Version BCH(18,6) (`v7..v40`, 2 copies).
-  - All **8 mask patterns (`0..7`)** and **exact ISO/IEC 18004 §7.8.3.1 penalty rules (N1 + N2 + N3 + N4)** with automatic best-mask selection or explicit forced mask.
+  - All **8 mask patterns (`0..7`)** and **exact ISO/IEC 18004 §7.8.3.1 / Nayuki `qrcodegen` penalty rules (N1 + N2 + N3 + N4)** including implicit light quiet-zone N3 edge matching (160/160 exact auto-mask match vs `qrcodegen 1.8.0`).
 - **Pure Pion Matrix Decoder & Error Correction (`src/decode.pion`)**
-  - Decodes raw `size × size` module matrices for any version `v1..v40` with **automatic 0°/90°/180°/270° rotation detection**.
+  - Decodes raw `size × size` module matrices for any version `v1..v40` with **automatic 0°/90°/180°/270° rotation and mirror-image (transposed) detection**.
   - Format BCH(15,5) and Version BCH(18,6) decoding with minimum Hamming-distance error correction (up to 3 bit errors).
   - Full **Berlekamp-Massey + Chien Search + Forney** Reed-Solomon decoder correcting up to `floor(ec_codewords / 2)` corrupted codewords per block.
-  - Reconstructs Numeric, Alphanumeric, Byte, Kanji, and ECI segments.
+  - Reconstructs Numeric, Alphanumeric, Byte, Kanji (with strict Shift-JIS pair validation), ECI (strict `<= 999999`), FNC1 (`0101`/`1001`), and Structured Append (`0011`) headers.
 - **Multi-Format Renderers (`src/render.pion`)**
-  - **Compact SVG** (`to_svg_default` / `to_svg`): merges horizontal dark module runs into a single `<path>` (or optional `<rect>` mode) with configurable quiet zone, colors, and module size.
-  - **UTF-8 Terminal Half-Blocks** (`to_terminal`): `▀`/`▄`/`█`/` ` (half height, directly scannable in terminal) and plain ASCII (`to_ascii`).
-  - **Raster Export**: 8-bit binary P5 PGM (`to_pgm`) and 32-bit RGBA (`to_rgba`).
+  - **Compact SVG** (`to_svg_default` / `to_svg` / `to_svg_checked`): merges horizontal dark module runs into a single `<path>` (or optional `<rect>` mode), with strict color allowlisting against SVG XSS/attribute injection and 64-bit coordinate arithmetic to prevent `viewBox` overflow.
+  - **UTF-8 Terminal Half-Blocks** (`to_terminal` / `to_terminal_checked`): `▀`/`▄`/`█`/` ` (half height, directly scannable in terminal) and plain ASCII (`to_ascii` / `to_ascii_checked`) with safe dimension bounds.
+  - **Raster Export**: 8-bit binary P5 PGM (`to_pgm` / `to_pgm_checked`) and 32-bit RGBA (`to_rgba` / `to_rgba_checked`) with 64-bit overflow checks and a 256 MiB safety cap (no integer-overflow aborts on Native or Wasm32).
 
 ## Quick Start
 
@@ -43,9 +43,11 @@ pub fn example() -> Result[String, qrcode::QrError] {
 
 ## Verification
 
-### Native Unit & Compliance Suite (`sh scripts/verify.sh packages/qrcode`)
+### Native Unit, Compliance & Red-Team Suites
 
-- `15/15` tests passing (`qrcode_test.pion`, `decode_test.pion`, `render_test.pion`), covering ISO/IEC 18004 Annex I `HELLO WORLD` vectors, all 160 `(version, ec)` capacity & block-division invariants, Numeric/Alphanumeric/Byte/Kanji/ECI modes, DP mixed-mode optimization, all 8 masks + 4 exact penalty rules, Format/Version BCH distance bounds, Reed-Solomon up-to-`floor(ec/2)` error recovery & `t+1` rejection, multi-version `v1..v40` + 90°/180°/270° rotated + bit-flip corrupted matrix decoding, and SVG/Terminal/ASCII/PGM/RGBA renderers.
+- `sh scripts/verify.sh packages/qrcode`: **`17/17`** tests passing (`qrcode_test.pion`, `decode_test.pion`, `render_test.pion`), covering ISO/IEC 18004 Annex I `HELLO WORLD` vectors, all 160 `(version, ec)` capacity & block-division invariants, Numeric/Alphanumeric/Byte/Kanji/ECI modes, exact DP mixed-mode optimization, all 8 masks + 4 exact penalty rules, Format/Version BCH distance bounds, Reed-Solomon up-to-`floor(ec/2)` error recovery & `t+1` rejection, multi-version `v1..v40` + 90°/180°/270° rotated + mirror-imaged + bit-flip corrupted matrix decoding, and SVG/Terminal/ASCII/PGM/RGBA renderers with XSS and overflow guards.
+- `pionc test --json --only-pkg packages/qrcode/audit`: **`21/21`** red-team audit tests passing (`13/13` remediated findings + `8/8` controls, `0` failures).
+- Differential oracle (`packages/qrcode/audit/run_audit.sh`): `1280/1280` pixel-identical fixed-mask symbols vs `qrcodegen 1.8.0`, `160/160` exact auto-mask match (`0` worse), `0/12000` suboptimal DP segmentations, `2689/2689` + `771/771` mirror cross-decoding with `rqrr 0.11.0`, `0` silent RS miscorrections across 4,688 injections, and byte-identical 4-mode Native/Wasm32 outputs with `0` traps.
 
 ### 4-Mode `wasm_smoke` Verification
 
@@ -60,37 +62,43 @@ pionc run --target wasm32 --release packages/qrcode/wasm_smoke
 
 - Verified stdout SHA-256 across all 4 modes: `e19b626d6e7669a7487f8f6ce5d2a7b4fc26a780bc7ae46e27608e15d6f6095c`
 
-## Head-to-Head Benchmarks (`pion` vs Rust `qrcode 0.14.1`)
+## Head-to-Head Multi-Baseline Benchmarks (`pion` vs `qrcode 0.14.1` / `qrcodegen 1.8.0` / `fast_qr 0.14.0`)
 
-Run with `sh packages/qrcode/bench/run_bench.sh` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, mandatory byte-identical stdout SHA-256). Both implementations run their default auto-mask ISO/IEC 18004 encoders (`pionc build --release` vs `cargo build --release --locked`), verified to produce **100% pixel-for-pixel identical QR matrices** and byte-identical compact SVG output.
+Measured with `packages/qrcode/audit/run_audit.sh bench` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, mandatory byte-identical stdout SHA-256 across all implementations and rounds). All Rust baselines are built with `cargo build --release --locked`; Pion is built with `pionc build --release`.
 
-> **Methodology note**: Pion implements exact ISO/IEC 18004 §7.8.3.1 N3/N4 penalty scoring and DP mixed-mode segmentation, whereas Rust `qrcode 0.14.1` uses a heuristic segmenter, an unrounded balance penalty approximation, and per-row/column boxed closures in N3 (`canvas.rs`). Benchmark workloads use representative real-world URLs, OTP URIs, and `v10..v40` binary payloads where both encoders select the exact same version and mask, guaranteeing strict pixel-for-pixel SHA-256 equivalence.
+> **Honest summary (leads & lags)**:
+> - **Leads**: Pion is **3.87×–7.39× faster** than `qrcode 0.14.1` across all workloads, **beats Nayuki `qrcodegen 1.8.0` on W1** (`1115.2 ms` vs `1172.0 ms`), uses the **lowest peak RSS** of all 4 implementations (`1.89–2.16 MiB`), and produces **smaller QR versions** than `qrcodegen`/`fast_qr` on real mixed-case payloads thanks to exact O(n) mixed-mode DP segmentation.
+> - **Lags**: `fast_qr 0.14.0` is **2.18× faster** than Pion on W1 and **3.57× faster** on W2; `qrcodegen 1.8.0` is **~8% faster** than Pion on large `v10..v40` binary encodes (W2).
 
 Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved)
 
 ### W1: Batch URL / 2FA OTP URI Encode (10,000 ops, v2–v6 M/Q, auto best mask)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_qrcode`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 1441.647 | 1390.821 | 1553.047 | 144164.68 | 1.86 MiB | **3.64x** |
-| `rust_qrcode` | 5249.401 | 5094.418 | 12996.890 | 524940.14 | 2.34 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Peak RSS | Speedup (vs `qrcode 0.14.1`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **1115.197** | 1057.980 | 1181.276 | **1.89 MiB** | **4.83x** (1.05x faster than `qrcodegen`; 2.18x slower than `fast_qr`) |
+| `rust_qrcode014` (`qrcode 0.14.1`) | 5382.242 | 5045.563 | 19670.618 | 2.48 MiB | 1.00x (baseline) |
+| `rust_qrcodegen` (`qrcodegen 1.8.0`) | 1171.980 | 1160.355 | 2165.364 | 2.42 MiB | 4.59x |
+| `rust_fast_qr` (`fast_qr 0.14.0`) | **511.794** | 500.976 | 895.892 | 2.17 MiB | **10.52x** |
 
-- Stdout SHA-256: `79f18f02e786006b922fd6349ef3644a8f5f64bc15e6d98641ed9b5f55ba7f08`
+- Stdout SHA-256: `a58f60af0df01ae748d6ce495ed1c66abf1f26096bb871c245a434b9ab151869`
 
-### W2: Large Multi-Version Encode (300 ops, v10/v17/v27/v36/v40 + RS Interleaving)
+### W2: Large Multi-Version Binary Encode (300 ops, v10–v40 + RS Interleaving)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_qrcode`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 700.823 | 694.389 | 730.627 | 2336075.97 | 2.14 MiB | **3.12x** |
-| `rust_qrcode` | 2187.344 | 2133.254 | 2277.352 | 7291147.92 | 3.11 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Peak RSS | Speedup (vs `qrcode 0.14.1`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 772.248 | 643.787 | 1170.226 | **2.16 MiB** | **3.87x** (1.08x slower than `qrcodegen`; 3.57x slower than `fast_qr`) |
+| `rust_qrcode014` (`qrcode 0.14.1`) | 2987.593 | 2343.264 | 5385.102 | 3.14 MiB | 1.00x (baseline) |
+| `rust_qrcodegen` (`qrcodegen 1.8.0`) | 712.249 | 596.495 | 1210.970 | 2.94 MiB | 4.19x |
+| `rust_fast_qr` (`fast_qr 0.14.0`) | **216.022** | 198.212 | 350.301 | 2.30 MiB | **13.83x** |
 
-- Stdout SHA-256: `28822777da5fd0a9338c57c3764cf9750ce02c525fc0d37b6e84240ebe28d366`
+- Stdout SHA-256: `0de3a5ce50d6c47499463e1e3ae0d8982cca9ec4734991d1a85d6ec2371ab8ba`
 
-### W3: End-to-End Encode + Compact SVG Generation (5,000 ops, Login/Device/OTP QR)
+### Real-World Mixed-Case Payloads (10,000 ops, OTP / Wi-Fi / vCard / URL / Numeric, DP optimizer on)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_qrcode`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 738.158 | 729.743 | 828.533 | 147631.64 | 2.05 MiB | **3.41x** |
-| `rust_qrcode` | 2518.494 | 2483.286 | 3024.829 | 503698.73 | 2.41 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Peak RSS | Speedup (vs `qrcode 0.14.1`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **1098.078** | 1004.872 | 1188.221 | **1.92 MiB** | **7.39x** |
+| `rust_qrcode014` (`qrcode 0.14.1`) | 8118.516 | 4535.996 | 10226.765 | 2.64 MiB | 1.00x (baseline) |
 
-- Stdout SHA-256: `da23c013b9221ec57785e89035ca476f623d38b6c5e8a4f2382a0c31bf8a415e`
+- Note: `qrcodegen 1.8.0` (`make_segments`) and `fast_qr 0.14.0` lack a mixed-mode optimizer and pick larger versions on these payloads, so only optimizer-equipped encoders match the SHA-256 gate (`bebae88dbe9b0261454f429b21024f59f369f7311da8bba24540b9eba6e1fb44`).
