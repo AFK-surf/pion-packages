@@ -1,0 +1,455 @@
+///| Red-team differential / fuzz harness CLI for `packages/webm` (Native --release and Wasm32 --release).
+///| Modes:
+///|   dump <file>                         -> canonical dump of parse_webm (shared with diff/rust + ffprobe)
+///|   mse <init> <media>                  -> canonical dump of parse_init_segment + parse_media_segment
+///|   batch <cases.bin> <init> [start]    -> one result line per `[u32 LE len][payload]` record:
+///|                                          parse_webm | parse_init_segment | parse_media_segment(init)
+///|   kf <file>                           -> find_keyframe_at vs brute-force oracle over every frame pts
+///|   bench <file> <iters> <stage>        -> stage = read | parse | parse_noframes | init
+///|   kfbench <file> <queries>            -> wall-clock of find_keyframe_at over `queries` targets
+
+import "webm"
+
+///|
+fn parse_int(s : String) -> Int {
+  let n = s.length()
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      acc = acc * 10 + (c - 48)
+    }
+    i = i + 1
+  }
+  acc
+}
+
+///|
+fn hex(v : UInt64) -> String {
+  let out = Bytes::new(16)
+  let mut i = 0
+  let mut shift = 60
+  while i < 16 {
+    let nib = ((v >> shift) & 15UL).to_int()
+    let ch = if nib < 10 { 48 + nib } else { 87 + nib }
+    out[i] = ch.to_byte()
+    i = i + 1
+    shift = shift - 4
+  }
+  out.to_string()
+}
+
+///|
+fn fnv(h0 : UInt64, data : Bytes, start : Int, len : Int) -> UInt64 {
+  let mut h = h0
+  let mut i = start
+  let end = start + len
+  while i < end {
+    h = (h ^ data[i].to_int().to_int64().to_uint64()) * 1099511628211UL
+    i = i + 1
+  }
+  h
+}
+
+///|
+fn fnv_i64(h0 : UInt64, v : Int64) -> UInt64 {
+  let mut h = h0
+  let mut k = 0
+  while k < 8 {
+    h = (h ^ ((v >> (k * 8)) & 255L).to_uint64()) * 1099511628211UL
+    k = k + 1
+  }
+  h
+}
+
+///|
+fn err_name(e : webm::WebmError) -> String {
+  match e {
+    InvalidLimits(_) => "InvalidLimits"
+    InvalidVint(_) => "InvalidVint"
+    TruncatedData(_) => "TruncatedData"
+    BoundsExceeded(_) => "BoundsExceeded"
+    InvalidHeader(_) => "InvalidHeader"
+    InvalidElementData(_) => "InvalidElementData"
+    InvalidBlock(_) => "InvalidBlock"
+    MissingRequiredElement(_) => "MissingRequiredElement"
+    LimitExceeded(_) => "LimitExceeded"
+  }
+}
+
+///| Invariant check every returned frame must satisfy: payload slice is inside the input.
+fn frames_inv(data : Bytes, frames : Array[webm::Frame]) -> String {
+  let n = data.length().to_int64()
+  let mut i = 0
+  while i < frames.length() {
+    let f = frames[i]
+    if f.offset < 0L || f.size < 0 || f.offset + f.size.to_int64() > n {
+      return " INV(frame " + i.to_string() + " off=" + f.offset.to_string() +
+      " size=" + f.size.to_string() + ")"
+    }
+    i = i + 1
+  }
+  ""
+}
+
+///|
+fn frames_hash(data : Bytes, frames : Array[webm::Frame]) -> UInt64 {
+  let mut h : UInt64 = 14695981039346656037UL
+  let mut i = 0
+  while i < frames.length() {
+    let f = frames[i]
+    h = fnv_i64(h, f.track_number)
+    h = fnv_i64(h, f.offset)
+    h = fnv_i64(h, f.size.to_int64())
+    h = fnv_i64(h, f.pts_ns)
+    h = fnv_i64(h, f.duration_ns)
+    h = fnv_i64(h, if f.is_keyframe { 1L } else { 0L })
+    i = i + 1
+  }
+  h
+}
+
+///|
+fn tracks_hash(tracks : Array[webm::TrackEntry]) -> UInt64 {
+  let mut h : UInt64 = 14695981039346656037UL
+  let mut i = 0
+  while i < tracks.length() {
+    let t = tracks[i]
+    h = fnv_i64(h, t.track_number)
+    h = fnv_i64(h, t.track_type.to_int64())
+    h = fnv_i64(h, t.default_duration)
+    h = fnv_i64(h, t.codec_id.length().to_int64())
+    h = fnv(h, t.codec_private, 0, t.codec_private.length())
+    i = i + 1
+  }
+  h
+}
+
+///|
+fn summarize_file(data : Bytes, r : Result[webm::WebmFile, webm::WebmError]) -> String {
+  match r {
+    Ok(f) =>
+    "OK t=" + f.tracks.length().to_string() + " c=" + f.clusters.length().to_string() +
+    " q=" + f.cues.length().to_string() + " f=" + f.frames.length().to_string() +
+    " scale=" + f.info.timestamp_scale.to_string() + " dms=" + f.info.duration_ms.to_string() +
+    " th=" + hex(tracks_hash(f.tracks)) + " fh=" + hex(frames_hash(data, f.frames)) +
+    frames_inv(data, f.frames)
+    Err(e) => "ERR " + err_name(e)
+  }
+}
+
+///|
+fn summarize_init(r : Result[webm::WebmInitSegment, webm::WebmError]) -> String {
+  match r {
+    Ok(s) =>
+    "OK t=" + s.tracks.length().to_string() + " q=" + s.cues.length().to_string() +
+    " scale=" + s.info.timestamp_scale.to_string() + " th=" + hex(tracks_hash(s.tracks))
+    Err(e) => "ERR " + err_name(e)
+  }
+}
+
+///|
+fn summarize_media(data : Bytes, r : Result[webm::WebmMediaSegment, webm::WebmError]) -> String {
+  match r {
+    Ok(m) =>
+    "OK c=" + m.clusters.length().to_string() + " f=" + m.frames.length().to_string() +
+    " s=" + m.start_pts_ms.to_string() + " e=" + m.end_pts_ms.to_string() +
+    " fh=" + hex(frames_hash(data, m.frames)) + frames_inv(data, m.frames)
+    Err(e) => "ERR " + err_name(e)
+  }
+}
+
+///|
+fn read_u32le(b : Bytes, p : Int) -> Int {
+  b[p].to_int() | (b[p + 1].to_int() << 8) | (b[p + 2].to_int() << 16) | (b[p + 3].to_int() << 24)
+}
+
+///|
+fn slice(b : Bytes, start : Int, len : Int) -> Bytes {
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = b[start + i]
+    i = i + 1
+  }
+  out
+}
+
+///| Canonical dump shared with `diff/rust` (matroska-demuxer) and `diff/compare.py` (ffprobe).
+fn dump_frames(world : World, data : Bytes, frames : Array[webm::Frame]) -> Unit {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < frames.length() {
+    let f = frames[i]
+    sb.write_string(
+      "F " + f.track_number.to_string() + " " + f.size.to_string() + " " + f.pts_ns.to_string() +
+      " " + f.pts_ms.to_string() + " " + f.duration_ns.to_string() + " " +
+      (if f.is_keyframe { "1" } else { "0" }) + " " + hex(fnv(14695981039346656037UL, data, f.offset.to_int(), f.size)) +
+      "\n",
+    )
+    i = i + 1
+  }
+  io_print(world, sb.to_string())
+}
+
+///|
+fn dump_tracks(world : World, tracks : Array[webm::TrackEntry]) -> Unit {
+  let mut i = 0
+  while i < tracks.length() {
+    let t = tracks[i]
+    io_println(
+      world,
+      "T " + t.track_number.to_string() + " " + t.track_type.to_string() + " " + t.codec_id + " " +
+      t.codec_private.length().to_string() + " " + hex(fnv(14695981039346656037UL, t.codec_private, 0, t.codec_private.length())) +
+      " " + webm::probe_codec_string(t) + " dd=" + t.default_duration.to_string(),
+    )
+    i = i + 1
+  }
+}
+
+///| Brute-force reference for find_keyframe_at: the keyframe of `track` with the largest pts_ms <= target
+///| (ties: the last such frame in file order).
+fn kf_oracle(frames : Array[webm::Frame], track : Int64, target : Int64) -> Option[Int] {
+  let mut best = -1
+  let mut i = 0
+  while i < frames.length() {
+    let f = frames[i]
+    if f.track_number == track && f.is_keyframe && f.pts_ms <= target {
+      if best < 0 || f.pts_ms >= frames[best].pts_ms {
+        best = i
+      }
+    }
+    i = i + 1
+  }
+  if best < 0 {
+    None
+  } else {
+    Some(best)
+  }
+}
+
+///|
+fn opt_str(o : Option[Int]) -> String {
+  match o {
+    Some(v) => v.to_string()
+    None => "none"
+  }
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 3 {
+    io_println(world, "usage: webm_audit <dump|mse|batch|kf|bench|kfbench> ...")
+    return 2
+  }
+  let mode = args[1]
+  let data = match fs_read_bytes(world, args[2]) {
+    Ok(b) => b
+    Err(_) => {
+      io_println(world, "cannot read " + args[2])
+      return 2
+    }
+  }
+  if mode == "dump" {
+    match webm::parse_webm(data) {
+      Ok(f) => {
+        io_println(
+          world,
+          "OK doc=" + f.header.doc_type + " scale=" + f.info.timestamp_scale.to_string() +
+          " tracks=" + f.tracks.length().to_string() + " clusters=" + f.clusters.length().to_string() +
+          " cues=" + f.cues.length().to_string() + " frames=" + f.frames.length().to_string() +
+          " dur_ms=" + f.info.duration_ms.to_string(),
+        )
+        dump_tracks(world, f.tracks)
+        dump_frames(world, data, f.frames)
+      }
+      Err(e) => io_println(world, "ERR " + err_name(e) + " " + webm::webm_error_message(e))
+    }
+    return 0
+  }
+  if mode == "mse" {
+    let media = match fs_read_bytes(world, args[3]) {
+      Ok(b) => b
+      Err(_) => return 2
+    }
+    match webm::parse_init_segment(data, webm::DecodeLimits::default()) {
+      Ok(init) => {
+        io_println(world, "INIT " + summarize_init(Ok(init)))
+        dump_tracks(world, init.tracks)
+        match webm::parse_media_segment(init, media, webm::DecodeLimits::default()) {
+          Ok(m) => {
+            io_println(world, "MEDIA " + summarize_media(media, Ok(m)))
+            dump_frames(world, media, m.frames)
+          }
+          Err(e) => io_println(world, "MEDIA ERR " + err_name(e) + " " + webm::webm_error_message(e))
+        }
+      }
+      Err(e) => io_println(world, "INIT ERR " + err_name(e) + " " + webm::webm_error_message(e))
+    }
+    return 0
+  }
+  if mode == "batch" {
+    let init_bytes = match fs_read_bytes(world, args[3]) {
+      Ok(b) => b
+      Err(_) => return 2
+    }
+    let init = match webm::parse_init_segment(init_bytes, webm::DecodeLimits::default()) {
+      Ok(v) => v
+      Err(_) => {
+        io_println(world, "bad init")
+        return 2
+      }
+    }
+    // one line per case, flushed as it is produced, so a trap / abort pinpoints the case (= lines printed)
+    let start = if args.length() >= 5 { parse_int(args[4]) } else { 0 }
+    let mut p = 0
+    let mut idx = 0
+    while p + 4 <= data.length() {
+      let len = read_u32le(data, p)
+      if idx >= start {
+        let rec = slice(data, p + 4, len)
+        io_println(
+          world,
+          idx.to_string() + " W:" + summarize_file(rec, webm::parse_webm(rec)) + " I:" +
+          summarize_init(webm::parse_init_segment(rec, webm::DecodeLimits::default())) + " M:" +
+          summarize_media(rec, webm::parse_media_segment(init, rec, webm::DecodeLimits::default())),
+        )
+      }
+      p = p + 4 + len
+      idx = idx + 1
+    }
+    return 0
+  }
+  if mode == "kf" {
+    match webm::parse_webm(data) {
+      Ok(f) => {
+        let mut bad = 0
+        let mut total = 0
+        let mut ti = 0
+        let mut first_bad = ""
+        while ti < f.tracks.length() {
+          let tn = f.tracks[ti].track_number
+          let mut i = 0
+          while i < f.frames.length() {
+            let mut d = -1L
+            while d <= 1L {
+              let target = f.frames[i].pts_ms + d
+              let got = webm::find_keyframe_at(f.frames, tn, target)
+              let want = kf_oracle(f.frames, tn, target)
+              total = total + 1
+              let same = match (got, want) {
+                (Some(a), Some(b)) => f.frames[a].pts_ms == f.frames[b].pts_ms
+                (None, None) => true
+                _ => false
+              }
+              if !same {
+                bad = bad + 1
+                if first_bad == "" {
+                  first_bad = " first: track=" + tn.to_string() + " target_ms=" + target.to_string() +
+                  " got=" + opt_str(got) +
+                  (match got { Some(a) => "(pts " + f.frames[a].pts_ms.to_string() + ")"; None => "" }) +
+                  " want=" + opt_str(want) +
+                  (match want { Some(b) => "(pts " + f.frames[b].pts_ms.to_string() + ")"; None => "" })
+                }
+              }
+              d = d + 1L
+            }
+            i = i + 1
+          }
+          ti = ti + 1
+        }
+        io_println(world, "KF queries=" + total.to_string() + " mismatches=" + bad.to_string() + first_bad)
+      }
+      Err(e) => io_println(world, "ERR " + err_name(e))
+    }
+    return 0
+  }
+  if mode == "bench" {
+    let iters = parse_int(args[3])
+    let stage = args[4]
+    let t0 = clock_now_ms(world)
+    let mut acc = 0
+    let mut i = 0
+    while i < iters {
+      if stage == "read" {
+        match fs_read_bytes(world, args[2]) {
+          Ok(b) => acc = acc + b.length()
+          Err(_) => ()
+        }
+      } else if stage == "init" {
+        match webm::parse_init_segment(data, webm::DecodeLimits::default()) {
+          Ok(s) => acc = acc + s.tracks.length()
+          Err(_) => ()
+        }
+      } else {
+        match webm::parse_webm(data) {
+          Ok(f) => acc = acc + f.frames.length()
+          Err(_) => ()
+        }
+      }
+      i = i + 1
+    }
+    let t1 = clock_now_ms(world)
+    io_println(world, "BENCH stage=" + stage + " iters=" + iters.to_string() + " ms=" + (t1 - t0).to_string() + " acc=" + acc.to_string())
+    return 0
+  }
+  if mode == "micro" {
+    // ns per call of the public VINT readers on a 2-byte ID + 1-byte size (the SimpleBlock header shape)
+    let n = parse_int(args[3])
+    let buf = Bytes::new(4)
+    buf[0] = (0xA3).to_byte()
+    buf[1] = (0x85).to_byte()
+    buf[2] = (0x81).to_byte()
+    buf[3] = (0x00).to_byte()
+    let t0 = clock_now_ms(world)
+    let mut acc = 0L
+    let mut i = 0
+    while i < n {
+      match webm::read_vint_id(buf, 0, 4) {
+        Ok(v) => acc = acc + v.id
+        Err(_) => ()
+      }
+      i = i + 1
+    }
+    let t1 = clock_now_ms(world)
+    i = 0
+    while i < n {
+      match webm::read_vint_size(buf, 1, 4) {
+        Ok(v) => acc = acc + v.size
+        Err(_) => ()
+      }
+      i = i + 1
+    }
+    let t2 = clock_now_ms(world)
+    io_println(world, "MICRO n=" + n.to_string() + " read_vint_id_ms=" + (t1 - t0).to_string() + " read_vint_size_ms=" + (t2 - t1).to_string() + " acc=" + acc.to_string())
+    return 0
+  }
+  if mode == "kfbench" {
+    let q = parse_int(args[3])
+    match webm::parse_webm(data) {
+      Ok(f) => {
+        let n = f.frames.length()
+        let tn = f.tracks[0].track_number
+        let t0 = clock_now_ms(world)
+        let mut hits = 0
+        let mut i = 0
+        while i < q {
+          let target = f.frames[(i * 7919) % n].pts_ms
+          match webm::find_keyframe_at(f.frames, tn, target) {
+            Some(_) => hits = hits + 1
+            None => ()
+          }
+          i = i + 1
+        }
+        let t1 = clock_now_ms(world)
+        io_println(world, "KFBENCH frames=" + n.to_string() + " queries=" + q.to_string() + " ms=" + (t1 - t0).to_string() + " hits=" + hits.to_string())
+      }
+      Err(e) => io_println(world, "ERR " + err_name(e))
+    }
+    return 0
+  }
+  io_println(world, "unknown mode " + mode)
+  2
+}
