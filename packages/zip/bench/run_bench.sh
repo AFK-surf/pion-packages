@@ -25,10 +25,10 @@ rm -rf "$OUT_DIR/go-build"
 cp -R "$BENCH_DIR/go" "$OUT_DIR/go-build"
 (cd "$OUT_DIR/go-build" && GOCACHE="$OUT_DIR/gocache" go build -o "$BIN_DIR/go_bench" .)
 
-echo "==> Building Rust zip benchmark (--release, target in /private/tmp)"
+echo "==> Building Rust zip benchmark (--release --locked, target in /private/tmp)"
 rm -rf "$OUT_DIR/rust-build"
 cp -R "$BENCH_DIR/rust" "$OUT_DIR/rust-build"
-CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build -q --release \
+CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build -q --release --locked \
   --manifest-path "$OUT_DIR/rust-build/Cargo.toml"
 cp "$OUT_DIR/rust-target/release/zip_bench_rust" "$BIN_DIR/rust_bench"
 
@@ -53,6 +53,7 @@ python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --baseline go_zip \
   --warmup 1 --rounds 5 --bytes "$MIXED_UNCOMP" \
   --md-out "$OUT_DIR/write.md" --json-out "$OUT_DIR/write.json"
+echo "  (Note: W2 stdout SHA-256 verifies files/total_uncomp/xor_crc; compressed L6 payload size is tracked separately in audit prof: Pion ~2.32 MB vs Go/zlib ~2.24 MB, +3.6%.)"
 
 echo ""
 echo "=== WORKLOAD 3: 20,000-Entry Central Directory Index Scan + 20,000 Random Name Lookups (x3 iters = 60k ops) ==="
