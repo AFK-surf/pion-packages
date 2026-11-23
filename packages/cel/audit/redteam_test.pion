@@ -1,0 +1,373 @@
+///| Red-team evidence for `packages/cel` vs Go `google/cel-go v0.24.1` (+ `cel-spec`).
+///| Every expected value in a `p0_*` / `p1_*` / `p2_*` test was read from the real cel-go
+///| (`audit/diff/go_oracle`, default `cel.NewEnv()`) unless the test says it is a cel-spec /
+///| resource-limit expectation. Each red test asserts the CORRECT behaviour: it FAILS while the
+///| defect exists and PASSES once fixed. `control_*` tests pin what Pion already gets right and
+///| must always pass. Test names carry the finding id from REPORT.md.
+
+import "cel"
+
+fn ev(src : String) -> Result[cel::Value, cel::CelError] {
+  cel::eval(src, cel::Activation::empty())
+}
+
+fn ev_lim(src : String, lim : cel::EvalLimits) -> Result[cel::Value, cel::CelError] {
+  cel::eval_with_limits(src, cel::Activation::empty(), lim)
+}
+
+fn show(r : Result[cel::Value, cel::CelError]) -> String {
+  match r {
+    Ok(v) => {
+      match v.kind {
+        cel::ValueKind::Bool(b) => "bool(" + b.to_string() + ")"
+        cel::ValueKind::Int64(n) => "int(" + n.to_string() + ")"
+        cel::ValueKind::UInt64(u) => "uint(" + u.to_string() + ")"
+        cel::ValueKind::Double(d) => "double(" + d.to_string() + ")"
+        cel::ValueKind::String(s) => "string(" + s + ")"
+        cel::ValueKind::Duration(d) => "duration(" + d.secs.to_string() + "s," + d.nanos.to_string() + "ns)"
+        cel::ValueKind::Timestamp(t) => "timestamp(" + t.secs.to_string() + ")"
+        _ => cel::value_type_name(v)
+      }
+    }
+    Err(e) => "error(" + e.to_string() + ")"
+  }
+}
+
+fn is_err(r : Result[cel::Value, cel::CelError]) -> Bool {
+  match r {
+    Ok(_) => false
+    Err(_) => true
+  }
+}
+
+fn is_limit(r : Result[cel::Value, cel::CelError]) -> Bool {
+  match r {
+    Ok(_) => false
+    Err(e) => e.is_kind(cel::CelErrorKind::LimitExceeded)
+  }
+}
+
+fn want(src : String, expected : cel::Value) -> Unit {
+  let r = ev(src)
+  let ok = match r {
+    Ok(v) => cel::value_strict_eq(v, expected)
+    Err(_) => false
+  }
+  debug_assert(ok, src + " => " + show(r) + ", cel-go: " + show(Ok(expected)))
+}
+
+fn want_err(src : String) -> Unit {
+  let r = ev(src)
+  debug_assert(is_err(r), src + " => " + show(r) + ", cel-go: error")
+}
+
+fn want_ok(src : String) -> Unit {
+  let r = ev(src)
+  debug_assert(!is_err(r), src + " => " + show(r) + ", cel-go: evaluates")
+}
+
+fn compiles_ok(src : String) -> Bool {
+  match cel::compile(src, cel::Env::new()) {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+fn rep(unit : String, sep : String, n : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    if i > 0 {
+      sb.write_string(sep)
+    }
+    sb.write_string(unit)
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+// `[[0]].map(l, l + l)` x k  ->  a list of 2^k zeros built with ~2k AST nodes.
+fn pow2_list(k : Int) -> String {
+  "[[0]]" + rep(".map(l, l + l)", "", k) + "[0]"
+}
+
+// 16-byte string doubled k times -> 16 * 2^k bytes.
+fn pow2_string(k : Int) -> String {
+  "['0123456789abcdef']" + rep(".map(s, s + s)", "", k) + "[0]"
+}
+
+fn total_bytes(v : cel::Value) -> Int {
+  match v.kind {
+    cel::ValueKind::String(s) => s.length()
+    cel::ValueKind::List(xs) => {
+      let mut t = 0
+      let mut i = 0
+      while i < xs.length() {
+        t = t + total_bytes(xs[i])
+        i = i + 1
+      }
+      t
+    }
+    _ => 8
+  }
+}
+
+// ============================================================================ P0
+
+///| P0-1: the static checker (`check_node`) recurses once per AST level with NO depth guard
+///| (the parser only counts `(`, `?:` and unary operators). `1+1+...` is parsed by a loop, so a
+///| flat 2000-term chain sails through the parser and the checker recurses 2000 deep.
+///| At ~19.4k terms (39 KB of source) `compile()` SIGSEGVs natively; on wasm32 it dies with
+///| `RangeError: Maximum call stack size exceeded` at ~331 terms (~660 bytes). cel-go rejects
+///| both cleanly ("max recursion depth exceeded", default limit 250). See dos/ for the crash.
+test "p0_1_compile_unbounded_checker_recursion_add_chain" {
+  let r = cel::compile(rep("1", "+", 2000), cel::Env::new())
+  let limited = match r {
+    Ok(_) => false
+    Err(e) => e.is_kind(cel::CelErrorKind::LimitExceeded)
+  }
+  debug_assert(limited, "compile(2000-term `1+1+...`) must fail with LimitExceeded (cel-go: max recursion depth exceeded); Pion accepted it, the checker recursed 2000 levels deep")
+}
+
+///|
+test "p0_1_compile_unbounded_checker_recursion_member_chain" {
+  let ok1 = compiles_ok("dyn({'a':1})" + rep(".a", "", 2000))
+  let ok2 = compiles_ok("dyn([0])" + rep("[0]", "", 2000))
+  debug_assert(!ok1 && !ok2, "2000-deep `.a.a...` / `[0][0]...` must be rejected by a depth limit before the checker recurses (cel-go: max recursion depth exceeded)")
+}
+
+///| P0-2: `max_output_bytes` is only checked per single value (one concat / one literal), never
+///| for the total retained by a result. With a 4 KiB limit, 64 fresh 4 KiB strings (256 KiB) are
+///| returned. With the DEFAULT limits (1 MiB) the same shape returns 1 GiB in 0.09 s (dos/
+///| `mem_amp 10`, RSS 1.10 GB), and list fan-out allows 131072 x 1 MiB = 128 GiB under the
+///| default max_cost. cel-go with `cel.CostLimit(1000000)` stops the 256 MiB variant ("actual cost
+///| limit exceeded") because its concat cost is proportional to the bytes produced.
+test "p0_2_max_output_bytes_not_cumulative" {
+  let lim = cel::EvalLimits::new(64, 1000000L, 4096)
+  let src = "[" + pow2_string(7) + "].map(s, [" + pow2_list(6) + "].map(l, l.map(i, s + s)))"
+  let r = ev_lim(src, lim)
+  let total = match r {
+    Ok(v) => total_bytes(v)
+    Err(_) => 0
+  }
+  debug_assert(total <= 4096, "max_output_bytes=4096 but the result holds " + total.to_string() + " bytes (" + show(r) + ")")
+}
+
+///| P0-3: `max_cost` charges 1 per AST node / loop iteration but nothing for the O(n) work inside
+///| `in`, `==` on lists/strings/maps, map lookups, `size(string)`, `contains`/`matches`.
+///| `L.map(i, 1 in L)` with |L| = 4096 performs 16.8 M equality tests for ~12 k cost units.
+///| Default limits allow |L| = 131072: 1.7e10 comparisons (~45 s CPU) in a single eval.
+///| cel-go `cel.CostLimit` charges `in` by list size and rejects it.
+test "p0_3_max_cost_ignores_linear_scans" {
+  let lim = cel::EvalLimits::new(64, 100000L, 1048576)
+  let src = "[" + pow2_list(12) + "].map(L, L.map(i, 1 in L))"
+  let r = ev_lim(src, lim)
+  debug_assert(is_limit(r), "16.8M comparisons must exceed max_cost=100000, got " + show(r))
+}
+
+///|
+test "p0_3_max_cost_ignores_string_equality" {
+  // 2^10 x (64 KiB == 64 KiB) = 64 MiB compared for ~4k cost units
+  let lim = cel::EvalLimits::new(64, 50000L, 1048576)
+  let src = "[" + pow2_string(12) + "].map(s, [" + pow2_list(10) + "].map(l, l.map(i, s == s + '')))"
+  let r = ev_lim(src, lim)
+  debug_assert(is_limit(r), "64 MiB of string comparison must exceed max_cost=50000, got " + show(r))
+}
+
+// ============================================================================ P1
+
+///| P1-1: `parse_double_str` accumulates digits in a Double and scales by repeated
+///| multiplication, so literals and `double()` are not correctly rounded: DBL_MAX parses as +Inf,
+///| the smallest subnormals as 0, DBL_MIN is off by 3 ulp.
+test "p1_1_double_literal_rounding" {
+  want("1.7976931348623157e308 < 1.0/0.0", cel::Value::bool(true))
+  want("5e-324 > 0.0", cel::Value::bool(true))
+  want("string(2.2250738585072014e-308)", cel::Value::string("2.2250738585072014e-308"))
+  want("uint(18446744073709549568.0)", cel::Value::uint(18446744073709549568UL))
+  want("double('4.9e-324') > 0.0", cel::Value::bool(true))
+}
+
+///| P1-2: duration parsing silently wraps int64 seconds: the sub-second branch and the
+///| nanos-carry do `total_secs + ...` unchecked, so a huge positive duration becomes negative.
+test "p1_2_duration_parse_silent_int64_wrap" {
+  want_err("duration('9223372036854775807s1000000000ns')")
+  want_err("duration('9223372036854775807.5s0.5s')")
+}
+
+///| P1-3: durations are not limited to cel-go's range (int64 nanoseconds, ~292 years), and
+///| duration/timestamp arithmetic leaves that range without error.
+test "p1_3_duration_range" {
+  want_err("duration('2562048h')")
+  want_err("duration('2562047h47m16.854775808s')")
+  want_err("duration('2562047h') + duration('2562047h')")
+  want_err("timestamp('2020-01-01T00:00:00Z') - timestamp('1700-01-01T00:00:00Z')")
+}
+
+///| P1-4: the timestamp range is the `time` package's (jiff: year -9999 .. 9999-12-30T22:00Z),
+///| not CEL's 0001-01-01T00:00:00Z .. 9999-12-31T23:59:59.999999999Z. The common
+///| "never expires" sentinel `9999-12-31T23:59:59Z` is REJECTED, while year 0 is accepted.
+test "p1_4_timestamp_range_cel_bounds" {
+  want_ok("timestamp('9999-12-31T23:59:59Z')")
+  want_ok("timestamp('9999-12-31T23:59:59.999999999Z')")
+  want_ok("timestamp(253402300799)")
+  want_err("timestamp('0000-12-31T23:59:59Z')")
+  want_err("timestamp(-62135596801)")
+  want_err("timestamp('0001-01-01T00:00:00Z') - duration('1s')")
+}
+
+///| P1-5: map literals keep duplicate keys: `size()` counts both, `.a` / `['a']` return the FIRST
+///| value while cel-go keeps the LAST (and cel-spec says a duplicate key is an error).
+///| A policy `{'role': 'viewer', 'role': 'admin'}.role` therefore reads differently in Pion.
+test "p1_5_map_literal_duplicate_keys" {
+  let r1 = ev("{'role': 'viewer', 'role': 'admin'}.role")
+  let ok1 = match r1 {
+    Ok(v) => cel::value_strict_eq(v, cel::Value::string("admin"))
+    Err(_) => true
+  }
+  debug_assert(ok1, "duplicate key: Pion returns " + show(r1) + ", cel-go: string(admin) (cel-spec: error)")
+  let r2 = ev("{'a': 1, 'a': 2}.size()")
+  let ok2 = match r2 {
+    Ok(v) => cel::value_strict_eq(v, cel::Value::int(1L))
+    Err(_) => true
+  }
+  debug_assert(ok2, "{'a':1,'a':2}.size() => " + show(r2) + ", cel-go: int(1)")
+}
+
+///| P1-6: `matches()` uses the Rust-regex dialect instead of RE2: `\d`/`\w`/`\s`/`\b` are
+///| Unicode-aware (Arabic-Indic digits pass `^\d+$`), `&&`/`--` are class set operations,
+///| `{1001}` is accepted. Input validators written for cel-go accept different strings.
+test "p1_6_matches_is_not_re2" {
+  want("'\\u0661\\u0662\\u0663'.matches('^\\\\d+$')", cel::Value::bool(false))
+  want("'\\u00e9'.matches('^\\\\w$')", cel::Value::bool(false))
+  want("'\\u00a0'.matches('^\\\\s$')", cel::Value::bool(false))
+  want("'&'.matches('^[a&&b]$')", cel::Value::bool(true))
+  want_err("'a'.matches('a{1001}')")
+}
+
+///| P1-7: timestamp accessors only accept fixed `±HH:MM` offsets: IANA zone names (and the
+///| sign-less `HH:MM` form) that cel-go supports are errors.
+test "p1_7_iana_timezones" {
+  want("timestamp('2020-03-01T00:30:00Z').getHours('America/New_York')", cel::Value::int(19L))
+  want("timestamp('2020-07-01T00:30:00Z').getHours('America/New_York')", cel::Value::int(20L))
+  want("timestamp('2020-03-01T00:30:00Z').getHours('Asia/Kolkata')", cel::Value::int(6L))
+  want("timestamp('2020-03-01T00:30:00Z').getHours('05:30')", cel::Value::int(6L))
+}
+
+///| P1-8: `duration.getMilliseconds()` returns the sub-second component; cel-go returns the
+///| whole duration in milliseconds (1.5 s -> 1500).
+test "p1_8_duration_get_milliseconds" {
+  want("duration('1.5s').getMilliseconds()", cel::Value::int(1500L))
+  want("duration('61.5s').getMilliseconds()", cel::Value::int(61500L))
+}
+
+///| P1-9: `string(double)` is not Go's `FormatFloat(f, 'g', -1, 64)`.
+test "p1_9_string_of_double_format" {
+  want("string(1e6)", cel::Value::string("1e+06"))
+  want("string(123456789.0)", cel::Value::string("1.23456789e+08"))
+  want("string(-0.0)", cel::Value::string("-0"))
+  want("string(1.0/0.0)", cel::Value::string("+Inf"))
+  want("string(0.0/0.0)", cel::Value::string("NaN"))
+}
+
+///| P1-10: `max_depth` (default 64) is applied to the *evaluation* recursion, and `||`/`&&`/`+`
+///| chains are left-nested (cel-go balances logical chains), so ordinary allow-lists with more
+///| than 63 clauses are rejected with LimitExceeded. cel-go evaluates 1000 clauses.
+test "p1_10_long_flat_chains_false_reject" {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < 70 {
+    if i > 0 {
+      sb.write_string(" || ")
+    }
+    sb.write_string("x == " + i.to_string())
+    i = i + 1
+  }
+  let r = cel::eval(sb.to_string(), cel::Activation::from_pairs([("x", cel::Value::int(69L))]))
+  let ok = match r {
+    Ok(v) => cel::value_strict_eq(v, cel::Value::bool(true))
+    Err(_) => false
+  }
+  debug_assert(ok, "70-clause `x == 0 || ... || x == 69` => " + show(r) + ", cel-go: bool(true)")
+  want(rep("1", " + ", 70), cel::Value::int(70L))
+}
+
+// ============================================================================ P2
+
+///| P2-1: CEL reserved words are accepted as identifiers / macro variables.
+test "p2_1_reserved_identifiers" {
+  let words = ["as", "break", "const", "continue", "else", "for", "function", "if", "import", "let", "loop", "package", "namespace", "return", "var", "void", "while"]
+  let mut accepted = ""
+  let mut i = 0
+  while i < words.length() {
+    match cel::parse("[1].map(" + words[i] + ", " + words[i] + ")") {
+      Ok(_) => accepted = accepted + words[i] + " "
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  debug_assert(accepted == "", "reserved identifiers accepted: " + accepted)
+}
+
+///| P2-2: grammar leniency: the `rb'..'` prefix (cel-go only lexes `br'..'`) and a nested
+///| conditional in the THEN branch without parentheses (cel-go grammar: `or ? or : expr`).
+test "p2_2_grammar_leniency" {
+  debug_assert(is_err(ev("rb'\\x80'")), "rb'..' must be a syntax error (cel-go)")
+  debug_assert(is_err(ev("true ? false ? 1 : 2 : 3")), "`a ? b ? c : d : e` must be a syntax error (cel-go: then-branch is conditionalOr)")
+}
+
+///| P2-3: error absorption does not extend to non-bool operands: cel-go treats a non-bool
+///| `||`/`&&` operand like an error that the other side can absorb.
+test "p2_3_absorb_non_bool_operand" {
+  want("dyn('a') || true", cel::Value::bool(true))
+  want("dyn(1) && false", cel::Value::bool(false))
+}
+
+///| P2-4: ordering against NaN returns false; cel-go raises "NaN values cannot be ordered".
+test "p2_4_nan_ordering_is_error" {
+  want_err("0.0/0.0 < 1.0")
+  want_err("dyn(1) > dyn(0.0/0.0)")
+}
+
+///| P2-5: the checker accepts programs cel-go's checker rejects (type confusion hidden until
+///| runtime): mixed-type equality, mismatched ternary branches, heterogeneous list concat,
+///| unary minus on duration, wrong map key type.
+test "p2_5_checker_too_lenient" {
+  let bad = ["1 == 'a'", "true ? 1 : 'a'", "[1] + ['a']", "-duration('1s')", "{1: 'a'}['x']"]
+  let mut accepted = ""
+  let mut i = 0
+  while i < bad.length() {
+    if compiles_ok(bad[i]) {
+      accepted = accepted + bad[i] + " ; "
+    }
+    i = i + 1
+  }
+  debug_assert(accepted == "", "type-checks although cel-go rejects: " + accepted)
+}
+
+///| P2-6: smaller conversion / indexing gaps vs cel-go.
+test "p2_6_conversion_gaps" {
+  want("[1, 2][1.0]", cel::Value::int(2L))
+  want("int(duration('1s'))", cel::Value::int(1000000000L))
+  want("double('infinity') > 0.0", cel::Value::bool(true))
+  want("string(timestamp('2020-01-01T08:00:00+08:00'))", cel::Value::string("2020-01-01T08:00:00+08:00"))
+}
+
+///| P2-7: RFC 3339 parsing is laxer and stricter than cel-go in different places.
+test "p2_7_timestamp_parse_strictness" {
+  want_err("timestamp('2020-01-01t00:00:00z')")
+  want_err("timestamp('2020-01-01 00:00:00Z')")
+  want_err("timestamp('2020-12-31T23:59:60Z')")
+  want_ok("timestamp('2020-01-01T00:00:00.1234567891Z')")
+}
+
+///| P2-8: invalid map key types (double, bytes) are accepted in literals.
+test "p2_8_invalid_map_key_types" {
+  want_err("{1.0: 'a'}[1]")
+}
+
+///| P2-9: unary minus on double is `0.0 - d` (and the literal parser does the same), so the sign
+///| of zero is lost: `-0.0` is +0.0 and `1.0 / -0.0` is +Inf instead of -Inf.
+test "p2_9_negative_zero_lost" {
+  want("1.0 / -0.0 < 0.0", cel::Value::bool(true))
+  want("1.0 / -(0.0) < 0.0", cel::Value::bool(true))
+}
