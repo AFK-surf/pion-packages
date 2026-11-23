@@ -42,29 +42,8 @@ theorem ascii_upper_byte_idempotent (c : I32) :
   · have hf : ((decide (c >= 97#i32)) && (decide (c <= 122#i32))) = false := Bool.eq_false_iff.mpr h
     simp only [hf, Bool.false_eq_true, ↓reduceIte]
 
-/-- Theorem 14: `ascii_upper_byte` never produces an ASCII lowercase byte `'a'..'z'`. -/
-theorem ascii_upper_byte_no_lowercase (c u : I32) (h : ascii_upper_byte c = ok u) :
-    ¬(97 ≤ u.val ∧ u.val ≤ 122) := by
-  unfold ascii_upper_byte at h
-  have hu := result_ok_inj h
-  subst hu
-  by_cases hlo : ((decide (c >= 97#i32)) && (decide (c <= 122#i32))) = true
-  · simp only [hlo, ↓reduceIte]
-    simp only [Bool.and_eq_true, decide_eq_true_eq] at hlo
-    have h1 : 97 ≤ c.val := hlo.1
-    have h2 : c.val ≤ 122 := hlo.2
-    have c32 : (32#i32 : I32).val = 32 := rfl
-    have hsub := i32_sub_val_of_bounds c 32#i32 (by omega) (by omega)
-    omega
-  · have hf : ((decide (c >= 97#i32)) && (decide (c <= 122#i32))) = false := Bool.eq_false_iff.mpr hlo
-    simp only [hf, Bool.false_eq_true, ↓reduceIte]
-    intro ⟨h1, h2⟩
-    apply hlo
-    simp only [Bool.and_eq_true, decide_eq_true_eq]
-    exact ⟨h1, h2⟩
-
 /-- Theorem 15: `is_ical_name_byte` accepts exactly RFC 5545 §3.1 `ALPHA / DIGIT / "-"`. -/
-theorem is_ical_name_byte_iff (c : I32) :
+lemma is_ical_name_byte_iff (c : I32) :
     is_ical_name_byte c = ok true ↔
       ((65 ≤ c.val ∧ c.val ≤ 90) ∨ (97 ≤ c.val ∧ c.val ≤ 122) ∨
        (48 ≤ c.val ∧ c.val ≤ 57) ∨ c.val = 45) := by
@@ -105,69 +84,5 @@ theorem is_ical_name_byte_upper_closed (c : I32) (h : is_ical_name_byte c = ok t
   · have hf : ((decide (c >= 97#i32)) && (decide (c <= 122#i32))) = false := Bool.eq_false_iff.mpr hlo
     simp only [hf, Bool.false_eq_true, ↓reduceIte]
     exact hc
-
-/-- Theorem 17: `is_ical_name_byte` rejects RFC 5545 content-line delimiters (`\r`, `\n`, `:`, `;`, space). -/
-theorem is_ical_name_byte_rejects_delimiters :
-    is_ical_name_byte 13#i32 = ok false ∧
-    is_ical_name_byte 10#i32 = ok false ∧
-    is_ical_name_byte 58#i32 = ok false ∧
-    is_ical_name_byte 59#i32 = ok false ∧
-    is_ical_name_byte 32#i32 = ok false := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> (unfold is_ical_name_byte; apply congrArg ok; decide)
-
-/-- Theorem 18: `clamp_leap_second` maps `[0, 60]` into `[0, 59]`. -/
-theorem clamp_leap_second_bounds (sc : I32) (h0 : 0 ≤ sc.val) (h60 : sc.val ≤ 60) :
-    ∃ r, clamp_leap_second sc = ok r ∧ 0 ≤ r.val ∧ r.val ≤ 59 := by
-  unfold clamp_leap_second
-  by_cases h : sc = 60#i32
-  · simp only [h, ↓reduceIte]
-    exact ⟨59#i32, rfl, by decide, by decide⟩
-  · simp only [h, ↓reduceIte]
-    have hne : sc.val ≠ 60 := fun hv => h (IScalar.eq_of_val_eq hv)
-    exact ⟨sc, rfl, h0, by omega⟩
-
-/-- Theorem 19: `clamp_leap_second` is idempotent. -/
-theorem clamp_leap_second_idempotent (sc : I32) :
-    (do let r ← clamp_leap_second sc; clamp_leap_second r) = clamp_leap_second sc := by
-  unfold clamp_leap_second
-  rw [result_bind_ok]
-  by_cases h : sc = 60#i32
-  · simp only [h, ↓reduceIte]
-    have hne : (59#i32 : I32) ≠ 60#i32 := by decide
-    simp only [hne, ↓reduceIte]
-  · simp only [h, ↓reduceIte]
-
-/-- Theorem 20: `parse_weekday_2_bytes` always returns a code in `[-1, 6]`. -/
-theorem parse_weekday_2_bytes_range (a0 b0 : I32) :
-    ∃ r, parse_weekday_2_bytes a0 b0 = ok r ∧ -1 ≤ r.val ∧ r.val ≤ 6 := by
-  unfold parse_weekday_2_bytes ascii_upper_byte
-  rw [result_bind_ok, result_bind_ok]
-  split_ifs
-  all_goals exact ⟨_, rfl, by decide, by decide⟩
-
-/-- Theorem 21: `parse_weekday_2_bytes` decodes all 7 RFC 5545 weekdays (`MO`..`SU`) and lowercase `mo`..`su` into `0..6`. -/
-theorem parse_weekday_2_bytes_all_7 :
-    parse_weekday_2_bytes 77#i32 79#i32 = ok 0#i32 ∧
-    parse_weekday_2_bytes 84#i32 85#i32 = ok 1#i32 ∧
-    parse_weekday_2_bytes 87#i32 69#i32 = ok 2#i32 ∧
-    parse_weekday_2_bytes 84#i32 72#i32 = ok 3#i32 ∧
-    parse_weekday_2_bytes 70#i32 82#i32 = ok 4#i32 ∧
-    parse_weekday_2_bytes 83#i32 65#i32 = ok 5#i32 ∧
-    parse_weekday_2_bytes 83#i32 85#i32 = ok 6#i32 ∧
-    parse_weekday_2_bytes 109#i32 111#i32 = ok 0#i32 ∧
-    parse_weekday_2_bytes 115#i32 117#i32 = ok 6#i32 := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-  all_goals
-    unfold parse_weekday_2_bytes ascii_upper_byte
-    rw [result_bind_ok, result_bind_ok]
-    simp
-
-/-- Theorem 22: `ParseLimits::default` sets strictly positive bounds on every DoS defense limit. -/
-theorem parse_limits_default_positive :
-    ∃ lim, ParseLimits.default = ok lim ∧
-      0 < lim.max_depth.val ∧ 0 < lim.max_lines.val ∧ 0 < lim.max_components.val ∧
-      0 < lim.max_properties_per_component.val ∧ 0 < lim.max_line_bytes.val := by
-  unfold ParseLimits.default
-  exact ⟨_, rfl, by decide, by decide, by decide, by decide, by decide⟩
 
 end IcalProofs

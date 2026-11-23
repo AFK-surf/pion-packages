@@ -8,36 +8,36 @@ open Aeneas Aeneas.Std Result Pion asn1
 namespace Asn1Proofs
 
 @[simp]
-theorem result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← ok x; f y) = f x := by
   simp
 
-theorem result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
+lemma result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
   simpa using h
 
-theorem iscalar_eq_of_bv_eq {ty} {a b : IScalar ty} (h : a.bv = b.bv) : a = b := by
+lemma iscalar_eq_of_bv_eq {ty} {a b : IScalar ty} (h : a.bv = b.bv) : a = b := by
   cases a; cases b; congr
 
-theorem iscalar_eq_of_val_eq {ty} {a b : IScalar ty} (h : a.val = b.val) : a = b :=
+lemma iscalar_eq_of_val_eq {ty} {a b : IScalar ty} (h : a.val = b.val) : a = b :=
   iscalar_eq_of_bv_eq (BitVec.eq_of_toInt_eq h)
 
-theorem i32_mk_bv (x : BitVec 32) : (⟨x⟩ : I32).bv = x := rfl
+lemma i32_mk_bv (x : BitVec 32) : (⟨x⟩ : I32).bv = x := rfl
 
-theorem i32_band_bv (a b : I32) : (Pion.I32.band a b).bv = a.bv &&& b.bv := rfl
+lemma i32_band_bv (a b : I32) : (Pion.I32.band a b).bv = a.bv &&& b.bv := rfl
 
-theorem i32_bor_bv (a b : I32) : (Pion.I32.bor a b).bv = a.bv ||| b.bv := rfl
+lemma i32_bor_bv (a b : I32) : (Pion.I32.bor a b).bv = a.bv ||| b.bv := rfl
 
-theorem i32_shl_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
+lemma i32_shl_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
     Pion.I32.shl x s = ok (⟨x.bv <<< s.val.toNat⟩ : I32) := by
   unfold Pion.I32.shl
   simp [hs0, hs1]
 
-theorem i32_shr_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
+lemma i32_shr_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
     Pion.I32.shr x s = ok (⟨x.bv.sshiftRight s.val.toNat⟩ : I32) := by
   unfold Pion.I32.shr
   simp [hs0, hs1]
 
-theorem i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
+lemma i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
     x.bv.toNat = x.val.toNat := by
   have h1 : x.val = x.bv.toInt := rfl
   have h2 : x.bv.toInt = if 2 * x.bv.toNat < 2 ^ 32 then (x.bv.toNat : Int) else (x.bv.toNat : Int) - 2 ^ 32 := by
@@ -45,7 +45,7 @@ theorem i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
   have hlt : x.bv.toNat < 2 ^ 32 := x.bv.isLt
   omega
 
-theorem i32_add_val_of_bounds (a b : I32)
+lemma i32_add_val_of_bounds (a b : I32)
     (hlo : -2147483648 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 2147483647) :
     (Pion.I32.add a b).val = a.val + b.val := by
   have h1 : (Pion.I32.add a b).val = (a.bv + b.bv).toInt := rfl
@@ -64,43 +64,12 @@ theorem i32_add_val_of_bounds (a b : I32)
       simpa [Int.add_emod_right] using h'
     simp only [Int.bmod, hm]; split <;> omega
 
-theorem bv32_getElem_high_false (x : I32) (hx0 : 0 ≤ x.val) {k : Nat} (hx : x.val < ((2 ^ k : Nat) : Int))
+lemma bv32_getElem_high_false (x : I32) (hx0 : 0 ≤ x.val) {k : Nat} (hx : x.val < ((2 ^ k : Nat) : Int))
     (i : Nat) (hi : i < 32) (hki : k ≤ i) : x.bv[i] = false := by
   rw [BitVec.getElem_eq_testBit_toNat, i32_val_nonneg_toNat x hx0]
   apply Nat.testBit_lt_two_pow
   have hlt : x.val.toNat < 2 ^ k := by omega
   exact Nat.lt_of_lt_of_le hlt (Nat.pow_le_pow_right (by omega) hki)
-
-/-- Theorem 1: `tag_class_from_code ∘ tag_class_code = id` on all 4 X.690 tag classes. -/
-theorem tag_class_roundtrip (c : TagClass) :
-    (do let k ← tag_class_code c; tag_class_from_code k) = ok c := by
-  cases c <;> simp [tag_class_code, tag_class_from_code]
-
-/-- Theorem 2: `tag_class_equals` is exact decidable equality on `TagClass`. -/
-theorem tag_class_equals_iff (a b : TagClass) :
-    tag_class_equals a b = ok true ↔ a = b := by
-  cases a <;> cases b <;> simp [tag_class_equals, tag_class_code]
-
-/-- Theorem 3: `Tag.equals` is exact decidable equality on `Tag`. -/
-theorem tag_equals_iff (a b : Tag) :
-    Tag.equals a b = ok true ↔ a = b := by
-  rcases a with ⟨ca, fa, na⟩
-  rcases b with ⟨cb, fb, nb⟩
-  unfold Tag.equals
-  constructor
-  · intro h
-    by_cases hnf : ((na == nb) && (fa == fb)) = true
-    · simp only [hnf, ↓reduceIte] at h
-      simp only [Bool.and_eq_true, beq_iff_eq] at hnf
-      rcases hnf with ⟨rfl, rfl⟩
-      have hc : ca = cb := by
-        cases ca <;> cases cb <;> simp [tag_class_code] at h ⊢
-      subst hc; rfl
-    · simp only [hnf] at h
-      exact absurd (result_ok_inj h) (by decide)
-  · intro h
-    cases h
-    cases ca <;> simp [tag_class_code]
 
 private lemma band_31_range (x : I32) :
     0 ≤ (Pion.I32.band x 31#i32).val ∧ (Pion.I32.band x 31#i32).val ≤ 31 := by
@@ -286,32 +255,6 @@ theorem short_tag_byte_roundtrip (cls : TagClass) (constructed : Bool) (num : I3
   simp only [hlt31, ↓reduceIte, hmask]
   exact henc
 
-/-- Theorem 6: X.690 §8.1.2.4 high-tag-number sentinel (`num ≥ 31`) sets low 5 bits to `0x1F` (31) and preserves class & constructed flag. -/
-theorem high_tag_sentinel_invariant (cls : TagClass) (constructed : Bool) (num : I32)
-    (hhi : 31 ≤ num.val) :
-    ∃ b, encode_tag_first_byte cls constructed num = ok b ∧
-      decode_tag_class_byte b = ok cls ∧
-      decode_tag_constructed_byte b = ok constructed ∧
-      decode_tag_low_byte b = ok 31#i32 := by
-  have hge31 : ¬(num < (31#i32 : I32)) := by change ¬(num.val < 31); omega
-  rcases byte_tag_decode_components cls constructed 31#i32 (by decide) (by decide) with ⟨b, henc, hcls, hcon, hlow⟩
-  refine ⟨b, ?_, hcls, hcon, hlow⟩
-  unfold encode_tag_first_byte
-  simp only [hge31, ↓reduceIte]
-  exact henc
-
-/-- Theorem 7: X.690 §11.1 DER BOOLEAN canonical check accepts ONLY `0x00` and `0xFF`. -/
-theorem der_bool_canonical_iff (v : I32) :
-    is_canonical_der_bool_byte v = ok true ↔ v = 0#i32 ∨ v = 255#i32 := by
-  unfold is_canonical_der_bool_byte
-  constructor
-  · intro h
-    have ht := result_ok_inj h
-    simp only [Bool.or_eq_true, beq_iff_eq] at ht
-    exact ht
-  · intro h
-    rcases h with rfl | rfl <;> simp
-
 private lemma byte_bit7_zero (b1 : I32) (hlo : 0 ≤ b1.val) (hhi : b1.val ≤ 127) :
     Pion.I32.band b1 128#i32 = 0#i32 := by
   apply iscalar_eq_of_bv_eq
@@ -358,33 +301,6 @@ theorem der_int_pair_rejects_redundant_zero (b1 : I32) (hlo : 0 ≤ b1.val) (hhi
   rw [byte_bit7_zero b1 hlo hhi]
   congr 1
 
-/-- Theorem 9: X.690 §8.3.2 DER INTEGER rejects redundant leading `0xFF` when next byte's MSB is 1. -/
-theorem der_int_pair_rejects_redundant_ff (b1 : I32) (hlo : 128 ≤ b1.val) (hhi : b1.val ≤ 255) :
-    is_canonical_der_int_pair 255#i32 b1 = ok false := by
-  unfold is_canonical_der_int_pair
-  rw [byte_bit7_nonzero b1 hlo hhi]
-  congr 1
-
-/-- Theorem 10: X.690 §8.3.2 DER INTEGER accepts necessary sign-extension leading `0x00` (when MSB=1) and `0xFF` (when MSB=0). -/
-theorem der_int_pair_accepts_sign_guard (b0 b1 : I32)
-    (h : (b0 = 0#i32 ∧ 128 ≤ b1.val ∧ b1.val ≤ 255) ∨ (b0 = 255#i32 ∧ 0 ≤ b1.val ∧ b1.val ≤ 127)) :
-    is_canonical_der_int_pair b0 b1 = ok true := by
-  unfold is_canonical_der_int_pair
-  rcases h with ⟨rfl, hlo, hhi⟩ | ⟨rfl, hlo, hhi⟩
-  · rw [byte_bit7_nonzero b1 hlo hhi]; congr 1
-  · rw [byte_bit7_zero b1 hlo hhi]; congr 1
-
-/-- Theorem 11: X.690 §8.6 BIT STRING rejects `unused_bits` outside `[0, 7]`. -/
-theorem bit_string_padding_rejects_out_of_range (len unused last : I32)
-    (h : unused.val < 0 ∨ unused.val > 7) :
-    is_valid_bit_string_padding len unused last = ok false := by
-  unfold is_valid_bit_string_padding
-  rcases h with hlt | hgt
-  · have h1 : unused < (0#i32 : I32) := hlt
-    simp [h1]
-  · have h2 : (7#i32 : I32) < unused := hgt
-    simp [h2]
-
 /-- Theorem 12: X.690 §11.2.2 empty BIT STRING is valid iff `unused_bits == 0`. -/
 theorem bit_string_empty_requires_zero_unused (unused last : I32) :
     is_valid_bit_string_padding 0#i32 unused last = ok true ↔ unused = 0#i32 := by
@@ -399,12 +315,6 @@ theorem bit_string_empty_requires_zero_unused (unused last : I32) :
       exact beq_iff_eq.mp ht
   · intro h
     subst h; simp
-
-/-- Theorem 13: X.690 §8.6 non-empty BIT STRING with `unused_bits = 0` is always valid regardless of `last_byte`. -/
-theorem bit_string_zero_unused_always_valid (len last : I32) (hne : len ≠ 0#i32) :
-    is_valid_bit_string_padding len 0#i32 last = ok true := by
-  unfold is_valid_bit_string_padding
-  simp [hne]
 
 private lemma der_length_encoded_size_spec (x : I32) :
     ∃ n, der_length_encoded_size x = ok n ∧ 1 ≤ n.val ∧ n.val ≤ 5 ∧

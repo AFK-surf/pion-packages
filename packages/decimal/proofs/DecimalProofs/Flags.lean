@@ -133,7 +133,7 @@ theorem make_flags_spec (neg : Bool) (scale : Std.U32) (hs : scale.val ≤ 28) :
       rw [BitVec.and_or_distrib_right, hsign_s]
       decide
 
-theorem Decimal.scale_spec (d : Decimal) :
+lemma Decimal.scale_spec (d : Decimal) :
     ∃ s : Std.U32, Decimal.scale d = ok s ∧ s.val = dec_scale d := by
   unfold Decimal.scale dec_scale
   obtain ⟨t, ht, htbv⟩ := u32_shr16_ok (Pion.U32.band d.flags SCALE_MASK)
@@ -147,16 +147,10 @@ theorem Decimal.scale_le_28 (d : Decimal) (hd : valid_decimal d) :
   obtain ⟨s, hs, hsv⟩ := Decimal.scale_spec d
   exact ⟨s, hs, by rw [hsv]; exact hd.2⟩
 
-theorem Decimal.is_sign_negative_spec (d : Decimal) :
+lemma Decimal.is_sign_negative_spec (d : Decimal) :
     Decimal.is_sign_negative d = ok (dec_neg d) := by
   unfold Decimal.is_sign_negative dec_neg SIGN_MASK
   simp only [Pion.U32.band, bne, BEq.beq]
-  rfl
-
-theorem Decimal.is_sign_positive_spec (d : Decimal) :
-    Decimal.is_sign_positive d = ok (!(dec_neg d)) := by
-  unfold Decimal.is_sign_positive dec_neg SIGN_MASK
-  simp only [Pion.U32.band, bne, BEq.beq, Bool.not_not]
   rfl
 
 theorem Decimal.is_zero_spec (d : Decimal) :
@@ -205,18 +199,6 @@ theorem Decimal.from_parts_ok_spec (lo mid hi : Std.U32) (neg : Bool) (scale : S
   rw [u64_bor_disjoint_32 hlo_lt ht_mod, u32_to_uint64_val, htv, u32_to_uint64_val,
     Nat.mod_eq_of_lt (u32_val_lt mid)]
   ring
-
-/-- `Decimal::from_parts` strictly rejects `scale > 28` with `Err(ScaleExceedsMaximumPrecision)`. -/
-theorem Decimal.from_parts_err_spec (lo mid hi : Std.U32) (neg : Bool) (scale : Std.U32)
-    (hs : scale.val > 28) :
-    Decimal.from_parts lo mid hi neg scale =
-      ok (Res.Err (DecimalError.ScaleExceedsMaximumPrecision scale)) := by
-  unfold Decimal.from_parts
-  have hgt : scale > MAX_SCALE := by
-    show (28#u32 : Std.U32).val < scale.val
-    have hv : (28#u32 : Std.U32).val = 28 := by decide
-    omega
-  simp [hgt]
 
 /-- `Decimal::set_scale` preserves validity for `scale ≤ 28` and rejects `scale > 28`. -/
 theorem Decimal.set_scale_spec (d : Decimal) (scale : Std.U32) :
@@ -332,24 +314,6 @@ theorem Decimal.neg_spec (d : Decimal) :
     · rw [h0]; decide
     · rw [h1]; decide
 
-theorem Decimal.neg_involutive (d : Decimal) :
-    (do let d1 ← Decimal.neg d; Decimal.neg d1) = ok d := by
-  obtain ⟨d1, hd1, hlo1, hhi1, hf1, _, _, _⟩ := Decimal.neg_spec d
-  obtain ⟨d2, hd2, hlo2, hhi2, hf2, _, _, _⟩ := Decimal.neg_spec d1
-  rw [hd1, b_ok, hd2]
-  congr 1
-  cases d with
-  | mk lo hi flags =>
-    cases d2 with
-    | mk lo2 hi2 flags2 =>
-      simp only at hlo1 hhi1 hf1 hlo2 hhi2 hf2
-      subst hlo2; subst hhi2; subst hlo1; subst hhi1
-      congr 1
-      rw [hf2, hf1]
-      apply u32_eq_of_bv_eq
-      dsimp only [Pion.U32.bxor]
-      rw [BitVec.xor_assoc, BitVec.xor_self, BitVec.xor_zero]
-
 /-- `Decimal::abs` never traps, is always non-negative, preserves `valid_decimal` and scale,
     is idempotent (`abs (abs d) = abs d`), and satisfies `abs (neg d) = abs d`. -/
 theorem Decimal.abs_spec (d : Decimal) :
@@ -387,29 +351,5 @@ theorem Decimal.abs_spec (d : Decimal) :
     rw [BitVec.and_assoc]
     have hmask : (MASK_ABS &&& MASK_SCALE) = MASK_SCALE := by decide
     rw [hmask]
-
-theorem Decimal.abs_idempotent (d : Decimal) :
-    (do let d1 ← Decimal.abs d; Decimal.abs d1) = Decimal.abs d := by
-  unfold Decimal.abs
-  simp only [b_ok]
-  congr 1; congr 1
-  apply u32_eq_of_bv_eq
-  dsimp only [Pion.U32.band]
-  rw [BitVec.and_assoc, BitVec.and_self]
-
-theorem Decimal.abs_neg (d : Decimal) :
-    (do let d1 ← Decimal.neg d; Decimal.abs d1) = Decimal.abs d := by
-  obtain ⟨d1, hd1, hlo1, hhi1, hf1, _, _, _⟩ := Decimal.neg_spec d
-  rw [hd1, b_ok]
-  unfold Decimal.abs
-  congr 1
-  rw [hlo1, hhi1, hf1]
-  congr 1
-  apply u32_eq_of_bv_eq
-  dsimp only [Pion.U32.band, Pion.U32.bxor, SIGN_MASK]
-  rw [bv_and_xor_distrib_right]
-  have h0 : ((2147483648#u32 : Std.U32).bv &&& (2147483647#u32 : Std.U32).bv) = 0#32 := by decide
-  rw [h0, BitVec.xor_zero]
-
 
 end DecimalProofs

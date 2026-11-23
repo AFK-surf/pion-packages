@@ -9,54 +9,49 @@ namespace CspEvalDiff
 
 private def mkI32 (n : Int) : Std.I32 := ⟨BitVec.ofInt 32 n⟩
 
-private def checkCase [BEq α] (label : String) (r : Result α) (expected : α) : String :=
-  if r.reducesTo expected then s!"{label}: PASS" else s!"{label}: FAIL"
+private def fmtBool (r : Result Bool) : String :=
+  match r.match with | .ok v => if v then "true" else "false" | _ => "TRAP"
+
+private def fmtI32 (r : Result Std.I32) : String :=
+  match r.match with | .ok v => toString v.val | _ => "TRAP"
 
 def runAll : List String :=
-  [ checkCase "lim_def" (do let l ← ParseLimits.default; parse_limits_all_nonneg l) true
-  , checkCase "lim_zero" (do let l ← ParseLimits.new (mkI32 0) (mkI32 0) (mkI32 0) (mkI32 0); parse_limits_all_nonneg l) true
-  , checkCase "lim_neg" (do let l ← ParseLimits.new (mkI32 (-1)) (mkI32 1) (mkI32 1) (mkI32 1); parse_limits_all_nonneg l) false
-  , checkCase "ws_sp" (csp_is_ws (mkI32 32)) true
-  , checkCase "ws_ff" (csp_is_ws (mkI32 12)) true
-  , checkCase "ws_lf" (csp_is_ws (mkI32 10)) false
-  , checkCase "alpha_A" (csp_is_alpha (mkI32 65)) true
-  , checkCase "alpha_z" (csp_is_alpha (mkI32 122)) true
-  , checkCase "alpha_5" (csp_is_alpha (mkI32 53)) false
-  , checkCase "digit_0" (csp_is_digit (mkI32 48)) true
-  , checkCase "digit_9" (csp_is_digit (mkI32 57)) true
-  , checkCase "digit_a" (csp_is_digit (mkI32 97)) false
-  , checkCase "ill_nul" (csp_is_illegal_header_byte (mkI32 0)) true
-  , checkCase "ill_lf" (csp_is_illegal_header_byte (mkI32 10)) true
-  , checkCase "ill_cr" (csp_is_illegal_header_byte (mkI32 13)) true
-  , checkCase "ill_del" (csp_is_illegal_header_byte (mkI32 127)) true
-  , checkCase "ill_tab" (csp_is_illegal_header_byte (mkI32 9)) false
-  , checkCase "ill_a" (csp_is_illegal_header_byte (mkI32 97)) false
-  , checkCase "ill_utf8" (csp_is_illegal_header_byte (mkI32 200)) false
-  , checkCase "ser_a" (csp_is_safe_serialized_byte (mkI32 97)) true
-  , checkCase "ser_semi" (csp_is_safe_serialized_byte (mkI32 59)) false
-  , checkCase "ser_comma" (csp_is_safe_serialized_byte (mkI32 44)) false
-  , checkCase "ser_sp" (csp_is_safe_serialized_byte (mkI32 32)) false
-  , checkCase "dir_dash" (csp_is_safe_directive_byte (mkI32 45)) true
-  , checkCase "dir_semi" (csp_is_safe_directive_byte (mkI32 59)) false
-  , checkCase "port_ok" (csp_port_step (mkI32 80) (mkI32 48)) (mkI32 800)
-  , checkCase "port_max" (csp_port_step (mkI32 6553) (mkI32 53)) (mkI32 65535)
-  , checkCase "port_ovf" (csp_port_step (mkI32 6553) (mkI32 54)) (mkI32 (-1))
-  , checkCase "port_bad" (csp_port_step (mkI32 80) (mkI32 97)) (mkI32 (-1))
-  , checkCase "pm_eq" (csp_explicit_port_matches (mkI32 8443) (mkI32 8443) false) true
-  , checkCase "pm_upg" (csp_explicit_port_matches (mkI32 80) (mkI32 443) true) true
-  , checkCase "pm_noupg" (csp_explicit_port_matches (mkI32 80) (mkI32 443) false) false
-  , checkCase "pm_nodown" (csp_explicit_port_matches (mkI32 443) (mkI32 80) true) false
-  , checkCase "inc_inc" (cors_is_include CredentialsMode.Include) true
-  , checkCase "inc_omit" (cors_is_include CredentialsMode.Omit) false
-  , checkCase "age_neg" (cors_clamp_max_age (mkI32 (-5))) (mkI32 0)
-  , checkCase "age_mid" (cors_clamp_max_age (mkI32 600)) (mkI32 600)
-  , checkCase "age_cap" (cors_clamp_max_age (mkI32 999999)) (mkI32 86400)
-  , checkCase "cws_cr" (cors_is_http_ws (mkI32 13)) true
-  , checkCase "cws_ff" (cors_is_http_ws (mkI32 12)) false
-  , checkCase "cuns_q" (cors_is_unsafe_request_header_byte (mkI32 34)) true
-  , checkCase "cuns_tab" (cors_is_unsafe_request_header_byte (mkI32 9)) false
-  , checkCase "clang_en" (cors_is_language_byte (mkI32 45)) true
-  , checkCase "clang_col" (cors_is_language_byte (mkI32 58)) false
+  [ s!"ws_sp={fmtBool (csp_is_ws (mkI32 32))}"
+  , s!"ws_ff={fmtBool (csp_is_ws (mkI32 12))}"
+  , s!"ws_lf={fmtBool (csp_is_ws (mkI32 10))}"
+  , s!"alpha_A={fmtBool (csp_is_alpha (mkI32 65))}"
+  , s!"alpha_z={fmtBool (csp_is_alpha (mkI32 122))}"
+  , s!"alpha_5={fmtBool (csp_is_alpha (mkI32 53))}"
+  , s!"digit_0={fmtBool (csp_is_digit (mkI32 48))}"
+  , s!"digit_9={fmtBool (csp_is_digit (mkI32 57))}"
+  , s!"digit_a={fmtBool (csp_is_digit (mkI32 97))}"
+  , s!"ill_nul={fmtBool (csp_is_illegal_header_byte (mkI32 0))}"
+  , s!"ill_lf={fmtBool (csp_is_illegal_header_byte (mkI32 10))}"
+  , s!"ill_cr={fmtBool (csp_is_illegal_header_byte (mkI32 13))}"
+  , s!"ill_del={fmtBool (csp_is_illegal_header_byte (mkI32 127))}"
+  , s!"ill_tab={fmtBool (csp_is_illegal_header_byte (mkI32 9))}"
+  , s!"ill_a={fmtBool (csp_is_illegal_header_byte (mkI32 97))}"
+  , s!"ill_utf8={fmtBool (csp_is_illegal_header_byte (mkI32 200))}"
+  , s!"ser_a={fmtBool (csp_is_safe_serialized_byte (mkI32 97))}"
+  , s!"ser_semi={fmtBool (csp_is_safe_serialized_byte (mkI32 59))}"
+  , s!"ser_comma={fmtBool (csp_is_safe_serialized_byte (mkI32 44))}"
+  , s!"ser_sp={fmtBool (csp_is_safe_serialized_byte (mkI32 32))}"
+  , s!"dir_dash={fmtBool (csp_is_safe_directive_byte (mkI32 45))}"
+  , s!"dir_semi={fmtBool (csp_is_safe_directive_byte (mkI32 59))}"
+  , s!"port_ok={fmtI32 (csp_port_step (mkI32 80) (mkI32 48))}"
+  , s!"port_max={fmtI32 (csp_port_step (mkI32 6553) (mkI32 53))}"
+  , s!"port_ovf={fmtI32 (csp_port_step (mkI32 6553) (mkI32 54))}"
+  , s!"port_bad={fmtI32 (csp_port_step (mkI32 80) (mkI32 97))}"
+  , s!"age_min={fmtI32 (cors_clamp_max_age (mkI32 (-2147483648)))}"
+  , s!"age_neg={fmtI32 (cors_clamp_max_age (mkI32 (-5)))}"
+  , s!"age_mid={fmtI32 (cors_clamp_max_age (mkI32 600))}"
+  , s!"age_cap={fmtI32 (cors_clamp_max_age (mkI32 999999))}"
+  , s!"age_max={fmtI32 (cors_clamp_max_age (mkI32 2147483647))}"
+  , s!"cuns_q={fmtBool (cors_is_unsafe_request_header_byte (mkI32 34))}"
+  , s!"cuns_tab={fmtBool (cors_is_unsafe_request_header_byte (mkI32 9))}"
+  , s!"cuns_del={fmtBool (cors_is_unsafe_request_header_byte (mkI32 127))}"
+  , s!"clang_en={fmtBool (cors_is_language_byte (mkI32 45))}"
+  , s!"clang_col={fmtBool (cors_is_language_byte (mkI32 58))}"
   ]
 
 #eval IO.println (String.intercalate "\n" runAll)

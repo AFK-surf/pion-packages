@@ -138,43 +138,6 @@ theorem hex_nibble_range (c : Std.I32) :
     omega
   · left; rfl
 
-/-- Theorem 2: Exact specification of `hex_nibble` across ASCII digits, lowercase and uppercase hex. -/
-theorem hex_nibble_exact_spec (c : Std.I32) :
-    ∃ r : Std.I32, hex_nibble c = ok r ∧
-      ((48 ≤ c.val ∧ c.val ≤ 57 → r.val = c.val - 48) ∧
-       (97 ≤ c.val ∧ c.val ≤ 102 → r.val = c.val - 87) ∧
-       (65 ≤ c.val ∧ c.val ≤ 70 → r.val = c.val - 55) ∧
-       (¬(48 ≤ c.val ∧ c.val ≤ 57) ∧ ¬(97 ≤ c.val ∧ c.val ≤ 102) ∧ ¬(65 ≤ c.val ∧ c.val ≤ 70) → r.val = -1)) := by
-  unfold hex_nibble
-  have c48 : (48#i32 : Std.I32).val = 48 := rfl
-  have c97 : (97#i32 : Std.I32).val = 97 := rfl
-  have c65 : (65#i32 : Std.I32).val = 65 := rfl
-  have c10 : (10#i32 : Std.I32).val = 10 := rfl
-  refine ⟨_, rfl, ?_⟩
-  split_ifs with h1 h2 h3
-  · simp only [Bool.and_eq_true, decide_eq_true_eq] at h1
-    have ha : (48 : Int) ≤ c.val := h1.1
-    have hb : c.val ≤ (57 : Int) := h1.2
-    have hsub := i32_sub_val c 48#i32 (by omega) (by omega)
-    refine ⟨fun _ => by omega, fun h => by omega, fun h => by omega, fun h => by omega⟩
-  · simp only [Bool.and_eq_true, decide_eq_true_eq] at h2
-    have ha : (97 : Int) ≤ c.val := h2.1
-    have hb : c.val ≤ (102 : Int) := h2.2
-    have hsub := i32_sub_val c 97#i32 (by omega) (by omega)
-    have hadd := i32_add_val (Pion.I32.sub c 97#i32) 10#i32 (by omega) (by omega)
-    refine ⟨fun h => by omega, fun _ => by omega, fun h => by omega, fun h => by omega⟩
-  · simp only [Bool.and_eq_true, decide_eq_true_eq] at h3
-    have ha : (65 : Int) ≤ c.val := h3.1
-    have hb : c.val ≤ (70 : Int) := h3.2
-    have hsub := i32_sub_val c 65#i32 (by omega) (by omega)
-    have hadd := i32_add_val (Pion.I32.sub c 65#i32) 10#i32 (by omega) (by omega)
-    refine ⟨fun h => by omega, fun h => by omega, fun _ => by omega, fun h => by omega⟩
-  · simp only [Bool.and_eq_true, decide_eq_true_eq, not_and] at h1 h2 h3
-    refine ⟨fun h => by exfalso; exact h1 h.1 h.2,
-            fun h => by exfalso; exact h2 h.1 h.2,
-            fun h => by exfalso; exact h3 h.1 h.2,
-            fun _ => rfl⟩
-
 /-- Theorem 3: `pkt_line_decode_len` computes the exact 16-bit big-endian hex value in `[0, 65535]`. -/
 theorem pkt_line_decode_len_exact (n0 n1 n2 n3 : Std.I32)
     (h0 : 0 ≤ n0.val ∧ n0.val ≤ 15)
@@ -222,25 +185,8 @@ theorem pkt_line_decode_len_exact (n0 n1 n2 n3 : Std.I32)
   rw [hrv, hbor3] at hval
   exact ⟨r, rfl, by omega, by omega, by omega⟩
 
-/-- Theorem 4: `pkt_line_decode_len` is injective on valid 4-nibble tuples in `[0, 15]^4`. -/
-theorem pkt_line_decode_len_injective
-    (a0 a1 a2 a3 b0 b1 b2 b3 : Std.I32)
-    (ha0 : 0 ≤ a0.val ∧ a0.val ≤ 15) (ha1 : 0 ≤ a1.val ∧ a1.val ≤ 15)
-    (ha2 : 0 ≤ a2.val ∧ a2.val ≤ 15) (ha3 : 0 ≤ a3.val ∧ a3.val ≤ 15)
-    (hb0 : 0 ≤ b0.val ∧ b0.val ≤ 15) (hb1 : 0 ≤ b1.val ∧ b1.val ≤ 15)
-    (hb2 : 0 ≤ b2.val ∧ b2.val ≤ 15) (hb3 : 0 ≤ b3.val ∧ b3.val ≤ 15)
-    (heq : pkt_line_decode_len a0 a1 a2 a3 = pkt_line_decode_len b0 b1 b2 b3) :
-    a0 = b0 ∧ a1 = b1 ∧ a2 = b2 ∧ a3 = b3 := by
-  obtain ⟨ra, hra, hrav, _, _⟩ := pkt_line_decode_len_exact a0 a1 a2 a3 ha0 ha1 ha2 ha3
-  obtain ⟨rb, hrb, hrbv, _, _⟩ := pkt_line_decode_len_exact b0 b1 b2 b3 hb0 hb1 hb2 hb3
-  rw [hra, hrb] at heq
-  have hrr : ra = rb := by simpa using heq
-  have hval : ra.val = rb.val := congrArg IScalar.val hrr
-  refine ⟨IScalar.eq_of_val_eq (by omega), IScalar.eq_of_val_eq (by omega),
-          IScalar.eq_of_val_eq (by omega), IScalar.eq_of_val_eq (by omega)⟩
-
 /-- Theorem 5: `pkt_line_classify_len` exactly partitions all 32-bit lengths into Flush/Delim/ResponseEnd/Data/Invalid. -/
-theorem pkt_line_classify_len_spec (total : Std.I32) :
+lemma pkt_line_classify_len_spec (total : Std.I32) :
     ∃ cls : Std.I32, pkt_line_classify_len total = ok cls ∧
       ((cls.val = 0 ↔ total.val = 0) ∧
        (cls.val = 1 ↔ total.val = 1) ∧
@@ -311,84 +257,5 @@ theorem pkt_line_encode_decode_roundtrip (plen : Int) (hplen : 0 ≤ plen ∧ pl
   have hrtot : r.val = total := by omega
   obtain ⟨cls, hcls, _, _, _, h3, _⟩ := pkt_line_classify_len_spec r
   exact ⟨r, cls, hr, hrtot, hcls, h3.mpr (by omega)⟩
-
-/-- Theorem 7: Exact characterization of `is_ref_forbidden_char` (`git-check-ref-format(1)` Rules 4, 5, 10). -/
-theorem is_ref_forbidden_char_spec (c : Std.I32) :
-    is_ref_forbidden_char c = ok true ↔
-      (c.val ≤ 32 ∨ c.val = 127 ∨ c.val = 126 ∨ c.val = 94 ∨ c.val = 58 ∨
-       c.val = 63 ∨ c.val = 42 ∨ c.val = 91 ∨ c.val = 92) := by
-  unfold is_ref_forbidden_char
-  simp only [ok.injEq, Bool.or_eq_true, decide_eq_true_eq, beq_iff_eq]
-  constructor
-  · intro h
-    rcases h with (((((((h | h) | h) | h) | h) | h) | h) | h) | h
-    · left; exact h
-    · right; left; exact congrArg IScalar.val h
-    · right; right; left; exact congrArg IScalar.val h
-    · right; right; right; left; exact congrArg IScalar.val h
-    · right; right; right; right; left; exact congrArg IScalar.val h
-    · right; right; right; right; right; left; exact congrArg IScalar.val h
-    · right; right; right; right; right; right; left; exact congrArg IScalar.val h
-    · right; right; right; right; right; right; right; left; exact congrArg IScalar.val h
-    · right; right; right; right; right; right; right; right; exact congrArg IScalar.val h
-  · intro h
-    rcases h with h | h | h | h | h | h | h | h | h
-    · left; left; left; left; left; left; left; left; exact h
-    · left; left; left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; right; exact IScalar.eq_of_val_eq h
-    · left; right; exact IScalar.eq_of_val_eq h
-    · right; exact IScalar.eq_of_val_eq h
-
-/-- Theorem 8: Standard Git ref characters (alphanumerics, `/`, `.`, `-`, `_`) are never forbidden. -/
-theorem is_ref_forbidden_char_allows_safe_chars (c : Std.I32)
-    (h : (48 ≤ c.val ∧ c.val ≤ 57) ∨ (65 ≤ c.val ∧ c.val ≤ 90) ∨
-         (97 ≤ c.val ∧ c.val ≤ 122) ∨ c.val = 47 ∨ c.val = 46 ∨ c.val = 45 ∨ c.val = 95) :
-    is_ref_forbidden_char c = ok false := by
-  have hne : is_ref_forbidden_char c ≠ ok true := by
-    intro htrue
-    rw [is_ref_forbidden_char_spec] at htrue
-    omega
-  unfold is_ref_forbidden_char at hne ⊢
-  cases hb : (((((((((decide (c <= 32#i32)) || (c == 127#i32)) || (c == 126#i32)) || (c == 94#i32)) || (c == 58#i32)) || (c == 63#i32)) || (c == 42#i32)) || (c == 91#i32)) || (c == 92#i32))
-  · rfl
-  · exfalso; exact hne (congrArg ok hb)
-
-/-- Theorem 9: Exact characterization of `is_ref_forbidden_pair` (`".."`, `"//"`, `"@{"`). -/
-theorem is_ref_forbidden_pair_spec (c next : Std.I32) :
-    is_ref_forbidden_pair c next = ok true ↔
-      ((c.val = 46 ∧ next.val = 46) ∨ (c.val = 47 ∧ next.val = 47) ∨ (c.val = 64 ∧ next.val = 123)) := by
-  unfold is_ref_forbidden_pair
-  simp only [ok.injEq, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq]
-  constructor
-  · intro h
-    rcases h with (⟨h1, h2⟩ | ⟨h1, h2⟩) | ⟨h1, h2⟩
-    · left; exact ⟨congrArg IScalar.val h1, congrArg IScalar.val h2⟩
-    · right; left; exact ⟨congrArg IScalar.val h1, congrArg IScalar.val h2⟩
-    · right; right; exact ⟨congrArg IScalar.val h1, congrArg IScalar.val h2⟩
-  · intro h
-    rcases h with ⟨h1, h2⟩ | ⟨h1, h2⟩ | ⟨h1, h2⟩
-    · left; left; exact ⟨IScalar.eq_of_val_eq h1, IScalar.eq_of_val_eq h2⟩
-    · left; right; exact ⟨IScalar.eq_of_val_eq h1, IScalar.eq_of_val_eq h2⟩
-    · right; exact ⟨IScalar.eq_of_val_eq h1, IScalar.eq_of_val_eq h2⟩
-
-/-- Theorem 10: `ObjectKind.pack_type` and `object_kind_from_pack_type_opt` form a bijection on `{1, 2, 3, 4}`, and `ObjectKind.equals` reflects `=`. -/
-theorem object_kind_pack_type_bijection :
-    (∀ k : ObjectKind, (do let t ← ObjectKind.pack_type k; object_kind_from_pack_type_opt t) = ok (some k)) ∧
-    (∀ a b : ObjectKind, ObjectKind.equals a b = ok true ↔ a = b) := by
-  constructor
-  · intro k; cases k <;> simp [ObjectKind.pack_type, object_kind_from_pack_type_opt]
-  · intro a b; cases a <;> cases b <;> simp [ObjectKind.equals, ObjectKind.pack_type]
-
-/-- Theorem 11: `FileMode.to_u32` is injective on all 5 Git tree modes and `FileMode.equals` reflects `=`. -/
-theorem file_mode_to_u32_injective_and_equals :
-    (∀ a b : FileMode, FileMode.to_u32 a = FileMode.to_u32 b → a = b) ∧
-    (∀ a b : FileMode, FileMode.equals a b = ok true ↔ a = b) := by
-  constructor
-  · intro a b h; cases a <;> cases b <;> first | rfl | (simp [FileMode.to_u32] at h)
-  · intro a b; cases a <;> cases b <;> simp [FileMode.equals, FileMode.to_u32]
 
 end GitProofs

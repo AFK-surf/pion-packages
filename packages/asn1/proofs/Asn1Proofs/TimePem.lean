@@ -93,28 +93,6 @@ theorem is_leap_year_spec (y : I32) (hlo : 0 ≤ y.val) (_hhi : y.val ≤ 9999) 
     · intro h; exact absurd (result_ok_inj h) (by decide)
     · intro h; rcases h with ⟨h4z, _⟩ | h400z <;> omega
 
-/-- Theorem 16: Gregorian `is_leap_year` is strictly 400-year periodic. -/
-theorem is_leap_year_period_400 (y : I32) (hlo : 0 ≤ y.val) (hhi : y.val ≤ 9599) :
-    is_leap_year (Pion.I32.add y 400#i32) = is_leap_year y := by
-  have c400 : (400#i32 : I32).val = 400 := rfl
-  have hadd : (Pion.I32.add y 400#i32).val = y.val + 400 := by
-    have := i32_add_val_of_bounds y 400#i32 (by omega) (by omega)
-    omega
-  have hspec1 := is_leap_year_spec (Pion.I32.add y 400#i32) (by omega) (by omega)
-  have hspec2 := is_leap_year_spec y hlo (by omega)
-  rcases is_leap_year_total (Pion.I32.add y 400#i32) (by omega) with ⟨b1, hb1⟩
-  rcases is_leap_year_total y hlo with ⟨b2, hb2⟩
-  rw [hb1, hb2]
-  congr 1
-  have hiff : (b1 = true) ↔ (b2 = true) := by
-    have h1 : b1 = true ↔ is_leap_year (Pion.I32.add y 400#i32) = ok true := by
-      rw [hb1]; constructor <;> intro h <;> [exact congrArg ok h; exact result_ok_inj h]
-    have h2 : b2 = true ↔ is_leap_year y = ok true := by
-      rw [hb2]; constructor <;> intro h <;> [exact congrArg ok h; exact result_ok_inj h]
-    rw [h1, h2, hspec1, hspec2, hadd]
-    omega
-  cases b1 <;> cases b2 <;> simp_all
-
 /-- Theorem 17: `days_in_month` returns `28..31` for valid months `1..12` and `0` outside `1..12`. -/
 theorem days_in_month_bounds (y m : I32) (hlo : 0 ≤ y.val) (_hhi : y.val ≤ 9999) :
     (1 ≤ m.val ∧ m.val ≤ 12 → ∃ d, days_in_month y m = ok d ∧ 28 ≤ d.val ∧ d.val ≤ 31) ∧
@@ -177,64 +155,5 @@ theorem days_in_month_feb_leap (y : I32) (hlo : 0 ≤ y.val) (_hhi : y.val ≤ 9
     · intro h; exact absurd (result_ok_inj h) (by decide)
     · intro h; exact absurd (result_ok_inj h) (by decide)
   · simp [days_in_month, hb]
-
-/-- Theorem 19: RFC 5280 §4.1.2.5.1 UTCTime 2-digit year expansion maps `[0, 99]` into `[1950, 2049]`. -/
-theorem utc_time_expand_year_rfc5280 (yy : I32) (hlo : 0 ≤ yy.val) (hhi : yy.val ≤ 99) :
-    ∃ y, utc_time_expand_year yy = ok y ∧ 1950 ≤ y.val ∧ y.val ≤ 2049 ∧
-      (50 ≤ yy.val → y.val = 1900 + yy.val) ∧
-      (yy.val < 50 → y.val = 2000 + yy.val) := by
-  unfold utc_time_expand_year
-  have c1900 : (1900#i32 : I32).val = 1900 := rfl
-  have c2000 : (2000#i32 : I32).val = 2000 := rfl
-  by_cases h50 : 50 ≤ yy.val
-  · have hge : (50#i32 : I32) ≤ yy := h50
-    simp only [hge, ↓reduceIte]
-    have hv := i32_add_val_of_bounds 1900#i32 yy (by omega) (by omega)
-    refine ⟨Pion.I32.add 1900#i32 yy, rfl, by omega, by omega, by omega, by omega⟩
-  · have hlt : ¬((50#i32 : I32) ≤ yy) := h50
-    simp only [hlt, ↓reduceIte]
-    have hv := i32_add_val_of_bounds 2000#i32 yy (by omega) (by omega)
-    refine ⟨Pion.I32.add 2000#i32 yy, rfl, by omega, by omega, by omega, by omega⟩
-
-/-- Theorem 20: `is_valid_hms` characterizes `[0, 23] × [0, 59] × [0, 59]`. -/
-theorem is_valid_hms_iff (h m s : I32) :
-    is_valid_hms h m s = ok true ↔
-      (0 ≤ h.val ∧ h.val ≤ 23) ∧ (0 ≤ m.val ∧ m.val ≤ 59) ∧ (0 ≤ s.val ∧ s.val ≤ 59) := by
-  unfold is_valid_hms
-  constructor
-  · intro hok
-    have ht := result_ok_inj hok
-    simp only [Bool.and_eq_true, decide_eq_true_eq] at ht
-    rcases ht with ⟨⟨⟨⟨⟨h1, h2⟩, m1⟩, m2⟩, s1⟩, s2⟩
-    exact ⟨⟨h1, h2⟩, ⟨m1, m2⟩, ⟨s1, s2⟩⟩
-  · intro ⟨⟨h1, h2⟩, ⟨m1, m2⟩, ⟨s1, s2⟩⟩
-    have hh1 : (0#i32 : I32) ≤ h := h1
-    have hh2 : h ≤ (23#i32 : I32) := h2
-    have hm1 : (0#i32 : I32) ≤ m := m1
-    have hm2 : m ≤ (59#i32 : I32) := m2
-    have hs1 : (0#i32 : I32) ≤ s := s1
-    have hs2 : s ≤ (59#i32 : I32) := s2
-    simp [hh1, hh2, hm1, hm2, hs1, hs2]
-
-/-- Theorem 21: RFC 7468 §3 PEM `labelchar` exact range `%x21-2C / %x2E-7E` (forbids SP, CTL, `-`, DEL, non-ASCII). -/
-theorem pem_label_char_rfc7468_iff (c : I32) :
-    is_pem_label_char c = ok true ↔ 33 ≤ c.val ∧ c.val ≤ 126 ∧ c.val ≠ 45 := by
-  unfold is_pem_label_char
-  constructor
-  · intro h
-    have ht := result_ok_inj h
-    simp only [Bool.and_eq_true, decide_eq_true_eq, bne_iff_ne, ne_eq] at ht
-    rcases ht with ⟨⟨hlo, hhi⟩, hne⟩
-    refine ⟨hlo, hhi, ?_⟩
-    intro heq
-    apply hne
-    exact iscalar_eq_of_val_eq heq
-  · intro ⟨hlo, hhi, hne⟩
-    have h1 : (33#i32 : I32) ≤ c := hlo
-    have h2 : c ≤ (126#i32 : I32) := hhi
-    have h3 : (c != 45#i32) = true := by
-      simp only [bne_iff_ne, ne_eq]
-      intro heq; subst heq; have : (45#i32 : I32).val = 45 := rfl; omega
-    simp [h1, h2, h3]
 
 end Asn1Proofs

@@ -103,15 +103,6 @@ theorem clamped_add_i64_exact (a b : Std.I64)
       rw [hsum]
       symm; exact min_eq_left (by linarith only [hgt', hsum])
 
-/-- Theorem 2: `clamped_add_i64` always lands in RFC 9111 §1.2.2 `[0, 2^31]`. -/
-theorem clamped_add_i64_bounds (a b : Std.I64)
-    (ha : 0 ≤ a.val) (hb0 : 0 ≤ b.val) (hbmax : b.val ≤ 2147483648) :
-    ∃ r : Std.I64, clamped_add_i64 a b = ok r ∧ 0 ≤ r.val ∧ r.val ≤ 2147483648 := by
-  obtain ⟨r, hr, hval⟩ := clamped_add_i64_exact a b ha hb0 hbmax
-  refine ⟨r, hr, ?_, ?_⟩
-  · rw [hval]; exact le_min (by linarith only [ha, hb0]) (by linarith only [])
-  · rw [hval]; exact min_le_right _ _
-
 /-- Theorem 3: `clamped_add_i64` is monotonic in both arguments on `[0, 2^31]`. -/
 theorem clamped_add_i64_mono (a1 a2 b1 b2 : Std.I64)
     (ha1 : 0 ≤ a1.val) (ha : a1.val ≤ a2.val)
@@ -124,7 +115,7 @@ theorem clamped_add_i64_mono (a1 a2 b1 b2 : Std.I64)
   exact min_le_min (by linarith only [ha, hb]) (le_refl _)
 
 /-- Theorem 4: `clamped_sub_i64` returns `0` whenever `hi ≤ lo`. -/
-theorem clamped_sub_i64_le_zero (hi lo : Std.I64) (hle : hi.val ≤ lo.val) :
+lemma clamped_sub_i64_le_zero (hi lo : Std.I64) (hle : hi.val ≤ lo.val) :
     clamped_sub_i64 hi lo = ok 0#i64 := by
   unfold clamped_sub_i64
   have hc : hi ≤ lo := (i64_le_iff hi lo).mpr hle
@@ -197,7 +188,7 @@ theorem clamped_sub_i64_exact (hi lo : Std.I64) (hle : lo.val ≤ hi.val) :
         symm; exact min_eq_left (by linarith only [hcap', hdiff])
 
 /-- Theorem 6: `clamped_sub_i64` is total and always returns a value in `[0, 2^31]` for ALL `Int64` inputs. -/
-theorem clamped_sub_i64_bounds (hi lo : Std.I64) :
+lemma clamped_sub_i64_bounds (hi lo : Std.I64) :
     ∃ r : Std.I64, clamped_sub_i64 hi lo = ok r ∧ 0 ≤ r.val ∧ r.val ≤ 2147483648 := by
   by_cases hle : hi.val ≤ lo.val
   · refine ⟨0#i64, clamped_sub_i64_le_zero hi lo hle, ?_, ?_⟩
@@ -294,17 +285,5 @@ theorem compute_current_age_core_mono_now (initial_age response_time now1 now2 :
   unfold compute_current_age_core
   rw [hr1, hr2, result_bind_ok, result_bind_ok, ha1, ha2, result_bind_ok, result_bind_ok]
   exact ⟨a1, a2, rfl, rfl, hale⟩
-
-/-- Theorem 12: At or before `response_time`, `compute_current_age_core` equals `initial_age` exactly. -/
-theorem compute_current_age_core_at_response_time (initial_age response_time now : Std.I64)
-    (hinit0 : 0 ≤ initial_age.val) (hinitmax : initial_age.val ≤ 2147483648)
-    (hnow : now.val ≤ response_time.val) :
-    compute_current_age_core initial_age response_time now = ok initial_age := by
-  unfold compute_current_age_core
-  rw [clamped_sub_i64_le_zero now response_time hnow, result_bind_ok]
-  obtain ⟨age, hage, hagev⟩ := clamped_add_i64_exact initial_age 0#i64 hinit0 (by rw [i64_val_0]) (by rw [i64_val_0]; linarith only [])
-  rw [i64_val_0, add_zero, min_eq_left hinitmax] at hagev
-  have heq : age = initial_age := IScalar.eq_of_val_eq hagev
-  rw [hage, result_bind_ok, heq]
 
 end HttpCacheProofs

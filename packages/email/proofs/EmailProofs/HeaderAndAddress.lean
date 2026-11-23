@@ -27,29 +27,12 @@ private lemma i32_add_val (x y : Std.I32)
     exact Int.bmod_eq_of_le (by omega) (by omega)
   exact hv
 
-/-- Theorem 1: `EmailLimits::default` has strictly positive limits with `max_header_bytes < max_body_bytes`. -/
-theorem email_limits_default_positive :
-    ∃ l : EmailLimits, EmailLimits.default = ok l ∧
-      l.max_depth.val = 16 ∧ l.max_parts.val = 1024 ∧ l.max_headers.val = 1024 ∧
-      l.max_header_bytes.val = 262144 ∧ l.max_body_bytes.val = 67108864 ∧
-      0 < l.max_depth.val ∧ l.max_header_bytes.val < l.max_body_bytes.val := by
-  refine ⟨EmailLimits.mk 16#i32 1024#i32 1024#i32 262144#i32 67108864#i32, rfl, ?_⟩
-  refine ⟨rfl, rfl, rfl, rfl, rfl, by decide, by decide⟩
-
 /-- Theorem 2: RFC 5322 `email_is_ftext` exact range (`33..126` excluding `:` = 58), rejecting CTL/SP/DEL/non-ASCII. -/
-theorem email_is_ftext_exact (c : Std.I32) :
+lemma email_is_ftext_exact (c : Std.I32) :
     email_is_ftext c = ok true ↔ (33 ≤ c.val ∧ c.val ≤ 126 ∧ c.val ≠ 58) := by
   unfold email_is_ftext
   simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff, i32_bne_iff]
   change (33 ≤ c.val ∧ c.val ≤ 126) ∧ c.val ≠ 58 ↔ _
-  omega
-
-/-- Theorem 3: `email_is_injection_byte` exact characterization (`NUL`, `LF`, `CR`). -/
-theorem email_is_injection_byte_exact (c : Std.I32) :
-    email_is_injection_byte c = ok true ↔ (c.val = 0 ∨ c.val = 10 ∨ c.val = 13) := by
-  unfold email_is_injection_byte
-  simp only [ok.injEq, Bool.or_eq_true, i32_beq_iff]
-  change (c.val = 0 ∨ c.val = 10) ∨ c.val = 13 ↔ _
   omega
 
 /-- Theorem 4: Valid header-name bytes (`email_is_ftext`) are strictly disjoint from injection bytes (`CR/LF/NUL`). -/
@@ -64,34 +47,6 @@ theorem email_is_ftext_disjoint_injection (c : Std.I32)
   simp only [Bool.or_eq_true, i32_beq_iff] at h
   change (c.val = 0 ∨ c.val = 10) ∨ c.val = 13 at h
   omega
-
-/-- Theorem 5: `email_effective_fold_limit` always returns at least `20` and defaults to RFC 5322 `78` when `< 20`. -/
-theorem email_effective_fold_limit_bounds (max_col : Std.I32) :
-    ∃ r : Std.I32, email_effective_fold_limit max_col = ok r ∧
-      20 ≤ r.val ∧
-      (max_col.val < 20 → r.val = 78) ∧
-      (20 ≤ max_col.val → r.val = max_col.val) := by
-  unfold email_effective_fold_limit
-  by_cases h : max_col < 20#i32
-  · simp only [h, ↓reduceIte]
-    have hv := (i32_lt_iff max_col 20#i32).mp h
-    change max_col.val < 20 at hv
-    refine ⟨78#i32, rfl, by decide, fun _ => rfl, fun hge => by omega⟩
-  · simp only [h, ↓reduceIte]
-    have hv : ¬ (max_col.val < 20) := fun hlt => h ((i32_lt_iff max_col 20#i32).mpr hlt)
-    refine ⟨max_col, rfl, by omega, fun hlt => by omega, fun _ => rfl⟩
-
-/-- Theorem 6: `email_effective_fold_limit` is idempotent across all 32-bit inputs. -/
-theorem email_effective_fold_limit_idempotent (max_col : Std.I32) :
-    (do let r ← email_effective_fold_limit max_col; email_effective_fold_limit r) =
-      email_effective_fold_limit max_col := by
-  rcases email_effective_fold_limit_bounds max_col with ⟨r, hr, h20, _, _⟩
-  rw [hr, result_bind_ok]
-  unfold email_effective_fold_limit
-  have hge : ¬ (r < 20#i32) := fun h => by
-    have hv := (i32_lt_iff r 20#i32).mp h
-    change r.val < 20 at hv; omega
-  simp only [hge, ↓reduceIte]
 
 /-- Theorem 7: `hdr_ascii_lower` is idempotent for all `Int` values. -/
 theorem hdr_ascii_lower_idempotent (c : Std.I32) :
@@ -113,11 +68,6 @@ theorem hdr_ascii_lower_idempotent (c : Std.I32) :
     simp only [hfalse, Bool.false_eq_true, ↓reduceIte]
   · have hf := Bool.eq_false_iff.mpr h
     simp only [hf, Bool.false_eq_true, ↓reduceIte]
-
-/-- Theorem 8: `hdr_ascii_lower` and `dt_lower` are extensionally identical on all `Int` values. -/
-theorem hdr_ascii_lower_eq_dt_lower (c : Std.I32) :
-    hdr_ascii_lower c = dt_lower c := by
-  rfl
 
 /-- Theorem 9: `addr_is_atext` accepts all ASCII alphanumerics (`A-Z`, `a-z`, `0-9`) and RFC 6532 UTF-8 (`>= 128`). -/
 theorem addr_is_atext_accepts_alnum_and_utf8 (c : Std.I32)

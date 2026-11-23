@@ -39,7 +39,7 @@ theorem civil_from_days_eq (z_in : Std.I64)
        else (do let __t_1 ← Pion.I64.div (Pion.I64.sub (Pion.I64.add z_in 719468#i64) 146096#i64) 146097#i64; ok __t_1)) = ok era := by
     change (if z >= 0#i64 then (do let __t ← Pion.I64.div z 146097#i64; ok __t)
             else (do let __t_1 ← Pion.I64.div (Pion.I64.sub z 146096#i64) 146097#i64; ok __t_1)) = ok era
-    rw [if_pos hz_ge0, hera, b_ok]
+    rw [ite_eq_left hz_ge0, hera, b_ok]
   dsimp only
   rw [hera_step, b_ok]
   have hera_ediv : era.val = z.val / 146097 := by
@@ -165,17 +165,17 @@ theorem civil_from_days_eq (z_in : Std.I64)
     dsimp only [m]
     by_cases h : mp.val < 10
     · have h' : mp < 10#i32 := h
-      rw [if_pos h', if_pos h, i32_add_val]; all_goals (have hc : (3#i32).val = 3 := (by change (BitVec.ofInt 32 3).toInt = 3; rw [BitVec.toInt_ofInt]; norm_num); rw [hc]; try (clear * - hmp_b; omega))
+      rw [ite_eq_left h', ite_eq_left h, i32_add_val]; all_goals (have hc : (3#i32).val = 3 := (by change (BitVec.ofInt 32 3).toInt = 3; rw [BitVec.toInt_ofInt]; norm_num); rw [hc]; try (clear * - hmp_b; omega))
     · have h' : ¬ (mp < 10#i32) := h
-      rw [if_neg h', if_neg h, i32_sub_val]; all_goals (have hc : (9#i32).val = 9 := (by change (BitVec.ofInt 32 9).toInt = 9; rw [BitVec.toInt_ofInt]; norm_num); rw [hc]; try (clear * - hmp_b; omega))
+      rw [ite_eq_right h', ite_eq_right h, i32_sub_val]; all_goals (have hc : (9#i32).val = 9 := (by change (BitVec.ofInt 32 9).toInt = 9; rw [BitVec.toInt_ofInt]; norm_num); rw [hc]; try (clear * - hmp_b; omega))
   set yr : Std.I32 := if m <= 2#i32 then Pion.I32.add y 1#i32 else y
   have hyr_val : yr.val = if m.val ≤ 2 then y.val + 1 else y.val := by
     dsimp only [yr]
     by_cases h : m.val ≤ 2
     · have h' : m <= 2#i32 := h
-      rw [if_pos h', if_pos h, i32_add_val]; all_goals (have hc : (1#i32).val = 1 := (by change (BitVec.ofInt 32 1).toInt = 1; rw [BitVec.toInt_ofInt]; norm_num); rw [hc]; try (clear * - hy_val hyoe_b hera_b; omega))
+      rw [ite_eq_left h', ite_eq_left h, i32_add_val]; all_goals (have hc : (1#i32).val = 1 := (by change (BitVec.ofInt 32 1).toInt = 1; rw [BitVec.toInt_ofInt]; norm_num); rw [hc]; try (clear * - hy_val hyoe_b hera_b; omega))
     · have h' : ¬ (m <= 2#i32) := h
-      rw [if_neg h', if_neg h]
+      rw [ite_eq_right h', ite_eq_right h]
   refine ⟨yr, m, d, rfl, ?_⟩
   have hyoe_unf : yoe.val = (doe.val - doe.val / 1460 + doe.val / 36524 - doe.val / 146096) / 365 := hyoe_eq_math
   refine Prod.ext ?_ (Prod.ext ?_ ?_)
@@ -183,8 +183,8 @@ theorem civil_from_days_eq (z_in : Std.I64)
   · rw [hm_val, hmp_ediv, hdoy_val, hyoe_unf, hdoe_val, hera_ediv, hz_val]
   · rw [hd_val, hmp_ediv, hdoy_val, hyoe_unf, hdoe_val, hera_ediv, hz_val]
 
-theorem civil_days_roundtrip_math (year month day : Int)
-    (hy1 : 1 ≤ year) (hy2 : year ≤ 9999)
+lemma civil_days_roundtrip_math (year month day : Int)
+    (_hy1 : 1 ≤ year) (_hy2 : year ≤ 9999)
     (hm1 : 1 ≤ month) (hm2 : month ≤ 12)
     (hd1 : 1 ≤ day) (hd2 : day ≤ daysInMonthMath year month) :
     civilFromDaysMath (daysFromCivilMath year month day) = (year, month, day) := by
@@ -262,10 +262,10 @@ theorem civil_days_roundtrip_math (year month day : Int)
     dsimp only [m_adj]; by_cases h : month > 2 <;> simp [h] <;> omega
   simp only [hz_eq, hera_back, hdoe_back, hyoe_back, hdoy_back, hmp_back, hm_back, Prod.mk.injEq]
   refine ⟨?_, ?_⟩
-  · dsimp only [yoe, era, y]; by_cases h : month ≤ 2 <;> simp [h] <;> omega
+  · dsimp only [yoe, era, y]; by_cases h : month ≤ 2 <;> simp [h]
   · exact ⟨trivial, by dsimp only [doy]; ring⟩
 
-theorem days_civil_roundtrip_math (z_in : Int)
+lemma days_civil_roundtrip_math (z_in : Int)
     (hz1 : -719162 ≤ z_in) (hz2 : z_in ≤ 2932896) :
     let (yr, m, d) := civilFromDaysMath z_in
     1 ≤ yr ∧ yr ≤ 9999 ∧ 1 ≤ m ∧ m ≤ 12 ∧ 1 ≤ d ∧ d ≤ daysInMonthMath yr m ∧
@@ -331,7 +331,7 @@ theorem days_civil_roundtrip_math (z_in : Int)
     rw [hdoe_eq]; dsimp only [doe, z]; omega
   exact ⟨hyr_b.1, hyr_b.2, hm1, hm12, hd1, hd2, hdfc⟩
 
-theorem min_unix_secs_val : MIN_UNIX_SECS.val = -62135596800 := by
+lemma min_unix_secs_val : MIN_UNIX_SECS.val = -62135596800 := by
   unfold MIN_UNIX_SECS
   have h0 : (0#i64).val = 0 := by
     change (BitVec.ofInt 64 0).toInt = 0; rw [BitVec.toInt_ofInt]; norm_num
@@ -342,7 +342,7 @@ theorem min_unix_secs_val : MIN_UNIX_SECS.val = -62135596800 := by
   · rw [h0, h1]; omega
   · rw [h0, h1]; omega
 
-theorem max_unix_secs_val : MAX_UNIX_SECS.val = 253402300799 := by
+lemma max_unix_secs_val : MAX_UNIX_SECS.val = 253402300799 := by
   unfold MAX_UNIX_SECS
   change (BitVec.ofInt 64 253402300799).toInt = 253402300799
   rw [BitVec.toInt_ofInt]; norm_num
@@ -360,10 +360,10 @@ theorem from_unix_secs_rejects_out_of_range (secs : Std.I64)
     · have h2 : secs > MAX_UNIX_SECS := by
         change MAX_UNIX_SECS.val < secs.val; rw [max_unix_secs_val]; exact hhi
       rw [decide_eq_true h2, Bool.or_true]
-  rw [if_pos hcond]
+  rw [ite_eq_left hcond]
   exact ⟨_, rfl⟩
 
-theorem unix_combine_val (dfc : Std.I64) (h m s : Std.I32)
+lemma unix_combine_val (dfc : Std.I64) (h m s : Std.I32)
     (hdlo : -719162 ≤ dfc.val) (hdhi : dfc.val ≤ 2932896)
     (hh1 : 0 ≤ h.val) (hh2 : h.val ≤ 23)
     (hm1 : 0 ≤ m.val) (hm2 : m.val ≤ 59)
@@ -388,7 +388,7 @@ theorem unix_combine_val (dfc : Std.I64) (h m s : Std.I32)
   rw [i64_add_val, h6, h5] <;> omega
 
 /-- Exact evaluation and validity of `DateTime.from_unix_secs` on `[-62135596800, 253402300799]`. -/
-theorem from_unix_secs_in_range_spec (secs : Std.I64)
+lemma from_unix_secs_in_range_spec (secs : Std.I64)
     (hlo : -62135596800 ≤ secs.val) (hhi : secs.val ≤ 253402300799) :
     ∃ dt : DateTime, DateTime.from_unix_secs secs = ok (Pion.Res.Ok dt) ∧
       DateTime.is_valid dt = ok true ∧
@@ -400,19 +400,19 @@ theorem from_unix_secs_in_range_spec (secs : Std.I64)
     have h2 : ¬ secs > MAX_UNIX_SECS := by
       change ¬ MAX_UNIX_SECS.val < secs.val; rw [max_unix_secs_val]; omega
     rw [decide_eq_false h1, decide_eq_false h2]; rfl
-  rw [if_neg (by rw [hcond]; decide)]
+  rw [ite_eq_right (by rw [hcond]; decide)]
   -- Compute Euclidean `days = secs / 86400`
   have hdays_step : ∃ days : Std.I64,
       (if secs >= 0#i64 then do let t ← Pion.I64.div secs 86400#i64; ok t
        else do let t ← Pion.I64.div (Pion.I64.sub secs 86399#i64) 86400#i64; ok t) = ok days ∧
       days.val = secs.val / 86400 := by
     by_cases h0 : secs >= 0#i64
-    · rw [if_pos h0]
+    · rw [ite_eq_left h0]
       obtain ⟨d, hd, hd_val⟩ := i64_div_pos_ok secs 86400#i64 (by rw [i64_86400_val]; omega)
       rw [hd, b_ok]
       have hge0 : 0 ≤ secs.val := h0
       exact ⟨d, rfl, by rw [hd_val, i64_86400_val]; exact tdiv_eq_ediv_of_nonneg _ 86400 hge0 (by omega)⟩
-    · rw [if_neg h0]
+    · rw [ite_eq_right h0]
       have hlt0 : secs.val < 0 := by
         have : ¬ (0 : Int) ≤ secs.val := h0; omega
       have hsub : (Pion.I64.sub secs 86399#i64).val = secs.val - 86399 := by
@@ -470,7 +470,7 @@ theorem from_unix_secs_in_range_spec (secs : Std.I64)
   set dt : DateTime := DateTime.mk yr m d hour minute second
   refine ⟨dt, ?_, ?_, ?_⟩
   · change (if (decide (yr < MIN_YEAR) || decide (yr > MAX_YEAR)) = true then _ else ok (Pion.Res.Ok dt)) = ok (Pion.Res.Ok dt)
-    rw [if_neg (by rw [hy_ok]; decide)]
+    rw [ite_eq_right (by rw [hy_ok]; decide)]
   · rw [datetime_is_valid_spec]
     dsimp only [dt]
     congr 1
@@ -558,7 +558,7 @@ theorem to_from_unix_secs_roundtrip (dt : DateTime) (hv : DateTime.is_valid dt =
   rwa [hdt_eq] at hfrom
 
 /-- `daysFromCivilMath` is strictly monotone in lexicographic `(year, month, day)`. -/
-theorem daysFromCivilMath_strict_mono {y1 m1 d1 y2 m2 d2 : Int}
+lemma daysFromCivilMath_strict_mono {y1 m1 d1 y2 m2 d2 : Int}
     (hy1 : 1 ≤ y1) (hy1' : y1 ≤ 9999) (hm1 : 1 ≤ m1) (hm1' : m1 ≤ 12) (hd1 : 1 ≤ d1) (hd1' : d1 ≤ daysInMonthMath y1 m1)
     (hy2 : 1 ≤ y2) (hy2' : y2 ≤ 9999) (hm2 : 1 ≤ m2) (hm2' : m2 ≤ 12) (hd2 : 1 ≤ d2) (hd2' : d2 ≤ daysInMonthMath y2 m2)
     (hlt : y1 < y2 ∨ (y1 = y2 ∧ m1 < m2) ∨ (y1 = y2 ∧ m1 = m2 ∧ d1 < d2)) :

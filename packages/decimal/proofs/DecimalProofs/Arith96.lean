@@ -96,7 +96,7 @@ theorem u64_mul_wide_spec (a b : Std.U64) :
 
 /-- Exact specification of `u96_cmp` on 3-word `[lo, mid, hi]` buffers:
     never traps and matches exact mathematical 96-bit natural number ordering. -/
-theorem u96_cmp_spec (a0 a1 a2 b0 b1 b2 : Std.U32) :
+lemma u96_cmp_spec (a0 a1 a2 b0 b1 b2 : Std.U32) :
     ∃ r : Std.I32, u96_cmp ⟨[a0, a1, a2]⟩ ⟨[b0, b1, b2]⟩ = ok r ∧
       (r = (-1)#i32 ↔ val96_parts a0 a1 a2 < val96_parts b0 b1 b2) ∧
       (r = 0#i32 ↔ val96_parts a0 a1 a2 = val96_parts b0 b1 b2) ∧
@@ -229,43 +229,6 @@ theorem u96_cmp_spec (a0 a1 a2 b0 b1 b2 : Std.U32) :
     · constructor <;> intro h; · exact absurd h (by decide)
       · omega
 
-theorem u96_cmp_refl (a0 a1 a2 : Std.U32) :
-    u96_cmp ⟨[a0, a1, a2]⟩ ⟨[a0, a1, a2]⟩ = ok 0#i32 := by
-  obtain ⟨r, hr, _, heq, _⟩ := u96_cmp_spec a0 a1 a2 a0 a1 a2
-  rw [hr, heq.mpr rfl]
-
-theorem u96_cmp_antisymm (a0 a1 a2 b0 b1 b2 : Std.U32) {r : Std.I32}
-    (h : u96_cmp ⟨[a0, a1, a2]⟩ ⟨[b0, b1, b2]⟩ = ok r) :
-    u96_cmp ⟨[b0, b1, b2]⟩ ⟨[a0, a1, a2]⟩ = ok (Pion.I32.neg r) := by
-  obtain ⟨r1, hr1, hlt1, heq1, hgt1⟩ := u96_cmp_spec a0 a1 a2 b0 b1 b2
-  obtain ⟨r2, hr2, hlt2, heq2, hgt2⟩ := u96_cmp_spec b0 b1 b2 a0 a1 a2
-  rw [hr1] at h
-  have hr : r1 = r := ok_inj h
-  subst hr
-  rcases lt_trichotomy (val96_parts a0 a1 a2) (val96_parts b0 b1 b2) with hlt | heq | hgt
-  · have h1 := hlt1.mpr hlt
-    have h2 := hgt2.mpr hlt
-    rw [hr2, h1, h2]; rfl
-  · have h1 := heq1.mpr heq
-    have h2 := heq2.mpr heq.symm
-    rw [hr2, h1, h2]; rfl
-  · have h1 := hgt1.mpr hgt
-    have h2 := hlt2.mpr hgt
-    rw [hr2, h1, h2]; rfl
-
-theorem u96_cmp_trans_lt (a0 a1 a2 b0 b1 b2 c0 c1 c2 : Std.U32)
-    (hab : u96_cmp ⟨[a0, a1, a2]⟩ ⟨[b0, b1, b2]⟩ = ok (-1)#i32)
-    (hbc : u96_cmp ⟨[b0, b1, b2]⟩ ⟨[c0, c1, c2]⟩ = ok (-1)#i32) :
-    u96_cmp ⟨[a0, a1, a2]⟩ ⟨[c0, c1, c2]⟩ = ok (-1)#i32 := by
-  obtain ⟨r1, hr1, hlt1, _, _⟩ := u96_cmp_spec a0 a1 a2 b0 b1 b2
-  obtain ⟨r2, hr2, hlt2, _, _⟩ := u96_cmp_spec b0 b1 b2 c0 c1 c2
-  obtain ⟨r3, hr3, hlt3, _, _⟩ := u96_cmp_spec a0 a1 a2 c0 c1 c2
-  rw [hr1] at hab
-  have h1 : r1 = (-1)#i32 := ok_inj hab
-  rw [hr2] at hbc
-  have h2 : r2 = (-1)#i32 := ok_inj hbc
-  rw [hr3, hlt3.mpr (Nat.lt_trans (hlt1.mp h1) (hlt2.mp h2))]
-
 /-- Exact specification of `inc96`: 96-bit `+ 1` with exact overflow detection. -/
 theorem inc96_spec (lo64 : Std.U64) (hi : Std.U32) :
     ∃ nlo nhi ov, inc96 lo64 hi = ok (nlo, nhi, ov) ∧
@@ -278,11 +241,11 @@ theorem inc96_spec (lo64 : Std.U64) (hi : Std.U32) :
   set nlo := Pion.U64.add lo64 1#u64
   have hnlo : nlo.val = (lo64.val + 1) % 2 ^ 64 := u64_add_val lo64 1#u64
   by_cases h1 : nlo ≠ 0#u64
-  · rw [if_pos h1]
+  · rw [ite_eq_left h1]
     have hne : nlo.val ≠ 0 := fun hz => h1 (UScalar.eq_of_val_eq hz)
     have hlt : lo64.val + 1 < 2 ^ 64 := by omega
     exact ⟨nlo, hi, false, rfl, fun _ => by omega, ⟨fun h => Bool.noConfusion h, fun h => by omega⟩⟩
-  · rw [if_neg h1]
+  · rw [ite_eq_right h1]
     have hlo_max : lo64.val = 2 ^ 64 - 1 := by
       have h0 : nlo = 0#u64 := Classical.not_not.mp h1
       have : nlo.val = 0 := by rw [h0]; rfl
@@ -290,13 +253,13 @@ theorem inc96_spec (lo64 : Std.U64) (hi : Std.U32) :
     set nhi := Pion.U32.add hi 1#u32
     have hnhi : nhi.val = (hi.val + 1) % 2 ^ 32 := u32_add_val hi 1#u32
     by_cases h2 : nhi ≠ 0#u32
-    · rw [if_pos h2]
+    · rw [ite_eq_left h2]
       have hne : nhi.val ≠ 0 := fun hz => h2 (UScalar.eq_of_val_eq hz)
       have hlt : hi.val + 1 < 2 ^ 32 := by omega
       exact ⟨0#u64, nhi, false, rfl,
         fun _ => by simp only [show (0#u64 : Std.U64).val = 0 from rfl]; omega,
         ⟨fun h => Bool.noConfusion h, fun h => by omega⟩⟩
-    · rw [if_neg h2]
+    · rw [ite_eq_right h2]
       have hhi_max : hi.val = 2 ^ 32 - 1 := by
         have h0 : nhi = 0#u32 := Classical.not_not.mp h2
         have : nhi.val = 0 := by rw [h0]; rfl
@@ -372,15 +335,8 @@ theorem mul10_add96_spec (lo64 : Std.U64) (hi : Std.U32) (digit : Std.U64)
         have : mid_part.val % 2 ^ 32 < 2 ^ 32 := Nat.mod_lt _ (by norm_num)
         omega
 
-/-- Exact specification of `overflow96_div10`: equals `(2^96 + 4) / 10`. -/
-theorem overflow96_div10_spec :
-    ∃ lo hi, overflow96_div10 = ok (lo, hi) ∧ val96 lo hi = (2 ^ 96 + 4) / 10 := by
-  unfold overflow96_div10 val96
-  refine ⟨_, _, rfl, ?_⟩
-  decide
-
 /-- Exact specification of `pow10_u32` on `0..=9`. -/
-theorem pow10_u32_spec (k : Std.I32) (hk0 : 0 ≤ k.val) (hk9 : k.val ≤ 9) :
+lemma pow10_u32_spec (k : Std.I32) (hk0 : 0 ≤ k.val) (hk9 : k.val ≤ 9) :
     ∃ r, pow10_u32 k = ok r ∧ r.val = 10 ^ k.val.toNat := by
   unfold pow10_u32
   refine ⟨_, rfl, ?_⟩

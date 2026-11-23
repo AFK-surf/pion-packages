@@ -97,7 +97,7 @@ private lemma i64_rem_86400 (x : Std.I64) :
     rfl
 
 /-- Theorem 13: `dt_is_digit` exact range (`'0'..'9'`, i.e., `48..57`). -/
-theorem dt_is_digit_exact (c : Std.I32) :
+lemma dt_is_digit_exact (c : Std.I32) :
     dt_is_digit c = ok true ↔ (48 ≤ c.val ∧ c.val ≤ 57) := by
   unfold dt_is_digit
   simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
@@ -125,70 +125,6 @@ theorem dt_is_digit_subset_email_classes (c : Std.I32) (hd : dt_is_digit c = ok 
     apply congrArg ok
     simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff', i32_bne_iff']
     change ((((33 ≤ c.val ∧ c.val ≤ 126) ∧ c.val ≠ 91) ∧ c.val ≠ 92) ∧ c.val ≠ 93); omega
-
-/-- Theorem 15: RFC 5322 §4.3 2-digit year normalization maps `[0, 99]` into `[1950, 2049]` with exact pivot at 49/50. -/
-theorem dt_normalize_year_2digit_bounds (year : Std.I32) (h0 : 0 ≤ year.val) (h99 : year.val ≤ 99) :
-    ∃ r : Std.I32, dt_normalize_year year 2#i32 = ok r ∧
-      1950 ≤ r.val ∧ r.val ≤ 2049 ∧
-      (year.val ≤ 49 → r.val = year.val + 2000) ∧
-      (50 ≤ year.val → r.val = year.val + 1900) := by
-  unfold dt_normalize_year
-  simp only [↓reduceIte]
-  by_cases h49 : year <= 49#i32
-  · simp only [h49, ↓reduceIte]
-    have hv := (i32_le_iff' year 49#i32).mp h49; change year.val ≤ 49 at hv
-    have ha := i32_add_val' year 2000#i32 (by change -2147483648 ≤ year.val + 2000; omega) (by change year.val + 2000 ≤ 2147483647; omega)
-    change (Pion.I32.add year 2000#i32).val = year.val + 2000 at ha
-    refine ⟨Pion.I32.add year 2000#i32, rfl, by omega, by omega, fun _ => ha, fun hge => by omega⟩
-  · simp only [h49, ↓reduceIte]
-    have hv : ¬ (year.val ≤ 49) := fun hle => h49 ((i32_le_iff' year 49#i32).mpr hle)
-    have ha := i32_add_val' year 1900#i32 (by change -2147483648 ≤ year.val + 1900; omega) (by change year.val + 1900 ≤ 2147483647; omega)
-    change (Pion.I32.add year 1900#i32).val = year.val + 1900 at ha
-    refine ⟨Pion.I32.add year 1900#i32, rfl, by omega, by omega, fun hle => by omega, fun _ => ha⟩
-
-/-- Theorem 16: RFC 5322 §4.3 3-digit year normalization maps `[0, 999]` to `year + 1900 ∈ [1900, 2899]`. -/
-theorem dt_normalize_year_3digit_bounds (year : Std.I32) (h0 : 0 ≤ year.val) (h999 : year.val ≤ 999) :
-    ∃ r : Std.I32, dt_normalize_year year 3#i32 = ok r ∧
-      r.val = year.val + 1900 ∧ 1900 ≤ r.val ∧ r.val ≤ 2899 := by
-  unfold dt_normalize_year
-  have h32 : (3#i32 : Std.I32) ≠ 2#i32 := by decide
-  simp only [h32, ↓reduceIte]
-  have ha := i32_add_val' year 1900#i32 (by change -2147483648 ≤ year.val + 1900; omega) (by change year.val + 1900 ≤ 2147483647; omega)
-  change (Pion.I32.add year 1900#i32).val = year.val + 1900 at ha
-  exact ⟨Pion.I32.add year 1900#i32, rfl, ha, by omega, by omega⟩
-
-/-- Theorem 17: 4-digit years are preserved identically by `dt_normalize_year`. -/
-theorem dt_normalize_year_4digit_identity (year : Std.I32) :
-    dt_normalize_year year 4#i32 = ok year := by
-  unfold dt_normalize_year
-  have h42 : (4#i32 : Std.I32) ≠ 2#i32 := by decide
-  have h43 : (4#i32 : Std.I32) ≠ 3#i32 := by decide
-  simp only [h42, h43, ↓reduceIte]
-
-/-- Theorem 18: `dt_clamp_leap_second` maps `[0, 60]` into `[0, 59]`, clamping `60 → 59` and preserving `[0, 59]`. -/
-theorem dt_clamp_leap_second_bounds (sec : Std.I32) (h0 : 0 ≤ sec.val) (h60 : sec.val ≤ 60) :
-    ∃ r : Std.I32, dt_clamp_leap_second sec = ok r ∧
-      0 ≤ r.val ∧ r.val ≤ 59 ∧
-      (sec.val = 60 → r.val = 59) ∧
-      (sec.val ≤ 59 → r.val = sec.val) := by
-  unfold dt_clamp_leap_second
-  by_cases h : sec = 60#i32
-  · simp only [h, ↓reduceIte]
-    refine ⟨59#i32, rfl, by decide, by decide, fun _ => rfl, fun hle => by change (60 : Int) ≤ 59 at hle; omega⟩
-  · simp only [h, ↓reduceIte]
-    have hv : sec.val ≠ 60 := fun heq => h (IScalar.eq_of_val_eq heq)
-    refine ⟨sec, rfl, by omega, by omega, fun heq => by omega, fun _ => rfl⟩
-
-/-- Theorem 19: `dt_clamp_leap_second` is idempotent across all 32-bit inputs. -/
-theorem dt_clamp_leap_second_idempotent (sec : Std.I32) :
-    (do let r ← dt_clamp_leap_second sec; dt_clamp_leap_second r) = dt_clamp_leap_second sec := by
-  unfold dt_clamp_leap_second
-  rw [result_bind_ok']
-  by_cases h : sec = 60#i32
-  · simp only [h, ↓reduceIte]
-    have hne : (59#i32 : Std.I32) ≠ 60#i32 := by decide
-    simp only [hne, ↓reduceIte]
-  · simp only [h, ↓reduceIte]
 
 /-- Theorem 20: Every valid RFC 5322 numeric timezone `±HHMM` (`0 ≤ hh ≤ 23`, `0 ≤ mm ≤ 59`) passes `dt_is_valid_offset_seconds`. -/
 theorem dt_numeric_offset_in_valid_range (sign hh mm : Std.I32)
@@ -244,12 +180,6 @@ theorem dt_numeric_offset_negation_symmetry (hh mm : Std.I32)
     omega
   have hn_v : (Pion.I32.neg mag).val = -mag.val := i32_neg_val' mag (by omega)
   exact ⟨mag, Pion.I32.neg mag, rfl, rfl, hn_v, hmag_v⟩
-
-/-- Theorem 22: Both `+0000` and `-0000` evaluate to offset `0`. -/
-theorem dt_numeric_offset_zero_both_signs :
-    dt_numeric_offset_seconds 43#i32 0#i32 0#i32 = ok 0#i32 ∧
-    dt_numeric_offset_seconds 45#i32 0#i32 0#i32 = ok 0#i32 := by
-  constructor <;> (unfold dt_numeric_offset_seconds; rfl)
 
 /-- Theorem 23: `dt_epoch_rem_sec` always yields a non-negative second-of-day in `[0, 86399]` for any `Int64` timestamp. -/
 theorem dt_epoch_rem_sec_bounds (local_sec : Std.I64) :

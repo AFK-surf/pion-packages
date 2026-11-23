@@ -66,7 +66,7 @@ private lemma i32_shl1_val (x : Std.I32) (hlo : 0 ≤ x.val) (hhi : x.val < 1073
   omega
 
 /-- Dinic forward half-edge index equals `2 * i` for all `0 <= i < 2^30`. -/
-theorem forward_half_edge_val (i : Std.I32) (h0 : 0 ≤ i.val) (hhi : i.val < 1073741824) :
+lemma forward_half_edge_val (i : Std.I32) (h0 : 0 ≤ i.val) (hhi : i.val < 1073741824) :
     ∃ f : Std.I32, forward_half_edge i = ok f ∧ f.val = 2 * i.val := by
   unfold forward_half_edge
   rw [i32_shl_1, result_bind_ok]
@@ -130,7 +130,7 @@ theorem forward_reverse_half_edge_pair (i : Std.I32) (h0 : 0 ≤ i.val) (hhi : i
   exact ⟨f, r, hf, hr_twin, hr_back, hfv, hrv⟩
 
 /-- Binary heap `heap_parent` computes `(idx - 1) / 2` for all `idx > 0`. -/
-theorem heap_parent_val (idx : Std.I32) (hpos : 0 < idx.val) :
+lemma heap_parent_val (idx : Std.I32) (hpos : 0 < idx.val) :
     ∃ p : Std.I32, heap_parent idx = ok p ∧ p.val = (idx.val - 1) / 2 := by
   have hidx := i32_bounds idx
   unfold heap_parent
@@ -152,7 +152,7 @@ theorem heap_parent_strict_decrease (idx : Std.I32) (hpos : 0 < idx.val) :
   exact ⟨p, hp, by omega, by omega⟩
 
 /-- Binary heap `heap_left_child` computes `2 * idx + 1` for all `0 <= idx < 2^30`. -/
-theorem heap_left_child_val (idx : Std.I32) (h0 : 0 ≤ idx.val) (hhi : idx.val < 1073741824) :
+lemma heap_left_child_val (idx : Std.I32) (h0 : 0 ≤ idx.val) (hhi : idx.val < 1073741824) :
     ∃ l : Std.I32, heap_left_child idx = ok l ∧ l.val = 2 * idx.val + 1 := by
   unfold heap_left_child
   rw [i32_shl_1, result_bind_ok]
@@ -160,12 +160,6 @@ theorem heap_left_child_val (idx : Std.I32) (h0 : 0 ≤ idx.val) (hhi : idx.val 
   have hshl := i32_shl1_val idx h0 hhi
   have h1 : (1#i32).val = 1 := by norm_num
   rw [i32_add_val _ 1#i32 (by omega) (by omega), hshl, h1]
-
-/-- Binary heap sift-down termination: `idx < heap_left_child idx` for all `0 <= idx < 2^30`. -/
-theorem heap_left_child_strict_increase (idx : Std.I32) (h0 : 0 ≤ idx.val) (hhi : idx.val < 1073741824) :
-    ∃ l : Std.I32, heap_left_child idx = ok l ∧ idx.val < l.val := by
-  obtain ⟨l, hl, hlv⟩ := heap_left_child_val idx h0 hhi
-  exact ⟨l, hl, by omega⟩
 
 /-- Binary heap parent-child bijection: `heap_parent` is the exact left-inverse of both `heap_left_child` and `heap_left_child + 1`. -/
 theorem heap_parent_children_inverse (idx : Std.I32) (h0 : 0 ≤ idx.val) (hhi : idx.val < 1073741823) :

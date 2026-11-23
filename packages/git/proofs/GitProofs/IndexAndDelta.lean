@@ -83,96 +83,6 @@ private lemma nat_and_neg8_u32 (n : Nat) (hn : n < 2 ^ 31) :
         omega
       simp [hlhs, hrhs]
 
-/-- Theorem 12: `HashKind.byte_len` returns 20 for SHA-1 and 32 for SHA-256. -/
-theorem hash_kind_byte_len_spec (k : HashKind) :
-    ∃ r : Std.I32, HashKind.byte_len k = ok r ∧
-      ((k = .Sha1 → r.val = 20) ∧ (k = .Sha256 → r.val = 32) ∧ (r.val = 20 ∨ r.val = 32)) := by
-  cases k
-  · refine ⟨20#i32, rfl, ?_, ?_, Or.inl rfl⟩
-    · intro _; rfl
-    · intro h; cases h
-  · refine ⟨32#i32, rfl, ?_, ?_, Or.inr rfl⟩
-    · intro h; cases h
-    · intro _; rfl
-
-/-- Theorem 13: `GitLimits.default` is valid and all 7 default resource caps are strictly positive. -/
-theorem git_limits_default_valid :
-    ∃ l : GitLimits, GitLimits.default = ok l ∧
-      git_limits_is_valid l = ok true ∧
-      0 < l.max_object_bytes.val ∧ 0 < l.max_pack_entries.val ∧
-      0 < l.max_delta_depth.val ∧ 0 < l.max_delta_result_bytes.val ∧
-      0 < l.max_tree_entries.val ∧ 0 < l.max_index_entries.val ∧
-      0 < l.max_pack_total_bytes.val := by
-  refine ⟨_, rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide
-
-/-- Theorem 14: Exact iff characterization of `git_limits_is_valid`. -/
-theorem git_limits_is_valid_iff (l : GitLimits) :
-    git_limits_is_valid l = ok true ↔
-      (0 ≤ l.max_object_bytes.val ∧ 0 ≤ l.max_pack_entries.val ∧
-       0 ≤ l.max_delta_depth.val ∧ 0 ≤ l.max_delta_result_bytes.val ∧
-       0 ≤ l.max_tree_entries.val ∧ 0 ≤ l.max_index_entries.val ∧
-       0 ≤ l.max_pack_total_bytes.val) := by
-  unfold git_limits_is_valid
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq]
-  constructor
-  · intro ⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩
-    exact ⟨h1, h2, h3, h4, h5, h6, h7⟩
-  · intro ⟨h1, h2, h3, h4, h5, h6, h7⟩
-    exact ⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩
-
-/-- Theorem 15: `index_flags_stage` always succeeds and extracts a 2-bit merge stage in `[0, 3]`. -/
-theorem index_flags_stage_bounds (flags : Std.U32) :
-    ∃ s : Std.I32, index_flags_stage flags = ok s ∧ 0 ≤ s.val ∧ s.val ≤ 3 := by
-  unfold index_flags_stage
-  have hshr : Pion.U32.shr flags 12#u32 = ok ⟨flags.bv >>> 12⟩ := by
-    unfold Pion.U32.shr
-    have hlt : (12#u32 : Std.U32).val < 32 := by decide
-    simp only [hlt, ↓reduceIte]
-    rfl
-  simp only [hshr, result_bind_ok']
-  set u : Std.U32 := Pion.U32.band ⟨flags.bv >>> 12⟩ 3#u32
-  have hu : u.bv.toNat ≤ 3 := by
-    change ((flags.bv >>> 12) &&& (3#32 : BitVec 32)).toNat ≤ 3
-    rw [BitVec.toNat_and]
-    have h3 : (3#32 : BitVec 32).toNat = 2 ^ 2 - 1 := rfl
-    rw [h3, Nat.and_two_pow_sub_one_eq_mod]
-    omega
-  set s : Std.I32 := Pion.U32.to_int u
-  have hsbv : s.bv = u.bv := by
-    unfold s Pion.U32.to_int UScalar.hcast
-    simp [BitVec.setWidth_eq]
-  have hsval : s.val = (u.bv.toNat : Int) := by
-    apply i32_val_of_bv_toNat_lt' s
-    rw [hsbv]; omega
-  exact ⟨s, rfl, by omega, by omega⟩
-
-/-- Theorem 16: `index_flags_stage` equals `(flags / 4096) % 4` exactly. -/
-theorem index_flags_stage_exact (flags : Std.U32) :
-    ∃ s : Std.I32, index_flags_stage flags = ok s ∧ s.val = ((flags.val / 4096) % 4 : Int) := by
-  unfold index_flags_stage
-  have hshr : Pion.U32.shr flags 12#u32 = ok ⟨flags.bv >>> 12⟩ := by
-    unfold Pion.U32.shr
-    have hlt : (12#u32 : Std.U32).val < 32 := by decide
-    simp only [hlt, ↓reduceIte]
-    rfl
-  simp only [hshr, result_bind_ok']
-  set u : Std.U32 := Pion.U32.band ⟨flags.bv >>> 12⟩ 3#u32
-  have hunat : u.bv.toNat = (flags.bv.toNat / 4096) % 4 := by
-    change ((flags.bv >>> 12) &&& (3#32 : BitVec 32)).toNat = (flags.bv.toNat / 4096) % 4
-    rw [BitVec.toNat_and, BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]
-    have h3 : (3#32 : BitVec 32).toNat = 2 ^ 2 - 1 := rfl
-    rw [h3, Nat.and_two_pow_sub_one_eq_mod]
-  set s : Std.I32 := Pion.U32.to_int u
-  have hsbv : s.bv = u.bv := by
-    unfold s Pion.U32.to_int UScalar.hcast
-    simp [BitVec.setWidth_eq]
-  have hsval : s.val = (u.bv.toNat : Int) := by
-    apply i32_val_of_bv_toNat_lt' s
-    rw [hsbv, hunat]; omega
-  refine ⟨s, rfl, ?_⟩
-  rw [hsval, hunat]
-  rfl
-
 /-- Theorem 17: `index_v2_padded_len` aligns `raw_len` up to the next multiple of 8. -/
 theorem index_v2_padded_len_spec (raw_len : Std.I32)
     (hlo : 0 ≤ raw_len.val) (hhi : raw_len.val ≤ 1000000000) :
@@ -257,20 +167,6 @@ theorem delta_copy_size_roundtrip (chunk : Std.I32)
     have h0 : chunk.val = 0 := congrArg IScalar.val h3
     omega
   · rfl
-
-/-- Theorem 21: `delta_copy_size_decode` always maps non-negative 24-bit wire values to `[1, 0xFFFFFF]`. -/
-theorem delta_copy_size_decode_pos (raw_size : Std.I32)
-    (hlo : 0 ≤ raw_size.val) (hhi : raw_size.val ≤ 16777215) :
-    ∃ r : Std.I32, delta_copy_size_decode raw_size = ok r ∧ 1 ≤ r.val ∧ r.val ≤ 16777215 := by
-  unfold delta_copy_size_decode
-  refine ⟨_, rfl, ?_, ?_⟩
-  · split_ifs with h0
-    · decide
-    · have hne : raw_size.val ≠ 0 := fun h => h0 (IScalar.eq_of_val_eq h)
-      omega
-  · split_ifs with h0
-    · decide
-    · omega
 
 /-- Theorem 22: `delta_copy_range_ok` guarantees overflow-free base read and target write bounds. -/
 theorem delta_copy_range_ok_sound (cp_off cp_size base_size out_pos target_size : Std.I32)

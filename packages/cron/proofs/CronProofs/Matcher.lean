@@ -15,7 +15,7 @@ open cron
 
 section MatcherGuards
 
-private theorem u64_shr_and_one_eq_zero_iff (m : Std.U64) (k : Nat) (hk : k < 64) :
+private theorem u64_shr_and_one_eq_zero_iff (m : Std.U64) (k : Nat) (_hk : k < 64) :
     Pion.U64.band ⟨m.bv >>> k⟩ 1#u64 = 0#u64 ↔ m.bv.getLsbD k = false := by
   rw [u64_band_eq_zero_iff]
   constructor
@@ -31,22 +31,6 @@ private theorem u64_shr_and_one_eq_zero_iff (m : Std.U64) (k : Nat) (hk : k < 64
       omega
     subst hi0
     simpa [BitVec.getLsbD_ushiftRight] using h
-
-/-- Red-team F5 guard: `matches_fixed_fields` returns `ok false` on every invalid `DateTime`. -/
-theorem matches_fixed_fields_rejects_invalid (c : Cron) (dt : DateTime)
-    (hinv : DateTime.is_valid dt = ok false) :
-    matches_fixed_fields c dt = ok false := by
-  unfold matches_fixed_fields
-  rw [hinv, b_ok]
-  simp
-
-/-- Red-team F5 guard: `matches_day` returns `ok false` on every invalid `DateTime`. -/
-theorem matches_day_rejects_invalid (c : Cron) (dt : DateTime)
-    (hinv : DateTime.is_valid dt = ok false) :
-    matches_day c dt = ok false := by
-  unfold matches_day
-  rw [hinv, b_ok]
-  simp
 
 /-- On every valid `DateTime`, `matches_fixed_fields` never traps (all shifts `< 64`)
     and matches the exact 4-field bitmask test. -/

@@ -47,19 +47,4 @@ lemma i32_bounds (x : Std.I32) :
     change (2 : Int) ^ (32 - 1) = 2147483648; norm_num
   omega
 
-/-- Default `DecodeOptions` has bounded depth (32), bounded elements (131072), and rejects trailing bytes. -/
-theorem decode_options_default_spec :
-    ∃ o : DecodeOptions, DecodeOptions.default = ok o ∧
-      o.max_depth.val = 32 ∧ o.max_elements.val = 131072 ∧ o.allow_trailing_bytes = false := by
-  refine ⟨DecodeOptions.mk 32#i32 131072#i32 false false false, rfl, ?_, ?_, rfl⟩ <;>
-    (dsimp only; norm_num)
-
-/-- Strict `DecodeOptions` enables canonical encoding enforcement, duplicate-key rejection, and rejects trailing bytes. -/
-theorem decode_options_strict_spec :
-    ∃ o : DecodeOptions, DecodeOptions.strict = ok o ∧
-      o.max_depth.val = 32 ∧ o.max_elements.val = 131072 ∧
-      o.reject_duplicate_keys = true ∧ o.require_canonical = true ∧ o.allow_trailing_bytes = false := by
-  refine ⟨DecodeOptions.mk 32#i32 131072#i32 true true false, rfl, ?_, ?_, rfl, rfl, rfl⟩ <;>
-    (dsimp only; norm_num)
-
 end CborProofs

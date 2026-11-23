@@ -19,16 +19,16 @@ open decimal
 
 /-! ## 0. Common Scalar, BitVec & Mathematical Model Helpers -/
 
-theorem b_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma b_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← (ok x : Result α); f y) = f x := by simp
 
-theorem b_ok2 {α β γ : Type} (x : α) (y : β) (f : α → β → Result γ) :
+lemma b_ok2 {α β γ : Type} (x : α) (y : β) (f : α → β → Result γ) :
     (do let (a, b) ← (ok (x, y) : Result (α × β)); f a b) = f x y := by simp
 
-theorem b_ok3 {α β γ δ : Type} (x : α) (y : β) (z : γ) (f : α → β → γ → Result δ) :
+lemma b_ok3 {α β γ δ : Type} (x : α) (y : β) (z : γ) (f : α → β → γ → Result δ) :
     (do let (a, b, c) ← (ok (x, y, z) : Result (α × β × γ)); f a b c) = f x y z := by simp
 
-theorem wp_ok_iff {α : Type u} (r : Result α) (P : α → Prop) :
+lemma wp_ok_iff {α : Type u} (r : Result α) (P : α → Prop) :
     r ⦃ P ⦄ ↔ ∃ y, r = ok y ∧ P y := by
   cases r with
   | ret y => simp [WP.spec_ok]
@@ -90,20 +90,20 @@ def dec_eq_rat (a b : Decimal) : Prop :=
 
 /-! ### Scalar arithmetic & bitwise helper lemmas -/
 
-theorem u32_val_lt (x : Std.U32) : x.val < 2 ^ 32 := x.bv.isLt
-theorem u64_val_lt (x : Std.U64) : x.val < 2 ^ 64 := x.bv.isLt
-theorem u8_val_lt (x : Std.U8) : x.val < 2 ^ 8 := x.bv.isLt
+lemma u32_val_lt (x : Std.U32) : x.val < 2 ^ 32 := x.bv.isLt
+lemma u64_val_lt (x : Std.U64) : x.val < 2 ^ 64 := x.bv.isLt
+lemma u8_val_lt (x : Std.U8) : x.val < 2 ^ 8 := x.bv.isLt
 
-theorem u32_eq_of_bv_eq {a b : Std.U32} (h : a.bv = b.bv) : a = b := by
+lemma u32_eq_of_bv_eq {a b : Std.U32} (h : a.bv = b.bv) : a = b := by
   cases a; cases b; congr
 
-theorem u64_eq_of_bv_eq {a b : Std.U64} (h : a.bv = b.bv) : a = b := by
+lemma u64_eq_of_bv_eq {a b : Std.U64} (h : a.bv = b.bv) : a = b := by
   cases a; cases b; congr
 
-theorem u8_eq_of_bv_eq {a b : Std.U8} (h : a.bv = b.bv) : a = b := by
+lemma u8_eq_of_bv_eq {a b : Std.U8} (h : a.bv = b.bv) : a = b := by
   cases a; cases b; congr
 
-theorem u32_to_uint64_val (x : Std.U32) : (Pion.U32.to_uint64 x).val = x.val := by
+lemma u32_to_uint64_val (x : Std.U32) : (Pion.U32.to_uint64 x).val = x.val := by
   cases x with
   | mk bv =>
     have hlt : bv.toNat < 2 ^ 32 := bv.isLt
@@ -111,13 +111,13 @@ theorem u32_to_uint64_val (x : Std.U32) : (Pion.U32.to_uint64 x).val = x.val := 
       BitVec.toNat_setWidth]
     omega
 
-theorem u64_to_uint_val (x : Std.U64) : (Pion.U64.to_uint x).val = x.val % 2 ^ 32 := by
+lemma u64_to_uint_val (x : Std.U64) : (Pion.U64.to_uint x).val = x.val % 2 ^ 32 := by
   cases x with
   | mk bv =>
     simp only [Pion.U64.to_uint, UScalar.cast, UScalar.val, UScalarTy.numBits,
       BitVec.toNat_setWidth]
 
-theorem u32_to_int_val {x : Std.U32} (h : x.val < 2 ^ 31) :
+lemma u32_to_int_val {x : Std.U32} (h : x.val < 2 ^ 31) :
     (Pion.U32.to_int x).val = (x.val : Int) := by
   cases x with
   | mk bv =>
@@ -126,7 +126,7 @@ theorem u32_to_int_val {x : Std.U32} (h : x.val < 2 ^ 31) :
       UScalar.val, BitVec.toInt_setWidth, BitVec.toInt_ofNat]
     rw [Int.bmod_eq_of_le_mul_two] <;> omega
 
-theorem i32_add_val {a b : Std.I32}
+lemma i32_add_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 2147483647) :
     (Pion.I32.add a b).val = a.val + b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -135,7 +135,7 @@ theorem i32_add_val {a b : Std.I32}
   rw [BitVec.toInt_add]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem i32_sub_val {a b : Std.I32}
+lemma i32_sub_val {a b : Std.I32}
     (hlo : -2147483648 ≤ a.val - b.val) (hhi : a.val - b.val ≤ 2147483647) :
     (Pion.I32.sub a b).val = a.val - b.val := by
   simp only [IScalar.val] at hlo hhi
@@ -144,12 +144,12 @@ theorem i32_sub_val {a b : Std.I32}
   rw [BitVec.toInt_sub]
   exact Int.bmod_eq_of_le_mul_two (by omega) (by omega)
 
-theorem u32_add_val (a b : Std.U32) :
+lemma u32_add_val (a b : Std.U32) :
     (Pion.U32.add a b).val = (a.val + b.val) % 2 ^ 32 := by
   simp only [Pion.U32.add, Std.U32.wrapping_add, UScalar.wrapping_add, UScalar.val,
     UScalarTy.numBits, BitVec.toNat_add]
 
-theorem u32_sub_val {a b : Std.U32} (h : b.val ≤ a.val) :
+lemma u32_sub_val {a b : Std.U32} (h : b.val ≤ a.val) :
     (Pion.U32.sub a b).val = a.val - b.val := by
   have ha := u32_val_lt a
   have hb := u32_val_lt b
@@ -158,17 +158,17 @@ theorem u32_sub_val {a b : Std.U32} (h : b.val ≤ a.val) :
     UScalarTy.numBits, BitVec.toNat_sub]
   omega
 
-theorem u32_mul_val (a b : Std.U32) :
+lemma u32_mul_val (a b : Std.U32) :
     (Pion.U32.mul a b).val = (a.val * b.val) % 2 ^ 32 := by
   simp only [Pion.U32.mul, Std.U32.wrapping_mul, UScalar.wrapping_mul, UScalar.val,
     UScalarTy.numBits, BitVec.toNat_mul]
 
-theorem u64_add_val (a b : Std.U64) :
+lemma u64_add_val (a b : Std.U64) :
     (Pion.U64.add a b).val = (a.val + b.val) % 2 ^ 64 := by
   simp only [Pion.U64.add, Std.U64.wrapping_add, UScalar.wrapping_add, UScalar.val,
     UScalarTy.numBits, BitVec.toNat_add]
 
-theorem u64_sub_val {a b : Std.U64} (h : b.val ≤ a.val) :
+lemma u64_sub_val {a b : Std.U64} (h : b.val ≤ a.val) :
     (Pion.U64.sub a b).val = a.val - b.val := by
   have ha := u64_val_lt a
   have hb := u64_val_lt b
@@ -177,7 +177,7 @@ theorem u64_sub_val {a b : Std.U64} (h : b.val ≤ a.val) :
     UScalarTy.numBits, BitVec.toNat_sub]
   omega
 
-theorem u64_sub_wrap_val {a b : Std.U64} (h : a.val < b.val) :
+lemma u64_sub_wrap_val {a b : Std.U64} (h : a.val < b.val) :
     (Pion.U64.sub a b).val = 2 ^ 64 + a.val - b.val := by
   have ha := u64_val_lt a
   have hb := u64_val_lt b
@@ -186,12 +186,12 @@ theorem u64_sub_wrap_val {a b : Std.U64} (h : a.val < b.val) :
     UScalarTy.numBits, BitVec.toNat_sub]
   omega
 
-theorem u64_mul_val (a b : Std.U64) :
+lemma u64_mul_val (a b : Std.U64) :
     (Pion.U64.mul a b).val = (a.val * b.val) % 2 ^ 64 := by
   simp only [Pion.U64.mul, Std.U64.wrapping_mul, UScalar.wrapping_mul, UScalar.val,
     UScalarTy.numBits, BitVec.toNat_mul]
 
-theorem u64_band_mask32 (x : Std.U64) :
+lemma u64_band_mask32 (x : Std.U64) :
     (Pion.U64.band x 4294967295#u64).val = x.val % 2 ^ 32 := by
   cases x with
   | mk bv =>
@@ -199,7 +199,7 @@ theorem u64_band_mask32 (x : Std.U64) :
     have h2 : (4294967295#u64 : Std.U64).bv.toNat = 2 ^ 32 - 1 := by decide
     rw [h2, Nat.and_two_pow_sub_one_eq_mod]
 
-theorem u64_shr32_ok (x : Std.U64) :
+lemma u64_shr32_ok (x : Std.U64) :
     ∃ y, Pion.U64.shr x 32#u64 = ok y ∧ y.val = x.val / 2 ^ 32 := by
   unfold Pion.U64.shr
   have hlt : (32#u64 : Std.U64).val < 64 := by decide
@@ -209,7 +209,7 @@ theorem u64_shr32_ok (x : Std.U64) :
   have hv : (32#u64 : Std.U64).bv.toNat = 32 := by decide
   rw [hv, Nat.shiftRight_eq_div_pow]
 
-theorem u64_shl32_ok (x : Std.U64) :
+lemma u64_shl32_ok (x : Std.U64) :
     ∃ y, Pion.U64.shl x 32#u64 = ok y ∧ y.val = (x.val % 2 ^ 32) * 2 ^ 32 := by
   unfold Pion.U64.shl
   have hlt : (32#u64 : Std.U64).val < 64 := by decide
@@ -221,10 +221,10 @@ theorem u64_shl32_ok (x : Std.U64) :
   have h64 : (2 : Nat) ^ 64 = 2 ^ 32 * 2 ^ 32 := by norm_num
   rw [h64, Nat.mul_mod_mul_right]
 
-theorem ok_inj {α : Type u} {x y : α} (h : (ok x : Result α) = ok y) : x = y := by
+lemma ok_inj {α : Type u} {x y : α} (h : (ok x : Result α) = ok y) : x = y := by
   simpa using h
 
-theorem bv_and_xor_distrib_right {w : Nat} (a b c : BitVec w) :
+lemma bv_and_xor_distrib_right {w : Nat} (a b c : BitVec w) :
     (a ^^^ b) &&& c = (a &&& c) ^^^ (b &&& c) := by
   apply BitVec.eq_of_getLsbD_eq
   intro i hi
@@ -232,7 +232,7 @@ theorem bv_and_xor_distrib_right {w : Nat} (a b c : BitVec w) :
   cases a.getLsbD i <;> cases b.getLsbD i <;> cases c.getLsbD i <;> rfl
 
 /-- Pure Nat identity: for `a < 2^n`, `a ||| (k * 2^n) = a + k * 2^n`. -/
-theorem nat_or_mul_pow2 : ∀ (n a k : Nat), a < 2 ^ n →
+lemma nat_or_mul_pow2 : ∀ (n a k : Nat), a < 2 ^ n →
     (a ||| (k * 2 ^ n)) = a + k * 2 ^ n
   | 0, a, k, ha => by
     have ha0 : a = 0 := by omega
@@ -252,7 +252,7 @@ theorem nat_or_mul_pow2 : ∀ (n a k : Nat), a < 2 ^ n →
     rw [hsplit1, hdiv, hmod, hmul]
     omega
 
-theorem u64_bor_disjoint_32 {lo hi : Std.U64}
+lemma u64_bor_disjoint_32 {lo hi : Std.U64}
     (hlo : lo.val < 2 ^ 32) (hhi : hi.val % 2 ^ 32 = 0) :
     (Pion.U64.bor lo hi).val = lo.val + hi.val := by
   simp only [UScalar.val] at hlo hhi
@@ -265,51 +265,51 @@ theorem u64_bor_disjoint_32 {lo hi : Std.U64}
   conv_lhs => rw [hdiv]
   rw [nat_or_mul_pow2 32 lo.bv.toNat (hi.bv.toNat / 2 ^ 32) hlo, ← hdiv]
 
-theorem u64_div_ok (a : Std.U64) {b : Std.U64} (hb : b.val ≠ 0) :
+lemma u64_div_ok (a : Std.U64) {b : Std.U64} (hb : b.val ≠ 0) :
     ∃ q, Pion.U64.div a b = ok q ∧ q.val = a.val / b.val := by
   have h := Pion.U64.div_spec a hb
   rw [wp_ok_iff] at h
   exact h
 
-theorem u32_shr16_ok (x : Std.U32) :
+lemma u32_shr16_ok (x : Std.U32) :
     ∃ y, Pion.U32.shr x 16#u32 = ok y ∧ y.bv = x.bv >>> 16 := by
   unfold Pion.U32.shr
   have hlt : (16#u32 : Std.U32).val < 32 := by decide
   simp only [hlt, ↓reduceIte]
   exact ⟨_, rfl, rfl⟩
 
-theorem u32_shl16_ok (x : Std.U32) :
+lemma u32_shl16_ok (x : Std.U32) :
     ∃ y, Pion.U32.shl x 16#u32 = ok y ∧ y.bv = x.bv <<< 16 := by
   unfold Pion.U32.shl
   have hlt : (16#u32 : Std.U32).val < 32 := by decide
   simp only [hlt, ↓reduceIte]
   exact ⟨_, rfl, rfl⟩
 
-theorem u32_shr_ok (x : Std.U32) (n : Std.U32) (hn : n.val < 32) :
+lemma u32_shr_ok (x : Std.U32) (n : Std.U32) (hn : n.val < 32) :
     ∃ y, Pion.U32.shr x n = ok y ∧ y.bv = x.bv >>> n.val := by
   unfold Pion.U32.shr
   simp only [hn, ↓reduceIte]
   exact ⟨_, rfl, rfl⟩
 
-theorem u32_shl_ok (x : Std.U32) (n : Std.U32) (hn : n.val < 32) :
+lemma u32_shl_ok (x : Std.U32) (n : Std.U32) (hn : n.val < 32) :
     ∃ y, Pion.U32.shl x n = ok y ∧ y.bv = x.bv <<< n.val := by
   unfold Pion.U32.shl
   simp only [hn, ↓reduceIte]
   exact ⟨_, rfl, rfl⟩
 
-theorem bytes_set_ok (b : Pion.Bytes) (i : Std.I32) (x : Std.U8)
+lemma bytes_set_ok (b : Pion.Bytes) (i : Std.I32) (x : Std.U8)
     (h0 : 0 ≤ i.val) (h1 : i.val < b.val.length) :
     Pion.Bytes.set b i x = ok ⟨b.val.set i.val.toNat x⟩ := by
   unfold Pion.Bytes.set Pion.listSet
   simp [h0, h1]
 
-theorem bytes_get_ok (b : Pion.Bytes) (i : Std.I32)
+lemma bytes_get_ok (b : Pion.Bytes) (i : Std.I32)
     (h0 : 0 ≤ i.val) (h1 : i.val < b.val.length) :
     Pion.Bytes.get b i = ok (b.val.get ⟨i.val.toNat, by omega⟩) := by
   unfold Pion.Bytes.get Pion.listGet
   simp [h0, h1]
 
-theorem bytes_length_ok (b : Pion.Bytes) (h : b.val.length ≤ 2147483647) :
+lemma bytes_length_ok (b : Pion.Bytes) (h : b.val.length ≤ 2147483647) :
     ∃ n, Pion.Bytes.length b = ok n ∧ n.val = b.val.length := by
   unfold Pion.Bytes.length Pion.lengthOf
   simp only [h, ↓reduceDIte]

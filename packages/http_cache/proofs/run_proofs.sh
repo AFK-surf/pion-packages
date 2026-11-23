@@ -2,165 +2,184 @@
 set -euo pipefail
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
+export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="http_cache"
+LEAN_MOD="HttpCache"
+PROOF_MOD="HttpCacheProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-LEAN_WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
-PROJ="$LEAN_WORK/proj"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in $LEAN_WORK ==="
-mkdir -p "$PROJ"
-if [ ! -d "$PROJ/PionLean" ]; then
-  if [ -d /private/tmp/pion-lean-ref/PionLean ]; then
-    cp -R /private/tmp/pion-lean-ref/PionLean "$PROJ/PionLean"
-    cp /private/tmp/pion-lean-ref/PionLean.lean "$PROJ/PionLean.lean"
-  else
-    echo "ERROR: PionLean reference missing" >&2
-    exit 1
-  fi
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
+  exit 1
+fi
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
 fi
 
-rm -f "$PROJ/lakefile.toml"
-cat > "$PROJ/lakefile.lean" <<EOF
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
 import Lake
 open Lake DSL
 
-require aeneas from "./.deps/aeneas"
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
 
-package «pionlean» where
-  leanOptions := #[⟨\`weak.linter.dupNamespace, false⟩]
+require aeneas from ".deps/aeneas"
 
-@[default_target] lean_lib PionLean
-
-lean_lib HttpCache where
-  moreLeanArgs := #["--memory=$LEAN_MEM_LIMIT", "-j", "$LEAN_NUM_THREADS"]
-
-lean_lib HttpCacheProofs where
-  moreLeanArgs := #["--memory=$LEAN_MEM_LIMIT", "-j", "$LEAN_NUM_THREADS"]
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
 EOF
 
-echo "=== [2/7] pionc extract-lean packages/http_cache ==="
-rm -rf "$PROJ/HttpCache" "$PROJ/HttpCacheProofs" "$PROJ/HttpCacheProofs.lean" "$PROJ/CheckAxioms.lean" "$PROJ/EvalDiff.lean"
-pionc extract-lean --json "$PKG_DIR" --out "$PROJ"
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
 
-cp "$SCRIPT_DIR/HttpCacheProofs.lean" "$PROJ/HttpCacheProofs.lean"
-cp -R "$SCRIPT_DIR/HttpCacheProofs" "$PROJ/HttpCacheProofs"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "$SCRIPT_DIR/HttpCacheProofs" "$SCRIPT_DIR/HttpCacheProofs.lean"; then
-  echo "FAIL: forbidden tactic or axiom found" >&2
-  exit 1
-fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean HttpCache.Types HttpCache.Funs HttpCacheProofs ==="
-(
-  cd "$PROJ"
-  LEAN_NUM_THREADS="$LEAN_NUM_THREADS" lake build \
-    PionLean HttpCache.Types HttpCache.Funs HttpCacheProofs
-)
-
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AXIOM_OUT="$(cd "$PROJ" && lake env lean "$PROJ/CheckAxioms.lean")"
-echo "$AXIOM_OUT"
-if echo "$AXIOM_OUT" | grep -E 'sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler'; then
-  echo "FAIL: non-standard axiom detected" >&2
-  exit 1
-fi
-THM_COUNT="$(echo "$AXIOM_OUT" | grep -c "^'HttpCacheProofs\." || true)"
-if [ "$THM_COUNT" -ne 24 ]; then
-  echo "FAIL: expected 24 theorems in CheckAxioms, got $THM_COUNT" >&2
-  exit 1
-fi
-echo "CheckAxioms: $THM_COUNT theorems verified, standard axioms only"
-
-echo "=== [6/7] Lean EvalDiff ==="
-LEAN_DIFF_OUT="$(cd "$PROJ" && lake env lean "$PROJ/EvalDiff.lean")"
-echo "$LEAN_DIFF_OUT"
-if echo "$LEAN_DIFF_OUT" | grep -q "FAIL"; then
-  echo "FAIL: Lean EvalDiff reported FAIL" >&2
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_TMP="$(mktemp -d /tmp/http_cache-diff.XXXXXX)"
-trap 'rm -rf "$DIFF_TMP"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
-mkdir -p "$DIFF_TMP/src"
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
 
-cat > "$DIFF_TMP/pion.toml" <<EOF
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "http_cache_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 http_cache = { path = "$PKG_DIR" }
 EOF
-
-cat > "$DIFF_TMP/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "http_cache"
 
-fn check_i64(w : World, label : String, actual : Int64, expected : Int64) -> Unit {
-  if actual == expected { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
 
-fn check_i32(w : World, label : String, actual : Int, expected : Int) -> Unit {
-  if actual == expected { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn check_bool(w : World, label : String, actual : Bool, expected : Bool) -> Unit {
-  if actual == expected { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-pub fn main(w : World) -> Int {
-  check_i64(w, "add_0_0", http_cache::clamped_add_i64(0L, 0L), 0L)
-  check_i64(w, "add_10_20", http_cache::clamped_add_i64(10L, 20L), 30L)
-  check_i64(w, "add_clamp", http_cache::clamped_add_i64(2147483640L, 100L), 2147483648L)
-  check_i64(w, "add_ovf", http_cache::clamped_add_i64(9223372036854775807L, 1L), 2147483648L)
-  check_i64(w, "sub_le", http_cache::clamped_sub_i64(100L, 200L), 0L)
-  check_i64(w, "sub_eq", http_cache::clamped_sub_i64(500L, 500L), 0L)
-  check_i64(w, "sub_mid", http_cache::clamped_sub_i64(1000L, 250L), 750L)
-  check_i64(w, "sub_clamp", http_cache::clamped_sub_i64(5000000000L, 0L), 2147483648L)
-  check_i64(w, "sub_extreme", http_cache::clamped_sub_i64(9223372036854775807L, -100L), 2147483648L)
-  check_i64(w, "iage_app", http_cache::compute_initial_age_core(50L, 10L, 100L, 105L), 50L)
-  check_i64(w, "iage_corr", http_cache::compute_initial_age_core(5L, 10L, 100L, 125L), 35L)
-  check_i64(w, "cage_0", http_cache::compute_current_age_core(30L, 1000L, 900L), 30L)
-  check_i64(w, "cage_60", http_cache::compute_current_age_core(30L, 1000L, 1060L), 90L)
-  check_i64(w, "cage_cap", http_cache::compute_current_age_core(2147483640L, 1000L, 2000L), 2147483648L)
-  check_bool(w, "hc_200", http_cache::is_heuristically_cacheable_status(200), true)
-  check_bool(w, "hc_206", http_cache::is_heuristically_cacheable_status(206), false)
-  check_bool(w, "hc_308", http_cache::is_heuristically_cacheable_status(308), true)
-  check_bool(w, "hc_410", http_cache::is_heuristically_cacheable_status(410), true)
-  check_bool(w, "hc_501", http_cache::is_heuristically_cacheable_status(501), true)
-  check_bool(w, "hc_500", http_cache::is_heuristically_cacheable_status(500), false)
-  check_bool(w, "us_302", http_cache::is_understood_status(302), true)
-  check_bool(w, "us_206", http_cache::is_understood_status(206), false)
-  check_bool(w, "us_418", http_cache::is_understood_status(418), false)
-  check_bool(w, "lim_def", http_cache::limits_all_nonneg(http_cache::CacheLimits::default()), true)
-  check_bool(w, "lim_neg", http_cache::limits_all_nonneg(http_cache::CacheLimits::new(-1, 1, 1, 1, 1L, 1, 1L)), false)
-  check_bool(w, "dig_0", http_cache::is_ascii_digit(48), true)
-  check_bool(w, "dig_9", http_cache::is_ascii_digit(57), true)
-  check_bool(w, "dig_a", http_cache::is_ascii_digit(97), false)
-  check_bool(w, "leap_2000", http_cache::is_leap_year(2000), true)
-  check_bool(w, "leap_1900", http_cache::is_leap_year(1900), false)
-  check_bool(w, "leap_2024", http_cache::is_leap_year(2024), true)
-  check_bool(w, "leap_2025", http_cache::is_leap_year(2025), false)
-  check_i32(w, "dim_feb24", http_cache::days_in_month(2024, 2), 29)
-  check_i32(w, "dim_feb25", http_cache::days_in_month(2025, 2), 28)
-  check_i32(w, "dim_apr", http_cache::days_in_month(2025, 4), 30)
-  check_i32(w, "dim_dec", http_cache::days_in_month(2025, 12), 31)
+pub fn main(world : World) -> Int {
+  io_println(world, "add_0_0=" + http_cache::clamped_add_i64(0L, 0L).to_string())
+  io_println(world, "add_10_20=" + http_cache::clamped_add_i64(10L, 20L).to_string())
+  io_println(world, "add_clamp=" + http_cache::clamped_add_i64(2147483640L, 100L).to_string())
+  io_println(world, "add_ovf=" + http_cache::clamped_add_i64(9223372036854775807L, 1L).to_string())
+  io_println(world, "sub_le=" + http_cache::clamped_sub_i64(100L, 200L).to_string())
+  io_println(world, "sub_eq=" + http_cache::clamped_sub_i64(500L, 500L).to_string())
+  io_println(world, "sub_mid=" + http_cache::clamped_sub_i64(1000L, 250L).to_string())
+  io_println(world, "sub_clamp=" + http_cache::clamped_sub_i64(5000000000L, 0L).to_string())
+  io_println(world, "sub_extreme=" + http_cache::clamped_sub_i64(9223372036854775807L, -100L).to_string())
+  io_println(world, "iage_app=" + http_cache::compute_initial_age_core(50L, 10L, 100L, 105L).to_string())
+  io_println(world, "iage_corr=" + http_cache::compute_initial_age_core(5L, 10L, 100L, 125L).to_string())
+  io_println(world, "cage_0=" + http_cache::compute_current_age_core(30L, 1000L, 900L).to_string())
+  io_println(world, "cage_60=" + http_cache::compute_current_age_core(30L, 1000L, 1060L).to_string())
+  io_println(world, "cage_cap=" + http_cache::compute_current_age_core(2147483640L, 1000L, 2000L).to_string())
+  io_println(world, "hc_200=" + bstr(http_cache::is_heuristically_cacheable_status(200)))
+  io_println(world, "hc_206=" + bstr(http_cache::is_heuristically_cacheable_status(206)))
+  io_println(world, "hc_308=" + bstr(http_cache::is_heuristically_cacheable_status(308)))
+  io_println(world, "hc_410=" + bstr(http_cache::is_heuristically_cacheable_status(410)))
+  io_println(world, "hc_501=" + bstr(http_cache::is_heuristically_cacheable_status(501)))
+  io_println(world, "hc_500=" + bstr(http_cache::is_heuristically_cacheable_status(500)))
+  io_println(world, "us_302=" + bstr(http_cache::is_understood_status(302)))
+  io_println(world, "us_206=" + bstr(http_cache::is_understood_status(206)))
+  io_println(world, "us_418=" + bstr(http_cache::is_understood_status(418)))
+  io_println(world, "leap_2000=" + bstr(http_cache::is_leap_year(2000)))
+  io_println(world, "leap_1900=" + bstr(http_cache::is_leap_year(1900)))
+  io_println(world, "leap_2024=" + bstr(http_cache::is_leap_year(2024)))
+  io_println(world, "leap_2025=" + bstr(http_cache::is_leap_year(2025)))
+  io_println(world, "dim_feb24=" + http_cache::days_in_month(2024, 2).to_string())
+  io_println(world, "dim_feb25=" + http_cache::days_in_month(2025, 2).to_string())
+  io_println(world, "dim_apr=" + http_cache::days_in_month(2025, 4).to_string())
+  io_println(world, "dim_dec=" + http_cache::days_in_month(2025, 12).to_string())
   0
 }
 EOF
-
-printf '%s\n' "$LEAN_DIFF_OUT" > "$DIFF_TMP/lean.out"
-PION_CACHE_DIR="$DIFF_TMP/cache" pionc run "$DIFF_TMP" > "$DIFF_TMP/pion.out"
-diff -u "$DIFF_TMP/lean.out" "$DIFF_TMP/pion.out"
-CASE_COUNT="$(wc -l < "$DIFF_TMP/lean.out" | tr -d ' ')"
-echo "Native vs Lean differential: $CASE_COUNT cases identical (diff -u exit 0)"
-echo "PASS: packages/http_cache Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

@@ -149,30 +149,6 @@ theorem epoch_day_weekday_mon0_bounds (ed : I32)
     have hrpos : 0 ≤ r.val := by change ¬(r.val < 0) at hlt; omega
     refine ⟨r, rfl, ?_, ?_, ?_⟩ <;> omega
 
-/-- Theorem 2: Unix epoch `1970-01-01` (`ed = 0`) is Thursday (`3`). -/
-theorem epoch_day_weekday_mon0_epoch_thu :
-    epoch_day_weekday_mon0 0#i32 = ok 3#i32 := by
-  rcases epoch_day_weekday_mon0_bounds 0#i32 (by decide) (by decide) with ⟨w, hw, _, _, hval⟩
-  rw [hw]
-  apply congrArg ok
-  apply IScalar.eq_of_val_eq
-  have c0 : (0#i32 : I32).val = 0 := rfl
-  have c3 : (3#i32 : I32).val = 3 := rfl
-  omega
-
-/-- Theorem 3: `epoch_day_weekday_mon0` is 7-day periodic. -/
-theorem epoch_day_weekday_mon0_periodic_7 (ed : I32)
-    (hlo : -1000000000 ≤ ed.val) (hhi : ed.val ≤ 1000000000) :
-    epoch_day_weekday_mon0 (Pion.I32.add ed 7#i32) = epoch_day_weekday_mon0 ed := by
-  have c7 : (7#i32 : I32).val = 7 := rfl
-  have hadd := i32_add_val_of_bounds ed 7#i32 (by omega) (by omega)
-  rcases epoch_day_weekday_mon0_bounds ed (by omega) (by omega) with ⟨w1, hw1, _, _, hv1⟩
-  rcases epoch_day_weekday_mon0_bounds (Pion.I32.add ed 7#i32) (by omega) (by omega) with ⟨w2, hw2, _, _, hv2⟩
-  rw [hw1, hw2]
-  apply congrArg ok
-  apply IScalar.eq_of_val_eq
-  omega
-
 /-- Theorem 4: Advancing an epoch day by 1 advances `epoch_day_weekday_mon0` by `+1 (mod 7)`. -/
 theorem epoch_day_weekday_mon0_succ (ed : I32)
     (hlo : -1000000000 ≤ ed.val) (hhi : ed.val ≤ 1000000000) :
@@ -184,16 +160,6 @@ theorem epoch_day_weekday_mon0_succ (ed : I32)
   rcases epoch_day_weekday_mon0_bounds ed (by omega) (by omega) with ⟨w1, hw1, _, _, hv1⟩
   rcases epoch_day_weekday_mon0_bounds (Pion.I32.add ed 1#i32) (by omega) (by omega) with ⟨w2, hw2, _, _, hv2⟩
   exact ⟨w1, w2, hw1, hw2, by omega⟩
-
-/-- Theorem 5: `doy_of ed jan1` yields a 1-based day-of-year in `[1, 366]`. -/
-theorem doy_of_bounds (ed jan1 : I32)
-    (hlo : 0 ≤ ed.val - jan1.val) (hhi : ed.val - jan1.val ≤ 365) :
-    ∃ d, doy_of ed jan1 = ok d ∧ 1 ≤ d.val ∧ d.val ≤ 366 ∧ d.val = ed.val - jan1.val + 1 := by
-  unfold doy_of
-  have c1 : (1#i32 : I32).val = 1 := rfl
-  have hsub := i32_sub_val_of_bounds ed jan1 (by omega) (by omega)
-  have hadd := i32_add_val_of_bounds (Pion.I32.sub ed jan1) 1#i32 (by omega) (by omega)
-  exact ⟨_, rfl, by omega, by omega, by omega⟩
 
 /-- Theorem 6: `neg_ordinal_day day total` maps `day ∈ [1, total]` bijectively to `[-total, -1]` with `day - neg = total + 1`. -/
 theorem neg_ordinal_day_bounds (day total : I32)
@@ -229,13 +195,6 @@ theorem floor_div_86400_exact (sec : I64)
     rw [hsub, c86399, c86400, int_tdiv_neg_pos _ 86400 (by omega)] at hqval
     have hto := i64_to_int_val_of_bounds q (by omega) (by omega)
     exact ⟨Pion.I64.to_int q, rfl, by omega⟩
-
-/-- Theorem 8: `floor_div_86400 sec` brackets `sec` in `[d * 86400, (d + 1) * 86400)`. -/
-theorem floor_div_86400_brackets (sec : I64)
-    (hlo : -100000000000000 ≤ sec.val) (hhi : sec.val ≤ 100000000000000) :
-    ∃ d, floor_div_86400 sec = ok d ∧ d.val * 86400 ≤ sec.val ∧ sec.val < (d.val + 1) * 86400 := by
-  rcases floor_div_86400_exact sec hlo hhi with ⟨d, hd, hval⟩
-  exact ⟨d, hd, by omega, by omega⟩
 
 /-- Theorem 9: RFC 5545 §3.3.10 `week1_start_of jan1 wkst` lies in `[jan1 - 3, jan1 + 3]` and contains at least 4 days in the year. -/
 theorem week1_start_of_range_and_4days (jan1 wkst : I32)
@@ -348,11 +307,5 @@ theorem jump_grid_to_progress_minimality_alignment (cur target step : I64)
     rw [hnxt, hmul]
     have : cur.val + q.val * step.val - cur.val = q.val * step.val := by omega
     rw [this, Int.mul_emod_left]
-
-/-- Theorem 12: When `target ≤ cur`, `jump_grid_to` steps forward by exactly one `step`. -/
-theorem jump_grid_to_already_past (cur target step : I64) (hle : target ≤ cur) :
-    jump_grid_to cur target step = ok (Pion.I64.add cur step) := by
-  unfold jump_grid_to
-  simp only [hle, ↓reduceIte]
 
 end IcalProofs

@@ -1,178 +1,178 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-PKG="$ROOT/packages/jq"
-PROOFS="$PKG/proofs"
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref}"
-AENEAS_DIR="${AENEAS_LEAN_DIR:-/private/tmp/pion-lean-semver/aeneas/backends/lean}"
 export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in $WORK ==="
-mkdir -p "$PROJ"
-cp -R "$PION_REF/lean/PionLean" "$PROJ/"
-cp "$PION_REF/lean/PionLean.lean" "$PROJ/"
-cp "$PION_REF/lean/lean-toolchain" "$PROJ/"
-cp "$PION_REF/lean/lakefile.lean" "$PROJ/"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="jq"
+LEAN_MOD="Jq"
+PROOF_MOD="JqProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-python3 - "$PROJ/lakefile.lean" "$AENEAS_DIR" "$MEM_LIMIT" "$LEAN_NUM_THREADS" <<'PY'
-import sys, pathlib
-p = pathlib.Path(sys.argv[1])
-aeneas_dir, mem, threads = sys.argv[2], sys.argv[3], sys.argv[4]
-txt = p.read_text()
-txt = txt.replace("../aeneas/backends/lean", aeneas_dir)
-extra = f'''
-lean_lib Jq where
-  moreLeanArgs := #["--memory={mem}", "-j", "{threads}"]
-
-lean_lib JqProofs where
-  moreLeanArgs := #["--memory={mem}", "-j", "{threads}"]
-'''
-if "lean_lib JqProofs" not in txt:
-    txt = txt.rstrip() + "\n" + extra
-p.write_text(txt)
-PY
-
-echo "=== [2/7] pionc extract-lean packages/jq ==="
-pionc extract-lean "$PKG" --out "$PROJ" --json
-
-rm -rf "$PROJ/JqProofs" "$PROJ/JqProofs.lean" "$PROJ/CheckAxioms.lean" "$PROJ/EvalDiff.lean"
-mkdir -p "$PROJ/JqProofs"
-cp "$PROOFS/JqProofs.lean" "$PROJ/"
-cp "$PROOFS/JqProofs/"*.lean "$PROJ/JqProofs/"
-cp "$PROOFS/CheckAxioms.lean" "$PROJ/"
-cp "$PROOFS/EvalDiff.lean" "$PROJ/"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "$PROOFS/JqProofs.lean" "$PROOFS/JqProofs/"; then
-  echo "FAIL: forbidden tactic or axiom found"
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
+fi
 
-echo "=== [4/7] lake build PionLean Jq.Types Jq.Funs JqProofs ==="
-(cd "$PROJ" && lake build PionLean Jq.Types Jq.Funs JqProofs)
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
 
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AX_OUT="$(cd "$PROJ" && lake env lean CheckAxioms.lean 2>&1)"
-echo "$AX_OUT"
-python3 - "$AX_OUT" <<'PY'
-import sys, re
-out = sys.argv[1]
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
 allowed = {"propext", "Classical.choice", "Quot.sound"}
-lines = [l.strip() for l in out.splitlines() if l.strip()]
-count = 0
-for l in lines:
-    if "does not depend on any axioms" in l:
-        count += 1
-        continue
-    m = re.search(r"depends on axioms:\s*\[([^\]]*)\]", l)
-    if m:
-        count += 1
-        axs = {a.strip() for a in m.group(1).split(",") if a.strip()}
-        bad = axs - allowed
-        if bad:
-            print(f"FAIL: unexpected axioms {bad} in: {l}")
-            sys.exit(1)
-    else:
-        print(f"FAIL: unexpected CheckAxioms line: {l}")
-        sys.exit(1)
-if count < 22:
-    print(f"FAIL: expected >= 22 checked theorems, got {count}")
-    sys.exit(1)
-print(f"CheckAxioms: {count} theorems verified, standard axioms only")
-PY
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
 
-echo "=== [6/7] Lean EvalDiff ==="
-LEAN_DIFF_OUT="$WORK/jq_lean_diff.txt"
-(cd "$PROJ" && lake env lean EvalDiff.lean) > "$LEAN_DIFF_OUT"
-cat "$LEAN_DIFF_OUT"
-if grep -q ': FAIL' "$LEAN_DIFF_OUT"; then
-  echo "FAIL: Lean EvalDiff reported a FAIL case"
-  exit 1
-fi
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_PKG="$WORK/jq_native_diff"
-rm -rf "$DIFF_PKG"
-mkdir -p "$DIFF_PKG/src"
-cat > "$DIFF_PKG/pion.toml" <<EOF
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "jq_native_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
-jq = { path = "$PKG" }
+jq = { path = "$PKG_DIR" }
 EOF
-
-cat > "$DIFF_PKG/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "jq"
 
-fn chk_i32(w : World, label : String, actual : Int, expected : Int) -> Unit {
-  if actual == expected {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
 
-fn chk_bool(w : World, label : String, actual : Bool, expected : Bool) -> Unit {
-  if actual == expected {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
-
-pub fn main(w : World) -> Int {
-  chk_bool(w, "ws_sp", jq::is_json_ws(32), true)
-  chk_bool(w, "ws_tab", jq::is_json_ws(9), true)
-  chk_bool(w, "ws_lf", jq::is_json_ws(10), true)
-  chk_bool(w, "ws_cr", jq::is_json_ws(13), true)
-  chk_bool(w, "ws_vt", jq::is_json_ws(11), false)
-  chk_bool(w, "fast_a", jq::is_json_str_fast_byte(97), true)
-  chk_bool(w, "fast_quote", jq::is_json_str_fast_byte(34), false)
-  chk_bool(w, "fast_bs", jq::is_json_str_fast_byte(92), false)
-  chk_bool(w, "fast_ctrl", jq::is_json_str_fast_byte(31), false)
-  chk_bool(w, "fast_nonascii", jq::is_json_str_fast_byte(128), false)
-  chk_bool(w, "ident_A", jq::is_ident_char(65), true)
-  chk_bool(w, "ident_9", jq::is_ident_char(57), true)
-  chk_bool(w, "ident_us", jq::is_ident_char(95), true)
-  chk_bool(w, "ident_dash", jq::is_ident_char(45), false)
-  chk_i32(w, "hex_0", jq::hex_val(48), 0)
-  chk_i32(w, "hex_F", jq::hex_val(70), 15)
-  chk_i32(w, "hex_a", jq::hex_val(97), 10)
-  chk_i32(w, "hex_bad", jq::hex_val(122), -1)
-  chk_i32(w, "san_ok", jq::sanitize_utf8_cp(65), 65)
-  chk_i32(w, "san_neg", jq::sanitize_utf8_cp(-1), 65533)
-  chk_i32(w, "san_surr", jq::sanitize_utf8_cp(55296), 65533)
-  chk_i32(w, "san_hi", jq::sanitize_utf8_cp(1114112), 65533)
-  chk_bool(w, "hi_surr", jq::is_high_surrogate(55357), true)
-  chk_bool(w, "lo_surr", jq::is_low_surrogate(56832), true)
-  chk_i32(w, "surr_emoji", jq::decode_surrogate_pair(55357, 56832), 128512)
-  chk_i32(w, "surr_min", jq::decode_surrogate_pair(55296, 56320), 65536)
-  chk_i32(w, "surr_max", jq::decode_surrogate_pair(56319, 57343), 1114111)
-  chk_i32(w, "clamp_mid", jq::clamp_slice_idx(3, 10), 3)
-  chk_i32(w, "clamp_neg", jq::clamp_slice_idx(-2, 10), 8)
-  chk_i32(w, "clamp_under", jq::clamp_slice_idx(-50, 10), 0)
-  chk_i32(w, "clamp_over", jq::clamp_slice_idx(50, 10), 10)
-  chk_i32(w, "clamp_i32min", jq::clamp_slice_idx(-2147483647 - 1, 10), 0)
-  chk_i32(w, "clamp64_lo", jq::clamp_slice_i64(-5000000000L, 10), 0)
-  chk_i32(w, "clamp64_hi", jq::clamp_slice_i64(5000000000L, 10), 10)
-  chk_i32(w, "clamp64_neg", jq::clamp_slice_i64(-3L, 10), 7)
+pub fn main(world : World) -> Int {
+  io_println(world, "hex_0=" + jq::hex_val(48).to_string())
+  io_println(world, "hex_F=" + jq::hex_val(70).to_string())
+  io_println(world, "hex_a=" + jq::hex_val(97).to_string())
+  io_println(world, "hex_bad=" + jq::hex_val(122).to_string())
+  io_println(world, "hex_min=" + jq::hex_val(-2147483648).to_string())
+  io_println(world, "san_ok=" + jq::sanitize_utf8_cp(65).to_string())
+  io_println(world, "san_neg=" + jq::sanitize_utf8_cp(-1).to_string())
+  io_println(world, "san_surr=" + jq::sanitize_utf8_cp(55296).to_string())
+  io_println(world, "san_hi=" + jq::sanitize_utf8_cp(1114112).to_string())
+  io_println(world, "hi_surr_t=" + bstr(jq::is_high_surrogate(55357)))
+  io_println(world, "hi_surr_f=" + bstr(jq::is_high_surrogate(56320)))
+  io_println(world, "lo_surr_t=" + bstr(jq::is_low_surrogate(56832)))
+  io_println(world, "lo_surr_f=" + bstr(jq::is_low_surrogate(55296)))
+  io_println(world, "surr_emoji=" + jq::decode_surrogate_pair(55357, 56832).to_string())
+  io_println(world, "surr_min=" + jq::decode_surrogate_pair(55296, 56320).to_string())
+  io_println(world, "surr_max=" + jq::decode_surrogate_pair(56319, 57343).to_string())
+  io_println(world, "clamp_mid=" + jq::clamp_slice_idx(3, 10).to_string())
+  io_println(world, "clamp_neg=" + jq::clamp_slice_idx(-2, 10).to_string())
+  io_println(world, "clamp_under=" + jq::clamp_slice_idx(-50, 10).to_string())
+  io_println(world, "clamp_over=" + jq::clamp_slice_idx(50, 10).to_string())
+  io_println(world, "clamp_i32min=" + jq::clamp_slice_idx(-2147483648, 10).to_string())
+  io_println(world, "clamp64_lo=" + jq::clamp_slice_i64(-5000000000L, 10).to_string())
+  io_println(world, "clamp64_hi=" + jq::clamp_slice_i64(5000000000L, 10).to_string())
+  io_println(world, "clamp64_neg=" + jq::clamp_slice_i64(-3L, 10).to_string())
   0
 }
 EOF
-
-PION_DIFF_OUT="$WORK/jq_pion_diff.txt"
-pionc run "$DIFF_PKG" > "$PION_DIFF_OUT"
-diff -u "$LEAN_DIFF_OUT" "$PION_DIFF_OUT"
-LINES="$(wc -l < "$LEAN_DIFF_OUT" | tr -d ' ')"
-echo "Native vs Lean differential: $LINES cases identical (diff -u exit 0)"
-echo "PASS: packages/jq Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

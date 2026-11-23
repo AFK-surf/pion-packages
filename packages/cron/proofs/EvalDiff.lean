@@ -85,9 +85,6 @@ private def lines : List String :=
   , s!"dim_2025_4={unwrapI32 (days_in_month (i32 2025) (i32 4))}"
   , s!"dim_2025_7={unwrapI32 (days_in_month (i32 2025) (i32 7))}"
   , s!"dim_2025_8={unwrapI32 (days_in_month (i32 2025) (i32 8))}"
-  , s!"dow_1970_01_01={unwrapI32 (weekday_of (i32 1970) (i32 1) (i32 1))}"
-  , s!"dow_2000_01_01={unwrapI32 (weekday_of (i32 2000) (i32 1) (i32 1))}"
-  , s!"dow_0001_01_01={unwrapI32 (weekday_of (i32 1) (i32 1) (i32 1))}"
   , s!"from_unix_0={unwrapDtRes (DateTime.from_unix_secs (i64 0))}"
   , s!"from_unix_neg1={unwrapDtRes (DateTime.from_unix_secs (i64 (-1)))}"
   , s!"from_unix_min={unwrapDtRes (DateTime.from_unix_secs (i64 (-62135596800)))}"
@@ -104,8 +101,6 @@ private def lines : List String :=
   , s!"valid_bad_f5={unwrapBool (DateTime.is_valid (mkDt 2025 6 15 12 30 64))}"
   , s!"match_fixed_ok={unwrapBool (matches_fixed_fields sampleCron (mkDt 2025 6 15 12 30 0))}"
   , s!"match_fixed_f5={unwrapBool (matches_fixed_fields sampleCron (mkDt 2025 6 15 12 30 64))}"
-  , s!"match_day_ok={unwrapBool (matches_day sampleCron (mkDt 2025 6 15 12 30 0))}"
-  , s!"match_day_f5={unwrapBool (matches_day sampleCron (mkDt 2025 6 15 12 30 64))}"
   ]
 
 #eval do

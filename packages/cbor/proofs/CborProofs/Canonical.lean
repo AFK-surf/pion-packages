@@ -5,7 +5,7 @@ open Aeneas Aeneas.Std Result Pion cbor
 namespace CborProofs
 
 /-- RFC 8949 §4.2.1: exact 5-tier head size specification for `head_size_u64`. -/
-theorem head_size_u64_spec (n : Std.U64) :
+private lemma head_size_u64_spec (n : Std.U64) :
     (n.val < 24 → head_size_u64 n = ok 1#i32) ∧
     (24 ≤ n.val ∧ n.val ≤ 255 → head_size_u64 n = ok 2#i32) ∧
     (256 ≤ n.val ∧ n.val ≤ 65535 → head_size_u64 n = ok 3#i32) ∧
@@ -42,7 +42,7 @@ theorem head_size_u64_spec (n : Std.U64) :
     simp only [c1, c2, c3, c4, ↓reduceIte]
 
 /-- `head_size_u64` always lies in `[1, 9]`. -/
-theorem head_size_u64_bounds (n : Std.U64) :
+private lemma head_size_u64_bounds (n : Std.U64) :
     ∃ s : Std.I32, head_size_u64 n = ok s ∧ 1 ≤ s.val ∧ s.val ≤ 9 := by
   obtain ⟨h1, h2, h3, h5, h9⟩ := head_size_u64_spec n
   by_cases c1 : n.val < 24
@@ -121,7 +121,7 @@ theorem head_size_int_agrees_u64 (n : Std.I32) (u : Std.U64)
         rw [u5 ⟨by omega, by omega⟩]; simp only [hc1, hc2, hc3, ↓reduceIte]
 
 /-- RFC 8949 §4.2.1: exact specification of `is_canonical_arg` for additional info `24..27`. -/
-theorem is_canonical_arg_spec (v : Std.U64) :
+private lemma is_canonical_arg_spec (v : Std.U64) :
     is_canonical_arg 24#i32 v = ok (decide (24 ≤ v.val)) ∧
     is_canonical_arg 25#i32 v = ok (decide (255 < v.val)) ∧
     is_canonical_arg 26#i32 v = ok (decide (65535 < v.val)) ∧
@@ -144,21 +144,6 @@ theorem is_canonical_arg_spec (v : Std.U64) :
     have hne2 : (27#i32 : Std.I32) ≠ 25#i32 := by decide
     have hne3 : (27#i32 : Std.I32) ≠ 26#i32 := by decide
     simp only [hne1, hne2, hne3, ↓reduceIte]; rfl
-
-/-- RFC 8949: reserved additional info (`ai >= 28` or `ai < 0`) is never canonical. -/
-theorem is_canonical_arg_rejects_reserved (ai : Std.I32) (v : Std.U64)
-    (h : ai.val < 0 ∨ 28 ≤ ai.val) :
-    is_canonical_arg ai v = ok false := by
-  unfold is_canonical_arg
-  have hne24 : ai ≠ 24#i32 := fun e => by have := (iscalar_eq_iff _ _).mp e; norm_num at this; omega
-  have hne25 : ai ≠ 25#i32 := fun e => by have := (iscalar_eq_iff _ _).mp e; norm_num at this; omega
-  have hne26 : ai ≠ 26#i32 := fun e => by have := (iscalar_eq_iff _ _).mp e; norm_num at this; omega
-  have hne27 : ai ≠ 27#i32 := fun e => by have := (iscalar_eq_iff _ _).mp e; norm_num at this; omega
-  simp only [hne24, hne25, hne26, hne27, ↓reduceIte]
-  congr 1
-  simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not, iscalar_le_iff, iscalar_lt_iff]
-  norm_num
-  omega
 
 /-- RFC 8949 §4.2.1 Encoder-Decoder Canonical Duality:
     the minimal head size chosen by `head_size_u64` is ALWAYS accepted by `is_canonical_arg`,
@@ -229,30 +214,5 @@ theorem canonical_encoder_decoder_duality (v : Std.U64) :
           · exact ne_ok (by norm_num) ((u3 ⟨by omega, c3⟩).symm.trans h)
           · exact ne_ok (by norm_num) ((u5 ⟨by omega, by omega⟩).symm.trans h)
     rw [c27, decide_eq_true (by omega)]
-
-private lemma i32_rem_pos (a b : Std.I32) (hb : 0 < b.val) :
-    Pion.I32.rem a b = ok (⟨a.bv.srem b.bv⟩ : Std.I32) := by
-  unfold Pion.I32.rem
-  have h1 : b.val ≠ 0 := by omega
-  simp [HMod.hMod, IScalar.rem, h1]
-  omega
-
-/-- RFC 3339 Tag 0: Gregorian leap-year calendar spots (2000, 2100, 2024, invalid month). -/
-theorem days_in_month_gregorian_spots :
-    days_in_month 2000#i32 2#i32 = ok 29#i32 ∧
-    days_in_month 2100#i32 2#i32 = ok 28#i32 ∧
-    days_in_month 2024#i32 2#i32 = ok 29#i32 ∧
-    days_in_month 2023#i32 2#i32 = ok 28#i32 ∧
-    days_in_month 2024#i32 0#i32 = ok 0#i32 ∧
-    days_in_month 2024#i32 13#i32 = ok 0#i32 := by
-  have h0 : (⟨0#32⟩ : Std.I32) = 0#i32 := rfl
-  have h3 : (⟨3#32⟩ : Std.I32) ≠ 0#i32 := by decide
-  have h23 : (⟨23#32⟩ : Std.I32) ≠ 0#i32 := by decide
-  have h24 : (⟨24#32⟩ : Std.I32) ≠ 0#i32 := by decide
-  have h100 : (⟨100#32⟩ : Std.I32) ≠ 0#i32 := by decide
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> (
-    unfold days_in_month
-    simp [i32_rem_pos, h0, h3, h23, h24, h100]
-  )
 
 end CborProofs

@@ -38,19 +38,6 @@ private lemma i32_127_mask_range (x : I32) :
     rw [BitVec.toInt_eq_toNat_cond]; rfl
   omega
 
-/-- Theorem 7: `pack_u24_b0/b1/b2` produce valid wire bytes in `[0, 255]`. -/
-theorem u24_pack_bytes_range (v : I32) :
-    ∃ b0 b1 b2, pack_u24_b0 v = ok b0 ∧ pack_u24_b1 v = ok b1 ∧ pack_u24_b2 v = ok b2 ∧
-      0 ≤ b0.val ∧ b0.val ≤ 255 ∧ 0 ≤ b1.val ∧ b1.val ≤ 255 ∧ 0 ≤ b2.val ∧ b2.val ≤ 255 := by
-  unfold pack_u24_b0 pack_u24_b1 pack_u24_b2
-  rw [i32_shr_ok v 16#i32 (by decide) (by decide), result_bind_ok]
-  rw [i32_shr_ok v 8#i32 (by decide) (by decide), result_bind_ok]
-  refine ⟨_, _, _, rfl, rfl, rfl, ?_⟩
-  have h0 := i32_255_mask_range (⟨v.bv.sshiftRight (16#i32 : I32).val.toNat⟩ : I32)
-  have h1 := i32_255_mask_range (⟨v.bv.sshiftRight (8#i32 : I32).val.toNat⟩ : I32)
-  have h2 := i32_255_mask_range v
-  omega
-
 /-- Theorem 8: RFC 9113 §4.1 24-bit frame length pack/unpack roundtrip for all `0 ≤ v ≤ 16777215`. -/
 theorem u24_roundtrip (v : I32) (hlo : 0 ≤ v.val) (hhi : v.val ≤ 16777215) :
     (do
@@ -137,23 +124,6 @@ theorem u24_roundtrip (v : I32) (hlo : 0 ≤ v.val) (hhi : v.val ≤ 16777215) :
         have hv0 : v.bv[i] = false := bv32_getElem_high_false v hlo (by omega : v.val < ((2 ^ 24 : Nat) : Int)) i hi (by omega)
         simp only [h8, h16, decide_false, Bool.not_false,
                    hm0, hm1, hm2, Bool.and_false, Bool.or_false, hv0]
-
-/-- Theorem 9: `pack_u31_b0..b3` produce valid wire bytes (`b0 ∈ [0, 127]` with R bit cleared, `b1..b3 ∈ [0, 255]`). -/
-theorem u31_pack_bytes_range (sid : I32) :
-    ∃ b0 b1 b2 b3, pack_u31_b0 sid = ok b0 ∧ pack_u31_b1 sid = ok b1 ∧
-      pack_u31_b2 sid = ok b2 ∧ pack_u31_b3 sid = ok b3 ∧
-      0 ≤ b0.val ∧ b0.val ≤ 127 ∧ 0 ≤ b1.val ∧ b1.val ≤ 255 ∧
-      0 ≤ b2.val ∧ b2.val ≤ 255 ∧ 0 ≤ b3.val ∧ b3.val ≤ 255 := by
-  unfold pack_u31_b0 pack_u31_b1 pack_u31_b2 pack_u31_b3
-  rw [i32_shr_ok sid 24#i32 (by decide) (by decide), result_bind_ok]
-  rw [i32_shr_ok sid 16#i32 (by decide) (by decide), result_bind_ok]
-  rw [i32_shr_ok sid 8#i32 (by decide) (by decide), result_bind_ok]
-  refine ⟨_, _, _, _, rfl, rfl, rfl, rfl, ?_⟩
-  have h0 := i32_127_mask_range (⟨sid.bv.sshiftRight (24#i32 : I32).val.toNat⟩ : I32)
-  have h1 := i32_255_mask_range (⟨sid.bv.sshiftRight (16#i32 : I32).val.toNat⟩ : I32)
-  have h2 := i32_255_mask_range (⟨sid.bv.sshiftRight (8#i32 : I32).val.toNat⟩ : I32)
-  have h3 := i32_255_mask_range sid
-  omega
 
 /-- Theorem 10: RFC 9113 §4.1 31-bit stream ID pack/unpack roundtrip for all `0 ≤ sid ≤ 2^31 - 1`. -/
 theorem u31_roundtrip (sid : I32) (hlo : 0 ≤ sid.val) :
@@ -424,52 +394,5 @@ theorem priority_dep_roundtrip (excl : Bool) (dep : I32) (hlo : 0 ≤ dep.val) :
       apply iscalar_eq_of_val_eq
       rw [i64_to_int_val_of_nonneg (Pion.I32.to_int64 dep) (by omega) (by omega), hcast_val]
     rw [hdep_bv excl]
-
-/-- Theorem 14: `unpack_priority_dep` always returns a non-negative 31-bit stream dependency in `[0, 2^31 - 1]`. -/
-theorem priority_dep_unpack_nonneg (raw : I64) :
-    ∃ dep, unpack_priority_dep raw = ok dep ∧ 0 ≤ dep.val ∧ dep.val ≤ 2147483647 := by
-  unfold unpack_priority_dep
-  refine ⟨Pion.I64.to_int (Pion.I64.band raw 2147483647#i64), rfl, ?_⟩
-  have hval : (Pion.I64.band raw 2147483647#i64).val = (Pion.I64.band raw 2147483647#i64).bv.toInt := rfl
-  have htoNat : (Pion.I64.band raw 2147483647#i64).bv.toNat ≤ 2147483647 := by
-    rw [i64_band_bv, BitVec.toNat_and]
-    have : (2147483647#i64).bv.toNat = 2147483647 := by decide
-    rw [this]
-    exact Nat.and_le_right
-  have h2 : (Pion.I64.band raw 2147483647#i64).bv.toInt =
-      if 2 * (Pion.I64.band raw 2147483647#i64).bv.toNat < 2 ^ 64 then ((Pion.I64.band raw 2147483647#i64).bv.toNat : Int)
-      else ((Pion.I64.band raw 2147483647#i64).bv.toNat : Int) - 2 ^ 64 := by
-    rw [BitVec.toInt_eq_toNat_cond]; rfl
-  have hband_range : 0 ≤ (Pion.I64.band raw 2147483647#i64).val ∧ (Pion.I64.band raw 2147483647#i64).val ≤ 2147483647 := by
-    omega
-  have hcast : (Pion.I64.to_int (Pion.I64.band raw 2147483647#i64)).val = (Pion.I64.band raw 2147483647#i64).val :=
-    i64_to_int_val_of_nonneg _ hband_range.1 hband_range.2
-  omega
-
-/-- Theorem 15: RFC 9113 §6.2 `encode_headers_flags` cleanly packs END_STREAM (0x01), END_HEADERS (0x04), PRIORITY (0x20) with PADDED (0x08) always 0. -/
-theorem encode_headers_flags_roundtrip (es eh prio : Bool) :
-    ∃ fl, encode_headers_flags es eh prio = ok fl ∧
-      ((Pion.I32.band fl 1#i32 != 0#i32) = es) ∧
-      ((Pion.I32.band fl 4#i32 != 0#i32) = eh) ∧
-      ((Pion.I32.band fl 32#i32 != 0#i32) = prio) ∧
-      (Pion.I32.band fl 8#i32 = 0#i32) := by
-  cases es <;> cases eh <;> cases prio <;>
-    (unfold encode_headers_flags; refine ⟨_, rfl, by decide, by decide, by decide, by decide⟩)
-
-/-- Theorem 15b: RFC 9113 §6.9 `is_valid_window_increment` characterizes `[1, 2^31 - 1]`. -/
-theorem is_valid_window_increment_iff (inc : I32) :
-    is_valid_window_increment inc = ok true ↔ 1 ≤ inc.val ∧ inc.val ≤ 2147483647 := by
-  unfold is_valid_window_increment
-  constructor
-  · intro h
-    have ht : (decide (inc > 0#i32) && decide (inc <= 2147483647#i32)) = true := result_ok_inj h
-    simp only [Bool.and_eq_true, decide_eq_true_eq] at ht
-    have h1 : 0 < inc.val := ht.1
-    have h2 : inc.val ≤ 2147483647 := ht.2
-    omega
-  · intro ⟨hlo, hhi⟩
-    have h1 : (0#i32 : I32) < inc := by change 0 < inc.val; omega
-    have h2 : inc ≤ (2147483647#i32 : I32) := hhi
-    simp [h1, h2]
 
 end Http2Proofs

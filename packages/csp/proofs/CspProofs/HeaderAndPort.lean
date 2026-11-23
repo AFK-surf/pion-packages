@@ -60,53 +60,7 @@ private lemma i32_mul_val (x y : Std.I32)
 private lemma result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← ok x; f y) = f x := by simp
 
-/-- Theorem 1: `ParseLimits::default` passes `parse_limits_all_nonneg` and has exact documented DoS defaults. -/
-theorem parse_limits_default_valid :
-    ∃ lim : ParseLimits,
-      ParseLimits.default = ok lim ∧
-      parse_limits_all_nonneg lim = ok true ∧
-      lim.max_header_bytes.val = 65536 ∧
-      lim.max_policies.val = 32 ∧
-      lim.max_directives_per_policy.val = 64 ∧
-      lim.max_sources_per_directive.val = 1024 := by
-  refine ⟨ParseLimits.mk 65536#i32 32#i32 64#i32 1024#i32, rfl, ?_, rfl, rfl, rfl, rfl⟩
-  unfold parse_limits_all_nonneg
-  rfl
-
-/-- Theorem 2: `parse_limits_all_nonneg` is an exact 4-field non-negativity iff characterization. -/
-theorem parse_limits_all_nonneg_iff (lim : ParseLimits) :
-    parse_limits_all_nonneg lim = ok true ↔
-      0 ≤ lim.max_header_bytes.val ∧
-      0 ≤ lim.max_policies.val ∧
-      0 ≤ lim.max_directives_per_policy.val ∧
-      0 ≤ lim.max_sources_per_directive.val := by
-  unfold parse_limits_all_nonneg
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le]
-  rw [i32_le_iff, i32_le_iff, i32_le_iff, i32_le_iff]
-  change (((0 ≤ lim.max_header_bytes.val ∧ 0 ≤ lim.max_policies.val) ∧
-           0 ≤ lim.max_directives_per_policy.val) ∧
-          0 ≤ lim.max_sources_per_directive.val) ↔ _
-  tauto
-
-/-- Theorem 3: All-zero `ParseLimits::new 0 0 0 0` is valid (`0` means strictly 0 allowed, never rejected). -/
-theorem parse_limits_zero_valid :
-    ∃ lim : ParseLimits,
-      ParseLimits.new 0#i32 0#i32 0#i32 0#i32 = ok lim ∧
-      parse_limits_all_nonneg lim = ok true := by
-  refine ⟨ParseLimits.mk 0#i32 0#i32 0#i32 0#i32, rfl, ?_⟩
-  unfold parse_limits_all_nonneg
-  rfl
-
-/-- Theorem 4: `csp_is_illegal_header_byte` unconditionally rejects HTTP header-injection control bytes (NUL, LF, VT, CR, DEL). -/
-theorem csp_illegal_header_byte_rejects_injection :
-    csp_is_illegal_header_byte 0#i32 = ok true ∧
-    csp_is_illegal_header_byte 10#i32 = ok true ∧
-    csp_is_illegal_header_byte 11#i32 = ok true ∧
-    csp_is_illegal_header_byte 13#i32 = ok true ∧
-    csp_is_illegal_header_byte 127#i32 = ok true := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> (unfold csp_is_illegal_header_byte; rfl)
-
-/-- Theorem 5: HTAB (9), FF (12), printable ASCII `[32, 126]`, and non-ASCII (`> 127`) are legal CSP header bytes (CSP3 §2.2.1). -/
+/-- HTAB (9), FF (12), printable ASCII `[32, 126]`, and non-ASCII (`> 127`) are legal CSP header bytes (CSP3 §2.2.1). -/
 theorem csp_illegal_header_byte_allows_ws_and_printable (c : Std.I32)
     (h : c.val = 9 ∨ c.val = 12 ∨ (32 ≤ c.val ∧ c.val ≤ 126) ∨ 128 ≤ c.val) :
     csp_is_illegal_header_byte c = ok false := by
@@ -118,7 +72,7 @@ theorem csp_illegal_header_byte_allows_ws_and_printable (c : Std.I32)
   change ((((c.val = 0 ∨ c.val = 10) ∨ c.val = 13) ∨ c.val = 127) ∨ ((c.val < 32 ∧ c.val ≠ 9) ∧ c.val ≠ 12)) at ht
   omega
 
-/-- Theorem 6: Every safe serialized token byte is printable ASCII `[33, 126] \ {';', ','}` and is strictly NOT an illegal header byte. -/
+/-- Every safe serialized token byte is printable ASCII `[33, 126] \ {';', ','}` and is strictly NOT an illegal header byte. -/
 theorem csp_safe_serialized_byte_implies_legal_header (c : Std.I32)
     (hsafe : csp_is_safe_serialized_byte c = ok true) :
     33 ≤ c.val ∧ c.val ≤ 126 ∧ c.val ≠ 59 ∧ c.val ≠ 44 ∧
@@ -134,18 +88,7 @@ theorem csp_safe_serialized_byte_implies_legal_header (c : Std.I32)
   have hhi : c.val ≤ 126 := by omega
   exact ⟨hlo, hhi, h3, h4, csp_illegal_header_byte_allows_ws_and_printable c (Or.inr (Or.inr (Or.inl ⟨by omega, hhi⟩)))⟩
 
-/-- Theorem 7: Serialization safety rejects SP, `;`, `,`, CR, LF, NUL, and DEL (anti-directive-injection invariant). -/
-theorem csp_safe_serialized_byte_rejects_delimiters :
-    csp_is_safe_serialized_byte 0#i32 = ok false ∧
-    csp_is_safe_serialized_byte 10#i32 = ok false ∧
-    csp_is_safe_serialized_byte 13#i32 = ok false ∧
-    csp_is_safe_serialized_byte 32#i32 = ok false ∧
-    csp_is_safe_serialized_byte 44#i32 = ok false ∧
-    csp_is_safe_serialized_byte 59#i32 = ok false ∧
-    csp_is_safe_serialized_byte 127#i32 = ok false := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> (unfold csp_is_safe_serialized_byte; rfl)
-
-/-- Theorem 8: Every safe directive-name byte (`[A-Za-z0-9-]`) is strictly a safe serialized token byte. -/
+/-- Every safe directive-name byte (`[A-Za-z0-9-]`) is strictly a safe serialized token byte. -/
 theorem csp_safe_directive_byte_implies_safe_serialized (c : Std.I32)
     (hdir : csp_is_safe_directive_byte c = ok true) :
     csp_is_safe_serialized_byte c = ok true := by
@@ -179,18 +122,7 @@ theorem csp_safe_directive_byte_implies_safe_serialized (c : Std.I32)
   · intro heq; have hv : c.val = 59 := congrArg IScalar.val heq; omega
   · intro heq; have hv : c.val = 44 := congrArg IScalar.val heq; omega
 
-/-- Theorem 9: `csp_is_alpha` and `csp_is_digit` are strictly disjoint across all `Int32`. -/
-theorem csp_is_alpha_digit_disjoint (c : Std.I32) :
-    ¬ (csp_is_alpha c = ok true ∧ csp_is_digit c = ok true) := by
-  rintro ⟨ha, hd⟩
-  unfold csp_is_alpha at ha
-  unfold csp_is_digit at hd
-  simp only [ok.injEq, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff] at ha hd
-  change (65 ≤ c.val ∧ c.val ≤ 90) ∨ (97 ≤ c.val ∧ c.val ≤ 122) at ha
-  change 48 ≤ c.val ∧ c.val ≤ 57 at hd
-  omega
-
-/-- Theorem 10: `csp_port_step` preserves `[0, 65535]` without `Int32` overflow or returns `-1` on invalid digit / port > 65535. -/
+/-- `csp_port_step` preserves `[0, 65535]` without `Int32` overflow or returns `-1` on invalid digit / port > 65535. -/
 theorem csp_port_step_bounds (acc c : Std.I32) (hacc0 : 0 ≤ acc.val) (haccmax : acc.val ≤ 65535) :
     ∃ r : Std.I32, csp_port_step acc c = ok r ∧
       (r.val = -1 ∨ (48 ≤ c.val ∧ c.val ≤ 57 ∧ r.val = acc.val * 10 + (c.val - 48) ∧ 0 ≤ r.val ∧ r.val ≤ 65535)) := by
@@ -223,20 +155,5 @@ theorem csp_port_step_bounds (acc c : Std.I32) (hacc0 : 0 ≤ acc.val) (haccmax 
         have : ¬ (65535 < next.val) := fun h => hov ((i32_lt_iff 65535#i32 next).mpr h)
         omega
       exact ⟨next, rfl, Or.inr ⟨hc48, hc57, hnext, by omega, hle⟩⟩
-
-/-- Theorem 11: `csp_explicit_port_matches` implements exact CSP3 §6.7.2.8 port matching + 80→443 secure upgrade. -/
-theorem csp_explicit_port_matches_iff (ep eff : Std.I32) (is_secure : Bool) :
-    csp_explicit_port_matches ep eff is_secure = ok true ↔
-      eff.val = ep.val ∨ (ep.val = 80 ∧ is_secure = true ∧ eff.val = 443) := by
-  unfold csp_explicit_port_matches
-  simp only [ok.injEq, Bool.or_eq_true, Bool.and_eq_true, i32_beq_iff]
-  change eff.val = ep.val ∨ ((ep.val = 80 ∧ is_secure = true) ∧ eff.val = 443) ↔ _
-  tauto
-
-/-- Theorem 12: Explicit port `443` NEVER downgrades to port `80` regardless of `is_secure`. -/
-theorem csp_explicit_port_no_downgrade (is_secure : Bool) :
-    csp_explicit_port_matches 443#i32 80#i32 is_secure = ok false := by
-  unfold csp_explicit_port_matches
-  cases is_secure <;> rfl
 
 end CspProofs

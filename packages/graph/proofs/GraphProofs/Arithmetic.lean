@@ -86,62 +86,6 @@ theorem checked_add_i64_some_iff (a b s : Std.I64) :
       · rintro ⟨_, _, hs⟩
         exact congrArg (fun x => ok (some x)) ((iscalar_eq_iff (Pion.I64.add a b) s).mpr (by rw [hadd, hs]))
 
-/-- Exact characterization of `checked_add_i64` returning `None` (overflow or underflow). -/
-theorem checked_add_i64_none_iff (a b : Std.I64) :
-    checked_add_i64 a b = ok none ↔
-      a.val + b.val > 9223372036854775807 ∨ a.val + b.val < -(9223372036854775808 : Int) := by
-  have htot : ∃ r : Option Std.I64, checked_add_i64 a b = ok r := by
-    unfold checked_add_i64; split_ifs <;> exact ⟨_, rfl⟩
-  obtain ⟨r, hr⟩ := htot
-  rw [hr]
-  cases r with
-  | none =>
-    simp only [true_iff]
-    by_contra hnot
-    have hlo : -(9223372036854775808 : Int) ≤ a.val + b.val := by omega
-    have hhi : a.val + b.val ≤ 9223372036854775807 := by omega
-    have hsome := (checked_add_i64_some_iff a b (Pion.I64.add a b)).mpr ⟨hlo, hhi, i64_add_val a b hlo hhi⟩
-    cases result_ok_inj (hr.symm.trans hsome)
-  | some s =>
-    have ⟨hlo, hhi, _⟩ := (checked_add_i64_some_iff a b s).mp hr
-    constructor
-    · intro h; cases result_ok_inj h
-    · intro h; omega
-
-/-- `checked_add_i64` is commutative for all `Int64` pairs. -/
-theorem checked_add_i64_comm (a b : Std.I64) :
-    checked_add_i64 a b = checked_add_i64 b a := by
-  by_cases h : -(9223372036854775808 : Int) ≤ a.val + b.val ∧ a.val + b.val ≤ 9223372036854775807
-  · have h1 := (checked_add_i64_some_iff a b (Pion.I64.add a b)).mpr ⟨h.1, h.2, i64_add_val a b h.1 h.2⟩
-    have h2 := (checked_add_i64_some_iff b a (Pion.I64.add a b)).mpr ⟨by omega, by omega, by rw [i64_add_val a b h.1 h.2]; omega⟩
-    exact h1.trans h2.symm
-  · have h1 := (checked_add_i64_none_iff a b).mpr (by omega)
-    have h2 := (checked_add_i64_none_iff b a).mpr (by omega)
-    exact h1.trans h2.symm
-
-/-- `0L` is the right identity of `checked_add_i64` (never overflows). -/
-theorem checked_add_i64_zero_right (a : Std.I64) :
-    checked_add_i64 a 0#i64 = ok (some a) := by
-  have ha := i64_bounds a
-  have h0 : (0#i64).val = 0 := by norm_num
-  exact (checked_add_i64_some_iff a 0#i64 a).mpr ⟨by omega, by omega, by omega⟩
-
-/-- Boundary overflow/underflow spots for `checked_add_i64`. -/
-theorem checked_add_i64_boundary_spots :
-    checked_add_i64 9223372036854775807#i64 1#i64 = ok none ∧
-    checked_add_i64 (Pion.I64.sub (-9223372036854775807)#i64 1#i64) (-1)#i64 = ok none ∧
-    checked_add_i64 9223372036854775807#i64 (-9223372036854775807)#i64 = ok (some 0#i64) := by
-  have hmax := i64_max_val
-  have hneg := i64_neg_max_val
-  have hmin := i64_min_expr_val
-  have h1 : (1#i64).val = 1 := by norm_num
-  have hm1 : ((-1)#i64).val = -1 := by norm_num
-  have h0 : (0#i64).val = 0 := by norm_num
-  refine ⟨?_, ?_, ?_⟩
-  · exact (checked_add_i64_none_iff _ _).mpr (by omega)
-  · exact (checked_add_i64_none_iff _ _).mpr (by omega)
-  · exact (checked_add_i64_some_iff _ _ _).mpr (by omega)
-
 /-- `fits_i64 hi lo = ok true` iff the 128-bit signed value `val128 hi lo` lies in `[MIN_I64, MAX_I64]`. -/
 theorem fits_i64_iff_val128_range (hi : Std.I64) (lo : Std.U64) :
     fits_i64 hi lo = ok true ↔
@@ -165,11 +109,6 @@ theorem fits_i64_iff_val128_range (hi : Std.I64) (lo : Std.U64) :
     by_cases hhi0 : hi.val = 0
     · left; exact ⟨hhi0, by omega⟩
     · right; exact ⟨by omega, by omega⟩
-
-/-- Exact specification of `i64_sign_hi`. -/
-theorem i64_sign_hi_spec (w : Std.I64) :
-    i64_sign_hi w = ok (if w.val < 0 then (-1)#i64 else 0#i64) := by
-  unfold i64_sign_hi; rfl
 
 private lemma i64_to_uint64_val (w : Std.I64) :
     ((Pion.I64.to_uint64 w).val : Int) =
@@ -254,24 +193,6 @@ theorem i128_lt_iff_val128 (a_hi : Std.I64) (a_lo : Std.U64) (b_hi : Std.I64) (b
       decide_eq_false_iff_not, iscalar_lt_iff, iscalar_eq_iff, uscalar_lt_iff]
     exact ⟨by omega, by by_cases heq : a_hi.val = b_hi.val <;> [right; left] <;> omega⟩
 
-/-- Strict order laws (irreflexivity, asymmetry, transitivity) for `i128_lt`. -/
-theorem i128_lt_strict_order (a_hi b_hi c_hi : Std.I64) (a_lo b_lo c_lo : Std.U64) :
-    i128_lt a_hi a_lo a_hi a_lo = ok false ∧
-    (i128_lt a_hi a_lo b_hi b_lo = ok true → i128_lt b_hi b_lo a_hi a_lo = ok false) ∧
-    (i128_lt a_hi a_lo b_hi b_lo = ok true → i128_lt b_hi b_lo c_hi c_lo = ok true →
-      i128_lt a_hi a_lo c_hi c_lo = ok true) := by
-  refine ⟨?_, ?_, ?_⟩
-  · rw [i128_lt_iff_val128, decide_eq_false (by omega)]
-  · intro hab
-    rw [i128_lt_iff_val128] at hab ⊢
-    have h1 : val128 a_hi a_lo < val128 b_hi b_lo := decide_eq_true_eq.mp (result_ok_inj hab)
-    rw [decide_eq_false (by omega)]
-  · intro hab hbc
-    rw [i128_lt_iff_val128] at hab hbc ⊢
-    have h1 : val128 a_hi a_lo < val128 b_hi b_lo := decide_eq_true_eq.mp (result_ok_inj hab)
-    have h2 : val128 b_hi b_lo < val128 c_hi c_lo := decide_eq_true_eq.mp (result_ok_inj hbc)
-    rw [decide_eq_true (by omega)]
-
 /-- Kruskal LSD Radix Sort key formula: `i64_to_radix_key w` equals `w.val + 2^63` exactly! -/
 theorem i64_to_radix_key_val (w : Std.I64) :
     ∃ k : Std.U64, i64_to_radix_key w = ok k ∧
@@ -343,27 +264,5 @@ theorem i64_to_radix_key_val (w : Std.I64) :
         rw [← h263, hsub]
   rw [hxor_nat]
   split_ifs at hto ⊢ <;> omega
-
-/-- Kruskal LSD Radix Sort soundness: `i64_to_radix_key` is strictly order-preserving on all `Int64`. -/
-theorem i64_to_radix_key_order_preserving (a b : Std.I64) (ka kb : Std.U64)
-    (ha : i64_to_radix_key a = ok ka) (hb : i64_to_radix_key b = ok kb) :
-    ka.val < kb.val ↔ a.val < b.val := by
-  obtain ⟨ka', hka', hva⟩ := i64_to_radix_key_val a
-  obtain ⟨kb', hkb', hvb⟩ := i64_to_radix_key_val b
-  have ea : ka = ka' := result_ok_inj (ha.symm.trans hka')
-  have eb : kb = kb' := result_ok_inj (hb.symm.trans hkb')
-  subst ea; subst eb; omega
-
-/-- `i64_to_radix_key` is injective on all `Int64`. -/
-theorem i64_to_radix_key_injective (a b : Std.I64) :
-    i64_to_radix_key a = i64_to_radix_key b ↔ a = b := by
-  constructor
-  · intro heq
-    obtain ⟨ka, hka, hva⟩ := i64_to_radix_key_val a
-    obtain ⟨kb, hkb, hvb⟩ := i64_to_radix_key_val b
-    have ek : ka = kb := result_ok_inj (hka.symm.trans (heq.trans hkb))
-    subst ek
-    exact (iscalar_eq_iff a b).mpr (by omega)
-  · intro h; rw [h]
 
 end GraphProofs

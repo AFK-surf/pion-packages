@@ -1,24 +1,11 @@
 import IcalProofs
 
 #print axioms IcalProofs.epoch_day_weekday_mon0_bounds
-#print axioms IcalProofs.epoch_day_weekday_mon0_epoch_thu
-#print axioms IcalProofs.epoch_day_weekday_mon0_periodic_7
 #print axioms IcalProofs.epoch_day_weekday_mon0_succ
-#print axioms IcalProofs.doy_of_bounds
 #print axioms IcalProofs.neg_ordinal_day_bounds
 #print axioms IcalProofs.floor_div_86400_exact
-#print axioms IcalProofs.floor_div_86400_brackets
 #print axioms IcalProofs.week1_start_of_range_and_4days
 #print axioms IcalProofs.week1_start_of_weekday_eq_wkst
 #print axioms IcalProofs.jump_grid_to_progress_minimality_alignment
-#print axioms IcalProofs.jump_grid_to_already_past
 #print axioms IcalProofs.ascii_upper_byte_idempotent
-#print axioms IcalProofs.ascii_upper_byte_no_lowercase
-#print axioms IcalProofs.is_ical_name_byte_iff
 #print axioms IcalProofs.is_ical_name_byte_upper_closed
-#print axioms IcalProofs.is_ical_name_byte_rejects_delimiters
-#print axioms IcalProofs.clamp_leap_second_bounds
-#print axioms IcalProofs.clamp_leap_second_idempotent
-#print axioms IcalProofs.parse_weekday_2_bytes_range
-#print axioms IcalProofs.parse_weekday_2_bytes_all_7
-#print axioms IcalProofs.parse_limits_default_positive

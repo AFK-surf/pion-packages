@@ -14,13 +14,13 @@ open cron
 
 section Bitmasks
 
-theorem bitvec_ofNat_pow_sub_one (w : Nat) (hw : w ≤ 64) :
+lemma bitvec_ofNat_pow_sub_one (w : Nat) (_hw : w ≤ 64) :
     ∀ i, i < 64 → (BitVec.ofNat 64 (2 ^ w - 1)).getLsbD i = decide (i < w) := by
   intro i hi
   rw [BitVec.getLsbD_ofNat]
   simp only [hi, decide_true, Bool.true_and, Nat.testBit_two_pow_sub_one]
 
-theorem bitvec_ofNat_band_hi (w : Nat) (hw : 2 * w ≤ 64) :
+lemma bitvec_ofNat_band_hi (w : Nat) (hw : 2 * w ≤ 64) :
     ∀ i, i < 64 → (BitVec.ofNat 64 ((2 ^ w - 1) * 2 ^ w)).getLsbD i = (decide (w ≤ i) && decide (i < 2 * w)) := by
   intro i hi
   have hsh : BitVec.ofNat 64 ((2 ^ w - 1) * 2 ^ w) = (BitVec.ofNat 64 (2 ^ w - 1)) <<< w := by
@@ -43,30 +43,30 @@ theorem bitvec_ofNat_band_hi (w : Nat) (hw : 2 * w ≤ 64) :
     · simp [h2, show i - w < w by omega]
     · simp [h2, show ¬ (i - w < w) by omega]
 
-theorem mask_lo32 : ∀ i, i < 64 → (4294967295#64).getLsbD i = decide (i < 32) :=
+lemma mask_lo32 : ∀ i, i < 64 → (4294967295#64).getLsbD i = decide (i < 32) :=
   bitvec_ofNat_pow_sub_one 32 (by omega)
-theorem mask_lo16 : ∀ i, i < 64 → (65535#64).getLsbD i = decide (i < 16) :=
+lemma mask_lo16 : ∀ i, i < 64 → (65535#64).getLsbD i = decide (i < 16) :=
   bitvec_ofNat_pow_sub_one 16 (by omega)
-theorem mask_lo8  : ∀ i, i < 64 → (255#64).getLsbD i = decide (i < 8) :=
+lemma mask_lo8  : ∀ i, i < 64 → (255#64).getLsbD i = decide (i < 8) :=
   bitvec_ofNat_pow_sub_one 8 (by omega)
-theorem mask_lo4  : ∀ i, i < 64 → (15#64).getLsbD i = decide (i < 4) :=
+lemma mask_lo4  : ∀ i, i < 64 → (15#64).getLsbD i = decide (i < 4) :=
   bitvec_ofNat_pow_sub_one 4 (by omega)
-theorem mask_lo2  : ∀ i, i < 64 → (3#64).getLsbD i = decide (i < 2) :=
+lemma mask_lo2  : ∀ i, i < 64 → (3#64).getLsbD i = decide (i < 2) :=
   bitvec_ofNat_pow_sub_one 2 (by omega)
-theorem mask_lo1  : ∀ i, i < 64 → (1#64).getLsbD i = decide (i < 1) :=
+lemma mask_lo1  : ∀ i, i < 64 → (1#64).getLsbD i = decide (i < 1) :=
   bitvec_ofNat_pow_sub_one 1 (by omega)
 
-theorem mask_hi32 : ∀ i, i < 64 → (18446744069414584320#64).getLsbD i = (decide (32 ≤ i) && decide (i < 64)) :=
+lemma mask_hi32 : ∀ i, i < 64 → (18446744069414584320#64).getLsbD i = (decide (32 ≤ i) && decide (i < 64)) :=
   bitvec_ofNat_band_hi 32 (by omega)
-theorem mask_hi16 : ∀ i, i < 64 → (4294901760#64).getLsbD i = (decide (16 ≤ i) && decide (i < 32)) :=
+lemma mask_hi16 : ∀ i, i < 64 → (4294901760#64).getLsbD i = (decide (16 ≤ i) && decide (i < 32)) :=
   bitvec_ofNat_band_hi 16 (by omega)
-theorem mask_hi8  : ∀ i, i < 64 → (65280#64).getLsbD i = (decide (8 ≤ i) && decide (i < 16)) :=
+lemma mask_hi8  : ∀ i, i < 64 → (65280#64).getLsbD i = (decide (8 ≤ i) && decide (i < 16)) :=
   bitvec_ofNat_band_hi 8 (by omega)
-theorem mask_hi4  : ∀ i, i < 64 → (240#64).getLsbD i = (decide (4 ≤ i) && decide (i < 8)) :=
+lemma mask_hi4  : ∀ i, i < 64 → (240#64).getLsbD i = (decide (4 ≤ i) && decide (i < 8)) :=
   bitvec_ofNat_band_hi 4 (by omega)
-theorem mask_hi2  : ∀ i, i < 64 → (12#64).getLsbD i = (decide (2 ≤ i) && decide (i < 4)) :=
+lemma mask_hi2  : ∀ i, i < 64 → (12#64).getLsbD i = (decide (2 ≤ i) && decide (i < 4)) :=
   bitvec_ofNat_band_hi 2 (by omega)
-theorem mask_hi1  : ∀ i, i < 64 → (2#64).getLsbD i = decide (i = 1) := by
+lemma mask_hi1  : ∀ i, i < 64 → (2#64).getLsbD i = decide (i = 1) := by
   intro i hi
   have h := bitvec_ofNat_band_hi 1 (by omega) i hi
   change (BitVec.ofNat 64 ((2 ^ 1 - 1) * 2 ^ 1)).getLsbD i = decide (i = 1)
@@ -76,8 +76,8 @@ theorem mask_hi1  : ∀ i, i < 64 → (2#64).getLsbD i = decide (i = 1) := by
   · simp [h1]; omega
 
 /-- Helper for one binary-search step of `ctz64`. -/
-theorem ctz_step {orig x : Std.U64} {n w : Nat} {mask : Std.U64}
-    (hw : 0 < w) (hnw : n + 2 * w ≤ 64)
+lemma ctz_step {orig x : Std.U64} {n w : Nat} {mask : Std.U64}
+    (_hw : 0 < w) (hnw : n + 2 * w ≤ 64)
     (hmask : ∀ i, i < 64 → mask.bv.getLsbD i = decide (i < w))
     (hshift : ∀ i, i < 2 * w → x.bv.getLsbD i = orig.bv.getLsbD (n + i))
     (hbelow : ∀ j, j < n → orig.bv.getLsbD j = false)
@@ -174,38 +174,38 @@ theorem ctz64_spec (x : Std.U64) (hx : x ≠ 0#u64) :
   have hr1 : (if c1 then Pion.I32.add 0#i32 32#i32 else 0#i32).val = (n1 : Int) := by
     dsimp only [n1]
     by_cases hc : c1
-    · rw [if_pos hc, if_pos hc]; rfl
-    · rw [if_neg hc, if_neg hc]; rfl
+    · rw [ite_eq_left hc, ite_eq_left hc]; rfl
+    · rw [ite_eq_right hc, ite_eq_right hc]; rfl
   set r1 : Std.I32 := if c1 then Pion.I32.add 0#i32 32#i32 else 0#i32
   have hr2 : (if c2 then Pion.I32.add r1 16#i32 else r1).val = (n2 : Int) := by
     dsimp only [n2]; by_cases hc : c2
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr1] <;> (try change (16#i32).val = 16; omega)
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr1]
       all_goals (have hc : (16#i32).val = 16 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr1
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr1
   set r2 : Std.I32 := if c2 then Pion.I32.add r1 16#i32 else r1
   have hr3 : (if c3 then Pion.I32.add r2 8#i32 else r2).val = (n3 : Int) := by
     dsimp only [n3]; by_cases hc : c3
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr2]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr2]
       all_goals (have hc : (8#i32).val = 8 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr2
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr2
   set r3 : Std.I32 := if c3 then Pion.I32.add r2 8#i32 else r2
   have hr4 : (if c4 then Pion.I32.add r3 4#i32 else r3).val = (n4 : Int) := by
     dsimp only [n4]; by_cases hc : c4
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr3]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr3]
       all_goals (have hc : (4#i32).val = 4 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr3
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr3
   set r4 : Std.I32 := if c4 then Pion.I32.add r3 4#i32 else r3
   have hr5 : (if c5 then Pion.I32.add r4 2#i32 else r4).val = (n5 : Int) := by
     dsimp only [n5]; by_cases hc : c5
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr4]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr4]
       all_goals (have hc : (2#i32).val = 2 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr4
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr4
   set r5 : Std.I32 := if c5 then Pion.I32.add r4 2#i32 else r4
   have hr6 : (if c6 then Pion.I32.add r5 1#i32 else r5).val = (n6 : Int) := by
     dsimp only [n6]; by_cases hc : c6
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr5]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr5]
       all_goals (have hc : (1#i32).val = 1 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr5
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr5
   set r6 : Std.I32 := if c6 then Pion.I32.add r5 1#i32 else r5
   have heval : ctz64 x = ok r6 := by
     unfold ctz64
@@ -214,42 +214,42 @@ theorem ctz64_spec (x : Std.U64) (hx : x ≠ 0#u64) :
         else ok (x, 0#i32)) = ok (x1, r1) := by
       dsimp only [x1, r1, c1]
       by_cases hc : Pion.U64.band x 4294967295#u64 = 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x 32#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x 32#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep2 : (if Pion.U64.band x1 65535#u64 = 0#u64 then
         do let x4 ← Pion.U64.shr x1 16#u64; ok (x4, Pion.I32.add r1 16#i32)
         else ok (x1, r1)) = ok (x2, r2) := by
       dsimp only [x2, r2, c2]
       by_cases hc : Pion.U64.band x1 65535#u64 = 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x1 16#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x1 16#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep3 : (if Pion.U64.band x2 255#u64 = 0#u64 then
         do let x6 ← Pion.U64.shr x2 8#u64; ok (x6, Pion.I32.add r2 8#i32)
         else ok (x2, r2)) = ok (x3, r3) := by
       dsimp only [x3, r3, c3]
       by_cases hc : Pion.U64.band x2 255#u64 = 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x2 8#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x2 8#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep4 : (if Pion.U64.band x3 15#u64 = 0#u64 then
         do let x8 ← Pion.U64.shr x3 4#u64; ok (x8, Pion.I32.add r3 4#i32)
         else ok (x3, r3)) = ok (x4, r4) := by
       dsimp only [x4, r4, c4]
       by_cases hc : Pion.U64.band x3 15#u64 = 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x3 4#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x3 4#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep5 : (if Pion.U64.band x4 3#u64 = 0#u64 then
         do let x10 ← Pion.U64.shr x4 2#u64; ok (x10, Pion.I32.add r4 2#i32)
         else ok (x4, r4)) = ok (x5, r5) := by
       dsimp only [x5, r5, c5]
       by_cases hc : Pion.U64.band x4 3#u64 = 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x4 2#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x4 2#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep6 : (if Pion.U64.band x5 1#u64 = 0#u64 then
         ok (Pion.I32.add r5 1#i32) else ok r5) = ok r6 := by
       dsimp only [r6, c6]
       by_cases hc : Pion.U64.band x5 1#u64 = 0#u64
-      · rw [if_pos hc, if_pos hc]
-      · rw [if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc]
+      · rw [ite_eq_right hc, ite_eq_right hc]
     dsimp only
     rw [hstep1, b_ok_pair, hstep2, b_ok_pair, hstep3, b_ok_pair, hstep4, b_ok_pair, hstep5, b_ok_pair, hstep6]
   refine ⟨r6, heval, by omega, by omega, ?_, ?_⟩
@@ -267,8 +267,8 @@ theorem ctz64_spec (x : Std.U64) (hx : x ≠ 0#u64) :
     exact s6.2.1 j hj
 
 /-- Helper for one binary-search step of `msb64`. -/
-theorem msb_step {orig x : Std.U64} {r w : Nat} {mask : Std.U64}
-    (hw : 0 < w) (hrw : r + 2 * w ≤ 64)
+lemma msb_step {orig x : Std.U64} {r w : Nat} {mask : Std.U64}
+    (_hw : 0 < w) (hrw : r + 2 * w ≤ 64)
     (hmask : ∀ i, i < 64 → mask.bv.getLsbD i = (decide (w ≤ i) && decide (i < 2 * w)))
     (hshift : ∀ i, i < 2 * w → x.bv.getLsbD i = orig.bv.getLsbD (r + i))
     (habove : ∀ j, r + 2 * w ≤ j → j < 64 → orig.bv.getLsbD j = false)
@@ -281,7 +281,7 @@ theorem msb_step {orig x : Std.U64} {r w : Nat} {mask : Std.U64}
     (∃ i, i < w ∧ x'.bv.getLsbD i = true) := by
   dsimp only
   by_cases hcond : Pion.U64.band x mask ≠ 0#u64
-  · rw [if_pos hcond, if_pos hcond]
+  · rw [ite_eq_left hcond, ite_eq_left hcond]
     obtain ⟨i, hi64, hmi, hxi⟩ := (u64_band_ne_zero_iff x mask).mp hcond
     rw [hmask i hi64] at hmi
     simp only [Bool.and_eq_true, decide_eq_true_eq] at hmi
@@ -297,7 +297,7 @@ theorem msb_step {orig x : Std.U64} {r w : Nat} {mask : Std.U64}
       rw [BitVec.getLsbD_ushiftRight]
       have heq : w + (i - w) = i := by omega
       rwa [heq]
-  · rw [if_neg hcond, if_neg hcond]
+  · rw [ite_eq_right hcond, ite_eq_right hcond]
     have hzero := (u64_band_eq_zero_iff x mask).mp (not_not.mp hcond)
     refine ⟨fun k hk => hshift k (by omega), ?_, ?_⟩
     · intro j hj1 hj2
@@ -362,7 +362,7 @@ theorem msb64_spec (x : Std.U64) (hx : x ≠ 0#u64) :
   have hn5 : n5 + 2 ≤ 64 := by dsimp [n5]; split <;> omega
   -- Step 6: w = 1
   have hm1 : ∀ i, i < 64 → (2#64).getLsbD i = (decide (1 ≤ i) && decide (i < 2 * 1)) := by
-    intro i hi; rw [mask_hi1 i hi]; by_cases h : i = 1 <;> simp [h] <;> omega
+    intro i hi; rw [mask_hi1 i hi]; by_cases h : i = 1 <;> (simp [h]; try omega)
   have s6 := msb_step (orig := x) (x := x5) (r := n5) (w := 1) (mask := 2#u64)
     (by omega) (by omega) hm1 s5.1 s5.2.1 s5.2.2
   set c6 := (Pion.U64.band x5 2#u64 ≠ 0#u64)
@@ -372,38 +372,38 @@ theorem msb64_spec (x : Std.U64) (hx : x ≠ 0#u64) :
   have hr1 : (if c1 then Pion.I32.add 0#i32 32#i32 else 0#i32).val = (n1 : Int) := by
     dsimp only [n1]
     by_cases hc : c1
-    · rw [if_pos hc, if_pos hc]; rfl
-    · rw [if_neg hc, if_neg hc]; rfl
+    · rw [ite_eq_left hc, ite_eq_left hc]; rfl
+    · rw [ite_eq_right hc, ite_eq_right hc]; rfl
   set r1 : Std.I32 := if c1 then Pion.I32.add 0#i32 32#i32 else 0#i32
   have hr2 : (if c2 then Pion.I32.add r1 16#i32 else r1).val = (n2 : Int) := by
     dsimp only [n2]; by_cases hc : c2
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr1]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr1]
       all_goals (have hc : (16#i32).val = 16 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr1
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr1
   set r2 : Std.I32 := if c2 then Pion.I32.add r1 16#i32 else r1
   have hr3 : (if c3 then Pion.I32.add r2 8#i32 else r2).val = (n3 : Int) := by
     dsimp only [n3]; by_cases hc : c3
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr2]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr2]
       all_goals (have hc : (8#i32).val = 8 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr2
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr2
   set r3 : Std.I32 := if c3 then Pion.I32.add r2 8#i32 else r2
   have hr4 : (if c4 then Pion.I32.add r3 4#i32 else r3).val = (n4 : Int) := by
     dsimp only [n4]; by_cases hc : c4
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr3]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr3]
       all_goals (have hc : (4#i32).val = 4 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr3
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr3
   set r4 : Std.I32 := if c4 then Pion.I32.add r3 4#i32 else r3
   have hr5 : (if c5 then Pion.I32.add r4 2#i32 else r4).val = (n5 : Int) := by
     dsimp only [n5]; by_cases hc : c5
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr4]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr4]
       all_goals (have hc : (2#i32).val = 2 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr4
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr4
   set r5 : Std.I32 := if c5 then Pion.I32.add r4 2#i32 else r4
   have hr6 : (if c6 then Pion.I32.add r5 1#i32 else r5).val = (n6 : Int) := by
     dsimp only [n6]; by_cases hc : c6
-    · rw [if_pos hc, if_pos hc, i32_add_val, hr5]
+    · rw [ite_eq_left hc, ite_eq_left hc, i32_add_val, hr5]
       all_goals (have hc : (1#i32).val = 1 := (by simp); rw [hc]; try omega)
-    · rw [if_neg hc, if_neg hc]; exact hr5
+    · rw [ite_eq_right hc, ite_eq_right hc]; exact hr5
   set r6 : Std.I32 := if c6 then Pion.I32.add r5 1#i32 else r5
   have heval : msb64 x = ok r6 := by
     unfold msb64
@@ -412,42 +412,42 @@ theorem msb64_spec (x : Std.U64) (hx : x ≠ 0#u64) :
         else ok (x, 0#i32)) = ok (x1, r1) := by
       dsimp only [x1, r1, c1]
       by_cases hc : Pion.U64.band x 18446744069414584320#u64 ≠ 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x 32#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x 32#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep2 : (if Pion.U64.band x1 4294901760#u64 ≠ 0#u64 then
         do let x4 ← Pion.U64.shr x1 16#u64; ok (x4, Pion.I32.add r1 16#i32)
         else ok (x1, r1)) = ok (x2, r2) := by
       dsimp only [x2, r2, c2]
       by_cases hc : Pion.U64.band x1 4294901760#u64 ≠ 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x1 16#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x1 16#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep3 : (if Pion.U64.band x2 65280#u64 ≠ 0#u64 then
         do let x6 ← Pion.U64.shr x2 8#u64; ok (x6, Pion.I32.add r2 8#i32)
         else ok (x2, r2)) = ok (x3, r3) := by
       dsimp only [x3, r3, c3]
       by_cases hc : Pion.U64.band x2 65280#u64 ≠ 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x2 8#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x2 8#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep4 : (if Pion.U64.band x3 240#u64 ≠ 0#u64 then
         do let x8 ← Pion.U64.shr x3 4#u64; ok (x8, Pion.I32.add r3 4#i32)
         else ok (x3, r3)) = ok (x4, r4) := by
       dsimp only [x4, r4, c4]
       by_cases hc : Pion.U64.band x3 240#u64 ≠ 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x3 4#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x3 4#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep5 : (if Pion.U64.band x4 12#u64 ≠ 0#u64 then
         do let x10 ← Pion.U64.shr x4 2#u64; ok (x10, Pion.I32.add r4 2#i32)
         else ok (x4, r4)) = ok (x5, r5) := by
       dsimp only [x5, r5, c5]
       by_cases hc : Pion.U64.band x4 12#u64 ≠ 0#u64
-      · rw [if_pos hc, if_pos hc, if_pos hc, u64_shr_lit x4 2#u64 (by decide), b_ok]; rfl
-      · rw [if_neg hc, if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc, ite_eq_left hc, u64_shr_lit x4 2#u64 (by decide), b_ok]; rfl
+      · rw [ite_eq_right hc, ite_eq_right hc, ite_eq_right hc]
     have hstep6 : (if Pion.U64.band x5 2#u64 ≠ 0#u64 then
         ok (Pion.I32.add r5 1#i32) else ok r5) = ok r6 := by
       dsimp only [r6, c6]
       by_cases hc : Pion.U64.band x5 2#u64 ≠ 0#u64
-      · rw [if_pos hc, if_pos hc]
-      · rw [if_neg hc, if_neg hc]
+      · rw [ite_eq_left hc, ite_eq_left hc]
+      · rw [ite_eq_right hc, ite_eq_right hc]
     dsimp only
     rw [hstep1, b_ok_pair, hstep2, b_ok_pair, hstep3, b_ok_pair, hstep4, b_ok_pair, hstep5, b_ok_pair, hstep6]
   refine ⟨r6, heval, by omega, by omega, ?_, ?_⟩
@@ -538,7 +538,7 @@ theorem next_set_bit_spec (mask : Std.U64) (frm : Std.I32) :
           have heq : frm.val.toNat + (j - frm.val.toNat) = j := by omega
           rwa [heq] at h1
 
-theorem low_mask_getLsbD (n : Nat) (hn : n < 64) (i : Nat) (hi : i < 64) :
+lemma low_mask_getLsbD (n : Nat) (hn : n < 64) (i : Nat) (_hi : i < 64) :
     ((1#64 <<< n) - 1#64).getLsbD i = decide (i < n) := by
   have h1 : (1#64 <<< n).toNat = 2 ^ n := by
     rw [BitVec.toNat_shiftLeft, BitVec.toNat_ofNat]
