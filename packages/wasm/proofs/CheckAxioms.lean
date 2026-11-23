@@ -1,0 +1,26 @@
+import WasmProofs
+
+#print axioms WasmProofs.val_type_code_roundtrip
+#print axioms WasmProofs.val_type_from_code_roundtrip
+#print axioms WasmProofs.val_type_code_injective
+#print axioms WasmProofs.val_type_equals_iff
+#print axioms WasmProofs.ref_type_code_roundtrip
+#print axioms WasmProofs.ref_type_embed_code_compat
+#print axioms WasmProofs.export_kind_code_injective
+#print axioms WasmProofs.val_type_to_id_injective_and_range
+#print axioms WasmProofs.ref_type_id_compat_and_is_ref
+#print axioms WasmProofs.is_ref_id_iff_val_type_ref
+#print axioms WasmProofs.section_order_rank_canonical_order
+#print axioms WasmProofs.section_order_rank_injective_on_known
+#print axioms WasmProofs.stack_type_compat_refl
+#print axioms WasmProofs.stack_type_compat_symm
+#print axioms WasmProofs.stack_type_compat_unknown
+#print axioms WasmProofs.stack_type_compat_concrete_iff
+#print axioms WasmProofs.limits_err_code_valid_iff
+#print axioms WasmProofs.limits_new_valid_iff
+#print axioms WasmProofs.leb128_i32_single_byte_range
+#print axioms WasmProofs.leb128_u32_5th_valid_iff
+#print axioms WasmProofs.leb128_u64_10th_valid_iff
+#print axioms WasmProofs.leb128_i32_5th_valid_exact
+#print axioms WasmProofs.leb128_i64_10th_valid_exact
+#print axioms WasmProofs.leb128_s33_5th_valid_exact
