@@ -1,0 +1,520 @@
+///| RFC 8301 §3.2 RSA PKCS#1 v1.5 SHA-256 verification for 1024..4096-bit DKIM keys.
+///| Keys >= 2048 bits delegate to `packages/crypto`; keys 1024..2047 bits use pure-Pion big-int modexp.
+///| Keys < 1024 bits (e.g. 512-bit) and > 4096 bits are strictly rejected.
+
+import "crypto"
+
+///|
+struct DkimDerReader {
+  data : Bytes
+  mut at : Int
+  end : Int
+}
+
+///|
+fn DkimDerReader::done(self : DkimDerReader) -> Bool {
+  self.at == self.end
+}
+
+///|
+fn DkimDerReader::take(self : DkimDerReader, tag : Int) -> Result[(Int, Int), EmailError] {
+  if self.at >= self.end {
+    return Err(EmailError::InvalidDkim("truncated DER"))
+  }
+  if (self.data[self.at].to_int() & 0xFF) != tag {
+    return Err(EmailError::InvalidDkim("unexpected DER tag"))
+  }
+  self.at = self.at + 1
+  if self.at >= self.end {
+    return Err(EmailError::InvalidDkim("truncated DER length"))
+  }
+  let l0 = self.data[self.at].to_int() & 0xFF
+  self.at = self.at + 1
+  let mut length = 0
+  if l0 < 0x80 {
+    length = l0
+  } else {
+    let nbytes = l0 & 0x7F
+    if nbytes == 0 || nbytes > 4 || self.at + nbytes > self.end {
+      return Err(EmailError::InvalidDkim("invalid DER length"))
+    }
+    let first = self.data[self.at].to_int() & 0xFF
+    if first == 0 {
+      return Err(EmailError::InvalidDkim("non-canonical DER length"))
+    }
+    let mut k = 0
+    while k < nbytes {
+      length = (length << 8) | (self.data[self.at].to_int() & 0xFF)
+      self.at = self.at + 1
+      k = k + 1
+    }
+    if length < 0x80 {
+      return Err(EmailError::InvalidDkim("non-canonical DER length"))
+    }
+  }
+  if self.at + length > self.end {
+    return Err(EmailError::InvalidDkim("DER value exceeds bounds"))
+  }
+  let start = self.at
+  self.at = self.at + length
+  Ok((start, length))
+}
+
+///|
+fn dkim_der_sequence(data : Bytes, off : Int, len : Int) -> Result[DkimDerReader, EmailError] {
+  let r = DkimDerReader::{ data: data, at: off, end: off + len }
+  let span = match r.take(0x30) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !r.done() {
+    return Err(EmailError::InvalidDkim("trailing bytes after DER SEQUENCE"))
+  }
+  Ok(DkimDerReader::{ data: data, at: span.0, end: span.0 + span.1 })
+}
+
+///|
+fn DkimDerReader::take_uint_bytes(self : DkimDerReader) -> Result[Bytes, EmailError] {
+  let span = match self.take(0x02) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let start = span.0
+  let len = span.1
+  if len == 0 {
+    return Err(EmailError::InvalidDkim("empty DER INTEGER"))
+  }
+  let b0 = self.data[start].to_int() & 0xFF
+  if (b0 & 0x80) != 0 {
+    return Err(EmailError::InvalidDkim("negative DER INTEGER"))
+  }
+  if len > 1 && b0 == 0 && (self.data[start + 1].to_int() & 0x80) == 0 {
+    return Err(EmailError::InvalidDkim("non-canonical DER INTEGER"))
+  }
+  let mut off = start
+  let end = start + len
+  while off < end && (self.data[off].to_int() & 0xFF) == 0 {
+    off = off + 1
+  }
+  Ok(self.data.slice(off, end))
+}
+
+///| Parse RSA SPKI DER returning `(n_bytes, e_bytes)` with leading zero bytes stripped.
+fn dkim_parse_rsa_spki_der(der : Bytes) -> Result[(Bytes, Bytes), EmailError] {
+  let spki = match dkim_der_sequence(der, 0, der.length()) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  let alg_span = match spki.take(0x30) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  let alg = DkimDerReader::{ data: der, at: alg_span.0, end: alg_span.0 + alg_span.1 }
+  let oid_span = match alg.take(0x06) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  // rsaEncryption OID: 1.2.840.113549.1.1.1 -> 2a 86 48 86 f7 0d 01 01 01
+  let rsa_oid = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]
+  if oid_span.1 != 9 {
+    return Err(EmailError::InvalidDkim("SPKI OID is not rsaEncryption"))
+  }
+  let mut oi = 0
+  while oi < 9 {
+    if (der[oid_span.0 + oi].to_int() & 0xFF) != rsa_oid[oi] {
+      return Err(EmailError::InvalidDkim("SPKI OID is not rsaEncryption"))
+    }
+    oi = oi + 1
+  }
+  if !alg.done() {
+    let null_span = match alg.take(0x05) {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+    if null_span.1 != 0 || !alg.done() {
+      return Err(EmailError::InvalidDkim("unexpected SPKI algorithm parameters"))
+    }
+  }
+  let bs = match spki.take(0x03) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  if !spki.done() || bs.1 < 2 || (der[bs.0].to_int() & 0xFF) != 0 {
+    return Err(EmailError::InvalidDkim("invalid SPKI BIT STRING"))
+  }
+  let pk = match dkim_der_sequence(der, bs.0 + 1, bs.1 - 1) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  let n_bytes = match pk.take_uint_bytes() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let e_bytes = match pk.take_uint_bytes() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if !pk.done() {
+    return Err(EmailError::InvalidDkim("trailing data in RSAPublicKey"))
+  }
+  Ok((n_bytes, e_bytes))
+}
+
+///| Bit length of a big-endian unsigned byte slice (leading zeros already stripped or not).
+fn dkim_be_bit_len(b : Bytes) -> Int {
+  let n = b.length()
+  let mut i = 0
+  while i < n && (b[i].to_int() & 0xFF) == 0 {
+    i = i + 1
+  }
+  if i >= n {
+    return 0
+  }
+  let top = b[i].to_int() & 0xFF
+  let mut bits = (n - i - 1) * 8
+  let mut t = top
+  while t > 0 {
+    bits = bits + 1
+    t = t >> 1
+  }
+  bits
+}
+
+// --- Pure-Pion little-endian base-2^30 unsigned big integers for RSA-1024..2047 verification ---
+
+///|
+fn dbu_trim(a : Array[UInt64]) -> Array[UInt64] {
+  let mut len = a.length()
+  while len > 0 && a[len - 1] == 0UL {
+    len = len - 1
+  }
+  if len == a.length() {
+    return a
+  }
+  let out : Array[UInt64] = []
+  let mut i = 0
+  while i < len {
+    out.push(a[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn dbu_u64(x : Int) -> UInt64 {
+  x.to_int64().to_uint64()
+}
+
+///|
+fn dbu_from_be(b : Bytes) -> Array[UInt64] {
+  let out : Array[UInt64] = []
+  let mut acc = 0UL
+  let mut bits = 0
+  let mut i = b.length() - 1
+  while i >= 0 {
+    acc = acc | (dbu_u64(b[i].to_int() & 0xFF) << dbu_u64(bits))
+    bits = bits + 8
+    while bits >= 30 {
+      out.push(acc & 0x3FFFFFFFUL)
+      acc = acc >> 30UL
+      bits = bits - 30
+    }
+    i = i - 1
+  }
+  if acc != 0UL {
+    out.push(acc)
+  }
+  dbu_trim(out)
+}
+
+///|
+fn dbu_to_be(a : Array[UInt64], out_len : Int) -> Bytes {
+  let out = Bytes::new(out_len)
+  let n = a.length()
+  let mut byte_idx = out_len - 1
+  let mut limb_idx = 0
+  let mut bit_off = 0
+  while byte_idx >= 0 && limb_idx < n {
+    let mut bv = (a[limb_idx] >> dbu_u64(bit_off)) & 0xFFUL
+    let avail = 30 - bit_off
+    if avail < 8 && limb_idx + 1 < n {
+      bv = bv | ((a[limb_idx + 1] << dbu_u64(avail)) & 0xFFUL)
+    }
+    out[byte_idx] = (bv & 0xFFUL).to_int().to_byte()
+    bit_off = bit_off + 8
+    if bit_off >= 30 {
+      bit_off = bit_off - 30
+      limb_idx = limb_idx + 1
+    }
+    byte_idx = byte_idx - 1
+  }
+  out
+}
+
+///|
+fn dbu_bit_len(a : Array[UInt64]) -> Int {
+  let mut n = a.length()
+  while n > 0 && a[n - 1] == 0UL {
+    n = n - 1
+  }
+  if n == 0 {
+    return 0
+  }
+  let mut top = a[n - 1]
+  let mut bits = (n - 1) * 30
+  while top > 0UL {
+    bits = bits + 1
+    top = top >> 1UL
+  }
+  bits
+}
+
+///|
+fn dbu_get_bit(a : Array[UInt64], bit : Int) -> Bool {
+  let idx = bit / 30
+  if idx >= a.length() {
+    return false
+  }
+  ((a[idx] >> dbu_u64(bit % 30)) & 1UL) != 0UL
+}
+
+///|
+fn dbu_cmp(a : Array[UInt64], b : Array[UInt64]) -> Int {
+  let la = a.length()
+  let lb = b.length()
+  if la != lb {
+    return if la < lb { -1 } else { 1 }
+  }
+  let mut i = la - 1
+  while i >= 0 {
+    if a[i] != b[i] {
+      return if a[i] < b[i] { -1 } else { 1 }
+    }
+    i = i - 1
+  }
+  0
+}
+
+///| Compare `a` with `b << shift`.
+fn dbu_cmp_shifted(a : Array[UInt64], b : Array[UInt64], shift : Int) -> Int {
+  let la = dbu_bit_len(a)
+  let lb = dbu_bit_len(b)
+  if lb == 0 {
+    return if la == 0 { 0 } else { 1 }
+  }
+  let lbs = lb + shift
+  if la != lbs {
+    return if la < lbs { -1 } else { 1 }
+  }
+  let word_shift = shift / 30
+  let bit_shift = shift % 30
+  let mut i = a.length() - 1
+  while i >= 0 {
+    let av = a[i]
+    let bv = if i < word_shift {
+      0UL
+    } else {
+      let bi = i - word_shift
+      let lo = if bi < b.length() { (b[bi] << dbu_u64(bit_shift)) & 0x3FFFFFFFUL } else { 0UL }
+      let hi = if bit_shift > 0 && bi > 0 && bi - 1 < b.length() {
+        b[bi - 1] >> dbu_u64(30 - bit_shift)
+      } else {
+        0UL
+      }
+      lo | hi
+    }
+    if av != bv {
+      return if av < bv { -1 } else { 1 }
+    }
+    i = i - 1
+  }
+  0
+}
+
+///| Subtract `b << shift` from `a` in place (requires `a >= b << shift`).
+fn dbu_sub_shifted_inplace(a : Array[UInt64], b : Array[UInt64], shift : Int) -> Unit {
+  let word_shift = shift / 30
+  let bit_shift = shift % 30
+  let mut borrow = 0UL
+  let mut i = word_shift
+  while i < a.length() {
+    let bi = i - word_shift
+    let lo = if bi < b.length() { (b[bi] << dbu_u64(bit_shift)) & 0x3FFFFFFFUL } else { 0UL }
+    let hi = if bit_shift > 0 && bi > 0 && bi - 1 < b.length() {
+      b[bi - 1] >> dbu_u64(30 - bit_shift)
+    } else {
+      0UL
+    }
+    let sub = (lo | hi) + borrow
+    if a[i] >= sub {
+      a[i] = a[i] - sub
+      borrow = 0UL
+    } else {
+      a[i] = a[i] + 0x40000000UL - sub
+      borrow = 1UL
+    }
+    if bi >= b.length() + 1 && borrow == 0UL {
+      break
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn dbu_mul(a : Array[UInt64], b : Array[UInt64]) -> Array[UInt64] {
+  let la = a.length()
+  let lb = b.length()
+  if la == 0 || lb == 0 {
+    return []
+  }
+  let res : Array[UInt64] = []
+  let mut k = 0
+  while k < la + lb {
+    res.push(0UL)
+    k = k + 1
+  }
+  let mut i = 0
+  while i < la {
+    let ai = a[i]
+    let mut carry = 0UL
+    let mut j = 0
+    while j < lb {
+      let prod = ai * b[j] + res[i + j] + carry
+      res[i + j] = prod & 0x3FFFFFFFUL
+      carry = prod >> 30
+      j = j + 1
+    }
+    let mut idx = i + lb
+    while carry > 0UL {
+      let s = res[idx] + carry
+      res[idx] = s & 0x3FFFFFFFUL
+      carry = s >> 30
+      idx = idx + 1
+    }
+    i = i + 1
+  }
+  dbu_trim(res)
+}
+
+///|
+fn dbu_mod(a : Array[UInt64], m : Array[UInt64]) -> Array[UInt64] {
+  let rem : Array[UInt64] = []
+  let mut i = 0
+  while i < a.length() {
+    rem.push(a[i])
+    i = i + 1
+  }
+  let la = dbu_bit_len(rem)
+  let lm = dbu_bit_len(m)
+  if la < lm {
+    return dbu_trim(rem)
+  }
+  let mut shift = la - lm
+  while shift >= 0 {
+    if dbu_cmp_shifted(rem, m, shift) >= 0 {
+      dbu_sub_shifted_inplace(rem, m, shift)
+    }
+    shift = shift - 1
+  }
+  dbu_trim(rem)
+}
+
+///|
+fn dbu_modpow(base : Array[UInt64], exp : Array[UInt64], modulus : Array[UInt64]) -> Array[UInt64] {
+  let mut res : Array[UInt64] = [1UL]
+  let bits = dbu_bit_len(exp)
+  let mut i = bits - 1
+  while i >= 0 {
+    res = dbu_mod(dbu_mul(res, res), modulus)
+    if dbu_get_bit(exp, i) {
+      res = dbu_mod(dbu_mul(res, base), modulus)
+    }
+    i = i - 1
+  }
+  res
+}
+
+///| Verify PKCS#1 v1.5 SHA-256 signature with a 1024..4096-bit RSA SPKI DER public key.
+fn dkim_rsa_verify_rs256_spki_der(
+  spki_der : Bytes,
+  message : Bytes,
+  signature : Bytes,
+) -> Result[Unit, EmailError] {
+  let (n_bytes, e_bytes) = match dkim_parse_rsa_spki_der(spki_der) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let n_bits = dkim_be_bit_len(n_bytes)
+  let e_bits = dkim_be_bit_len(e_bytes)
+  if n_bits < 1024 || n_bits > 4096 {
+    return Err(EmailError::InvalidDkim("RSA key size must be 1024..4096 bits"))
+  }
+  if n_bytes.length() == 0 || (n_bytes[n_bytes.length() - 1].to_int() & 1) == 0 {
+    return Err(EmailError::InvalidDkim("RSA modulus must be odd"))
+  }
+  if e_bits < 2 || e_bits > 33 || e_bytes.length() == 0 || (e_bytes[e_bytes.length() - 1].to_int() & 1) == 0 {
+    return Err(EmailError::InvalidDkim("invalid RSA public exponent"))
+  }
+  // Delegate >= 2048-bit keys to `packages/crypto`
+  if n_bits >= 2048 {
+    let pub_key = match crypto::RsaPublicKey::from_spki_der(spki_der) {
+      Ok(k) => k
+      Err(_) => return Err(EmailError::InvalidDkim("invalid RSA SPKI DER"))
+    }
+    return match crypto::rsa_verify_rs256(pub_key, message, signature) {
+      Ok(_) => Ok(())
+      Err(_) => Err(EmailError::DkimVerifyFailed("rsa-sha256 signature verification failed"))
+    }
+  }
+  // 1024..2047-bit path (RFC 8301 §3.2 MUST verify)
+  let em_len = (n_bits + 7) / 8
+  if signature.length() != em_len {
+    return Err(EmailError::DkimVerifyFailed("RSA signature length mismatch"))
+  }
+  let n = dbu_from_be(n_bytes)
+  let e = dbu_from_be(e_bytes)
+  if dbu_cmp(e, n) >= 0 {
+    return Err(EmailError::InvalidDkim("RSA exponent >= modulus"))
+  }
+  let s = dbu_from_be(signature)
+  if dbu_cmp(s, n) >= 0 {
+    return Err(EmailError::DkimVerifyFailed("RSA signature integer >= modulus"))
+  }
+  let m = dbu_modpow(s, e, n)
+  let em = dbu_to_be(m, em_len)
+
+  // Construct canonical RFC 8017 §9.2 DigestInfo for SHA-256
+  let digest = crypto::sha256(message)
+  let prefix = [
+    0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+  ]
+  let t_len = 19 + 32
+  if em_len < t_len + 11 {
+    return Err(EmailError::DkimVerifyFailed("RSA modulus too small for SHA-256"))
+  }
+  let expected = Bytes::new(em_len)
+  expected[0] = (0x00).to_byte()
+  expected[1] = (0x01).to_byte()
+  let ps_end = em_len - t_len - 1
+  let mut i = 2
+  while i < ps_end {
+    expected[i] = (0xFF).to_byte()
+    i = i + 1
+  }
+  expected[ps_end] = (0x00).to_byte()
+  let mut pi = 0
+  while pi < 19 {
+    expected[ps_end + 1 + pi] = prefix[pi].to_byte()
+    pi = pi + 1
+  }
+  let mut di = 0
+  while di < 32 {
+    expected[ps_end + 20 + di] = digest[di]
+    di = di + 1
+  }
+  if crypto::constant_time_eq(em, expected) {
+    Ok(())
+  } else {
+    Err(EmailError::DkimVerifyFailed("rsa-sha256 signature verification failed"))
+  }
+}

@@ -1,0 +1,809 @@
+///| Iterative MIME email tree parser and body/inline/attachment extractor.
+
+import "mime"
+
+///|
+pub struct Attachment {
+  filename : String
+  safe_filename : Option[String]
+  content_type : String
+  content_id : Option[String]
+  is_inline : Bool
+  body : Bytes
+}
+
+///|
+pub struct MimePart {
+  headers : Array[Header]
+  content_type : String
+  charset : String
+  content_disposition : Option[String]
+  filename : Option[String]
+  safe_filename : Option[String]
+  content_id : Option[String]
+  transfer_encoding : String
+  body : Bytes
+  children : Array[MimePart]
+}
+
+///|
+pub struct EmailMessage {
+  headers : Array[Header]
+  raw_header_bytes : Bytes
+  raw_body_bytes : Bytes
+  root : MimePart
+}
+
+///|
+fn msg_ascii_lower_str(s : String) -> String {
+  let len = s.length()
+  let mut has_upper = false
+  let mut k = 0
+  while k < len {
+    let c = s.code_unit_at(k)
+    if c >= 65 && c <= 90 {
+      has_upper = true
+      break
+    }
+    k = k + 1
+  }
+  if !has_upper {
+    return s
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < len {
+    sb.write_byte(hdr_ascii_lower(s.code_unit_at(i)).to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn msg_strip_angle_brackets(s : String) -> String {
+  let t = hdr_trim_wsp(s)
+  let len = t.length()
+  if len >= 2 && t.code_unit_at(0) == 60 && t.code_unit_at(len - 1) == 62 {
+    t.slice(1, len - 1)
+  } else {
+    t
+  }
+}
+
+///| RFC 2045 §6.8 single-pass Base64 decoder: ignores all characters outside the Base64 alphabet.
+fn msg_decode_base64_permissive(raw : Bytes, start : Int, end : Int) -> Bytes {
+  let cap = ((end - start) * 3) / 4 + 4
+  let tmp = Bytes::new(cap)
+  let mut out_len = 0
+  let mut buf = 0
+  let mut bits = 0
+  let mut i = start
+  while i < end {
+    let c = raw[i].to_int() & 0xFF
+    if c == 61 {
+      // Padding '=' ends the stream
+      break
+    }
+    let v = if c >= 65 && c <= 90 {
+      c - 65
+    } else if c >= 97 && c <= 122 {
+      c - 71
+    } else if c >= 48 && c <= 57 {
+      c + 4
+    } else if c == 43 {
+      62
+    } else if c == 47 {
+      63
+    } else {
+      -1
+    }
+    if v >= 0 {
+      buf = (buf << 6) | v
+      bits = bits + 6
+      if bits >= 8 {
+        bits = bits - 8
+        tmp[out_len] = ((buf >> bits) & 0xFF).to_byte()
+        out_len = out_len + 1
+      }
+    }
+    i = i + 1
+  }
+  if out_len == cap {
+    tmp
+  } else {
+    tmp.slice(0, out_len)
+  }
+}
+
+///|
+fn msg_decode_body_range(raw : Bytes, start : Int, end : Int, encoding : String) -> Result[Bytes, EmailError] {
+  let enc = msg_ascii_lower_str(hdr_trim_wsp(encoding))
+  if enc == "" || enc == "7bit" || enc == "8bit" || enc == "binary" {
+    return Ok(if start == 0 && end == raw.length() { raw } else { raw.slice(start, end) })
+  }
+  if enc == "base64" {
+    return Ok(msg_decode_base64_permissive(raw, start, end))
+  }
+  if enc == "quoted-printable" {
+    let slice = if start == 0 && end == raw.length() { raw } else { raw.slice(start, end) }
+    return match mime::qp_decode(slice) {
+      Ok(b) => Ok(b)
+      Err(_) => Err(EmailError::InvalidEncoding("invalid quoted-printable body"))
+    }
+  }
+  // Unknown transfer-encoding: return raw bytes per Postel's law
+  Ok(if start == 0 && end == raw.length() { raw } else { raw.slice(start, end) })
+}
+
+///|
+fn msg_is_multipart(essence : String) -> Bool {
+  essence.length() >= 10 && essence.slice(0, 10) == "multipart/"
+}
+
+///|
+fn msg_safe_filename_from_raw(raw_name : String) -> Option[String] {
+  let sb = StringBuilder::new()
+  sb.write_string("attachment; filename=\"")
+  let len = raw_name.length()
+  let mut i = 0
+  while i < len {
+    let c = raw_name.code_unit_at(i)
+    if c == 34 || c == 92 {
+      sb.write_byte((92).to_byte())
+    }
+    sb.write_byte(c.to_byte())
+    i = i + 1
+  }
+  sb.write_byte((34).to_byte())
+  match mime::parse_content_disposition(sb.to_string()) {
+    Ok(cd) => cd.safe_filename()
+    Err(_) => None
+  }
+}
+
+///| Zero-copy RFC 2046 §5.1.1 multipart splitter over `raw[start..end)`.
+///| Tolerates a missing close-delimiter `--boundary--` while strictly checking delimiter suffix.
+fn msg_split_multipart(
+  raw : Bytes,
+  start : Int,
+  end : Int,
+  boundary : String,
+  max_parts : Int,
+) -> Result[Array[(Int, Int)], EmailError] {
+  let blen = boundary.length()
+  if blen == 0 || blen > 200 {
+    return Err(EmailError::InvalidMime("invalid multipart boundary"))
+  }
+  let parts : Array[(Int, Int)] = []
+  let mut pos = start
+  let mut in_part = false
+  let mut part_start = start
+
+  while pos < end {
+    // Check if current line starts with `--<boundary>`
+    if pos + 2 + blen <= end && raw[pos].to_int() == 45 && raw[pos + 1].to_int() == 45 {
+      let mut eq = true
+      let mut k = 0
+      while k < blen {
+        if (raw[pos + 2 + k].to_int() & 0xFF) != boundary.code_unit_at(k) {
+          eq = false
+          break
+        }
+        k = k + 1
+      }
+      if eq {
+        let mut after = pos + 2 + blen
+        let is_close = after + 2 <= end && raw[after].to_int() == 45 && raw[after + 1].to_int() == 45
+        if is_close {
+          after = after + 2
+        }
+        // RFC 2046 §5.1.1: optional transport padding (SP/HTAB) before CRLF/LF/EOF
+        while after < end && (raw[after].to_int() == 32 || raw[after].to_int() == 9) {
+          after = after + 1
+        }
+        let valid_eol = after == end ||
+        raw[after].to_int() == 10 ||
+        (raw[after].to_int() == 13 && after + 1 < end && raw[after + 1].to_int() == 10)
+        if valid_eol {
+          if in_part {
+            // The CRLF/LF immediately preceding the delimiter belongs to the delimiter, not the part
+            let mut pend = pos
+            if pend >= part_start + 2 && raw[pend - 2].to_int() == 13 && raw[pend - 1].to_int() == 10 {
+              pend = pend - 2
+            } else if pend >= part_start + 1 && raw[pend - 1].to_int() == 10 {
+              pend = pend - 1
+            }
+            parts.push((part_start, pend))
+            if parts.length() > max_parts {
+              return Err(EmailError::LimitExceeded("MIME part count exceeds max_parts"))
+            }
+          }
+          if is_close {
+            return Ok(parts)
+          }
+          // Advance past delimiter line ending
+          let mut next_start = after
+          if next_start < end && raw[next_start].to_int() == 13 && next_start + 1 < end && raw[next_start + 1].to_int() == 10 {
+            next_start = next_start + 2
+          } else if next_start < end && raw[next_start].to_int() == 10 {
+            next_start = next_start + 1
+          }
+          in_part = true
+          part_start = next_start
+          pos = next_start
+          continue
+        }
+      }
+    }
+    // Advance to the start of the next line
+    while pos < end && raw[pos].to_int() != 10 {
+      pos = pos + 1
+    }
+    if pos < end {
+      pos = pos + 1
+    }
+  }
+
+  // Tolerate missing close-delimiter: keep the trailing open part if any
+  if in_part {
+    parts.push((part_start, end))
+    if parts.length() > max_parts {
+      return Err(EmailError::LimitExceeded("MIME part count exceeds max_parts"))
+    }
+  }
+  Ok(parts)
+}
+
+///|
+struct PartWork {
+  parent_idx : Int
+  headers : Array[Header]
+  buf : Bytes
+  start : Int
+  end : Int
+  depth : Int
+}
+
+///|
+fn parse_part_tree_iterative(
+  top_headers : Array[Header],
+  raw_buf : Bytes,
+  body_start : Int,
+  body_end : Int,
+  limits : EmailLimits,
+) -> Result[MimePart, EmailError] {
+  // Hard safety ceiling prevents O(N^2) memory amplification even when caller raises max_depth
+  let hard_max_depth = 256
+  let eff_max_depth = if limits.max_depth < hard_max_depth { limits.max_depth } else { hard_max_depth }
+
+  let stack : Array[PartWork] = [
+    PartWork::{
+      parent_idx: -1,
+      headers: top_headers,
+      buf: raw_buf,
+      start: body_start,
+      end: body_end,
+      depth: 0,
+    },
+  ]
+  let nodes : Array[MimePart] = []
+  let child_indices : Array[Array[Int]] = []
+  let mut part_count = 0
+
+  while stack.length() > 0 {
+    let work = stack[stack.length() - 1]
+    let _ = stack.pop()
+
+    if work.depth > eff_max_depth {
+      return Err(EmailError::LimitExceeded("MIME nesting depth exceeds max_depth"))
+    }
+    if part_count >= limits.max_parts {
+      return Err(EmailError::LimitExceeded("MIME part count exceeds max_parts"))
+    }
+    part_count = part_count + 1
+
+    // Single-pass scan for the 4 MIME headers
+    let mut ct_opt : Option[String] = None
+    let mut cd_opt : Option[String] = None
+    let mut cid_opt : Option[String] = None
+    let mut te_opt : Option[String] = None
+    let mut hi = 0
+    while hi < work.headers.length() {
+      let h = work.headers[hi]
+      let hlen = h.name.length()
+      if hlen == 12 && ct_opt is None && hdr_eq_ignore_case(h.name, "Content-Type") {
+        ct_opt = Some(h.value)
+      } else if hlen == 19 && cd_opt is None && hdr_eq_ignore_case(h.name, "Content-Disposition") {
+        cd_opt = Some(h.value)
+      } else if hlen == 10 && cid_opt is None && hdr_eq_ignore_case(h.name, "Content-ID") {
+        cid_opt = Some(h.value)
+      } else if hlen == 25 && te_opt is None && hdr_eq_ignore_case(h.name, "Content-Transfer-Encoding") {
+        te_opt = Some(h.value)
+      }
+      hi = hi + 1
+    }
+
+    // Parse Content-Type
+    let mut content_type = "text/plain"
+    let mut charset = "us-ascii"
+    let mut boundary : Option[String] = None
+    let mut ct_name : Option[String] = None
+    match ct_opt {
+      Some(ct_raw) =>
+      match mime::parse_media_type(ct_raw) {
+        Ok(mt) => {
+          content_type = mt.essence()
+          match mt.param("charset") {
+            Some(cs) => charset = msg_ascii_lower_str(cs)
+            None => ()
+          }
+          boundary = mt.param("boundary")
+          ct_name = mt.param("name")
+        }
+        Err(_) => ()
+      }
+      None => ()
+    }
+
+    // Parse Content-Disposition (+ RFC 2047 filename decoding)
+    let mut disp_type : Option[String] = None
+    let mut filename : Option[String] = None
+    let mut safe_filename : Option[String] = None
+    match cd_opt {
+      Some(cd_raw) =>
+      match mime::parse_content_disposition(cd_raw) {
+        Ok(cd) => {
+          disp_type = Some(cd.disposition)
+          match cd.filename() {
+            Some(fn_raw) =>
+            if fn_raw.contains("=?") {
+              let dec_fn = email_decode_rfc2047(fn_raw)
+              filename = Some(dec_fn)
+              safe_filename = msg_safe_filename_from_raw(dec_fn)
+            } else {
+              filename = Some(fn_raw)
+              safe_filename = cd.safe_filename()
+            }
+            None => ()
+          }
+        }
+        Err(_) => ()
+      }
+      None => ()
+    }
+    match (filename, ct_name) {
+      (None, Some(n_raw)) => {
+        let dec_n = if n_raw.contains("=?") { email_decode_rfc2047(n_raw) } else { n_raw }
+        filename = Some(dec_n)
+        safe_filename = msg_safe_filename_from_raw(dec_n)
+      }
+      _ => ()
+    }
+
+    // Parse Content-ID
+    let content_id = match cid_opt {
+      Some(cid) => {
+        let stripped = msg_strip_angle_brackets(cid)
+        if stripped.length() > 0 { Some(stripped) } else { None }
+      }
+      None => None
+    }
+
+    // Parse Content-Transfer-Encoding
+    let transfer_encoding = match te_opt {
+      Some(te) => msg_ascii_lower_str(hdr_trim_wsp(te))
+      None => "7bit"
+    }
+
+    let node_idx = nodes.length()
+    child_indices.push([])
+    if work.parent_idx >= 0 {
+      child_indices[work.parent_idx].push(node_idx)
+    }
+
+    if msg_is_multipart(content_type) {
+      match boundary {
+        Some(b) => {
+          let spans = match msg_split_multipart(work.buf, work.start, work.end, b, limits.max_parts) {
+            Ok(ps) => ps
+            Err(e) => return Err(e)
+          }
+          nodes.push(
+            MimePart::{
+              headers: work.headers,
+              content_type: content_type,
+              charset: charset,
+              content_disposition: disp_type,
+              filename: filename,
+              safe_filename: safe_filename,
+              content_id: content_id,
+              transfer_encoding: transfer_encoding,
+              body: Bytes::new(0),
+              children: [],
+            },
+          )
+          // Push children in reverse order so they pop in document order
+          let mut pi = spans.length() - 1
+          while pi >= 0 {
+            let (ps, pe) = spans[pi]
+            let (sub_hdrs, sub_body_off) = match parse_headers_range(work.buf, ps, pe, limits) {
+              Ok(v) => v
+              Err(e) => return Err(e)
+            }
+            stack.push(
+              PartWork::{
+                parent_idx: node_idx,
+                headers: sub_hdrs,
+                buf: work.buf,
+                start: sub_body_off,
+                end: pe,
+                depth: work.depth + 1,
+              },
+            )
+            pi = pi - 1
+          }
+          continue
+        }
+        None => {
+          let raw_slice = work.buf.slice(work.start, work.end)
+          nodes.push(
+            MimePart::{
+              headers: work.headers,
+              content_type: content_type,
+              charset: charset,
+              content_disposition: disp_type,
+              filename: filename,
+              safe_filename: safe_filename,
+              content_id: content_id,
+              transfer_encoding: transfer_encoding,
+              body: raw_slice,
+              children: [],
+            },
+          )
+          continue
+        }
+      }
+    }
+
+    if content_type == "message/rfc822" {
+      let decoded = match msg_decode_body_range(work.buf, work.start, work.end, transfer_encoding) {
+        Ok(b) => b
+        Err(e) => return Err(e)
+      }
+      nodes.push(
+        MimePart::{
+          headers: work.headers,
+          content_type: content_type,
+          charset: charset,
+          content_disposition: disp_type,
+          filename: filename,
+          safe_filename: safe_filename,
+          content_id: content_id,
+          transfer_encoding: transfer_encoding,
+          body: decoded,
+          children: [],
+        },
+      )
+      match parse_headers_range(decoded, 0, decoded.length(), limits) {
+        Ok((sub_hdrs, sub_off)) =>
+        stack.push(
+          PartWork::{
+            parent_idx: node_idx,
+            headers: sub_hdrs,
+            buf: decoded,
+            start: sub_off,
+            end: decoded.length(),
+            depth: work.depth + 1,
+          },
+        )
+        Err(_) => ()
+      }
+      continue
+    }
+
+    let decoded = match msg_decode_body_range(work.buf, work.start, work.end, transfer_encoding) {
+      Ok(b) => b
+      Err(e) => return Err(e)
+    }
+    nodes.push(
+      MimePart::{
+        headers: work.headers,
+        content_type: content_type,
+        charset: charset,
+        content_disposition: disp_type,
+        filename: filename,
+        safe_filename: safe_filename,
+        content_id: content_id,
+        transfer_encoding: transfer_encoding,
+        body: decoded,
+        children: [],
+      },
+    )
+  }
+
+  // Assemble children bottom-up so nested subtrees are always complete
+  let mut ni = nodes.length() - 1
+  while ni >= 0 {
+    let cidxs = child_indices[ni]
+    let mut ci = 0
+    while ci < cidxs.length() {
+      nodes[ni].children.push(nodes[cidxs[ci]])
+      ci = ci + 1
+    }
+    ni = ni - 1
+  }
+  Ok(nodes[0])
+}
+
+///|
+pub fn parse_message(raw : Bytes) -> Result[EmailMessage, EmailError] {
+  parse_message_with_limits(raw, EmailLimits::default())
+}
+
+///|
+pub fn parse_message_with_limits(
+  raw : Bytes,
+  limits : EmailLimits,
+) -> Result[EmailMessage, EmailError] {
+  let (top_headers, body_off) = match parse_headers(raw, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let body_len = raw.length() - body_off
+  if body_len > limits.max_body_bytes {
+    return Err(EmailError::LimitExceeded("message body exceeds max_body_bytes"))
+  }
+  let raw_header_bytes = raw.slice(0, body_off)
+  let raw_body_bytes = raw.slice(body_off, raw.length())
+  let root = match parse_part_tree_iterative(top_headers, raw, body_off, raw.length(), limits) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  Ok(
+    EmailMessage::{
+      headers: top_headers,
+      raw_header_bytes: raw_header_bytes,
+      raw_body_bytes: raw_body_bytes,
+      root: root,
+    },
+  )
+}
+
+///|
+pub fn EmailMessage::header(self : EmailMessage, name : String) -> Option[String] {
+  headers_get(self.headers, name)
+}
+
+///|
+pub fn EmailMessage::header_decoded(self : EmailMessage, name : String) -> Option[String] {
+  headers_get_decoded(self.headers, name)
+}
+
+///|
+pub fn EmailMessage::headers_all(self : EmailMessage, name : String) -> Array[String] {
+  headers_get_all(self.headers, name)
+}
+
+///|
+pub fn EmailMessage::subject(self : EmailMessage) -> Option[String] {
+  headers_get_decoded(self.headers, "Subject")
+}
+
+///|
+pub fn EmailMessage::message_id(self : EmailMessage) -> Option[String] {
+  headers_get(self.headers, "Message-ID")
+}
+
+///|
+fn msg_parse_addr_header(
+  self : EmailMessage,
+  name : String,
+) -> Result[Array[Mailbox], EmailError] {
+  match headers_get(self.headers, name) {
+    None => Ok([])
+    Some(v) =>
+    match parse_address_list(v) {
+      Ok(addrs) => Ok(flatten_addresses(addrs))
+      Err(e) => Err(e)
+    }
+  }
+}
+
+///|
+pub fn EmailMessage::from(self : EmailMessage) -> Result[Array[Mailbox], EmailError] {
+  msg_parse_addr_header(self, "From")
+}
+
+///|
+pub fn EmailMessage::to(self : EmailMessage) -> Result[Array[Mailbox], EmailError] {
+  msg_parse_addr_header(self, "To")
+}
+
+///|
+pub fn EmailMessage::cc(self : EmailMessage) -> Result[Array[Mailbox], EmailError] {
+  msg_parse_addr_header(self, "Cc")
+}
+
+///|
+pub fn EmailMessage::date(self : EmailMessage) -> Result[Option[EmailDate], EmailError] {
+  match headers_get(self.headers, "Date") {
+    None => Ok(None)
+    Some(v) =>
+    match parse_date(v) {
+      Ok(d) => Ok(Some(d))
+      Err(e) => Err(e)
+    }
+  }
+}
+
+///|
+fn part_is_attachment_disp(p : MimePart) -> Bool {
+  match p.content_disposition {
+    Some(d) => d == "attachment"
+    None => false
+  }
+}
+
+///|
+fn part_is_inline_resource(p : MimePart) -> Bool {
+  match p.content_disposition {
+    Some(d) =>
+    if d == "inline" {
+      match (p.content_id, p.filename) {
+        (Some(_), _) => true
+        (_, Some(_)) => true
+        _ => p.content_type != "text/plain" && p.content_type != "text/html"
+      }
+    } else {
+      false
+    }
+    None =>
+    match p.content_id {
+      Some(_) => p.content_type != "text/plain" && p.content_type != "text/html"
+      None => false
+    }
+  }
+}
+
+///|
+fn collect_parts_dfs(root : MimePart) -> Array[MimePart] {
+  let out : Array[MimePart] = []
+  let stack : Array[MimePart] = [root]
+  while stack.length() > 0 {
+    let cur = stack[stack.length() - 1]
+    let _ = stack.pop()
+    if msg_is_multipart(cur.content_type) {
+      let mut i = cur.children.length() - 1
+      while i >= 0 {
+        stack.push(cur.children[i])
+        i = i - 1
+      }
+    } else {
+      out.push(cur)
+    }
+  }
+  out
+}
+
+///|
+pub fn EmailMessage::text_body(self : EmailMessage) -> Option[String] {
+  let leaves = collect_parts_dfs(self.root)
+  let mut i = 0
+  while i < leaves.length() {
+    let p = leaves[i]
+    if p.content_type == "text/plain" && !part_is_attachment_disp(p) {
+      return Some(decode_charset_to_utf8(p.body, p.charset))
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+pub fn EmailMessage::html_body(self : EmailMessage) -> Option[String] {
+  let leaves = collect_parts_dfs(self.root)
+  let mut i = 0
+  while i < leaves.length() {
+    let p = leaves[i]
+    if p.content_type == "text/html" && !part_is_attachment_disp(p) {
+      return Some(decode_charset_to_utf8(p.body, p.charset))
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+pub fn EmailMessage::attachments(self : EmailMessage) -> Array[Attachment] {
+  let leaves = collect_parts_dfs(self.root)
+  let out : Array[Attachment] = []
+  let mut i = 0
+  while i < leaves.length() {
+    let p = leaves[i]
+    let is_att = part_is_attachment_disp(p) ||
+    (!part_is_inline_resource(p) &&
+      p.content_type != "text/plain" &&
+      p.content_type != "text/html")
+    if is_att {
+      let fname = match p.filename {
+        Some(f) => f
+        None => ""
+      }
+      out.push(
+        Attachment::{
+          filename: fname,
+          safe_filename: p.safe_filename,
+          content_type: p.content_type,
+          content_id: p.content_id,
+          is_inline: false,
+          body: p.body,
+        },
+      )
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+pub fn EmailMessage::inline_parts(self : EmailMessage) -> Array[Attachment] {
+  let leaves = collect_parts_dfs(self.root)
+  let out : Array[Attachment] = []
+  let mut i = 0
+  while i < leaves.length() {
+    let p = leaves[i]
+    if part_is_inline_resource(p) {
+      let fname = match p.filename {
+        Some(f) => f
+        None => ""
+      }
+      out.push(
+        Attachment::{
+          filename: fname,
+          safe_filename: p.safe_filename,
+          content_type: p.content_type,
+          content_id: p.content_id,
+          is_inline: true,
+          body: p.body,
+        },
+      )
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+pub fn EmailMessage::part_by_cid(
+  self : EmailMessage,
+  cid : String,
+) -> Option[Attachment] {
+  let target = msg_strip_angle_brackets(cid)
+  let leaves = collect_parts_dfs(self.root)
+  let mut i = 0
+  while i < leaves.length() {
+    let p = leaves[i]
+    match p.content_id {
+      Some(c) =>
+      if c == target {
+        let fname = match p.filename {
+          Some(f) => f
+          None => ""
+        }
+        return Some(
+          Attachment::{
+            filename: fname,
+            safe_filename: p.safe_filename,
+            content_type: p.content_type,
+            content_id: Some(c),
+            is_inline: part_is_inline_resource(p),
+            body: p.body,
+          },
+        )
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+  None
+}
