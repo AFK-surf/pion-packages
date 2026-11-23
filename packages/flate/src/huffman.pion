@@ -2,13 +2,33 @@
 ///| and length-limited Canonical Huffman encoder (Package-Merge, <= 15 bits).
 
 ///|
-let huff_root_bits : Int = 9
+let litlen_root_bits : Int = 10
 
 ///|
-let huff_root_size : Int = 512
+let litlen_root_size : Int = 1024
 
 ///|
-let huff_root_mask : Int = 511
+let litlen_root_mask : UInt64 = 1023UL
+
+///|
+let dist_root_bits : Int = 9
+
+///|
+let dist_root_mask : UInt64 = 511UL
+
+///| Precomputed bit masks `(1UL << k) - 1UL` for `k = 0..16`.
+fn build_bit_masks() -> FixedArray[UInt64] {
+  let a : FixedArray[UInt64] = FixedArray::make(17, 0UL)
+  let mut k = 0
+  while k <= 16 {
+    a[k] = (1UL << k) - 1UL
+    k = k + 1
+  }
+  a
+}
+
+///|
+let bit_masks : FixedArray[UInt64] = build_bit_masks()
 
 ///| Code-length alphabet order (RFC 1951 §3.2.7).
 fn build_cl_order() -> FixedArray[Int] {
@@ -226,26 +246,32 @@ fn build_dist_to_code_small() -> FixedArray[Int] {
 ///|
 let dist_to_code_small : FixedArray[Int] = build_dist_to_code_small()
 
-///| Fast distance (1..32768) -> distance code (0..29).
+///| Map `(dist - 1) >> 7` (range 4..255) to RFC 1951 distance code (18..29).
+fn build_dist_to_code_hi() -> FixedArray[Int] {
+  let a : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut code = 18
+  while code < 30 {
+    let lo = (dist_base[code] - 1) >> 7
+    let hi = (dist_base[code] + (1 << dist_extra[code]) - 2) >> 7
+    let mut k = lo
+    while k <= hi && k < 256 {
+      a[k] = code
+      k = k + 1
+    }
+    code = code + 1
+  }
+  a
+}
+
+///|
+let dist_to_code_hi : FixedArray[Int] = build_dist_to_code_hi()
+
+///| Fast O(1) distance (1..32768) -> distance code (0..29).
 fn dist_to_code(dist : Int) -> Int {
   if dist <= 512 {
     return dist_to_code_small[dist]
   }
-  // For dist > 512, shift right by 7 -> range 4..255 maps cleanly via small table + 14
-  let shifted = ((dist - 1) >> 7) + 1
-  // dist_base[18..29] = 513..32768, each is 128x of dist_base[4..15]
-  let mut lo = 18
-  let mut hi = 29
-  while lo < hi {
-    let mid = (lo + hi + 1) >> 1
-    if dist_base[mid] <= dist {
-      lo = mid
-    } else {
-      hi = mid - 1
-    }
-  }
-  let _ = shifted
-  lo
+  dist_to_code_hi[(dist - 1) >> 7]
 }
 
 ///| Bit-reverse the bottom `bits` bits of `code`.
@@ -439,10 +465,318 @@ fn build_fixed_dist_lengths() -> FixedArray[Int] {
 ///|
 let fixed_dist_lengths : FixedArray[Int] = build_fixed_dist_lengths()
 
-///| Prebuilt fixed Inflate litlen LUT (512 entries, max code len 9 fits completely in primary!).
+///| Build 2-level packed LitLen Inflate Huffman LUT into `table` (size >= 2048 for 10-bit root).
+///| Direct entry encoding (`(entry & 16) == 0`):
+///|   - `0`: invalid code
+///|   - `(entry & 48) == 32`: literal -> `nb = entry & 15`, `lit = entry >> 8`
+///|   - `(entry & 64) != 0`: EOB (sym 256) -> `nb = entry & 15`
+///|   - `(entry & 128) != 0`: length -> `nb = entry & 15`, `lextra = (entry >> 8) & 15`, `lbase = entry >> 12`
+///|   - `(entry & 256) != 0`: invalid symbol (286..287) -> `nb = entry & 15`, `sym = entry >> 9`
+///| Subtable entry (`(entry & 16) != 0`): `sub_bits = entry & 15`, `sub_off = entry >> 5`.
+fn build_litlen_inflate_table(
+  lengths : FixedArray[Int],
+  num_syms : Int,
+  table : FixedArray[Int],
+  root_bits : Int,
+) -> Result[Int, FlateError] {
+  let count : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut max_len = 0
+  let mut total_syms = 0
+  let mut i = 0
+  while i < num_syms {
+    let l = lengths[i]
+    if l < 0 || l > 15 {
+      return Err(FlateError::InvalidHuffmanTree("code length out of 0..15 range"))
+    }
+    if l > 0 {
+      count[l] = count[l] + 1
+      if l > max_len {
+        max_len = l
+      }
+      total_syms = total_syms + 1
+    }
+    i = i + 1
+  }
+  let root_size = 1 << root_bits
+  i = 0
+  while i < root_size {
+    table[i] = 0
+    i = i + 1
+  }
+  if total_syms == 0 {
+    return Err(FlateError::InvalidHuffmanTree("empty Huffman tree"))
+  }
+  let mut left = 1
+  let mut b = 1
+  while b <= 15 {
+    left = (left << 1) - count[b]
+    if left < 0 {
+      return Err(FlateError::InvalidHuffmanTree("oversubscribed Huffman tree"))
+    }
+    b = b + 1
+  }
+  if left > 0 && !(total_syms == 1 && max_len == 1) {
+    return Err(FlateError::InvalidHuffmanTree("incomplete Huffman tree"))
+  }
+
+  let next_code : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut code = 0
+  b = 1
+  while b <= 15 {
+    code = (code + count[b - 1]) << 1
+    next_code[b] = code
+    b = b + 1
+  }
+
+  let sub_max_bits : FixedArray[Int] = FixedArray::make(root_size, 0)
+  let sym_codes : FixedArray[Int] = FixedArray::make(num_syms, 0)
+  let lb = len_base
+  let le = len_extra
+  let mut sym = 0
+  while sym < num_syms {
+    let l = lengths[sym]
+    if l > 0 {
+      let c = next_code[l]
+      next_code[l] = c + 1
+      let rev = bit_reverse(c, l)
+      sym_codes[sym] = rev
+      if l <= root_bits {
+        let packed = if sym < 256 {
+          (sym << 8) | 32
+        } else if sym == 256 {
+          64
+        } else if sym <= 285 {
+          let lidx = sym - 257
+          (lb[lidx] << 12) | (le[lidx] << 8) | 128
+        } else {
+          (sym << 9) | 256
+        }
+        let entry = packed | l
+        let step = 1 << l
+        let mut idx = rev
+        while idx < root_size {
+          table[idx] = entry
+          idx = idx + step
+        }
+      } else {
+        let prefix = rev & (root_size - 1)
+        let extra = l - root_bits
+        if extra > sub_max_bits[prefix] {
+          sub_max_bits[prefix] = extra
+        }
+      }
+    }
+    sym = sym + 1
+  }
+
+  let mut next_free = root_size
+  let mut p = 0
+  while p < root_size {
+    let sb = sub_max_bits[p]
+    if sb > 0 {
+      let sub_size = 1 << sb
+      if next_free + sub_size > table.length() {
+        return Err(FlateError::InvalidHuffmanTree("Huffman subtable overflow"))
+      }
+      table[p] = (next_free << 5) | 16 | sb
+      let mut k = 0
+      while k < sub_size {
+        table[next_free + k] = 0
+        k = k + 1
+      }
+      next_free = next_free + sub_size
+    }
+    p = p + 1
+  }
+
+  sym = 0
+  while sym < num_syms {
+    let l = lengths[sym]
+    if l > root_bits {
+      let rev = sym_codes[sym]
+      let prefix = rev & (root_size - 1)
+      let root_entry = table[prefix]
+      let sub_off = root_entry >> 5
+      let sub_bits = root_entry & 15
+      let sub_size = 1 << sub_bits
+      let extra_len = l - root_bits
+      let packed = if sym < 256 {
+        (sym << 8) | 32
+      } else if sym == 256 {
+        64
+      } else if sym <= 285 {
+        let lidx = sym - 257
+        (lb[lidx] << 12) | (le[lidx] << 8) | 128
+      } else {
+        (sym << 9) | 256
+      }
+      let entry = packed | extra_len
+      let step = 1 << extra_len
+      let mut idx = rev >> root_bits
+      while idx < sub_size {
+        table[sub_off + idx] = entry
+        idx = idx + step
+      }
+    }
+    sym = sym + 1
+  }
+  Ok(total_syms)
+}
+
+///| Build 2-level packed Distance Inflate Huffman LUT into `table` (size >= 1024 for 9-bit root).
+///| Direct entry encoding (`(entry & 16) == 0`):
+///|   - `0`: invalid code
+///|   - `(entry & 48) == 32`: valid dist -> `dnb = entry & 15`, `dextra = (entry >> 6) & 15`, `dbase = entry >> 10`
+///|   - `(entry & 64) != 0`: invalid dist symbol (30..31) -> `dnb = entry & 15`, `dsym = entry >> 7`
+///| Subtable entry (`(entry & 16) != 0`): `sub_bits = entry & 15`, `sub_off = entry >> 5`.
+fn build_dist_inflate_table(
+  lengths : FixedArray[Int],
+  num_syms : Int,
+  table : FixedArray[Int],
+  root_bits : Int,
+  allow_empty : Bool,
+) -> Result[Int, FlateError] {
+  let count : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut max_len = 0
+  let mut total_syms = 0
+  let mut i = 0
+  while i < num_syms {
+    let l = lengths[i]
+    if l < 0 || l > 15 {
+      return Err(FlateError::InvalidHuffmanTree("code length out of 0..15 range"))
+    }
+    if l > 0 {
+      count[l] = count[l] + 1
+      if l > max_len {
+        max_len = l
+      }
+      total_syms = total_syms + 1
+    }
+    i = i + 1
+  }
+  let root_size = 1 << root_bits
+  i = 0
+  while i < root_size {
+    table[i] = 0
+    i = i + 1
+  }
+  if total_syms == 0 {
+    if allow_empty {
+      return Ok(0)
+    }
+    return Err(FlateError::InvalidHuffmanTree("empty Huffman tree"))
+  }
+  let mut left = 1
+  let mut b = 1
+  while b <= 15 {
+    left = (left << 1) - count[b]
+    if left < 0 {
+      return Err(FlateError::InvalidHuffmanTree("oversubscribed Huffman tree"))
+    }
+    b = b + 1
+  }
+  if left > 0 && !(total_syms == 1 && max_len == 1) {
+    return Err(FlateError::InvalidHuffmanTree("incomplete Huffman tree"))
+  }
+
+  let next_code : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut code = 0
+  b = 1
+  while b <= 15 {
+    code = (code + count[b - 1]) << 1
+    next_code[b] = code
+    b = b + 1
+  }
+
+  let sub_max_bits : FixedArray[Int] = FixedArray::make(root_size, 0)
+  let sym_codes : FixedArray[Int] = FixedArray::make(num_syms, 0)
+  let db = dist_base
+  let de = dist_extra
+  let mut sym = 0
+  while sym < num_syms {
+    let l = lengths[sym]
+    if l > 0 {
+      let c = next_code[l]
+      next_code[l] = c + 1
+      let rev = bit_reverse(c, l)
+      sym_codes[sym] = rev
+      if l <= root_bits {
+        let packed = if sym <= 29 {
+          (db[sym] << 10) | (de[sym] << 6) | 32
+        } else {
+          (sym << 7) | 64
+        }
+        let entry = packed | l
+        let step = 1 << l
+        let mut idx = rev
+        while idx < root_size {
+          table[idx] = entry
+          idx = idx + step
+        }
+      } else {
+        let prefix = rev & (root_size - 1)
+        let extra = l - root_bits
+        if extra > sub_max_bits[prefix] {
+          sub_max_bits[prefix] = extra
+        }
+      }
+    }
+    sym = sym + 1
+  }
+
+  let mut next_free = root_size
+  let mut p = 0
+  while p < root_size {
+    let sb = sub_max_bits[p]
+    if sb > 0 {
+      let sub_size = 1 << sb
+      if next_free + sub_size > table.length() {
+        return Err(FlateError::InvalidHuffmanTree("Huffman subtable overflow"))
+      }
+      table[p] = (next_free << 5) | 16 | sb
+      let mut k = 0
+      while k < sub_size {
+        table[next_free + k] = 0
+        k = k + 1
+      }
+      next_free = next_free + sub_size
+    }
+    p = p + 1
+  }
+
+  sym = 0
+  while sym < num_syms {
+    let l = lengths[sym]
+    if l > root_bits {
+      let rev = sym_codes[sym]
+      let prefix = rev & (root_size - 1)
+      let root_entry = table[prefix]
+      let sub_off = root_entry >> 5
+      let sub_bits = root_entry & 15
+      let sub_size = 1 << sub_bits
+      let extra_len = l - root_bits
+      let packed = if sym <= 29 {
+        (db[sym] << 10) | (de[sym] << 6) | 32
+      } else {
+        (sym << 7) | 64
+      }
+      let entry = packed | extra_len
+      let step = 1 << extra_len
+      let mut idx = rev >> root_bits
+      while idx < sub_size {
+        table[sub_off + idx] = entry
+        idx = idx + step
+      }
+    }
+    sym = sym + 1
+  }
+  Ok(total_syms)
+}
+
+///| Prebuilt fixed Inflate litlen LUT (1024 entries, max code len 9 fits completely in 10-bit primary).
 fn build_fixed_litlen_lut() -> FixedArray[Int] {
-  let t : FixedArray[Int] = FixedArray::make(1024, 0)
-  let _ = build_inflate_table(fixed_litlen_lengths, 288, t, huff_root_bits, false)
+  let t : FixedArray[Int] = FixedArray::make(litlen_root_size, 0)
+  let _ = build_litlen_inflate_table(fixed_litlen_lengths, 288, t, litlen_root_bits)
   t
 }
 
@@ -452,7 +786,7 @@ let fixed_litlen_lut : FixedArray[Int] = build_fixed_litlen_lut()
 ///| Prebuilt fixed Inflate dist LUT (all 5-bit codes).
 fn build_fixed_dist_lut() -> FixedArray[Int] {
   let t : FixedArray[Int] = FixedArray::make(64, 0)
-  let _ = build_inflate_table(fixed_dist_lengths, 32, t, 5, false)
+  let _ = build_dist_inflate_table(fixed_dist_lengths, 32, t, 5, false)
   t
 }
 

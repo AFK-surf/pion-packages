@@ -49,7 +49,19 @@ fn main() {
             if args.len() >= 5 {
                 fs::write(&args[4], &last_gz).expect("write dump");
             }
-            println!("mode={} input_bytes={} iters={}", mode, data.len(), iters);
+            let mut dec_reader = GzDecoder::new(last_gz.as_slice());
+            let mut dec = Vec::with_capacity(data.len());
+            dec_reader.read_to_end(&mut dec).expect("verify gzip decompress");
+            let mut vcrc = Crc::new();
+            vcrc.update(&dec);
+            println!(
+                "mode={} input_bytes={} iters={} verified_len={} verified_crc32={}",
+                mode,
+                data.len(),
+                iters,
+                dec.len(),
+                vcrc.sum() as i64
+            );
         }
         "checksum" => {
             let mut crc = Crc::new();

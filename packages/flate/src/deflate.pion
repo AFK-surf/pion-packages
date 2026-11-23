@@ -1,20 +1,23 @@
 ///| High-performance RFC 1951 raw DEFLATE compressor.
 ///| Features a 32 KiB sliding window with 15-bit hash-chain LZ77 (levels 0..9:
-///| stored, fast/greedy, and lazy matching), Package-Merge length-limited (<= 15 bit)
-///| Canonical Huffman coding, and per-block minimum-cost selection among Stored, Fixed, and Dynamic.
+///| stored, fast/greedy with adaptive miss-skipping, and lazy matching with zlib-style
+///| `good_length`/`max_lazy`/`nice_length` early exit), incompressible-block Stored fast path,
+///| Package-Merge length-limited (<= 15 bit) Canonical Huffman coding, and per-block
+///| minimum-cost selection among Stored, Fixed, and Dynamic.
 
-///| 64-bit LSB-first bit writer backed by a growable `Bytes` buffer.
+///| 64-bit LSB-first bit writer backed by chunked `Bytes` buffers (`memcpy`-based flush).
 struct BitWriter {
   mut buf : Bytes
   mut len : Int
   mut bitbuf : UInt64
   mut bitcnt : Int
+  chunks : Array[Bytes]
 }
 
 ///|
 fn BitWriter::new(init_cap : Int) -> BitWriter {
-  let c = if init_cap < 64 { 64 } else { init_cap }
-  BitWriter::{ buf: Bytes::new(c), len: 0, bitbuf: 0UL, bitcnt: 0 }
+  let c = if init_cap < 256 { 256 } else if init_cap > 65536 { 65536 } else { init_cap }
+  BitWriter::{ buf: Bytes::new(c), len: 0, bitbuf: 0UL, bitcnt: 0, chunks: [] }
 }
 
 ///|
@@ -23,30 +26,29 @@ fn bw_ensure(bw : BitWriter, extra : Int) -> Unit {
   if needed <= bw.buf.length() {
     return
   }
+  if bw.len >= 4096 {
+    bw.chunks.push(bw.buf.slice(0, bw.len))
+    bw.len = 0
+    if extra <= bw.buf.length() {
+      return
+    }
+    let mut new_cap = bw.buf.length() * 2
+    while new_cap < extra {
+      new_cap = new_cap * 2
+    }
+    bw.buf = Bytes::new(new_cap)
+    return
+  }
   let mut new_cap = bw.buf.length() * 2
   while new_cap < needed {
     new_cap = new_cap * 2
   }
-  let mut next = Bytes::new(new_cap)
-  let used = bw.len
-  let mut i = 0
-  let lim8 = used - 8
-  while i <= lim8 {
-    next[i] = bw.buf[i]
-    next[i + 1] = bw.buf[i + 1]
-    next[i + 2] = bw.buf[i + 2]
-    next[i + 3] = bw.buf[i + 3]
-    next[i + 4] = bw.buf[i + 4]
-    next[i + 5] = bw.buf[i + 5]
-    next[i + 6] = bw.buf[i + 6]
-    next[i + 7] = bw.buf[i + 7]
-    i = i + 8
+  let pad = Bytes::new(new_cap - bw.len)
+  bw.buf = if bw.len == bw.buf.length() {
+    bw.buf.concat(pad)
+  } else {
+    bw.buf.slice(0, bw.len).concat(pad)
   }
-  while i < used {
-    next[i] = bw.buf[i]
-    i = i + 1
-  }
-  bw.buf = next
 }
 
 ///|
@@ -85,25 +87,34 @@ fn bw_align_byte(bw : BitWriter) -> Unit {
 
 ///| Write raw bytes directly (caller must call `bw_align_byte` first).
 fn bw_write_raw(bw : BitWriter, data : Bytes, start : Int, count : Int) -> Unit {
+  if count >= 256 {
+    if bw.len > 0 {
+      bw.chunks.push(bw.buf.slice(0, bw.len))
+      bw.len = 0
+    }
+    bw.chunks.push(data.slice(start, start + count))
+    return
+  }
   bw_ensure(bw, count)
   let mut k = 0
-  let lim8 = count - 8
-  while k <= lim8 {
-    bw.buf[bw.len + k] = data[start + k]
-    bw.buf[bw.len + k + 1] = data[start + k + 1]
-    bw.buf[bw.len + k + 2] = data[start + k + 2]
-    bw.buf[bw.len + k + 3] = data[start + k + 3]
-    bw.buf[bw.len + k + 4] = data[start + k + 4]
-    bw.buf[bw.len + k + 5] = data[start + k + 5]
-    bw.buf[bw.len + k + 6] = data[start + k + 6]
-    bw.buf[bw.len + k + 7] = data[start + k + 7]
-    k = k + 8
-  }
   while k < count {
     bw.buf[bw.len + k] = data[start + k]
     k = k + 1
   }
   bw.len = bw.len + count
+}
+
+///| Finalize `BitWriter` into a contiguous `Bytes` buffer.
+fn bw_finish(bw : BitWriter) -> Bytes {
+  bw_align_byte(bw)
+  if bw.chunks.length() == 0 {
+    return bw.buf.slice(0, bw.len)
+  }
+  if bw.len > 0 {
+    bw.chunks.push(bw.buf.slice(0, bw.len))
+    bw.len = 0
+  }
+  concat_bytes_chunks(bw.chunks)
 }
 
 ///| Emit stored block(s) for `data[start..start+count]`.
@@ -232,6 +243,7 @@ fn rle_encode_lengths(
 }
 
 ///| Flush buffered LZ77 tokens choosing the smallest of Stored, Fixed, or Dynamic Huffman.
+///| Returns `true` if Stored was chosen.
 fn flush_lz77_block(
   bw : BitWriter,
   data : Bytes,
@@ -240,10 +252,33 @@ fn flush_lz77_block(
   tok_lit_len : FixedArray[Int],
   tok_dist : FixedArray[Int],
   tok_cnt : Int,
+  match_cnt : Int,
   lit_freqs : FixedArray[Int],
   dist_freqs : FixedArray[Int],
   is_final : Bool,
-) -> Unit {
+) -> Bool {
+  // Fast check: if 0 matches and literal distribution is near-flat across >= 240 symbols,
+  // Dynamic Huffman cannot beat Stored; skip Package-Merge entirely.
+  if match_cnt == 0 && block_raw_len >= 1024 {
+    let mut distinct = 0
+    let mut max_f = 0
+    let mut k = 0
+    while k < 256 {
+      let f = lit_freqs[k]
+      if f > 0 {
+        distinct = distinct + 1
+        if f > max_f {
+          max_f = f
+        }
+      }
+      k = k + 1
+    }
+    if distinct >= 240 && max_f * 64 < block_raw_len {
+      emit_stored_blocks(bw, data, block_start, block_raw_len, is_final)
+      return true
+    }
+  }
+
   // Always include EOB symbol 256
   lit_freqs[256] = 1
 
@@ -348,7 +383,7 @@ fn flush_lz77_block(
   // Pick minimum-cost block representation
   if stored_bits <= fixed_bits && stored_bits <= dyn_bits {
     emit_stored_blocks(bw, data, block_start, block_raw_len, is_final)
-    return
+    return true
   }
 
   let use_dyn = dyn_bits < fixed_bits
@@ -427,6 +462,7 @@ fn flush_lz77_block(
   }
   // Emit EOB (symbol 256)
   bw_write_bits(bw, lit_codes[256], lit_lens_out[256])
+  false
 }
 
 ///| 15-bit multiplicative 3-byte hash.
@@ -438,7 +474,7 @@ fn lz77_hash3(data : Bytes, pos : Int) -> Int {
 }
 
 ///| Find best LZ77 match at `pos` walking up to `max_chain` hash-chain entries.
-///| Returns `(best_len, best_dist)`.
+///| Returns packed `(best_len << 16) | best_dist` (0 if no match > `prev_best_len`).
 fn lz77_find_match(
   data : Bytes,
   pos : Int,
@@ -446,25 +482,31 @@ fn lz77_find_match(
   start_cand : Int,
   prev : FixedArray[Int],
   max_chain : Int,
+  good_len : Int,
   nice_len : Int,
   prev_best_len : Int,
-) -> (Int, Int) {
+) -> Int {
   let max_len = if n - pos < 258 { n - pos } else { 258 }
-  if max_len < 3 {
-    return (0, 0)
+  if max_len < 3 || prev_best_len >= max_len {
+    return 0
   }
   let min_pos = if pos > 32768 { pos - 32768 } else { 0 }
   let mut best_len = prev_best_len
   let mut best_dist = 0
+  let mut steps = if best_len >= good_len { max_chain >> 2 } else { max_chain }
+  if steps <= 0 {
+    steps = 1
+  }
   let b0 = data[pos]
   let b1 = data[pos + 1]
   let b2 = data[pos + 2]
+  let mut end_b = if best_len < max_len { data[pos + best_len] } else { b0 }
+  let mut end_p = data[pos + best_len - 1]
   let mut cand = start_cand
-  let mut steps = max_chain
   while cand >= min_pos && steps > 0 {
-    // Quick check at best_len end byte before scanning from start
     if best_len < max_len &&
-    data[cand + best_len] == data[pos + best_len] &&
+    data[cand + best_len] == end_b &&
+    data[cand + best_len - 1] == end_p &&
     data[cand] == b0 &&
     data[cand + 1] == b1 &&
     data[cand + 2] == b2 {
@@ -485,6 +527,11 @@ fn lz77_find_match(
         if best_len >= nice_len || best_len == max_len {
           break
         }
+        end_b = data[pos + best_len]
+        end_p = data[pos + best_len - 1]
+        if best_len >= good_len && steps > (max_chain >> 2) {
+          steps = max_chain >> 2
+        }
       }
     }
     let next_cand = prev[cand & 32767]
@@ -494,7 +541,65 @@ fn lz77_find_match(
     cand = next_cand
     steps = steps - 1
   }
-  (best_len, best_dist)
+  if best_dist == 0 {
+    return 0
+  }
+  (best_len << 16) | best_dist
+}
+
+///| Quick entropy + 3-byte-match probe on `data[start..start+probe_len]` to detect
+///| high-entropy incompressible chunks (e.g. encrypted/compressed/random bytes).
+fn is_incompressible_probe(
+  data : Bytes,
+  start : Int,
+  probe_len : Int,
+  probe_table : FixedArray[Int],
+) -> Bool {
+  let end = start + probe_len
+  let hist : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut i = start
+  while i < end {
+    let b = data[i].to_int()
+    hist[b] = hist[b] + 1
+    i = i + 1
+  }
+  let mut distinct = 0
+  let mut max_f = 0
+  i = 0
+  while i < 256 {
+    let f = hist[i]
+    if f > 0 {
+      distinct = distinct + 1
+      if f > max_f {
+        max_f = f
+      }
+    }
+    i = i + 1
+  }
+  // Low alphabet cardinality or skewed frequencies (e.g. text, JSON, Fibonacci) are compressible by Huffman
+  if distinct < 200 || max_f * 24 >= probe_len {
+    return false
+  }
+  // Quick 1-slot hash match count over probe window
+  let mut matches = 0
+  i = start
+  let lim = end - 3
+  while i <= lim {
+    let h = lz77_hash3(data, i) & 4095
+    let prev_p = probe_table[h]
+    probe_table[h] = i
+    if prev_p >= start &&
+    data[prev_p] == data[i] &&
+    data[prev_p + 1] == data[i + 1] &&
+    data[prev_p + 2] == data[i + 2] {
+      matches = matches + 1
+      i = i + 3
+    } else {
+      i = i + 1
+    }
+  }
+  // Random data has ~0.01% 3-byte collisions in a 1-2 KiB window; require very few matches
+  matches * 64 < probe_len
 }
 
 ///| Compress `data` into a raw RFC 1951 DEFLATE stream at `level` (0..9).
@@ -506,8 +611,7 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
   if level == 0 {
     let bw = BitWriter::new(n + 16)
     emit_stored_blocks(bw, data, 0, n, true)
-    bw_align_byte(bw)
-    return Ok(bw.buf.slice(0, bw.len))
+    return Ok(bw_finish(bw))
   }
   if n == 0 {
     let mut empty = Bytes::new(2)
@@ -516,7 +620,7 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
     return Ok(empty)
   }
 
-  // Compression level parameters
+  // Standard zlib-inspired level parameters
   let max_chain = if level == 1 {
     4
   } else if level == 2 {
@@ -534,7 +638,27 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
   } else if level == 8 {
     256
   } else {
-    1024
+    512
+  }
+  let good_len = if level <= 4 {
+    4
+  } else if level <= 7 {
+    8
+  } else {
+    32
+  }
+  let max_lazy = if level <= 3 {
+    0
+  } else if level == 4 {
+    4
+  } else if level <= 6 {
+    16
+  } else if level == 7 {
+    32
+  } else if level == 8 {
+    64
+  } else {
+    128
   }
   let nice_len = if level == 1 {
     8
@@ -549,11 +673,45 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
   } else {
     258
   }
+  let max_ins_limit = if level == 1 {
+    4
+  } else if level == 2 {
+    8
+  } else if level <= 4 {
+    16
+  } else if level == 5 {
+    32
+  } else if level == 6 {
+    64
+  } else if level == 7 {
+    128
+  } else {
+    258
+  }
+  let skip_shift = if level == 1 {
+    5
+  } else if level <= 3 {
+    6
+  } else if level <= 6 {
+    7
+  } else {
+    0
+  }
+  let skip_max = if level == 1 {
+    64
+  } else if level == 2 {
+    32
+  } else if level <= 6 {
+    16
+  } else {
+    1
+  }
   let use_lazy = level >= 4
 
   let bw = BitWriter::new(if n / 2 + 64 < 256 { 256 } else { n / 2 + 64 })
   let head : FixedArray[Int] = FixedArray::make(32768, -1)
   let prev : FixedArray[Int] = FixedArray::make(32768, -1)
+  let probe_table : FixedArray[Int] = FixedArray::make(4096, -1)
 
   let max_tokens = 32768
   let tok_lit_len : FixedArray[Int] = FixedArray::make(max_tokens, 0)
@@ -563,52 +721,94 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
   let ltc = len_to_code
 
   let mut tok_cnt = 0
+  let mut match_cnt = 0
   let mut block_start = 0
   let mut pos = 0
+  let mut miss_count = 0
+  let mut consec_stored = 0
+  let mut pending_len = 0
+  let mut pending_dist = 0
 
+  // Initial incompressible probe for large inputs (avoids burning LZ77 on random files)
   while pos < n {
+    // Fast Stored bypass for incompressible chunks (65535 B per probe)
+    if tok_cnt == 0 && pending_len == 0 && n - pos >= 8192 {
+      let do_probe = consec_stored > 0 || (pos == 0 && n >= 16384)
+      if do_probe {
+        let probe_len = if consec_stored >= 2 { 1024 } else { 2048 }
+        if is_incompressible_probe(data, pos, probe_len, probe_table) {
+          let chunk = if n - pos > 65535 { 65535 } else { n - pos }
+          let chunk_final = pos + chunk == n
+          emit_stored_blocks(bw, data, pos, chunk, chunk_final)
+          pos = pos + chunk
+          block_start = pos
+          consec_stored = consec_stored + 1
+          continue
+        }
+        consec_stored = 0
+      }
+    }
+
     let mut match_len = 0
     let mut match_dist = 0
 
-    if pos + 2 < n {
+    if pending_len >= 3 {
+      // Carry over lazy match already found at `pos` on the previous iteration
+      match_len = pending_len
+      match_dist = pending_dist
+      pending_len = 0
+      pending_dist = 0
+    } else if pos + 2 < n {
       let h = lz77_hash3(data, pos)
       let cand = head[h]
       prev[pos & 32767] = cand
       head[h] = pos
       if cand >= 0 {
-        let (ml, md) = lz77_find_match(
-          data, pos, n, cand, prev, max_chain, nice_len, 2,
+        let packed = lz77_find_match(
+          data, pos, n, cand, prev, max_chain, good_len, nice_len, 2,
         )
-        match_len = ml
-        match_dist = md
+        if packed != 0 {
+          match_len = packed >> 16
+          match_dist = packed & 65535
+        }
       }
     }
 
-    // Lazy matching (levels 4..9): check if pos+1 has a strictly better match
-    if use_lazy && match_len >= 3 && match_len < nice_len && pos + 3 < n {
+    // Lazy matching (levels 4..9): only check pos+1 if match_len < max_lazy
+    let mut lazy_inserted = false
+    if use_lazy && match_len >= 3 && match_len < max_lazy && pos + 3 < n {
       let h2 = lz77_hash3(data, pos + 1)
       let cand2 = head[h2]
+      prev[(pos + 1) & 32767] = cand2
+      head[h2] = pos + 1
+      lazy_inserted = true
       if cand2 >= 0 {
-        let (ml2, _) = lz77_find_match(
+        let packed2 = lz77_find_match(
           data,
           pos + 1,
           n,
           cand2,
           prev,
           max_chain >> 1,
+          good_len,
           nice_len,
           match_len,
         )
-        if ml2 > match_len {
-          // Emit current byte as literal and advance to pos+1
+        if packed2 != 0 {
+          let ml2 = packed2 >> 16
+          let md2 = packed2 & 65535
+          // Emit current byte as literal and carry over (ml2, md2) to pos+1 without re-searching
           let b = data[pos].to_int()
           tok_lit_len[tok_cnt] = b
           tok_dist[tok_cnt] = 0
           tok_cnt = tok_cnt + 1
           lit_freqs[b] = lit_freqs[b] + 1
           pos = pos + 1
+          pending_len = ml2
+          pending_dist = md2
+          miss_count = 0
           if tok_cnt == max_tokens {
-            flush_lz77_block(
+            let was_stored = flush_lz77_block(
               bw,
               data,
               block_start,
@@ -616,11 +816,14 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
               tok_lit_len,
               tok_dist,
               tok_cnt,
+              match_cnt,
               lit_freqs,
               dist_freqs,
               pos == n,
             )
+            consec_stored = if was_stored { consec_stored + 1 } else { 0 }
             tok_cnt = 0
+            match_cnt = 0
             block_start = pos
             let mut z = 0
             while z < 286 {
@@ -639,22 +842,32 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
     }
 
     if match_len >= 3 {
+      miss_count = 0
       tok_lit_len[tok_cnt] = match_len
       tok_dist[tok_cnt] = match_dist
       tok_cnt = tok_cnt + 1
+      match_cnt = match_cnt + 1
       let lsym = 257 + ltc[match_len]
       lit_freqs[lsym] = lit_freqs[lsym] + 1
       let dcode = dist_to_code(match_dist)
       dist_freqs[dcode] = dist_freqs[dcode] + 1
 
-      // Insert intermediate positions into hash chains (skip for level 1 long matches)
-      let max_ins = if level == 1 && match_len > 4 { 4 } else { match_len }
-      let mut step = 1
+      // Insert intermediate positions into hash chains (capped by max_ins_limit, always keeping tail for RLE dist=1)
+      let max_ins = if match_len > max_ins_limit { max_ins_limit } else { match_len }
+      let mut step = if lazy_inserted { 2 } else { 1 }
       while step < max_ins && pos + step + 2 < n {
         let hp = lz77_hash3(data, pos + step)
         prev[(pos + step) & 32767] = head[hp]
         head[hp] = pos + step
         step = step + 1
+      }
+      if match_len > max_ins_limit {
+        let tail = pos + match_len - 1
+        if tail + 2 < n {
+          let hp = lz77_hash3(data, tail)
+          prev[tail & 32767] = head[hp]
+          head[hp] = tail
+        }
       }
       pos = pos + match_len
     } else {
@@ -664,10 +877,37 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
       tok_cnt = tok_cnt + 1
       lit_freqs[b] = lit_freqs[b] + 1
       pos = pos + 1
+      miss_count = miss_count + 1
+
+      // Adaptive miss-skipping on incompressible runs (levels 1..6)
+      if skip_shift > 0 && miss_count >= (1 << skip_shift) && tok_cnt < max_tokens {
+        let mut skip = miss_count >> skip_shift
+        if skip > skip_max {
+          skip = skip_max
+        }
+        let room = max_tokens - tok_cnt
+        if skip > room {
+          skip = room
+        }
+        if skip > n - pos {
+          skip = n - pos
+        }
+        let mut s = 0
+        while s < skip {
+          let sb = data[pos].to_int()
+          tok_lit_len[tok_cnt] = sb
+          tok_dist[tok_cnt] = 0
+          tok_cnt = tok_cnt + 1
+          lit_freqs[sb] = lit_freqs[sb] + 1
+          pos = pos + 1
+          s = s + 1
+        }
+        miss_count = miss_count + skip
+      }
     }
 
     if tok_cnt == max_tokens {
-      flush_lz77_block(
+      let was_stored = flush_lz77_block(
         bw,
         data,
         block_start,
@@ -675,11 +915,14 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
         tok_lit_len,
         tok_dist,
         tok_cnt,
+        match_cnt,
         lit_freqs,
         dist_freqs,
         pos == n,
       )
+      consec_stored = if was_stored { consec_stored + 1 } else { 0 }
       tok_cnt = 0
+      match_cnt = 0
       block_start = pos
       let mut z = 0
       while z < 286 {
@@ -694,8 +937,8 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
     }
   }
 
-  if tok_cnt > 0 || bw.len == 0 {
-    flush_lz77_block(
+  if tok_cnt > 0 || (bw.len == 0 && bw.chunks.length() == 0) {
+    let _ = flush_lz77_block(
       bw,
       data,
       block_start,
@@ -703,14 +946,14 @@ pub fn deflate_compress(data : Bytes, level : Int) -> Result[Bytes, FlateError] 
       tok_lit_len,
       tok_dist,
       tok_cnt,
+      match_cnt,
       lit_freqs,
       dist_freqs,
       true,
     )
   }
 
-  bw_align_byte(bw)
-  Ok(bw.buf.slice(0, bw.len))
+  Ok(bw_finish(bw))
 }
 
 ///| Compress `data` into a raw RFC 1951 DEFLATE stream at default level 6.

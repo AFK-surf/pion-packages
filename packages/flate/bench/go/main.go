@@ -85,7 +85,19 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		fmt.Printf("mode=%s input_bytes=%d iters=%d\n", mode, len(data), iters)
+		gr, err := gzip.NewReader(bytes.NewReader(lastGz))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		dec, err := io.ReadAll(gr)
+		_ = gr.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		vcrc := crc32.ChecksumIEEE(dec)
+		fmt.Printf("mode=%s input_bytes=%d iters=%d verified_len=%d verified_crc32=%d\n", mode, len(data), iters, len(dec), int64(vcrc))
 
 	case "checksum":
 		var c uint32
