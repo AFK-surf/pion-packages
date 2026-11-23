@@ -143,14 +143,32 @@ import "regex"
 
 fn fb(b : Bool) -> String { if b { "true" } else { "false" } }
 
+fn flk(lk : regex::LookKind) -> String {
+  match lk {
+    regex::LookKind::StartText => "StartText"
+    regex::LookKind::EndText => "EndText"
+    regex::LookKind::StartLine => "StartLine"
+    regex::LookKind::EndLine => "EndLine"
+    regex::LookKind::WordBoundaryAscii => "WordBoundaryAscii"
+    regex::LookKind::NotWordBoundaryAscii => "NotWordBoundaryAscii"
+    regex::LookKind::WordBoundaryUnicode => "WordBoundaryUnicode"
+    regex::LookKind::NotWordBoundaryUnicode => "NotWordBoundaryUnicode"
+  }
+}
+
 pub fn main(world : World) -> Int {
   let r1 = regex::CharRange::{ lo: 10, hi: 30 }
   let r2 = regex::CharRange::{ lo: 20, hi: 40 }
+  let r3 = regex::CharRange::{ lo: 31, hi: 50 }
+  let r4 = regex::CharRange::{ lo: 32, hi: 50 }
   let rmin = regex::CharRange::{ lo: -2147483648, hi: 2147483647 }
   io_println(world, "op_add0=" + regex::onepass_mask_add_slot(0L, 0, 4).to_string())
   io_println(world, "op_add62=" + regex::onepass_mask_add_slot(0L, 62, 63).to_string())
   io_println(world, "op_oob63=" + regex::onepass_mask_add_slot(5L, 63, 64).to_string())
   io_println(world, "op_neg=" + regex::onepass_mask_add_slot(5L, -1, 4).to_string())
+  io_println(world, "op_can_ok=" + fb(regex::onepass_can_compile(false, 31, 512)))
+  io_println(world, "op_can_32=" + fb(regex::onepass_can_compile(false, 32, 10)))
+  io_println(world, "op_can_look=" + fb(regex::onepass_can_compile(true, 4, 10)))
   io_println(world, "cap_ok=" + fb(regex::captures_slot_valid(0, 2)))
   io_println(world, "cap_edge=" + fb(regex::captures_slot_valid(1, 3)))
   io_println(world, "cap_neg=" + fb(regex::captures_slot_valid(-1, 10)))
@@ -163,6 +181,20 @@ pub fn main(world : World) -> Int {
   let mn = regex::char_range_intersect(rmin, r1)
   io_println(world, "cr_int_ov=" + ov.lo.to_string() + "," + ov.hi.to_string())
   io_println(world, "cr_int_min=" + mn.lo.to_string() + "," + mn.hi.to_string())
+  io_println(world, "cr_mrg_adj=" + fb(regex::char_range_can_merge(r1, r3)))
+  io_println(world, "cr_mrg_gap=" + fb(regex::char_range_can_merge(r1, r4)))
+  io_println(world, "cr_mrg_max=" + fb(regex::char_range_can_merge(rmin, r1)))
+  let mg = regex::char_range_merge(r1, r3)
+  io_println(world, "cr_mrg_val=" + mg.lo.to_string() + "," + mg.hi.to_string())
+  io_println(world, "pike_sl_nl=" + fb(regex::pike_look_holds(regex::LookKind::StartLine, 5, 10, 10, 97, true, false, true)))
+  io_println(world, "pike_el_nl=" + fb(regex::pike_look_holds(regex::LookKind::EndLine, 5, 10, 97, 10, true, true, false)))
+  io_println(world, "pike_wb_cb=" + fb(regex::pike_look_holds(regex::LookKind::WordBoundaryAscii, 5, 10, 97, 32, true, true, false)))
+  io_println(world, "pike_wb_nocb=" + fb(regex::pike_look_holds(regex::LookKind::WordBoundaryAscii, 5, 10, 97, 32, false, true, false)))
+  io_println(world, "dfa_el_nl=" + fb(regex::dfa_look_holds(regex::LookKind::EndLine, false, false, true, true, false, false)))
+  io_println(world, "dfa_wb=" + fb(regex::dfa_look_holds(regex::LookKind::WordBoundaryAscii, false, false, true, false, false, false)))
+  io_println(world, "rev_st=" + flk(regex::reverse_look_kind(regex::LookKind::StartText)))
+  io_println(world, "rev_sl=" + flk(regex::reverse_look_kind(regex::LookKind::StartLine)))
+  io_println(world, "rev_wb=" + flk(regex::reverse_look_kind(regex::LookKind::WordBoundaryAscii)))
   io_println(world, "u8_128=" + fb(regex::is_utf8_cont_byte(128)))
   io_println(world, "u8_191=" + fb(regex::is_utf8_cont_byte(191)))
   io_println(world, "u8_192=" + fb(regex::is_utf8_cont_byte(192)))
