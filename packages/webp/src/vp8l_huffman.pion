@@ -1,0 +1,484 @@
+///| VP8L LSB 64-bit bit reader and fast 2-level flat Canonical Huffman decoder.
+
+///| Primary LUT width in bits (8-bit = 256 entries, L1-cache friendly and compact for meta-Huffman).
+let vp8l_lut_bits : Int = 8
+
+let vp8l_lut_size : Int = 256
+
+let vp8l_lut_mask : Int = 255
+
+let vp8l_max_code_len : Int = 15
+
+///| LSB-first 64-bit buffered bit reader over a `Bytes` slice `[pos..end)`.
+struct BitReader {
+  data : Bytes
+  mut pos : Int
+  end : Int
+  mut bits : UInt64
+  mut nbits : Int
+}
+
+fn BitReader::new(data : Bytes, start : Int, end : Int) -> BitReader {
+  BitReader::{ data: data, pos: start, end: end, bits: 0UL, nbits: 0 }
+}
+
+///| Refill the 64-bit bit buffer so at least 56 bits are available when input allows.
+fn BitReader::refill(self : BitReader) -> Unit {
+  while self.nbits <= 56 && self.pos < self.end {
+    let b = self.data[self.pos].to_int().to_int64().to_uint64()
+    self.bits = self.bits | (b << self.nbits)
+    self.pos = self.pos + 1
+    self.nbits = self.nbits + 8
+  }
+}
+
+///| Read `n` bits (`0 <= n <= 32`) in LSB-first order.
+fn BitReader::read_bits(self : BitReader, n : Int) -> Result[Int, WebpError] {
+  if n == 0 {
+    return Ok(0)
+  }
+  if self.nbits < n {
+    self.refill()
+    if self.nbits < n {
+      return Err(WebpError::UnexpectedEof("VP8L bitstream truncated"))
+    }
+  }
+  let mask : UInt64 = (1UL << n) - 1UL
+  let v = (self.bits & mask).to_int()
+  self.bits = self.bits >> n
+  self.nbits = self.nbits - n
+  Ok(v)
+}
+
+///| Fast inline helper to read 1 bit.
+fn BitReader::read_bit(self : BitReader) -> Result[Int, WebpError] {
+  if self.nbits < 1 {
+    self.refill()
+    if self.nbits < 1 {
+      return Err(WebpError::UnexpectedEof("VP8L bitstream truncated"))
+    }
+  }
+  let v = (self.bits & 1UL).to_int()
+  self.bits = self.bits >> 1
+  self.nbits = self.nbits - 1
+  Ok(v)
+}
+
+///| Reverse the lowest `len` bits of `code` (`1 <= len <= 15`).
+fn reverse_bits_n(code : Int, len : Int) -> Int {
+  let mut c = code
+  let mut r = 0
+  let mut i = 0
+  while i < len {
+    r = (r << 1) | (c & 1)
+    c = c >> 1
+    i = i + 1
+  }
+  r
+}
+
+///| Flat 2-level Canonical Huffman table for VP8L.
+///| Encoding of each entry in `table`:
+///|   - `entry > 0`: direct symbol hit -> `bits_used = (entry & 0xFF) - 1`, `symbol = entry >> 8`.
+///|   - `entry < 0`: 2-level subtable -> `v = -entry`, `sub_bits = v & 0xF`, `sub_off = v >> 4`.
+///|   - `entry == 0`: invalid/unassigned code.
+struct HuffTable {
+  is_single : Bool
+  single_sym : Int
+  table : FixedArray[Int]
+}
+
+fn HuffTable::empty() -> HuffTable {
+  HuffTable::{ is_single: true, single_sym: 0, table: FixedArray::make(0, 0) }
+}
+
+fn HuffTable::single(sym : Int) -> HuffTable {
+  HuffTable::{ is_single: true, single_sym: sym, table: FixedArray::make(0, 0) }
+}
+
+///| Build a 1- or 2-symbol simple Huffman table.
+///| Per RFC 9649 §3.7.2.1.1, canonical assignment gives code 0 to `min(sym0, sym1)`;
+///| when `sym0 == sym1`, builds a single-symbol (0-bit) table.
+fn HuffTable::build_simple(
+  n_symbols : Int,
+  sym0 : Int,
+  sym1 : Int,
+  alphabet_size : Int,
+) -> Result[HuffTable, WebpError] {
+  if sym0 >= alphabet_size {
+    return Err(WebpError::InvalidHuffman("simple symbol 0 out of range"))
+  }
+  if n_symbols == 1 {
+    return Ok(HuffTable::single(sym0))
+  }
+  if sym1 >= alphabet_size {
+    return Err(WebpError::InvalidHuffman("simple symbol 1 out of range"))
+  }
+  if sym0 == sym1 {
+    return Ok(HuffTable::single(sym0))
+  }
+  let lo = if sym0 < sym1 { sym0 } else { sym1 }
+  let hi = if sym0 < sym1 { sym1 } else { sym0 }
+  let tbl = FixedArray::make(vp8l_lut_size, 0)
+  let e0 = (lo << 8) | 2 // len=1 -> 1+1=2
+  let e1 = (hi << 8) | 2
+  let mut i = 0
+  while i < vp8l_lut_size {
+    tbl[i] = e0
+    tbl[i + 1] = e1
+    i = i + 2
+  }
+  Ok(HuffTable::{ is_single: false, single_sym: 0, table: tbl })
+}
+
+///| Build a 1- or 2-symbol simple Huffman table directly into flat `out : Array[Int]`.
+///| Returns `>= 0` base offset in `out`, or `-(sym + 1)` for a single-symbol (0-bit) table.
+fn vp8l_huff_build_simple_into(
+  n_symbols : Int,
+  sym0 : Int,
+  sym1 : Int,
+  alphabet_size : Int,
+  keep : Bool,
+  out : Array[Int],
+) -> Result[Int, WebpError] {
+  if sym0 >= alphabet_size {
+    return Err(WebpError::InvalidHuffman("simple symbol 0 out of range"))
+  }
+  if n_symbols == 1 {
+    return Ok(-(sym0 + 1))
+  }
+  if sym1 >= alphabet_size {
+    return Err(WebpError::InvalidHuffman("simple symbol 1 out of range"))
+  }
+  if !keep {
+    return Ok(-1)
+  }
+  if sym0 == sym1 {
+    return Ok(-(sym0 + 1))
+  }
+  let lo = if sym0 < sym1 { sym0 } else { sym1 }
+  let hi = if sym0 < sym1 { sym1 } else { sym0 }
+  let base = out.length()
+  let e0 = (lo << 8) | 2
+  let e1 = (hi << 8) | 2
+  let mut i = 0
+  while i < vp8l_lut_size {
+    out.push(e0)
+    out.push(e1)
+    i = i + 2
+  }
+  Ok(base)
+}
+
+///| Build a 2-level flat Canonical Huffman table directly into `out : Array[Int]` using reusable scratch arrays.
+///| Returns `>= 0` base offset in `out`, or `-(sym + 1)` for a single-symbol (0-bit) table.
+fn vp8l_huff_build_into(
+  code_lengths : FixedArray[Int],
+  n : Int,
+  keep : Bool,
+  out : Array[Int],
+  count : FixedArray[Int],
+  next_code : FixedArray[Int],
+  sub_max_len : FixedArray[Int],
+  sym_rev : FixedArray[Int],
+) -> Result[Int, WebpError] {
+  let mut i = 0
+  while i <= vp8l_max_code_len {
+    count[i] = 0
+    i = i + 1
+  }
+  let mut num_syms = 0
+  let mut last_sym = 0
+  i = 0
+  while i < n {
+    let cl = code_lengths[i]
+    if cl < 0 || cl > vp8l_max_code_len {
+      return Err(WebpError::InvalidHuffman("code length out of range"))
+    }
+    if cl > 0 {
+      count[cl] = count[cl] + 1
+      num_syms = num_syms + 1
+      last_sym = i
+    }
+    i = i + 1
+  }
+  if num_syms == 0 {
+    return Err(WebpError::InvalidHuffman("empty Huffman tree"))
+  }
+  if num_syms == 1 {
+    return Ok(-(last_sym + 1))
+  }
+
+  let mut code = 0
+  let mut kraft = 0
+  let mut bits = 1
+  while bits <= vp8l_max_code_len {
+    code = (code + count[bits - 1]) << 1
+    next_code[bits] = code
+    kraft = kraft + (count[bits] << (vp8l_max_code_len - bits))
+    bits = bits + 1
+  }
+  if kraft != (1 << vp8l_max_code_len) {
+    return Err(WebpError::InvalidHuffman("incomplete or over-subscribed Huffman tree"))
+  }
+  if !keep {
+    return Ok(-1)
+  }
+
+  let mut p = 0
+  while p < vp8l_lut_size {
+    sub_max_len[p] = 0
+    p = p + 1
+  }
+  let mut s = 0
+  while s < n {
+    let cl = code_lengths[s]
+    if cl > 0 {
+      let c = next_code[cl]
+      next_code[cl] = c + 1
+      let rev = reverse_bits_n(c, cl)
+      sym_rev[s] = rev
+      if cl > vp8l_lut_bits {
+        let pfx = rev & vp8l_lut_mask
+        let rem = cl - vp8l_lut_bits
+        if rem > sub_max_len[pfx] {
+          sub_max_len[pfx] = rem
+        }
+      }
+    }
+    s = s + 1
+  }
+
+  let mut total_size = vp8l_lut_size
+  p = 0
+  while p < vp8l_lut_size {
+    let sb = sub_max_len[p]
+    if sb > 0 {
+      total_size = total_size + (1 << sb)
+    }
+    p = p + 1
+  }
+
+  let base = out.length()
+  let mut k = 0
+  while k < total_size {
+    out.push(0)
+    k = k + 1
+  }
+
+  let mut cur_off = vp8l_lut_size
+  p = 0
+  while p < vp8l_lut_size {
+    let sb = sub_max_len[p]
+    if sb > 0 {
+      out[base + p] = -((cur_off << 4) | sb)
+      cur_off = cur_off + (1 << sb)
+    }
+    p = p + 1
+  }
+
+  s = 0
+  while s < n {
+    let cl = code_lengths[s]
+    if cl > 0 {
+      let rev = sym_rev[s]
+      if cl <= vp8l_lut_bits {
+        let entry = (s << 8) | (cl + 1)
+        let step = 1 << cl
+        let mut idx = rev
+        while idx < vp8l_lut_size {
+          out[base + idx] = entry
+          idx = idx + step
+        }
+      } else {
+        let pfx = rev & vp8l_lut_mask
+        let desc = -out[base + pfx]
+        let sub_bits = desc & 0xF
+        let sub_off = desc >> 4
+        let rem_len = cl - vp8l_lut_bits
+        let rem_code = rev >> vp8l_lut_bits
+        let entry = (s << 8) | (rem_len + 1)
+        let sub_size = 1 << sub_bits
+        let step = 1 << rem_len
+        let mut idx = rem_code
+        while idx < sub_size {
+          out[base + sub_off + idx] = entry
+          idx = idx + step
+        }
+      }
+    }
+    s = s + 1
+  }
+
+  Ok(base)
+}
+
+///| Build a 2-level flat Canonical Huffman table from `code_lengths[0..n)`.
+fn HuffTable::build(code_lengths : FixedArray[Int], n : Int) -> Result[HuffTable, WebpError] {
+  let count = FixedArray::make(vp8l_max_code_len + 1, 0)
+  let mut num_syms = 0
+  let mut last_sym = 0
+  let mut max_len = 0
+  let mut i = 0
+  while i < n {
+    let cl = code_lengths[i]
+    if cl < 0 || cl > vp8l_max_code_len {
+      return Err(WebpError::InvalidHuffman("code length out of range"))
+    }
+    if cl > 0 {
+      count[cl] = count[cl] + 1
+      num_syms = num_syms + 1
+      last_sym = i
+      if cl > max_len {
+        max_len = cl
+      }
+    }
+    i = i + 1
+  }
+  if num_syms == 0 {
+    return Err(WebpError::InvalidHuffman("empty Huffman tree"))
+  }
+  if num_syms == 1 {
+    return Ok(HuffTable::single(last_sym))
+  }
+
+  // Validate Kraft equality (reject incomplete and over-subscribed trees) and compute canonical start codes.
+  let next_code = FixedArray::make(vp8l_max_code_len + 1, 0)
+  let mut code = 0
+  let mut kraft = 0
+  let mut bits = 1
+  while bits <= vp8l_max_code_len {
+    code = (code + count[bits - 1]) << 1
+    next_code[bits] = code
+    kraft = kraft + (count[bits] << (vp8l_max_code_len - bits))
+    bits = bits + 1
+  }
+  if kraft != (1 << vp8l_max_code_len) {
+    return Err(WebpError::InvalidHuffman("incomplete or over-subscribed Huffman tree"))
+  }
+
+  // Assign canonical reversed codes and measure secondary table sizes for codes > vp8l_lut_bits.
+  let sub_max_len = FixedArray::make(vp8l_lut_size, 0)
+  let sym_rev = FixedArray::make(n, 0)
+  let mut s = 0
+  while s < n {
+    let cl = code_lengths[s]
+    if cl > 0 {
+      let c = next_code[cl]
+      next_code[cl] = c + 1
+      let rev = reverse_bits_n(c, cl)
+      sym_rev[s] = rev
+      if cl > vp8l_lut_bits {
+        let pfx = rev & vp8l_lut_mask
+        let rem = cl - vp8l_lut_bits
+        if rem > sub_max_len[pfx] {
+          sub_max_len[pfx] = rem
+        }
+      }
+    }
+    s = s + 1
+  }
+
+  // Calculate total table size (primary + all secondary subtables).
+  let mut total_size = vp8l_lut_size
+  let mut p = 0
+  while p < vp8l_lut_size {
+    let sb = sub_max_len[p]
+    if sb > 0 {
+      total_size = total_size + (1 << sb)
+    }
+    p = p + 1
+  }
+
+  let tbl = FixedArray::make(total_size, 0)
+  // Allocate secondary table descriptors in primary LUT.
+  let mut cur_off = vp8l_lut_size
+  p = 0
+  while p < vp8l_lut_size {
+    let sb = sub_max_len[p]
+    if sb > 0 {
+      tbl[p] = -((cur_off << 4) | sb)
+      cur_off = cur_off + (1 << sb)
+    }
+    p = p + 1
+  }
+
+  // Populate primary and secondary entries.
+  s = 0
+  while s < n {
+    let cl = code_lengths[s]
+    if cl > 0 {
+      let rev = sym_rev[s]
+      if cl <= vp8l_lut_bits {
+        let entry = (s << 8) | (cl + 1)
+        let step = 1 << cl
+        let mut idx = rev
+        while idx < vp8l_lut_size {
+          tbl[idx] = entry
+          idx = idx + step
+        }
+      } else {
+        let pfx = rev & vp8l_lut_mask
+        let desc = -tbl[pfx]
+        let sub_bits = desc & 0xF
+        let sub_off = desc >> 4
+        let rem_len = cl - vp8l_lut_bits
+        let rem_code = rev >> vp8l_lut_bits
+        let entry = (s << 8) | (rem_len + 1)
+        let sub_size = 1 << sub_bits
+        let step = 1 << rem_len
+        let mut idx = rem_code
+        while idx < sub_size {
+          tbl[sub_off + idx] = entry
+          idx = idx + step
+        }
+      }
+    }
+    s = s + 1
+  }
+
+  Ok(HuffTable::{ is_single: false, single_sym: 0, table: tbl })
+}
+
+///| Decode the next Huffman symbol from `br` using 2-level flat LUT.
+fn HuffTable::next_sym(self : HuffTable, br : BitReader) -> Result[Int, WebpError] {
+  if self.is_single {
+    return Ok(self.single_sym)
+  }
+  if br.nbits < vp8l_max_code_len {
+    br.refill()
+  }
+  let idx = (br.bits & vp8l_lut_mask.to_int64().to_uint64()).to_int()
+  let entry = self.table[idx]
+  if entry > 0 {
+    let blen = (entry & 0xFF) - 1
+    if br.nbits < blen {
+      return Err(WebpError::UnexpectedEof("VP8L Huffman symbol truncated"))
+    }
+    br.bits = br.bits >> blen
+    br.nbits = br.nbits - blen
+    return Ok(entry >> 8)
+  }
+  if entry < 0 {
+    if br.nbits < vp8l_lut_bits {
+      return Err(WebpError::UnexpectedEof("VP8L Huffman symbol truncated"))
+    }
+    let desc = -entry
+    let sub_bits = desc & 0xF
+    let sub_off = desc >> 4
+    let sub_mask = (1 << sub_bits) - 1
+    let sub_idx = ((br.bits >> vp8l_lut_bits) & sub_mask.to_int64().to_uint64()).to_int()
+    let sub_entry = self.table[sub_off + sub_idx]
+    if sub_entry <= 0 {
+      return Err(WebpError::InvalidHuffman("invalid secondary Huffman code"))
+    }
+    let total_len = vp8l_lut_bits + (sub_entry & 0xFF) - 1
+    if br.nbits < total_len {
+      return Err(WebpError::UnexpectedEof("VP8L Huffman secondary symbol truncated"))
+    }
+    br.bits = br.bits >> total_len
+    br.nbits = br.nbits - total_len
+    return Ok(sub_entry >> 8)
+  }
+  Err(WebpError::InvalidHuffman("invalid primary Huffman code"))
+}
