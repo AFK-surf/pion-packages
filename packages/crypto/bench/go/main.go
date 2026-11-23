@@ -226,8 +226,9 @@ func benchAes256Gcm() int {
 		return 1
 	}
 	h := sha256.New()
-	for i := 0; i < 64; i++ {
+	for i := 0; i < 1000; i++ {
 		nonce[0] = byte(i & 0xFF)
+		nonce[1] = byte((i >> 8) & 0xFF)
 		sealed := aead.Seal(nil, nonce, pt, aad)
 		opened, err := aead.Open(nil, nonce, sealed, aad)
 		if err != nil || len(opened) != len(pt) {
@@ -259,9 +260,10 @@ func benchAes256GcmSmall() int {
 		return 1
 	}
 	h := sha256.New()
-	for i := 0; i < 2000; i++ {
+	for i := 0; i < 150000; i++ {
 		nonce[0] = byte(i & 0xFF)
 		nonce[1] = byte((i >> 8) & 0xFF)
+		nonce[2] = byte((i >> 16) & 0xFF)
 		sealed := aead.Seal(nil, nonce, pt, aad)
 		opened, err := aead.Open(nil, nonce, sealed, aad)
 		if err != nil || len(opened) != len(pt) {
@@ -284,7 +286,7 @@ func benchP256Ecdh() int {
 	}
 	curve := ecdh.P256()
 	h := sha256.New()
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 2000; i++ {
 		sk[31] = byte((int(sk[31]) + 1) & 0xFF)
 		priv, err := curve.NewPrivateKey(sk)
 		if err != nil {
@@ -316,7 +318,7 @@ func benchP256Validate() int {
 	curveEcdh := ecdh.P256()
 	curveEll := elliptic.P256()
 	okCount := 0
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 20000; i++ {
 		if _, err := curveEcdh.NewPublicKey(pubU); err == nil {
 			okCount++
 		}
@@ -325,7 +327,7 @@ func benchP256Validate() int {
 		}
 	}
 	fmt.Printf("p256_validate_ok=%d\n", okCount)
-	if okCount == 400 {
+	if okCount == 40000 {
 		return 0
 	}
 	return 2

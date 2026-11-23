@@ -133,41 +133,41 @@ python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --md-out "$OUT_DIR/bench_p256.md" --json-out "$OUT_DIR/bench_p256.json"
 
 echo ""
-echo "=== BENCH 9: AES-256-GCM AEAD (4 MiB seal + open) ==="
+echo "=== BENCH 9: AES-256-GCM AEAD (1,000 x 64 KiB seal + open) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
-  --title "Crypto Bench 9: AES-256-GCM AEAD (4 MiB seal + open)" \
+  --title "Crypto Bench 9: AES-256-GCM AEAD (1,000 x 64 KiB seal + open)" \
   --impl "pion=$BIN_DIR/pion_crypto_bench aes256gcm" \
   --impl "go_stdlib=$BIN_DIR/go_crypto_bench aes256gcm" \
   --baseline go_stdlib \
-  --warmup 1 --rounds 5 --bytes 8388608 \
+  --warmup 1 --rounds 5 --bytes 131072000 \
   --md-out "$OUT_DIR/bench_aes256gcm.md" --json-out "$OUT_DIR/bench_aes256gcm.json"
 
 echo ""
-echo "=== BENCH 10: AES-256-GCM AEAD Small Packets (2,000 x 256 B seal + open) ==="
+echo "=== BENCH 10: AES-256-GCM AEAD Small Packets (150,000 x 256 B seal + open) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
-  --title "Crypto Bench 10: AES-256-GCM Small Packets (2,000 x 256 B seal + open)" \
+  --title "Crypto Bench 10: AES-256-GCM Small Packets (150,000 x 256 B seal + open)" \
   --impl "pion=$BIN_DIR/pion_crypto_bench aes256gcm_small" \
   --impl "go_stdlib=$BIN_DIR/go_crypto_bench aes256gcm_small" \
   --baseline go_stdlib \
-  --warmup 1 --rounds 5 --ops 4000 \
+  --warmup 1 --rounds 5 --ops 300000 \
   --md-out "$OUT_DIR/bench_aes256gcm_small.md" --json-out "$OUT_DIR/bench_aes256gcm_small.json"
 
 echo ""
-echo "=== BENCH 11: NIST P-256 ECDH (50 key exchanges) ==="
+echo "=== BENCH 11: NIST P-256 ECDH (2,000 key exchanges) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
-  --title "Crypto Bench 11: NIST P-256 ECDH (50 key exchanges)" \
+  --title "Crypto Bench 11: NIST P-256 ECDH (2,000 key exchanges)" \
   --impl "pion=$BIN_DIR/pion_crypto_bench p256_ecdh" \
   --impl "go_stdlib=$BIN_DIR/go_crypto_bench p256_ecdh" \
   --baseline go_stdlib \
-  --warmup 1 --rounds 5 --ops 50 \
+  --warmup 1 --rounds 5 --ops 2000 \
   --md-out "$OUT_DIR/bench_p256_ecdh.md" --json-out "$OUT_DIR/bench_p256_ecdh.json"
 
 echo ""
-echo "=== BENCH 12: NIST P-256 Pubkey Validation (200 uncompressed + 200 compressed) ==="
+echo "=== BENCH 12: NIST P-256 Pubkey Validation (20,000 uncompressed + 20,000 compressed) ==="
 python3 "$ROOT_DIR/scripts/bench_compare.py" \
-  --title "Crypto Bench 12: NIST P-256 Pubkey Validation (200 uncompressed + 200 compressed)" \
+  --title "Crypto Bench 12: NIST P-256 Pubkey Validation (20,000 uncompressed + 20,000 compressed)" \
   --impl "pion=$BIN_DIR/pion_crypto_bench p256_validate" \
   --impl "go_stdlib=$BIN_DIR/go_crypto_bench p256_validate" \
   --baseline go_stdlib \
-  --warmup 1 --rounds 5 --ops 400 \
+  --warmup 1 --rounds 5 --ops 40000 \
   --md-out "$OUT_DIR/bench_p256_validate.md" --json-out "$OUT_DIR/bench_p256_validate.json"
