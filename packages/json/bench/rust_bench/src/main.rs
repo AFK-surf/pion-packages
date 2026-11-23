@@ -156,7 +156,15 @@ fn run_w3(path: &str, iters: usize) -> i32 {
             }
             out.push_str(&serde_json::to_string(k).unwrap());
             out.push(':');
-            out.push_str(&serde_json::to_string(v).unwrap());
+            if let Some(iv) = v.as_i64() {
+                if (-9007199254740991..=9007199254740991).contains(&iv) {
+                    out.push_str(&iv.to_string());
+                } else {
+                    out.push_str(&format!("{:.0}", iv as f64));
+                }
+            } else {
+                out.push_str(&serde_json::to_string(v).unwrap());
+            }
         }
         out.push('}');
         canon_bytes += out.len() as i64;

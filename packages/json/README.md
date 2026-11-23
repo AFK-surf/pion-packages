@@ -8,21 +8,20 @@ Designed to replace ad-hoc `Json` boilerplate across Pion repositories and elimi
 
 - **Strict RFC 8259 compliance**: rejects comments (`//`, `/* */`), trailing commas, single-quoted strings, unquoted keys, leading zeros (`01`), leading `+`, trailing/leading dots (`1.`, `.5`), non-RFC-8259 whitespace (`\v`, `\f`, NBSP, UTF-8 BOM), unescaped control characters (`0x00..0x1F`), lone UTF-16 surrogates, and invalid UTF-8 (overlong sequences, UTF-8 surrogates, code points `> U+10FFFF`, truncated sequences).
 - **Lossless number model (`Json::Int` / `Json::Float` / `Json::BigNum` + `JsonNumber`)**:
-  - Pure integers in `Int64::MIN..=Int64::MAX` (`-9223372036854775808`..`9223372036854775807`, including `> 2^53` Snowflake IDs and nanosecond timestamps) are parsed directly into `Json::Int(Int64)` without ever passing through `Double`.
-  - Out-of-range integers (e.g. `u64::MAX = 18446744073709551615`, arbitrary-precision integers) and binary64-overflowing exponents (`1e500`) are preserved losslessly as `Json::BigNum(raw_repr)`, with exact `as_u64()`, `as_i64()`, `as_f64()`, and `raw_repr()` accessors.
+  - Pure integers in `Int64::MIN..=Int64::MAX` (`-9223372036854775808`..`9223372036854775807`, including `> 2^53` Snowflake IDs and nanosecond timestamps) are parsed directly into `Json::Int(Int64)` without ever passing through `Double`. `-0` is preserved as `Json::Float(-0.0)`.
+  - Out-of-range integers (e.g. `u64::MAX = 18446744073709551615`, arbitrary-precision integers) and binary64-overflowing exponents (`1e500`) are preserved losslessly as `Json::BigNum(raw_repr)`, with strictly RFC 8259-validated `as_u64()`, `as_i64()`, `as_f64()`, `raw_repr()`, and serializer checks (`Err(InvalidNumber)` on malformed literals).
   - Floating-point parsing uses **Eisel-Lemire 128-bit fast path + pure-Pion BigInt (Algorithm M) exact 0-ULP fallback** (handles subnormals, exact half-ULP ties-to-even, and 768+ digit literals identically on Native and Wasm32).
   - Floating-point formatting uses **pure-Pion Ryu** shortest roundtrip (zero module-level mutable state; bit-exact across Native and Wasm32).
-- **Order-preserving + O(1) lookup `JsonObject`**:
-  - Preserves field insertion order for deterministic serialization and diffs.
-  - Uses inline linear scan for small objects (`<= 8` keys) and automatically promotes to a deterministic-seed open-addressing hash index (`> 8` keys) for O(1) lookup with zero O(n²) degradation on 50k+ key objects.
+- **Order-preserving + HashDoS-immune `JsonObject`**:
+  - Preserves field insertion order for deterministic serialization and diffs, while `json_eq` / `Json::eq` is object-key-order independent per RFC 8259 §4.
+  - Uses inline linear scan for small objects (`<= 8` keys), promotes to an O(1) open-addressing hash index (`> 8` keys), and automatically falls back to a deterministic iterative AVL tree when probe chains exceed 256 — guaranteeing worst-case O(log N) lookup/insert even under white-box offline HashDoS.
   - Configurable `DuplicateKeyPolicy`: `LastWins` (default, matching `serde_json` `preserve_order`), `FirstWins`, or `Reject` (prevents key-smuggling).
-- **Ergonomic immutable API**:
-  - Constructors: `Json::null`, `Json::bool`, `Json::int`, `Json::float`, `Json::big_num`, `Json::str`, `Json::arr`, `Json::obj`.
-  - Readers: `get`, `get_str`, `get_i64`, `get_u64`, `get_f64`, `get_bool`, `get_array`, `get_obj`, `is_null`, `at`, `pointer` (RFC 6901).
-  - Immutable mutators: `set_field`, `without_keys`, `merge_object`.
+- **True immutable API**:
+  - Constructors (`Json::arr`, `Json::obj`, `JsonObject::from_pairs`) and readers (`entries()`, `as_array()`, `get_array()`) defensively copy `Array` containers so external mutation can never alias or desynchronize internal object indices.
+  - Immutable mutators: `set_field`, `without_keys` (O(n + k) indexed for `> 8` keys), `merge_object`. (Note: repeated single-key `set_field` calls copy the top-level entry list in O(n); batch updates via `merge_object` or `Json::obj` when building large objects.)
 - **RFC 8785 (JCS) Canonical Serialization (`stringify_canonical`)**:
-  - Sorts object keys by **UTF-16 code unit** order (so supplementary characters like `😀` `U+1F600` (`0xD83D 0xDE00`) sort before BMP `U+E000..U+FFFF` such as `דּ` `U+FB33`).
-  - Uses ES6/Ryu shortest number serialization (`-0.0` → `0`, `1.0` → `1`, lowercase `\u00xx` control escapes).
+  - Sorts object keys by **UTF-16 code unit** order (so supplementary characters like `😀` `U+1F600` (`0xD83D 0xDE00`) sort before BMP `U+E000..U+FFFF` such as `דּ` `U+FB33`) using a fast bounds-safe UTF-8 byte comparison with `0xEE..0xEF` vs `0xF0..0xF4` fix-up.
+  - Formats all numbers (including `Int` beyond `±(2^53 - 1)` and finite `BigNum`) via ECMAScript `Number::toString` / Ryu (`-0.0` → `0`, `1.0` → `1`, lowercase `\u00xx` control escapes), rejects non-finite numbers (`1e400`, `NaN`, `Infinity`) with `Err(NonFiniteNumber)`, and rejects invalid UTF-8 keys/values with `Err(InvalidUnicode)`.
 - **Fully iterative & DoS-hardened (`JsonLimits`)**:
   - Explicit heap stacks for parsing, serialization, and `json_eq` (zero recursion, 5,000+ nesting depth without stack overflow on Native or Wasm32).
   - Explicit `max_depth`, `max_bytes`, `max_elements`, and `max_string_bytes` limits.
@@ -53,7 +52,7 @@ fn example() -> Result[String, json::JsonError] {
 sh scripts/verify.sh packages/json
 ```
 
-All 22 test suites pass on Native, and `packages/json/wasm_smoke` builds and executes identically across all 4 modes (`native_dbg`, `native_rel`, `wasm_dbg`, `wasm_rel`, exit 0, identical stdout SHA-256 `d8dcc005eaee0b2c31bd24683d10dc2eee1c9bca0c2c97927cf7eb1180dca657`).
+All 28 test suites pass on Native, and `packages/json/wasm_smoke` builds and executes identically across all 4 modes (`native_dbg`, `native_rel`, `wasm_dbg`, `wasm_rel`, exit 0, identical stdout SHA-256 `0c0ec01bb7ab362dcf231b0bef02bde9c8cd31e640054d5940dd8586a475f8f9`).
 
 ## Head-to-Head Benchmarks
 
@@ -68,29 +67,29 @@ SHA-256: `f6dc207b4a9af2d5974b99dd534a9692346268fe3c8225777edada50232c024d`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_serde_json` | 111.921 | 110.706 | 131.678 | 153.89 | 29.25 MiB | 1.00x (baseline) |
-| `pion_json` | **143.528** | 140.372 | 144.326 | **120.00** | 30.52 MiB | **0.78x** (1.59x vs Go) |
-| `go_encoding_json` | 227.835 | 211.472 | 258.313 | 75.60 | 47.05 MiB | 0.49x |
+| `rust_serde_json` | 55.022 | 54.472 | 56.658 | 313.03 | 29.23 MiB | 1.00x (baseline) |
+| `pion_json` | **100.040** | 98.238 | 118.875 | **172.17** | 30.53 MiB | **0.55x** (1.48x vs Go) |
+| `go_encoding_json` | 147.643 | 146.578 | 158.153 | 116.66 | 44.64 MiB | 0.37x |
 
 ### W2: Parse + Extract/Filter/Mutate + Stringify Roundtrip (`8 × 2,074,535 B = 16,596,280 B`)
 SHA-256: `00d7bc9247539a2f51b1c6d0320176125e0468424d8fa12cdc3be3a8120e5f57`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_serde_json` | 177.464 | 152.279 | 191.930 | 93.52 | 31.45 MiB | 1.00x (baseline) |
-| `go_encoding_json` | 242.171 | 237.716 | 255.807 | 68.53 | 45.77 MiB | 0.73x |
-| `pion_json` | **379.442** | 371.321 | 404.948 | **43.74** | **27.33 MiB** | **0.47x** (0.64x vs Go) |
+| `rust_serde_json` | 96.097 | 89.984 | 98.210 | 172.70 | 31.47 MiB | 1.00x (baseline) |
+| `pion_json` | **171.425** | 169.439 | 179.179 | **96.81** | **27.55 MiB** | **0.56x** (1.00x vs Go) |
+| `go_encoding_json` | 171.952 | 171.583 | 177.898 | 96.52 | 44.12 MiB | 0.56x |
 
 ### W3: Wide 50,000-Key Object Parse + 50k Random Lookups + RFC 8785 Canonical Stringify (`5 × 1,550,101 B = 7,750,505 B`, 250k lookups)
-SHA-256: `082b4e7fccf677c67dec5e18345d8de4e15390c87db029605aae3a4b6de50861`
+SHA-256: `db0c9e142e81aa1bd4b279e36dd2f35ff408e5896cf1b569e2065285fff8347e`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_serde_json` | 250.145 | 247.816 | 259.825 | 30.98 | 1000.58 | 11.61 MiB | 1.00x (baseline) |
-| `pion_json` | **748.154** | 712.391 | 837.990 | **10.36** | **2992.61** | **22.31 MiB** | **0.33x** (1.03x vs Go) |
-| `go_encoding_json` | 767.329 | 719.650 | 778.980 | 10.10 | 3069.32 | 30.34 MiB | 0.33x |
+| `rust_serde_json` | 100.787 | 99.323 | 103.404 | 76.90 | 403.15 | 11.62 MiB | 1.00x (baseline) |
+| `pion_json` | **156.211** | 152.201 | 162.996 | **49.62** | **624.84** | **22.33 MiB** | **0.65x** (2.43x vs Go) |
+| `go_encoding_json` | 379.590 | 375.135 | 388.004 | 20.42 | 1518.36 | 29.77 MiB | 0.27x |
 
 ### Honest Performance Analysis
 
-- **Strengths**: On pure parsing (W1), `pion_json` reaches **120 MB/s** (78% of Rust `serde_json --release`, **1.59x faster than Go `encoding/json`**) with nearly identical RSS to Rust (30.5 MiB vs 29.3 MiB). On wide 50k-key objects with random lookups and RFC 8785 canonicalization (W3), `pion_json` edges out Go `encoding/json` (**1.03x faster**, 26% lower peak RSS). On W2, `pion_json` achieves the **lowest peak RSS** of all three implementations (27.3 MiB).
-- **Gaps & Trade-offs**: On W2 (0.47x vs Rust) and W3 (0.33x vs Rust), `pion_json` trails Rust `serde_json` due to: (1) dynamic `Json::pointer` path parsing inside the hot loop in W2 (vs Rust's zero-copy borrowed `&str` pointer slice), (2) per-object heap allocation of `Array[(String, Json)]` for each mutated output item, and (3) bottom-up merge sort allocating two temporary `Array`s of 50k entries in W3.
+- **Strengths**: On pure parsing (W1), `pion_json` reaches **172 MB/s** (0.55x of Rust `serde_json --release`, **1.48x faster than Go `encoding/json`**) with nearly identical RSS to Rust (30.5 MiB vs 29.2 MiB). On W2, `pion_json` matches Go `encoding/json` while achieving the **lowest peak RSS** of all three (27.6 MiB). On W3 (50k-key parse + lookups + RFC 8785 JCS), fast byte-wise UTF-16 ordering (`0xEE..0xEF` vs `0xF0..0xF4` fix-up) brings `pion_json` to **156.2 ms** (**0.65x Rust**, **2.43x faster than Go**). On adversarial 40k-key workloads (`audit/run_audit.sh bench`), `pion_json` handles colliding keys at **13.1 ms** (0.83x Rust, 1.1x vs ordinary keys) and `without_keys` (20k of 40k) at **14.4 ms** (0.81x Rust, lower RSS).
+- **Methodology & Trade-offs**: Rust `serde_json` is built with default features (without `float_roundtrip`), so its float parsing takes a faster, not always 0-ULP path while `pion_json` is strictly 0-ULP; in W3, Rust uses `BTreeMap` (`O(log n)` lookups) and allocates per-key strings via `serde_json::to_string`, which partially handicaps Rust in W3 while W1/W2 slightly favor Rust. Remaining W1/W2 gaps vs Rust come from Pion's pre-parse full-string UTF-8 pass and bounds-checked byte scanning.

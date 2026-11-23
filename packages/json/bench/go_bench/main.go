@@ -239,7 +239,12 @@ func runW3(path string, iters int) int {
 			kb, _ := json.Marshal(k)
 			buf.Write(kb)
 			buf.WriteByte(':')
-			buf.WriteString(string(obj[k].(json.Number)))
+			iv, _ := obj[k].(json.Number).Int64()
+			if iv >= -9007199254740991 && iv <= 9007199254740991 {
+				buf.WriteString(strconv.FormatInt(iv, 10))
+			} else {
+				buf.WriteString(strconv.FormatFloat(float64(iv), 'f', 0, 64))
+			}
 		}
 		buf.WriteByte('}')
 		out := buf.Bytes()

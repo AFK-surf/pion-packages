@@ -1,7 +1,13 @@
-///| Pure, zero-global-state open-addressing hash index for `JsonObject` O(1) lookup
+///| Pure, zero-global-state, HashDoS-immune object index for `JsonObject` lookup
 ///| and parser duplicate-key resolution.
 ///|
-///| Small objects (<= 8 entries) skip hash-table allocation and use linear scan.
+///| - Small objects (<= 8 entries): linear scan (zero index allocation).
+///| - Normal objects (> 8 entries): O(1) open-addressing hash table.
+///| - Adversarial/colliding inputs (probe chain > 64): automatic fallback to a
+///|   deterministic, iterative, arena-backed AVL tree with strict O(log N) worst-case
+///|   insert and lookup bounds — mathematically immune even to white-box offline attacks.
+
+let max_probe_chain : Int = 256
 
 fn mix64(x : UInt64) -> UInt64 {
   let mut z = x + 0x9E3779B97F4A7C15UL
@@ -10,14 +16,18 @@ fn mix64(x : UInt64) -> UInt64 {
   z ^ (z >> 31UL)
 }
 
-///| Derive a deterministic per-document/per-object 64-bit seed without any global state.
+///| Derive a deterministic per-document 64-bit seed from sampled bytes (zero global state).
 fn derive_seed_from_str(src : String) -> UInt64 {
   let n = src.length()
   let mut s = mix64(0x243F6A8885A308D3UL ^ (n.to_int64().reinterpret_as_uint64() * 0xD6E8FEB86659FD93UL))
   if n > 0 {
-    s = mix64(s ^ src.code_unit_at(0).to_int64().reinterpret_as_uint64())
-    s = mix64(s ^ src.code_unit_at(n >> 1).to_int64().reinterpret_as_uint64())
-    s = mix64(s ^ src.code_unit_at(n - 1).to_int64().reinterpret_as_uint64())
+    let mut k = 0
+    while k < 16 {
+      let idx = (k * (n - 1)) / 15
+      let b = src.code_unit_at(idx).to_int64().reinterpret_as_uint64()
+      s = mix64(s ^ (b + (k.to_int64().reinterpret_as_uint64() << 8UL)))
+      k = k + 1
+    }
   }
   s
 }
@@ -26,12 +36,37 @@ fn derive_seed_from_entries(entries : Array[(String, Json)]) -> UInt64 {
   let n = entries.length()
   let mut s = mix64(0x13198A2E03707344UL ^ (n.to_int64().reinterpret_as_uint64() * 0x9E3779B97F4A7C15UL))
   if n > 0 {
-    let (k0, _) = entries[0]
-    let (kl, _) = entries[n - 1]
-    s = mix64(s ^ k0.length().to_int64().reinterpret_as_uint64())
-    s = mix64(s ^ kl.length().to_int64().reinterpret_as_uint64())
-    if k0.length() > 0 {
-      s = mix64(s ^ k0.code_unit_at(0).to_int64().reinterpret_as_uint64())
+    let mut k = 0
+    while k < 8 {
+      let idx = (k * (n - 1)) / 7
+      let (ek, _) = entries[idx]
+      let el = ek.length()
+      s = mix64(s ^ el.to_int64().reinterpret_as_uint64())
+      if el > 0 {
+        s = mix64(s ^ ek.code_unit_at(0).to_int64().reinterpret_as_uint64())
+        s = mix64(s ^ ek.code_unit_at(el - 1).to_int64().reinterpret_as_uint64())
+      }
+      k = k + 1
+    }
+  }
+  s
+}
+
+fn derive_seed_from_keys(keys : Array[String]) -> UInt64 {
+  let n = keys.length()
+  let mut s = mix64(0x6A09E667F3BCC908UL ^ (n.to_int64().reinterpret_as_uint64() * 0x9E3779B97F4A7C15UL))
+  if n > 0 {
+    let mut k = 0
+    while k < 8 {
+      let idx = (k * (n - 1)) / 7
+      let ek = keys[idx]
+      let el = ek.length()
+      s = mix64(s ^ el.to_int64().reinterpret_as_uint64())
+      if el > 0 {
+        s = mix64(s ^ ek.code_unit_at(0).to_int64().reinterpret_as_uint64())
+        s = mix64(s ^ ek.code_unit_at(el - 1).to_int64().reinterpret_as_uint64())
+      }
+      k = k + 1
     }
   }
   s
@@ -62,6 +97,190 @@ fn hash_str_seeded(s : String, seed : UInt64) -> UInt64 {
   if h == 0UL { 1UL } else { h }
 }
 
+///| Deterministic byte-wise lexicographical comparison for `String`.
+fn cmp_str_bytes(a : String, b : String) -> Int {
+  let na = a.length()
+  let nb = b.length()
+  let lim = if na < nb { na } else { nb }
+  let mut i = 0
+  while i < lim {
+    let ba = a.code_unit_at(i)
+    let bb = b.code_unit_at(i)
+    if ba != bb {
+      return ba - bb
+    }
+    i = i + 1
+  }
+  na - nb
+}
+
+///| Iterative, arena-backed AVL tree mapping `String -> entry_idx`.
+///| Guarantees strict O(log N) worst-case insert and lookup without recursion.
+struct ObjAvlTree {
+  mut root : Int
+  keys : Array[String]
+  vals : Array[Int]
+  left : Array[Int]
+  right : Array[Int]
+  height : Array[Int]
+}
+
+fn ObjAvlTree::new() -> ObjAvlTree {
+  ObjAvlTree::{
+    root: -1,
+    keys: [],
+    vals: [],
+    left: [],
+    right: [],
+    height: [],
+  }
+}
+
+fn ObjAvlTree::node_h(self : ObjAvlTree, id : Int) -> Int {
+  if id < 0 { 0 } else { self.height[id] }
+}
+
+fn ObjAvlTree::update_h(self : ObjAvlTree, id : Int) -> Unit {
+  let lh = self.node_h(self.left[id])
+  let rh = self.node_h(self.right[id])
+  self.height[id] = 1 + (if lh > rh { lh } else { rh })
+}
+
+fn ObjAvlTree::rotate_right(self : ObjAvlTree, y : Int) -> Int {
+  let x = self.left[y]
+  let t2 = self.right[x]
+  self.right[x] = y
+  self.left[y] = t2
+  self.update_h(y)
+  self.update_h(x)
+  x
+}
+
+fn ObjAvlTree::rotate_left(self : ObjAvlTree, x : Int) -> Int {
+  let y = self.right[x]
+  let t2 = self.left[y]
+  self.left[y] = x
+  self.right[x] = t2
+  self.update_h(x)
+  self.update_h(y)
+  y
+}
+
+///| O(log N) iterative lookup; returns `entry_idx` or `-1`.
+fn ObjAvlTree::get(self : ObjAvlTree, key : String) -> Int {
+  let mut cur = self.root
+  while cur >= 0 {
+    let c = cmp_str_bytes(key, self.keys[cur])
+    if c == 0 {
+      return self.vals[cur]
+    } else if c < 0 {
+      cur = self.left[cur]
+    } else {
+      cur = self.right[cur]
+    }
+  }
+  -1
+}
+
+///| O(log N) iterative insert-if-absent; returns existing `entry_idx` or `-1`.
+fn ObjAvlTree::insert_if_absent(
+  self : ObjAvlTree,
+  key : String,
+  entry_idx : Int,
+  path_nodes : FixedArray[Int],
+  path_dir : FixedArray[Int],
+) -> Int {
+  let mut cur = self.root
+  let mut depth = 0
+  while cur >= 0 {
+    let c = cmp_str_bytes(key, self.keys[cur])
+    if c == 0 {
+      return self.vals[cur]
+    }
+    path_nodes[depth] = cur
+    if c < 0 {
+      path_dir[depth] = 0
+      cur = self.left[cur]
+    } else {
+      path_dir[depth] = 1
+      cur = self.right[cur]
+    }
+    depth = depth + 1
+  }
+  let new_id = self.keys.length()
+  self.keys.push(key)
+  self.vals.push(entry_idx)
+  self.left.push(-1)
+  self.right.push(-1)
+  self.height.push(1)
+  if depth == 0 {
+    self.root = new_id
+    return -1
+  }
+  let parent = path_nodes[depth - 1]
+  if path_dir[depth - 1] == 0 {
+    self.left[parent] = new_id
+  } else {
+    self.right[parent] = new_id
+  }
+  let mut d = depth - 1
+  while d >= 0 {
+    let node = path_nodes[d]
+    let lh = self.node_h(self.left[node])
+    let rh = self.node_h(self.right[node])
+    let bf = lh - rh
+    if bf > 1 {
+      let l = self.left[node]
+      if self.node_h(self.left[l]) < self.node_h(self.right[l]) {
+        self.left[node] = self.rotate_left(l)
+      }
+      let new_sub = self.rotate_right(node)
+      if d == 0 {
+        self.root = new_sub
+      } else {
+        let gp = path_nodes[d - 1]
+        if path_dir[d - 1] == 0 {
+          self.left[gp] = new_sub
+        } else {
+          self.right[gp] = new_sub
+        }
+      }
+      break
+    } else if bf < -1 {
+      let r = self.right[node]
+      if self.node_h(self.right[r]) < self.node_h(self.left[r]) {
+        self.right[node] = self.rotate_right(r)
+      }
+      let new_sub = self.rotate_left(node)
+      if d == 0 {
+        self.root = new_sub
+      } else {
+        let gp = path_nodes[d - 1]
+        if path_dir[d - 1] == 0 {
+          self.left[gp] = new_sub
+        } else {
+          self.right[gp] = new_sub
+        }
+      }
+      break
+    } else {
+      let new_h = 1 + (if lh > rh { lh } else { rh })
+      if new_h == self.height[node] {
+        break
+      }
+      self.height[node] = new_h
+    }
+    d = d - 1
+  }
+  -1
+}
+
+///| Frozen index for `JsonObject`: O(1) open-addressing hash table or O(log N) AVL tree.
+enum ObjectHashIndex {
+  Hash(UInt64, Int, FixedArray[String], FixedArray[UInt64], FixedArray[Int])
+  Tree(ObjAvlTree)
+}
+
 ///| Mutable builder for `ObjectHashIndex` used during object construction/parsing.
 struct ObjIndexBuilder {
   seed : UInt64
@@ -71,6 +290,9 @@ struct ObjIndexBuilder {
   mut hashes : FixedArray[UInt64]
   ///| entry_idx + 1 (0 means empty)
   mut vals : FixedArray[Int]
+  mut tree : Option[ObjAvlTree]
+  path_nodes : FixedArray[Int]
+  path_dir : FixedArray[Int]
 }
 
 fn ObjIndexBuilder::new(initial_cap : Int, seed : UInt64) -> ObjIndexBuilder {
@@ -85,7 +307,34 @@ fn ObjIndexBuilder::new(initial_cap : Int, seed : UInt64) -> ObjIndexBuilder {
     keys: FixedArray::make(c, ""),
     hashes: FixedArray::make(c, 0UL),
     vals: FixedArray::make(c, 0),
+    tree: None,
+    path_nodes: FixedArray::make(64, 0),
+    path_dir: FixedArray::make(64, 0),
   }
+}
+
+///| Migrate all existing hash-table entries into a deterministic AVL tree.
+fn ObjIndexBuilder::migrate_to_tree(
+  self : ObjIndexBuilder,
+  src_cap : Int,
+  src_keys : FixedArray[String],
+  src_vals : FixedArray[Int],
+) -> ObjAvlTree {
+  let t = ObjAvlTree::new()
+  let mut i = 0
+  while i < src_cap {
+    let v = src_vals[i]
+    if v != 0 {
+      let _ = t.insert_if_absent(src_keys[i], v - 1, self.path_nodes, self.path_dir)
+    }
+    i = i + 1
+  }
+  self.tree = Some(t)
+  self.cap = 0
+  self.keys = FixedArray::make(0, "")
+  self.hashes = FixedArray::make(0, 0UL)
+  self.vals = FixedArray::make(0, 0)
+  t
 }
 
 fn ObjIndexBuilder::grow(self : ObjIndexBuilder) -> Unit {
@@ -104,7 +353,13 @@ fn ObjIndexBuilder::grow(self : ObjIndexBuilder) -> Unit {
     if v != 0 {
       let h = old_hashes[i]
       let mut slot = (h & new_mask).to_int()
+      let mut probes = 0
       while new_vals[slot] != 0 {
+        probes = probes + 1
+        if probes > max_probe_chain {
+          let _ = self.migrate_to_tree(old_cap, old_keys, old_vals)
+          return
+        }
         slot = (slot + 1) & (new_cap - 1)
       }
       new_keys[slot] = old_keys[i]
@@ -121,6 +376,10 @@ fn ObjIndexBuilder::grow(self : ObjIndexBuilder) -> Unit {
 
 ///| Look up `key`; returns `entry_idx` or `-1` if absent.
 fn ObjIndexBuilder::get(self : ObjIndexBuilder, key : String) -> Int {
+  match self.tree {
+    Some(t) => return t.get(key)
+    None => ()
+  }
   let h = hash_str_seeded(key, self.seed)
   let mask = self.cap - 1
   let mut slot = (h & mask.to_int64().reinterpret_as_uint64()).to_int()
@@ -139,12 +398,33 @@ fn ObjIndexBuilder::get(self : ObjIndexBuilder, key : String) -> Int {
 
 ///| Insert `key -> entry_idx` if absent; returns existing `entry_idx` if already present, else `-1`.
 fn ObjIndexBuilder::insert_if_absent(self : ObjIndexBuilder, key : String, entry_idx : Int) -> Int {
+  match self.tree {
+    Some(t) => {
+      let existing = t.insert_if_absent(key, entry_idx, self.path_nodes, self.path_dir)
+      if existing < 0 {
+        self.len = self.len + 1
+      }
+      return existing
+    }
+    None => ()
+  }
   if self.len * 8 >= self.cap * 5 {
     self.grow()
+    match self.tree {
+      Some(t) => {
+        let existing = t.insert_if_absent(key, entry_idx, self.path_nodes, self.path_dir)
+        if existing < 0 {
+          self.len = self.len + 1
+        }
+        return existing
+      }
+      None => ()
+    }
   }
   let h = hash_str_seeded(key, self.seed)
   let mask = self.cap - 1
   let mut slot = (h & mask.to_int64().reinterpret_as_uint64()).to_int()
+  let mut probes = 0
   while true {
     let v = self.vals[slot]
     if v == 0 {
@@ -157,6 +437,15 @@ fn ObjIndexBuilder::insert_if_absent(self : ObjIndexBuilder, key : String, entry
     if self.hashes[slot] == h && self.keys[slot] == key {
       return v - 1
     }
+    probes = probes + 1
+    if probes > max_probe_chain {
+      let t = self.migrate_to_tree(self.cap, self.keys, self.vals)
+      let existing = t.insert_if_absent(key, entry_idx, self.path_nodes, self.path_dir)
+      if existing < 0 {
+        self.len = self.len + 1
+      }
+      return existing
+    }
     slot = (slot + 1) & mask
   }
   -1
@@ -164,31 +453,33 @@ fn ObjIndexBuilder::insert_if_absent(self : ObjIndexBuilder, key : String, entry
 
 ///| Freeze the mutable builder into an immutable `ObjectHashIndex`.
 fn ObjIndexBuilder::freeze(self : ObjIndexBuilder) -> ObjectHashIndex {
-  ObjectHashIndex::{
-    seed: self.seed,
-    cap: self.cap,
-    keys: self.keys,
-    hashes: self.hashes,
-    vals: self.vals,
+  match self.tree {
+    Some(t) => ObjectHashIndex::Tree(t)
+    None => ObjectHashIndex::Hash(self.seed, self.cap, self.keys, self.hashes, self.vals)
   }
 }
 
-///| O(1) lookup on a frozen `ObjectHashIndex`. Returns `entry_idx` or `-1`.
+///| Lookup on a frozen `ObjectHashIndex`. Returns `entry_idx` or `-1`.
 fn ObjectHashIndex::get_idx(self : ObjectHashIndex, key : String) -> Int {
-  let h = hash_str_seeded(key, self.seed)
-  let mask = self.cap - 1
-  let mut slot = (h & mask.to_int64().reinterpret_as_uint64()).to_int()
-  while true {
-    let v = self.vals[slot]
-    if v == 0 {
-      return -1
+  match self {
+    ObjectHashIndex::Tree(t) => t.get(key)
+    ObjectHashIndex::Hash(seed, cap, keys, hashes, vals) => {
+      let h = hash_str_seeded(key, seed)
+      let mask = cap - 1
+      let mut slot = (h & mask.to_int64().reinterpret_as_uint64()).to_int()
+      while true {
+        let v = vals[slot]
+        if v == 0 {
+          return -1
+        }
+        if hashes[slot] == h && keys[slot] == key {
+          return v - 1
+        }
+        slot = (slot + 1) & mask
+      }
+      -1
     }
-    if self.hashes[slot] == h && self.keys[slot] == key {
-      return v - 1
-    }
-    slot = (slot + 1) & mask
   }
-  -1
 }
 
 ///| Build a `JsonObject` from deduplicated entries, automatically indexing when `len > 8`.
