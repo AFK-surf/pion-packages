@@ -1,11 +1,14 @@
 ///| Configurable plain-text preview and summary extraction from Markdown / `Document` AST.
-///| Fully iterative traversal (zero native recursion) with UTF-8 code-point safe truncation.
+///| Fully iterative traversal (zero native recursion) with grapheme-cluster-safe UTF-8 truncation.
 
 ///| Configuration for extracting plain-text summaries/previews from Markdown.
 pub val struct PlainTextOptions {
   pub image_placeholder : String
   pub link_placeholder : String
   pub code_block_placeholder : String
+  ///| Placeholder emitted for `Inline::Math` nodes. Note: `Inline::Math` is currently reserved
+  ///| for manually constructed or extension-transformed `Document` ASTs; the default CommonMark/GFM
+  ///| parser does not automatically parse `$...$` into `Inline::Math`.
   pub math_placeholder : String
   pub collapse_whitespace : Bool
   pub max_chars : Int
@@ -23,7 +26,7 @@ pub fn PlainTextOptions::default() -> PlainTextOptions {
   }
 }
 
-///| Mutable accumulator enforcing whitespace policy and UTF-8 code-point truncation.
+///| Mutable accumulator enforcing whitespace policy, raw-tag suppression, and grapheme-safe truncation.
 struct PlainTextWriter {
   sb : StringBuilder
   collapse : Bool
@@ -32,26 +35,163 @@ struct PlainTextWriter {
   mut has_output : Bool
   mut pending_sep : Int // 0 = none, 1 = space, 2 = newline
   mut last_was_space : Bool
+  mut truncated : Bool
+  mut suppress_raw_tag : Int // 0 = none, 1 = script, 2 = style
 }
 
 ///|
 fn pt_is_full(w : PlainTextWriter) -> Bool {
-  w.max_chars > 0 && w.emitted_chars >= w.max_chars
+  w.truncated || (w.max_chars > 0 && w.emitted_chars >= w.max_chars)
 }
 
 ///|
-fn pt_utf8_char_len(b0 : Int) -> Int {
-  if b0 < 0x80 {
-    1
-  } else if (b0 & 0xE0) == 0xC0 {
-    2
-  } else if (b0 & 0xF0) == 0xE0 {
-    3
-  } else if (b0 & 0xF8) == 0xF0 {
-    4
+fn pt_ascii_lower(b : Int) -> Int {
+  if b >= 65 && b <= 90 {
+    b + 32
   } else {
-    1
+    b
   }
+}
+
+///|
+fn pt_is_regional_indicator(cp : Int) -> Bool {
+  cp >= 0x1F1E6 && cp <= 0x1F1FF
+}
+
+///|
+fn pt_is_hangul_l(cp : Int) -> Bool {
+  (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0xA960 && cp <= 0xA97C)
+}
+
+///|
+fn pt_is_hangul_v(cp : Int) -> Bool {
+  (cp >= 0x1160 && cp <= 0x11A7) || (cp >= 0xD7B0 && cp <= 0xD7C6)
+}
+
+///|
+fn pt_is_hangul_t(cp : Int) -> Bool {
+  (cp >= 0x11A8 && cp <= 0x11FF) || (cp >= 0xD7CB && cp <= 0xD7FB)
+}
+
+///| Core UAX #29 grapheme extend / modifier codepoints (combining marks, VS, skin tones, tags).
+fn pt_is_grapheme_extend(cp : Int) -> Bool {
+  if cp < 0x0300 {
+    return false
+  }
+  (cp >= 0x0300 && cp <= 0x036F) || // Combining Diacritical Marks
+  (cp >= 0xFE00 && cp <= 0xFE0F) || // Variation Selectors
+  (cp >= 0x1F3FB && cp <= 0x1F3FF) || // Emoji Skin Tone Modifiers
+  (cp >= 0xE0100 && cp <= 0xE01EF) || // Variation Selectors Supplement (IVS)
+  (cp >= 0x20D0 && cp <= 0x20FF) || // Combining Diacritical Marks for Symbols (incl. U+20E3)
+  (cp >= 0x1AB0 && cp <= 0x1AFF) || // Combining Diacritical Marks Extended
+  (cp >= 0x1DC0 && cp <= 0x1DFF) || // Combining Diacritical Marks Supplement
+  (cp >= 0xFE20 && cp <= 0xFE2F) || // Combining Half Marks
+  cp == 0x200C || // ZWNJ
+  (cp >= 0xE0020 && cp <= 0xE007F) || // Tag characters (subdivision flags)
+  (cp >= 0x0591 && cp <= 0x05BD) ||
+  cp == 0x05BF ||
+  cp == 0x05C1 ||
+  cp == 0x05C2 ||
+  cp == 0x05C4 ||
+  cp == 0x05C5 ||
+  cp == 0x05C7 ||
+  (cp >= 0x064B && cp <= 0x065F) ||
+  cp == 0x0670 ||
+  (cp >= 0x0900 && cp <= 0x0903) ||
+  (cp >= 0x093A && cp <= 0x094F) ||
+  (cp >= 0x0951 && cp <= 0x0957) ||
+  (cp >= 0x0962 && cp <= 0x0963) ||
+  cp == 0x0E31 ||
+  (cp >= 0x0E34 && cp <= 0x0E3A) ||
+  (cp >= 0x0E47 && cp <= 0x0E4E) ||
+  cp == 0x3099 ||
+  cp == 0x309A
+}
+
+///| Advance one grapheme cluster from `start` within `s[start..end]`.
+///| Returns `(next_byte_pos, code_point_count)`.
+fn pt_next_grapheme(s : String, start : Int, end : Int) -> (Int, Int) {
+  let b0 = s.code_unit_at(start)
+  // Fast path: plain ASCII not followed by non-ASCII combining mark (or CRLF).
+  if b0 < 0x80 {
+    if b0 == 13 && start + 1 < end && s.code_unit_at(start + 1) == 10 {
+      return (start + 2, 2)
+    }
+    if start + 1 >= end || s.code_unit_at(start + 1) < 0x80 {
+      return (start + 1, 1)
+    }
+  }
+  let (cp0, len0_raw) = utf8_decode(s, start)
+  let len0 = if start + len0_raw <= end { len0_raw } else { end - start }
+  let mut pos = start + len0
+  let mut cps = 1
+
+  // Regional Indicator pair (flag emoji)
+  if pt_is_regional_indicator(cp0) && pos < end && s.code_unit_at(pos) >= 0x80 {
+    let (cp1, len1) = utf8_decode(s, pos)
+    if pos + len1 <= end && pt_is_regional_indicator(cp1) {
+      pos = pos + len1
+      cps = cps + 1
+    }
+  } else if pt_is_hangul_l(cp0) {
+    // Hangul L* V+ T*
+    while pos < end && s.code_unit_at(pos) >= 0x80 {
+      let (cp1, len1) = utf8_decode(s, pos)
+      if pos + len1 <= end && pt_is_hangul_l(cp1) {
+        pos = pos + len1
+        cps = cps + 1
+      } else {
+        break
+      }
+    }
+    while pos < end && s.code_unit_at(pos) >= 0x80 {
+      let (cp1, len1) = utf8_decode(s, pos)
+      if pos + len1 <= end && pt_is_hangul_v(cp1) {
+        pos = pos + len1
+        cps = cps + 1
+      } else {
+        break
+      }
+    }
+    while pos < end && s.code_unit_at(pos) >= 0x80 {
+      let (cp1, len1) = utf8_decode(s, pos)
+      if pos + len1 <= end && pt_is_hangul_t(cp1) {
+        pos = pos + len1
+        cps = cps + 1
+      } else {
+        break
+      }
+    }
+  }
+
+  // Trailing Extend / Variation Selectors / Skin Tones / ZWJ sequences
+  while pos < end {
+    if s.code_unit_at(pos) < 0x80 {
+      break
+    }
+    let (cp, clen) = utf8_decode(s, pos)
+    if pos + clen > end {
+      break
+    }
+    if cp == 0x200D {
+      // ZWJ: attach ZWJ and (if present) the following non-ASCII joined character
+      pos = pos + clen
+      cps = cps + 1
+      if pos < end && s.code_unit_at(pos) >= 0x80 {
+        let (cp2, clen2) = utf8_decode(s, pos)
+        if pos + clen2 <= end && !is_unicode_ws(cp2) {
+          pos = pos + clen2
+          cps = cps + 1
+        }
+      }
+    } else if pt_is_grapheme_extend(cp) {
+      pos = pos + clen
+      cps = cps + 1
+    } else {
+      break
+    }
+  }
+  (pos, cps)
 }
 
 ///|
@@ -61,11 +201,21 @@ fn pt_mark_sep(w : PlainTextWriter, level : Int) -> Unit {
   }
 }
 
-///| Flush pending separator before writing visible text; returns false if `max_chars` reached.
-fn pt_flush_sep(w : PlainTextWriter) -> Bool {
-  if pt_is_full(w) {
-    return false
+///| Number of code points required to flush the currently pending separator (0 or 1).
+fn pt_sep_cost(w : PlainTextWriter) -> Int {
+  if w.has_output && w.pending_sep > 0 {
+    if w.collapse {
+      if !w.last_was_space { 1 } else { 0 }
+    } else {
+      1
+    }
+  } else {
+    0
   }
+}
+
+///| Emit the pending separator (caller already verified budget for separator + next grapheme).
+fn pt_emit_sep(w : PlainTextWriter) -> Unit {
   if w.has_output && w.pending_sep > 0 {
     if w.collapse {
       if !w.last_was_space {
@@ -86,10 +236,9 @@ fn pt_flush_sep(w : PlainTextWriter) -> Bool {
       w.pending_sep = 0
     }
   }
-  !pt_is_full(w)
 }
 
-///| Write a string span `s[start..end]` respecting `collapse_whitespace` and UTF-8 `max_chars`.
+///| Write a string span `s[start..end]` respecting `collapse_whitespace` and grapheme-safe `max_chars`.
 fn pt_write_span(w : PlainTextWriter, s : String, start : Int, end : Int) -> Unit {
   if start >= end || pt_is_full(w) {
     return ()
@@ -103,17 +252,40 @@ fn pt_write_span(w : PlainTextWriter, s : String, start : Int, end : Int) -> Uni
         i = i + 1
         continue
       }
-      if !pt_flush_sep(w) {
+      if b0 < 0x80 && (i + 1 >= end || s.code_unit_at(i + 1) < 0x80) {
+        let sep_cost = if w.has_output && w.pending_sep > 0 && !w.last_was_space { 1 } else { 0 }
+        if w.max_chars > 0 && w.emitted_chars + sep_cost + 1 > w.max_chars {
+          w.truncated = true
+          return ()
+        }
+        if sep_cost > 0 {
+          pt_emit_sep(w)
+        }
+        w.sb.write_byte(b0.to_byte())
+        w.emitted_chars = w.emitted_chars + 1
+        w.has_output = true
+        w.last_was_space = false
+        i = i + 1
+        if w.max_chars > 0 && w.emitted_chars >= w.max_chars {
+          return ()
+        }
+        continue
+      }
+      let (next_i, cluster_cps) = pt_next_grapheme(s, i, end)
+      let sep_cost = pt_sep_cost(w)
+      if w.max_chars > 0 && w.emitted_chars + sep_cost + cluster_cps > w.max_chars {
+        w.truncated = true
         return ()
       }
-      let clen = pt_utf8_char_len(b0)
-      let next_i = if i + clen <= end { i + clen } else { end }
-      if clen == 1 {
+      if sep_cost > 0 {
+        pt_emit_sep(w)
+      }
+      if next_i - i == 1 {
         w.sb.write_byte(b0.to_byte())
       } else {
         w.sb.write_substring(s, i, next_i)
       }
-      w.emitted_chars = w.emitted_chars + 1
+      w.emitted_chars = w.emitted_chars + cluster_cps
       w.has_output = true
       w.last_was_space = false
       i = next_i
@@ -122,91 +294,363 @@ fn pt_write_span(w : PlainTextWriter, s : String, start : Int, end : Int) -> Uni
       }
     }
   } else {
-    if !pt_flush_sep(w) {
-      return ()
-    }
     let mut i = start
     while i < end {
-      if pt_is_full(w) {
+      let b0 = s.code_unit_at(i)
+      if b0 < 0x80 && b0 != 13 && (i + 1 >= end || s.code_unit_at(i + 1) < 0x80) {
+        let sep_cost = if w.has_output && w.pending_sep > 0 { 1 } else { 0 }
+        if w.max_chars > 0 && w.emitted_chars + sep_cost + 1 > w.max_chars {
+          w.truncated = true
+          return ()
+        }
+        if sep_cost > 0 {
+          pt_emit_sep(w)
+        }
+        w.sb.write_byte(b0.to_byte())
+        w.emitted_chars = w.emitted_chars + 1
+        w.has_output = true
+        w.last_was_space = b0 == 32
+        i = i + 1
+        if w.max_chars > 0 && w.emitted_chars >= w.max_chars {
+          return ()
+        }
+        continue
+      }
+      let (next_i, cluster_cps) = pt_next_grapheme(s, i, end)
+      let sep_cost = pt_sep_cost(w)
+      if w.max_chars > 0 && w.emitted_chars + sep_cost + cluster_cps > w.max_chars {
+        w.truncated = true
         return ()
       }
-      let b0 = s.code_unit_at(i)
-      let clen = pt_utf8_char_len(b0)
-      let next_i = if i + clen <= end { i + clen } else { end }
-      if clen == 1 {
+      if sep_cost > 0 {
+        pt_emit_sep(w)
+      }
+      if next_i - i == 1 {
         w.sb.write_byte(b0.to_byte())
         w.last_was_space = b0 == 32
       } else {
         w.sb.write_substring(s, i, next_i)
         w.last_was_space = false
       }
-      w.emitted_chars = w.emitted_chars + 1
+      w.emitted_chars = w.emitted_chars + cluster_cps
       w.has_output = true
       i = next_i
+      if pt_is_full(w) {
+        return ()
+      }
     }
   }
 }
 
-///| Write a string respecting `collapse_whitespace` and UTF-8 `max_chars`.
+///| Write a string respecting `collapse_whitespace` and grapheme-safe `max_chars`.
 fn pt_write_str(w : PlainTextWriter, s : String) -> Unit {
   pt_write_span(w, s, 0, s.length())
 }
 
-///| Check if an HTML tag starting at `s[lt..gt]` is a break/block boundary tag.
+///| Case-insensitive ASCII comparison of `s[p..p+len]` against lowercase `lit`.
+fn pt_tag_eq(s : String, p : Int, len : Int, lit : String) -> Bool {
+  if len != lit.length() {
+    return false
+  }
+  let mut k = 0
+  while k < len {
+    if pt_ascii_lower(s.code_unit_at(p + k)) != lit.code_unit_at(k) {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Check if an HTML tag starting at `s[lt..gt]` is a break/block/cell boundary tag.
 fn pt_is_break_html_tag(s : String, lt : Int, gt : Int) -> Bool {
   let mut p = lt + 1
   if p < gt && s.code_unit_at(p) == 47 {
     p = p + 1
   }
-  if p >= gt {
+  let mut e = p
+  while e < gt && is_ascii_alnum(s.code_unit_at(e)) {
+    e = e + 1
+  }
+  let len = e - p
+  if len == 0 || len > 10 {
     return false
   }
-  let c0 = s.code_unit_at(p) | 32
-  if c0 == 98 && p + 1 < gt && (s.code_unit_at(p + 1) | 32) == 114 {
-    // br
-    return p + 2 == gt || s.code_unit_at(p + 2) == 32 || s.code_unit_at(p + 2) == 47
+  if e < gt {
+    let nb = s.code_unit_at(e)
+    if nb != 32 && nb != 9 && nb != 10 && nb != 12 && nb != 13 && nb != 47 {
+      return false
+    }
   }
-  if c0 == 112 && (p + 1 == gt || s.code_unit_at(p + 1) == 32) {
-    // p
-    return true
+  if len == 1 {
+    pt_tag_eq(s, p, 1, "p")
+  } else if len == 2 {
+    pt_tag_eq(s, p, 2, "br") ||
+    pt_tag_eq(s, p, 2, "hr") ||
+    pt_tag_eq(s, p, 2, "li") ||
+    pt_tag_eq(s, p, 2, "ul") ||
+    pt_tag_eq(s, p, 2, "ol") ||
+    pt_tag_eq(s, p, 2, "dl") ||
+    pt_tag_eq(s, p, 2, "dt") ||
+    pt_tag_eq(s, p, 2, "dd") ||
+    pt_tag_eq(s, p, 2, "td") ||
+    pt_tag_eq(s, p, 2, "th") ||
+    pt_tag_eq(s, p, 2, "tr") ||
+    pt_tag_eq(s, p, 2, "h1") ||
+    pt_tag_eq(s, p, 2, "h2") ||
+    pt_tag_eq(s, p, 2, "h3") ||
+    pt_tag_eq(s, p, 2, "h4") ||
+    pt_tag_eq(s, p, 2, "h5") ||
+    pt_tag_eq(s, p, 2, "h6")
+  } else if len == 3 {
+    pt_tag_eq(s, p, 3, "div") || pt_tag_eq(s, p, 3, "nav") || pt_tag_eq(s, p, 3, "pre")
+  } else if len == 4 {
+    pt_tag_eq(s, p, 4, "main") || pt_tag_eq(s, p, 4, "form")
+  } else if len == 5 {
+    pt_tag_eq(s, p, 5, "table") ||
+    pt_tag_eq(s, p, 5, "thead") ||
+    pt_tag_eq(s, p, 5, "tbody") ||
+    pt_tag_eq(s, p, 5, "tfoot") ||
+    pt_tag_eq(s, p, 5, "aside")
+  } else if len == 6 {
+    pt_tag_eq(s, p, 6, "header") || pt_tag_eq(s, p, 6, "footer") || pt_tag_eq(s, p, 6, "figure")
+  } else if len == 7 {
+    pt_tag_eq(s, p, 7, "caption") ||
+    pt_tag_eq(s, p, 7, "section") ||
+    pt_tag_eq(s, p, 7, "article") ||
+    pt_tag_eq(s, p, 7, "address") ||
+    pt_tag_eq(s, p, 7, "details") ||
+    pt_tag_eq(s, p, 7, "summary")
+  } else if len == 8 {
+    pt_tag_eq(s, p, 8, "fieldset")
+  } else if len == 10 {
+    pt_tag_eq(s, p, 10, "blockquote") || pt_tag_eq(s, p, 10, "figcaption")
+  } else {
+    false
   }
-  if c0 == 100 && p + 2 < gt && (s.code_unit_at(p + 1) | 32) == 105 && (s.code_unit_at(p + 2) | 32) == 118 {
-    // div
-    return true
-  }
-  false
 }
 
-///| Strip HTML tags and comments from `raw`, emitting visible inner text.
-fn pt_write_html_stripped(w : PlainTextWriter, raw : String) -> Unit {
+///| Return 1 if `s[lt..gt]` is a non-self-closing `<script...>` start tag,
+///| 2 if `<style...>`, else 0.
+fn pt_raw_open_tag_kind(s : String, lt : Int, gt : Int) -> Int {
+  let p = lt + 1
+  if p >= gt || s.code_unit_at(p) == 47 {
+    return 0
+  }
+  // Self-closing tag `<script .../>` does not suppress subsequent content
+  if gt - 1 > p && s.code_unit_at(gt - 1) == 47 {
+    return 0
+  }
+  let mut e = p
+  while e < gt && is_ascii_alnum(s.code_unit_at(e)) {
+    e = e + 1
+  }
+  if e < gt {
+    let nb = s.code_unit_at(e)
+    if nb != 32 && nb != 9 && nb != 10 && nb != 12 && nb != 13 && nb != 47 {
+      return 0
+    }
+  }
+  let len = e - p
+  if len == 6 && pt_tag_eq(s, p, 6, "script") {
+    1
+  } else if len == 5 && pt_tag_eq(s, p, 5, "style") {
+    2
+  } else {
+    0
+  }
+}
+
+///| Check if `s[i..n]` starts with `</script` (kind=1) or `</style` (kind=2) followed by ws/`>` and a closing `>`.
+///| Returns `Some(after_gt)` if matched, `None` otherwise.
+fn pt_match_raw_close_tag(s : String, i : Int, n : Int, kind : Int) -> Option[Int] {
+  if i + 2 >= n || s.code_unit_at(i) != 60 || s.code_unit_at(i + 1) != 47 {
+    return None
+  }
+  let p = i + 2
+  let tlen = if kind == 1 { 6 } else { 5 }
+  if p + tlen >= n {
+    return None
+  }
+  let matched = if kind == 1 {
+    pt_tag_eq(s, p, 6, "script")
+  } else {
+    pt_tag_eq(s, p, 5, "style")
+  }
+  if !matched {
+    return None
+  }
+  let after_name = p + tlen
+  let nb = s.code_unit_at(after_name)
+  if nb != 62 && nb != 32 && nb != 9 && nb != 10 && nb != 12 && nb != 13 && nb != 47 {
+    return None
+  }
+  let mut j = after_name
+  while j < n && s.code_unit_at(j) != 62 {
+    j = j + 1
+  }
+  if j < n && s.code_unit_at(j) == 62 {
+    Some(j + 1)
+  } else {
+    None
+  }
+}
+
+///| Emit a raw HTML text segment `raw[start..end]` with HTML character reference decoding.
+fn pt_write_html_entities_decoded(w : PlainTextWriter, raw : String, start : Int, end : Int) -> Unit {
+  if start >= end || pt_is_full(w) {
+    return ()
+  }
+  let mut i = start
+  let mut mark = start
+  while i < end && !pt_is_full(w) {
+    if raw.code_unit_at(i) == 38 {
+      match scan_entity(raw, i, end) {
+        Some((decoded, next_i)) => {
+          if mark < i {
+            pt_write_span(w, raw, mark, i)
+          }
+          if !pt_is_full(w) {
+            pt_write_str(w, decoded)
+          }
+          i = next_i
+          mark = i
+        }
+        None => i = i + 1
+      }
+    } else {
+      i = i + 1
+    }
+  }
+  if mark < end && !pt_is_full(w) {
+    pt_write_span(w, raw, mark, end)
+  }
+}
+
+///| Emit raw HTML text `raw[start..end]`: decodes character references and, in multiline HTML-block
+///| mode, normalizes raw newlines so blocks never start with `\n` or produce `\n\n\n`.
+fn pt_write_html_text_span(w : PlainTextWriter, raw : String, start : Int, end : Int, is_block : Bool) -> Unit {
+  if start >= end || pt_is_full(w) {
+    return ()
+  }
+  if !is_block || w.collapse {
+    pt_write_html_entities_decoded(w, raw, start, end)
+    return ()
+  }
+  // Multiline HTML block mode: convert raw newlines into pending newline separators and skip blank lines.
+  let mut i = start
+  while i < end && !pt_is_full(w) {
+    let b = raw.code_unit_at(i)
+    if b == 10 || b == 13 {
+      pt_mark_sep(w, 2)
+      i = i + 1
+      continue
+    }
+    let line_start = i
+    while i < end && raw.code_unit_at(i) != 10 && raw.code_unit_at(i) != 13 {
+      i = i + 1
+    }
+    // Check if this line segment is purely ASCII spaces/tabs
+    let mut k = line_start
+    while k < i && (raw.code_unit_at(k) == 32 || raw.code_unit_at(k) == 9) {
+      k = k + 1
+    }
+    if k < i {
+      pt_write_html_entities_decoded(w, raw, line_start, i)
+    } else if i < end {
+      pt_mark_sep(w, 2)
+    }
+  }
+}
+
+///| Strip HTML tags, comments, and `<script>`/`<style>` bodies from `raw`, emitting decoded visible text.
+///| Strictly O(N) even on adversarial inputs with 100 KB of unclosed `<`.
+fn pt_write_html_stripped(w : PlainTextWriter, raw : String, is_block : Bool) -> Unit {
   let n = raw.length()
   let mut i = 0
   let mut text_start = 0
+  let mut no_more_gt = false
   while i < n && !pt_is_full(w) {
+    if w.suppress_raw_tag != 0 {
+      if raw.code_unit_at(i) == 60 {
+        match pt_match_raw_close_tag(raw, i, n, w.suppress_raw_tag) {
+          Some(after_gt) => {
+            w.suppress_raw_tag = 0
+            i = after_gt
+            text_start = i
+            continue
+          }
+          None => ()
+        }
+      }
+      i = i + 1
+      text_start = i
+      continue
+    }
     if raw.code_unit_at(i) == 60 {
       // '<'
-      if text_start < i {
-        pt_write_span(w, raw, text_start, i)
+      if no_more_gt || i + 1 >= n {
+        i = i + 1
+        continue
       }
-      if i + 3 < n &&
-      raw.code_unit_at(i + 1) == 33 &&
-      raw.code_unit_at(i + 2) == 45 &&
-      raw.code_unit_at(i + 3) == 45 {
-        // HTML comment <!-- ... -->
+      let b1 = raw.code_unit_at(i + 1)
+      // 1. HTML comment: <!-- ... -->, plus HTML5 empty comments <!--> and <!--->
+      if b1 == 33 && i + 3 < n && raw.code_unit_at(i + 2) == 45 && raw.code_unit_at(i + 3) == 45 {
+        if text_start < i {
+          pt_write_html_text_span(w, raw, text_start, i, is_block)
+        }
+        if i + 4 < n && raw.code_unit_at(i + 4) == 62 {
+          i = i + 5
+          text_start = i
+          continue
+        }
+        if i + 5 < n && raw.code_unit_at(i + 4) == 45 && raw.code_unit_at(i + 5) == 62 {
+          i = i + 6
+          text_start = i
+          continue
+        }
         let mut j = i + 4
+        let mut found = false
+        let mut end_pos = n
         while j + 2 < n {
           if raw.code_unit_at(j) == 45 && raw.code_unit_at(j + 1) == 45 && raw.code_unit_at(j + 2) == 62 {
-            j = j + 3
+            found = true
+            end_pos = j + 3
             break
           }
           j = j + 1
         }
-        if j + 2 >= n {
-          i = n
+        if found {
+          i = end_pos
         } else {
-          i = j
+          i = n
         }
         text_start = i
+        continue
+      }
+      // 2. Declaration <! ... > or Processing Instruction <? ... >
+      if b1 == 33 || b1 == 63 {
+        let mut j = i + 2
+        while j < n && raw.code_unit_at(j) != 62 {
+          j = j + 1
+        }
+        if j < n && raw.code_unit_at(j) == 62 {
+          if text_start < i {
+            pt_write_html_text_span(w, raw, text_start, i, is_block)
+          }
+          i = j + 1
+          text_start = i
+          continue
+        } else {
+          no_more_gt = true
+          i = i + 1
+          continue
+        }
+      }
+      // 3. Start tag (< + ASCII alpha) or End tag (</ + ASCII alpha)
+      let is_tag = is_ascii_alpha(b1) || (b1 == 47 && i + 2 < n && is_ascii_alpha(raw.code_unit_at(i + 2)))
+      if !is_tag {
+        i = i + 1
         continue
       }
       let mut j = i + 1
@@ -225,21 +669,32 @@ fn pt_write_html_stripped(w : PlainTextWriter, raw : String) -> Unit {
         j = j + 1
       }
       if j < n && raw.code_unit_at(j) == 62 {
-        if pt_is_break_html_tag(raw, i, j) {
+        if text_start < i {
+          pt_write_html_text_span(w, raw, text_start, i, is_block)
+        }
+        let raw_kind = pt_raw_open_tag_kind(raw, i, j)
+        if raw_kind != 0 {
+          w.suppress_raw_tag = raw_kind
+        } else if pt_is_break_html_tag(raw, i, j) {
           pt_mark_sep(w, 1)
         }
         i = j + 1
         text_start = i
       } else {
-        i = n
-        text_start = n
+        if quote == 0 {
+          no_more_gt = true
+        }
+        i = i + 1
       }
     } else {
       i = i + 1
     }
   }
-  if text_start < n && !pt_is_full(w) {
-    pt_write_span(w, raw, text_start, n)
+  if w.suppress_raw_tag == 0 && text_start < n && !pt_is_full(w) {
+    pt_write_html_text_span(w, raw, text_start, n, is_block)
+  }
+  if is_block {
+    w.suppress_raw_tag = 0
   }
 }
 
@@ -265,22 +720,30 @@ fn pt_emit_inlines(w : PlainTextWriter, inlines : Array[Inline], pt_opts : Plain
     match stack.pop() {
       Some(work) => match work {
         PtInlineWork::CheckPlaceholder(chars_before, ph) => {
-          if w.emitted_chars == chars_before && ph.length() > 0 {
+          if w.suppress_raw_tag == 0 && w.emitted_chars == chars_before && ph.length() > 0 {
             pt_write_str(w, ph)
           }
         }
         PtInlineWork::Visit(inl) => match inl {
-          Inline::Text(s) => pt_write_str(w, s)
-          Inline::Code(s) => pt_write_str(w, s)
-          Inline::SoftBreak => if w.collapse {
-            pt_mark_sep(w, 1)
-          } else {
-            pt_mark_sep(w, 2)
+          Inline::Text(s) => if w.suppress_raw_tag == 0 {
+            pt_write_str(w, s)
           }
-          Inline::HardBreak => if w.collapse {
-            pt_mark_sep(w, 1)
-          } else {
-            pt_mark_sep(w, 2)
+          Inline::Code(s) => if w.suppress_raw_tag == 0 {
+            pt_write_str(w, s)
+          }
+          Inline::SoftBreak => if w.suppress_raw_tag == 0 {
+            if w.collapse {
+              pt_mark_sep(w, 1)
+            } else {
+              pt_mark_sep(w, 2)
+            }
+          }
+          Inline::HardBreak => if w.suppress_raw_tag == 0 {
+            if w.collapse {
+              pt_mark_sep(w, 1)
+            } else {
+              pt_mark_sep(w, 2)
+            }
           }
           Inline::Emphasis(ch) | Inline::Strong(ch) | Inline::Strikethrough(ch) => {
             let mut j = ch.length() - 1
@@ -290,7 +753,9 @@ fn pt_emit_inlines(w : PlainTextWriter, inlines : Array[Inline], pt_opts : Plain
             }
           }
           Inline::Link(_url, _title, ch) => {
-            stack.push(PtInlineWork::CheckPlaceholder(w.emitted_chars, pt_opts.link_placeholder))
+            if w.suppress_raw_tag == 0 {
+              stack.push(PtInlineWork::CheckPlaceholder(w.emitted_chars, pt_opts.link_placeholder))
+            }
             let mut j = ch.length() - 1
             while j >= 0 {
               stack.push(PtInlineWork::Visit(ch[j]))
@@ -298,16 +763,18 @@ fn pt_emit_inlines(w : PlainTextWriter, inlines : Array[Inline], pt_opts : Plain
             }
           }
           Inline::Image(_url, _title, ch) => {
-            stack.push(PtInlineWork::CheckPlaceholder(w.emitted_chars, pt_opts.image_placeholder))
+            if w.suppress_raw_tag == 0 {
+              stack.push(PtInlineWork::CheckPlaceholder(w.emitted_chars, pt_opts.image_placeholder))
+            }
             let mut j = ch.length() - 1
             while j >= 0 {
               stack.push(PtInlineWork::Visit(ch[j]))
               j = j - 1
             }
           }
-          Inline::HtmlInline(raw) => pt_write_html_stripped(w, raw)
+          Inline::HtmlInline(raw) => pt_write_html_stripped(w, raw, false)
           Inline::FootnoteReference(_lbl) => ()
-          Inline::Math(_display, tex) => {
+          Inline::Math(_display, tex) => if w.suppress_raw_tag == 0 {
             if pt_opts.math_placeholder.length() > 0 {
               pt_write_str(w, pt_opts.math_placeholder)
             } else {
@@ -319,6 +786,7 @@ fn pt_emit_inlines(w : PlainTextWriter, inlines : Array[Inline], pt_opts : Plain
       None => ()
     }
   }
+  w.suppress_raw_tag = 0
 }
 
 ///| Explicit stack work item for iterative block traversal.
@@ -337,6 +805,8 @@ pub fn Document::plain_text(self : Document, pt_opts : PlainTextOptions) -> Stri
     has_output: false,
     pending_sep: 0,
     last_was_space: false,
+    truncated: false,
+    suppress_raw_tag: 0,
   }
   let stack : Array[PtBlockWork] = Array::with_capacity(self.blocks.length() + 8)
   let mut i = self.blocks.length() - 1
@@ -415,7 +885,7 @@ pub fn Document::plain_text(self : Document, pt_opts : PlainTextOptions) -> Stri
           }
           Block::ThematicBreak => pt_mark_sep(w, 2)
           Block::HtmlBlock(raw) => {
-            pt_write_html_stripped(w, raw)
+            pt_write_html_stripped(w, raw, true)
             pt_mark_sep(w, 2)
           }
         }

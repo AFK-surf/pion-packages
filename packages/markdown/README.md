@@ -7,7 +7,7 @@ Idiomatic pure Pion port of Rust [`pulldown-cmark`](https://github.com/pulldown-
 - **Upstream**: [`pulldown-cmark/pulldown-cmark`](https://github.com/pulldown-cmark/pulldown-cmark) `v0.13.1` (MIT)
 - **Specification**: [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/) + GitHub Flavored Markdown (GFM) Tables, Strikethrough, Task Lists, Autolink Literals + CommonMark CJK-friendly emphasis amendments (Unicode 17)
 
-## Compliance & Test Coverage (`719 / 719` PASS)
+## Compliance & Test Coverage (`725 / 725` PASS)
 
 | Suite | Passed | Notes |
 | --- | ---: | --- |
@@ -19,8 +19,9 @@ Idiomatic pure Pion port of Rust [`pulldown-cmark`](https://github.com/pulldown-
 | Smart Punctuation (`smart_punct.rs`) | **16 / 16** | O(N) single-pass curly quotes, em/en dashes, ellipses |
 | CJK-Friendly Emphasis (`cjk_friendly_emphasis.rs` + toggle) | **11 / 11** | Full Unicode 17 CJK ranges, IVS & variation selectors |
 | Pathological & Extended Tests (`extensions_test.pion` + 10k stress) | **7 / 7** | Iterative block rendering (50k+ nesting, 0 SIGSEGV), O(N) inline parsing, `parse_with_offsets`, footnotes, YAML/Pluses frontmatter |
-| Tree AST & Plain-Text Extraction (`ast_plain_text_test.pion`) | **11 / 11** | Full `Document`/`Block`/`Inline` AST, GFM tables/tasklists/footnotes/frontmatter, UTF-8 code-point safe `max_chars` (CJK & Emoji), 50k `>` & 32k `- ` stack safety, AST vs Event consistency |
+| Tree AST & Plain-Text Extraction (`ast_plain_text_test.pion`) | **17 / 17** | Full `Document`/`Block`/`Inline` AST, GFM tables/tasklists/footnotes/frontmatter, grapheme-safe `max_chars` (CJK, Emoji ZWJ, combining marks, flags), `<script>`/`<style>` & HTML entity stripping, O(N) text coalescing, 50k `>` & 32k `- ` stack safety, AST vs Event consistency |
 | Red-Team P0 / P1 Audit (`audit/tests/redteam_test.pion`) | **P0 6/6, P1 41/41, OK 8/8** | 0 SIGSEGV, 0 direct-vs-parse divergences across 85,152 differential cases |
+| Red-Team v0.3.0 Audit (`audit_v030/run_audit.sh`) | **P1 7/7, P2 7/7, PRE 1/1, OK 10/10** | Full `FUZZ=20000` `exit 0`: 0 AST-vs-event mismatches, 0 `plain_text` invariant violations (`I1`–`I4`), 6/6 linear scaling probes, 19/19 4-mode SHA-256 parity |
 | Upstream `pulldown-cmark 0.13.1` `table` / `strikethrough` / `regression` | **27/28, 14/15, 192/210** | 954 / 1,148 total across all upstream suites |
 | Wasm32 & Native 4-Mode Smoke (`wasm_smoke`) | **PASS** | `native_dbg` / `native_rel` / `wasm_dbg` / `wasm_rel` all exit 0 with identical SHA-256 (incl. 50k `>` & 32k `- ` nesting, 0 Wasm32 `RangeError`) |
 
@@ -73,6 +74,7 @@ let from_ast = doc.plain_text(markdown::PlainTextOptions::default())
 - **Tree AST (`v0.3.0`)**: `Document`, `FrontMatter`, `Block`, `Inline`, `ListItem`, `TableCell`
   - `parse_document(src : String, opts : Options) -> Document`
   - `parse_document_extended(src : String, opts : ExtendedOptions) -> Document`
+  - Note: `Inline::Math` and `PlainTextOptions.math_placeholder` are currently reserved for manually constructed or extension-transformed `Document` ASTs; the default CommonMark/GFM parser does not automatically parse `$...$` into `Inline::Math`.
 - **Plain-Text Extraction (`v0.3.0`)**: `PlainTextOptions` (`PlainTextOptions::default()`)
   - `Document::plain_text(self : Document, pt_opts : PlainTextOptions) -> String`
   - `to_plain_text(src : String, opts : Options, pt_opts : PlainTextOptions) -> String`
@@ -114,10 +116,10 @@ Run via `scripts/bench_compare.py` with mandatory stdout SHA-256 byte-for-byte v
 
 | Operation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `to_html_pulldown` (regression check vs Rust `0.91x`, `24.453 ms`) | 26.912 | 23.446 | 27.450 | 93.01 | 18.45 MiB |
-| `parse_document` (full tree `Document` AST) | 32.574 | 31.550 | 33.754 | 76.85 | 33.84 MiB |
-| `to_plain_text` (full document, `collapse_whitespace: true`) | 40.340 | 38.409 | 41.680 | 62.05 | 34.89 MiB |
-| `to_plain_text` (`max_chars: 120` preview with placeholders) | 31.395 | 30.919 | 34.199 | 79.73 | 33.84 MiB |
+| `to_html_pulldown` (regression check vs Rust `0.91x`, `21.543 ms`) | 23.704 | 21.792 | 24.299 | 105.60 | 18.44 MiB |
+| `parse_document` (full tree `Document` AST) | 35.851 | 34.484 | 36.133 | 69.82 | 33.84 MiB |
+| `to_plain_text` (full document, `collapse_whitespace: true`) | 41.174 | 39.394 | 43.375 | 60.80 | 34.88 MiB |
+| `to_plain_text` (`max_chars: 120` preview with placeholders) | 34.076 | 30.610 | 36.293 | 73.46 | 33.86 MiB |
 
 ### 4. O(N²) DoS Elimination (`sh packages/markdown/audit/run_audit.sh`)
 
