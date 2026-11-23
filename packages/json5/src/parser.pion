@@ -342,6 +342,39 @@ fn Parser::parse_identifier_key(self : Parser) -> Result[String, Json5Error] {
       self.pos = p
       return Ok(s.slice(start, p))
     }
+  } else if b0 >= 0x80 {
+    // Fast zero-copy path for unescaped non-ASCII Unicode identifiers
+    let (cp0, clen0) = decode_utf8_at(s, start)
+    if !is_es5_id_start(cp0) {
+      return Err(self.err(start, "invalid unquoted object key"))
+    }
+    let mut p = start + clen0
+    let mut hit_escape = false
+    while p < n {
+      let b = s.code_unit_at(p)
+      if b < 0x80 {
+        if b == 92 {
+          hit_escape = true
+          break
+        }
+        if is_ascii_id_part(b) {
+          p = p + 1
+        } else {
+          break
+        }
+      } else {
+        let (cp, clen) = decode_utf8_at(s, p)
+        if is_es5_id_part(cp) {
+          p = p + clen
+        } else {
+          break
+        }
+      }
+    }
+    if !hit_escape {
+      self.pos = p
+      return Ok(s.slice(start, p))
+    }
   }
 
   // General path: Unicode characters and/or \uXXXX escapes
@@ -490,6 +523,7 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
   }
 
   // Hexadecimal integer 0x... / 0X... (JSON5 only)
+  // Exact single-rounding IEEE-754 conversion (tracks top 60..63 significant bits + sticky bit).
   if c == 48 &&
   p + 1 < n &&
   (s.code_unit_at(p + 1) == 120 || s.code_unit_at(p + 1) == 88) {
@@ -498,23 +532,30 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
     }
     p = p + 2
     let hex_start = p
-    let mut acc_u : UInt64 = 0UL
-    let mut acc_d : Double = 0.0
-    let mut use_double = false
+    let mut mant : UInt64 = 0UL
+    let mut bits = 0
+    let mut exp = 0
+    let mut sticky = false
     while p < n {
       let hv = hex_val(s.code_unit_at(p))
       if hv >= 16 {
         break
       }
-      if !use_double {
-        if p - hex_start < 15 {
-          acc_u = (acc_u << 4UL) | hv.to_int64().reinterpret_as_uint64()
-        } else {
-          acc_d = acc_u.to_int64().to_double() * 16.0 + hv.to_double()
-          use_double = true
+      if bits == 0 {
+        if hv != 0 {
+          mant = hv.to_int64().reinterpret_as_uint64()
+          bits = hex_nibble_bits(hv)
         }
+      } else if bits <= 59 {
+        mant = (mant << 4UL) | hv.to_int64().reinterpret_as_uint64()
+        bits = bits + 4
       } else {
-        acc_d = acc_d * 16.0 + hv.to_double()
+        if exp < 10000 {
+          exp = exp + 4
+        }
+        if hv != 0 {
+          sticky = true
+        }
       }
       p = p + 1
     }
@@ -524,7 +565,7 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
     if !self.is_delim_at(p) {
       return Err(self.err(p, "unexpected character after hexadecimal number"))
     }
-    let num_val = if use_double { acc_d } else { acc_u.to_int64().to_double() }
+    let num_val = hex_mant_to_double(mant, bits, exp, sticky)
     if self.opts.reject_overflow && (num_val == 1.0 / 0.0 || num_val == -1.0 / 0.0) {
       return Err(self.err(start, "hexadecimal number overflow"))
     }
@@ -541,13 +582,14 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
   let mut has_dot = false
   let mut has_frac_digits = false
   let mut has_exp = false
-  let mut fast_int : Int64 = 0L
-  let mut fast_ok = true
-  let mut int_digit_count = 0
+  let mut mant : UInt64 = 0UL
+  let mut sig_digits = 0
+  let mut exp_adj = 0
+  let mut mant_overflow = false
+  let mut exp_val = 0
 
   if c == 48 {
     has_int_digits = true
-    int_digit_count = 1
     p = p + 1
     if p < n && is_ascii_digit(s.code_unit_at(p)) {
       return Err(self.err(p, "leading zero is not allowed in number"))
@@ -559,12 +601,15 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
       if !is_ascii_digit(d) {
         break
       }
-      if int_digit_count < 15 {
-        fast_int = fast_int * 10L + (d - 48).to_int64()
-      } else {
-        fast_ok = false
+      let dig = d - 48
+      if sig_digits < 19 {
+        mant = mant * 10UL + dig.to_int64().reinterpret_as_uint64()
+        sig_digits = sig_digits + 1
+      } else if dig != 0 {
+        mant_overflow = true
+      } else if exp_adj < 100000 {
+        exp_adj = exp_adj + 1
       }
-      int_digit_count = int_digit_count + 1
       p = p + 1
     }
   } else if c != 46 {
@@ -577,10 +622,35 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
       return Err(self.err(p, "leading decimal point is not allowed in JSON/JSONC"))
     }
     has_dot = true
-    fast_ok = false
     p = p + 1
-    while p < n && is_ascii_digit(s.code_unit_at(p)) {
+    while p < n {
+      let d = s.code_unit_at(p)
+      if !is_ascii_digit(d) {
+        break
+      }
       has_frac_digits = true
+      let dig = d - 48
+      if sig_digits == 0 {
+        if dig == 0 {
+          if exp_adj > -100000 {
+            exp_adj = exp_adj - 1
+          }
+        } else {
+          mant = dig.to_int64().reinterpret_as_uint64()
+          sig_digits = 1
+          if exp_adj > -100000 {
+            exp_adj = exp_adj - 1
+          }
+        }
+      } else if sig_digits < 19 {
+        mant = mant * 10UL + dig.to_int64().reinterpret_as_uint64()
+        sig_digits = sig_digits + 1
+        if exp_adj > -100000 {
+          exp_adj = exp_adj - 1
+        }
+      } else if dig != 0 {
+        mant_overflow = true
+      }
       p = p + 1
     }
     if !has_int_digits && !has_frac_digits {
@@ -594,18 +664,33 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
   // Exponent part
   if p < n && (s.code_unit_at(p) == 101 || s.code_unit_at(p) == 69) {
     has_exp = true
-    fast_ok = false
     p = p + 1
-    if p < n && (s.code_unit_at(p) == 43 || s.code_unit_at(p) == 45) {
-      p = p + 1
+    let mut exp_neg = false
+    if p < n {
+      let eb = s.code_unit_at(p)
+      if eb == 45 {
+        exp_neg = true
+        p = p + 1
+      } else if eb == 43 {
+        p = p + 1
+      }
     }
     let exp_start = p
-    while p < n && is_ascii_digit(s.code_unit_at(p)) {
+    let mut exp_abs = 0
+    while p < n {
+      let d = s.code_unit_at(p)
+      if !is_ascii_digit(d) {
+        break
+      }
+      if exp_abs < 100000 {
+        exp_abs = exp_abs * 10 + (d - 48)
+      }
       p = p + 1
     }
     if p == exp_start {
       return Err(self.err(p, "expected exponent digits"))
     }
+    exp_val = if exp_neg { -exp_abs } else { exp_abs }
   }
 
   if !self.is_delim_at(p) {
@@ -613,15 +698,38 @@ fn Parser::parse_number(self : Parser) -> Result[Double, Json5Error] {
   }
   self.pos = p
 
-  // Fast path: exact small integer (no dot, no exp, <= 15 digits)
-  if fast_ok && !has_dot && !has_exp {
+  // Fast path 1: exact small integer (no dot, no exp, <= 15 digits)
+  if !has_dot && !has_exp && !mant_overflow && sig_digits <= 15 {
+    let iv = mant.reinterpret_as_int64()
     if neg {
-      if fast_int == 0L {
+      if iv == 0L {
         return Ok(-0.0)
       }
-      return Ok((-fast_int).to_double())
+      return Ok((-iv).to_double())
     }
-    return Ok(fast_int.to_double())
+    return Ok(iv.to_double())
+  }
+
+  // Fast path 2: exact zero
+  if !mant_overflow && mant == 0UL {
+    return Ok(if neg { -0.0 } else { 0.0 })
+  }
+
+  // Fast path 3: Eisel-Lemire 128-bit single-rounding float parser (<= 19 sig digits)
+  if !mant_overflow {
+    let q = exp_val + exp_adj
+    match eisel_lemire_f64(mant, q) {
+      Some(v) => {
+        if self.opts.reject_overflow && (v == 1.0 / 0.0 || v == -1.0 / 0.0) {
+          return Err(self.err(start, "floating-point number overflow"))
+        }
+        if neg {
+          return Ok(if v == 0.0 { -0.0 } else { -v })
+        }
+        return Ok(v)
+      }
+      None => ()
+    }
   }
 
   // General float path: normalize JSON5 leading '+' / leading '.' / trailing '.' for to_double()

@@ -3,10 +3,11 @@
 Pure Pion **JSON5 v2.0** (ECMAScript 5.1 subset), **JSONC**, **RFC 6901 JSON Pointer**, and **RFC 6902 JSON Patch** (`apply` + `diff`) library.
 
 - **Zero C glue / zero `World` dependency** — compiles and runs identically on Native and `wasm32` (verified across Native/Wasm32 × debug/release).
-- **100% upstream compliance** — passes all **114 / 114** official `json5/json5-tests` cases (valid `.json`/`.json5`, invalid `.js`/`.txt`, Unicode unquoted/escaped keys), all **108 / 108** active `json-patch/json-patch-tests` RFC 6902 vectors (`spec_tests.json` + `tests.json`), RFC 6901 §5 official pointer vectors, JSONC / strict JSON modes, serialization roundtrips, and Day-1 red-team suites (**241 / 241** tests passing).
-- **100% iterative parser & serializer (0 recursion)** — uses an explicit heap container stack with zero call-stack growth; verified on 10,000-level deep nesting (`[[[...]]]`) with 0 SIGSEGV, bounded by configurable `max_depth` (default `128`) and `max_nodes` (default `1_000_000`).
-- **Bit-exact IEEE-754 shortest roundtrip float formatting (Ryu)** — pure Pion 128-bit integer arithmetic guarantees bit-exact roundtrip for finite binary64 doubles (`to_json_string` rejects `NaN`/`Infinity`/`-Infinity` per RFC 8259; `to_json5_string` preserves them).
-- **Day-1 adversarial hardening** — strict UTF-8 validation (`parse_bytes`), malformed UTF-16 surrogate escape rejection, float overflow rejection (`1e400`), configurable duplicate-key policies (`LastWins`, `FirstWins`, `Reject`) backed by a seeded open-addressing `HashIndex` for wide objects (HashDoS-resistant), huge array index overflow/OOM guards, RFC 6902 §4.4 self-descendant `move` rejection, and atomic transaction rollback on `apply_patch` failure.
+- **100% upstream compliance** — passes all **114 / 114** official `json5/json5-tests` cases (valid `.json`/`.json5`, invalid `.js`/`.txt`, Unicode unquoted/escaped keys), all **108 / 108** active `json-patch/json-patch-tests` RFC 6902 vectors (`spec_tests.json` + `tests.json`), RFC 6901 §5 official pointer vectors, JSONC / strict JSON modes, serialization roundtrips, and red-team suites (**242 / 242** package tests passing, **13 / 15** independent red-team audit tests passing, **0 / 1,112,064** strong Unicode identifier disagreements, **0 / 37,995** numeric parse disagreements vs Node `json5`).
+- **100% iterative algorithms (0 recursion)** — `parse`, `serialize`, `value_eq`, `clone_value`, `diff`, and `apply_patch` all use explicit heap stacks with zero call-stack growth. Default resource budgets bound both parsing (`max_depth: 128`, `max_nodes: 1_000_000`) and patching (`max_depth: 512`, `max_nodes: 1_000_000`, configurable via `apply_patch_with_options`).
+- **Bit-exact IEEE-754 parsing & formatting** — Eisel-Lemire 128-bit decimal float fast path, single-rounding exact hexadecimal integer parsing (zero double-rounding for arbitrary-length hex literals), and pure Pion Ryu shortest roundtrip formatting (`-0.0` preserved as `"-0.0"`; `0 / 59,999` roundtrip failures; `to_json_string` rejects `NaN`/`Infinity`/`-Infinity` per RFC 8259; `to_json5_string` preserves them).
+- **Full UCD 13.0.0 ECMAScript 5.1 §7.6 identifier tables** — sorted range tables + binary search (with O(1) ASCII / CJK / Hangul fast paths) covering all `U+0000..=U+10FFFF` (`Lu`/`Ll`/`Lt`/`Lm`/`Lo`/`Nl` + `$`/`_` for `ID_Start`, `+Mn`/`Mc`/`Nd`/`Pc`/`U+200C`/`U+200D` for `ID_Continue`).
+- **Copy-on-Write structural sharing `apply_patch` & linear-time `diff`/`value_eq`** — `apply_patch` copies only the O(depth) containers along the modified path (natural O(depth) atomic rollback, zero full-document clone, zero clone on `move`/`copy`); `diff` and `value_eq` use a seeded LastWins `HashIndex` for objects with `>= 16` keys and handle duplicate keys symmetrically.
 
 ## API
 
@@ -79,6 +80,11 @@ pub fn pointer_unescape(token : String) -> Result[String, Json5Error]
 pub fn pointer_get(doc : Json5Value, ptr : String) -> Result[Option[Json5Value], Json5Error]
 pub fn pointer_get_parsed(doc : Json5Value, ptr : JsonPointer) -> Option[Json5Value]
 
+// O(1) Repeated Lookups on Wide Objects
+pub struct ObjectIndex
+pub fn ObjectIndex::from_value(value : Json5Value) -> Option[ObjectIndex]
+pub fn ObjectIndex::get(self : ObjectIndex, key : String) -> Option[Json5Value]
+
 // RFC 6902 JSON Patch & Diff
 pub enum PatchOp {
   Add(String, Json5Value)
@@ -89,10 +95,13 @@ pub enum PatchOp {
   Test(String, Json5Value)
 }
 pub struct Patch { pub ops : Array[PatchOp] }
+pub struct PatchOptions { pub max_depth : Int, pub max_nodes : Int }
+pub fn PatchOptions::default() -> PatchOptions
 pub fn parse_patch(src : String) -> Result[Patch, Json5Error]
 pub fn patch_from_value(value : Json5Value) -> Result[Patch, Json5Error]
 pub fn patch_to_value(patch : Patch) -> Json5Value
 pub fn apply_patch(doc : Json5Value, patch : Patch) -> Result[Json5Value, Json5Error]
+pub fn apply_patch_with_options(doc : Json5Value, patch : Patch, opts : PatchOptions) -> Result[Json5Value, Json5Error]
 pub fn diff(a : Json5Value, b : Json5Value) -> Patch
 ```
 
@@ -170,7 +179,30 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | St
 | `rust_json_patch` | 140.022 | 134.873 | 148.554 | 1400.22 | 2.14 MiB | 1.00x (baseline) |
 | `node_fast_json_patch` | 266.937 | 256.552 | 303.542 | 2669.37 | 52.78 MiB | 0.52x |
 
-_`pion` leads Rust `json-patch =4.2.0` by **1.31x** (1,066 ns/op vs 1,400 ns/op) and Node `fast-json-patch@3.1.1` by **2.50x**, at 2.00 MiB peak RSS._
+_`pion` leads Rust `json-patch =4.2.0` by **1.19x** (1,362 ns/op vs 1,626 ns/op) and Node `fast-json-patch@3.1.1` by **2.29x**, at 2.16 MiB peak RSS._
+
+### Adversarial Benchmarks (A1–A8, `packages/json5/audit`)
+
+Measured on `Darwin arm64` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against Rust `json5 =1.3.8` + `serde_json =1.0.140` (`preserve_order`) + `json-patch =4.2.0` and Node `json5@2.2.3` + `fast-json-patch@3.1.1`:
+
+| Workload | Pion (Before) | Pion (After) | Rust | Node | Pion vs Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **A1** Parse 5.5 MB JSON5, 240k non-ASCII keys | 0.83x | **78.1 ms** | 72.4 ms | 649.3 ms | **0.93x** (8.3x faster than Node) |
+| **A2** Parse 6.9 MB, 300k 17-digit doubles | 0.49x | **59.9 ms** | 36.6 ms | 395.9 ms | **0.61x** (6.6x faster than Node) |
+| **A3** RFC 6902 `test`: 50k-key object vs itself | 5,545 ms | **52.1 ms** | 28.9 ms | 116.4 ms | **0.55x** (106x speedup; 2.2x faster than Node) |
+| **A4** `diff()`: 50k-key objects, 1 value changed | 16,594 ms | **48.6 ms** | 24.0 ms | 89.8 ms | **0.49x** (341x speedup; 1.85x faster than Node) |
+| **A5** `diff()`: 100-level spine, 5k-int pad/level | — | **94.8 ms** | 56.3 ms | 76.4 ms | **0.59x** |
+| **A6** 50k `pointer_get` on 50k-key `Array` object | 5,022 ms | 6,114 ms | 23.4 ms | 84.3 ms | O(k) linear scan (use `ObjectIndex` for O(1)) |
+| **A7** 200 single-op atomic patches on 2.5 MB doc | 1,193 ms | **36.8 ms** | 28.4 ms | 59.3 ms | **0.77x** (32.4x speedup; 1.61x faster than Node) |
+| **A8** 18,000-op add/move nesting 6,000 levels | 4,009 ms | **31.0 ms**\* | 25.6 ms | throws | **0.82x** (129x speedup)\* |
+
+_\*Default `apply_patch` enforces `max_depth: 512` and safely rejects the 6,000-level nesting DoS (0 Wasm32 crash on `patchgrow` 1,890 rounds). The A8 timing above uses `apply_patch_with_options(PatchOptions::{ max_depth: 8192, max_nodes: 1_000_000 })` with SHA-256-verified identical output against Rust._
+
+## Design Boundaries & Known Limitations
+
+- **Recursive RC drop ceiling (compiler limitation)**: All library algorithms (`parse`, `serialize`, `value_eq`, `clone_value`, `diff`, `apply_patch`) are 100% iterative (verified up to 35,000 levels natively for `diff` with 0 SIGSEGV). However, the Pion compiler currently generates a recursive RC destructor for recursive enums (`Json5Value`), which limits safe teardown depth on `wasm32` to ~1,400–1,600 levels. On `wasm32`, keep document nesting depth `<= 512` (enforced by default in `ParseOptions::default().max_depth = 128` and `PatchOptions::default().max_depth = 512`).
+- **IEEE-754 `Double` numeric representation**: To preserve full API compatibility for `Json5Value::Number(Double)` (matching ECMAScript 5.1, Node `json5`, and `fast-json-patch`), integers outside `[-2^53, 2^53]` round to the nearest binary64 `Double` (so `9007199254740993` and `9007199254740992` compare equal in RFC 6902 `test` and round-trip as `9007199254740992`). This accounts for the 2 remaining `>2^53` tests in `packages/json5/audit/redteam_test.pion` (`13/15 PASS`).
+- **Single `get` / `pointer_get` on wide objects**: `Json5Value::Object(Array[(String, Json5Value)])` preserves insertion order and public enum compatibility, so a single `get` or `pointer_get` scans entries linearly (A6). For repeated lookups on wide objects, build an `ObjectIndex` once via `ObjectIndex::from_value(obj)` and query in O(1) via `idx.get(key)`.
 
 Reproduce:
 
