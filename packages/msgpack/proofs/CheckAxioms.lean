@@ -1,0 +1,24 @@
+import MsgpackProofs
+
+#print axioms MsgpackProofs.decode_options_default_spec
+#print axioms MsgpackProofs.decode_options_strict_spec
+#print axioms MsgpackProofs.encode_options_specs
+#print axioms MsgpackProofs.is_valid_ext_tag_spec
+#print axioms MsgpackProofs.uint_encoded_size_spec
+#print axioms MsgpackProofs.uint_encoded_size_bounds
+#print axioms MsgpackProofs.uint_encoded_size_mono
+#print axioms MsgpackProofs.int_encoded_size_nonneg_agrees_uint
+#print axioms MsgpackProofs.int_encoded_size_neg_spec
+#print axioms MsgpackProofs.int_encoded_size_bounds
+#print axioms MsgpackProofs.str_encoded_size_spec
+#print axioms MsgpackProofs.bin_encoded_size_spec
+#print axioms MsgpackProofs.container_head_size_spec
+#print axioms MsgpackProofs.ext_encoded_size_fixext
+#print axioms MsgpackProofs.timestamp_encoded_size_spec
+#print axioms MsgpackProofs.float32_zero_roundtrip
+#print axioms MsgpackProofs.float32_inf_roundtrip
+#print axioms MsgpackProofs.float32_normal_spots_roundtrip
+#print axioms MsgpackProofs.float32_nan_payload_roundtrip
+#print axioms MsgpackProofs.double_bits_to_float32_rejects_excess_precision
+#print axioms MsgpackProofs.double_bits_to_float32_rejects_lossy_nan
+#print axioms MsgpackProofs.float32_to_double_bits_normal_exact
