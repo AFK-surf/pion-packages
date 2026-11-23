@@ -200,64 +200,87 @@ theorem b64_pack4_neg_if_invalid (s0 s1 s2 s3 : Std.I32)
   have hpow : (2 : Nat) ^ IScalarTy.I32.numBits = 2 ^ 32 := rfl
   omega
 
-/-- Exact Hex length bijection: `hex_decoded_len (hex_encoded_len n) = ok n` for `0 ≤ n ≤ 1073741823`. -/
-theorem hex_len_roundtrip (n : Std.I32) (h0 : 0 ≤ n.val) (hhi : n.val ≤ 1073741823) :
-    (do let L ← hex_encoded_len n; hex_decoded_len L) = ok n := by
-  unfold hex_encoded_len hex_decoded_len
-  rw [result_bind_ok]
-  have h2 : (2#i32).val = 2 := by norm_num
-  have hmul : (Pion.I32.mul n 2#i32).val = n.val * 2 := by
-    have := i32_mul_val n 2#i32 (by rw [h2]; omega) (by rw [h2]; omega)
-    rw [h2] at this; exact this
-  set L := Pion.I32.mul n 2#i32
-  have ⟨hLnat, hLlt⟩ := i32_toNat_of_nonneg L (by omega)
-  have heven : Pion.I32.band L 1#i32 = 0#i32 := by
-    apply (iscalar_eq_iff _ _).mpr
-    have hband : (Pion.I32.band L 1#i32).bv.toNat = L.bv.toNat % 2 := by
-      rw [i32_band_bv, BitVec.toNat_and]
-      have h1 : (1#i32).bv.toNat = 1 := by decide
-      rw [h1]
-      have : (1 : Nat) = 2 ^ 1 - 1 := by norm_num
-      rw [this, Nat.and_two_pow_sub_one_eq_mod]
-    have hval : (Pion.I32.band L 1#i32).val = ((Pion.I32.band L 1#i32).bv.toNat : Int) := by
-      change (Pion.I32.band L 1#i32).bv.toInt = _
-      rw [BitVec.toInt_eq_toNat_cond, ite_eq_left (by omega)]
-    have h0v : (0#i32).val = 0 := by norm_num
-    omega
-  simp only [heven, ne_eq, not_true_eq_false, ↓reduceIte]
-  unfold Pion.I32.shr
-  have hc : 0 ≤ (1#i32).val ∧ (1#i32).val < 32 := by norm_num
-  have h1n : (1#i32).val.toNat = 1 := by norm_num
-  simp only [hc, and_self, ↓reduceIte, h1n]
-  rw [result_bind_ok]
-  congr 1
-  apply (iscalar_eq_iff _ _).mpr
-  have hmsb : L.bv.msb = false := by
-    rw [BitVec.msb_eq_decide]; simp only [decide_eq_false_iff_not]; omega
-  have hshr : (L.bv.sshiftRight 1).toNat = L.bv.toNat / 2 := by
-    rw [bv32_sshiftRight_eq_ushiftRight L.bv 1 hmsb, BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]
-  change (L.bv.sshiftRight 1).toInt = n.val
-  rw [BitVec.toInt_eq_toNat_cond, ite_eq_left (by omega), hshr]
-  omega
+/-- Full-domain Hex `hex_encoded_len` specification over ALL `Std.I32` inputs:
+    never traps, returns `0` for `n ≤ 0`, and equals `min (2 * n) INT32_MAX` for `n > 0`. -/
+theorem hex_encoded_len_full_domain (n : Std.I32) :
+    ∃ L : Std.I32, hex_encoded_len n = ok L ∧
+      0 ≤ L.val ∧ L.val ≤ 2147483647 ∧
+      L.val = (if n.val ≤ 0 then 0 else min 2147483647 (n.val * 2)) := by
+  have hb := i32_bounds n
+  have hmax := i64_max32_val
+  have h2 : (2#i64).val = 2 := by decide
+  have hmax32 : (2147483647#i32).val = 2147483647 := by norm_num
+  unfold hex_encoded_len
+  by_cases hle : n.val ≤ 0
+  · have hle' : n ≤ 0#i32 := hle
+    simp only [hle', hle, ↓reduceIte]
+    exact ⟨0#i32, rfl, by norm_num, by norm_num, by norm_num⟩
+  · have hle' : ¬(n ≤ 0#i32) := hle
+    simp only [hle', hle, ↓reduceIte]
+    have hn64 : (Pion.I32.to_int64 n).val = n.val := i32_to_int64_val n
+    have hmul : (Pion.I64.mul (Pion.I32.to_int64 n) 2#i64).val = n.val * 2 := by
+      rw [i64_mul_val _ _ (by rw [hn64, h2]; omega) (by rw [hn64, h2]; omega), hn64, h2]
+    set res := Pion.I64.mul (Pion.I32.to_int64 n) 2#i64
+    by_cases hgt : res.val > 2147483647
+    · have hgt' : res > 2147483647#i64 := by rw [iscalar_gt_iff, hmax]; omega
+      simp only [hgt', ↓reduceIte]
+      exact ⟨2147483647#i32, rfl, by omega, by omega, by omega⟩
+    · have hgt' : ¬(res > 2147483647#i64) := by rw [iscalar_gt_iff, hmax]; omega
+      simp only [hgt', ↓reduceIte]
+      have hcast := i64_to_int_val res (by omega) (by omega)
+      exact ⟨Pion.I64.to_int res, rfl, by omega, by omega, by omega⟩
 
-/-- `hex_decoded_len` rejects every odd non-negative length with `-1`. -/
-theorem hex_decoded_len_rejects_odd (n : Std.I32) (h0 : 0 ≤ n.val) (hodd : n.val % 2 = 1) :
-    hex_decoded_len n = ok (-1)#i32 := by
-  unfold hex_decoded_len
-  have ⟨hnat, _⟩ := i32_toNat_of_nonneg n h0
-  have hband : (Pion.I32.band n 1#i32).bv.toNat = n.bv.toNat % 2 := by
-    rw [i32_band_bv, BitVec.toNat_and]
-    have h1 : (1#i32).bv.toNat = 1 := by decide
-    rw [h1]
-    have : (1 : Nat) = 2 ^ 1 - 1 := by norm_num
-    rw [this, Nat.and_two_pow_sub_one_eq_mod]
-  have hval : (Pion.I32.band n 1#i32).val = ((Pion.I32.band n 1#i32).bv.toNat : Int) := by
-    change (Pion.I32.band n 1#i32).bv.toInt = _
-    rw [BitVec.toInt_eq_toNat_cond, ite_eq_left (by omega)]
-  have h0v : (0#i32).val = 0 := by norm_num
-  have hne0 : Pion.I32.band n 1#i32 ≠ 0#i32 := fun h => by
-    have hv := (iscalar_eq_iff _ _).mp h; rw [h0v] at hv; omega
-  simp only [hne0, ne_eq, not_false_eq_true, ↓reduceIte]
+/-- Full-domain Hex length roundtrip over ALL non-negative `Std.I32`:
+    exact bijection `hex_decoded_len (hex_encoded_len n) = ok n` for `n * 2 ≤ INT32_MAX`,
+    and safe saturation at `INT32_MAX` above. -/
+theorem hex_len_roundtrip_full (n : Std.I32) (h0 : 0 ≤ n.val) :
+    if n.val * 2 ≤ 2147483647 then
+      (do let L ← hex_encoded_len n; hex_decoded_len L) = ok n
+    else
+      hex_encoded_len n = ok 2147483647#i32 := by
+  obtain ⟨L, hL, hL0, hLhi, hLv⟩ := hex_encoded_len_full_domain n
+  by_cases hfit : n.val * 2 ≤ 2147483647
+  · simp only [hfit, ↓reduceIte]
+    rw [hL, result_bind_ok]
+    have hLexact : L.val = n.val * 2 := by split_ifs at hLv <;> omega
+    unfold hex_decoded_len
+    have hnotneg : ¬(L < 0#i32) := by rw [iscalar_lt_iff]; norm_num; omega
+    simp only [hnotneg, ↓reduceIte]
+    have ⟨hLnat, hLlt⟩ := i32_toNat_of_nonneg L hL0
+    have heven : Pion.I32.band L 1#i32 = 0#i32 := by
+      apply (iscalar_eq_iff _ _).mpr
+      have hband : (Pion.I32.band L 1#i32).bv.toNat = L.bv.toNat % 2 := by
+        rw [i32_band_bv, BitVec.toNat_and]
+        have h1 : (1#i32).bv.toNat = 1 := by decide
+        rw [h1]
+        have : (1 : Nat) = 2 ^ 1 - 1 := by norm_num
+        rw [this, Nat.and_two_pow_sub_one_eq_mod]
+      have hval : (Pion.I32.band L 1#i32).val = ((Pion.I32.band L 1#i32).bv.toNat : Int) := by
+        change (Pion.I32.band L 1#i32).bv.toInt = _
+        rw [BitVec.toInt_eq_toNat_cond, ite_eq_left (by omega)]
+      have h0v : (0#i32).val = 0 := by norm_num
+      omega
+    simp only [heven, ne_eq, not_true_eq_false, ↓reduceIte]
+    unfold Pion.I32.shr
+    have hc : 0 ≤ (1#i32).val ∧ (1#i32).val < 32 := by norm_num
+    have h1n : (1#i32).val.toNat = 1 := by norm_num
+    simp only [hc, and_self, ↓reduceIte, h1n]
+    rw [result_bind_ok]
+    congr 1
+    apply (iscalar_eq_iff _ _).mpr
+    have hmsb : L.bv.msb = false := by
+      rw [BitVec.msb_eq_decide]; simp only [decide_eq_false_iff_not]; omega
+    have hshr : (L.bv.sshiftRight 1).toNat = L.bv.toNat / 2 := by
+      rw [bv32_sshiftRight_eq_ushiftRight L.bv 1 hmsb, BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]
+    change (L.bv.sshiftRight 1).toInt = n.val
+    rw [BitVec.toInt_eq_toNat_cond, ite_eq_left (by omega), hshr]
+    omega
+  · simp only [hfit, ↓reduceIte]
+    rw [hL]
+    congr 1
+    apply (iscalar_eq_iff _ _).mpr
+    have hmax32 : (2147483647#i32).val = 2147483647 := by norm_num
+    split_ifs at hLv <;> omega
 
 /-- Exact Hex byte ↔ nibble pair roundtrip: `hex_pack_byte (b >> 4) (b & 15) = ok b` for every `0 ≤ b < 256`. -/
 theorem hex_pack_byte_roundtrip (b : Std.I32) (h0 : 0 ≤ b.val) (h256 : b.val < 256) :

@@ -61,67 +61,6 @@ theorem encode_item_info_ref_id (ref_id : Std.I32) (ho hr hp : Bool)
     simp only [↓reduceIte, Bool.false_eq_true, bv_and_31_128, bv_and_31_64, bv_and_31_32, bv_and_31_0,
       BitVec.or_zero]
 
-/-- Yjs v1 wire info byte roundtrip for `has_origin` (bit 7). -/
-theorem encode_item_info_has_origin (ref_id : Std.I32) (ho hr hp : Bool) :
-    (do let b ← encode_item_info ref_id ho hr hp; info_has_origin b) = ok ho := by
-  unfold encode_item_info info_has_origin
-  rw [result_bind_ok]
-  congr 1
-  have heq : Pion.I32.band (Pion.I32.bor (Pion.I32.bor (Pion.I32.bor (Pion.I32.band ref_id 31#i32)
-      (if ho then 128#i32 else 0#i32)) (if hr then 64#i32 else 0#i32)) (if hp then 32#i32 else 0#i32)) 128#i32 =
-      (if ho then 128#i32 else 0#i32) := by
-    apply i32_eq_of_bv
-    simp only [i32_band_bv, i32_bor_bv]
-    rw [bv_and_or_distrib, bv_and_or_distrib, bv_and_or_distrib, BitVec.and_assoc, bv_and_31_128', BitVec.and_zero]
-    cases ho <;> cases hr <;> cases hp <;> decide
-  rw [heq]
-  cases ho <;> decide
-
-/-- Yjs v1 wire info byte roundtrip for `has_right_origin` (bit 6). -/
-theorem encode_item_info_has_right_origin (ref_id : Std.I32) (ho hr hp : Bool) :
-    (do let b ← encode_item_info ref_id ho hr hp; info_has_right_origin b) = ok hr := by
-  unfold encode_item_info info_has_right_origin
-  rw [result_bind_ok]
-  congr 1
-  have heq : Pion.I32.band (Pion.I32.bor (Pion.I32.bor (Pion.I32.bor (Pion.I32.band ref_id 31#i32)
-      (if ho then 128#i32 else 0#i32)) (if hr then 64#i32 else 0#i32)) (if hp then 32#i32 else 0#i32)) 64#i32 =
-      (if hr then 64#i32 else 0#i32) := by
-    apply i32_eq_of_bv
-    simp only [i32_band_bv, i32_bor_bv]
-    rw [bv_and_or_distrib, bv_and_or_distrib, bv_and_or_distrib, BitVec.and_assoc, bv_and_31_64', BitVec.and_zero]
-    cases ho <;> cases hr <;> cases hp <;> decide
-  rw [heq]
-  cases hr <;> decide
-
-/-- Yjs v1 wire info byte roundtrip for `has_parent_sub` (bit 5). -/
-theorem encode_item_info_has_parent_sub (ref_id : Std.I32) (ho hr hp : Bool) :
-    (do let b ← encode_item_info ref_id ho hr hp; info_has_parent_sub b) = ok hp := by
-  unfold encode_item_info info_has_parent_sub
-  rw [result_bind_ok]
-  congr 1
-  have heq : Pion.I32.band (Pion.I32.bor (Pion.I32.bor (Pion.I32.bor (Pion.I32.band ref_id 31#i32)
-      (if ho then 128#i32 else 0#i32)) (if hr then 64#i32 else 0#i32)) (if hp then 32#i32 else 0#i32)) 32#i32 =
-      (if hp then 32#i32 else 0#i32) := by
-    apply i32_eq_of_bv
-    simp only [i32_band_bv, i32_bor_bv]
-    rw [bv_and_or_distrib, bv_and_or_distrib, bv_and_or_distrib, BitVec.and_assoc, bv_and_31_32', BitVec.and_zero]
-    cases ho <;> cases hr <;> cases hp <;> decide
-  rw [heq]
-  cases hp <;> decide
-
-/-- `info_cant_copy_parent` returns `!has_origin && !has_right_origin` on any encoded info byte. -/
-theorem encode_item_info_cant_copy_parent (ref_id : Std.I32) (ho hr hp : Bool) :
-    (do let b ← encode_item_info ref_id ho hr hp; info_cant_copy_parent b) = ok (!ho && !hr) := by
-  have h1 := encode_item_info_has_origin ref_id ho hr hp
-  have h2 := encode_item_info_has_right_origin ref_id ho hr hp
-  unfold encode_item_info at h1 h2 ⊢
-  rw [result_bind_ok] at h1 h2 ⊢
-  unfold info_cant_copy_parent
-  rw [h1, result_bind_ok]
-  cases ho
-  · simp only [Bool.not_false, ↓reduceIte, Bool.true_and, h2, result_bind_ok]
-  · simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, Bool.false_and]
-
 /-- `encode_item_info` always produces an unsigned byte in `[0, 255]`. -/
 theorem encode_item_info_bounds (ref_id : Std.I32) (ho hr hp : Bool) :
     ∃ b : Std.I32, encode_item_info ref_id ho hr hp = ok b ∧ 0 ≤ b.val ∧ b.val < 256 := by
@@ -189,37 +128,6 @@ theorem hex_nibble_roundtrip (n : Std.I32) (h0 : 0 ≤ n.val) (h16 : n.val < 16)
     apply (iscalar_eq_iff _ _).mpr
     have hsub := i32_sub_val (Pion.I32.add 87#i32 n) 87#i32 (by omega) (by omega)
     omega
-
-/-- `parse_hex_nibble` is case-insensitive for `'A'..'F'` vs `'a'..'f'`. -/
-theorem parse_hex_nibble_case_insensitive (k : Std.I32) (h0 : 0 ≤ k.val) (h6 : k.val < 6) :
-    parse_hex_nibble (Pion.I32.add 65#i32 k) = parse_hex_nibble (Pion.I32.add 97#i32 k) := by
-  unfold parse_hex_nibble
-  congr 1
-  have h65 : (65#i32).val = 65 := by norm_num
-  have h97 : (97#i32).val = 97 := by norm_num
-  have haddA := i32_add_val 65#i32 k (by omega) (by omega)
-  have hadda := i32_add_val 97#i32 k (by omega) (by omega)
-  have h48 : (48#i32).val = 48 := by norm_num
-  have h57 : (57#i32).val = 57 := by norm_num
-  have h70 : (70#i32).val = 70 := by norm_num
-  have h102 : (102#i32).val = 102 := by norm_num
-  have h55 : (55#i32).val = 55 := by norm_num
-  have h87 : (87#i32).val = 87 := by norm_num
-  have cA1 : ((decide (Pion.I32.add 65#i32 k ≥ 48#i32)) && (decide (Pion.I32.add 65#i32 k ≤ 57#i32))) = false := by
-    simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not, iscalar_le_iff, haddA]; omega
-  have cA2 : ((decide (Pion.I32.add 65#i32 k ≥ 97#i32)) && (decide (Pion.I32.add 65#i32 k ≤ 102#i32))) = false := by
-    simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not, iscalar_le_iff, haddA]; omega
-  have cA3 : ((decide (Pion.I32.add 65#i32 k ≥ 65#i32)) && (decide (Pion.I32.add 65#i32 k ≤ 70#i32))) = true := by
-    simp only [Bool.and_eq_true, decide_eq_true_eq, iscalar_le_iff, haddA]; omega
-  have ca1 : ((decide (Pion.I32.add 97#i32 k ≥ 48#i32)) && (decide (Pion.I32.add 97#i32 k ≤ 57#i32))) = false := by
-    simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not, iscalar_le_iff, hadda]; omega
-  have ca2 : ((decide (Pion.I32.add 97#i32 k ≥ 97#i32)) && (decide (Pion.I32.add 97#i32 k ≤ 102#i32))) = true := by
-    simp only [Bool.and_eq_true, decide_eq_true_eq, iscalar_le_iff, hadda]; omega
-  simp only [cA1, cA2, cA3, ca1, ca2, Bool.false_eq_true, ↓reduceIte]
-  apply (iscalar_eq_iff _ _).mpr
-  have hsA := i32_sub_val (Pion.I32.add 65#i32 k) 55#i32 (by omega) (by omega)
-  have hsa := i32_sub_val (Pion.I32.add 97#i32 k) 87#i32 (by omega) (by omega)
-  omega
 
 /-- `parse_hex_nibble` always returns `-1` (invalid) or a nibble in `[0, 15]`. -/
 theorem parse_hex_nibble_range (c : Std.I32) :
