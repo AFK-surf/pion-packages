@@ -1,5 +1,5 @@
 ///| High-performance level-indexed MQTT Topic Trie router (`O(depth)` matching, `$` safe,
-///| generation-stamped O(1) deduplication).
+///| generation-stamped O(1) deduplication, free-list slot/node recycling & bottom-up pruning).
 
 ///|
 struct TrieNode {
@@ -20,10 +20,21 @@ fn TrieNode::new() -> TrieNode {
 }
 
 ///|
+fn TrieNode::is_empty(self : TrieNode) -> Bool {
+  self.hash_ids.length() == 0 &&
+  self.exact_ids.length() == 0 &&
+  self.plus_child < 0 &&
+  self.children.length() == 0
+}
+
+///|
 pub struct TopicTrie[T] {
   nodes : Array[TrieNode]
+  free_nodes : Array[Int]
   entry_keys : Array[Int]
+  entry_share_groups : Array[String]
   entry_values : Array[T]
+  free_entries : Array[Int]
   mut count : Int
   seen_gen : Map[Int, Int]
   mut gen : Int
@@ -33,8 +44,11 @@ pub struct TopicTrie[T] {
 pub fn TopicTrie::new[T]() -> TopicTrie[T] {
   TopicTrie::{
     nodes: [TrieNode::new()],
+    free_nodes: [],
     entry_keys: [],
+    entry_share_groups: [],
     entry_values: [],
+    free_entries: [],
     count: 0,
     seen_gen: Map::new(),
     gen: 0,
@@ -44,6 +58,44 @@ pub fn TopicTrie::new[T]() -> TopicTrie[T] {
 ///|
 pub fn TopicTrie::len[T](self : TopicTrie[T]) -> Int {
   self.count
+}
+
+///| Allocate a Trie node index, reusing a pruned slot when available.
+fn TopicTrie::alloc_node[T](self : TopicTrie[T]) -> Int {
+  if self.free_nodes.length() > 0 {
+    match self.free_nodes.pop() {
+      Some(nid) => return nid
+      None => ()
+    }
+  }
+  let nid = self.nodes.length()
+  self.nodes.push(TrieNode::new())
+  nid
+}
+
+///| Allocate an entry slot, reusing a freed slot when available.
+fn TopicTrie::alloc_entry[T](
+  self : TopicTrie[T],
+  key : Int,
+  share_group : String,
+  value : T,
+) -> Int {
+  if self.free_entries.length() > 0 {
+    match self.free_entries.pop() {
+      Some(eid) => {
+        self.entry_keys[eid] = key
+        self.entry_share_groups[eid] = share_group
+        self.entry_values[eid] = value
+        return eid
+      }
+      None => ()
+    }
+  }
+  let eid = self.entry_keys.length()
+  self.entry_keys.push(key)
+  self.entry_share_groups.push(share_group)
+  self.entry_values.push(value)
+  eid
 }
 
 ///| Split a topic or filter string by `/` into level slices.
@@ -72,13 +124,13 @@ fn split_levels(s : String) -> Array[String] {
   levels
 }
 
-///| Strip `$share/{group}/` prefix if present after validation.
-fn normalize_filter_for_trie(filter : String) -> Result[String, MqttError] {
+///| Parse filter into `(share_group, inner_filter)` where `share_group` is `""` for plain filters.
+fn parse_filter_for_trie(filter : String) -> Result[(String, String), MqttError] {
   match parse_shared_subscription(filter) {
-    Ok(Some(s)) => Ok(s.filter)
+    Ok(Some(s)) => Ok((s.share_name, s.filter))
     Ok(None) =>
     match validate_topic_filter(filter) {
-      Ok(_) => Ok(filter)
+      Ok(_) => Ok(("", filter))
       Err(e) => Err(e)
     }
     Err(e) => Err(e)
@@ -101,8 +153,8 @@ pub fn TopicTrie::insert_with_key[T](
   key : Int,
   value : T,
 ) -> Result[Unit, MqttError] {
-  let norm = match normalize_filter_for_trie(filter) {
-    Ok(f) => f
+  let (share_group, norm) = match parse_filter_for_trie(filter) {
+    Ok(pair) => pair
     Err(e) => return Err(e)
   }
   let levels = split_levels(norm)
@@ -112,17 +164,14 @@ pub fn TopicTrie::insert_with_key[T](
   while i < n {
     let seg = levels[i]
     if seg == "#" {
-      let eid = self.entry_keys.length()
-      self.entry_keys.push(key)
-      self.entry_values.push(value)
+      let eid = self.alloc_entry(key, share_group, value)
       self.nodes[cur].hash_ids.push(eid)
       self.count = self.count + 1
       return Ok(())
     } else if seg == "+" {
       let mut nxt = self.nodes[cur].plus_child
       if nxt < 0 {
-        nxt = self.nodes.length()
-        self.nodes.push(TrieNode::new())
+        nxt = self.alloc_node()
         self.nodes[cur].plus_child = nxt
       }
       cur = nxt
@@ -130,8 +179,7 @@ pub fn TopicTrie::insert_with_key[T](
       match self.nodes[cur].children.get(seg) {
         Some(nxt) => cur = nxt
         None => {
-          let nxt = self.nodes.length()
-          self.nodes.push(TrieNode::new())
+          let nxt = self.alloc_node()
           self.nodes[cur].children.set(seg, nxt)
           cur = nxt
         }
@@ -139,25 +187,27 @@ pub fn TopicTrie::insert_with_key[T](
     }
     i = i + 1
   }
-  let eid = self.entry_keys.length()
-  self.entry_keys.push(key)
-  self.entry_values.push(value)
+  let eid = self.alloc_entry(key, share_group, value)
   self.nodes[cur].exact_ids.push(eid)
   self.count = self.count + 1
   Ok(())
 }
 
-///| Remove the first entry matching `(filter, key)` from the trie.
+///| Remove the first entry matching `(filter, key)` from the trie, reclaiming entry and empty node slots.
 pub fn TopicTrie::remove[T](
   self : TopicTrie[T],
   filter : String,
   key : Int,
 ) -> Bool {
-  let norm = match normalize_filter_for_trie(filter) {
-    Ok(f) => f
+  let (share_group, norm) = match parse_filter_for_trie(filter) {
+    Ok(pair) => pair
     Err(_) => return false
   }
   let levels = split_levels(norm)
+  let path_parent : Array[Int] = []
+  let path_child : Array[Int] = []
+  let path_seg : Array[String] = []
+  let path_is_plus : Array[Bool] = []
   let mut cur = 0
   let mut i = 0
   let n = levels.length()
@@ -172,10 +222,20 @@ pub fn TopicTrie::remove[T](
       if nxt < 0 {
         return false
       }
+      path_parent.push(cur)
+      path_child.push(nxt)
+      path_seg.push("")
+      path_is_plus.push(true)
       cur = nxt
     } else {
       match self.nodes[cur].children.get(seg) {
-        Some(nxt) => cur = nxt
+        Some(nxt) => {
+          path_parent.push(cur)
+          path_child.push(nxt)
+          path_seg.push(seg)
+          path_is_plus.push(false)
+          cur = nxt
+        }
         None => return false
       }
     }
@@ -190,7 +250,7 @@ pub fn TopicTrie::remove[T](
   let mut j = 0
   while j < arr.length() {
     let eid = arr[j]
-    if self.entry_keys[eid] == key {
+    if self.entry_keys[eid] == key && self.entry_share_groups[eid] == share_group {
       idx = j
       break
     }
@@ -199,12 +259,44 @@ pub fn TopicTrie::remove[T](
   if idx < 0 {
     return false
   }
+  let removed_eid = arr[idx]
   let last = arr.length() - 1
   if idx != last {
     arr[idx] = arr[last]
   }
   let _ = arr.pop()
+  // Recycle entry slot.
+  self.entry_keys[removed_eid] = -2
+  self.entry_share_groups[removed_eid] = ""
+  self.free_entries.push(removed_eid)
   self.count = self.count - 1
+  // Prune empty nodes bottom-up and recycle their slots.
+  let mut k = path_child.length() - 1
+  while k >= 0 {
+    let nid = path_child[k]
+    if !self.nodes[nid].is_empty() {
+      break
+    }
+    let parent = path_parent[k]
+    if path_is_plus[k] {
+      self.nodes[parent].plus_child = -1
+    } else {
+      let _ = self.nodes[parent].children.remove(path_seg[k])
+    }
+    self.free_nodes.push(nid)
+    k = k - 1
+  }
+  // When completely empty, compact backing arrays so peak churn never lingers.
+  if self.count == 0 {
+    self.nodes.clear()
+    self.nodes.push(TrieNode::new())
+    self.free_nodes.clear()
+    self.entry_keys.clear()
+    self.entry_share_groups.clear()
+    self.entry_values.clear()
+    self.free_entries.clear()
+    self.seen_gen.clear()
+  }
   true
 }
 
@@ -242,6 +334,10 @@ pub fn TopicTrie::match_topic[T](self : TopicTrie[T], topic : String) -> Array[T
   let tb = topic.to_bytes()
   if tb.length() == 0 {
     return out
+  }
+  if self.gen == 2147483647 {
+    self.seen_gen.clear()
+    self.gen = 0
   }
   self.gen = self.gen + 1
   let is_dollar = tb[0].to_int() == 0x24
