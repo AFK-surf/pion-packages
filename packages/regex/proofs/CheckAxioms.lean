@@ -9,3 +9,9 @@ import RegexProofs
 #print axioms RegexProofs.is_utf8_cont_byte_iff
 #print axioms RegexProofs.hex_val_bounds
 #print axioms RegexProofs.regex_ws_meta_disjoint
+#print axioms RegexProofs.pike_dfa_look_equiv
+#print axioms RegexProofs.reverse_look_kind_duality
+#print axioms RegexProofs.char_range_merge_union_iff
+#print axioms RegexProofs.char_range_intersect_alg_laws
+#print axioms RegexProofs.onepass_mask_add_slot_bit_spec
+#print axioms RegexProofs.onepass_can_compile_slot_budget

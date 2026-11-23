@@ -132,11 +132,24 @@ All scenarios below verified 100% stdout byte-identical against Rust `regex =1.1
 
 ## Formal Verification (Lean 4)
 
-**9** machine-checked, `0-sorry` Lean 4 theorems (strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover `CharRange` and 8 production `#verify` kernels in `packages/regex/src/`:
-- **Automata & Captures (`proofs/RegexProofs/AutomataAndCaptures.lean`, 2 theorems)**: One-Pass DFA 64-bit capture slot bitmask idempotence and `Captures` slot index memory-safety bounds (`2*idx+1 < slots_len`).
-- **Character Ranges & Syntax (`proofs/RegexProofs/RangesAndSyntax.lean`, 7 theorems)**: `CharRange` lexicographic total order (antisymmetric, transitive, total), `char_range_intersect` exact point-membership semantics, UTF-8 continuation byte mask semantics, `hex_val` bounds `[-1, 15]`, and `(?x)` whitespace vs `escape()` metacharacter disjointness.
-- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (`diff -u`, including `INT32_MIN`/`INT32_MAX` and out-of-precondition cases).
+**15** machine-checked, `0-sorry` Lean 4 theorems (**6 A-grade** core invariant theorems + **9 B-grade** primitive theorems; strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, `FunsExternal.lean` 0 axioms, verified via `pionc extract-lean` + Aeneas) cover `CharRange`, `LookKind`, and 14 production `#verify` kernels in `packages/regex/src/`:
+
+### Stage 2 A-Grade Core Theorems (`proofs/RegexProofs/LookAndOnePass.lean`)
+
+| Theorem | Production Kernel | Property Proved |
+| --- | --- | --- |
+| `pike_dfa_look_equiv` | `pike_look_holds`, `dfa_look_holds` | Exact semantic equivalence between PikeVM and Lazy DFA across all 8 `LookKind` variants × full text/byte/word contexts at UTF-8 char boundaries, P0-2 non-char-boundary rejection, and `\b`/`\B` complementarity |
+| `reverse_look_kind_duality` | `reverse_look_kind`, `dfa_look_holds` | Exact forward/reverse context duality (`start ↔ eoi`, `prev_nl ↔ next_nl`, `prev_word ↔ next_word`) and involution across all 8 `LookKind`s |
+| `char_range_merge_union_iff` | `char_range_can_merge`, `char_range_merge` | Full-`I32` (incl. `INT32_MAX`, zero overflow) soundness & completeness of `normalize_ranges` merge predicate, exact integer set union when mergeable, and strict gap when not |
+| `char_range_intersect_alg_laws` | `char_range_intersect` | Commutativity, idempotence, associativity, and exact emptiness characterization (`r.hi < r.lo ↔ ∀ x, ¬(x ∈ a ∧ x ∈ b)`) |
+| `onepass_mask_add_slot_bit_spec` | `onepass_mask_add_slot` | Exact 64-bit per-bit semantics, non-interference, sign-bit 63 preservation, out-of-bounds no-op, and full commutativity |
+| `onepass_can_compile_slot_budget` | `onepass_can_compile` | Guarantees look-free NFA, `num_nfa ≤ 512`, and `2 ≤ 2 * num_captures ≤ 62 < 63` (every capture slot fits strictly inside the 63 non-sign bits) |
+
+- **Existing B-Grade Theorems (`AutomataAndCaptures.lean` & `RangesAndSyntax.lean`, 9 theorems)**: One-Pass mask idempotence, `Captures` slot bounds, `CharRange` total order & point-membership intersection, UTF-8 continuation byte mask, `hex_val` bounds, and `(?x)` whitespace vs `escape()` metacharacter disjointness.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (**42** cases identical via `diff -u`, including `INT32_MIN`/`INT32_MAX` and all look-around / range-merge / One-Pass kernels).
+- **Semantic Mutation Kill Gate (`proofs/mutation_check.sh`)**: **10 / 10 killed (100% ≥ 90%)** across PikeVM & DFA look-around drift (including the `RT-lean-proofs` `\b` divergence, P1-2 `(?m)$`, and P0-2 UTF-8 char-boundary guard), `reverse_look_kind` flips, `CharRange` merge gap/bound faults, and `onepass_can_compile` 63-bit budget overflow.
 
 ```sh
 LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/regex/proofs/run_proofs.sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/regex/proofs/mutation_check.sh
 ```
