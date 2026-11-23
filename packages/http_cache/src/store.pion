@@ -1,0 +1,720 @@
+///| Pure Pion bounded Sans-IO LRU in-memory HTTP cache store.
+///| Supports O(1) LRU promotion/eviction, O(1) Vary-keyed lookup per URI,
+///| dual capacity limits (`max_entries` + body/header `max_total_bytes`),
+///| HEAD-safe metadata updates, most-recent variant selection (RFC 9111 §4.1),
+///| 304 Not Modified updates with eviction on revocation, and RFC 9111 §4.4 invalidation.
+
+struct LruSlot {
+  mut active : Bool
+  mut uri : String
+  mut vary_sig : String
+  mut vary_key : String
+  mut seq : Int64
+  mut entry : Option[StoredEntry]
+  mut byte_size : Int64
+  mut header_size : Int64
+  mut prev : Int
+  mut next : Int
+}
+
+///| Secondary index grouping variants that share the same normalized `Vary` header set.
+struct VaryGroup {
+  vary_sig : String
+  vary_headers : Array[String]
+  variants : Map[String, Array[Int]]
+  all_slots : Array[Int]
+}
+
+///| Bounded LRU cache store supporting multi-variant `Vary` storage,
+///| 304 Not Modified updates, and RFC 9111 §4.4 unsafe method invalidation.
+pub struct CacheStore {
+  opts : CachePolicyOptions
+  limits : CacheLimits
+  slots : Array[LruSlot]
+  free_slots : Array[Int]
+  uri_groups : Map[String, Array[VaryGroup]]
+  mut next_seq : Int64
+  mut head : Int
+  mut tail : Int
+  mut count : Int
+  mut bytes_used : Int64
+  mut header_bytes_used : Int64
+}
+
+///| Create a new bounded `CacheStore`.
+pub fn CacheStore::new(
+  opts : CachePolicyOptions,
+  limits : CacheLimits,
+) -> Result[CacheStore, CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(CacheStore::{
+    opts: opts,
+    limits: limits,
+    slots: [],
+    free_slots: [],
+    uri_groups: Map::new(),
+    next_seq: 1L,
+    head: -1,
+    tail: -1,
+    count: 0,
+    bytes_used: 0L,
+    header_bytes_used: 0L,
+  })
+}
+
+fn entry_header_bytes(entry : StoredEntry) -> Int64 {
+  let mut total = entry.uri.length().to_int64()
+  let mut i = 0
+  while i < entry.response_headers.length() {
+    total = total + entry.response_headers[i].name.length().to_int64() +
+    entry.response_headers[i].value.length().to_int64()
+    i = i + 1
+  }
+  let mut j = 0
+  while j < entry.request_headers.length() {
+    total = total + entry.request_headers[j].name.length().to_int64() +
+    entry.request_headers[j].value.length().to_int64()
+    j = j + 1
+  }
+  total
+}
+
+fn compute_vary_sig(vary_headers : Array[String]) -> String {
+  if vary_headers.length() == 0 {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < vary_headers.length() {
+    if i > 0 {
+      sb.write_string("\n")
+    }
+    sb.write_string(vary_headers[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Build a normalized header map once per request for O(1) Vary key computation.
+fn build_request_header_map(headers : Array[Header]) -> Map[String, String] {
+  let m : Map[String, String] = Map::new()
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    let low = ascii_slice_lower(h.name, 0, h.name.length())
+    let v = trim_ows_slice(h.value, 0, h.value.length())
+    match m.get(low) {
+      None => m.set(low, v)
+      Some(prev) => m.set(low, prev + ", " + v)
+    }
+    i = i + 1
+  }
+  m
+}
+
+///| Compute collision-free Vary variant key distinguishing missing vs empty vs present values.
+fn compute_vary_key_from_map(
+  vary_headers : Array[String],
+  hdr_map : Map[String, String],
+) -> String {
+  if vary_headers.length() == 0 {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < vary_headers.length() {
+    match hdr_map.get(vary_headers[i]) {
+      None => sb.write_string("0;")
+      Some(v) => {
+        sb.write_string("1:")
+        sb.write_string(v.length().to_string())
+        sb.write_string(":")
+        sb.write_string(v)
+        sb.write_string(";")
+      }
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn compute_vary_key_direct(
+  vary_headers : Array[String],
+  headers : Array[Header],
+) -> String {
+  if vary_headers.length() == 0 {
+    return ""
+  }
+  if headers.length() > 12 || vary_headers.length() > 3 {
+    let m = build_request_header_map(headers)
+    return compute_vary_key_from_map(vary_headers, m)
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < vary_headers.length() {
+    match normalized_header_value(headers, vary_headers[i]) {
+      None => sb.write_string("0;")
+      Some(v) => {
+        sb.write_string("1:")
+        sb.write_string(v.length().to_string())
+        sb.write_string(":")
+        sb.write_string(v)
+        sb.write_string(";")
+      }
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn unlink_slot(self : CacheStore, idx : Int) -> Unit {
+  let p = self.slots[idx].prev
+  let n = self.slots[idx].next
+  if p >= 0 {
+    self.slots[p].next = n
+  } else {
+    self.head = n
+  }
+  if n >= 0 {
+    self.slots[n].prev = p
+  } else {
+    self.tail = p
+  }
+  self.slots[idx].prev = -1
+  self.slots[idx].next = -1
+}
+
+fn push_front_slot(self : CacheStore, idx : Int) -> Unit {
+  self.slots[idx].prev = -1
+  self.slots[idx].next = self.head
+  if self.head >= 0 {
+    self.slots[self.head].prev = idx
+  } else {
+    self.tail = idx
+  }
+  self.head = idx
+}
+
+fn touch_slot(self : CacheStore, idx : Int) -> Unit {
+  if self.head == idx {
+    return
+  }
+  unlink_slot(self, idx)
+  push_front_slot(self, idx)
+}
+
+fn add_to_uri_groups(
+  self : CacheStore,
+  uri : String,
+  vary_sig : String,
+  vary_headers : Array[String],
+  vary_key : String,
+  idx : Int,
+) -> Unit {
+  match self.uri_groups.get(uri) {
+    None => {
+      let vm : Map[String, Array[Int]] = Map::new()
+      vm.set(vary_key, [idx])
+      self.uri_groups.set(uri, [
+        VaryGroup::{ vary_sig: vary_sig, vary_headers: vary_headers, variants: vm, all_slots: [idx] },
+      ])
+    }
+    Some(groups) => {
+      let mut i = 0
+      while i < groups.length() {
+        if groups[i].vary_sig == vary_sig {
+          match groups[i].variants.get(vary_key) {
+            Some(list) => list.push(idx)
+            None => groups[i].variants.set(vary_key, [idx])
+          }
+          groups[i].all_slots.push(idx)
+          return
+        }
+        i = i + 1
+      }
+      let vm : Map[String, Array[Int]] = Map::new()
+      vm.set(vary_key, [idx])
+      groups.push(VaryGroup::{ vary_sig: vary_sig, vary_headers: vary_headers, variants: vm, all_slots: [idx] })
+    }
+  }
+}
+
+fn remove_from_uri_groups(
+  self : CacheStore,
+  uri : String,
+  vary_sig : String,
+  vary_key : String,
+  idx : Int,
+) -> Unit {
+  match self.uri_groups.get(uri) {
+    None => ()
+    Some(groups) => {
+      let mut g = 0
+      while g < groups.length() {
+        if groups[g].vary_sig == vary_sig {
+          match groups[g].variants.get(vary_key) {
+            None => ()
+            Some(list) => {
+              let mut i = 0
+              while i < list.length() {
+                if list[i] == idx {
+                  let last = list.length() - 1
+                  if i != last {
+                    list[i] = list[last]
+                  }
+                  let _ = list.pop()
+                  break
+                }
+                i = i + 1
+              }
+              if list.length() == 0 {
+                groups[g].variants.remove(vary_key)
+              }
+            }
+          }
+          let all = groups[g].all_slots
+          let mut j = 0
+          while j < all.length() {
+            if all[j] == idx {
+              let last_a = all.length() - 1
+              if j != last_a {
+                all[j] = all[last_a]
+              }
+              let _ = all.pop()
+              break
+            }
+            j = j + 1
+          }
+          if all.length() == 0 {
+            let last_g = groups.length() - 1
+            if g != last_g {
+              groups[g] = groups[last_g]
+            }
+            let _ = groups.pop()
+          }
+          break
+        }
+        g = g + 1
+      }
+      if groups.length() == 0 {
+        self.uri_groups.remove(uri)
+      }
+    }
+  }
+}
+
+fn evict_slot(self : CacheStore, idx : Int) -> Unit {
+  if !self.slots[idx].active {
+    return
+  }
+  let uri = self.slots[idx].uri
+  let vsig = self.slots[idx].vary_sig
+  let vkey = self.slots[idx].vary_key
+  let sz = self.slots[idx].byte_size
+  let hsz = self.slots[idx].header_size
+  unlink_slot(self, idx)
+  remove_from_uri_groups(self, uri, vsig, vkey, idx)
+  self.slots[idx].active = false
+  self.slots[idx].uri = ""
+  self.slots[idx].vary_sig = ""
+  self.slots[idx].vary_key = ""
+  self.slots[idx].entry = None
+  self.slots[idx].byte_size = 0L
+  self.slots[idx].header_size = 0L
+  self.count = self.count - 1
+  self.bytes_used = self.bytes_used - sz
+  self.header_bytes_used = self.header_bytes_used - hsz
+  self.free_slots.push(idx)
+}
+
+fn evict_until_fits(
+  self : CacheStore,
+  needed_bytes : Int64,
+  needed_header_bytes : Int64,
+  needed_entries : Int,
+) -> Unit {
+  while self.tail >= 0 &&
+  (self.count + needed_entries > self.limits.max_entries ||
+    self.bytes_used + needed_bytes > self.limits.max_total_bytes ||
+    self.header_bytes_used + needed_header_bytes > self.limits.max_total_bytes) {
+    evict_slot(self, self.tail)
+  }
+}
+
+///| O(1) per VaryGroup lookup selecting the most recent matching variant (RFC 9111 §4.1).
+fn find_matching_slot(self : CacheStore, req : CacheRequest) -> Option[Int] {
+  let groups = match self.uri_groups.get(req.uri) {
+    None => return None
+    Some(g) => g
+  }
+  if groups.length() == 0 {
+    return None
+  }
+  let use_map = req.headers.length() > 12 || groups.length() > 1
+  let hdr_map : Option[Map[String, String]] = if use_map {
+    Some(build_request_header_map(req.headers))
+  } else {
+    None
+  }
+  let mut best_idx = -1
+  let mut best_time = -9223372036854775807L
+  let mut best_seq = -1L
+
+  let mut g = 0
+  while g < groups.length() {
+    let grp = groups[g]
+    let vkey = match hdr_map {
+      Some(m) => compute_vary_key_from_map(grp.vary_headers, m)
+      None => compute_vary_key_direct(grp.vary_headers, req.headers)
+    }
+    match grp.variants.get(vkey) {
+      None => ()
+      Some(list) => {
+        let mut i = 0
+        while i < list.length() {
+          let idx = list[i]
+          if self.slots[idx].active {
+            match self.slots[idx].entry {
+              Some(e) => {
+                let method_ok = req.method == e.method ||
+                (req.method == "HEAD" && e.method == "GET")
+                if method_ok && !e.vary_star {
+                  let s = self.slots[idx].seq
+                  if best_idx < 0 ||
+                  e.response_time > best_time ||
+                  (e.response_time == best_time && s > best_seq) {
+                    best_idx = idx
+                    best_time = e.response_time
+                    best_seq = s
+                  }
+                }
+              }
+              None => ()
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    g = g + 1
+  }
+  if best_idx >= 0 { Some(best_idx) } else { None }
+}
+
+///| Find an existing slot with exact same URI, method, vary_sig, and vary_key.
+fn find_exact_slot(
+  self : CacheStore,
+  uri : String,
+  method : String,
+  vary_sig : String,
+  vary_key : String,
+) -> Option[Int] {
+  let groups = match self.uri_groups.get(uri) {
+    None => return None
+    Some(g) => g
+  }
+  let mut g = 0
+  while g < groups.length() {
+    if groups[g].vary_sig == vary_sig {
+      match groups[g].variants.get(vary_key) {
+        None => return None
+        Some(list) => {
+          let mut i = 0
+          while i < list.length() {
+            let idx = list[i]
+            if self.slots[idx].active {
+              match self.slots[idx].entry {
+                Some(e) => {
+                  if e.method == method {
+                    return Some(idx)
+                  }
+                }
+                None => ()
+              }
+            }
+            i = i + 1
+          }
+          return None
+        }
+      }
+    }
+    g = g + 1
+  }
+  None
+}
+
+///| Look up a matching cached entry for `req` at Unix timestamp `now`.
+pub fn CacheStore::lookup(
+  self : CacheStore,
+  req : CacheRequest,
+  now : Int64,
+) -> Result[StoreLookup, CacheError] {
+  let req_cc = match parse_request_cache_control_with_limits(req.headers, self.limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match find_matching_slot(self, req) {
+    None => {
+      if req_cc.only_if_cached {
+        Ok(StoreLookup::GatewayTimeout504)
+      } else {
+        Ok(StoreLookup::Miss)
+      }
+    }
+    Some(idx) => {
+      let entry = match self.slots[idx].entry {
+        Some(e) => e
+        None => return Ok(StoreLookup::Miss)
+      }
+      match evaluate_lookup_parsed(req, req_cc, entry, now, self.opts, true) {
+        Err(e) => Err(e)
+        Ok(CacheLookup::Fresh(ttl)) => {
+          touch_slot(self, idx)
+          Ok(StoreLookup::HitFresh(entry, ttl))
+        }
+        Ok(CacheLookup::StaleWhileRevalidate(conds)) => {
+          touch_slot(self, idx)
+          Ok(StoreLookup::HitStaleWhileRevalidate(entry, conds))
+        }
+        Ok(CacheLookup::StaleNeedsRevalidation(conds)) => {
+          Ok(StoreLookup::NeedsRevalidation(entry, conds))
+        }
+        Ok(CacheLookup::GatewayTimeout504) => Ok(StoreLookup::GatewayTimeout504)
+        Ok(CacheLookup::Miss) => Ok(StoreLookup::Miss)
+      }
+    }
+  }
+}
+
+///| Store a response if storable and within `CacheLimits`.
+///| Returns `Ok(true)` if stored, `Ok(false)` if not storable or exceeds limits.
+///| Never lets a `HEAD` response evict a cached `GET` body (RFC 9111 §4.3.5).
+pub fn CacheStore::store(
+  self : CacheStore,
+  req : CacheRequest,
+  resp : CacheResponse,
+  body : Bytes,
+  request_time : Int64,
+  response_time : Int64,
+) -> Result[Bool, CacheError] {
+  if self.limits.max_entries == 0 || self.limits.max_total_bytes == 0L {
+    // Still validate headers/limits so malformed inputs fail closed
+    match parse_request_cache_control_with_limits(req.headers, self.limits) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    match parse_response_cache_control_with_limits(resp.headers, self.limits) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    return Ok(false)
+  }
+  let body_len = body.length().to_int64()
+  if body_len > self.limits.max_entry_bytes || body_len > self.limits.max_total_bytes {
+    match parse_request_cache_control_with_limits(req.headers, self.limits) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    match parse_response_cache_control_with_limits(resp.headers, self.limits) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    return Ok(false)
+  }
+  let maybe_entry = match create_entry(req, resp, body, request_time, response_time, self.opts, self.limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let entry = match maybe_entry {
+    Some(e) => e
+    None => return Ok(false)
+  }
+  let hdr_len = entry_header_bytes(entry)
+  if hdr_len > self.limits.max_total_bytes {
+    return Ok(false)
+  }
+
+  let vsig = compute_vary_sig(entry.vary_headers)
+  let vkey = compute_vary_key_direct(entry.vary_headers, entry.request_headers)
+
+  // RFC 9111 §4.3.5: if storing a HEAD response and a GET entry exists for this
+  // URI + Vary, do not evict the GET body; keep the GET entry intact.
+  if req.method == "HEAD" {
+    match find_exact_slot(self, entry.uri, "GET", vsig, vkey) {
+      Some(_) => return Ok(false)
+      None => ()
+    }
+  }
+
+  // Replace identical (uri, method, vary_sig, vary_key) slot if present
+  match find_exact_slot(self, entry.uri, entry.method, vsig, vkey) {
+    Some(old_idx) => evict_slot(self, old_idx)
+    None => ()
+  }
+
+  // Evict LRU entries until both entry count and body/header byte bounds fit
+  evict_until_fits(self, body_len, hdr_len, 1)
+
+  let seq = self.next_seq
+  self.next_seq = seq + 1L
+
+  let idx = match self.free_slots.pop() {
+    Some(free_idx) => {
+      self.slots[free_idx].active = true
+      self.slots[free_idx].uri = entry.uri
+      self.slots[free_idx].vary_sig = vsig
+      self.slots[free_idx].vary_key = vkey
+      self.slots[free_idx].seq = seq
+      self.slots[free_idx].entry = Some(entry)
+      self.slots[free_idx].byte_size = body_len
+      self.slots[free_idx].header_size = hdr_len
+      self.slots[free_idx].prev = -1
+      self.slots[free_idx].next = -1
+      free_idx
+    }
+    None => {
+      let new_idx = self.slots.length()
+      self.slots.push(LruSlot::{
+        active: true,
+        uri: entry.uri,
+        vary_sig: vsig,
+        vary_key: vkey,
+        seq: seq,
+        entry: Some(entry),
+        byte_size: body_len,
+        header_size: hdr_len,
+        prev: -1,
+        next: -1,
+      })
+      new_idx
+    }
+  }
+
+  push_front_slot(self, idx)
+  add_to_uri_groups(self, entry.uri, vsig, entry.vary_headers, vkey, idx)
+  self.count = self.count + 1
+  self.bytes_used = self.bytes_used + body_len
+  self.header_bytes_used = self.header_bytes_used + hdr_len
+  Ok(true)
+}
+
+///| Merge a 304 Not Modified response into the matching cached variant.
+///| Evicts the stored entry if the merged response becomes non-storable (e.g. `no-store`).
+pub fn CacheStore::update_304(
+  self : CacheStore,
+  req : CacheRequest,
+  resp_304 : CacheResponse,
+  request_time : Int64,
+  response_time : Int64,
+) -> Result[Option[StoredEntry], CacheError] {
+  match find_matching_slot(self, req) {
+    None => Ok(None)
+    Some(idx) => {
+      let existing = match self.slots[idx].entry {
+        Some(e) => e
+        None => return Ok(None)
+      }
+      let merged = match merge_304(existing, resp_304, request_time, response_time, self.opts, self.limits) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      // RFC 9111 §3: if 304 revokes storability (no-store, unqualified private in shared, Vary: *), evict immediately
+      let revoked = merged.response_cc.no_store ||
+      merged.vary_star ||
+      (self.opts.is_shared && merged.response_cc.is_private && merged.response_cc.private_fields.length() == 0)
+      if revoked {
+        evict_slot(self, idx)
+        return Ok(None)
+      }
+      let new_hdr_len = entry_header_bytes(merged)
+      if new_hdr_len > self.limits.max_total_bytes {
+        evict_slot(self, idx)
+        return Ok(None)
+      }
+      let old_hdr_len = self.slots[idx].header_size
+      self.header_bytes_used = self.header_bytes_used - old_hdr_len + new_hdr_len
+      self.slots[idx].header_size = new_hdr_len
+      self.slots[idx].entry = Some(merged)
+      let seq = self.next_seq
+      self.next_seq = seq + 1L
+      self.slots[idx].seq = seq
+      touch_slot(self, idx)
+      while self.tail >= 0 && self.tail != idx && self.header_bytes_used > self.limits.max_total_bytes {
+        evict_slot(self, self.tail)
+      }
+      Ok(Some(merged))
+    }
+  }
+}
+
+///| Invalidate all cached variants for an exact URI. Returns number of evicted entries.
+pub fn CacheStore::invalidate_uri(self : CacheStore, uri : String) -> Int {
+  let to_evict : Array[Int] = match self.uri_groups.get(uri) {
+    None => return 0
+    Some(groups) => {
+      let copy : Array[Int] = []
+      let mut g = 0
+      while g < groups.length() {
+        let all = groups[g].all_slots
+        let mut i = 0
+        while i < all.length() {
+          copy.push(all[i])
+          i = i + 1
+        }
+        g = g + 1
+      }
+      copy
+    }
+  }
+  let mut evicted = 0
+  let mut i = 0
+  while i < to_evict.length() {
+    let idx = to_evict[i]
+    if self.slots[idx].active {
+      evict_slot(self, idx)
+      evicted = evicted + 1
+    }
+    i = i + 1
+  }
+  evicted
+}
+
+///| Invalidate cached entries affected by an unsafe request and its response (RFC 9111 §4.4).
+///| Returns the number of evicted entries.
+pub fn CacheStore::invalidate_for_response(
+  self : CacheStore,
+  req : CacheRequest,
+  resp : CacheResponse,
+) -> Result[Int, CacheError] {
+  let targets = match invalidation_targets(req, resp) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let mut total = 0
+  let mut i = 0
+  while i < targets.length() {
+    total = total + self.invalidate_uri(targets[i])
+    i = i + 1
+  }
+  Ok(total)
+}
+
+///| Current number of stored entries.
+pub fn CacheStore::entry_count(self : CacheStore) -> Int {
+  self.count
+}
+
+///| Current total body bytes stored.
+pub fn CacheStore::total_bytes(self : CacheStore) -> Int64 {
+  self.bytes_used
+}
+
+///| Remove all entries from the store.
+pub fn CacheStore::clear(self : CacheStore) -> Unit {
+  while self.head >= 0 {
+    evict_slot(self, self.head)
+  }
+}

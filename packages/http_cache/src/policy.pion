@@ -1,0 +1,1255 @@
+///| RFC 9111 HTTP Caching policy engine: storability, freshness, age, Vary,
+///| conditional revalidation, 304 merging, and RFC 3986 same-origin invalidation.
+
+fn clamped_add_i64(a : Int64, b : Int64) -> Int64 {
+  if b > 0L && a > max_delta_seconds - b {
+    max_delta_seconds
+  } else {
+    let sum = a + b
+    if sum > max_delta_seconds { max_delta_seconds } else if sum < 0L { 0L } else { sum }
+  }
+}
+
+fn trim_ows_slice(s : String, start : Int, end : Int) -> String {
+  let mut a = start
+  let mut b = end
+  while a < b && is_ows(s.code_unit_at(a)) {
+    a = a + 1
+  }
+  while b > a && is_ows(s.code_unit_at(b - 1)) {
+    b = b - 1
+  }
+  let len = b - a
+  if len <= 0 {
+    return ""
+  }
+  if a == 0 && b == s.length() {
+    return s
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = s.code_unit_at(a + i).to_byte()
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn get_first_header(headers : Array[Header], name_lower : String) -> Option[String] {
+  let mut i = 0
+  while i < headers.length() {
+    if ascii_eq_ignore_case(headers[i].name, name_lower) {
+      return Some(headers[i].value)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn has_header(headers : Array[Header], name_lower : String) -> Bool {
+  match get_first_header(headers, name_lower) {
+    Some(_) => true
+    None => false
+  }
+}
+
+fn str_list_contains(list : Array[String], target : String) -> Bool {
+  let mut i = 0
+  while i < list.length() {
+    if list[i] == target {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn check_headers_limits(headers : Array[Header], limits : CacheLimits) -> Result[Unit, CacheError] {
+  if headers.length() > limits.max_headers {
+    return Err(CacheError::LimitExceeded("headers exceed max_headers"))
+  }
+  let mut total = 0
+  let mut i = 0
+  while i < headers.length() {
+    total = total + headers[i].name.length() + headers[i].value.length()
+    if total > limits.max_header_bytes {
+      return Err(CacheError::LimitExceeded("headers exceed max_header_bytes"))
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+///| RFC 9110 §15.1 / §15.4.9 heuristically cacheable final status codes.
+///| Note: 206 Partial Content is intentionally excluded because this engine
+///| does not implement RFC 9111 §3.3/§3.4 range combination.
+fn is_heuristically_cacheable_status(status : Int) -> Bool {
+  status == 200 || status == 203 || status == 204 ||
+  status == 300 || status == 301 || status == 308 ||
+  status == 404 || status == 405 || status == 410 || status == 414 || status == 501
+}
+
+///| Status codes understood by this RFC 9111 cache implementation.
+fn is_understood_status(status : Int) -> Bool {
+  is_heuristically_cacheable_status(status) ||
+  status == 201 || status == 302 || status == 303 || status == 307 ||
+  status == 403 || status == 400
+}
+
+fn is_cacheable_method(method : String) -> Bool {
+  method == "GET" || method == "HEAD"
+}
+
+fn is_safe_method(method : String) -> Bool {
+  method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "TRACE"
+}
+
+///| Parse all `Vary` headers into `(vary_names_lower, has_star)`.
+fn parse_vary_headers(
+  headers : Array[Header],
+  limits : CacheLimits,
+) -> Result[(Array[String], Bool), CacheError] {
+  let names : Array[String] = []
+  let mut has_star = false
+  let mut i = 0
+  while i < headers.length() {
+    if ascii_eq_ignore_case(headers[i].name, "vary") {
+      let v = headers[i].value
+      let n = v.length()
+      let mut p = 0
+      while p < n {
+        while p < n && (is_ows(v.code_unit_at(p)) || v.code_unit_at(p) == 44) {
+          p = p + 1
+        }
+        let start = p
+        while p < n && v.code_unit_at(p) != 44 {
+          p = p + 1
+        }
+        let mut end = p
+        while end > start && is_ows(v.code_unit_at(end - 1)) {
+          end = end - 1
+        }
+        if end > start {
+          let tok = ascii_slice_lower(v, start, end)
+          if tok == "*" {
+            has_star = true
+          } else {
+            if !str_list_contains(names, tok) {
+              if names.length() >= limits.max_vary_headers {
+                return Err(CacheError::LimitExceeded("Vary exceeds max_vary_headers"))
+              }
+              names.push(tok)
+            }
+          }
+        }
+        if p < n && v.code_unit_at(p) == 44 {
+          p = p + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  Ok((names, has_star))
+}
+
+fn parse_age_header(headers : Array[Header]) -> Int64 {
+  match get_first_header(headers, "age") {
+    None => 0L
+    Some(raw) => {
+      let trimmed = trim_ows_slice(raw, 0, raw.length())
+      match parse_delta_seconds(trimmed) {
+        Ok(v) => v
+        Err(_) => 0L
+      }
+    }
+  }
+}
+
+fn check_storable_parsed(
+  req : CacheRequest,
+  resp : CacheResponse,
+  req_cc : RequestCacheControl,
+  resp_cc : ResponseCacheControl,
+  vary_star : Bool,
+  opts : CachePolicyOptions,
+) -> Bool {
+  if !is_cacheable_method(req.method) {
+    return false
+  }
+  // RFC 9111 §3: status must be final (>= 200); 206 Partial Content is not
+  // stored as a complete representation (§3.3/§3.4).
+  if resp.status < 200 || resp.status == 206 {
+    return false
+  }
+  // RFC 9111 §3: no-store in either request or response forbids storing.
+  if req_cc.no_store || resp_cc.no_store {
+    return false
+  }
+  // RFC 9111 §5.2.2.3: must-understand requires understood status code.
+  if resp_cc.must_understand && !is_understood_status(resp.status) {
+    return false
+  }
+  // RFC 9111 §4.1: Vary: * can never be matched for reuse.
+  if vary_star {
+    return false
+  }
+  // Shared cache restrictions
+  if opts.is_shared {
+    // Unqualified `private` forbids storage in shared caches.
+    // Field-qualified `private="field"` is allowed to store, but listed fields
+    // MUST be stripped from stored headers (RFC 9111 §5.2.2.7).
+    if resp_cc.is_private && resp_cc.private_fields.length() == 0 {
+      return false
+    }
+    // RFC 9111 §3.5: Authorization header in shared cache requires public, must-revalidate, or s-maxage.
+    if has_header(req.headers, "authorization") {
+      let allowed = resp_cc.is_public || resp_cc.must_revalidate || match resp_cc.s_maxage {
+        Some(_) => true
+        None => false
+      }
+      if !allowed {
+        return false
+      }
+    }
+  }
+
+  // RFC 9111 §3: response must have explicit caching permission or heuristically cacheable status.
+  let has_explicit = resp_cc.is_public ||
+  (!opts.is_shared && resp_cc.is_private) ||
+  (opts.is_shared && match resp_cc.s_maxage { Some(_) => true None => false }) ||
+  (match resp_cc.max_age { Some(_) => true None => false }) ||
+  has_header(resp.headers, "expires")
+
+  has_explicit || is_heuristically_cacheable_status(resp.status)
+}
+
+///| Check storability with explicit policy options and resource limits (RFC 9111 §3).
+pub fn is_storable_with_options(
+  req : CacheRequest,
+  resp : CacheResponse,
+  opts : CachePolicyOptions,
+  limits : CacheLimits,
+) -> Result[Bool, CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if resp.status < 100 || resp.status > 599 {
+    return Err(CacheError::InvalidResponse("status code out of range"))
+  }
+  let req_cc = match parse_request_cache_control_with_limits(req.headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let resp_cc = match parse_response_cache_control_with_limits(resp.headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (_, vary_star) = match parse_vary_headers(resp.headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  Ok(check_storable_parsed(req, resp, req_cc, resp_cc, vary_star, opts))
+}
+
+///| Check whether a request/response pair is storable under RFC 9111 §3.
+pub fn is_storable(
+  req : CacheRequest,
+  resp : CacheResponse,
+  is_shared : Bool,
+) -> Result[Bool, CacheError] {
+  let opts = if is_shared { CachePolicyOptions::shared() } else { CachePolicyOptions::private_cache() }
+  is_storable_with_options(req, resp, opts, CacheLimits::default())
+}
+
+///| Compute RFC 9111 §4.2.1 freshness lifetime in seconds.
+pub fn compute_freshness_lifetime(
+  resp : CacheResponse,
+  response_time : Int64,
+  opts : CachePolicyOptions,
+) -> Result[Int64, CacheError] {
+  let resp_cc = match parse_response_cache_control(resp.headers) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  compute_freshness_lifetime_cc(resp, resp_cc, response_time, opts)
+}
+
+fn compute_freshness_lifetime_cc(
+  resp : CacheResponse,
+  resp_cc : ResponseCacheControl,
+  response_time : Int64,
+  opts : CachePolicyOptions,
+) -> Result[Int64, CacheError] {
+  // 1. s-maxage (shared cache only)
+  if opts.is_shared {
+    match resp_cc.s_maxage {
+      Some(s) => return Ok(s)
+      None => ()
+    }
+  }
+  // 2. max-age
+  match resp_cc.max_age {
+    Some(m) => return Ok(m)
+    None => ()
+  }
+  // 3. Expires - Date (or response_time if Date missing)
+  let date_val = match get_first_header(resp.headers, "date") {
+    Some(d) => match parse_http_date(d) {
+      Ok(ts) => ts
+      Err(_) => response_time
+    }
+    None => response_time
+  }
+  match get_first_header(resp.headers, "expires") {
+    Some(exp_raw) => {
+      // RFC 9111 §5.3: invalid Expires (e.g. "0") represents a time in the past -> 0s
+      match parse_http_date(exp_raw) {
+        Ok(exp_ts) => {
+          if exp_ts <= date_val {
+            return Ok(0L)
+          }
+          // Overflow-safe subtraction for extreme timestamps
+          if date_val < 0L && exp_ts > 9223372036854775807L + date_val {
+            return Ok(max_delta_seconds)
+          }
+          let diff = exp_ts - date_val
+          return Ok(if diff > max_delta_seconds { max_delta_seconds } else { diff })
+        }
+        Err(_) => return Ok(0L)
+      }
+    }
+    None => ()
+  }
+  // 4. Heuristic freshness (RFC 9111 §4.2.2) with overflow-safe arithmetic
+  if opts.heuristic_fraction_pct > 0 && is_heuristically_cacheable_status(resp.status) {
+    match get_first_header(resp.headers, "last-modified") {
+      Some(lm_raw) => match parse_http_date(lm_raw) {
+        Ok(lm_ts) => {
+          if date_val > lm_ts {
+            let pct = opts.heuristic_fraction_pct.to_int64()
+            let max_safe_delta = (max_delta_seconds / pct + 1L) * 100L
+            let delta = if lm_ts < 0L && date_val > 9223372036854775807L + lm_ts {
+              max_safe_delta
+            } else {
+              let d = date_val - lm_ts
+              if d > max_safe_delta { max_safe_delta } else { d }
+            }
+            let mut heur = (delta / 100L) * pct + ((delta % 100L) * pct) / 100L
+            if opts.max_heuristic_seconds >= 0L && heur > opts.max_heuristic_seconds {
+              heur = opts.max_heuristic_seconds
+            }
+            if heur > max_delta_seconds {
+              heur = max_delta_seconds
+            }
+            return Ok(heur)
+          }
+        }
+        Err(_) => ()
+      }
+      None => ()
+    }
+  }
+  Ok(0L)
+}
+
+///| Compute RFC 9111 §4.2.3 initial age in seconds at response receipt time.
+pub fn compute_initial_age(
+  resp : CacheResponse,
+  request_time : Int64,
+  response_time : Int64,
+) -> Result[Int64, CacheError] {
+  let apparent_age = match get_first_header(resp.headers, "date") {
+    Some(d) => match parse_http_date(d) {
+      Ok(date_val) => {
+        if response_time <= date_val {
+          0L
+        } else if date_val < 0L && response_time > 9223372036854775807L + date_val {
+          max_delta_seconds
+        } else {
+          let diff = response_time - date_val
+          if diff > max_delta_seconds { max_delta_seconds } else { diff }
+        }
+      }
+      Err(_) => 0L
+    }
+    None => 0L
+  }
+  let response_delay = if response_time > request_time {
+    if request_time < 0L && response_time > 9223372036854775807L + request_time {
+      max_delta_seconds
+    } else {
+      let d = response_time - request_time
+      if d > max_delta_seconds { max_delta_seconds } else { d }
+    }
+  } else {
+    0L
+  }
+  let age_value = parse_age_header(resp.headers)
+  let corrected_age_value = clamped_add_i64(age_value, response_delay)
+  Ok(if apparent_age > corrected_age_value { apparent_age } else { corrected_age_value })
+}
+
+///| Compute RFC 9111 §4.2.3 current age in seconds at timestamp `now`.
+pub fn compute_current_age(entry : StoredEntry, now : Int64) -> Int64 {
+  let resident_time = if now > entry.response_time {
+    if entry.response_time < 0L && now > 9223372036854775807L + entry.response_time {
+      max_delta_seconds
+    } else {
+      let d = now - entry.response_time
+      if d > max_delta_seconds { max_delta_seconds } else { d }
+    }
+  } else {
+    0L
+  }
+  clamped_add_i64(entry.initial_age, resident_time)
+}
+
+///| Normalize all header values for a given lowercase header name (RFC 9111 §4.1):
+///| join multiple occurrences with ", " and trim leading/trailing OWS per value.
+fn normalized_header_value(headers : Array[Header], name_lower : String) -> Option[String] {
+  let mut found = false
+  let mut first_val = ""
+  let mut sb : Option[StringBuilder] = None
+  let mut i = 0
+  while i < headers.length() {
+    if ascii_eq_ignore_case(headers[i].name, name_lower) {
+      let v = trim_ows_slice(headers[i].value, 0, headers[i].value.length())
+      if !found {
+        found = true
+        first_val = v
+      } else {
+        match sb {
+          None => {
+            let b = StringBuilder::new()
+            b.write_string(first_val)
+            b.write_string(", ")
+            b.write_string(v)
+            sb = Some(b)
+          }
+          Some(b) => {
+            b.write_string(", ")
+            b.write_string(v)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  if !found {
+    None
+  } else {
+    match sb {
+      None => Some(first_val)
+      Some(b) => Some(b.to_string())
+    }
+  }
+}
+
+///| Check RFC 9111 §4.1 `Vary` header match between stored and incoming requests.
+pub fn vary_matches(
+  stored_req_headers : Array[Header],
+  new_req_headers : Array[Header],
+  vary_headers : Array[String],
+  vary_star : Bool,
+) -> Bool {
+  if vary_star {
+    return false
+  }
+  let mut i = 0
+  while i < vary_headers.length() {
+    let field = vary_headers[i]
+    let a = normalized_header_value(stored_req_headers, field)
+    let b = normalized_header_value(new_req_headers, field)
+    let eq = match (a, b) {
+      (None, None) => true
+      (Some(x), Some(y)) => x == y
+      _ => false
+    }
+    if !eq {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Build conditional revalidation headers (`If-None-Match` / `If-Modified-Since`).
+pub fn build_revalidation_headers(entry : StoredEntry) -> Array[Header] {
+  let out : Array[Header] = []
+  match entry.etag {
+    Some(et) => out.push(Header::new("if-none-match", et))
+    None => ()
+  }
+  match entry.last_modified {
+    Some(lm) => out.push(Header::new("if-modified-since", lm))
+    None => ()
+  }
+  out
+}
+
+///| Clone only request headers named in `vary_headers` (lowercased).
+///| Prevents retaining unrelated per-user headers (e.g. Cookie, Authorization, padding).
+fn clone_vary_request_headers(
+  headers : Array[Header],
+  vary_headers : Array[String],
+) -> Array[Header] {
+  if vary_headers.length() == 0 {
+    return []
+  }
+  let out : Array[Header] = []
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    let low = ascii_slice_lower(h.name, 0, h.name.length())
+    if str_list_contains(vary_headers, low) {
+      out.push(Header::new(low, h.value))
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Clone response headers (lowercased), stripping fields forbidden from
+///| being stored/replayed without revalidation:
+///| - RFC 9111 §5.2.2.7: shared cache MUST NOT store `private="field"` headers.
+///| - RFC 9111 §5.2.2.4: cache MUST NOT replay `no-cache="field"` headers without validation.
+fn clone_storable_response_headers(
+  headers : Array[Header],
+  resp_cc : ResponseCacheControl,
+  is_shared : Bool,
+) -> Array[Header] {
+  let strip_private = is_shared && resp_cc.private_fields.length() > 0
+  let strip_no_cache = resp_cc.no_cache_fields.length() > 0
+  let out : Array[Header] = []
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    let low = ascii_slice_lower(h.name, 0, h.name.length())
+    let drop = (strip_private && str_list_contains(resp_cc.private_fields, low)) ||
+    (strip_no_cache && str_list_contains(resp_cc.no_cache_fields, low))
+    if !drop {
+      out.push(Header::new(low, h.value))
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Create a `StoredEntry` if the response is storable, or `Ok(None)` otherwise.
+pub fn create_entry(
+  req : CacheRequest,
+  resp : CacheResponse,
+  body : Bytes,
+  request_time : Int64,
+  response_time : Int64,
+  opts : CachePolicyOptions,
+  limits : CacheLimits,
+) -> Result[Option[StoredEntry], CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if resp.status < 100 || resp.status > 599 {
+    return Err(CacheError::InvalidResponse("status code out of range"))
+  }
+  let req_cc = match parse_request_cache_control_with_limits(req.headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let resp_cc = match parse_response_cache_control_with_limits(resp.headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (vary_headers, vary_star) = match parse_vary_headers(resp.headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if !check_storable_parsed(req, resp, req_cc, resp_cc, vary_star, opts) {
+    return Ok(None)
+  }
+  if body.length().to_int64() > limits.max_entry_bytes {
+    return Ok(None)
+  }
+  let initial_age = match compute_initial_age(resp, request_time, response_time) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let freshness = match compute_freshness_lifetime_cc(resp, resp_cc, response_time, opts) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let stored_resp_headers = clone_storable_response_headers(resp.headers, resp_cc, opts.is_shared)
+  let etag = get_first_header(stored_resp_headers, "etag")
+  let last_modified = get_first_header(stored_resp_headers, "last-modified")
+  Ok(Some(StoredEntry::{
+    method: req.method,
+    uri: req.uri,
+    status: resp.status,
+    request_headers: clone_vary_request_headers(req.headers, vary_headers),
+    response_headers: stored_resp_headers,
+    body: body,
+    request_time: request_time,
+    response_time: response_time,
+    initial_age: initial_age,
+    freshness_lifetime: freshness,
+    response_cc: resp_cc,
+    vary_headers: vary_headers,
+    vary_star: vary_star,
+    etag: etag,
+    last_modified: last_modified,
+  }))
+}
+
+///| Evaluate a cache lookup decision against a stored entry at time `now` (RFC 9111 §4).
+pub fn evaluate_lookup(
+  req : CacheRequest,
+  entry : StoredEntry,
+  now : Int64,
+  opts : CachePolicyOptions,
+  limits : CacheLimits,
+) -> Result[CacheLookup, CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let req_cc = match parse_request_cache_control_with_limits(req.headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  evaluate_lookup_parsed(req, req_cc, entry, now, opts, false)
+}
+
+fn evaluate_lookup_parsed(
+  req : CacheRequest,
+  req_cc : RequestCacheControl,
+  entry : StoredEntry,
+  now : Int64,
+  opts : CachePolicyOptions,
+  vary_already_matched : Bool,
+) -> Result[CacheLookup, CacheError] {
+  // Defense in depth: never serve an entry marked no-store
+  if entry.response_cc.no_store {
+    return Ok(if req_cc.only_if_cached { CacheLookup::GatewayTimeout504 } else { CacheLookup::Miss })
+  }
+
+  // Method & URI match (HEAD can be satisfied by GET)
+  let method_ok = req.method == entry.method || (req.method == "HEAD" && entry.method == "GET")
+  if !method_ok || req.uri != entry.uri {
+    return Ok(if req_cc.only_if_cached { CacheLookup::GatewayTimeout504 } else { CacheLookup::Miss })
+  }
+
+  // Vary match
+  if !vary_already_matched &&
+  !vary_matches(entry.request_headers, req.headers, entry.vary_headers, entry.vary_star) {
+    return Ok(if req_cc.only_if_cached { CacheLookup::GatewayTimeout504 } else { CacheLookup::Miss })
+  }
+
+  let current_age = compute_current_age(entry, now)
+  let remaining = entry.freshness_lifetime - current_age
+
+  // Unqualified response no-cache or request no-cache always requires revalidation
+  let resp_requires_reval = entry.response_cc.no_cache && entry.response_cc.no_cache_fields.length() == 0
+  if resp_requires_reval || req_cc.no_cache {
+    if req_cc.only_if_cached {
+      return Ok(CacheLookup::GatewayTimeout504)
+    }
+    return Ok(CacheLookup::StaleNeedsRevalidation(build_revalidation_headers(entry)))
+  }
+
+  // Check request max-age constraint
+  let mut req_age_ok = true
+  match req_cc.max_age {
+    Some(rmax) => {
+      if current_age >= rmax {
+        req_age_ok = false
+      }
+    }
+    None => ()
+  }
+
+  // Check request min-fresh constraint
+  let mut min_fresh_ok = true
+  match req_cc.min_fresh {
+    Some(mf) => {
+      if remaining < mf {
+        min_fresh_ok = false
+      }
+    }
+    None => ()
+  }
+
+  // Fresh!
+  if remaining > 0L && req_age_ok && min_fresh_ok {
+    let eff_ttl = match req_cc.max_age {
+      Some(rmax) => {
+        let r_rem = rmax - current_age
+        if r_rem < remaining { r_rem } else { remaining }
+      }
+      None => remaining
+    }
+    return Ok(CacheLookup::Fresh(eff_ttl))
+  }
+
+  // Entry is stale (or violates request max-age/min-fresh).
+  // RFC 9111 §5.2.2.10: s-maxage implies proxy-revalidate in a shared cache.
+  let has_s_maxage = match entry.response_cc.s_maxage {
+    Some(_) => true
+    None => false
+  }
+  let must_reval = entry.response_cc.must_revalidate ||
+  (opts.is_shared && (entry.response_cc.proxy_revalidate || has_s_maxage))
+
+  // Check request max-stale (only allowed if not must-revalidate/proxy-revalidate/s-maxage)
+  if !must_reval && req_cc.has_max_stale && req_age_ok && min_fresh_ok {
+    let staleness = -remaining
+    let stale_ok = match req_cc.max_stale_seconds {
+      None => true
+      Some(ms) => staleness <= ms
+    }
+    if stale_ok {
+      return Ok(CacheLookup::Fresh(0L))
+    }
+  }
+
+  // Check RFC 5861 stale-while-revalidate
+  if !must_reval && req_age_ok && min_fresh_ok {
+    match entry.response_cc.stale_while_revalidate {
+      Some(swr) => {
+        let staleness = -remaining
+        if staleness >= 0L && staleness <= swr {
+          return Ok(CacheLookup::StaleWhileRevalidate(build_revalidation_headers(entry)))
+        }
+      }
+      None => ()
+    }
+  }
+
+  if req_cc.only_if_cached {
+    return Ok(CacheLookup::GatewayTimeout504)
+  }
+
+  Ok(CacheLookup::StaleNeedsRevalidation(build_revalidation_headers(entry)))
+}
+
+///| Headers that MUST NOT be overwritten by a 304 Not Modified response (RFC 9111 §3.2).
+fn is_304_protected_header(name_lower : String) -> Bool {
+  name_lower == "content-length" ||
+  name_lower == "content-encoding" ||
+  name_lower == "transfer-encoding" ||
+  name_lower == "content-range" ||
+  name_lower == "connection" ||
+  name_lower == "keep-alive" ||
+  name_lower == "proxy-authenticate" ||
+  name_lower == "proxy-authorization" ||
+  name_lower == "te" ||
+  name_lower == "trailer" ||
+  name_lower == "upgrade"
+}
+
+fn is_weak_etag(et : String) -> Bool {
+  et.length() >= 2 && et.code_unit_at(0) == 87 && et.code_unit_at(1) == 47 // "W/"
+}
+
+fn strip_weak_prefix(et : String) -> String {
+  if is_weak_etag(et) {
+    slice_str(et, 2, et.length())
+  } else {
+    et
+  }
+}
+
+///| RFC 9111 §4.3.4 validator match check for 304 Not Modified updates.
+fn validators_match_304(entry : StoredEntry, resp_304 : CacheResponse) -> Bool {
+  match get_first_header(resp_304.headers, "etag") {
+    Some(raw_new) => {
+      let new_et = trim_ows_slice(raw_new, 0, raw_new.length())
+      match entry.etag {
+        None => return false
+        Some(raw_old) => {
+          let old_et = trim_ows_slice(raw_old, 0, raw_old.length())
+          if !is_weak_etag(new_et) {
+            // Strong validator in 304: MUST match stored strong validator exactly
+            return !is_weak_etag(old_et) && old_et == new_et
+          } else {
+            // Weak validator in 304: weak comparison
+            return strip_weak_prefix(old_et) == strip_weak_prefix(new_et)
+          }
+        }
+      }
+    }
+    None => ()
+  }
+  match get_first_header(resp_304.headers, "last-modified") {
+    Some(raw_lm) => {
+      let new_lm = trim_ows_slice(raw_lm, 0, raw_lm.length())
+      match entry.last_modified {
+        Some(old_lm) => return trim_ows_slice(old_lm, 0, old_lm.length()) == new_lm
+        None => return false
+      }
+    }
+    None => ()
+  }
+  true
+}
+
+///| Merge a 304 Not Modified response into an existing `StoredEntry` (RFC 9111 §3.2 / §4.3.4).
+pub fn merge_304(
+  entry : StoredEntry,
+  resp_304 : CacheResponse,
+  request_time : Int64,
+  response_time : Int64,
+  opts : CachePolicyOptions,
+  limits : CacheLimits,
+) -> Result[StoredEntry, CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if resp_304.status != 304 {
+    return Err(CacheError::InvalidResponse("merge_304 requires status 304"))
+  }
+  match check_headers_limits(resp_304.headers, limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if !validators_match_304(entry, resp_304) {
+    return Err(CacheError::InvalidResponse("304 validator does not match stored entry"))
+  }
+
+  // Collect lowercase names present in 304 response (excluding protected representation/hop-by-hop headers)
+  let updated_names : Array[String] = []
+  let mut has_new_date = false
+  let mut i = 0
+  while i < resp_304.headers.length() {
+    let low = ascii_slice_lower(resp_304.headers[i].name, 0, resp_304.headers[i].name.length())
+    if low == "date" {
+      has_new_date = true
+    }
+    updated_names.push(low)
+    i = i + 1
+  }
+
+  // Keep existing headers not overridden by 304 (and always drop stale Date if 304 omitted Date)
+  let merged_raw : Array[Header] = []
+  let mut j = 0
+  while j < entry.response_headers.length() {
+    let h = entry.response_headers[j]
+    if !has_new_date && h.name == "date" {
+      j = j + 1
+      continue
+    }
+    let mut overridden = false
+    if !is_304_protected_header(h.name) {
+      let mut k = 0
+      while k < updated_names.length() {
+        if h.name == updated_names[k] {
+          overridden = true
+          break
+        }
+        k = k + 1
+      }
+    }
+    if !overridden {
+      merged_raw.push(h)
+    }
+    j = j + 1
+  }
+
+  // Append non-protected headers from 304
+  let mut m = 0
+  while m < resp_304.headers.length() {
+    let low = updated_names[m]
+    if !is_304_protected_header(low) {
+      merged_raw.push(Header::new(low, resp_304.headers[m].value))
+    }
+    m = m + 1
+  }
+
+  // RFC 9110 §6.6.1: stamp Date on a Date-less 304 response so age resets properly
+  if !has_new_date {
+    merged_raw.push(Header::new("date", format_http_date(response_time)))
+  }
+
+  match check_headers_limits(merged_raw, limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+
+  let resp_cc = match parse_response_cache_control_with_limits(merged_raw, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let merged_headers = clone_storable_response_headers(merged_raw, resp_cc, opts.is_shared)
+  let merged_resp = CacheResponse::new(entry.status, merged_headers)
+  let (vary_headers, vary_star) = match parse_vary_headers(merged_headers, limits) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let initial_age = match compute_initial_age(merged_resp, request_time, response_time) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let freshness = match compute_freshness_lifetime_cc(merged_resp, resp_cc, response_time, opts) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let etag = get_first_header(merged_headers, "etag")
+  let last_modified = get_first_header(merged_headers, "last-modified")
+
+  Ok(StoredEntry::{
+    method: entry.method,
+    uri: entry.uri,
+    status: entry.status,
+    request_headers: entry.request_headers,
+    response_headers: merged_headers,
+    body: entry.body,
+    request_time: request_time,
+    response_time: response_time,
+    initial_age: initial_age,
+    freshness_lifetime: freshness,
+    response_cc: resp_cc,
+    vary_headers: vary_headers,
+    vary_star: vary_star,
+    etag: etag,
+    last_modified: last_modified,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Origin parsing & RFC 9111 §4.4 / RFC 3986 §5.2 same-origin invalidation
+// ---------------------------------------------------------------------------
+
+val struct ParsedOrigin {
+  scheme : String
+  host : String
+  port : Int
+  authority_end : Int
+}
+
+fn parse_origin(uri : String) -> Option[ParsedOrigin] {
+  let n = uri.length()
+  let mut i = 0
+  while i < n && uri.code_unit_at(i) != 58 {
+    i = i + 1
+  }
+  if i == 0 || i + 3 > n {
+    return None
+  }
+  if uri.code_unit_at(i + 1) != 47 || uri.code_unit_at(i + 2) != 47 {
+    return None
+  }
+  let scheme = ascii_slice_lower(uri, 0, i)
+  let auth_start = i + 3
+  let mut auth_end = auth_start
+  while auth_end < n {
+    let c = uri.code_unit_at(auth_end)
+    if c == 47 || c == 63 || c == 35 {
+      break
+    }
+    auth_end = auth_end + 1
+  }
+  if auth_end == auth_start {
+    return None
+  }
+  // Strip optional userinfo@
+  let mut host_start = auth_start
+  let mut k = auth_start
+  while k < auth_end {
+    if uri.code_unit_at(k) == 64 {
+      host_start = k + 1
+    }
+    k = k + 1
+  }
+  if host_start >= auth_end {
+    return None
+  }
+  // Handle IPv6 literal [::1]:port or host:port
+  let mut host_end = auth_end
+  let mut port = if scheme == "http" { 80 } else if scheme == "https" { 443 } else { -1 }
+  if uri.code_unit_at(host_start) == 91 {
+    let mut close = host_start + 1
+    while close < auth_end && uri.code_unit_at(close) != 93 {
+      close = close + 1
+    }
+    if close >= auth_end {
+      return None
+    }
+    host_end = close + 1
+    if host_end < auth_end {
+      if uri.code_unit_at(host_end) != 58 {
+        return None
+      }
+      let p_start = host_end + 1
+      if p_start >= auth_end {
+        return None
+      }
+      let mut p_acc = 0
+      let mut p_i = p_start
+      while p_i < auth_end {
+        let c = uri.code_unit_at(p_i)
+        if !is_ascii_digit(c) {
+          return None
+        }
+        p_acc = p_acc * 10 + (c - 48)
+        if p_acc > 65535 {
+          return None
+        }
+        p_i = p_i + 1
+      }
+      port = p_acc
+    }
+  } else {
+    let mut colon = -1
+    let mut j = host_start
+    while j < auth_end {
+      if uri.code_unit_at(j) == 58 {
+        colon = j
+      }
+      j = j + 1
+    }
+    if colon >= 0 {
+      host_end = colon
+      let p_start = colon + 1
+      if p_start >= auth_end {
+        return None
+      }
+      let mut p_acc = 0
+      let mut p_i = p_start
+      while p_i < auth_end {
+        let c = uri.code_unit_at(p_i)
+        if !is_ascii_digit(c) {
+          return None
+        }
+        p_acc = p_acc * 10 + (c - 48)
+        if p_acc > 65535 {
+          return None
+        }
+        p_i = p_i + 1
+      }
+      port = p_acc
+    }
+  }
+  if host_end <= host_start {
+    return None
+  }
+  let host = ascii_slice_lower(uri, host_start, host_end)
+  Some(ParsedOrigin::{ scheme: scheme, host: host, port: port, authority_end: auth_end })
+}
+
+///| Check whether two URIs share the same origin (scheme, host, effective port).
+pub fn same_origin(uri_a : String, uri_b : String) -> Bool {
+  match (parse_origin(uri_a), parse_origin(uri_b)) {
+    (Some(a), Some(b)) => a.scheme == b.scheme && a.host == b.host && a.port == b.port
+    _ => false
+  }
+}
+
+fn slice_str(s : String, start : Int, end : Int) -> String {
+  let len = end - start
+  if len <= 0 {
+    return ""
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = s.code_unit_at(start + i).to_byte()
+    i = i + 1
+  }
+  out.to_string()
+}
+
+///| RFC 3986 §5.2.4 `remove_dot_segments`.
+fn remove_dot_segments(path : String) -> String {
+  let segs : Array[String] = []
+  let n = path.length()
+  let mut i = 0
+  let mut trailing_slash = false
+  while i < n {
+    let has_leading = path.code_unit_at(i) == 47
+    if has_leading {
+      i = i + 1
+    }
+    let start = i
+    while i < n && path.code_unit_at(i) != 47 {
+      i = i + 1
+    }
+    let seg = slice_str(path, start, i)
+    if seg == "." {
+      trailing_slash = i >= n
+    } else if seg == ".." {
+      if segs.length() > 0 {
+        let _ = segs.pop()
+      }
+      trailing_slash = i >= n
+    } else if seg.length() > 0 {
+      segs.push(seg)
+      trailing_slash = i < n && i == n - 1 && path.code_unit_at(i) == 47
+    } else {
+      trailing_slash = true
+    }
+  }
+  if segs.length() == 0 {
+    return "/"
+  }
+  let sb = StringBuilder::new()
+  let mut k = 0
+  while k < segs.length() {
+    sb.write_string("/")
+    sb.write_string(segs[k])
+    k = k + 1
+  }
+  if trailing_slash || (n > 0 && path.code_unit_at(n - 1) == 47) {
+    sb.write_string("/")
+  }
+  sb.to_string()
+}
+
+fn split_path_and_suffix(s : String, start : Int) -> (String, String) {
+  let n = s.length()
+  let mut i = start
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 63 || c == 35 {
+      return (slice_str(s, start, i), slice_str(s, i, n))
+    }
+    i = i + 1
+  }
+  (slice_str(s, start, n), "")
+}
+
+///| RFC 3986 §5.2 relative URI reference resolution.
+fn resolve_uri(base : String, ref_uri : String) -> Option[String] {
+  let trimmed = trim_ows_slice(ref_uri, 0, ref_uri.length())
+  if trimmed.length() == 0 {
+    return None
+  }
+  // Absolute URI (contains "://")
+  match parse_origin(trimmed) {
+    Some(o) => {
+      let (p, suffix) = split_path_and_suffix(trimmed, o.authority_end)
+      if p.length() == 0 {
+        return Some(trimmed)
+      }
+      return Some(slice_str(trimmed, 0, o.authority_end) + remove_dot_segments(p) + suffix)
+    }
+    None => ()
+  }
+  let base_origin = match parse_origin(base) {
+    Some(o) => o
+    None => return None
+  }
+  // Protocol-relative "//host/path"
+  if trimmed.length() >= 2 && trimmed.code_unit_at(0) == 47 && trimmed.code_unit_at(1) == 47 {
+    let candidate = base_origin.scheme + ":" + trimmed
+    match parse_origin(candidate) {
+      Some(o) => {
+        let (p, suffix) = split_path_and_suffix(candidate, o.authority_end)
+        if p.length() == 0 {
+          return Some(candidate)
+        }
+        return Some(slice_str(candidate, 0, o.authority_end) + remove_dot_segments(p) + suffix)
+      }
+      None => return Some(candidate)
+    }
+  }
+  let origin_prefix = slice_str(base, 0, base_origin.authority_end)
+  let (base_path, _) = split_path_and_suffix(base, base_origin.authority_end)
+  let c0 = trimmed.code_unit_at(0)
+  // Query-only reference "?query"
+  if c0 == 63 {
+    let norm_base_path = if base_path.length() == 0 { "/" } else { base_path }
+    return Some(origin_prefix + norm_base_path + trimmed)
+  }
+  // Fragment-only reference "#frag"
+  if c0 == 35 {
+    let mut hash_pos = base.length()
+    let mut hi = base_origin.authority_end
+    while hi < base.length() {
+      if base.code_unit_at(hi) == 35 {
+        hash_pos = hi
+        break
+      }
+      hi = hi + 1
+    }
+    return Some(slice_str(base, 0, hash_pos) + trimmed)
+  }
+  // Root-relative "/path"
+  if c0 == 47 {
+    let (ref_path, ref_suffix) = split_path_and_suffix(trimmed, 0)
+    return Some(origin_prefix + remove_dot_segments(ref_path) + ref_suffix)
+  }
+  // Path-relative reference merged with base directory (RFC 3986 §5.2.3)
+  let (ref_path, ref_suffix) = split_path_and_suffix(trimmed, 0)
+  let merged_path = if base_path.length() == 0 {
+    "/" + ref_path
+  } else {
+    let mut last_slash = -1
+    let mut i = 0
+    while i < base_path.length() {
+      if base_path.code_unit_at(i) == 47 {
+        last_slash = i
+      }
+      i = i + 1
+    }
+    if last_slash < 0 {
+      "/" + ref_path
+    } else {
+      slice_str(base_path, 0, last_slash + 1) + ref_path
+    }
+  }
+  Some(origin_prefix + remove_dot_segments(merged_path) + ref_suffix)
+}
+
+fn push_unique(arr : Array[String], item : String) -> Unit {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == item {
+      return
+    }
+    i = i + 1
+  }
+  arr.push(item)
+}
+
+///| Compute same-origin URIs to invalidate after an unsafe method receives a
+///| non-error response (RFC 9111 §4.4).
+pub fn invalidation_targets(
+  req : CacheRequest,
+  resp : CacheResponse,
+) -> Result[Array[String], CacheError] {
+  if is_safe_method(req.method) {
+    return Ok([])
+  }
+  // RFC 9111 §4.4: only non-error responses (2xx / 3xx) trigger invalidation
+  if resp.status < 200 || resp.status >= 400 {
+    return Ok([])
+  }
+  let out : Array[String] = []
+  if req.uri.length() > 0 {
+    out.push(req.uri)
+  }
+  match get_first_header(resp.headers, "location") {
+    Some(loc) => match resolve_uri(req.uri, loc) {
+      Some(resolved) => {
+        if same_origin(req.uri, resolved) {
+          push_unique(out, resolved)
+        }
+      }
+      None => ()
+    }
+    None => ()
+  }
+  match get_first_header(resp.headers, "content-location") {
+    Some(cloc) => match resolve_uri(req.uri, cloc) {
+      Some(resolved) => {
+        if same_origin(req.uri, resolved) {
+          push_unique(out, resolved)
+        }
+      }
+      None => ()
+    }
+    None => ()
+  }
+  Ok(out)
+}

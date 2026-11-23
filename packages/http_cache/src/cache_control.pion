@@ -1,0 +1,574 @@
+///| RFC 9111 §5.2 Cache-Control directive parser for requests and responses.
+///| Supports case-insensitive directive names, quoted-string values with
+///| backslash escaping, multi-header merging, RFC 9111 §5.4 Pragma: no-cache
+///| fallback when Cache-Control is absent, strict negative/non-digit
+///| rejection, RFC 9111 §1.2.2 delta-seconds clamping, and explicit CacheLimits.
+
+fn ascii_lower_byte(c : Int) -> Int {
+  if c >= 65 && c <= 90 { c + 32 } else { c }
+}
+
+fn ascii_eq_ignore_case(a : String, b_lower : String) -> Bool {
+  let n = a.length()
+  if n != b_lower.length() {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    if ascii_lower_byte(a.code_unit_at(i)) != b_lower.code_unit_at(i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn ascii_slice_lower(s : String, start : Int, end : Int) -> String {
+  let len = end - start
+  if len <= 0 {
+    return ""
+  }
+  // Fast path: full string already lowercase ASCII -> zero allocation
+  if start == 0 && end == s.length() {
+    let mut has_upper = false
+    let mut i = 0
+    while i < len {
+      let c = s.code_unit_at(i)
+      if c >= 65 && c <= 90 {
+        has_upper = true
+        break
+      }
+      i = i + 1
+    }
+    if !has_upper {
+      return s
+    }
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = ascii_lower_byte(s.code_unit_at(start + i)).to_byte()
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn is_ows(c : Int) -> Bool {
+  c == 32 || c == 9
+}
+
+fn is_tchar(c : Int) -> Bool {
+  if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+    return true
+  }
+  c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 ||
+  c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 ||
+  c == 96 || c == 124 || c == 126
+}
+
+fn parse_delta_seconds(s : String) -> Result[Int64, CacheError] {
+  let n = s.length()
+  if n == 0 {
+    return Err(CacheError::InvalidCacheControl("empty delta-seconds"))
+  }
+  let mut acc = 0L
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return Err(CacheError::InvalidCacheControl("non-digit in delta-seconds: " + s))
+    }
+    if acc < max_delta_seconds {
+      acc = acc * 10L + (c - 48).to_int64()
+      if acc > max_delta_seconds {
+        acc = max_delta_seconds
+      }
+    }
+    i = i + 1
+  }
+  Ok(acc)
+}
+
+///| Check if a `Pragma` header value contains the `no-cache` token (RFC 9111 §5.4).
+fn pragma_has_no_cache(value : String) -> Bool {
+  let n = value.length()
+  let mut i = 0
+  while i < n {
+    while i < n && (is_ows(value.code_unit_at(i)) || value.code_unit_at(i) == 44) {
+      i = i + 1
+    }
+    let start = i
+    while i < n && value.code_unit_at(i) != 44 && value.code_unit_at(i) != 61 && !is_ows(value.code_unit_at(i)) {
+      i = i + 1
+    }
+    if i - start == 8 && ascii_slice_lower(value, start, i) == "no-cache" {
+      return true
+    }
+    while i < n && value.code_unit_at(i) != 44 {
+      i = i + 1
+    }
+    if i < n && value.code_unit_at(i) == 44 {
+      i = i + 1
+    }
+  }
+  false
+}
+
+///| Parse a comma-separated list of field names from a quoted directive value
+///| (e.g. `no-cache="Set-Cookie, Authorization"`).
+fn split_field_names(raw : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = raw.length()
+  let mut i = 0
+  while i < n {
+    while i < n && (is_ows(raw.code_unit_at(i)) || raw.code_unit_at(i) == 44) {
+      i = i + 1
+    }
+    let start = i
+    while i < n && raw.code_unit_at(i) != 44 {
+      i = i + 1
+    }
+    let mut end = i
+    while end > start && is_ows(raw.code_unit_at(end - 1)) {
+      end = end - 1
+    }
+    if end > start {
+      out.push(ascii_slice_lower(raw, start, end))
+    }
+    if i < n && raw.code_unit_at(i) == 44 {
+      i = i + 1
+    }
+  }
+  out
+}
+
+///| Parse raw Cache-Control header value into `(lower_name, Option[value])` directives.
+fn parse_cc_directives_into(
+  value : String,
+  limits : CacheLimits,
+  out : Array[(String, Option[String])],
+) -> Result[Unit, CacheError] {
+  let n = value.length()
+  if n > limits.max_header_bytes {
+    return Err(CacheError::LimitExceeded("Cache-Control header exceeds max_header_bytes"))
+  }
+  let mut i = 0
+  while i < n {
+    // Skip OWS and commas
+    while i < n && (is_ows(value.code_unit_at(i)) || value.code_unit_at(i) == 44) {
+      i = i + 1
+    }
+    if i >= n {
+      break
+    }
+    if out.length() >= limits.max_directives {
+      return Err(CacheError::LimitExceeded("Cache-Control exceeds max_directives"))
+    }
+    // Parse directive token name
+    let name_start = i
+    while i < n && is_tchar(value.code_unit_at(i)) {
+      i = i + 1
+    }
+    if i == name_start {
+      return Err(CacheError::InvalidCacheControl("expected directive token"))
+    }
+    let name = ascii_slice_lower(value, name_start, i)
+
+    // Skip OWS before optional '='
+    while i < n && is_ows(value.code_unit_at(i)) {
+      i = i + 1
+    }
+    let mut arg : Option[String] = None
+    if i < n && value.code_unit_at(i) == 61 {
+      // '='
+      i = i + 1
+      while i < n && is_ows(value.code_unit_at(i)) {
+        i = i + 1
+      }
+      if i >= n {
+        return Err(CacheError::InvalidCacheControl("missing value after '='"))
+      }
+      if value.code_unit_at(i) == 34 {
+        // Quoted-string
+        i = i + 1
+        let raw_bytes : Array[Byte] = []
+        let mut closed = false
+        while i < n {
+          let c = value.code_unit_at(i)
+          if c == 92 {
+            // Backslash escape
+            i = i + 1
+            if i >= n {
+              return Err(CacheError::InvalidCacheControl("dangling escape in quoted-string"))
+            }
+            raw_bytes.push(value.code_unit_at(i).to_byte())
+            i = i + 1
+          } else if c == 34 {
+            i = i + 1
+            closed = true
+            break
+          } else {
+            raw_bytes.push(c.to_byte())
+            i = i + 1
+          }
+        }
+        if !closed {
+          return Err(CacheError::InvalidCacheControl("unterminated quoted-string"))
+        }
+        let q_bytes = Bytes::new(raw_bytes.length())
+        let mut qi = 0
+        while qi < raw_bytes.length() {
+          q_bytes[qi] = raw_bytes[qi]
+          qi = qi + 1
+        }
+        arg = Some(q_bytes.to_string())
+      } else {
+        // Unquoted token value (read until ',' or OWS)
+        let val_start = i
+        while i < n && value.code_unit_at(i) != 44 && !is_ows(value.code_unit_at(i)) {
+          i = i + 1
+        }
+        if i == val_start {
+          return Err(CacheError::InvalidCacheControl("empty unquoted directive value"))
+        }
+        let v_bytes = Bytes::new(i - val_start)
+        let mut k = 0
+        while k < i - val_start {
+          v_bytes[k] = value.code_unit_at(val_start + k).to_byte()
+          k = k + 1
+        }
+        arg = Some(v_bytes.to_string())
+      }
+    }
+
+    // Skip trailing OWS and expect ',' or end
+    while i < n && is_ows(value.code_unit_at(i)) {
+      i = i + 1
+    }
+    if i < n && value.code_unit_at(i) != 44 {
+      return Err(CacheError::InvalidCacheControl("expected ',' between directives"))
+    }
+    if i < n && value.code_unit_at(i) == 44 {
+      i = i + 1
+    }
+    out.push((name, arg))
+  }
+  Ok(())
+}
+
+fn min_opt_i64(a : Option[Int64], b : Int64) -> Option[Int64] {
+  match a {
+    None => Some(b)
+    Some(x) => Some(if b < x { b } else { x })
+  }
+}
+
+fn max_opt_i64(a : Option[Int64], b : Int64) -> Option[Int64] {
+  match a {
+    None => Some(b)
+    Some(x) => Some(if b > x { b } else { x })
+  }
+}
+
+fn apply_request_directives(
+  dirs : Array[(String, Option[String])],
+  pragma_no_cache : Bool,
+) -> Result[RequestCacheControl, CacheError] {
+  let mut max_age : Option[Int64] = None
+  let mut has_max_stale = false
+  let mut max_stale_seconds : Option[Int64] = None
+  let mut min_fresh : Option[Int64] = None
+  let mut no_cache = pragma_no_cache
+  let mut no_store = false
+  let mut no_transform = false
+  let mut only_if_cached = false
+
+  let mut i = 0
+  while i < dirs.length() {
+    let (name, arg) = dirs[i]
+    if name == "max-age" {
+      match arg {
+        Some(v) => match parse_delta_seconds(v) {
+          Ok(sec) => max_age = min_opt_i64(max_age, sec)
+          Err(e) => return Err(e)
+        }
+        None => return Err(CacheError::InvalidCacheControl("max-age requires delta-seconds"))
+      }
+    } else if name == "max-stale" {
+      has_max_stale = true
+      match arg {
+        Some(v) => match parse_delta_seconds(v) {
+          Ok(sec) => max_stale_seconds = min_opt_i64(max_stale_seconds, sec)
+          Err(e) => return Err(e)
+        }
+        None => ()
+      }
+    } else if name == "min-fresh" {
+      match arg {
+        Some(v) => match parse_delta_seconds(v) {
+          Ok(sec) => min_fresh = max_opt_i64(min_fresh, sec)
+          Err(e) => return Err(e)
+        }
+        None => return Err(CacheError::InvalidCacheControl("min-fresh requires delta-seconds"))
+      }
+    } else if name == "no-cache" {
+      no_cache = true
+    } else if name == "no-store" {
+      no_store = true
+    } else if name == "no-transform" {
+      no_transform = true
+    } else if name == "only-if-cached" {
+      only_if_cached = true
+    }
+    i = i + 1
+  }
+
+  Ok(RequestCacheControl::{
+    max_age: max_age,
+    has_max_stale: has_max_stale,
+    max_stale_seconds: max_stale_seconds,
+    min_fresh: min_fresh,
+    no_cache: no_cache,
+    no_store: no_store,
+    no_transform: no_transform,
+    only_if_cached: only_if_cached,
+  })
+}
+
+fn apply_response_directives(
+  dirs : Array[(String, Option[String])],
+  pragma_no_cache : Bool,
+) -> Result[ResponseCacheControl, CacheError] {
+  let mut is_public = false
+  let mut is_private = false
+  let private_fields : Array[String] = []
+  let mut no_cache = pragma_no_cache
+  let no_cache_fields : Array[String] = []
+  let mut no_store = false
+  let mut must_revalidate = false
+  let mut proxy_revalidate = false
+  let mut must_understand = false
+  let mut max_age : Option[Int64] = None
+  let mut s_maxage : Option[Int64] = None
+  let mut immutable = false
+  let mut stale_while_revalidate : Option[Int64] = None
+  let mut stale_if_error : Option[Int64] = None
+  let mut no_transform = false
+
+  let mut i = 0
+  while i < dirs.length() {
+    let (name, arg) = dirs[i]
+    if name == "public" {
+      is_public = true
+    } else if name == "private" {
+      is_private = true
+      match arg {
+        Some(v) => {
+          let fields = split_field_names(v)
+          let mut j = 0
+          while j < fields.length() {
+            private_fields.push(fields[j])
+            j = j + 1
+          }
+        }
+        None => ()
+      }
+    } else if name == "no-cache" {
+      no_cache = true
+      match arg {
+        Some(v) => {
+          let fields = split_field_names(v)
+          let mut j = 0
+          while j < fields.length() {
+            no_cache_fields.push(fields[j])
+            j = j + 1
+          }
+        }
+        None => ()
+      }
+    } else if name == "no-store" {
+      no_store = true
+    } else if name == "must-revalidate" {
+      must_revalidate = true
+    } else if name == "proxy-revalidate" {
+      proxy_revalidate = true
+    } else if name == "must-understand" {
+      must_understand = true
+    } else if name == "max-age" {
+      match arg {
+        Some(v) => match parse_delta_seconds(v) {
+          Ok(sec) => max_age = min_opt_i64(max_age, sec)
+          Err(e) => return Err(e)
+        }
+        None => return Err(CacheError::InvalidCacheControl("max-age requires delta-seconds"))
+      }
+    } else if name == "s-maxage" {
+      match arg {
+        Some(v) => match parse_delta_seconds(v) {
+          Ok(sec) => s_maxage = min_opt_i64(s_maxage, sec)
+          Err(e) => return Err(e)
+        }
+        None => return Err(CacheError::InvalidCacheControl("s-maxage requires delta-seconds"))
+      }
+    } else if name == "immutable" {
+      immutable = true
+    } else if name == "stale-while-revalidate" {
+      match arg {
+        Some(v) => match parse_delta_seconds(v) {
+          Ok(sec) => stale_while_revalidate = min_opt_i64(stale_while_revalidate, sec)
+          Err(e) => return Err(e)
+        }
+        None => return Err(CacheError::InvalidCacheControl("stale-while-revalidate requires delta-seconds"))
+      }
+    } else if name == "stale-if-error" {
+      match arg {
+        Some(v) => match parse_delta_seconds(v) {
+          Ok(sec) => stale_if_error = min_opt_i64(stale_if_error, sec)
+          Err(e) => return Err(e)
+        }
+        None => return Err(CacheError::InvalidCacheControl("stale-if-error requires delta-seconds"))
+      }
+    } else if name == "no-transform" {
+      no_transform = true
+    }
+    i = i + 1
+  }
+
+  Ok(ResponseCacheControl::{
+    is_public: is_public,
+    is_private: is_private,
+    private_fields: private_fields,
+    no_cache: no_cache,
+    no_cache_fields: no_cache_fields,
+    no_store: no_store,
+    must_revalidate: must_revalidate,
+    proxy_revalidate: proxy_revalidate,
+    must_understand: must_understand,
+    max_age: max_age,
+    s_maxage: s_maxage,
+    immutable: immutable,
+    stale_while_revalidate: stale_while_revalidate,
+    stale_if_error: stale_if_error,
+    no_transform: no_transform,
+  })
+}
+
+///| Parse a single request `Cache-Control` header value with default limits.
+pub fn parse_request_cc_value(
+  value : String,
+) -> Result[RequestCacheControl, CacheError] {
+  let limits = CacheLimits::default()
+  let dirs : Array[(String, Option[String])] = []
+  match parse_cc_directives_into(value, limits, dirs) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  apply_request_directives(dirs, false)
+}
+
+///| Parse request `Cache-Control` directives enforcing explicit `CacheLimits`.
+///| Falls back to `Pragma: no-cache` when no `Cache-Control` header is present (RFC 9111 §5.4).
+pub fn parse_request_cache_control_with_limits(
+  headers : Array[Header],
+  limits : CacheLimits,
+) -> Result[RequestCacheControl, CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if headers.length() > limits.max_headers {
+    return Err(CacheError::LimitExceeded("request headers exceed max_headers"))
+  }
+  let dirs : Array[(String, Option[String])] = []
+  let mut has_cc = false
+  let mut has_pragma_nc = false
+  let mut total_bytes = 0
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    total_bytes = total_bytes + h.name.length() + h.value.length()
+    if total_bytes > limits.max_header_bytes {
+      return Err(CacheError::LimitExceeded("request headers exceed max_header_bytes"))
+    }
+    if ascii_eq_ignore_case(h.name, "cache-control") {
+      has_cc = true
+      match parse_cc_directives_into(h.value, limits, dirs) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+    } else if !has_cc && ascii_eq_ignore_case(h.name, "pragma") {
+      if pragma_has_no_cache(h.value) {
+        has_pragma_nc = true
+      }
+    }
+    i = i + 1
+  }
+  apply_request_directives(dirs, !has_cc && has_pragma_nc)
+}
+
+///| Parse request `Cache-Control` directives from all `Cache-Control` headers.
+pub fn parse_request_cache_control(
+  headers : Array[Header],
+) -> Result[RequestCacheControl, CacheError] {
+  parse_request_cache_control_with_limits(headers, CacheLimits::default())
+}
+
+///| Parse a single response `Cache-Control` header value with default limits.
+pub fn parse_response_cc_value(
+  value : String,
+) -> Result[ResponseCacheControl, CacheError] {
+  let limits = CacheLimits::default()
+  let dirs : Array[(String, Option[String])] = []
+  match parse_cc_directives_into(value, limits, dirs) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  apply_response_directives(dirs, false)
+}
+
+///| Parse response `Cache-Control` directives enforcing explicit `CacheLimits`.
+///| Falls back to `Pragma: no-cache` when no `Cache-Control` header is present (RFC 9111 §5.4).
+pub fn parse_response_cache_control_with_limits(
+  headers : Array[Header],
+  limits : CacheLimits,
+) -> Result[ResponseCacheControl, CacheError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if headers.length() > limits.max_headers {
+    return Err(CacheError::LimitExceeded("response headers exceed max_headers"))
+  }
+  let dirs : Array[(String, Option[String])] = []
+  let mut has_cc = false
+  let mut has_pragma_nc = false
+  let mut total_bytes = 0
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    total_bytes = total_bytes + h.name.length() + h.value.length()
+    if total_bytes > limits.max_header_bytes {
+      return Err(CacheError::LimitExceeded("response headers exceed max_header_bytes"))
+    }
+    if ascii_eq_ignore_case(h.name, "cache-control") {
+      has_cc = true
+      match parse_cc_directives_into(h.value, limits, dirs) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+    } else if !has_cc && ascii_eq_ignore_case(h.name, "pragma") {
+      if pragma_has_no_cache(h.value) {
+        has_pragma_nc = true
+      }
+    }
+    i = i + 1
+  }
+  apply_response_directives(dirs, !has_cc && has_pragma_nc)
+}
+
+///| Parse response `Cache-Control` directives from all `Cache-Control` headers.
+pub fn parse_response_cache_control(
+  headers : Array[Header],
+) -> Result[ResponseCacheControl, CacheError] {
+  parse_response_cache_control_with_limits(headers, CacheLimits::default())
+}
