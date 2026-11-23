@@ -1,6 +1,6 @@
 # `url` — Pure-Pion WHATWG URL Standard Library
 
-Zero-dependency, pure-Pion implementation of the [WHATWG URL Standard](https://url.spec.whatwg.org/) modeled after [`servo/rust-url`](https://github.com/servo/rust-url), including full URL parsing/resolution, Punycode (RFC 3492) + full Unicode 16.0.0 UTS #46 / IDNA domain processing (Mapping, NFC, CheckBidi, CheckJoiners, P4/V1/V5/V6/V7), IPv4/IPv6 parsing & RFC 5952 serialization, percent-encoding, O(1)/O(N) slice-based setters, and `QueryParams` (`URLSearchParams`).
+Zero-dependency, pure-Pion implementation (`v0.1.1`) of the [WHATWG URL Standard](https://url.spec.whatwg.org/) modeled after [`servo/rust-url`](https://github.com/servo/rust-url), including full URL parsing/resolution, Punycode (RFC 3492) + full Unicode 16.0.0 UTS #46 / IDNA domain processing (Mapping, NFC, CheckBidi, CheckJoiners, P4/V1/V5/V6/V7), IPv4/IPv6 parsing & RFC 5952 serialization, percent-encoding, O(1)/O(N) slice-based setters, `QueryParams` (`URLSearchParams`), and RFC 2397 / Fetch §6 `data:` URI parsing (`parse_data_url`).
 
 ## Compliance & Test Results
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 # 4-mode wasm_smoke parity check and head-to-head benchmark runner for packages/crypto:
-# Pure Pion (Native --release) vs Go stdlib (crypto/sha256, crypto/sha512, crypto/hmac, crypto/ed25519).
+# Pure Pion (Native --release) vs Go stdlib (+ golang.org/x/crypto/chacha20poly1305).
 # All build artifacts are isolated in /tmp/pion-crypto-bench (zero worktree pollution).
 set -eu
 
@@ -44,10 +44,13 @@ echo ""
 echo "==> Building Pion Native benchmark (--release)"
 pionc build --release -o "$BIN_DIR/pion_crypto_bench" "$BENCH_DIR/pion_bench"
 
-echo "==> Building Go stdlib benchmark (isolated in /tmp)"
+echo "==> Building Go benchmark (isolated in /tmp)"
 cp "$BENCH_DIR/go/go.mod" "$OUT_DIR/go-build/go.mod"
+if [ -f "$BENCH_DIR/go/go.sum" ]; then
+  cp "$BENCH_DIR/go/go.sum" "$OUT_DIR/go-build/go.sum"
+fi
 cp "$BENCH_DIR/go/main.go" "$OUT_DIR/go-build/main.go"
-(cd "$OUT_DIR/go-build" && go build -o "$BIN_DIR/go_crypto_bench" .)
+(cd "$OUT_DIR/go-build" && go mod tidy && go build -o "$BIN_DIR/go_crypto_bench" .)
 
 echo ""
 echo "=== BENCH 1: SHA-256 (16 MiB streaming) ==="
@@ -88,3 +91,43 @@ python3 "$ROOT_DIR/scripts/bench_compare.py" \
   --baseline go_stdlib \
   --warmup 1 --rounds 5 --ops 400 \
   --md-out "$OUT_DIR/bench_ed25519.md" --json-out "$OUT_DIR/bench_ed25519.json"
+
+echo ""
+echo "=== BENCH 5: X25519 (200 key exchanges) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "Crypto Bench 5: X25519 (200 key exchanges)" \
+  --impl "pion=$BIN_DIR/pion_crypto_bench x25519" \
+  --impl "go_stdlib=$BIN_DIR/go_crypto_bench x25519" \
+  --baseline go_stdlib \
+  --warmup 1 --rounds 5 --ops 200 \
+  --md-out "$OUT_DIR/bench_x25519.md" --json-out "$OUT_DIR/bench_x25519.json"
+
+echo ""
+echo "=== BENCH 6: HKDF-SHA256 (20,000 x 64 B) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "Crypto Bench 6: HKDF-SHA256 (20,000 x 64 B)" \
+  --impl "pion=$BIN_DIR/pion_crypto_bench hkdf256" \
+  --impl "go_stdlib=$BIN_DIR/go_crypto_bench hkdf256" \
+  --baseline go_stdlib \
+  --warmup 1 --rounds 5 --ops 20000 \
+  --md-out "$OUT_DIR/bench_hkdf256.md" --json-out "$OUT_DIR/bench_hkdf256.json"
+
+echo ""
+echo "=== BENCH 7: ChaCha20-Poly1305 AEAD (4 MiB seal + open) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "Crypto Bench 7: ChaCha20-Poly1305 AEAD (4 MiB seal + open)" \
+  --impl "pion=$BIN_DIR/pion_crypto_bench chacha20" \
+  --impl "go_xcrypto=$BIN_DIR/go_crypto_bench chacha20" \
+  --baseline go_xcrypto \
+  --warmup 1 --rounds 5 --bytes 8388608 \
+  --md-out "$OUT_DIR/bench_chacha20.md" --json-out "$OUT_DIR/bench_chacha20.json"
+
+echo ""
+echo "=== BENCH 8: NIST P-256 ES256 (50 sign + 50 verify) ==="
+python3 "$ROOT_DIR/scripts/bench_compare.py" \
+  --title "Crypto Bench 8: NIST P-256 ES256 (50 sign + 50 verify)" \
+  --impl "pion=$BIN_DIR/pion_crypto_bench p256" \
+  --impl "go_stdlib=$BIN_DIR/go_crypto_bench p256" \
+  --baseline go_stdlib \
+  --warmup 1 --rounds 5 --ops 100 \
+  --md-out "$OUT_DIR/bench_p256.md" --json-out "$OUT_DIR/bench_p256.json"
