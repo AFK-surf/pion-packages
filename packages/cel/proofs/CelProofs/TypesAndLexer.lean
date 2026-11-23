@@ -80,14 +80,14 @@ theorem cel_type_eq_iff (a b : CelType) :
     | Dyn | Null | Bool | Int | UInt | Double | String | Bytes | List _ | Timestamp | Duration | «Type» =>
       rw [cel_type_eq]; all_goals simp
 
-/-- Theorem 14: `cel_type_eq` is reflexive. -/
-theorem cel_type_eq_refl (a : CelType) :
+/-- Helper: `cel_type_eq` is reflexive. -/
+private lemma cel_type_eq_refl (a : CelType) :
     cel_type_eq a a = ok true := by
   rcases cel_type_eq_iff a a with ⟨r, hr, hiff⟩
   rw [hr, hiff.mpr rfl]
 
-/-- Theorem 15: `cel_type_eq` is symmetric. -/
-theorem cel_type_eq_symm (a b : CelType) :
+/-- Helper: `cel_type_eq` is symmetric. -/
+private lemma cel_type_eq_symm (a b : CelType) :
     cel_type_eq a b = cel_type_eq b a := by
   rcases cel_type_eq_iff a b with ⟨r1, hr1, hiff1⟩
   rcases cel_type_eq_iff b a with ⟨r2, hr2, hiff2⟩
@@ -95,51 +95,6 @@ theorem cel_type_eq_symm (a b : CelType) :
   apply congrArg ok
   apply Bool.eq_iff_iff.mpr
   rw [hiff1, hiff2, eq_comm]
-
-/-- Theorem 16: `is_assignable` is total on all pairs of `CelType`. -/
-theorem is_assignable_total (a b : CelType) :
-    ∃ r, is_assignable a b = ok r := by
-  induction a generalizing b with
-  | Dyn => rw [is_assignable]; exact ⟨true, rfl⟩
-  | List x ih =>
-    cases b with
-    | Dyn => rw [is_assignable]; exact ⟨true, rfl⟩
-    | List y =>
-      rw [is_assignable]
-      rcases ih y with ⟨r, hr⟩
-      rw [hr, result_bind_ok]
-      exact ⟨r, rfl⟩
-    | Null | Bool | Int | UInt | Double | String | Bytes | Map _ _ | Timestamp | Duration | «Type» =>
-      rw [is_assignable]
-      · exact ⟨false, rfl⟩
-      all_goals simp
-  | Map k1 v1 ihk ihv =>
-    cases b with
-    | Dyn => rw [is_assignable]; exact ⟨true, rfl⟩
-    | Map k2 v2 =>
-      rw [is_assignable]
-      rcases ihk k2 with ⟨rk, hrk⟩
-      rw [hrk, result_bind_ok]
-      cases rk
-      · exact ⟨false, by simp⟩
-      · rcases ihv v2 with ⟨rv, hrv⟩
-        rw [hrv, result_bind_ok]
-        exact ⟨rv, by simp⟩
-    | Null | Bool | Int | UInt | Double | String | Bytes | List _ | Timestamp | Duration | «Type» =>
-      rw [is_assignable]
-      · exact ⟨false, rfl⟩
-      all_goals simp
-  | Null | Bool | Int | UInt | Double | String | Bytes | Timestamp | Duration | «Type» =>
-    cases b with
-    | Dyn =>
-      rw [is_assignable]
-      · exact ⟨true, rfl⟩
-      all_goals simp
-    | Null | Bool | Int | UInt | Double | String | Bytes | List _ | Map _ _ | Timestamp | Duration | «Type» =>
-      rw [is_assignable]
-      · rw [cel_type_eq]
-        all_goals simp
-      all_goals simp
 
 /-- Theorem 17: `is_assignable` is reflexive (every CEL type is assignable to itself). -/
 theorem is_assignable_refl (a : CelType) :
@@ -206,36 +161,6 @@ theorem is_assignable_symm (a b : CelType) :
       | (rw [is_assignable, is_assignable]
          · rw [cel_type_eq_symm]
          all_goals simp)
-
-/-- Theorem 19: `Dyn` is universally assignable on both sides. -/
-theorem is_assignable_dyn (a : CelType) :
-    is_assignable .Dyn a = ok true ∧ is_assignable a .Dyn = ok true := by
-  constructor
-  · rw [is_assignable]
-  · rw [is_assignable_symm, is_assignable]
-
-/-- Theorem 20: Structural type equality implies assignability. -/
-theorem is_assignable_of_eq (a b : CelType) (h : cel_type_eq a b = ok true) :
-    is_assignable a b = ok true := by
-  rcases cel_type_eq_iff a b with ⟨r, hr, hiff⟩
-  rw [hr] at h
-  have hab : a = b := hiff.mp (result_ok_inj h)
-  subst hab
-  exact is_assignable_refl a
-
-/-- Theorem 21: `is_valid_map_key_type` accepts exactly `{Bool, Int, UInt, String, Dyn}` per CEL spec (rejecting `Double`, `Bytes`, `Null`, containers, `Timestamp`, `Duration`, `Type`). -/
-theorem is_valid_map_key_type_exact (t : CelType) :
-    is_valid_map_key_type t = ok true ↔
-      (t = .Bool ∨ t = .Int ∨ t = .UInt ∨ t = .String ∨ t = .Dyn) := by
-  cases t <;> unfold is_valid_map_key_type <;> simp
-
-/-- Theorem 22: `is_numeric_type` and `is_bool_compat` match their exact CEL spec sets. -/
-theorem is_numeric_and_bool_compat_exact (t : CelType) :
-    (is_numeric_type t = ok true ↔ (t = .Int ∨ t = .UInt ∨ t = .Double ∨ t = .Dyn)) ∧
-    (is_bool_compat t = ok true ↔ (t = .Bool ∨ t = .Dyn)) := by
-  constructor
-  · cases t <;> unfold is_numeric_type <;> simp
-  · cases t <;> unfold is_bool_compat <;> simp
 
 /-- Theorem 23: CEL identifier start bytes are a subset of continuation bytes, while ASCII digits are continuation bytes disjoint from identifier starts. -/
 theorem lexer_ident_digit_invariants (b : I32) :

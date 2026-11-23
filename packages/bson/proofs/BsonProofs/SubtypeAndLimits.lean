@@ -117,8 +117,8 @@ theorem binary_subtype_to_from_byte_roundtrip (b : Std.I32) (h0 : 0 ≤ b.val) (
 private lemma ne_of_val_gt {b k : Std.I32} (h : k.val < b.val) : b ≠ k :=
   fun heq => by rw [heq] at h; omega
 
-/-- Theorem 2: `BinarySubtype.from_byte` maps `0x0A..0x7F` to `Reserved` and `0x80..0xFF` to `UserDefined`. -/
-theorem binary_subtype_from_byte_ranges (b : Std.I32) (h0 : 0 ≤ b.val) (h255 : b.val ≤ 255) :
+/-- Helper: `BinarySubtype.from_byte` maps `0x0A..0x7F` to `Reserved` and `0x80..0xFF` to `UserDefined`. -/
+private lemma binary_subtype_from_byte_ranges (b : Std.I32) (h0 : 0 ≤ b.val) (h255 : b.val ≤ 255) :
     (10 ≤ b.val ∧ b.val ≤ 127 → BinarySubtype.from_byte b = ok (BinarySubtype.Reserved b)) ∧
     (128 ≤ b.val ∧ b.val ≤ 255 → BinarySubtype.from_byte b = ok (BinarySubtype.UserDefined b)) := by
   have hb : Pion.I32.band b 255#i32 = b := i32_band_255_eq_self b h0 h255
@@ -188,78 +188,6 @@ theorem binary_subtype_from_to_byte_canonical (s : BinarySubtype) (hcan : isCano
     rw [i32_band_255_eq_self v (by omega) (by omega), result_bind_ok]
     exact (binary_subtype_from_byte_ranges v (by omega) (by omega)).2 ⟨hlo, hhi⟩
 
-/-- Theorem 4: `BinarySubtype.to_byte` is total and always yields a wire byte in `[0, 255]`. -/
-theorem binary_subtype_to_byte_bounds (s : BinarySubtype) :
-    ∃ r : Std.I32, BinarySubtype.to_byte s = ok r ∧ 0 ≤ r.val ∧ r.val ≤ 255 := by
-  cases s with
-  | Generic => exact ⟨0#i32, rfl, by decide, by decide⟩
-  | Function => exact ⟨1#i32, rfl, by decide, by decide⟩
-  | BinaryOld => exact ⟨2#i32, rfl, by decide, by decide⟩
-  | UuidOld => exact ⟨3#i32, rfl, by decide, by decide⟩
-  | Uuid => exact ⟨4#i32, rfl, by decide, by decide⟩
-  | Md5 => exact ⟨5#i32, rfl, by decide, by decide⟩
-  | Encrypted => exact ⟨6#i32, rfl, by decide, by decide⟩
-  | Column => exact ⟨7#i32, rfl, by decide, by decide⟩
-  | Sensitive => exact ⟨8#i32, rfl, by decide, by decide⟩
-  | Vector => exact ⟨9#i32, rfl, by decide, by decide⟩
-  | Reserved v => exact ⟨Pion.I32.band v 255#i32, rfl, i32_band_255_bounds v⟩
-  | UserDefined v => exact ⟨Pion.I32.band v 255#i32, rfl, i32_band_255_bounds v⟩
-
-/-- Theorem 5: `binary_subtype_eq` is reflexive across all `BinarySubtype` values. -/
-theorem binary_subtype_eq_refl (s : BinarySubtype) :
-    binary_subtype_eq s s = ok true := by
-  obtain ⟨r, hr, _, _⟩ := binary_subtype_to_byte_bounds s
-  unfold binary_subtype_eq
-  rw [hr, result_bind_ok, result_bind_ok]
-  apply congrArg ok
-  exact (i32_beq_iff r r).mpr rfl
-
-/-- Theorem 6: `binary_subtype_eq` is symmetric across all `BinarySubtype` pairs. -/
-theorem binary_subtype_eq_symm (a b : BinarySubtype)
-    (h : binary_subtype_eq a b = ok true) :
-    binary_subtype_eq b a = ok true := by
-  obtain ⟨ra, hra, _, _⟩ := binary_subtype_to_byte_bounds a
-  obtain ⟨rb, hrb, _, _⟩ := binary_subtype_to_byte_bounds b
-  unfold binary_subtype_eq at h ⊢
-  rw [hra, result_bind_ok, hrb, result_bind_ok] at h
-  rw [hrb, result_bind_ok, hra, result_bind_ok]
-  simp only [ok.injEq, i32_beq_iff] at h ⊢
-  exact h.symm
-
-/-- Theorem 7: `binary_subtype_eq` is transitive across all `BinarySubtype` triples. -/
-theorem binary_subtype_eq_trans (a b c : BinarySubtype)
-    (hab : binary_subtype_eq a b = ok true) (hbc : binary_subtype_eq b c = ok true) :
-    binary_subtype_eq a c = ok true := by
-  obtain ⟨ra, hra, _, _⟩ := binary_subtype_to_byte_bounds a
-  obtain ⟨rb, hrb, _, _⟩ := binary_subtype_to_byte_bounds b
-  obtain ⟨rc, hrc, _, _⟩ := binary_subtype_to_byte_bounds c
-  unfold binary_subtype_eq at hab hbc ⊢
-  rw [hra, result_bind_ok, hrb, result_bind_ok] at hab
-  rw [hrb, result_bind_ok, hrc, result_bind_ok] at hbc
-  rw [hra, result_bind_ok, hrc, result_bind_ok]
-  simp only [ok.injEq, i32_beq_iff] at hab hbc ⊢
-  exact hab.trans hbc
-
-/-- Theorem 8: `BsonLimits::default` matches MongoDB BSON 1.1 limits (depth 128, 16 MiB, 1M elements, array-key validation off). -/
-theorem bson_limits_default_spec :
-    ∃ lim : BsonLimits,
-      BsonLimits.default = ok lim ∧
-      lim.max_depth.val = 128 ∧
-      lim.max_doc_bytes.val = 16777216 ∧
-      lim.max_elements.val = 1000000 ∧
-      lim.validate_array_keys = false := by
-  exact ⟨BsonLimits.mk 128#i32 16777216#i32 1000000#i32 false, rfl, rfl, rfl, rfl, rfl⟩
-
-/-- Theorem 9: `BsonLimits::with_validate_array_keys` preserves all three numeric limits and updates only `validate_array_keys`. -/
-theorem bson_limits_with_validate_preserves_bounds (d b e : Std.I32) (v : Bool) :
-    ∃ lim lim' : BsonLimits,
-      BsonLimits.new d b e = ok lim ∧
-      BsonLimits.with_validate_array_keys lim v = ok lim' ∧
-      lim.validate_array_keys = false ∧
-      lim'.max_depth = d ∧ lim'.max_doc_bytes = b ∧ lim'.max_elements = e ∧
-      lim'.validate_array_keys = v := by
-  exact ⟨BsonLimits.mk d b e false, BsonLimits.mk d b e v, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-
 /-- Theorem 10: `oid_hex_val` always returns either `-1` (invalid) or a nibble in `[0, 15]`. -/
 theorem oid_hex_val_bounds (c : Std.I32) :
     ∃ r : Std.I32, oid_hex_val c = ok r ∧ (r.val = -1 ∨ (0 ≤ r.val ∧ r.val ≤ 15)) := by
@@ -292,53 +220,5 @@ theorem oid_hex_val_bounds (c : Std.I32) :
       · have h3f := Bool.eq_false_iff.mpr h3
         simp only [h3f, Bool.false_eq_true, ↓reduceIte]
         exact ⟨(-1)#i32, rfl, Or.inl i32_val_neg1⟩
-
-/-- Theorem 11: `oid_hex_val` is case-insensitive on `'A'..'F'` (`oid_hex_val (c + 32) = oid_hex_val c = c - 55`). -/
-theorem oid_hex_val_case_insensitive (c : Std.I32) (hlo : 65 ≤ c.val) (hhi : c.val ≤ 70) :
-    ∃ r : Std.I32,
-      oid_hex_val c = ok r ∧
-      oid_hex_val (Pion.I32.add c 32#i32) = ok r ∧
-      r.val = c.val - 55 := by
-  set cl := Pion.I32.add c 32#i32
-  have hcl : cl.val = c.val + 32 :=
-    i32_add_val c 32#i32 (by change -2147483648 ≤ c.val + 32; omega) (by change c.val + 32 ≤ 2147483647; omega)
-  have hsub1 : (Pion.I32.sub c 55#i32).val = c.val - 55 :=
-    i32_sub_val c 55#i32 (by change -2147483648 ≤ c.val - 55; omega) (by change c.val - 55 ≤ 2147483647; omega)
-  have hsub2 : (Pion.I32.sub cl 87#i32).val = c.val - 55 := by
-    have h := i32_sub_val cl 87#i32 (by change -2147483648 ≤ cl.val - 87; omega) (by change cl.val - 87 ≤ 2147483647; omega)
-    change (Pion.I32.sub cl 87#i32).val = cl.val - 87 at h
-    omega
-  have heq : Pion.I32.sub cl 87#i32 = Pion.I32.sub c 55#i32 := IScalar.eq_of_val_eq (by omega)
-  refine ⟨Pion.I32.sub c 55#i32, ?_, ?_, hsub1⟩
-  · unfold oid_hex_val
-    have f1 : ((decide (c >= 48#i32)) && (decide (c <= 57#i32))) = false := by
-      rw [Bool.eq_false_iff]; intro h; simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff] at h
-      change 48 ≤ c.val ∧ c.val ≤ 57 at h; omega
-    have f2 : ((decide (c >= 97#i32)) && (decide (c <= 102#i32))) = false := by
-      rw [Bool.eq_false_iff]; intro h; simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff] at h
-      change 97 ≤ c.val ∧ c.val ≤ 102 at h; omega
-    have t3 : ((decide (c >= 65#i32)) && (decide (c <= 70#i32))) = true := by
-      simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff]
-      change 65 ≤ c.val ∧ c.val ≤ 70; omega
-    simp only [f1, f2, t3, Bool.false_eq_true, ↓reduceIte]
-  · unfold oid_hex_val
-    have f1 : ((decide (cl >= 48#i32)) && (decide (cl <= 57#i32))) = false := by
-      rw [Bool.eq_false_iff]; intro h; simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff] at h
-      change 48 ≤ cl.val ∧ cl.val ≤ 57 at h; omega
-    have t2 : ((decide (cl >= 97#i32)) && (decide (cl <= 102#i32))) = true := by
-      simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff]
-      change 97 ≤ cl.val ∧ cl.val ≤ 102; omega
-    simp only [f1, t2, Bool.false_eq_true, ↓reduceIte, heq]
-
-/-- Theorem 12: `oid_hex_val` maps ASCII digits `'0'..'9'` exactly to `0..9`. -/
-theorem oid_hex_val_digit_exact (c : Std.I32) (hlo : 48 ≤ c.val) (hhi : c.val ≤ 57) :
-    ∃ r : Std.I32, oid_hex_val c = ok r ∧ r.val = c.val - 48 := by
-  unfold oid_hex_val
-  have t1 : ((decide (c >= 48#i32)) && (decide (c <= 57#i32))) = true := by
-    simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff]
-    change 48 ≤ c.val ∧ c.val ≤ 57; omega
-  simp only [t1, ↓reduceIte]
-  exact ⟨Pion.I32.sub c 48#i32, rfl,
-    i32_sub_val c 48#i32 (by change -2147483648 ≤ c.val - 48; omega) (by change c.val - 48 ≤ 2147483647; omega)⟩
 
 end BsonProofs

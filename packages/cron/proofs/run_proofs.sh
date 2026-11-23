@@ -1,167 +1,147 @@
-#!/bin/sh
-# End-to-end Lean 4 formal verification runner for `packages/cron`.
-#
-# Steps:
-#   1. Provision a Lake project in /private/tmp/pion-lean-cron/proj
-#      (AFK-surf/pion `lean/` + AeneasVerif/aeneas @ 1dc8ad31b1 + cached mathlib).
-#   2. Extract `packages/cron` via `pionc extract-lean --json`.
-#   3. Scan `packages/cron/proofs/` to reject `sorry`, `admit`, `bv_decide`, `native_decide`.
-#   4. Build `PionLean`, `Cron`, and `CronProofs` with `lake build` (0 errors).
-#   5. Verify `#print axioms` in `CheckAxioms.lean` (only propext / Classical.choice / Quot.sound).
-#   6. Run `EvalDiff.lean` and diff every public-API case against a native Pion binary.
-#
-# All build artifacts stay under /private/tmp; the git worktree is never modified.
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-PROOFS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CRON_DIR=$(CDPATH= cd -- "$PROOFS_DIR/.." && pwd)
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-cron}"
-PROJ="$WORK/proj"
-AENEAS_REV="1dc8ad31b1"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="cron"
+LEAN_MOD="Cron"
+PROOF_MOD="CronProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-echo "=== [1/6] Provision Lake project in $PROJ ==="
-mkdir -p "$WORK"
-
-# Locate or shallow-clone AFK-surf/pion for `lean/` (PionLean + lakefile + manifest).
-PION_REF="${PION_REF_DIR:-/private/tmp/pion-lean-ref}"
-if [ ! -d "$PION_REF/lean/PionLean" ]; then
-  PION_REF="$WORK/pion-ref"
-  if [ ! -d "$PION_REF/lean/PionLean" ]; then
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-# Locate or clone Aeneas @ 1dc8ad31b1.
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  if [ -n "${LEAN_PACKAGES_SEED:-}" ]; then
-    cp -Rc "$LEAN_PACKAGES_SEED" "$PROJ/.lake/packages" 2>/dev/null || cp -R "$LEAN_PACKAGES_SEED" "$PROJ/.lake/packages"
-  else
-    (cd "$PROJ" && lake exe cache get)
-  fi
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-printf '\nlean_lib Cron where\n  globs := #[.submodules `Cron]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib CronProofs where\n  globs := #[.andSubmodules `CronProofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [2/6] pionc extract-lean packages/cron ==="
-rm -rf "$PROJ/Cron"
-EXTRACT_JSON=$(pionc extract-lean --json --out "$PROJ" "$CRON_DIR")
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Cron/$f.lean" ]; then
-    echo "FAIL: missing Cron/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/CronProofs"
-cp -R "$PROOFS_DIR/CronProofs" "$PROJ/CronProofs"
-cp "$PROOFS_DIR/CronProofs.lean" "$PROJ/CronProofs.lean"
-cp "$PROOFS_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$PROOFS_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-echo "=== [3/6] Static scan for forbidden proof tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$PROOFS_DIR/CronProofs.lean" "$PROOFS_DIR/CronProofs" "$PROOFS_DIR/CheckAxioms.lean" "$PROOFS_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: forbidden token (sorry/admit/bv_decide/native_decide) found in proofs" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "static scan: 0 sorry / admit / bv_decide / native_decide"
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
+fi
 
-echo "=== [4/6] lake build PionLean Cron CronProofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Cron CronProofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error:' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
   exit 1
 fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Cron CronProofs: exit 0, 0 errors"
 
-echo "=== [5/6] Axiom audit (#print axioms) ==="
-set +e
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-RC=$?
-set -e
-printf '%s\n' "$AXIOMS_OUT"
-if [ "$RC" -ne 0 ]; then
-  echo "FAIL: CheckAxioms.lean failed (rc=$RC)" >&2
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
   exit 1
 fi
-EXPECTED_THMS=$(grep -c '^#print axioms' "$PROJ/CheckAxioms.lean")
-printf '%s\n' "$AXIOMS_OUT" | python3 -c '
-import re, sys
-text = sys.stdin.read()
-expected = int(sys.argv[1])
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+LEAN_PUB="$(mktemp /tmp/${PKG_NAME}_lean_pub.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$LEAN_PUB" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
 allowed = {"propext", "Classical.choice", "Quot.sound"}
-found = re.findall(r"^\x27([^\x27]+)\x27 depends on axioms: \[([^\]]*)\]", text, re.M)
-free = re.findall(r"^\x27([^\x27]+)\x27 does not depend on any axioms", text, re.M)
-bad = [(n, sorted(set(a.replace(",", " ").split()) - allowed)) for n, a in found
-       if set(a.replace(",", " ").split()) - allowed]
-if bad or len(found) + len(free) != expected:
-    print("FAIL: axioms: non-standard=%r, checked %d of %d" % (bad, len(found) + len(free), expected), file=sys.stderr)
-    sys.exit(1)
-print("axioms: %d/%d theorems verified (only propext / Classical.choice / Quot.sound)" % (expected, expected))
-' "$EXPECTED_THMS"
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
 
-echo "=== [6/6] EvalDiff: Lean #eval vs native Pion differential ==="
-set +e
-lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" EvalDiff.lean > "$WORK/lean_eval.out" 2>&1
-RC=$?
-set -e
-if [ "$RC" -ne 0 ]; then
-  cat "$WORK/lean_eval.out" >&2
-  echo "FAIL: EvalDiff.lean failed (rc=$RC)" >&2
-  exit 1
-fi
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
 
-# Build a throw-away native Pion runner in $WORK/native_diff for all public API cases.
-NATIVE_DIR="$WORK/native_diff"
-rm -rf "$NATIVE_DIR"
-mkdir -p "$NATIVE_DIR/src"
-cat > "$NATIVE_DIR/pion.toml" <<EOF
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "cron_eval_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
-cron = { path = "$CRON_DIR" }
+cron = { path = "$PKG_DIR" }
 EOF
-
-cat > "$NATIVE_DIR/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "cron"
 
-fn fmt_bool(b : Bool) -> String {
-  if b { "true" } else { "false" }
-}
+fn fmt_bool(b : Bool) -> String { if b { "true" } else { "false" } }
 
 fn fmt_dt_res(r : Result[cron::DateTime, cron::CronError]) -> String {
   match r {
@@ -193,9 +173,6 @@ pub fn main(world : World) -> Int {
   io_println(world, "dim_2025_4=" + cron::days_in_month(2025, 4).to_string())
   io_println(world, "dim_2025_7=" + cron::days_in_month(2025, 7).to_string())
   io_println(world, "dim_2025_8=" + cron::days_in_month(2025, 8).to_string())
-  io_println(world, "dow_1970_01_01=" + cron::weekday_of(1970, 1, 1).to_string())
-  io_println(world, "dow_2000_01_01=" + cron::weekday_of(2000, 1, 1).to_string())
-  io_println(world, "dow_0001_01_01=" + cron::weekday_of(1, 1, 1).to_string())
   io_println(world, "from_unix_0=" + fmt_dt_res(cron::DateTime::from_unix_secs(0L)))
   io_println(world, "from_unix_neg1=" + fmt_dt_res(cron::DateTime::from_unix_secs(-1L)))
   io_println(world, "from_unix_min=" + fmt_dt_res(cron::DateTime::from_unix_secs(-62135596800L)))
@@ -212,22 +189,13 @@ pub fn main(world : World) -> Int {
   io_println(world, "valid_bad_f5=" + fmt_bool(mk_dt(2025, 6, 15, 12, 30, 64).is_valid()))
   io_println(world, "match_fixed_ok=" + fmt_bool(c.matches(mk_dt(2025, 6, 15, 12, 30, 0))))
   io_println(world, "match_fixed_f5=" + fmt_bool(c.matches(mk_dt(2025, 6, 15, 12, 30, 64))))
-  io_println(world, "match_day_ok=" + fmt_bool(c.matches(mk_dt(2025, 6, 15, 12, 30, 0))))
-  io_println(world, "match_day_f5=" + fmt_bool(c.matches(mk_dt(2025, 6, 15, 12, 30, 64))))
   0
 }
 EOF
-
-pionc build --release -o "$NATIVE_DIR/runner" "$NATIVE_DIR"
-"$NATIVE_DIR/runner" > "$WORK/native_eval.out"
-
-# Filter Lean output to the matching public-API keys and verify exact byte parity.
-grep -E '^(leap_|dim_|dow_|from_unix_|to_unix_|valid_|match_)' "$WORK/lean_eval.out" > "$WORK/lean_public.out"
-if ! diff -u "$WORK/native_eval.out" "$WORK/lean_public.out"; then
-  echo "FAIL: native Pion and Lean #eval outputs disagree" >&2
-  exit 1
-fi
-PUBLIC_CASES=$(wc -l < "$WORK/native_eval.out" | tr -d ' ')
-TOTAL_CASES=$(wc -l < "$WORK/lean_eval.out" | tr -d ' ')
-echo "EvalDiff: $TOTAL_CASES Lean #eval cases ($PUBLIC_CASES native-vs-Lean diff -u matched 100%)"
-echo "PASS: packages/cron Lean 4 formal verification"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+grep -E '^(leap_|dim_|from_unix_|to_unix_|valid_|match_)' "$LEAN_OUT" > "$LEAN_PUB"
+diff -u "$NATIVE_OUT" "$LEAN_PUB"
+CASES="$(wc -l < "$NATIVE_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES public cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

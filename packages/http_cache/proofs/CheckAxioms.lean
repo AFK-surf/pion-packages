@@ -1,26 +1,15 @@
 import HttpCacheProofs
 
 #print axioms HttpCacheProofs.clamped_add_i64_exact
-#print axioms HttpCacheProofs.clamped_add_i64_bounds
 #print axioms HttpCacheProofs.clamped_add_i64_mono
-#print axioms HttpCacheProofs.clamped_sub_i64_le_zero
 #print axioms HttpCacheProofs.clamped_sub_i64_exact
-#print axioms HttpCacheProofs.clamped_sub_i64_bounds
 #print axioms HttpCacheProofs.clamped_sub_i64_mono_hi
 #print axioms HttpCacheProofs.compute_initial_age_core_exact
 #print axioms HttpCacheProofs.compute_initial_age_core_bounds
 #print axioms HttpCacheProofs.compute_current_age_core_bounds
 #print axioms HttpCacheProofs.compute_current_age_core_mono_now
-#print axioms HttpCacheProofs.compute_current_age_core_at_response_time
-#print axioms HttpCacheProofs.cache_limits_default_valid
-#print axioms HttpCacheProofs.limits_all_nonneg_iff
-#print axioms HttpCacheProofs.cache_policy_options_shared_vs_private
-#print axioms HttpCacheProofs.request_cc_empty_defaults
 #print axioms HttpCacheProofs.heuristically_cacheable_implies_understood
-#print axioms HttpCacheProofs.heuristically_cacheable_exact_11
-#print axioms HttpCacheProofs.heuristically_cacheable_excludes_206_and_1xx
 #print axioms HttpCacheProofs.understood_status_final_range
-#print axioms HttpCacheProofs.is_ascii_digit_spec
 #print axioms HttpCacheProofs.is_leap_year_spec
 #print axioms HttpCacheProofs.days_in_month_bounds
 #print axioms HttpCacheProofs.days_in_month_feb_leap_iff

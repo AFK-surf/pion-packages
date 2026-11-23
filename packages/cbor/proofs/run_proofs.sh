@@ -1,214 +1,194 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/cbor`.
-#
-# Builds a throw-away Lake project in /private/tmp/pion-lean-cbor (zero git
-# worktree pollution), extracts `packages/cbor` via `pionc extract-lean`,
-# compiles `PionLean`, `Cbor`, and `CborProofs`, rejects any
-# `sorry`/`admit`/`native_decide`/`bv_decide`, verifies `#print axioms`
-# (only `propext`, `Classical.choice`, `Quot.sound`), and runs `EvalDiff.lean`
-# + a Pion native differential cross-check (`diff -u`).
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-cbor}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="cbor"
+LEAN_MOD="Cbor"
+PROOF_MOD="CborProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/cbor ==="
-rm -rf "$PROJ/Cbor"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Cbor/$f.lean" ]; then
-    echo "FAIL: missing Cbor/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/CborProofs"
-cp -R "$SCRIPT_DIR/CborProofs" "$PROJ/CborProofs"
-cp "$SCRIPT_DIR/CborProofs.lean" "$PROJ/CborProofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Cbor where\n  globs := #[.submodules `Cbor]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib CborProofs where\n  globs := #[.andSubmodules `CborProofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/CborProofs.lean" "$SCRIPT_DIR/CborProofs" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Cbor CborProofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Cbor CborProofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
-  exit 1
-fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Cbor CborProofs: exit 0, 0 errors"
-
-echo "=== [5/7] #print axioms audit ==="
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-echo "$AXIOMS_OUT"
-BAD_AXIOMS=$(printf '%s\n' "$AXIOMS_OUT" | grep -E "depends on axioms:" | sed 's/.*\[//;s/\].*//;s/,/\n/g' | tr -d ' ' | sort -u | grep -v -E '^(propext|Classical\.choice|Quot\.sound)$' || true)
-if [ -n "$BAD_AXIOMS" ]; then
-  echo "FAIL: unexpected axioms found: $BAD_AXIOMS" >&2
-  exit 1
-fi
-if printf '%s\n' "$AXIOMS_OUT" | grep -q "error:"; then
-  echo "FAIL: CheckAxioms.lean reported errors" >&2
-  exit 1
-fi
-echo "Axioms audit: ONLY standard axioms (propext, Classical.choice, Quot.sound)"
-
-echo "=== [6/7] EvalDiff.lean (#eval) ==="
-EVAL_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" EvalDiff.lean 2>&1)
-echo "$EVAL_OUT"
-if printf '%s\n' "$EVAL_OUT" | grep -q "error:"; then
-  echo "FAIL: EvalDiff.lean reported errors" >&2
-  exit 1
-fi
-if printf '%s\n' "$EVAL_OUT" | grep -q ': FAIL$'; then
-  echo "FAIL: EvalDiff.lean had a FAIL check" >&2
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$WORK/native-diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "cbor_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 cbor = { path = "$PKG_DIR" }
 EOF
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "cbor"
 
-fn report(w : World, label : String, passed : Bool) -> Unit {
-  if passed {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
 
-fn opt_i32_eq(o : Option[Int], want : Int) -> Bool {
+fn opt_i32(o : Option[Int]) -> String {
   match o {
-    Some(v) => v == want
-    None => false
+    None => "None"
+    Some(v) => "Some(" + v.to_string() + ")"
   }
 }
 
-fn opt_i64_eq(o : Option[Int64], want : Int64) -> Bool {
-  match o {
-    Some(v) => v == want
-    None => false
-  }
-}
-
-pub fn main(w : World) -> Int {
-  report(w, "head_u64_0", cbor::head_size_u64(0UL) == 1)
-  report(w, "head_u64_23", cbor::head_size_u64(23UL) == 1)
-  report(w, "head_u64_24", cbor::head_size_u64(24UL) == 2)
-  report(w, "head_u64_255", cbor::head_size_u64(255UL) == 2)
-  report(w, "head_u64_256", cbor::head_size_u64(256UL) == 3)
-  report(w, "head_u64_65535", cbor::head_size_u64(65535UL) == 3)
-  report(w, "head_u64_65536", cbor::head_size_u64(65536UL) == 5)
-  report(w, "head_u64_u32max", cbor::head_size_u64(4294967295UL) == 5)
-  report(w, "head_u64_u32max_p1", cbor::head_size_u64(4294967296UL) == 9)
-  report(w, "head_int_23", cbor::head_size_int(23) == 1)
-  report(w, "head_int_24", cbor::head_size_int(24) == 2)
-  report(w, "head_int_65536", cbor::head_size_int(65536) == 5)
-  report(w, "canon_ai24_23_false", cbor::is_canonical_arg(24, 23UL) == false)
-  report(w, "canon_ai24_24_true", cbor::is_canonical_arg(24, 24UL) == true)
-  report(w, "canon_ai25_255_false", cbor::is_canonical_arg(25, 255UL) == false)
-  report(w, "canon_ai25_256_true", cbor::is_canonical_arg(25, 256UL) == true)
-  report(w, "canon_ai26_65535_false", cbor::is_canonical_arg(26, 65535UL) == false)
-  report(w, "canon_ai26_65536_true", cbor::is_canonical_arg(26, 65536UL) == true)
-  report(w, "canon_ai27_u32max_false", cbor::is_canonical_arg(27, 4294967295UL) == false)
-  report(w, "canon_ai27_u32max_p1_true", cbor::is_canonical_arg(27, 4294967296UL) == true)
-  report(w, "canon_ai28_false", cbor::is_canonical_arg(28, 0UL) == false)
-  report(w, "days_2000_02", cbor::days_in_month(2000, 2) == 29)
-  report(w, "days_2100_02", cbor::days_in_month(2100, 2) == 28)
-  report(w, "f16_pos_zero_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(0)), 0))
-  report(w, "f16_neg_zero_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(32768)), 32768))
-  report(w, "f16_1_0_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(15360)), 15360))
-  report(w, "f16_1_5_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(15872)), 15872))
-  report(w, "f16_min_subnormal_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(1)), 1))
-  report(w, "f16_max_normal_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(31743)), 31743))
-  report(w, "f16_pos_inf_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(31744)), 31744))
-  report(w, "f16_neg_inf_rt", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(64512)), 64512))
-  report(w, "f16_nan_canon", opt_i32_eq(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(32257)), 32256))
-  report(w, "f32_pos_zero_rt", opt_i64_eq(cbor::double_bits_to_float32_exact(cbor::float32_to_double_bits(0L)), 0L))
-  report(w, "f32_neg_zero_rt", opt_i64_eq(cbor::double_bits_to_float32_exact(cbor::float32_to_double_bits(2147483648L)), 2147483648L))
-  report(w, "f32_100000_rt", opt_i64_eq(cbor::double_bits_to_float32_exact(cbor::float32_to_double_bits(1203982336L)), 1203982336L))
-  report(w, "f32_pos_inf_rt", opt_i64_eq(cbor::double_bits_to_float32_exact(cbor::float32_to_double_bits(2139095040L)), 2139095040L))
+pub fn main(world : World) -> Int {
+  io_println(world, "head_u64_0=" + cbor::head_size_u64(0UL).to_string())
+  io_println(world, "head_u64_23=" + cbor::head_size_u64(23UL).to_string())
+  io_println(world, "head_u64_24=" + cbor::head_size_u64(24UL).to_string())
+  io_println(world, "head_u64_255=" + cbor::head_size_u64(255UL).to_string())
+  io_println(world, "head_u64_256=" + cbor::head_size_u64(256UL).to_string())
+  io_println(world, "head_u64_65535=" + cbor::head_size_u64(65535UL).to_string())
+  io_println(world, "head_u64_65536=" + cbor::head_size_u64(65536UL).to_string())
+  io_println(world, "head_u64_u32max=" + cbor::head_size_u64(4294967295UL).to_string())
+  io_println(world, "head_u64_u32max_p1=" + cbor::head_size_u64(4294967296UL).to_string())
+  io_println(world, "head_u64_max=" + cbor::head_size_u64(18446744073709551615UL).to_string())
+  io_println(world, "head_int_23=" + cbor::head_size_int(23).to_string())
+  io_println(world, "head_int_24=" + cbor::head_size_int(24).to_string())
+  io_println(world, "head_int_65536=" + cbor::head_size_int(65536).to_string())
+  io_println(world, "head_int_max=" + cbor::head_size_int(2147483647).to_string())
+  io_println(world, "canon_24_23=" + bstr(cbor::is_canonical_arg(24, 23UL)))
+  io_println(world, "canon_24_24=" + bstr(cbor::is_canonical_arg(24, 24UL)))
+  io_println(world, "canon_25_255=" + bstr(cbor::is_canonical_arg(25, 255UL)))
+  io_println(world, "canon_25_256=" + bstr(cbor::is_canonical_arg(25, 256UL)))
+  io_println(world, "canon_26_65535=" + bstr(cbor::is_canonical_arg(26, 65535UL)))
+  io_println(world, "canon_26_65536=" + bstr(cbor::is_canonical_arg(26, 65536UL)))
+  io_println(world, "canon_27_u32max=" + bstr(cbor::is_canonical_arg(27, 4294967295UL)))
+  io_println(world, "canon_27_u32max_p1=" + bstr(cbor::is_canonical_arg(27, 4294967296UL)))
+  io_println(world, "canon_28_0=" + bstr(cbor::is_canonical_arg(28, 0UL)))
+  io_println(world, "f16_rt_0=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(0))))
+  io_println(world, "f16_rt_m0=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(32768))))
+  io_println(world, "f16_rt_1=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(15360))))
+  io_println(world, "f16_rt_sub=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(1))))
+  io_println(world, "f16_rt_max=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(31743))))
+  io_println(world, "f16_rt_inf=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(31744))))
+  io_println(world, "f16_rt_ninf=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(64512))))
+  io_println(world, "f16_nan_canon=" + opt_i32(cbor::double_bits_to_float16_exact(cbor::float16_to_double_bits(32257))))
+  io_println(world, "f16_excess=" + opt_i32(cbor::double_bits_to_float16_exact(4607182418800017409L)))
+  io_println(world, "f16_to_d_1=" + cbor::float16_to_double_bits(15360).to_string())
   0
 }
 EOF
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
-echo "PASS: packages/cbor Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

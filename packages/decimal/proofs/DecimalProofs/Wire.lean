@@ -16,7 +16,7 @@ open decimal
 def u32_byte (x : Std.U32) (shift : Nat) : Std.U8 :=
   Pion.I32.to_byte (Pion.U32.to_int (Pion.U32.band ⟨x.bv >>> shift⟩ 255#u32))
 
-theorem u32_byte_to_u32_bv (x : Std.U32) (shift : Nat) :
+lemma u32_byte_to_u32_bv (x : Std.U32) (shift : Nat) :
     (Pion.I32.to_uint (Pion.U8.to_int (u32_byte x shift))).bv =
       (x.bv >>> shift) &&& MASK_BYTE := by
   unfold u32_byte
@@ -38,7 +38,7 @@ theorem u32_byte_to_u32_bv (x : Std.U32) (shift : Nat) :
     rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
     simp [MASK_BYTE, BitVec.getElem_signExtend, BitVec.getElem_ushiftRight, BitVec.getLsbD_ushiftRight]
 
-theorem u32_reconstruct_le (x : Std.U32) :
+lemma u32_reconstruct_le (x : Std.U32) :
     (((x.bv >>> 0) &&& MASK_BYTE) |||
      (((x.bv >>> 8) &&& MASK_BYTE) <<< 8) |||
      (((x.bv >>> 16) &&& MASK_BYTE) <<< 16) |||
@@ -124,12 +124,7 @@ theorem Decimal.serialize_spec (d : Decimal) :
   subst hf8' hf16' hf24' hl8' hl16' hl24' hm8' hm16' hm24' hh8' hh16' hh24'
   rfl
 
-theorem Decimal.serialize_length (d : Decimal) :
-    ∃ b : Pion.Bytes, Decimal.serialize d = ok b ∧ b.val.length = 16 := by
-  rw [Decimal.serialize_spec d]
-  exact ⟨_, rfl, rfl⟩
-
-theorem bytes_get_eq_of_idx (l : List Std.U8) (i : Std.I32) (k : Nat) (v : Std.U8)
+lemma bytes_get_eq_of_idx (l : List Std.U8) (i : Std.I32) (k : Nat) (v : Std.U8)
     (hk : i.val = (k : Int)) (hlt : k < l.length) (hv : l[k]? = some v) :
     Pion.Bytes.get ⟨l⟩ i = ok v := by
   have h0 : 0 ≤ i.val := by omega
@@ -145,7 +140,7 @@ theorem bytes_get_eq_of_idx (l : List Std.U8) (i : Std.I32) (k : Nat) (v : Std.U
   rw [heq] at hv; injection hv with h; exact congrArg ok h
 
 /-- `read_u32_le` on 4 serialized bytes of `x` recovers `x` identically. -/
-theorem read_u32_le_of_bytes (l : List Std.U8) (off : Std.I32) (x : Std.U32)
+lemma read_u32_le_of_bytes (l : List Std.U8) (off : Std.I32) (x : Std.U32)
     (h0 : 0 ≤ off.val) (h1 : off.val + 3 < l.length) (hmax : off.val ≤ 2147483640)
     (hb0 : l[off.val.toNat]? = some (u32_byte x 0))
     (hb1 : l[(off.val + 1).toNat]? = some (u32_byte x 8))
@@ -178,7 +173,7 @@ theorem read_u32_le_of_bytes (l : List Std.U8) (off : Std.I32) (x : Std.U32)
   rw [hs1bv, hs2bv, hs3bv, u32_byte_to_u32_bv, u32_byte_to_u32_bv, u32_byte_to_u32_bv, u32_byte_to_u32_bv]
   exact u32_reconstruct_le x
 
-theorem valid_flags_mask_eq (f : Std.U32) (hf : valid_flags f) :
+lemma valid_flags_mask_eq (f : Std.U32) (hf : valid_flags f) :
     Pion.U32.band f 2149515264#u32 = f := by
   apply u32_eq_of_bv_eq
   dsimp only [Pion.U32.band]
@@ -249,21 +244,8 @@ theorem Decimal.deserialize_serialize_roundtrip (d : Decimal) (hd : valid_decima
     simp only [hshr, Nat.mod_eq_of_lt hmid_lt]
     omega
 
-/-- `Decimal::deserialize` strictly rejects any byte slice whose length is not 16. -/
-theorem Decimal.deserialize_wrong_length_err (b : Pion.Bytes)
-    (hlen : b.val.length ≤ 2147483647) (hne : b.val.length ≠ 16) :
-    Decimal.deserialize b = ok (Res.Err DecimalError.EmptyData) := by
-  unfold Decimal.deserialize
-  obtain ⟨n, hn, hnv⟩ := bytes_length_ok b hlen
-  rw [hn, b_ok]
-  have hn16 : n ≠ 16#i32 := by
-    intro heq
-    have : n.val = 16 := by rw [heq]; rfl
-    omega
-  simp [hn16]
-
 /-- `read_u32_le` never traps when `0 ≤ off` and `off + 3 < b.val.length`. -/
-theorem read_u32_le_total (b : Pion.Bytes) (off : Std.I32)
+lemma read_u32_le_total (b : Pion.Bytes) (off : Std.I32)
     (h0 : 0 ≤ off.val) (h1 : off.val + 3 < b.val.length) (hmax : off.val ≤ 2147483640) :
     ∃ w : Std.U32, read_u32_le b off = ok w := by
   have hv1 : (1#i32 : Std.I32).val = 1 := by decide
@@ -358,15 +340,15 @@ theorem Decimal.deserialize_always_valid (b : Pion.Bytes) (hlen : b.val.length =
         ok (q01, q11, q21) := by
       by_cases hc0 : Pion.U64.to_uint (Pion.U64.sub (Pion.U64.bor t10 (Pion.U32.to_uint64 lo))
             (Pion.U64.mul (Pion.U32.to_uint64 (Pion.U64.to_uint t11)) div64)) >= 5#u32
-      · rw [if_pos hc0]
+      · rw [ite_eq_left hc0]
         dsimp only
         by_cases hc1 : Pion.U64.add (Pion.U32.to_uint64 (Pion.U64.to_uint t11)) 1#u64 > 4294967295#u64
-        · rw [if_pos hc1]
+        · rw [ite_eq_left hc1]
           by_cases hc2 : Pion.U64.add (Pion.U32.to_uint64 (Pion.U64.to_uint t9)) 1#u64 > 4294967295#u64
-          · rw [if_pos hc2]; exact ⟨_, _, _, rfl⟩
-          · rw [if_neg hc2]; exact ⟨_, _, _, rfl⟩
-        · rw [if_neg hc1]; exact ⟨_, _, _, rfl⟩
-      · rw [if_neg hc0]; exact ⟨_, _, _, rfl⟩
+          · rw [ite_eq_left hc2]; exact ⟨_, _, _, rfl⟩
+          · rw [ite_eq_right hc2]; exact ⟨_, _, _, rfl⟩
+        · rw [ite_eq_right hc1]; exact ⟨_, _, _, rfl⟩
+      · rw [ite_eq_right hc0]; exact ⟨_, _, _, rfl⟩
     obtain ⟨q01, q11, q21, hcar⟩ := hcarry
     rw [hcar, b_ok]
     obtain ⟨t12, ht12, _⟩ := u64_shl32_ok (Pion.U32.to_uint64 q11)

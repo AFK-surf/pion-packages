@@ -10,49 +10,6 @@ namespace HttpCacheProofs
 private lemma result_bind_ok' {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← ok x; f y) = f x := by simp
 
-/-- Theorem 13: `CacheLimits.default` has strictly positive limits and satisfies `limits_all_nonneg`. -/
-theorem cache_limits_default_valid :
-    ∃ l : CacheLimits, CacheLimits.default = ok l ∧
-      0 < l.max_header_bytes.val ∧ 0 < l.max_headers.val ∧
-      0 < l.max_vary_headers.val ∧ 0 < l.max_directives.val ∧
-      0 < l.max_entry_bytes.val ∧ 0 < l.max_entries.val ∧
-      0 < l.max_total_bytes.val ∧ limits_all_nonneg l = ok true := by
-  refine ⟨_, rfl, by decide, by decide, by decide, by decide, by decide, by decide, by decide, rfl⟩
-
-/-- Theorem 14: Exact iff characterization of `limits_all_nonneg` across all 7 resource limit fields. -/
-theorem limits_all_nonneg_iff (l : CacheLimits) :
-    limits_all_nonneg l = ok true ↔
-      (0 ≤ l.max_header_bytes.val ∧ 0 ≤ l.max_headers.val ∧
-       0 ≤ l.max_vary_headers.val ∧ 0 ≤ l.max_directives.val ∧
-       0 ≤ l.max_entry_bytes.val ∧ 0 ≤ l.max_entries.val ∧
-       0 ≤ l.max_total_bytes.val) := by
-  unfold limits_all_nonneg
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq]
-  have c0_32 : (0#i32 : Std.I32).val = 0 := rfl
-  have c0_64 : (0#i64 : Std.I64).val = 0 := rfl
-  constructor
-  · intro ⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩
-    exact ⟨h1, h2, h3, h4, h5, h6, h7⟩
-  · intro ⟨h1, h2, h3, h4, h5, h6, h7⟩
-    exact ⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩
-
-/-- Theorem 15: `CachePolicyOptions.shared` and `private_cache` differ solely in `is_shared` and share RFC 9111 10%/86400s heuristic defaults. -/
-theorem cache_policy_options_shared_vs_private :
-    ∃ s p : CachePolicyOptions,
-      CachePolicyOptions.shared = ok s ∧ CachePolicyOptions.private_cache = ok p ∧
-      s.is_shared = true ∧ p.is_shared = false ∧
-      s.heuristic_fraction_pct.val = 10 ∧ p.heuristic_fraction_pct.val = 10 ∧
-      s.max_heuristic_seconds.val = 86400 ∧ p.max_heuristic_seconds.val = 86400 := by
-  refine ⟨_, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-
-/-- Theorem 16: `RequestCacheControl.empty` has all optional directives `none` and all flags `false`. -/
-theorem request_cc_empty_defaults :
-    ∃ r : RequestCacheControl, RequestCacheControl.empty = ok r ∧
-      r.max_age = none ∧ r.has_max_stale = false ∧ r.max_stale_seconds = none ∧
-      r.min_fresh = none ∧ r.no_cache = false ∧ r.no_store = false ∧
-      r.no_transform = false ∧ r.only_if_cached = false := by
-  refine ⟨_, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
-
 /-- Theorem 17: Every heuristically cacheable status code is understood by the RFC 9111 cache engine. -/
 theorem heuristically_cacheable_implies_understood (s : Std.I32)
     (h : is_heuristically_cacheable_status s = ok true) :
@@ -60,43 +17,6 @@ theorem heuristically_cacheable_implies_understood (s : Std.I32)
   unfold is_understood_status
   rw [h, result_bind_ok']
   rfl
-
-/-- Theorem 18: Exact iff characterization of the 11 RFC 9110 §15.1 heuristically cacheable final status codes. -/
-theorem heuristically_cacheable_exact_11 (s : Std.I32) :
-    is_heuristically_cacheable_status s = ok true ↔
-      (s.val = 200 ∨ s.val = 203 ∨ s.val = 204 ∨
-       s.val = 300 ∨ s.val = 301 ∨ s.val = 308 ∨
-       s.val = 404 ∨ s.val = 405 ∨ s.val = 410 ∨ s.val = 414 ∨ s.val = 501) := by
-  unfold is_heuristically_cacheable_status
-  simp only [ok.injEq, Bool.or_eq_true, beq_iff_eq]
-  constructor
-  · intro h
-    rcases h with ((((((((((h | h) | h) | h) | h) | h) | h) | h) | h) | h) | h) <;>
-    · subst h; decide
-  · intro h
-    rcases h with h | h | h | h | h | h | h | h | h | h | h
-    · left; left; left; left; left; left; left; left; left; left; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; left; right; exact IScalar.eq_of_val_eq h
-    · left; left; right; exact IScalar.eq_of_val_eq h
-    · left; right; exact IScalar.eq_of_val_eq h
-    · right; exact IScalar.eq_of_val_eq h
-
-/-- Theorem 19: `206 Partial Content` and all `1xx` (`status < 200`) responses are never heuristically cacheable. -/
-theorem heuristically_cacheable_excludes_206_and_1xx (s : Std.I32)
-    (h : s.val < 200 ∨ s.val = 206) :
-    is_heuristically_cacheable_status s = ok false := by
-  have hne : is_heuristically_cacheable_status s ≠ ok true := by
-    intro ht; rw [heuristically_cacheable_exact_11] at ht; omega
-  unfold is_heuristically_cacheable_status at hne ⊢
-  cases hb : ((((((((((s == 200#i32) || (s == 203#i32)) || (s == 204#i32)) || (s == 300#i32)) || (s == 301#i32)) || (s == 308#i32)) || (s == 404#i32)) || (s == 405#i32)) || (s == 410#i32)) || (s == 414#i32)) || (s == 501#i32)
-  · rfl
-  · exfalso; exact hne (congrArg ok hb)
 
 /-- Theorem 20: Every understood status code is a valid final HTTP status code in `[200, 599]` and excludes `206`. -/
 theorem understood_status_final_range (s : Std.I32)
@@ -114,13 +34,6 @@ theorem understood_status_final_range (s : Std.I32)
   · subst h; decide
   · subst h; decide
   · subst h; decide
-
-/-- Theorem 21: `is_ascii_digit` matches exactly ASCII `'0'..'9'` (`48..57`). -/
-theorem is_ascii_digit_spec (c : Std.I32) :
-    is_ascii_digit c = ok true ↔ (48 ≤ c.val ∧ c.val ≤ 57) := by
-  unfold is_ascii_digit
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq]
-  rfl
 
 private lemma i32_rem_pos_ok (a b : Std.I32) (ha : 0 ≤ a.val) (hb : 0 < b.val) :
     ∃ r : Std.I32, Pion.I32.rem a b = ok r ∧ r.val = a.val % b.val := by

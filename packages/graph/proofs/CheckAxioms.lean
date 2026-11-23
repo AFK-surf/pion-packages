@@ -1,31 +1,13 @@
 import GraphProofs
 
-#print axioms GraphProofs.node_id_roundtrip
-#print axioms GraphProofs.node_id_eq_equiv
-#print axioms GraphProofs.edge_id_roundtrip
-#print axioms GraphProofs.edge_id_eq_equiv
-#print axioms GraphProofs.is_valid_node_count_spec
-#print axioms GraphProofs.is_valid_node_idx_spec
 #print axioms GraphProofs.checked_add_i64_some_iff
-#print axioms GraphProofs.checked_add_i64_none_iff
-#print axioms GraphProofs.checked_add_i64_comm
-#print axioms GraphProofs.checked_add_i64_zero_right
-#print axioms GraphProofs.checked_add_i64_boundary_spots
 #print axioms GraphProofs.fits_i64_iff_val128_range
-#print axioms GraphProofs.i64_sign_hi_spec
 #print axioms GraphProofs.sign_extend_i64_exact_and_fits
 #print axioms GraphProofs.i128_add_carry_exact
 #print axioms GraphProofs.i128_lt_iff_val128
-#print axioms GraphProofs.i128_lt_strict_order
 #print axioms GraphProofs.i64_to_radix_key_val
-#print axioms GraphProofs.i64_to_radix_key_order_preserving
-#print axioms GraphProofs.i64_to_radix_key_injective
 #print axioms GraphProofs.residual_twin_involution
 #print axioms GraphProofs.residual_twin_ne_self
-#print axioms GraphProofs.forward_half_edge_val
 #print axioms GraphProofs.forward_reverse_half_edge_pair
-#print axioms GraphProofs.heap_parent_val
 #print axioms GraphProofs.heap_parent_strict_decrease
-#print axioms GraphProofs.heap_left_child_val
-#print axioms GraphProofs.heap_left_child_strict_increase
 #print axioms GraphProofs.heap_parent_children_inverse

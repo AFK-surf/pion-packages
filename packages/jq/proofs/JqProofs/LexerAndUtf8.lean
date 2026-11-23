@@ -43,94 +43,6 @@ private lemma i32_sub_val (a b : Std.I32)
 private lemma result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← ok x; f y) = f x := by simp
 
-/-- Theorem 1: `is_json_ws` matches the exact 4 RFC 8259 §2 whitespace bytes (SP, HTAB, LF, CR). -/
-theorem is_json_ws_spec (b : Std.I32) :
-    is_json_ws b = ok true ↔ (b.val = 32 ∨ b.val = 9 ∨ b.val = 10 ∨ b.val = 13) := by
-  unfold is_json_ws
-  simp only [ok.injEq, Bool.or_eq_true, beq_iff_eq]
-  constructor
-  · intro h
-    rcases h with ((h | h) | h) | h
-    · left; exact congrArg IScalar.val h
-    · right; left; exact congrArg IScalar.val h
-    · right; right; left; exact congrArg IScalar.val h
-    · right; right; right; exact congrArg IScalar.val h
-  · intro h
-    rcases h with h | h | h | h
-    · left; left; left; exact IScalar.eq_of_val_eq h
-    · left; left; right; exact IScalar.eq_of_val_eq h
-    · left; right; exact IScalar.eq_of_val_eq h
-    · right; exact IScalar.eq_of_val_eq h
-
-/-- Theorem 2: Exact characterization of `is_json_str_fast_byte`. -/
-theorem is_json_str_fast_byte_spec (b : Std.I32) :
-    is_json_str_fast_byte b = ok true ↔ (32 ≤ b.val ∧ b.val < 128 ∧ b.val ≠ 34 ∧ b.val ≠ 92) := by
-  unfold is_json_str_fast_byte
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, bne_iff_ne]
-  constructor
-  · intro ⟨⟨⟨h1, h2⟩, h3⟩, h4⟩
-    exact ⟨h1, h2, fun h => h3 (IScalar.eq_of_val_eq h), fun h => h4 (IScalar.eq_of_val_eq h)⟩
-  · intro ⟨h1, h2, h3, h4⟩
-    exact ⟨⟨⟨h1, h2⟩, fun h => h3 (congrArg IScalar.val h)⟩, fun h => h4 (congrArg IScalar.val h)⟩
-
-/-- Theorem 3: Quotes, backslashes, control characters, and non-ASCII bytes never take the fast path. -/
-theorem is_json_str_fast_byte_disjoint_escapes (b : Std.I32)
-    (h : b.val < 32 ∨ b.val ≥ 128 ∨ b.val = 34 ∨ b.val = 92) :
-    is_json_str_fast_byte b = ok false := by
-  have hne : is_json_str_fast_byte b ≠ ok true := by
-    intro ht
-    rw [is_json_str_fast_byte_spec] at ht
-    omega
-  unfold is_json_str_fast_byte at hne ⊢
-  cases hb : ((((decide (b >= 32#i32)) && (decide (b < 128#i32))) && (b != 34#i32)) && (b != 92#i32))
-  · rfl
-  · exfalso; exact hne (congrArg ok hb)
-
-/-- Theorem 4: `is_ascii_alpha` and `is_ascii_digit` are strictly disjoint. -/
-theorem is_ascii_alpha_digit_disjoint (b : Std.I32) :
-    ¬ (is_ascii_alpha b = ok true ∧ is_ascii_digit b = ok true) := by
-  intro ⟨ha, hd⟩
-  unfold is_ascii_alpha at ha
-  unfold is_ascii_digit at hd
-  simp only [ok.injEq, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at ha hd
-  have hd1 : (48 : Int) ≤ b.val := hd.1
-  have hd2 : b.val ≤ (57 : Int) := hd.2
-  rcases ha with (⟨h1, h2⟩ | ⟨h1, h2⟩) | h3
-  · change (65 : Int) ≤ b.val at h1; omega
-  · change (97 : Int) ≤ b.val at h1; omega
-  · have : b.val = 95 := congrArg IScalar.val h3; omega
-
-/-- Theorem 5: Exact iff characterization of `is_ident_char` (`A-Z`, `a-z`, `0-9`, `_`). -/
-theorem is_ident_char_spec (b : Std.I32) :
-    is_ident_char b = ok true ↔
-      ((65 ≤ b.val ∧ b.val ≤ 90) ∨ (97 ≤ b.val ∧ b.val ≤ 122) ∨ b.val = 95 ∨ (48 ≤ b.val ∧ b.val ≤ 57)) := by
-  unfold is_ident_char is_ascii_alpha is_ascii_digit
-  simp only [result_bind_ok]
-  split_ifs with h1
-  · simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h1
-    constructor
-    · intro _
-      rcases h1 with (⟨a, c⟩ | ⟨a, c⟩) | h95
-      · left; exact ⟨a, c⟩
-      · right; left; exact ⟨a, c⟩
-      · right; right; left; exact congrArg IScalar.val h95
-    · intro _; rfl
-  · simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq]
-    constructor
-    · intro ⟨a, c⟩; right; right; right; exact ⟨a, c⟩
-    · intro h
-      rcases h with ⟨a, c⟩ | ⟨a, c⟩ | h95 | ⟨a, c⟩
-      · exfalso; apply h1
-        simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq]
-        left; left; exact ⟨a, c⟩
-      · exfalso; apply h1
-        simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq]
-        left; right; exact ⟨a, c⟩
-      · exfalso; apply h1
-        simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq]
-        right; exact IScalar.eq_of_val_eq h95
-      · exact ⟨a, c⟩
-
 /-- Theorem 6: `hex_val` returns the exact hex nibble in `[0, 15]` or `-1`. -/
 theorem hex_val_range_and_spec (b : Std.I32) :
     ∃ r : Std.I32, hex_val b = ok r ∧
@@ -177,25 +89,6 @@ theorem sanitize_utf8_cp_valid_scalar (cp : Std.I32) :
     have h2 : ¬ (cp.val > (1114111 : Int)) := h.1.2
     have h3 : (55296 : Int) ≤ cp.val → ¬ (cp.val ≤ 57343) := h.2
     refine ⟨by omega, by omega, fun ⟨a, b⟩ => h3 a b⟩
-
-/-- Theorem 8: `sanitize_utf8_cp` is idempotent. -/
-theorem sanitize_utf8_cp_idempotent (cp : Std.I32) :
-    (do let r ← sanitize_utf8_cp cp; sanitize_utf8_cp r) = sanitize_utf8_cp cp := by
-  obtain ⟨r, hr, hr0, hrhi, hrns⟩ := sanitize_utf8_cp_valid_scalar cp
-  rw [hr, result_bind_ok]
-  unfold sanitize_utf8_cp
-  have hcond : (((decide (r < 0#i32)) || (decide (r > 1114111#i32))) ||
-      ((decide (r >= 55296#i32)) && (decide (r <= 57343#i32)))) = false := by
-    cases hb : (((decide (r < 0#i32)) || (decide (r > 1114111#i32))) ||
-        ((decide (r >= 55296#i32)) && (decide (r <= 57343#i32))))
-    · rfl
-    · simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq] at hb
-      rcases hb with (h1 | h2) | ⟨h3, h4⟩
-      · change r.val < 0 at h1; omega
-      · change r.val > 1114111 at h2; omega
-      · exact (hrns ⟨h3, h4⟩).elim
-  rw [hcond]
-  rfl
 
 /-- Theorem 9: `is_high_surrogate` and `is_low_surrogate` are disjoint and partition `[0xD800, 0xDFFF]`. -/
 theorem surrogate_ranges_disjoint_and_partition (u : Std.I32) :

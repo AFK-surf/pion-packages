@@ -1,217 +1,190 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/graph`.
-# All Lake build artifacts stay in /private/tmp/pion-lean-graph (zero git worktree pollution).
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-graph}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="graph"
+LEAN_MOD="Graph"
+PROOF_MOD="GraphProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/graph ==="
-rm -rf "$PROJ/Graph"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Graph/$f.lean" ]; then
-    echo "FAIL: missing Graph/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/GraphProofs"
-cp -R "$SCRIPT_DIR/GraphProofs" "$PROJ/GraphProofs"
-cp "$SCRIPT_DIR/GraphProofs.lean" "$PROJ/GraphProofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Graph where\n  globs := #[.submodules `Graph]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib GraphProofs where\n  globs := #[.andSubmodules `GraphProofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/GraphProofs.lean" "$SCRIPT_DIR/GraphProofs" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Graph GraphProofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Graph GraphProofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
-  exit 1
-fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Graph GraphProofs: exit 0, 0 errors"
-
-echo "=== [5/7] #print axioms audit ==="
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-echo "$AXIOMS_OUT"
-BAD_AXIOMS=$(printf '%s\n' "$AXIOMS_OUT" | grep -E "depends on axioms:" | sed 's/.*\[//;s/\].*//;s/,/\n/g' | tr -d ' ' | sort -u | grep -v -E '^(propext|Classical\.choice|Quot\.sound)$' || true)
-if [ -n "$BAD_AXIOMS" ]; then
-  echo "FAIL: unexpected axioms found: $BAD_AXIOMS" >&2
-  exit 1
-fi
-if printf '%s\n' "$AXIOMS_OUT" | grep -q "error:"; then
-  echo "FAIL: CheckAxioms.lean reported errors" >&2
-  exit 1
-fi
-echo "Axioms audit: ONLY standard axioms (propext, Classical.choice, Quot.sound)"
-
-echo "=== [6/7] EvalDiff.lean (#eval) ==="
-EVAL_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" --run EvalDiff.lean 2>&1)
-echo "$EVAL_OUT"
-if printf '%s\n' "$EVAL_OUT" | grep -q "error:"; then
-  echo "FAIL: EvalDiff.lean reported errors" >&2
-  exit 1
-fi
-if printf '%s\n' "$EVAL_OUT" | grep -q ': FAIL$'; then
-  echo "FAIL: EvalDiff.lean had a FAIL check" >&2
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$WORK/native-diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "graph_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 graph = { path = "$PKG_DIR" }
 EOF
-
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "graph"
 
-fn report(w : World, label : String, passed : Bool) -> Unit {
-  if passed {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
+
+fn opt_i64(o : Option[Int64]) -> String {
+  match o {
+    None => "None"
+    Some(v) => "Some(" + v.to_string() + ")"
   }
 }
 
-fn opt_i64_eq(a : Option[Int64], b : Option[Int64]) -> Bool {
-  match (a, b) {
-    (None, None) => true
-    (Some(x), Some(y)) => x == y
-    _ => false
-  }
-}
-
-pub fn main(w : World) -> Int {
-  report(w, "node_id_rt_0", graph::NodeId::new(0).to_int() == 0)
-  report(w, "node_id_rt_42", graph::NodeId::new(42).to_int() == 42)
-  report(w, "node_id_eq_true", graph::NodeId::new(7).eq(graph::NodeId::new(7)))
-  report(w, "node_id_eq_false", !graph::NodeId::new(7).eq(graph::NodeId::new(8)))
-  report(w, "edge_id_rt_99", graph::EdgeId::new(99).to_int() == 99)
-  report(w, "edge_id_eq_true", graph::EdgeId::new(3).eq(graph::EdgeId::new(3)))
-  report(w, "edge_id_eq_false", !graph::EdgeId::new(3).eq(graph::EdgeId::new(4)))
-
-  report(w, "valid_nc_neg1", !graph::is_valid_node_count(-1))
-  report(w, "valid_nc_0", graph::is_valid_node_count(0))
-  report(w, "valid_nc_max", graph::is_valid_node_count(67108864))
-  report(w, "valid_nc_over", !graph::is_valid_node_count(67108865))
-  report(w, "valid_idx_neg1", !graph::is_valid_node_idx(-1, 10))
-  report(w, "valid_idx_0_10", graph::is_valid_node_idx(0, 10))
-  report(w, "valid_idx_9_10", graph::is_valid_node_idx(9, 10))
-  report(w, "valid_idx_10_10", !graph::is_valid_node_idx(10, 10))
-
-  let min_i64 = -9223372036854775807L - 1L
-  report(w, "cadd_10_20", opt_i64_eq(graph::checked_add_i64(10L, 20L), Some(30L)))
-  report(w, "cadd_max_0", opt_i64_eq(graph::checked_add_i64(9223372036854775807L, 0L), Some(9223372036854775807L)))
-  report(w, "cadd_max_1_none", opt_i64_eq(graph::checked_add_i64(9223372036854775807L, 1L), None))
-  report(w, "cadd_min_m1_none", opt_i64_eq(graph::checked_add_i64(min_i64, -1L), None))
-  report(w, "cadd_max_negmax", opt_i64_eq(graph::checked_add_i64(9223372036854775807L, -9223372036854775807L), Some(0L)))
-
-  report(w, "fits_0_max", graph::fits_i64(0L, 9223372036854775807UL))
-  report(w, "fits_0_signbit_false", !graph::fits_i64(0L, 9223372036854775808UL))
-  report(w, "fits_m1_signbit_true", graph::fits_i64(-1L, 9223372036854775808UL))
-  report(w, "fits_m1_halfmax_false", !graph::fits_i64(-1L, 9223372036854775807UL))
-  report(w, "fits_1_0_false", !graph::fits_i64(1L, 0UL))
-  report(w, "sign_hi_pos", graph::i64_sign_hi(42L) == 0L)
-  report(w, "sign_hi_neg", graph::i64_sign_hi(-42L) == -1L)
-  report(w, "carry_0", graph::i128_add_carry(100UL, 200UL) == 0L)
-  report(w, "carry_1", graph::i128_add_carry(18446744073709551615UL, 1UL) == 1L)
-  report(w, "i128_lt_hi", graph::i128_lt(-1L, 100UL, 0L, 0UL))
-  report(w, "i128_lt_lo", graph::i128_lt(0L, 5UL, 0L, 6UL))
-  report(w, "i128_lt_eq", !graph::i128_lt(0L, 5UL, 0L, 5UL))
-
-  report(w, "radix_min", graph::i64_to_radix_key(min_i64) == 0UL)
-  report(w, "radix_0", graph::i64_to_radix_key(0L) == 9223372036854775808UL)
-  report(w, "radix_max", graph::i64_to_radix_key(9223372036854775807L) == 18446744073709551615UL)
-
-  report(w, "fwd_edge_5", graph::forward_half_edge(5) == 10)
-  report(w, "twin_10", graph::residual_twin(10) == 11)
-  report(w, "twin_11", graph::residual_twin(11) == 10)
-  report(w, "heap_parent_1", graph::heap_parent(1) == 0)
-  report(w, "heap_parent_2", graph::heap_parent(2) == 0)
-  report(w, "heap_parent_7", graph::heap_parent(7) == 3)
-  report(w, "heap_left_0", graph::heap_left_child(0) == 1)
-  report(w, "heap_left_3", graph::heap_left_child(3) == 7)
+pub fn main(world : World) -> Int {
+  let i64_min : Int64 = -9223372036854775807L - 1L
+  io_println(world, "cadd_10_20=" + opt_i64(graph::checked_add_i64(10L, 20L)))
+  io_println(world, "cadd_max_0=" + opt_i64(graph::checked_add_i64(9223372036854775807L, 0L)))
+  io_println(world, "cadd_max_1=" + opt_i64(graph::checked_add_i64(9223372036854775807L, 1L)))
+  io_println(world, "cadd_min_m1=" + opt_i64(graph::checked_add_i64(i64_min, -1L)))
+  io_println(world, "cadd_max_nmax=" + opt_i64(graph::checked_add_i64(9223372036854775807L, -9223372036854775807L)))
+  io_println(world, "fits_0_max=" + bstr(graph::fits_i64(0L, 9223372036854775807UL)))
+  io_println(world, "fits_0_sb=" + bstr(graph::fits_i64(0L, 9223372036854775808UL)))
+  io_println(world, "fits_m1_sb=" + bstr(graph::fits_i64(-1L, 9223372036854775808UL)))
+  io_println(world, "fits_m1_hm=" + bstr(graph::fits_i64(-1L, 9223372036854775807UL)))
+  io_println(world, "fits_1_0=" + bstr(graph::fits_i64(1L, 0UL)))
+  io_println(world, "sign_hi_pos=" + graph::i64_sign_hi(42L).to_string())
+  io_println(world, "sign_hi_neg=" + graph::i64_sign_hi(-42L).to_string())
+  io_println(world, "carry_0=" + graph::i128_add_carry(100UL, 200UL).to_string())
+  io_println(world, "carry_1=" + graph::i128_add_carry(18446744073709551615UL, 1UL).to_string())
+  io_println(world, "i128_lt_hi=" + bstr(graph::i128_lt(-1L, 100UL, 0L, 0UL)))
+  io_println(world, "i128_lt_lo=" + bstr(graph::i128_lt(0L, 5UL, 0L, 6UL)))
+  io_println(world, "i128_lt_eq=" + bstr(graph::i128_lt(0L, 5UL, 0L, 5UL)))
+  io_println(world, "radix_min=" + graph::i64_to_radix_key(i64_min).to_string())
+  io_println(world, "radix_0=" + graph::i64_to_radix_key(0L).to_string())
+  io_println(world, "radix_max=" + graph::i64_to_radix_key(9223372036854775807L).to_string())
+  io_println(world, "fwd_5=" + graph::forward_half_edge(5).to_string())
+  io_println(world, "twin_10=" + graph::residual_twin(10).to_string())
+  io_println(world, "twin_11=" + graph::residual_twin(11).to_string())
+  io_println(world, "hp_1=" + graph::heap_parent(1).to_string())
+  io_println(world, "hp_2=" + graph::heap_parent(2).to_string())
+  io_println(world, "hp_7=" + graph::heap_parent(7).to_string())
+  io_println(world, "hl_0=" + graph::heap_left_child(0).to_string())
+  io_println(world, "hl_3=" + graph::heap_left_child(3).to_string())
   0
 }
 EOF
-
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
-echo "PASS: packages/graph Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"

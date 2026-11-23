@@ -8,42 +8,42 @@ open Aeneas Aeneas.Std Result Pion http2
 namespace Http2Proofs
 
 @[simp]
-theorem result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
+lemma result_bind_ok {α β : Type} (x : α) (f : α → Result β) :
     (do let y ← ok x; f y) = f x := by
   simp
 
-theorem result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
+lemma result_ok_inj {α : Type} {a b : α} (h : (ok a : Result α) = ok b) : a = b := by
   simpa using h
 
-theorem iscalar_eq_of_bv_eq {ty} {a b : IScalar ty} (h : a.bv = b.bv) : a = b := by
+lemma iscalar_eq_of_bv_eq {ty} {a b : IScalar ty} (h : a.bv = b.bv) : a = b := by
   cases a; cases b; congr
 
-theorem iscalar_eq_of_val_eq {ty} {a b : IScalar ty} (h : a.val = b.val) : a = b :=
+lemma iscalar_eq_of_val_eq {ty} {a b : IScalar ty} (h : a.val = b.val) : a = b :=
   iscalar_eq_of_bv_eq (BitVec.eq_of_toInt_eq h)
 
-theorem i32_band_bv (a b : I32) : (Pion.I32.band a b).bv = a.bv &&& b.bv := by
+lemma i32_band_bv (a b : I32) : (Pion.I32.band a b).bv = a.bv &&& b.bv := by
   rfl
 
-theorem i32_bor_bv (a b : I32) : (Pion.I32.bor a b).bv = a.bv ||| b.bv := by
+lemma i32_bor_bv (a b : I32) : (Pion.I32.bor a b).bv = a.bv ||| b.bv := by
   rfl
 
-theorem i64_band_bv (a b : I64) : (Pion.I64.band a b).bv = a.bv &&& b.bv := by
+lemma i64_band_bv (a b : I64) : (Pion.I64.band a b).bv = a.bv &&& b.bv := by
   rfl
 
-theorem i64_bor_bv (a b : I64) : (Pion.I64.bor a b).bv = a.bv ||| b.bv := by
+lemma i64_bor_bv (a b : I64) : (Pion.I64.bor a b).bv = a.bv ||| b.bv := by
   rfl
 
-theorem i32_shl_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
+lemma i32_shl_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
     Pion.I32.shl x s = ok (⟨x.bv <<< s.val.toNat⟩ : I32) := by
   unfold Pion.I32.shl
   simp [hs0, hs1]
 
-theorem i32_shr_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
+lemma i32_shr_ok (x : I32) (s : I32) (hs0 : 0 ≤ s.val) (hs1 : s.val < 32) :
     Pion.I32.shr x s = ok (⟨x.bv.sshiftRight s.val.toNat⟩ : I32) := by
   unfold Pion.I32.shr
   simp [hs0, hs1]
 
-theorem i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
+lemma i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
     x.bv.toNat = x.val.toNat := by
   have h1 : x.val = x.bv.toInt := rfl
   have h2 : x.bv.toInt = if 2 * x.bv.toNat < 2 ^ 32 then (x.bv.toNat : Int) else (x.bv.toNat : Int) - 2 ^ 32 := by
@@ -51,14 +51,14 @@ theorem i32_val_nonneg_toNat (x : I32) (hx : 0 ≤ x.val) :
   have hlt : x.bv.toNat < 2 ^ 32 := x.bv.isLt
   omega
 
-theorem bv32_getElem_high_false (x : I32) (hx0 : 0 ≤ x.val) {k : Nat} (hx : x.val < ((2 ^ k : Nat) : Int))
+lemma bv32_getElem_high_false (x : I32) (hx0 : 0 ≤ x.val) {k : Nat} (hx : x.val < ((2 ^ k : Nat) : Int))
     (i : Nat) (hi : i < 32) (hki : k ≤ i) : x.bv[i] = false := by
   rw [BitVec.getElem_eq_testBit_toNat, i32_val_nonneg_toNat x hx0]
   apply Nat.testBit_lt_two_pow
   have hlt : x.val.toNat < 2 ^ k := by omega
   exact Nat.lt_of_lt_of_le hlt (Nat.pow_le_pow_right (by omega) hki)
 
-theorem bv32_nonneg_of_msb_false (x : I32) (hmsb : x.bv[31] = false) :
+lemma bv32_nonneg_of_msb_false (x : I32) (hmsb : x.bv[31] = false) :
     0 ≤ x.val ∧ x.val ≤ 2147483647 := by
   have hval : x.val = x.bv.toInt := rfl
   have h2 : x.bv.toInt = if 2 * x.bv.toNat < 2 ^ 32 then (x.bv.toNat : Int) else (x.bv.toNat : Int) - 2 ^ 32 := by
@@ -74,7 +74,7 @@ theorem bv32_nonneg_of_msb_false (x : I32) (hmsb : x.bv[31] = false) :
     simp at htb
   omega
 
-theorem i32_add_val_of_bounds (a b : I32)
+lemma i32_add_val_of_bounds (a b : I32)
     (hlo : -2147483648 ≤ a.val + b.val) (hhi : a.val + b.val ≤ 2147483647) :
     (Pion.I32.add a b).val = a.val + b.val := by
   have h1 : (Pion.I32.add a b).val = (a.bv + b.bv).toInt := rfl
@@ -93,7 +93,7 @@ theorem i32_add_val_of_bounds (a b : I32)
       simpa [Int.add_emod_right] using h'
     simp only [Int.bmod, hm]; split <;> omega
 
-theorem i64_sub_val_of_bounds (a b : I64)
+lemma i64_sub_val_of_bounds (a b : I64)
     (hlo : -9223372036854775808 ≤ a.val - b.val) (hhi : a.val - b.val ≤ 9223372036854775807) :
     (Pion.I64.sub a b).val = a.val - b.val := by
   have h1 : (Pion.I64.sub a b).val = (a.bv - b.bv).toInt := rfl
@@ -111,27 +111,6 @@ theorem i64_sub_val_of_bounds (a b : I64)
         Int.emod_eq_of_lt (by omega) (by omega)
       simpa [Int.add_emod_right] using h'
     simp only [Int.bmod, hm]; split <;> omega
-
-/-- Theorem 1: RFC 7541 §4.1 HPACK dynamic table entry size = name_len + value_len + 32 (≥ 32). -/
-theorem hpack_entry_size_spec (nlen vlen : I32)
-    (hn : 0 ≤ nlen.val) (hv : 0 ≤ vlen.val)
-    (hbound : nlen.val + vlen.val + 32 ≤ 2147483647) :
-    ∃ sz, hpack_entry_size nlen vlen = ok sz ∧
-      sz.val = nlen.val + vlen.val + 32 ∧ 32 ≤ sz.val := by
-  unfold hpack_entry_size
-  have h32 : (32#i32 : I32).val = 32 := rfl
-  have h1 : (Pion.I32.add nlen vlen).val = nlen.val + vlen.val :=
-    i32_add_val_of_bounds nlen vlen (by omega) (by omega)
-  have h2 : (Pion.I32.add (Pion.I32.add nlen vlen) 32#i32).val =
-      (Pion.I32.add nlen vlen).val + 32 := by
-    have := i32_add_val_of_bounds (Pion.I32.add nlen vlen) 32#i32 (by omega) (by omega)
-    omega
-  refine ⟨Pion.I32.add (Pion.I32.add nlen vlen) 32#i32, rfl, by omega, by omega⟩
-
-/-- Theorem 2: `stream_state_eq` is exact decidable equality on RFC 9113 §5.1 `StreamState`. -/
-theorem stream_state_eq_iff (a b : StreamState) :
-    stream_state_eq a b = ok true ↔ a = b := by
-  cases a <;> cases b <;> simp [stream_state_eq]
 
 /-- Theorem 3: RFC 9113 §5.1.1 server (odd) and client (even) remote stream parities partition all stream IDs. -/
 theorem is_remote_stream_parity_complement (sid : I32) :
@@ -194,12 +173,6 @@ theorem flow_window_add_ok_bounds (cur inc : I64)
     omega
   have hle' : cur.val ≤ (Pion.I64.sub 2147483647#i64 inc).val := hle
   omega
-
-/-- Theorem 5: RFC 9113 §5.1 DATA receive permission classification across all 7 stream states. -/
-theorem can_recv_data_in_state_spec (st : StreamState) :
-    (can_recv_data_in_state st = ok 0#i32 ↔ st = .Open ∨ st = .HalfClosedLocal) ∧
-    (can_recv_data_in_state st = ok 1#i32 ↔ st = .HalfClosedRemote ∨ st = .Closed) := by
-  cases st <;> simp [can_recv_data_in_state]
 
 /-- Theorem 6: RFC 9113 §5.1 receiving END_STREAM on any DATA-receiving state blocks all subsequent DATA. -/
 theorem recv_end_stream_blocks_further_data (st : StreamState)

@@ -172,11 +172,11 @@ theorem aligned_add_96_add_no_overflow
   have hcarry : carry.val = (a_lo.val + b_lo.val) / 2 ^ 64 := by
     simp only [carry]
     by_cases hlt : lo2 < a_lo
-    · rw [if_pos hlt]
+    · rw [ite_eq_left hlt]
       have : lo2.val < a_lo.val := hlt
       have : (1#u64 : Std.U64).val = 1 := by decide
       omega
-    · rw [if_neg hlt]
+    · rw [ite_eq_right hlt]
       have : ¬(lo2.val < a_lo.val) := hlt
       have : (0#u64 : Std.U64).val = 0 := by decide
       omega
@@ -213,11 +213,11 @@ theorem aligned_add_96_add_overflow_scale0
   have hcarry : carry.val = (a_lo.val + b_lo.val) / 2 ^ 64 := by
     simp only [carry]
     by_cases hlt : lo2 < a_lo
-    · rw [if_pos hlt]
+    · rw [ite_eq_left hlt]
       have : lo2.val < a_lo.val := hlt
       have : (1#u64 : Std.U64).val = 1 := by decide
       omega
-    · rw [if_neg hlt]
+    · rw [ite_eq_right hlt]
       have : ¬(lo2.val < a_lo.val) := hlt
       have : (0#u64 : Std.U64).val = 0 := by decide
       omega
@@ -249,11 +249,11 @@ theorem aligned_add_96_add_overflow_rescale
   have hcarry : carry.val = (a_lo.val + b_lo.val) / 2 ^ 64 := by
     simp only [carry]
     by_cases hlt : lo2 < a_lo
-    · rw [if_pos hlt]
+    · rw [ite_eq_left hlt]
       have : lo2.val < a_lo.val := hlt
       have : (1#u64 : Std.U64).val = 1 := by decide
       omega
-    · rw [if_neg hlt]
+    · rw [ite_eq_right hlt]
       have : ¬(lo2.val < a_lo.val) := hlt
       have : (0#u64 : Std.U64).val = 0 := by decide
       omega
@@ -290,14 +290,14 @@ theorem aligned_add_96_sub_spec
   have hal := u64_val_lt a_lo; have hbl := u64_val_lt b_lo
   have hah := u32_val_lt a_hi; have hbh := u32_val_lt b_hi
   by_cases hge : (if a_hi ≠ b_hi then decide (a_hi > b_hi) else decide (a_lo >= b_lo)) = true
-  · rw [if_pos hge]
+  · rw [ite_eq_left hge]
     have hval_ge : val96 b_lo b_hi ≤ val96 a_lo a_hi := by
       unfold val96
       by_cases hne : a_hi ≠ b_hi
-      · rw [if_pos hne] at hge
+      · rw [ite_eq_left hne] at hge
         simp only [decide_eq_true_eq] at hge
         have : b_hi.val < a_hi.val := hge; omega
-      · rw [if_neg hne] at hge
+      · rw [ite_eq_right hne] at hge
         simp only [decide_eq_true_eq] at hge
         have heq : a_hi = b_hi := Classical.not_not.mp hne
         have : b_lo.val ≤ a_lo.val := hge; rw [heq]; omega
@@ -325,16 +325,16 @@ theorem aligned_add_96_sub_spec
         have h1 : (Pion.U32.sub a_hi b_hi).val = a_hi.val - b_hi.val := u32_sub_val (by omega)
         rw [u32_sub_val (by omega), h1, hbw]; omega
       omega
-  · rw [if_neg hge]
+  · rw [ite_eq_right hge]
     have hval_lt : val96 a_lo a_hi < val96 b_lo b_hi := by
       unfold val96
       by_cases hne : a_hi ≠ b_hi
-      · rw [if_pos hne] at hge
+      · rw [ite_eq_left hne] at hge
         simp only [decide_eq_true_eq] at hge
         have : ¬(b_hi.val < a_hi.val) := hge
         have : a_hi.val ≠ b_hi.val := fun he => hne (UScalar.eq_of_val_eq he)
         omega
-      · rw [if_neg hne] at hge
+      · rw [ite_eq_right hne] at hge
         simp only [decide_eq_true_eq] at hge
         have heq : a_hi = b_hi := Classical.not_not.mp hne
         have : ¬(b_lo.val ≤ a_lo.val) := hge; rw [heq]; omega
@@ -384,11 +384,11 @@ private theorem cmp_magnitude_loop0_spec (diff : Std.I32) (b_lo : Std.U64) (b_hi
       have hstep_pos : 1 ≤ step.val ∧ step.val ≤ 9 ∧ step.val ≤ d.val := by
         simp only [step]
         by_cases h9 : d >= 9#i32
-        · rw [if_pos h9]
+        · rw [ite_eq_left h9]
           have : (9#i32 : Std.I32).val ≤ d.val := h9
           have hv : (9#i32 : Std.I32).val = 9 := by decide
           omega
-        · rw [if_neg h9]
+        · rw [ite_eq_right h9]
           have : ¬((9#i32 : Std.I32).val ≤ d.val) := h9
           have hv : (9#i32 : Std.I32).val = 9 := by decide
           omega
@@ -492,11 +492,11 @@ private theorem cmp_magnitude_loop1_spec (diff : Std.I32) (a_lo : Std.U64) (a_hi
       have hstep_pos : 1 ≤ step.val ∧ step.val ≤ 9 ∧ step.val ≤ d.val := by
         simp only [step]
         by_cases h9 : d >= 9#i32
-        · rw [if_pos h9]
+        · rw [ite_eq_left h9]
           have : (9#i32 : Std.I32).val ≤ d.val := h9
           have hv : (9#i32 : Std.I32).val = 9 := by decide
           omega
-        · rw [if_neg h9]
+        · rw [ite_eq_right h9]
           have : ¬((9#i32 : Std.I32).val ≤ d.val) := h9
           have hv : (9#i32 : Std.I32).val = 9 := by decide
           omega
@@ -635,9 +635,9 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
   set s1 := Pion.U32.to_int sc1
   set s2 := Pion.U32.to_int sc2
   by_cases hne : s1 ≠ s2
-  · rw [if_pos hne]
+  · rw [ite_eq_left hne]
     by_cases hgt : s1 > s2
-    · rw [if_pos hgt]
+    · rw [ite_eq_left hgt]
       have hs1_gt : dec_scale b < dec_scale a := by have : s2.val < s1.val := hgt; omega
       have hpow_rel : 10 ^ dec_scale a = 10 ^ dec_scale b * 10 ^ (dec_scale a - dec_scale b) := by
         rw [← Nat.pow_add, show dec_scale b + (dec_scale a - dec_scale b) = dec_scale a by omega]
@@ -648,7 +648,7 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
         rw [i32_sub_val (by omega) (by omega)]
         omega
       by_cases hfast : ((b.hi == 0#u32) && decide (diff <= 19#i32)) = true
-      · rw [if_pos hfast]
+      · rw [ite_eq_left hfast]
         simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at hfast
         have hdiff19 : diff.val ≤ 19 := by
           have : diff.val ≤ (19#i32 : Std.I32).val := hfast.2
@@ -671,7 +671,7 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
             exact Nat.mul_lt_mul_of_pos_right hlt_mag hpos_p
           exact ⟨(-1)#i32, by
             change (if nh > 4294967295#u64 then _ else _) = _
-            rw [if_pos hov], ⟨fun _ => hlt_rat, fun _ => rfl⟩,
+            rw [ite_eq_left hov], ⟨fun _ => hlt_rat, fun _ => rfl⟩,
             ⟨fun h => absurd h (by decide), fun h => by omega⟩,
             ⟨fun h => absurd h (by decide), fun h => by omega⟩⟩
         · have hnh : nh.val < 2 ^ 32 := by
@@ -684,14 +684,14 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
           rw [hval_b] at hcmp
           refine ⟨_, by
             change (if nh > 4294967295#u64 then _ else _) = _
-            rw [if_neg hov], ?_, ?_, ?_⟩
+            rw [ite_eq_right hov], ?_, ?_, ?_⟩
           · rw [hcmp.1, hpow_rel, Nat.mul_comm (10 ^ dec_scale b), ← Nat.mul_assoc]
             exact ⟨fun h => Nat.mul_lt_mul_of_pos_right h hpos_p, fun h => Nat.lt_of_mul_lt_mul_right h⟩
           · rw [hcmp.2.1, hpow_rel, Nat.mul_comm (10 ^ dec_scale b), ← Nat.mul_assoc]
             exact ⟨fun h => congrArg (· * 10 ^ dec_scale b) h, fun h => Nat.eq_of_mul_eq_mul_right hpos_p h⟩
           · rw [hcmp.2.2, hpow_rel, Nat.mul_comm (10 ^ dec_scale b), ← Nat.mul_assoc]
             exact ⟨fun h => Nat.mul_lt_mul_of_pos_right h hpos_p, fun h => Nat.lt_of_mul_lt_mul_right h⟩
-      · rw [if_neg hfast]
+      · rw [ite_eq_right hfast]
         have hloop := cmp_magnitude_loop0_spec diff b.lo64 b.hi (by omega) (by omega)
           (dec_mag b * 10 ^ (dec_scale a - dec_scale b))
           (by unfold dec_mag; rw [show diff.val.toNat = dec_scale a - dec_scale b by omega])
@@ -719,7 +719,7 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
             exact ⟨fun h => congrArg (· * 10 ^ dec_scale b) h, fun h => Nat.eq_of_mul_eq_mul_right hpos_p h⟩
           · rw [hcmp.2.2, hpow_rel, Nat.mul_comm (10 ^ dec_scale b), ← Nat.mul_assoc]
             exact ⟨fun h => Nat.mul_lt_mul_of_pos_right h hpos_p, fun h => Nat.lt_of_mul_lt_mul_right h⟩
-    · rw [if_neg hgt]
+    · rw [ite_eq_right hgt]
       have hs2_gt : dec_scale a < dec_scale b := by
         have h1 : ¬(s2.val < s1.val) := hgt
         have h2 : s1.val ≠ s2.val := fun he => hne (IScalar.eq_of_val_eq he)
@@ -733,7 +733,7 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
         rw [i32_sub_val (by omega) (by omega)]
         omega
       by_cases hfast : ((a.hi == 0#u32) && decide (diff <= 19#i32)) = true
-      · rw [if_pos hfast]
+      · rw [ite_eq_left hfast]
         simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at hfast
         have hdiff19 : diff.val ≤ 19 := by
           have : diff.val ≤ (19#i32 : Std.I32).val := hfast.2
@@ -756,7 +756,7 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
             exact Nat.mul_lt_mul_of_pos_right hgt_mag hpos_p
           exact ⟨1#i32, by
             change (if nh > 4294967295#u64 then _ else _) = _
-            rw [if_pos hov], ⟨fun h => absurd h (by decide), fun h => by omega⟩,
+            rw [ite_eq_left hov], ⟨fun h => absurd h (by decide), fun h => by omega⟩,
             ⟨fun h => absurd h (by decide), fun h => by omega⟩,
             ⟨fun _ => hgt_rat, fun _ => rfl⟩⟩
         · have hnh : nh.val < 2 ^ 32 := by
@@ -769,14 +769,14 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
           rw [hval_a] at hcmp
           refine ⟨_, by
             change (if nh > 4294967295#u64 then _ else _) = _
-            rw [if_neg hov], ?_, ?_, ?_⟩
+            rw [ite_eq_right hov], ?_, ?_, ?_⟩
           · rw [hcmp.1, hpow_rel, Nat.mul_comm (10 ^ dec_scale a), ← Nat.mul_assoc]
             exact ⟨fun h => Nat.mul_lt_mul_of_pos_right h hpos_p, fun h => Nat.lt_of_mul_lt_mul_right h⟩
           · rw [hcmp.2.1, hpow_rel, Nat.mul_comm (10 ^ dec_scale a), ← Nat.mul_assoc]
             exact ⟨fun h => congrArg (· * 10 ^ dec_scale a) h, fun h => Nat.eq_of_mul_eq_mul_right hpos_p h⟩
           · rw [hcmp.2.2, hpow_rel, Nat.mul_comm (10 ^ dec_scale a), ← Nat.mul_assoc]
             exact ⟨fun h => Nat.mul_lt_mul_of_pos_right h hpos_p, fun h => Nat.lt_of_mul_lt_mul_right h⟩
-      · rw [if_neg hfast]
+      · rw [ite_eq_right hfast]
         have hloop := cmp_magnitude_loop1_spec diff a.lo64 a.hi (by omega) (by omega)
           (dec_mag a * 10 ^ (dec_scale b - dec_scale a))
           (by unfold dec_mag; rw [show diff.val.toNat = dec_scale b - dec_scale a by omega])
@@ -804,7 +804,7 @@ theorem cmp_magnitude_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_de
             exact ⟨fun h => congrArg (· * 10 ^ dec_scale a) h, fun h => Nat.eq_of_mul_eq_mul_right hpos_p h⟩
           · rw [hcmp.2.2, hpow_rel, Nat.mul_comm (10 ^ dec_scale a), ← Nat.mul_assoc]
             exact ⟨fun h => Nat.mul_lt_mul_of_pos_right h hpos_p, fun h => Nat.lt_of_mul_lt_mul_right h⟩
-  · rw [if_neg hne]
+  · rw [ite_eq_right hne]
     have hseq : dec_scale a = dec_scale b := by
       have : s1 = s2 := Classical.not_not.mp hne
       have : s1.val = s2.val := congrArg IScalar.val this
@@ -886,7 +886,7 @@ theorem Decimal.compare_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_
       simp only [haz_f, Bool.false_eq_true, ↓reduceIte]
       rw [Decimal.is_sign_negative_spec, b_ok, Decimal.is_sign_negative_spec, b_ok]
       by_cases hsn : dec_neg a ≠ dec_neg b
-      · rw [if_pos hsn]
+      · rw [ite_eq_left hsn]
         cases hna : dec_neg a
         · have hnb : dec_neg b = true := by cases h : dec_neg b <;> simp_all
           simp only [Bool.false_eq_true, ↓reduceIte]
@@ -904,7 +904,7 @@ theorem Decimal.compare_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_
           exact ⟨(-1)#i32, rfl, ⟨fun _ => hlt, fun _ => rfl⟩,
             ⟨fun h => absurd h (by decide), fun h => by unfold dec_eq_rat at h; nlinarith⟩,
             ⟨fun h => absurd h (by decide), fun h => by unfold dec_lt_rat at h; nlinarith⟩⟩
-      · rw [if_neg hsn]
+      · rw [ite_eq_right hsn]
         have hsneq : dec_neg a = dec_neg b := Classical.not_not.mp hsn
         -- Both branches (same flags fast path vs general cmp_magnitude) compute `mag` matching cross-multiplied magnitude
         have hmag_goal : ∀ mag : Std.I32,
@@ -981,86 +981,6 @@ theorem Decimal.compare_neg_zero_eq_pos_zero (a b : Decimal)
     unfold dec_eq_rat dec_signed_val; rw [hza, hzb]; simp
   rw [heq.mpr this]
 
-theorem Decimal.compare_refl (a : Decimal) (ha : valid_decimal a) :
-    Decimal.compare a a = ok 0#i32 := by
-  obtain ⟨r, hr, _, heq, _⟩ := Decimal.compare_spec a a ha ha
-  rw [hr, heq.mpr rfl]
-
-theorem Decimal.compare_antisymm (a b : Decimal) (ha : valid_decimal a) (hb : valid_decimal b)
-    {r : Std.I32} (h : Decimal.compare a b = ok r) :
-    Decimal.compare b a = ok (Pion.I32.neg r) := by
-  obtain ⟨r1, hr1, hlt1, heq1, hgt1⟩ := Decimal.compare_spec a b ha hb
-  obtain ⟨r2, hr2, hlt2, heq2, hgt2⟩ := Decimal.compare_spec b a hb ha
-  rw [hr1] at h; have hr := ok_inj h; subst hr
-  rcases lt_trichotomy (dec_signed_val a * (10 ^ dec_scale b : Int))
-      (dec_signed_val b * (10 ^ dec_scale a : Int)) with hlt | heq | hgt
-  · rw [hr2, hlt1.mpr hlt, hgt2.mpr hlt]; rfl
-  · rw [hr2, heq1.mpr heq, heq2.mpr heq.symm]; rfl
-  · rw [hr2, hgt1.mpr hgt, hlt2.mpr hgt]; rfl
-
-theorem Decimal.compare_trans_lt (a b c : Decimal)
-    (ha : valid_decimal a) (hb : valid_decimal b) (hc : valid_decimal c)
-    (hab : Decimal.compare a b = ok (-1)#i32)
-    (hbc : Decimal.compare b c = ok (-1)#i32) :
-    Decimal.compare a c = ok (-1)#i32 := by
-  obtain ⟨r1, hr1, hlt1, _, _⟩ := Decimal.compare_spec a b ha hb
-  obtain ⟨r2, hr2, hlt2, _, _⟩ := Decimal.compare_spec b c hb hc
-  obtain ⟨r3, hr3, hlt3, _, _⟩ := Decimal.compare_spec a c ha hc
-  rw [hr1] at hab; have h1 := hlt1.mp (ok_inj hab)
-  rw [hr2] at hbc; have h2 := hlt2.mp (ok_inj hbc)
-  unfold dec_lt_rat at h1 h2
-  have hpa : (0 : Int) < 10 ^ dec_scale a := by positivity
-  have hpb : (0 : Int) < 10 ^ dec_scale b := by positivity
-  have hpc : (0 : Int) < 10 ^ dec_scale c := by positivity
-  have h3 : dec_lt_rat a c := by
-    unfold dec_lt_rat
-    have hmul : (dec_signed_val a * (10 ^ dec_scale c : Int)) * (10 ^ dec_scale b : Int) <
-        (dec_signed_val c * (10 ^ dec_scale a : Int)) * (10 ^ dec_scale b : Int) := by
-      have m1 : dec_signed_val a * (10 ^ dec_scale b : Int) * (10 ^ dec_scale c : Int) <
-          dec_signed_val b * (10 ^ dec_scale a : Int) * (10 ^ dec_scale c : Int) :=
-        Int.mul_lt_mul_of_pos_right h1 hpc
-      have m2 : dec_signed_val b * (10 ^ dec_scale c : Int) * (10 ^ dec_scale a : Int) <
-          dec_signed_val c * (10 ^ dec_scale b : Int) * (10 ^ dec_scale a : Int) :=
-        Int.mul_lt_mul_of_pos_right h2 hpa
-      linarith
-    exact lt_of_mul_lt_mul_right hmul (by omega)
-  rw [hr3, hlt3.mpr h3]
-
-theorem Decimal.eq_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_decimal b) :
-    ∃ r : Bool, Decimal.eq a b = ok r ∧ (r = true ↔ dec_eq_rat a b) := by
-  unfold Decimal.eq
-  obtain ⟨c, hc, _, heq, _⟩ := Decimal.compare_spec a b ha hb
-  rw [hc, b_ok]
-  exact ⟨c == 0#i32, rfl, by simp [beq_iff_eq, heq]⟩
-
-theorem Decimal.lt_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_decimal b) :
-    ∃ r : Bool, Decimal.lt a b = ok r ∧ (r = true ↔ dec_lt_rat a b) := by
-  unfold Decimal.lt
-  obtain ⟨c, hc, hlt, heq, hgt⟩ := Decimal.compare_spec a b ha hb
-  rw [hc, b_ok]
-  refine ⟨decide (c < 0#i32), rfl, ?_⟩
-  rw [decide_eq_true_eq]
-  rcases lt_trichotomy (dec_signed_val a * (10 ^ dec_scale b : Int))
-      (dec_signed_val b * (10 ^ dec_scale a : Int)) with h | h | h
-  · rw [hlt.mpr h]; exact ⟨fun _ => h, fun _ => by decide⟩
-  · rw [heq.mpr h]; exact ⟨fun hc0 => absurd hc0 (by decide), fun hlt' => by unfold dec_lt_rat at hlt'; omega⟩
-  · rw [hgt.mpr h]; exact ⟨fun hc0 => absurd hc0 (by decide), fun hlt' => by unfold dec_lt_rat at hlt'; omega⟩
-
-theorem Decimal.le_spec (a b : Decimal) (ha : valid_decimal a) (hb : valid_decimal b) :
-    ∃ r : Bool, Decimal.le a b = ok r ∧ (r = true ↔ dec_lt_rat a b ∨ dec_eq_rat a b) := by
-  unfold Decimal.le
-  obtain ⟨c, hc, hlt, heq, hgt⟩ := Decimal.compare_spec a b ha hb
-  rw [hc, b_ok]
-  refine ⟨decide (c <= 0#i32), rfl, ?_⟩
-  rw [decide_eq_true_eq]
-  rcases lt_trichotomy (dec_signed_val a * (10 ^ dec_scale b : Int))
-      (dec_signed_val b * (10 ^ dec_scale a : Int)) with h | h | h
-  · rw [hlt.mpr h]; exact ⟨fun _ => Or.inl h, fun _ => by decide⟩
-  · rw [heq.mpr h]; exact ⟨fun _ => Or.inr h, fun _ => by decide⟩
-  · rw [hgt.mpr h]
-    exact ⟨fun hc0 => absurd hc0 (by decide), fun hor => by
-      rcases hor with h1 | h2 <;> (unfold dec_lt_rat dec_eq_rat at *; omega)⟩
-
 /-- Loop specification for `truncate_core_loop0`: exact 96-bit division by `10^drop` with sticky flag. -/
 private theorem truncate_core_loop0_spec (drop : Std.I32) (q2 q1 q0 : Std.U32) (had_rem : Bool)
     (hd0 : 0 ≤ drop.val) (hd28 : drop.val ≤ 28) :
@@ -1086,11 +1006,11 @@ private theorem truncate_core_loop0_spec (drop : Std.I32) (q2 q1 q0 : Std.U32) (
       have hstep : 1 ≤ step.val ∧ step.val ≤ 9 ∧ step.val ≤ d.val := by
         simp only [step]
         by_cases h9 : d > 9#i32
-        · rw [if_pos h9]
+        · rw [ite_eq_left h9]
           have : (9#i32 : Std.I32).val < d.val := h9
           have hv : (9#i32 : Std.I32).val = 9 := by decide
           omega
-        · rw [if_neg h9]
+        · rw [ite_eq_right h9]
           have : ¬((9#i32 : Std.I32).val < d.val) := h9
           have hv : (9#i32 : Std.I32).val = 9 := by decide
           omega

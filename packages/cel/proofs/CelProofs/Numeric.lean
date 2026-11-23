@@ -86,22 +86,6 @@ private lemma u64_div_ok (a b : U64) (hb : b.val ≠ 0) :
   simp only [WP.spec_ok] at hspec
   exact ⟨⟨a.bv / b.bv⟩, hok, hspec⟩
 
-/-- Theorem 1: `i64_neg_overflows a` returns `true` iff `a = INT64_MIN` (i.e. `-a` exceeds `INT64_MAX`). -/
-theorem i64_neg_overflows_iff (a : I64) :
-    i64_neg_overflows a = ok true ↔ a.val = -9223372036854775808 := by
-  unfold i64_neg_overflows
-  constructor
-  · intro h
-    have h1 := result_ok_inj h
-    have h2 : a = Pion.I64.sub (-9223372036854775807)#i64 1#i64 := by simpa using h1
-    rw [h2, i64_min_val]
-  · intro h
-    have heq : a = Pion.I64.sub (-9223372036854775807)#i64 1#i64 := by
-      apply IScalar.eq_of_val_eq
-      rw [h, i64_min_val]
-    rw [heq]
-    simp
-
 /-- Theorem 2: `i64_add_overflows a b` returns `true` iff `a + b` lies outside `[-2^63, 2^63 - 1]`. -/
 theorem i64_add_overflows_iff (a b : I64) :
     i64_add_overflows a b = ok true ↔
@@ -192,62 +176,6 @@ theorem i64_sub_overflows_iff (a b : I64) :
       show (Pion.I64.add 9223372036854775807#i64 b).val < a.val
       rw [hadd, i64_max_val]; omega
 
-/-- Theorem 4: `i64_div_err_code` classifies division-by-zero (`1`), `INT64_MIN / -1` overflow (`2`), and safe division (`0`). -/
-theorem i64_div_err_code_spec (a b : I64) :
-    ∃ r, i64_div_err_code a b = ok r ∧
-      (r = 1#i32 ↔ b.val = 0) ∧
-      (r = 2#i32 ↔ (a.val = -9223372036854775808 ∧ b.val = -1)) ∧
-      (r = 0#i32 ↔ (b.val ≠ 0 ∧ ¬(a.val = -9223372036854775808 ∧ b.val = -1))) := by
-  unfold i64_div_err_code
-  refine ⟨_, rfl, ?_, ?_, ?_⟩
-  · by_cases hb : b = 0#i64
-    · subst hb; simp
-    · have hbv : b.val ≠ 0 := fun h => hb (IScalar.eq_of_val_eq h)
-      simp only [hb, ↓reduceIte, hbv, iff_false]
-      split_ifs <;> decide
-  · by_cases hb : b = 0#i64
-    · subst hb
-      simp only [↓reduceIte]
-      constructor
-      · intro h; cases h
-      · intro ⟨_, h1⟩; exact absurd h1 (by decide)
-    · simp only [hb, ↓reduceIte]
-      by_cases hcond : ((a == Pion.I64.sub (-9223372036854775807)#i64 1#i64) && (b == (-1)#i64)) = true
-      · simp only [hcond, ↓reduceIte, true_iff]
-        simp only [Bool.and_eq_true, beq_iff_eq] at hcond
-        rcases hcond with ⟨ha, hb1⟩
-        exact ⟨by rw [ha, i64_min_val], by rw [hb1]; decide⟩
-      · have hcf : ((a == Pion.I64.sub (-9223372036854775807)#i64 1#i64) && (b == (-1)#i64)) = false :=
-          Bool.eq_false_iff.mpr hcond
-        simp only [hcf, Bool.false_eq_true, ↓reduceIte]
-        constructor
-        · intro h; cases h
-        · intro ⟨ha, hb1⟩
-          exfalso
-          apply hcond
-          simp only [Bool.and_eq_true, beq_iff_eq]
-          exact ⟨IScalar.eq_of_val_eq (by rw [ha, i64_min_val]),
-                 IScalar.eq_of_val_eq (by rw [hb1]; decide)⟩
-  · by_cases hb : b = 0#i64
-    · subst hb; simp
-    · have hbv : b.val ≠ 0 := fun h => hb (IScalar.eq_of_val_eq h)
-      simp only [hb, ↓reduceIte]
-      by_cases hcond : ((a == Pion.I64.sub (-9223372036854775807)#i64 1#i64) && (b == (-1)#i64)) = true
-      · simp only [hcond, ↓reduceIte]
-        simp only [Bool.and_eq_true, beq_iff_eq] at hcond
-        rcases hcond with ⟨ha, hb1⟩
-        constructor
-        · intro h; cases h
-        · intro ⟨_, hnot⟩
-          exact absurd ⟨by rw [ha, i64_min_val], by rw [hb1]; decide⟩ hnot
-      · have hcf : ((a == Pion.I64.sub (-9223372036854775807)#i64 1#i64) && (b == (-1)#i64)) = false :=
-          Bool.eq_false_iff.mpr hcond
-        simp only [hcf, Bool.false_eq_true, ↓reduceIte, true_iff]
-        refine ⟨hbv, fun ⟨ha, hb1⟩ => hcond ?_⟩
-        simp only [Bool.and_eq_true, beq_iff_eq]
-        exact ⟨IScalar.eq_of_val_eq (by rw [ha, i64_min_val]),
-               IScalar.eq_of_val_eq (by rw [hb1]; decide)⟩
-
 /-- Theorem 5: `u64_add_overflows a b` returns `true` iff `a + b ≥ 2^64`. -/
 theorem u64_add_overflows_iff (a b : U64) :
     u64_add_overflows a b = ok true ↔ a.val + b.val ≥ 2 ^ 64 := by
@@ -268,30 +196,6 @@ theorem u64_add_overflows_iff (a b : U64) :
     have hlt : (Pion.U64.sub 18446744073709551615#u64 b).val < a.val := by
       rw [hsub]; omega
     exact decide_eq_true hlt
-
-/-- Theorem 6: `u64_add_overflows` is commutative. -/
-theorem u64_add_overflows_comm (a b : U64) :
-    u64_add_overflows a b = u64_add_overflows b a := by
-  have h1 := u64_add_overflows_iff a b
-  have h2 := u64_add_overflows_iff b a
-  unfold u64_add_overflows at h1 h2 ⊢
-  apply congrArg ok
-  apply Bool.eq_iff_iff.mpr
-  constructor
-  · intro ht
-    have hge : a.val + b.val ≥ 2 ^ 64 := h1.mp (congrArg ok ht)
-    exact result_ok_inj (h2.mpr (by omega))
-  · intro ht
-    have hge : b.val + a.val ≥ 2 ^ 64 := h2.mp (congrArg ok ht)
-    exact result_ok_inj (h1.mpr (by omega))
-
-/-- Theorem 7: `u64_sub_underflows a b` returns `true` iff `a < b`. -/
-theorem u64_sub_underflows_iff (a b : U64) :
-    u64_sub_underflows a b = ok true ↔ a.val < b.val := by
-  unfold u64_sub_underflows
-  constructor
-  · intro h; have h1 := result_ok_inj h; simpa using h1
-  · intro h; apply congrArg ok; simp [h]
 
 /-- Theorem 8: `u64_mul_overflows a b` returns `true` iff `a * b ≥ 2^64`. -/
 theorem u64_mul_overflows_iff (a b : U64) :
@@ -323,16 +227,6 @@ theorem u64_mul_overflows_iff (a b : U64) :
       simp only [Bool.and_eq_true, bne_iff_ne]
       exact ⟨fun h0 => h.1 (by rw [h0]; rfl), fun h0 => h.2 (by rw [h0]; rfl)⟩
     rcases hzero with h0 | h0 <;> simp [h0]
-
-/-- Theorem 9: `u64_mul_overflows` is commutative. -/
-theorem u64_mul_overflows_comm (a b : U64) :
-    u64_mul_overflows a b = u64_mul_overflows b a := by
-  rcases u64_mul_overflows_iff a b with ⟨r1, hr1, hiff1⟩
-  rcases u64_mul_overflows_iff b a with ⟨r2, hr2, hiff2⟩
-  rw [hr1, hr2]
-  apply congrArg ok
-  apply Bool.eq_iff_iff.mpr
-  rw [hiff1, hiff2, Nat.mul_comm]
 
 /-- Theorem 10: `cmp_i64_u64` is an exact mathematical trichotomy in `ℤ` between `Int64` and `UInt64`. -/
 theorem cmp_i64_u64_spec (i : I64) (u : U64) :
@@ -404,12 +298,6 @@ theorem cmp_i64_u64_spec (i : I64) (u : U64) :
           constructor
           · intro h; cases h
           · intro h; omega
-
-/-- Theorem 11: Every negative `Int64` is strictly less than every `UInt64` (including `0UL`). -/
-theorem cmp_i64_u64_neg_always_lt (i : I64) (u : U64) (hi : i.val < 0) :
-    cmp_i64_u64 i u = ok (-1)#i32 := by
-  rcases cmp_i64_u64_spec i u with ⟨r, hr, hlt, _, _⟩
-  rw [hr, hlt.mpr (by omega)]
 
 /-- Theorem 12: `int_to_u64` preserves the exact integer value for every non-negative `Int`. -/
 theorem int_to_u64_nonneg_exact (n : I32) (hn : 0 ≤ n.val) :

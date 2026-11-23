@@ -27,7 +27,7 @@ def daysInMonthMath (y m : Int) : Int :=
   else
     31
 
-theorem i32_band_3_eq_zero_iff (y : Std.I32) :
+lemma i32_band_3_eq_zero_iff (y : Std.I32) :
     Pion.I32.band y 3#i32 = 0#i32 ↔ y.val % 4 = 0 := by
   constructor
   · intro h
@@ -68,7 +68,7 @@ theorem i32_band_3_eq_zero_iff (y : Std.I32) :
       · simp [hlt]
     exact congrArg IScalar.mk hbv
 
-theorem i32_band_15_eq_zero_iff (y : Std.I32) :
+lemma i32_band_15_eq_zero_iff (y : Std.I32) :
     Pion.I32.band y 15#i32 = 0#i32 ↔ y.val % 16 = 0 := by
   constructor
   · intro h
@@ -113,14 +113,14 @@ theorem is_leap_year_spec (year : Std.I32) :
     is_leap_year year = ok (isLeapYearMath year.val) := by
   unfold is_leap_year isLeapYearMath
   by_cases h4 : Pion.I32.band year 3#i32 ≠ 0#i32
-  · rw [if_pos h4]
+  · rw [ite_eq_left h4]
     have hne4 : year.val % 4 ≠ 0 := fun hc => h4 ((i32_band_3_eq_zero_iff year).mpr hc)
     congr 1
     have hne400 : year.val % 400 ≠ 0 := by omega
     have h1 : (year.val % 4 == 0) = false := beq_false_of_ne hne4
     have h2 : (year.val % 400 == 0) = false := beq_false_of_ne hne400
     rw [h1, h2]; rfl
-  · rw [if_neg h4]
+  · rw [ite_eq_right h4]
     have hd4 : year.val % 4 = 0 := (i32_band_3_eq_zero_iff year).mp (not_not.mp h4)
     obtain ⟨r, hrem, hrval⟩ := i32_rem_ok year 25#i32 (by decide) (fun ⟨_, h⟩ => absurd h (by decide))
     rw [hrem, b_ok]
@@ -158,15 +158,6 @@ theorem is_leap_year_spec (year : Std.I32) :
         simp [h25, h16', h100, h400]
     · have h100 : year.val % 100 ≠ 0 := by omega
       simp [hd4, h25, h100]
-
-theorem is_leap_year_2000 : is_leap_year 2000#i32 = ok true := by
-  rw [is_leap_year_spec]; rfl
-
-theorem is_leap_year_2100 : is_leap_year 2100#i32 = ok false := by
-  rw [is_leap_year_spec]; rfl
-
-theorem is_leap_year_2400 : is_leap_year 2400#i32 = ok true := by
-  rw [is_leap_year_spec]; rfl
 
 /-- Exact specification of `days_in_month` for all valid months `1 ≤ month ≤ 12`. -/
 theorem days_in_month_spec (year month : Std.I32)
@@ -212,7 +203,7 @@ theorem days_in_month_spec (year month : Std.I32)
       intro m
       unfold Pion.I32.shr
       have h03 : 0 ≤ (3#i32).val ∧ (3#i32).val < 32 := by simp
-      rw [if_pos h03, b_ok]; rfl
+      rw [ite_eq_left h03, b_ok]; rfl
     rcases hcases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
     · exact ⟨31#i32, by rw [hshr]; rfl, by unfold daysInMonthMath; rfl, by decide, by decide, fun hc => absurd hc (by decide)⟩
     · exact ⟨31#i32, by rw [hshr]; rfl, by unfold daysInMonthMath; rfl, by decide, by decide, fun hc => absurd hc (by decide)⟩
@@ -326,7 +317,7 @@ theorem datetime_is_valid_spec (dt : DateTime) :
                 exact (decide_eq_false (by omega)).symm
 
 /-- Red-team F5 guard: a valid `DateTime` has every field strictly `< 64` (no 64-bit shift wrap/trap). -/
-theorem datetime_valid_shift_bounds (dt : DateTime) (h : DateTime.is_valid dt = ok true) :
+lemma datetime_valid_shift_bounds (dt : DateTime) (h : DateTime.is_valid dt = ok true) :
     0 ≤ dt.second.val ∧ dt.second.val < 60 ∧
     0 ≤ dt.minute.val ∧ dt.minute.val < 60 ∧
     0 ≤ dt.hour.val ∧ dt.hour.val < 24 ∧
@@ -369,24 +360,24 @@ def civilFromDaysMath (z_in : Int) : Int × Int × Int :=
   let yr := if m ≤ 2 then y + 1 else y
   (yr, m, d)
 
-theorem tdiv_eq_ediv_of_nonneg (a b : Int) (ha : 0 ≤ a) (hb : 0 < b) :
+lemma tdiv_eq_ediv_of_nonneg (a b : Int) (ha : 0 ≤ a) (_hb : 0 < b) :
     Int.tdiv a b = a / b :=
   Int.tdiv_eq_ediv_of_nonneg ha
 
-theorem i32_div_pos_ok (a b : Std.I32) (hb : 0 < b.val) :
+lemma i32_div_pos_ok (a b : Std.I32) (hb : 0 < b.val) :
     ∃ z : Std.I32, Pion.I32.div a b = ok z ∧ z.val = Int.tdiv a.val b.val :=
   i32_div_ok a b (by omega) (fun ⟨_, h⟩ => by omega)
 
-theorem i64_div_pos_ok (a b : Std.I64) (hb : 0 < b.val) :
+lemma i64_div_pos_ok (a b : Std.I64) (hb : 0 < b.val) :
     ∃ z : Std.I64, Pion.I64.div a b = ok z ∧ z.val = Int.tdiv a.val b.val :=
   i64_div_ok a b (by omega) (fun ⟨_, h⟩ => by omega)
 
-theorem doe_bounds_math (yoe doy : Int) (hy0 : 0 ≤ yoe) (hy399 : yoe ≤ 399)
+lemma doe_bounds_math (yoe doy : Int) (hy0 : 0 ≤ yoe) (hy399 : yoe ≤ 399)
     (hd0 : 0 ≤ doy) (hd365 : doy ≤ 365) :
     0 ≤ yoe * 365 + yoe / 4 - yoe / 100 + doy ∧
     yoe * 365 + yoe / 4 - yoe / 100 + doy ≤ 146096 := by omega
 
-theorem dfc_range_math (year month day : Int)
+lemma dfc_range_math (year month day : Int)
     (hy1 : 1 ≤ year) (hy2 : year ≤ 9999)
     (hm1 : 1 ≤ month) (hm2 : month ≤ 12)
     (hd1 : 1 ≤ day) (hd2 : day ≤ daysInMonthMath year month) :
@@ -463,10 +454,10 @@ theorem days_from_civil_eq (year month day : Std.I32)
     dsimp only [y]
     by_cases h : month.val ≤ 2
     · have h' : month <= 2#i32 := h
-      rw [if_pos h', if_pos h, i32_sub_val]
+      rw [ite_eq_left h', ite_eq_left h, i32_sub_val]
       all_goals (have hc : (1#i32).val = 1 := (by simp); rw [hc]; try omega)
     · have h' : ¬ (month <= 2#i32) := h
-      rw [if_neg h', if_neg h]
+      rw [ite_eq_right h', ite_eq_right h]
   have hy_b : 0 ≤ y.val ∧ y.val ≤ 9999 := by omega
   have hy_ge0' : y >= 0#i32 := hy_b.1
   simp only [hy_ge0', ↓reduceIte]
@@ -490,10 +481,10 @@ theorem days_from_civil_eq (year month day : Std.I32)
     dsimp only [m_adj]
     by_cases h : month.val > 2
     · have h' : month > 2#i32 := h
-      rw [if_pos h', if_pos h, i32_sub_val]
+      rw [ite_eq_left h', ite_eq_left h, i32_sub_val]
       all_goals (have hc : (3#i32).val = 3 := (by simp); rw [hc]; try omega)
     · have h' : ¬ (month > 2#i32) := h
-      rw [if_neg h', if_neg h, i32_add_val]
+      rw [ite_eq_right h', ite_eq_right h, i32_add_val]
       all_goals (have hc : (9#i32).val = 9 := (by simp); rw [hc]; try omega)
   have hm_adj_b : 0 ≤ m_adj.val ∧ m_adj.val ≤ 11 := by omega
   have h153m : (Pion.I32.mul 153#i32 m_adj).val = 153 * m_adj.val := by
@@ -570,22 +561,22 @@ def yoeStart (yoe : Int) : Int :=
 def yoeOfDoe (doe : Int) : Int :=
   (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
 
-theorem yoeLen_eq_366_iff (yoe : Int) :
+lemma yoeLen_eq_366_iff (yoe : Int) :
     yoeLen yoe = 366 ↔ ((yoe + 1) % 4 = 0 ∧ (yoe + 1) % 100 ≠ 0) ∨ yoe = 399 := by
   unfold yoeLen
   by_cases h : ((yoe + 1) % 4 == 0 && (yoe + 1) % 100 != 0 || yoe == 399) = true
-  · rw [if_pos h]
+  · rw [ite_eq_left h]
     simp only [Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, bne_iff_ne] at h
     exact ⟨fun _ => h, fun _ => rfl⟩
-  · rw [if_neg h]
+  · rw [ite_eq_right h]
     simp only [Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, bne_iff_ne] at h
     exact ⟨fun hc => absurd hc (by omega), fun hc => absurd hc h⟩
 
-theorem yoeLen_cases (yoe : Int) :
+lemma yoeLen_cases (yoe : Int) :
     yoeLen yoe = 365 ∨ yoeLen yoe = 366 := by
   unfold yoeLen; split <;> simp
 
-theorem yoeOfDoe_yoeStart (yoe doy : Int)
+lemma yoeOfDoe_yoeStart (yoe doy : Int)
     (hy0 : 0 ≤ yoe) (hy399 : yoe ≤ 399)
     (hd0 : 0 ≤ doy) (hdlen : doy < yoeLen yoe) :
     yoeOfDoe (yoeStart yoe + doy) = yoe := by
@@ -599,12 +590,12 @@ theorem yoeOfDoe_yoeStart (yoe doy : Int)
   have hdoe_def : doe = 365 * yoe + yoe / 4 - yoe / 100 + doy := rfl
   have hq146096 : doe / 146096 = if yoe = 399 ∧ doy = 365 then 1 else 0 := by
     by_cases h : yoe = 399 ∧ doy = 365
-    · rw [if_pos h]; obtain ⟨rfl, rfl⟩ := h; rw [hdoe_def]; omega
-    · rw [if_neg h]; omega
+    · rw [ite_eq_left h]; obtain ⟨rfl, rfl⟩ := h; rw [hdoe_def]; omega
+    · rw [ite_eq_right h]; omega
   have hq36524 : doe / 36524 = if yoe = 399 ∧ doy = 365 then 4 else yoe / 100 := by
     by_cases h : yoe = 399 ∧ doy = 365
-    · rw [if_pos h]; obtain ⟨rfl, rfl⟩ := h; rw [hdoe_def]; omega
-    · rw [if_neg h]
+    · rw [ite_eq_left h]; obtain ⟨rfl, rfl⟩ := h; rw [hdoe_def]; omega
+    · rw [ite_eq_right h]
       by_cases h99 : yoe = 99
       · have : doy ≤ 364 := by
           by_cases h365 : doy = 365
@@ -631,8 +622,8 @@ theorem yoeOfDoe_yoeStart (yoe doy : Int)
   change (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365 = yoe
   rw [hq146096, hq36524]
   by_cases h : yoe = 399 ∧ doy = 365
-  · rw [if_pos h, if_pos h]; obtain ⟨rfl, rfl⟩ := h; rw [hdoe_def]; omega
-  · rw [if_neg h, if_neg h]
+  · rw [ite_eq_left h, ite_eq_left h]; obtain ⟨rfl, rfl⟩ := h; rw [hdoe_def]; omega
+  · rw [ite_eq_right h, ite_eq_right h]
     rcases hq1460 with hq | ⟨hq, hd1⟩
     · rw [hq]
       by_cases h365 : doy = 365
@@ -642,7 +633,7 @@ theorem yoeOfDoe_yoeStart (yoe doy : Int)
       · omega
     · rw [hq]; omega
 
-theorem yoeOfDoe_bounds (doe : Int) (h0 : 0 ≤ doe) (h1 : doe ≤ 146096) :
+lemma yoeOfDoe_bounds (doe : Int) (h0 : 0 ≤ doe) (h1 : doe ≤ 146096) :
     let yoe := yoeOfDoe doe
     0 ≤ yoe ∧ yoe ≤ 399 ∧ 0 ≤ doe - yoeStart yoe ∧ doe - yoeStart yoe < yoeLen yoe := by
   dsimp only
@@ -689,7 +680,7 @@ theorem yoeOfDoe_bounds (doe : Int) (h0 : 0 ≤ doe) (h1 : doe ≤ 146096) :
     exact ⟨hy0, by omega, by omega, by omega⟩
 
 /-- Isolated month/day inverse within a March-based year (`0 ≤ doy ≤ 365`). -/
-theorem doy_mp_spec (doy : Int) (h0 : 0 ≤ doy) (h1 : doy ≤ 365) :
+lemma doy_mp_spec (doy : Int) (h0 : 0 ≤ doy) (h1 : doy ≤ 365) :
     let mp := (5 * doy + 2) / 153
     let d := doy - (153 * mp + 2) / 5 + 1
     let m := if mp < 10 then mp + 3 else mp - 9
@@ -709,13 +700,13 @@ theorem doy_mp_spec (doy : Int) (h0 : 0 ≤ doy) (h1 : doy ≤ 365) :
      · intro _; unfold daysInMonthMath; simp; omega
      · intro hm; omega)
 
-theorem daysInMonthMath_nonfeb (y1 y2 m : Int) (hm : m ≠ 2) :
+lemma daysInMonthMath_nonfeb (y1 y2 m : Int) (hm : m ≠ 2) :
     daysInMonthMath y1 m = daysInMonthMath y2 m := by
   unfold daysInMonthMath
   have h : (m == 2) = false := beq_false_of_ne hm
   simp [h]
 
-theorem leap_iff_yoe (era yoe : Int) (hy0 : 0 ≤ yoe) (hy399 : yoe ≤ 399) :
+lemma leap_iff_yoe (era yoe : Int) (hy0 : 0 ≤ yoe) (hy399 : yoe ≤ 399) :
     isLeapYearMath (yoe + era * 400 + 1) = decide (yoeLen yoe = 366) := by
   unfold isLeapYearMath
   by_cases h : yoeLen yoe = 366

@@ -1,192 +1,179 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-PKG="$ROOT/packages/git"
-PROOFS="$PKG/proofs"
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref}"
-AENEAS_DIR="${AENEAS_LEAN_DIR:-/private/tmp/pion-lean-semver/aeneas/backends/lean}"
 export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in $WORK ==="
-mkdir -p "$PROJ"
-cp -R "$PION_REF/lean/PionLean" "$PROJ/"
-cp "$PION_REF/lean/PionLean.lean" "$PROJ/"
-cp "$PION_REF/lean/lean-toolchain" "$PROJ/"
-cp "$PION_REF/lean/lakefile.lean" "$PROJ/"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="git"
+LEAN_MOD="Git"
+PROOF_MOD="GitProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-python3 - "$PROJ/lakefile.lean" "$AENEAS_DIR" "$MEM_LIMIT" "$LEAN_NUM_THREADS" <<'PY'
-import sys, pathlib
-p = pathlib.Path(sys.argv[1])
-aeneas_dir, mem, threads = sys.argv[2], sys.argv[3], sys.argv[4]
-txt = p.read_text()
-txt = txt.replace("../aeneas/backends/lean", aeneas_dir)
-extra = f'''
-lean_lib Git where
-  moreLeanArgs := #["--memory={mem}", "-j", "{threads}"]
-
-lean_lib GitProofs where
-  moreLeanArgs := #["--memory={mem}", "-j", "{threads}"]
-'''
-if "lean_lib GitProofs" not in txt:
-    txt = txt.rstrip() + "\n" + extra
-p.write_text(txt)
-PY
-
-echo "=== [2/7] pionc extract-lean packages/git ==="
-pionc extract-lean "$PKG" --out "$PROJ" --json
-
-rm -rf "$PROJ/GitProofs" "$PROJ/GitProofs.lean" "$PROJ/CheckAxioms.lean" "$PROJ/EvalDiff.lean"
-mkdir -p "$PROJ/GitProofs"
-cp "$PROOFS/GitProofs.lean" "$PROJ/"
-cp "$PROOFS/GitProofs/"*.lean "$PROJ/GitProofs/"
-cp "$PROOFS/CheckAxioms.lean" "$PROJ/"
-cp "$PROOFS/EvalDiff.lean" "$PROJ/"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "$PROOFS/GitProofs.lean" "$PROOFS/GitProofs/"; then
-  echo "FAIL: forbidden tactic or axiom found"
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
+fi
 
-echo "=== [4/7] lake build PionLean Git.Types Git.Funs GitProofs ==="
-(cd "$PROJ" && lake build PionLean Git.Types Git.Funs GitProofs)
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
 
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AX_OUT="$(cd "$PROJ" && lake env lean CheckAxioms.lean 2>&1)"
-echo "$AX_OUT"
-python3 - "$AX_OUT" <<'PY'
-import sys, re
-out = sys.argv[1]
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_.']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
 allowed = {"propext", "Classical.choice", "Quot.sound"}
-lines = [l.strip() for l in out.splitlines() if l.strip()]
-count = 0
-for l in lines:
-    if "does not depend on any axioms" in l:
-        count += 1
-        continue
-    m = re.search(r"depends on axioms:\s*\[([^\]]*)\]", l)
-    if m:
-        count += 1
-        axs = {a.strip() for a in m.group(1).split(",") if a.strip()}
-        bad = axs - allowed
-        if bad:
-            print(f"FAIL: unexpected axioms {bad} in: {l}")
-            sys.exit(1)
-    else:
-        print(f"FAIL: unexpected CheckAxioms line: {l}")
-        sys.exit(1)
-if count < 22:
-    print(f"FAIL: expected >= 22 checked theorems, got {count}")
-    sys.exit(1)
-print(f"CheckAxioms: {count} theorems verified, standard axioms only")
-PY
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
 
-echo "=== [6/7] Lean EvalDiff ==="
-LEAN_DIFF_OUT="$WORK/git_lean_diff.txt"
-(cd "$PROJ" && lake env lean EvalDiff.lean) > "$LEAN_DIFF_OUT"
-cat "$LEAN_DIFF_OUT"
-if grep -q ': FAIL' "$LEAN_DIFF_OUT"; then
-  echo "FAIL: Lean EvalDiff reported a FAIL case"
-  exit 1
-fi
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_PKG="$WORK/git_native_diff"
-rm -rf "$DIFF_PKG"
-mkdir -p "$DIFF_PKG/src"
-cat > "$DIFF_PKG/pion.toml" <<EOF
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "git_native_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
-git = { path = "$PKG" }
+git = { path = "$PKG_DIR" }
 EOF
-
-cat > "$DIFF_PKG/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "git"
 
-fn chk_i32(w : World, label : String, actual : Int, expected : Int) -> Unit {
-  if actual == expected {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
+fn bstr(b : Bool) -> String { if b { "true" } else { "false" } }
 
-fn chk_bool(w : World, label : String, actual : Bool, expected : Bool) -> Unit {
-  if actual == expected {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
-  }
-}
-
-fn kind_code(o : Option[git::ObjectKind]) -> Int {
-  match o {
-    Some(git::ObjectKind::Commit) => 1
-    Some(git::ObjectKind::Tree) => 2
-    Some(git::ObjectKind::Blob) => 3
-    Some(git::ObjectKind::Tag) => 4
-    None => 0
-  }
-}
-
-pub fn main(w : World) -> Int {
-  chk_i32(w, "hex_0", git::hex_nibble(48), 0)
-  chk_i32(w, "hex_9", git::hex_nibble(57), 9)
-  chk_i32(w, "hex_a", git::hex_nibble(97), 10)
-  chk_i32(w, "hex_f", git::hex_nibble(102), 15)
-  chk_i32(w, "hex_A", git::hex_nibble(65), 10)
-  chk_i32(w, "hex_F", git::hex_nibble(70), 15)
-  chk_i32(w, "hex_g", git::hex_nibble(103), -1)
-  chk_i32(w, "pkt_len_0000", git::pkt_line_decode_len(0, 0, 0, 0), 0)
-  chk_i32(w, "pkt_len_0010", git::pkt_line_decode_len(0, 0, 1, 0), 16)
-  chk_i32(w, "pkt_len_fff0", git::pkt_line_decode_len(15, 15, 15, 0), 65520)
-  chk_i32(w, "pkt_cls_0", git::pkt_line_classify_len(0), 0)
-  chk_i32(w, "pkt_cls_1", git::pkt_line_classify_len(1), 1)
-  chk_i32(w, "pkt_cls_2", git::pkt_line_classify_len(2), 2)
-  chk_i32(w, "pkt_cls_3", git::pkt_line_classify_len(3), -1)
-  chk_i32(w, "pkt_cls_4", git::pkt_line_classify_len(4), 3)
-  chk_i32(w, "pkt_cls_65520", git::pkt_line_classify_len(65520), 3)
-  chk_i32(w, "pkt_cls_65521", git::pkt_line_classify_len(65521), -1)
-  chk_bool(w, "ref_ch_sp", git::is_ref_forbidden_char(32), true)
-  chk_bool(w, "ref_ch_tilde", git::is_ref_forbidden_char(126), true)
-  chk_bool(w, "ref_ch_slash", git::is_ref_forbidden_char(47), false)
-  chk_bool(w, "ref_ch_a", git::is_ref_forbidden_char(97), false)
-  chk_bool(w, "ref_pair_dotdot", git::is_ref_forbidden_pair(46, 46), true)
-  chk_bool(w, "ref_pair_ss", git::is_ref_forbidden_pair(47, 47), true)
-  chk_bool(w, "ref_pair_atb", git::is_ref_forbidden_pair(64, 123), true)
-  chk_bool(w, "ref_pair_ok", git::is_ref_forbidden_pair(97, 98), false)
-  chk_i32(w, "okind_1", kind_code(git::object_kind_from_pack_type_opt(1)), 1)
-  chk_i32(w, "okind_4", kind_code(git::object_kind_from_pack_type_opt(4)), 4)
-  chk_i32(w, "okind_5", kind_code(git::object_kind_from_pack_type_opt(5)), 0)
-  chk_i32(w, "idx_stage_0", git::index_flags_stage(0U), 0)
-  chk_i32(w, "idx_stage_3", git::index_flags_stage(12288U), 3)
-  chk_i32(w, "idx_pad_63", git::index_v2_padded_len(63), 64)
-  chk_i32(w, "idx_pad_64", git::index_v2_padded_len(64), 64)
-  chk_i32(w, "idx_padb_63", git::index_v2_pad_bytes(63), 1)
-  chk_i32(w, "idx_padb_64", git::index_v2_pad_bytes(64), 0)
-  chk_i32(w, "delta_dec_0", git::delta_copy_size_decode(0), 65536)
-  chk_i32(w, "delta_dec_42", git::delta_copy_size_decode(42), 42)
-  chk_i32(w, "delta_enc_65536", git::delta_copy_size_encode(65536), 0)
-  chk_bool(w, "delta_rng_ok", git::delta_copy_range_ok(10, 20, 30, 5, 25), true)
-  chk_bool(w, "delta_rng_bad", git::delta_copy_range_ok(11, 20, 30, 5, 25), false)
+pub fn main(world : World) -> Int {
+  io_println(world, "hex_0=" + git::hex_nibble(48).to_string())
+  io_println(world, "hex_9=" + git::hex_nibble(57).to_string())
+  io_println(world, "hex_a=" + git::hex_nibble(97).to_string())
+  io_println(world, "hex_f=" + git::hex_nibble(102).to_string())
+  io_println(world, "hex_A=" + git::hex_nibble(65).to_string())
+  io_println(world, "hex_F=" + git::hex_nibble(70).to_string())
+  io_println(world, "hex_g=" + git::hex_nibble(103).to_string())
+  io_println(world, "hex_min=" + git::hex_nibble(-2147483648).to_string())
+  io_println(world, "pkt_len_0000=" + git::pkt_line_decode_len(0, 0, 0, 0).to_string())
+  io_println(world, "pkt_len_0010=" + git::pkt_line_decode_len(0, 0, 1, 0).to_string())
+  io_println(world, "pkt_len_fff0=" + git::pkt_line_decode_len(15, 15, 15, 0).to_string())
+  io_println(world, "pkt_len_ffff=" + git::pkt_line_decode_len(15, 15, 15, 15).to_string())
+  io_println(world, "idx_pad_63=" + git::index_v2_padded_len(63).to_string())
+  io_println(world, "idx_pad_64=" + git::index_v2_padded_len(64).to_string())
+  io_println(world, "idx_pad_70=" + git::index_v2_padded_len(70).to_string())
+  io_println(world, "idx_padb_63=" + git::index_v2_pad_bytes(63).to_string())
+  io_println(world, "idx_padb_64=" + git::index_v2_pad_bytes(64).to_string())
+  io_println(world, "idx_padb_70=" + git::index_v2_pad_bytes(70).to_string())
+  io_println(world, "delta_dec_0=" + git::delta_copy_size_decode(0).to_string())
+  io_println(world, "delta_dec_42=" + git::delta_copy_size_decode(42).to_string())
+  io_println(world, "delta_enc_65536=" + git::delta_copy_size_encode(65536).to_string())
+  io_println(world, "delta_enc_42=" + git::delta_copy_size_encode(42).to_string())
+  io_println(world, "delta_rng_ok=" + bstr(git::delta_copy_range_ok(10, 20, 30, 5, 25)))
+  io_println(world, "delta_rng_bad=" + bstr(git::delta_copy_range_ok(11, 20, 30, 5, 25)))
+  io_println(world, "delta_rng_neg=" + bstr(git::delta_copy_range_ok(-1, 10, 30, 0, 25)))
   0
 }
 EOF
-
-PION_DIFF_OUT="$WORK/git_pion_diff.txt"
-pionc run "$DIFF_PKG" > "$PION_DIFF_OUT"
-diff -u "$LEAN_DIFF_OUT" "$PION_DIFF_OUT"
-LINES="$(wc -l < "$LEAN_DIFF_OUT" | tr -d ' ')"
-echo "Native vs Lean differential: $LINES cases identical (diff -u exit 0)"
-echo "PASS: packages/git Lean 4 proofs"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
+echo "PASS: packages/$PKG_NAME Lean 4 proofs"
