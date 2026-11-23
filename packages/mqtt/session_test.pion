@@ -1,0 +1,253 @@
+///| Sans-IO Client Session State Machine tests:
+///| CONNECT/CONNACK, QoS 0/1/2 bidirectional flows, Receive Maximum flow control,
+///| reconnect DUP=1 retransmission, Topic Alias mapping, and Keepalive PINGREQ/PINGRESP.
+
+///|
+fn must_encode(pkt : Packet, ver : ProtocolVersion) -> Bytes {
+  match encode_packet(pkt, ver) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "must_encode failed: " + mqtt_error_string(e))
+      Bytes::new(0)
+    }
+  }
+}
+
+///|
+test "session_qos0_qos1_qos2_and_out_of_order_acks" {
+  let cfg = SessionConfig::new("sess-1", ProtocolVersion::V5)
+  let s = Session::new(cfg)
+  debug_assert(s.connect(1000L) is Ok(_), "connect")
+  let tx_conn = s.poll_transmit()
+  debug_assert(tx_conn.length() > 0, "CONNECT bytes queued")
+
+  // Broker responds CONNACK with Receive Maximum = 2
+  let ca_props = Properties::empty()
+  ca_props.receive_maximum = Some(2)
+  ca_props.topic_alias_maximum = Some(4)
+  let ca_wire = must_encode(
+    Packet::ConnAck(ConnAckPacket::{ session_present: false, reason_code: 0, properties: ca_props }),
+    ProtocolVersion::V5,
+  )
+  match s.feed(ca_wire, 1010L) {
+    Ok(evs) => debug_assert(evs.length() == 1, "Connected event")
+    Err(e) => debug_assert(false, "feed connack failed: " + mqtt_error_string(e))
+  }
+
+  // QoS 0: does not consume inflight window
+  match s.publish("t/q0", "hi".to_bytes(), QoS::AtMostOnce, false, Properties::empty(), 1020L) {
+    Ok(None) => ()
+    _ => debug_assert(false, "QoS 0 must return None packet_id")
+  }
+  debug_assert(s.inflight_count() == 0, "QoS 0 inflight 0")
+
+  // QoS 1 (pid 1) & QoS 2 (pid 2): fills Receive Maximum = 2
+  let pid1 = match s.publish("t/q1", "m1".to_bytes(), QoS::AtLeastOnce, false, Properties::empty(), 1030L) {
+    Ok(Some(id)) => id
+    _ => {
+      debug_assert(false, "QoS 1 publish failed")
+      0
+    }
+  }
+  let pid2 = match s.publish("t/q2", "m2".to_bytes(), QoS::ExactlyOnce, false, Properties::empty(), 1040L) {
+    Ok(Some(id)) => id
+    _ => {
+      debug_assert(false, "QoS 2 publish failed")
+      0
+    }
+  }
+  debug_assert(pid1 != pid2 && s.inflight_count() == 2, "2 inflight")
+
+  // 3rd QoS 1 publish exceeds Receive Maximum = 2
+  match s.publish("t/q1b", "m3".to_bytes(), QoS::AtLeastOnce, false, Properties::empty(), 1050L) {
+    Err(MqttError::FlowControlExceeded) => ()
+    _ => debug_assert(false, "Receive Maximum flow control must trigger")
+  }
+  let _ = s.poll_transmit()
+
+  // Out-of-order: PUBREC for pid2 arrives BEFORE PUBACK for pid1
+  let rec2 = must_encode(
+    Packet::PubRec(PubRecPacket::{ packet_id: pid2, reason_code: 0, properties: Properties::empty() }),
+    ProtocolVersion::V5,
+  )
+  debug_assert(s.feed(rec2, 1060L) is Ok(_), "feed pubrec")
+  let tx_rel = s.poll_transmit()
+  match decode_packet(tx_rel, ProtocolVersion::V5) {
+    Ok((Packet::PubRel(pr), _)) => debug_assert(pr.packet_id == pid2, "auto PUBREL pid2")
+    _ => debug_assert(false, "expected auto PUBREL")
+  }
+
+  // PUBCOMP for pid2 frees 1 slot
+  let comp2 = must_encode(
+    Packet::PubComp(PubCompPacket::{ packet_id: pid2, reason_code: 0, properties: Properties::empty() }),
+    ProtocolVersion::V5,
+  )
+  match s.feed(comp2, 1070L) {
+    Ok(evs) => debug_assert(evs.length() == 1, "PublishComplete event")
+    Err(_) => debug_assert(false, "feed pubcomp failed")
+  }
+  debug_assert(s.inflight_count() == 1, "inflight down to 1")
+
+  // PUBACK for pid1 frees last slot
+  let ack1 = must_encode(
+    Packet::PubAck(PubAckPacket::{ packet_id: pid1, reason_code: 0, properties: Properties::empty() }),
+    ProtocolVersion::V5,
+  )
+  match s.feed(ack1, 1080L) {
+    Ok(evs) => debug_assert(evs.length() == 1, "PublishAcked event")
+    Err(_) => debug_assert(false, "feed puback failed")
+  }
+  debug_assert(s.inflight_count() == 0, "inflight 0")
+}
+
+///|
+test "session_inbound_qos2_dedup_and_topic_alias" {
+  let cfg = SessionConfig::new("sess-in", ProtocolVersion::V5)
+  let s = Session::new(cfg)
+  debug_assert(s.connect(0L) is Ok(_), "connect")
+  let _ = s.poll_transmit()
+  let ca = must_encode(
+    Packet::ConnAck(ConnAckPacket::{ session_present: false, reason_code: 0, properties: Properties::empty() }),
+    ProtocolVersion::V5,
+  )
+  debug_assert(s.feed(ca, 10L) is Ok(_), "connack")
+
+  // Inbound QoS 2 PUBLISH registers Topic Alias 3 = "factory/arm/pos"
+  let p1_props = Properties::empty()
+  p1_props.topic_alias = Some(3)
+  let p1 = must_encode(
+    Packet::Publish(PublishPacket::{
+      dup: false,
+      qos: QoS::ExactlyOnce,
+      retain: false,
+      topic: "factory/arm/pos",
+      packet_id: Some(77),
+      properties: p1_props,
+      payload: "x=1".to_bytes(),
+    }),
+    ProtocolVersion::V5,
+  )
+  match s.feed(p1, 20L) {
+    Ok(evs) => debug_assert(evs.length() == 1, "first QoS 2 emits PublishReceived")
+    Err(e) => debug_assert(false, "inbound qos2 failed: " + mqtt_error_string(e))
+  }
+  let tx_rec = s.poll_transmit()
+  match decode_packet(tx_rec, ProtocolVersion::V5) {
+    Ok((Packet::PubRec(r), _)) => debug_assert(r.packet_id == 77, "auto PUBREC 77")
+    _ => debug_assert(false, "expected PUBREC")
+  }
+
+  // Duplicate QoS 2 PUBLISH (same pid=77) must NOT emit a second PublishReceived, still replies PUBREC
+  let p1_dup = must_encode(
+    Packet::Publish(PublishPacket::{
+      dup: true,
+      qos: QoS::ExactlyOnce,
+      retain: false,
+      topic: "",
+      packet_id: Some(77),
+      properties: p1_props,
+      payload: "x=1".to_bytes(),
+    }),
+    ProtocolVersion::V5,
+  )
+  match s.feed(p1_dup, 30L) {
+    Ok(evs) => debug_assert(evs.length() == 0, "duplicate QoS 2 must be deduped")
+    Err(_) => debug_assert(false, "dup qos2 feed failed")
+  }
+  let _ = s.poll_transmit()
+
+  // Inbound QoS 0 using alias 3 with empty topic resolves to "factory/arm/pos"
+  let p2_props = Properties::empty()
+  p2_props.topic_alias = Some(3)
+  let p2 = must_encode(
+    Packet::Publish(PublishPacket::{
+      dup: false,
+      qos: QoS::AtMostOnce,
+      retain: false,
+      topic: "",
+      packet_id: None,
+      properties: p2_props,
+      payload: "x=2".to_bytes(),
+    }),
+    ProtocolVersion::V5,
+  )
+  match s.feed(p2, 40L) {
+    Ok(evs) => {
+      debug_assert(evs.length() == 1, "resolved alias event")
+      match evs[0] {
+        SessionEvent::PublishReceived(pkt) => debug_assert(pkt.topic == "factory/arm/pos", "alias resolved")
+        _ => debug_assert(false, "expected PublishReceived")
+      }
+    }
+    Err(e) => debug_assert(false, "alias resolve failed: " + mqtt_error_string(e))
+  }
+
+  // Inbound PUBREL 77 -> auto PUBCOMP 77
+  let rel = must_encode(
+    Packet::PubRel(PubRelPacket::{ packet_id: 77, reason_code: 0, properties: Properties::empty() }),
+    ProtocolVersion::V5,
+  )
+  debug_assert(s.feed(rel, 50L) is Ok(_), "feed pubrel")
+  match decode_packet(s.poll_transmit(), ProtocolVersion::V5) {
+    Ok((Packet::PubComp(c), _)) => debug_assert(c.packet_id == 77, "auto PUBCOMP 77")
+    _ => debug_assert(false, "expected PUBCOMP")
+  }
+}
+
+///|
+test "session_reconnect_dup_retransmit_and_keepalive" {
+  let cfg = SessionConfig::{
+    client_id: "sess-reconn",
+    version: ProtocolVersion::V5,
+    clean_start: false,
+    keep_alive_secs: 10,
+    receive_maximum: 65535,
+    topic_alias_maximum: 4,
+    username: None,
+    password: None,
+    will: None,
+    connect_properties: Properties::empty(),
+    limits: MqttLimits::default(),
+  }
+  let s = Session::new(cfg)
+  debug_assert(s.connect(0L) is Ok(_), "connect 1")
+  let _ = s.poll_transmit()
+  let ca1 = must_encode(
+    Packet::ConnAck(ConnAckPacket::{ session_present: false, reason_code: 0, properties: Properties::empty() }),
+    ProtocolVersion::V5,
+  )
+  debug_assert(s.feed(ca1, 100L) is Ok(_), "connack 1")
+  let _ = s.publish("persist/msg", "v1".to_bytes(), QoS::AtLeastOnce, false, Properties::empty(), 200L)
+  let _ = s.poll_transmit()
+  debug_assert(s.inflight_count() == 1, "1 inflight before drop")
+
+  // Keepalive tick at 10,300 ms triggers PINGREQ
+  debug_assert(s.tick(10300L) is Ok(_), "tick pingreq")
+  match decode_packet(s.poll_transmit(), ProtocolVersion::V5) {
+    Ok((Packet::PingReq, _)) => ()
+    _ => debug_assert(false, "expected PINGREQ on keepalive tick")
+  }
+  let pr = must_encode(Packet::PingResp, ProtocolVersion::V5)
+  match s.feed(pr, 10400L) {
+    Ok(evs) => debug_assert(evs.length() == 1, "PingRespReceived")
+    Err(_) => debug_assert(false, "pingresp feed")
+  }
+
+  // Transport drops, reconnect with session_present=true -> retransmits PUBLISH with DUP=1
+  s.on_transport_disconnected()
+  debug_assert(s.connect(11000L) is Ok(_), "connect 2")
+  let _ = s.poll_transmit()
+  let ca2 = must_encode(
+    Packet::ConnAck(ConnAckPacket::{ session_present: true, reason_code: 0, properties: Properties::empty() }),
+    ProtocolVersion::V5,
+  )
+  debug_assert(s.feed(ca2, 11100L) is Ok(_), "connack 2")
+  let retx = s.poll_transmit()
+  match decode_packet(retx, ProtocolVersion::V5) {
+    Ok((Packet::Publish(p), _)) => {
+      debug_assert(p.dup, "retransmitted PUBLISH must have DUP=1")
+      debug_assert(p.topic == "persist/msg", "retransmitted topic")
+    }
+    _ => debug_assert(false, "expected retransmitted PUBLISH with DUP=1")
+  }
+}
