@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 35 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` `v0.2.0` 的数据取自包 README（未记录 pion commit），发布验证（`verify.sh` 44 包、`ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`（`v0.1.0` 为 `AFK-surf/pion@8d110a3`）；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -32,7 +32,7 @@
 
 ## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1 + `fts`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -177,10 +177,14 @@
 | `effect` | W1 有界队列乒乓（cap = 16） | 50,000 msgs | 18.318 ms | 17.479 ms (Go) / 57.203 ms (Node) | 0.95x (vs Go) · **3.12x** (vs Node) | **1.83 MiB** | 4.59 / 48.62 MiB (Go / Node) |
 | `effect` | W2 虚拟时钟定时器调度（Pion 为完整结构化纤程，基线为裸最小堆，见明细） | 20,000 timers | 47.402 ms | 18.574 ms (Go) / 58.455 ms (Node) | 0.39x (vs Go) · **1.23x** (vs Node) | 28.23 MiB | 5.95 / 49.86 MiB (Go / Node) |
 | `effect` | W3 结构化扇出汇合（2,500 × 4） | 10,000 fibers | 19.481 ms | 18.090 ms (Go) / 51.110 ms (Node) | 0.93x (vs Go) · **2.62x** (vs Node) | **1.84 MiB** | 5.42 / 45.16 MiB (Go / Node) |
-| `crypto` | SHA-256 流式哈希 | 16 MiB | 93.978 ms | 15.941 ms (Go stdlib) | 0.17x | **1.80 MiB** | 4.66 MiB |
-| `crypto` | SHA-512 流式哈希 | 16 MiB | 55.985 ms | 18.779 ms (Go stdlib) | 0.34x | **1.80 MiB** | 4.72 MiB |
-| `crypto` | HMAC-SHA256 | 50,000 × 256 B | 122.492 ms | 27.119 ms (Go stdlib) | 0.22x | **1.75 MiB** | 11.16 MiB |
-| `crypto` | Ed25519 签名 + 验签 | 200 + 200 ops | 44.075 ms | 16.478 ms (Go stdlib) | 0.37x | **1.83 MiB** | 4.78 MiB |
+| `crypto` | SHA-256 流式哈希 | 16 MiB | 99.222 ms | 16.040 ms (Go) | 0.16x | **1.83 MiB** | 5.00 MiB |
+| `crypto` | SHA-512 流式哈希 | 16 MiB | 63.226 ms | 20.020 ms (Go) | 0.32x | **1.81 MiB** | 5.02 MiB |
+| `crypto` | HMAC-SHA256 | 50,000 × 256 B | 148.533 ms | 31.896 ms (Go) | 0.21x | **1.80 MiB** | 11.38 MiB |
+| `crypto` | Ed25519 签名 + 验签 | 200 + 200 ops | 53.251 ms | 25.262 ms (Go) | 0.47x | **1.88 MiB** | 5.11 MiB |
+| `crypto` | X25519 密钥交换 | 200 次 | 25.949 ms | 24.797 ms (Go) | 0.96x | **1.84 MiB** | 4.92 MiB |
+| `crypto` | HKDF-SHA256 | 20,000 × 64 B | 95.725 ms | 32.600 ms (Go) | 0.34x | **1.84 MiB** | 12.11 MiB |
+| `crypto` | ChaCha20-Poly1305 加密 + 解密 | 4 MiB | 73.765 ms | 25.090 ms (Go) | 0.34x | **2.05 MiB** | 10.33 MiB |
+| `crypto` | NIST P-256 ES256 签名 + 验签 | 50 + 50 ops | 116.225 ms | 18.904 ms (Go) | 0.16x | **1.89 MiB** | 5.77 MiB |
 | `brotli` | Web HTML/CSS/JS/JSON 解压（2 MiB q6 × 10） | 20 MiB | 34.820 ms | 25.524 ms (`rust_brotli`) / 24.281 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.70x (vs C) | — | — |
 | `brotli` | WOFF2 字体载荷解压（1 MiB q11 × 10） | 10 MiB | 33.678 ms | 24.419 ms (`rust_brotli`) / 25.004 ms (`c_brotlidec`) | 0.73x (vs Rust) · 0.74x (vs C) | — | — |
 | `brotli` | 小包批量解压（512 pkts q5 × 10） | 5,120 pkts | 43.355 ms | 69.620 ms (`rust_brotli`) / 35.054 ms (`c_brotlidec`) | **1.61x** (vs Rust) · 0.81x (vs C) | — | — |
@@ -1410,16 +1414,20 @@ _SHA-256 verified identical across all implementations and rounds: `8e7d2450047c
 
 ### crypto
 
-参考实现：Go `go1.27.3` 标准库 `crypto/sha256` / `crypto/sha512` / `crypto/hmac` / `crypto/ed25519`，源码见 [`packages/crypto/bench/`](packages/crypto/bench/)。编译器 `AFK-surf/pion@8d110a3`。`sh packages/crypto/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对四个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5 --baseline go_stdlib`，双方 stdout SHA-256 逐字节一致。详见 [`packages/crypto/README.md`](packages/crypto/README.md)。
+`v0.2.0`。参考实现：Go `go1.27.3` 标准库 `crypto/sha256` / `crypto/sha512` / `crypto/hmac` / `crypto/ed25519` / `crypto/ecdsa` 与 `golang.org/x/crypto` `v0.58.0`（`curve25519` / `chacha20poly1305` / `hkdf`），源码见 [`packages/crypto/bench/`](packages/crypto/bench/)。数据取自包 README（`Darwin arm64`，未记录 pion commit），发布验证（`verify.sh` 44 包、`audit/ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`。`sh packages/crypto/bench/run_bench.sh` 先做 `wasm_smoke` 4 模式 SHA-256 校验，再构建 Pion `--release` 与 Go 二进制并对 8 个负载调用 `scripts/bench_compare.py --warmup 1 --rounds 5`（严格交替），双方 stdout SHA-256 在每个负载上逐字节一致。详见 [`packages/crypto/README.md`](packages/crypto/README.md)。
 
-| Workload | Pion Median / Peak RSS | Go stdlib Median / Peak RSS | Pion 吞吐 | Pion vs Go |
+| Workload | Pion Median / Peak RSS | Go Median / Peak RSS | Pion 吞吐 / 单次 | Pion vs Go |
 | --- | ---: | ---: | ---: | ---: |
-| SHA-256（16 MiB 流式） | 93.978 ms / 1.80 MiB | 15.941 ms / 4.66 MiB | 178.5 MB/s | 0.17x |
-| SHA-512（16 MiB 流式） | 55.985 ms / 1.80 MiB | 18.779 ms / 4.72 MiB | 299.7 MB/s | 0.34x |
-| HMAC-SHA256（50,000 × 256 B） | 122.492 ms / 1.75 MiB | 27.119 ms / 11.16 MiB | 2,449.84 ns/op（约 408k ops/s） | 0.22x |
-| Ed25519（200 签名 + 200 验签） | 44.075 ms / 1.83 MiB | 16.478 ms / 4.78 MiB | 110.19 µs/op（约 9.1k ops/s） | 0.37x |
+| SHA-256（16 MiB 流式） | 99.222 ms / 1.83 MiB | 16.040 ms / 5.00 MiB | 169.09 MB/s | 0.16x |
+| SHA-512（16 MiB 流式） | 63.226 ms / 1.81 MiB | 20.020 ms / 5.02 MiB | 265.35 MB/s | 0.32x |
+| HMAC-SHA256（50,000 × 256 B） | 148.533 ms / 1.80 MiB | 31.896 ms / 11.38 MiB | 2,970.67 ns/op | 0.21x |
+| Ed25519（200 签名 + 200 验签） | 53.251 ms / 1.88 MiB | 25.262 ms / 5.11 MiB | 133.13 µs/op | 0.47x |
+| X25519（200 次密钥交换） | 25.949 ms / 1.84 MiB | 24.797 ms / 4.92 MiB | 129.75 µs/op | 0.96x |
+| HKDF-SHA256（20,000 × 64 B） | 95.725 ms / 1.84 MiB | 32.600 ms / 12.11 MiB | 4,786.25 ns/op | 0.34x |
+| ChaCha20-Poly1305（4 MiB 加密 + 解密） | 73.765 ms / 2.05 MiB | 25.090 ms / 10.33 MiB | 113.72 MB/s | 0.34x |
+| NIST P-256 ES256（50 签名 + 50 验签） | 116.225 ms / 1.89 MiB | 18.904 ms / 5.77 MiB | 1.16 ms/op | 0.16x |
 
-41 / 41 单测（含 27 个红队测试）；`wasm_smoke` 4 模式 stdout SHA-256 均为 `259b374d007b191c2415407d487ff639131c8625f8766e3104714fd48c2f8fa6`。领先项：峰值 RSS 1.75–1.83 MiB，比 Go 的 4.66–11.16 MiB 低 2.6×–6.4×。落后项：四个负载全部慢于 Go（0.17x–0.37x）。两侧实现手段不对等：Go 在 `darwin/arm64` 上用 ARMv8 加密扩展（`SHA256H` / `SHA512H` 指令）加速 SHA-256 / SHA-512，Ed25519 用手写 ARM64 汇编与预计算基点表；本包是零 C FFI、零汇编的纯标量 Pion 代码，Native 与 `wasm32` 共用同一实现，签名路径额外付出无分支常量时间查表的开销。
+69 / 69 单测（含 40 个红队测试）；`wasm_smoke` 4 模式 stdout 均为 `3525 B`、SHA-256 `feceef7d07daa52fb9aaf44c09dec5047d1b5838c71024d3ea1bd8bce296d7ee`。v0.2.0 红队审计无 P0，修复 P1 RT-4（常量时间 RSA CRT）、P2 RT-5（常量时间 P-256 标量运算）与 P2 RT-6（RSA `e < 2^33` 上限），三项修复不改变任何输出：8 个基准的 stdout 修复前后逐字节一致。领先项：峰值 RSS 1.80–2.05 MiB，比 Go 的 4.92–12.11 MiB 低 2.6×–6.6×；X25519 达 Go 的 0.96x。落后项：8 个负载全部慢于 Go（0.16x–0.96x），P-256 ES256 与 SHA-256 最弱（0.16x）。两侧实现手段不对等：Go 在 `darwin/arm64` 上用 ARMv8 加密扩展（`SHA256H` / `SHA512H`）加速 SHA-256 / SHA-512，ChaCha20 / Poly1305 用 NEON / ARM64 汇编，Ed25519 / P-256 用手写 ARM64 汇编与预计算表；本包是零 C FFI、零汇编的纯标量 Pion 代码，Native 与 `wasm32` 共用同一实现，签名路径额外付出无分支常量时间查表与运算的开销。
 
 ### brotli
 
