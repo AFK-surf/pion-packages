@@ -11,7 +11,7 @@
 | 测试节点 | `tokyo-mac-studio-0` |
 | CPU / 内存 | Apple M5 Max (18 cores), 64 GB RAM |
 | 操作系统 | macOS 27.0.1 (Build 26A434, `arm64_apple`) |
-| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` `v0.2.0` 的数据取自包 README（未记录 pion commit），发布验证（`verify.sh` 44 包、`ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`（`v0.1.0` 为 `AFK-surf/pion@8d110a3`）；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`；Wave 10 四个包（`http2` / `jsonschema` / `mime` / `asn1`）的数据取自各包 README（未记录 pion commit），发布验证（`verify.sh` 51 包 4,706 / 4,706、4 个 `audit` 套件与 51 × 4 `wasm_smoke`，后者在逐包隔离的 `PION_CACHE_DIR` 下运行，以规避上游 `pionc` Wasm32 CAS 跨包污染缺陷）使用 `AFK-surf/pion@c375cee`） |
+| Pion (`pionc`) | `0.1.0`（v0.2.0 基线 `AFK-surf/pion@b1e4effbfafd94e4f71da4d31c87a83bde34888c`；`markdown` v0.2.1 为 `AFK-surf/pion@a62689d5`；`texmath` Wasm32 复测与 Wave 4 四个包为 `AFK-surf/pion@69a0189d`；Wave 5 与 Wave 6 八个包的数据取自各包 README，未记录 pion commit；Wave 6 发布验证（`verify.sh` 与 24 × 4 `wasm_smoke`）使用 `AFK-surf/pion@bee7628`；Wave 7 四个包的数据取自各包 README，发布验证（`verify.sh` 与 28 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；Wave 8 四个包的数据取自各包 README（基准与红队审计均在 `AFK-surf/pion@81b8fb0` 上产出），发布验证（`verify.sh` 与 32 × 4 `wasm_smoke`）使用 `AFK-surf/pion@81b8fb0`；`base64` 与 `effect` 的数据取自各包 README，编译器为 `AFK-surf/pion@8d110a3`，`effect` 发布验证（`verify.sh` 34 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；`crypto` `v0.2.0` 的数据取自包 README（未记录 pion commit），发布验证（`verify.sh` 44 包、`ct_ssa_check.py` 与 `wasm_smoke` 4 模式）使用 `AFK-surf/pion@c375cee`（`v0.1.0` 为 `AFK-surf/pion@8d110a3`）；`fts` 的数据取自包 README，编译器为 `AFK-surf/pion@8d110a3`，发布验证（`verify.sh` 40 包与 `wasm_smoke` 4 模式）亦使用 `AFK-surf/pion@8d110a3`；Wave 9 四个包（`zip` / `dns` / `protobuf` / `graphql`）的数据取自各包 README，基准与红队审计在 `AFK-surf/pion@8d110a3` 上产出，发布验证（`verify.sh` 44 包、4 个 `audit` 套件与 44 × 4 `wasm_smoke`）使用 `AFK-surf/pion@c375cee`；Wave 10 四个包（`http2` / `jsonschema` / `mime` / `asn1`）的数据取自各包 README（未记录 pion commit），发布验证（`verify.sh` 51 包 4,706 / 4,706、4 个 `audit` 套件与 51 × 4 `wasm_smoke`，后者在逐包隔离的 `PION_CACHE_DIR` 下运行，以规避上游 `pionc` Wasm32 CAS 跨包污染缺陷）使用 `AFK-surf/pion@c375cee`；Wave 13 四个包（`bson` / `resp` / `hcl` / `email`）的数据取自各包红队修复后刷新的 README，发布验证（`verify.sh` 69 包 5,029 / 5,029、4 个 `audit` 套件与 69 × 4 `wasm_smoke` 冷共享 CAS `xargs -P 6` 并发）使用 `AFK-surf/pion@66d2b4b`） |
 | Rust (`rustc`) | `1.100.0 (0ef1bc386 2026-11-09)` |
 | Go (`go`) | `go1.27.3 darwin/arm64` |
 | Node.js (`node`) | `v24.22.2` |
@@ -30,9 +30,9 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–12 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–10 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–13 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–10 + `fts`）
 
-`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。Wave 11 新增 `cel`（以 Go `cel-go v0.24.1` 为基线）、`wasm`（以 Rust `wasmparser` / `wasm-encoder` / `wasmprinter 0.221.3` 为基线）、`ical`（以 Rust `rrule 0.14.0` / `icalendar 0.16.17` 为基线）与 `ssh`（以 Go `golang.org/x/crypto/ssh v0.38.0` 为基线；Go 缺失的 `|1|` 哈希主机、RFC 4253 分包与 `SSHSIG` 由等价 Go 实现补齐）`v0.1.0`，首发即红队修复后版本。Wave 12 新增 `git`（以 Rust `gix`（`gix-object 0.46` / `gix-pack 0.56` / `gix-index 0.37` / `gix-packetline 0.18`）为基线）、`jq`（以 Go `gojq v0.12.17` 为基线）、`qrcode`（以 Rust `qrcode 0.14.1` 为基线，另列 `qrcodegen 1.8.0` / `fast_qr 0.14.0`）与 `mqtt`（以 Rust `rumqttc 0.25.1` 为基线，另列 Go `paho.golang/packets v0.23.0`；`TopicTrie` 为同算法跨语言对照）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+`v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。Wave 11 新增 `cel`（以 Go `cel-go v0.24.1` 为基线）、`wasm`（以 Rust `wasmparser` / `wasm-encoder` / `wasmprinter 0.221.3` 为基线）、`ical`（以 Rust `rrule 0.14.0` / `icalendar 0.16.17` 为基线）与 `ssh`（以 Go `golang.org/x/crypto/ssh v0.38.0` 为基线；Go 缺失的 `|1|` 哈希主机、RFC 4253 分包与 `SSHSIG` 由等价 Go 实现补齐）`v0.1.0`，首发即红队修复后版本。Wave 12 新增 `git`（以 Rust `gix`（`gix-object 0.46` / `gix-pack 0.56` / `gix-index 0.37` / `gix-packetline 0.18`）为基线）、`jq`（以 Go `gojq v0.12.17` 为基线）、`qrcode`（以 Rust `qrcode 0.14.1` 为基线，另列 `qrcodegen 1.8.0` / `fast_qr 0.14.0`）与 `mqtt`（以 Rust `rumqttc 0.25.1` 为基线，另列 Go `paho.golang/packets v0.23.0`；`TopicTrie` 为同算法跨语言对照）`v0.1.0`，首发即红队修复后版本。Wave 13 新增 `bson`（以 Rust `bson 2.15.0` 为基线；解码另列零拷贝 `RawDocument` 遍历）、`resp`（以 Rust `redis-protocol 6.0.0` 零拷贝 `decode_bytes_mut` 为基线）、`hcl`（以 Go `hashicorp/hcl/v2 v2.23.0` 为基线）与 `email`（MIME 解析以 Rust `mail-parser 0.9.4`、地址 / 日期解析以 Go `net/mail`、DKIM 以 Go `go-msgauth v0.7.0` 为基线）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -287,6 +287,18 @@
 | `mqtt` | 500,000 × MQTT 3.1.1 + 5.0 混合控制报文流式解码（137 B 分片） | 500,000 pkts | 101.253 ms (`202.51 ns/op`) | **44.190 ms** (`rust_rumqttc 0.25.1`) | 0.44x | **2.16 MiB** | 5.72 MiB |
 | `mqtt` | 500,000 × MQTT 5.0 全 15 种控制报文（含 `AUTH`）流式解码 | 500,000 pkts | **140.293 ms** (`280.59 ns/op`) | 402.232 ms (`go_paho v0.23.0`) | **2.87x** | **2.14 MiB** | 18.28 MiB |
 | `mqtt` | `TopicTrie` 路由（10,000 通配订阅 × 100,000 发布，同算法对照） | 100,000 pubs | 238.851 ms (`2388.52 ns/op`) | **151.683 ms** (`rust_trie_foldhash`；SipHash 294.326 ms，Go 355.923 ms) | 0.64x | **3.83 MiB** | 6.39 MiB |
+| `bson` | BSON 解码（50,000 复合文档，owned `BsonDocument` + 遍历） | 12.01 MB | 59.839 ms (200.75 MB/s) | 99.650 ms (`rust_ref` `Document::from_reader`；零拷贝 `rust_raw` **31.190 ms**) | **1.67x** | 2.83 MiB | 2.84 MiB |
+| `bson` | BSON 编码（50,000 复合文档） | 12.01 MB | **44.761 ms** (268.37 MB/s) | 47.095 ms (`rust_bson 2.15.0`) | **1.05x** | **4.45 MiB** | 5.72 MiB |
+| `bson` | BSON ↔ Extended JSON v2 Canonical + Relaxed 往返（20,000 文档） | 4.81 MB | **175.664 ms** (27.35 MB/s) | 245.903 ms (`rust_bson 2.15.0`，经 `serde_json::Value`) | **1.40x** | **4.73 MiB** | 5.98 MiB |
+| `resp` | 200,000 混合 RESP3 响应流式解码（137 B 分片） | 5.73 MB | 53.333 ms (107.46 MB/s) | **50.346 ms** (`rust_redis_protocol 6.0.0` 零拷贝) | 0.94x | 12.67 MiB | **7.55 MiB** |
+| `resp` | 500,000 管道命令编码 + 解码往返（`SET` / `GET` / `HSET` / `MGET`） | 500,000 ops | 278.751 ms (`557.50 ns/op`) | **207.744 ms** (`rust_redis_protocol 6.0.0`) | 0.75x | 2.80 MiB | **2.31 MiB** |
+| `resp` | 2,000,000 Cluster `key_slot` + 500,000 `MOVED` / `ASK` 解析 | 2,000,000 ops | 48.325 ms (`24.16 ns/op`) | **32.137 ms** (`rust_redis_protocol 6.0.0`) | 0.67x | **1.73 MiB** | 1.94 MiB |
+| `hcl` | 大 Terraform 配置（2,111 块）解析 + AST 遍历（× 15） | 2,111 blocks | 590.412 ms | **420.075 ms** (`go_hcl v2.23.0`) | 0.71x | **24.05 MiB** | 59.62 MiB |
+| `hcl` | 批量解析 + `EvalContext` 表达式 / `for` / 模板 / 内建函数（× 1,000） | 1,000 ops | **42.036 ms** | 129.594 ms (`go_hcl v2.23.0`) | **3.08x** | **3.00 MiB** | 15.12 MiB |
+| `hcl` | `format_hcl` vs `hclwrite.Format` 批量规范格式化（× 3,000，逐字节一致） | 3,000 ops | **123.722 ms** | 169.535 ms (`go_hcl v2.23.0`) | **1.37x** | **2.56 MiB** | 18.41 MiB |
+| `email` | 5,000 封多部分 MIME 邮件解析 + 正文 / 附件哈希 | 6.35 MB | 48.458 ms (130.95 MB/s) | **25.434 ms** (`rust_mail_parser 0.9.4`) | 0.52x | 3.23 MiB | **2.69 MiB** |
+| `email` | 100,000 次复杂 RFC 5322 地址列表 + 日期解析 | 12.49 MB | **120.999 ms** (103.24 MB/s) | 208.833 ms (`go_net_mail`) | **1.73x** | **2.36 MiB** | 17.27 MiB |
+| `email` | 2,000 封邮件构建 + DKIM `relaxed/relaxed` Ed25519 签名 / 验签往返 | 2,000 ops | 575.242 ms | **121.817 ms** (`go_msgauth v0.7.0`) | 0.21x | **2.38 MiB** | 16.98 MiB |
 
 ## 各包明细
 
@@ -2210,3 +2222,147 @@ Single-certificate extension cliff (`N = 64,000` distinct extensions, `1.2 MB` D
 | W3 `TopicTrie` 10,000 Wildcard Subs × 100,000 Publishes | 238.851 ms (`2388.52`) | **151.683 ms (`1516.83`)** (`rust_trie_foldhash`)；SipHash 294.326 ms、FNV 169.125 ms、Go 355.923 ms | 224.283 / 265.019 | **3.83 MiB** | 6.39 MiB（Go 13.12 MiB） | 0.64x（vs SipHash **1.23x**、vs Go **1.49x**） | `b7e0b1e8964642f6…` |
 
 红队：22 / 22 单测，`audit/` 零改动且 `audit` **37 / 37** 全绿（25 / 25 redteam + 12 / 12 control）。领先项：编解码对 Go `paho` 快 2.19×（W1）/ 2.87×（W2b），内存低约 8.5–9×；`TopicTrie` 快于 Go（1.49×）与 Rust `std` SipHash（1.23×）且 RSS 最低。落后项：Rust `rumqttc` 原始编解码快 2.3–3.4×（W1 0.30×、W2 0.44×，零拷贝 `bytes::Bytes` 切片且校验更少，Pion 强制完整 OASIS UTF-8 / 属性 / 原因码合规）；W3 对同为种子化快速哈希的 Rust `foldhash` 慢 1.57×（0.64×）。
+
+### bson
+
+参考实现：Rust [`bson`](https://crates.io/crates/bson) `2.15.0`（`--release --locked`）。`sh packages/bson/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行。公平口径：W1 的 `rust_ref` 严格按引用遍历 `Document`（无 `doc.clone()`），并另列零拷贝 `RawDocument` 遍历 `rust_raw`（快于 Pion 1.92×，如实列出）；W3 中 Rust 公开 ExtJSON API 经 `serde_json::Value` 且消费输入（每文档需 `doc.clone()`）。详见 [`packages/bson/README.md`](packages/bson/README.md)。
+
+#### W1: BSON Decode (50,000 composite documents, 12,012,500 B)
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_ref`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`--release`, owned `BsonDocument` + walk) | 59.839 | 57.878 | 67.074 | 200.75 | 1196.77 | 2.83 MiB | **1.67x** |
+| `rust_ref` (`bson 2.15.0`, `Document::from_reader` + walk by ref) | 99.650 | 97.915 | 110.859 | 120.55 | 1993.01 | 2.84 MiB | 1.00x (baseline) |
+| `rust_raw` (`bson 2.15.0`, `RawDocument::from_bytes` zero-copy walk) | **31.190** | 30.627 | 32.818 | 385.14 | 623.80 | 2.50 MiB | **3.19x** (`rust_raw` is **1.92x** faster than Pion) |
+
+- Verified stdout SHA-256: `5aaa2cd2a70a7fd150fdbe14ebfe1ef0c98b0a5c6cc23cd95f70595cae079a09`
+- Note: `rust_ref` walks `Document` strictly by reference (no `doc.clone()`). For read-only traversal without materializing an owned DOM, Rust's zero-copy `RawDocument` API (`rust_raw`) validates every element on the fly and is ~1.92x faster than Pion's owned-tree decode.
+
+#### W2: BSON Encode (50,000 composite documents, 12,012,500 B)
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_bson`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`--release`) | 44.761 | 44.409 | 45.382 | 268.37 | 895.23 | 4.45 MiB | **1.05x** |
+| `rust_bson` (`2.15.0`, `--release --locked`) | 47.095 | 46.181 | 48.115 | 255.07 | 941.90 | 5.72 MiB | 1.00x (baseline) |
+
+- Verified stdout SHA-256: `fb667c1dcaef24a105c6ba39aa0d733c65a33f7b9327d7877b94392fb11a7d7f`
+
+#### W3: BSON ↔ Extended JSON v2 Canonical + Relaxed Roundtrip (20,000 docs, 4,805,000 B)
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_bson`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`--release`) | 175.664 | 173.493 | 189.812 | 27.35 | 8783.22 | 4.73 MiB | **1.40x** |
+| `rust_bson` (`2.15.0`, `--release --locked`) | 245.903 | 243.389 | 253.249 | 19.54 | 12295.13 | 5.98 MiB | 1.00x (baseline) |
+
+- Verified stdout SHA-256: `f3a6ca6a2132d4c515a511e57fcfc1b1c126809eb78834e70af071b89ad9d016`
+- Note: Rust `bson`'s public Extended JSON API goes through `serde_json::Value` (with `preserve_order` / `IndexMap`), and `into_*_extjson(self)` consumes its input (requiring a `doc.clone()` per document). Pion serializes/parses directly between `BsonDocument` and JSON text.
+
+### resp
+
+参考实现：Rust [`redis-protocol`](https://crates.io/crates/redis-protocol) `6.0.0`（`--release`，锁定 `Cargo.lock`）。`sh packages/resp/bench/run_bench.sh` 经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行。公平口径：Rust 侧使用惯用零拷贝 `decode_bytes_mut`（红队修复中去掉了 `buf.clone().freeze()`），W3 双方都解析 `MOVED` 与 `ASK` 并物化 owned `host`。详见 [`packages/resp/README.md`](packages/resp/README.md)。
+
+#### W1: 200,000 Mixed RESP3 Responses Streaming Decode (137B chunks)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Input: `5,731,182 B` | Ops: `200,000` | Stdout SHA-256: `b0e9a02f61dab29da01cc60bc45f762ab23d89118c6a46803b38bedc5d2989f9`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_redis_protocol`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`--release`) | 53.333 | 53.107 | 53.644 | 107.46 | 266.66 | 12.67 MiB | 0.94x |
+| `rust_redis_protocol` (`6.0.0`, `--release`) | **50.346** | **49.699** | **50.428** | **113.84** | **251.73** | **7.55 MiB** | **1.00x (baseline)** |
+
+#### W2: 500,000 Pipelined Commands Encode + Decode Roundtrip (`SET`/`GET`/`HSET`/`MGET`)
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `500,000` | Stdout SHA-256: `378354e9ec08373e4055fba30435922b5f828c3dee13f0d6a793834c941816c0`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_redis_protocol`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`--release`) | 278.751 | 278.111 | 298.877 | 557.50 | 2.80 MiB | 0.75x |
+| `rust_redis_protocol` (`6.0.0`, `--release`) | **207.744** | **206.120** | **214.488** | **415.49** | **2.31 MiB** | **1.00x (baseline)** |
+
+#### W3: 2,000,000 Cluster `key_slot` (`{hash_tag}`) + 500,000 `MOVED`/`ASK` Redirect Parse
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000,000` | Stdout SHA-256: `dcb9d7eab4bae30aa394d5aab73c52a40d4545a0665a28eca07c9b94285ebf00`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_redis_protocol`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`--release`) | 48.325 | 47.142 | 48.850 | 24.16 | **1.73 MiB** | 0.67x |
+| `rust_redis_protocol` (`6.0.0`, `--release`) | **32.137** | **31.968** | **32.798** | **16.07** | 1.94 MiB | **1.00x (baseline)** |
+
+> **Honest Performance Analysis**:
+> - **W1 (0.94x vs Rust `redis-protocol` zero-copy `decode_bytes_mut`)**: After fixing the Rust harness to use idiomatic zero-copy `decode_bytes_mut` (eliminating `buf.clone().freeze()`) and upgrading Pion's `StreamDecoder` to an O(n) incremental state machine, Pion reaches near parity with Rust (`53.3 ms` vs `50.3 ms`, `107.5 MB/s` vs `113.8 MB/s`).
+> - **W2 (0.75x)**: `redis-protocol` uses zero-copy `bytes::Bytes` reference-counted sub-slicing during batch decode, whereas Pion allocates owned `Bytes` slices per `BulkString`.
+> - **W3 (0.67x, improved from 0.31x)**: Both sides now parse `MOVED` and `ASK` and materialize an owned `host` string; Pion's single-pass `key_slot` and zero-`to_bytes()` `parse_cluster_redirect` cut median runtime from `109.9 ms` to `48.3 ms` (`2.27x` faster), with the remaining gap due to bounds-checked CRC16 table lookups vs Rust's `crc16` crate.
+
+### hcl
+
+参考实现：Go [`github.com/hashicorp/hcl/v2`](https://github.com/hashicorp/hcl) `v2.23.0`（`hclsyntax` / `hclwrite` / `cty`）。`sh packages/hcl/bench/run_bench.sh` 经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行；W3 `format_hcl` 输出与 `hclwrite.Format` 逐字节一致。详见 [`packages/hcl/README.md`](packages/hcl/README.md)。
+
+#### W1: Large Terraform Infra Config (`1,111` top-level / `2,111` total blocks) Parse + AST Walk (`15x`)
+
+10 `variable` blocks, 1 `locals` block, 1,000 `resource "aws_instance"` blocks (each with tags, `<<-EOF` heredoc with template interpolation, and nested `root_block_device` block), and 100 `module` blocks.
+SHA-256: `e436af329e7f4df18a33834d963893262b40bfbdefe75b17231a2a508bb06e5f`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_hcl`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 590.412 | 556.260 | 636.540 | 39360769.47 | 24.05 MiB | 0.71x |
+| `go_hcl` | 420.075 | 402.781 | 431.032 | 28004966.67 | 59.62 MiB | 1.00x (baseline) |
+
+#### W2: Batch Parse + `EvalContext` Full Expressions / `for` / Templates / Built-ins (`1,000x`)
+
+End-to-end parse + `EvalContext` evaluation of templates (`${...}`, `%{for}`, `%{if}`, `~`), `for` tuple & object (`...` grouping) comprehensions, full splat `[*]`, ternary with type unification, arbitrary-precision `BigDec` arithmetic (with exact small-integer fast path), and built-ins (`lower`, `upper`, `join`, `concat`, `merge`, `length`, `min`, `max`), serialized via streaming budgeted canonical JSON.
+SHA-256: `93ab6ab3ed8ffd56375ac5bbd2ac59a08af2db8f8e0bfbda4ae50e6034cc2b8b`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_hcl`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 42.036 | 41.320 | 42.280 | 42036.46 | 3.00 MiB | **3.08x** |
+| `go_hcl` | 129.594 | 126.871 | 131.298 | 129593.58 | 15.12 MiB | 1.00x (baseline) |
+
+#### W3: Batch Canonical Formatting `format_hcl` vs `hclwrite.Format` (`3,000x`)
+
+Realistic Terraform configuration featuring multi-line `tags = { ... }` attribute blocks (breaking `=` alignment groups), multi-line lists, aligned trailing `#`/`//` comments, nested `versioning`/`lifecycle` blocks, `locals` with `for` comprehension, blank lines, and heredoc preservation — verified byte-for-byte identical to `hclwrite.Format`.
+SHA-256: `7a4ec307b3a987955ac58fb6a748b43c0242950e35c5a4b48480c14a7de98224`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_hcl`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 123.722 | 122.713 | 126.061 | 41240.79 | 2.56 MiB | **1.37x** |
+| `go_hcl` | 169.535 | 165.330 | 172.597 | 56511.75 | 18.41 MiB | 1.00x (baseline) |
+
+#### Objective Performance & Tradeoff Notes
+
+- **Expression & Template Evaluation (W2, 3.08x faster, 5.0x lower RSS)**: `packages/hcl` evaluates a flat `Array[ExprNode]` arena directly over `HclValue`, combining an exact small-integer fast path with pure-Pion arbitrary-precision `BigDec` arithmetic and a streaming `max_output_bytes`-budgeted JSON encoder, avoiding `go-cty`'s reflection/type-descriptor boxing while preserving `go-cty` precision and safety budgets.
+- **Canonical Formatting (W3, 1.37x faster, 7.2x lower RSS)**: Even with a full syntax validation pass (`parse_file_impl`) and full multi-line value group breaking + trailing comment alignment, `format_hcl` outperforms `hclwrite.Format` on realistic Terraform configurations with 7.2x lower peak RSS.
+- **Large Config Parsing (W1, 0.71x speed, 2.5x lower RSS)**: After upgrading `ExprNode::LitNumber` to carry full `HclValue` (supporting exact `BigDec` literals) and adding full bracket-newline tracking, single-pass parsing on 2,111-block files is currently ~0.71x of Go's `hclsyntax.ParseConfig` while maintaining 2.5x lower peak RSS (24.05 MiB vs 59.62 MiB).
+- **Safety & Cross-Runtime Guarantees**: All recursion paths clamp `max_depth` to a stack-safe ceiling (`160`) to prevent native stack overflow (`SIGSEGV`) and Wasm32 `RangeError`; all number-to-integer conversions are range-checked to avoid Wasm32 `f64→i32/i64` traps; `max_output_bytes` bounds templates, `join`, `format`, `jsonencode`, and `eval_body_to_json` incrementally.
+
+### email
+
+参考实现：Rust [`mail-parser`](https://crates.io/crates/mail-parser) `0.9.4`（`--release --locked`）、Go 标准库 `net/mail` 与 [`github.com/emersion/go-msgauth`](https://github.com/emersion/go-msgauth) `v0.7.0`（`-mod=readonly`）。`sh packages/email/bench/run_bench.sh` 经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行。详见 [`packages/email/README.md`](packages/email/README.md)。
+
+#### W1: 5,000 Multi-Part MIME Emails Parse & Body/Attachment Hash
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Input: `6,345,580 B` | Ops: `5,000` | SHA-256: `38ce7a358e162dc3d24eac354cec116c69bb18e9285ee0bf01e87773ce8a59d4`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_mail_parser) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 48.458 | 48.087 | 50.830 | 130.95 | 9691.67 | 3.23 MiB | 0.52x |
+| `rust_mail_parser` | 25.434 | 25.074 | 26.399 | 249.49 | 5086.76 | 2.69 MiB | 1.00x (baseline) |
+
+#### W2: 100,000 Complex RFC 5322 Address-List & Date Parses
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Input: `12,492,000 B` | Ops: `100,000` | SHA-256: `1d0df93f8a814b8bdecfc1a80825b48d26caeb67c3cbcdbbc9c5835608d786a6`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs go_net_mail) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 120.999 | 120.128 | 122.108 | 103.24 | 1209.99 | 2.36 MiB | **1.73x** |
+| `go_net_mail` | 208.833 | 204.809 | 214.841 | 59.82 | 2088.32 | 17.27 MiB | 1.00x (baseline) |
+
+#### W3: 2,000 Email Build + DKIM `relaxed/relaxed` Ed25519 Sign/Verify Roundtrip
+
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000` | SHA-256: `22223d47651049b1e97bcb09f9a11326f3dc32ac91d74fb790a04d19fabe7eda`
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs go_msgauth) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 575.242 | 572.885 | 576.752 | 287620.96 | 2.38 MiB | 0.21x |
+| `go_msgauth` | 121.817 | 119.132 | 123.446 | 60908.71 | 16.98 MiB | 1.00x (baseline) |
+
+> **Honest Assessment**: `packages/email` outperforms Go `net/mail` by **1.73x** (with 7.3x lower RSS) on complex RFC 5322 address-list and date parsing (W2), reaches **130.95 MB/s** (0.52x of Rust `mail-parser`, up from 113 MB/s) on full multi-part MIME tree parsing + charset validation + QP/Base64 decoding (W1), and runs at **0.21x** of `github.com/emersion/go-msgauth v0.7.0` (with 7.1x lower RSS) on full end-to-end DKIM sign/re-parse/verify (W3) because `packages/crypto` uses portable pure-Pion Ed25519 curve arithmetic versus Go's assembly implementation.
