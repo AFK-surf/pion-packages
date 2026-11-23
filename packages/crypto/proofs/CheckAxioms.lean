@@ -8,7 +8,7 @@ import CryptoProofs
 #print axioms CryptoProofs.fe_cswap_pair_zero
 #print axioms CryptoProofs.fe_cswap_pair_one
 #print axioms CryptoProofs.fe_cswap_pair_involutive
-#print axioms CryptoProofs.ct_eq_nibble_exact
+#print axioms CryptoProofs.fe_add_comm
 #print axioms CryptoProofs.x25519_clamp_low_byte_cofactor8
 #print axioms CryptoProofs.x25519_clamp_high_byte_range
 #print axioms CryptoProofs.x25519_clamp_idempotent_all

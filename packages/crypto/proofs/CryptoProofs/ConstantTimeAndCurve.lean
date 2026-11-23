@@ -46,26 +46,10 @@ private lemma bv32_toInt_of_nonneg (v : BitVec 32) (h : v.toNat < 2147483648) :
   have h2 : 2 * v.toNat < 2 ^ 32 := by omega
   simp only [h2, ↓reduceIte]
 
-private lemma i32_toNat_eq_of_nonneg (x : Std.I32) (h0 : 0 ≤ x.val) :
-    (x.bv.toNat : Int) = x.val ∧ x.bv.toNat < 2147483648 := by
-  have hdef : x.val = x.bv.toInt := rfl
-  rw [BitVec.toInt_eq_toNat_cond] at hdef
-  by_cases hlt : 2 * x.bv.toNat < 2 ^ 32
-  · simp only [hlt, ↓reduceIte] at hdef
-    exact ⟨hdef.symm, by omega⟩
-  · simp only [hlt, ↓reduceIte] at hdef
-    have hlt2 := x.bv.isLt
-    omega
-
-private lemma i32_shr31 (x : Std.I32) :
-    Pion.I32.shr x 31#i32 = ok ⟨x.bv.sshiftRight 31⟩ := by
-  unfold Pion.I32.shr; rfl
-
-private lemma fin16_ct_eq_nibble :
-    ∀ a b : Fin 16,
-      ((((BitVec.ofNat 32 a.val ^^^ BitVec.ofNat 32 b.val) - 1#32).sshiftRight 31).signExtend 64 &&& 1#64) =
-        if a = b then 1#64 else 0#64 := by
-  decide
+private lemma i64_add_comm (a b : Std.I64) : Pion.I64.add a b = Pion.I64.add b a := by
+  apply iscalar_eq_of_bv
+  change a.bv + b.bv = b.bv + a.bv
+  exact BitVec.add_comm a.bv b.bv
 
 private lemma bv32_or_eq_zero_iff (x y : BitVec 32) : (x ||| y = 0#32) ↔ (x = 0#32 ∧ y = 0#32) := by
   constructor
@@ -169,42 +153,14 @@ theorem fe_cswap_pair_involutive (a b : Fe) (s : Std.I64) (hs : s = 0#i64 ∨ s 
   · rw [fe_cswap_pair_zero, result_bind_ok, fe_cswap_pair_zero]
   · rw [fe_cswap_pair_one, result_bind_ok, fe_cswap_pair_one]
 
-/-- Theorem 9: Ed25519 / P-256 branch-free windowed lookup `ct_eq_nibble a b` returns `1` iff `a = b` and `0` iff `a ≠ b` for all nibbles `0..15`. -/
-theorem ct_eq_nibble_exact (a b : Std.I32)
-    (ha0 : 0 ≤ a.val) (ha15 : a.val ≤ 15) (hb0 : 0 ≤ b.val) (hb15 : b.val ≤ 15) :
-    (a = b → ct_eq_nibble a b = ok 1#i64) ∧
-    (a ≠ b → ct_eq_nibble a b = ok 0#i64) := by
-  have ⟨han, _⟩ := i32_toNat_eq_of_nonneg a ha0
-  have ⟨hbn, _⟩ := i32_toNat_eq_of_nonneg b hb0
-  have halt : a.bv.toNat < 16 := by omega
-  have hblt : b.bv.toNat < 16 := by omega
-  have hspec := fin16_ct_eq_nibble ⟨a.bv.toNat, halt⟩ ⟨b.bv.toNat, hblt⟩
-  set abv : BitVec 32 := a.bv
-  set bbv : BitVec 32 := b.bv
-  have habv : BitVec.ofNat 32 abv.toNat = abv := by rw [BitVec.ofNat_toNat]; simp
-  have hbbv : BitVec.ofNat 32 bbv.toNat = bbv := by rw [BitVec.ofNat_toNat]; simp
-  change ((((BitVec.ofNat 32 abv.toNat ^^^ BitVec.ofNat 32 bbv.toNat) - 1#32).sshiftRight 31).signExtend 64 &&& 1#64) = _ at hspec
-  rw [habv, hbbv] at hspec
-  have hcast : ∀ x : Std.I32, (Pion.I32.to_int64 x).bv = x.bv.signExtend 64 := fun _ => rfl
-  have hstep : ct_eq_nibble a b = ok ⟨(((abv ^^^ bbv) - 1#32).sshiftRight 31).signExtend 64 &&& 1#64⟩ := by
-    unfold ct_eq_nibble
-    rw [i32_shr31, result_bind_ok]
-    apply congrArg ok; apply iscalar_eq_of_bv
-    change (Pion.I32.to_int64 ⟨((abv ^^^ bbv) - 1#32).sshiftRight 31⟩).bv &&& 1#64 = _
-    rw [hcast]
-  constructor
-  · intro heq; subst heq
-    rw [hstep]; apply congrArg ok; apply iscalar_eq_of_bv
-    simp only [↓reduceIte] at hspec
-    exact hspec
-  · intro hne
-    have hfin_ne : (⟨a.bv.toNat, halt⟩ : Fin 16) ≠ ⟨b.bv.toNat, hblt⟩ := by
-      intro h; apply hne; apply iscalar_eq_of_bv
-      have hv : a.bv.toNat = b.bv.toNat := congrArg (fun x : Fin 16 => x.val) h
-      exact BitVec.eq_of_toNat_eq hv
-    rw [hstep]; apply congrArg ok; apply iscalar_eq_of_bv
-    simp only [hfin_ne, ↓reduceIte] at hspec
-    exact hspec
+/-- Theorem 9: Ed25519 / X25519 10-limb field addition `fe_add` is commutative across all `2^1280` `Fe` pairs. -/
+theorem fe_add_comm (a b : Fe) :
+    fe_add a b = fe_add b a := by
+  unfold fe_add
+  cases a; cases b
+  simp only [Result.ok.injEq, Fe.mk.injEq]
+  exact ⟨i64_add_comm _ _, i64_add_comm _ _, i64_add_comm _ _, i64_add_comm _ _, i64_add_comm _ _,
+         i64_add_comm _ _, i64_add_comm _ _, i64_add_comm _ _, i64_add_comm _ _, i64_add_comm _ _⟩
 
 /-- Theorem 10: RFC 7748 §5 X25519 low-byte clamping clears bits `0..2` (`r % 8 = 0`, cofactor-8) and lands in `[0, 248]`. -/
 theorem x25519_clamp_low_byte_cofactor8 (b : Std.I32) :

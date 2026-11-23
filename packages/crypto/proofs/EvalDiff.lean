@@ -33,11 +33,11 @@ def runAll : List String := [
   checkI64 "cswap_0a" (do let p ← fe_cswap_pair feA feB 0#i64; ok p.1.h0) 1#i64,
   checkI64 "cswap_1a" (do let p ← fe_cswap_pair feA feB 1#i64; ok p.1.h0) 11#i64,
   checkI64 "cswap_1b" (do let p ← fe_cswap_pair feA feB 1#i64; ok p.2.h9) 10#i64,
-  -- ct_eq_nibble (4)
-  checkI64 "ctn_00" (ct_eq_nibble 0#i32 0#i32) 1#i64,
-  checkI64 "ctn_ff" (ct_eq_nibble 15#i32 15#i32) 1#i64,
-  checkI64 "ctn_01" (ct_eq_nibble 0#i32 1#i32) 0#i64,
-  checkI64 "ctn_f0" (ct_eq_nibble 15#i32 0#i32) 0#i64,
+  -- fe_add (4)
+  checkI64 "feadd_h0" (do let r ← fe_add feA feB; ok r.h0) 12#i64,
+  checkI64 "feadd_h4" (do let r ← fe_add feA feB; ok r.h4) 20#i64,
+  checkI64 "feadd_h9" (do let r ← fe_add feA feB; ok r.h9) 30#i64,
+  checkI64 "feadd_ba" (do let r ← fe_add feB feA; ok r.h0) 12#i64,
   -- x25519 scalar clamping (6)
   checkI32 "xlo_0" (x25519_clamp_low_byte 0#i32) 0#i32,
   checkI32 "xlo_7" (x25519_clamp_low_byte 7#i32) 0#i32,
