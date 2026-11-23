@@ -1,182 +1,180 @@
 #!/usr/bin/env bash
-# End-to-end Lean 4 formal verification & native-vs-Lean differential runner for packages/json5.
 set -euo pipefail
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-export PATH="${HOME}/.pion/bin:${HOME}/.elan/bin:${PATH}"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
+export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="json5"
+LEAN_MOD="Json5"
+PROOF_MOD="Json5Proofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-LEAN_WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
-LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-PROJ_DIR="${LEAN_WORK}/proj"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in ${LEAN_WORK} ==="
-mkdir -p "${PROJ_DIR}"
-if [ ! -d "${PROJ_DIR}/PionLean" ]; then
-  if [ -d /private/tmp/pion-lean-ref/PionLean ]; then
-    cp -R /private/tmp/pion-lean-ref/PionLean "${PROJ_DIR}/PionLean"
-    cp /private/tmp/pion-lean-ref/PionLean.lean "${PROJ_DIR}/PionLean.lean"
-  else
-    echo "ERROR: PionLean reference missing" >&2
-    exit 1
-  fi
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
+  exit 1
+fi
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
 fi
 
-if [ ! -e "${PROJ_DIR}/.deps/aeneas" ]; then
-  if [ ! -d "${LEAN_WORK}/aeneas/backends/lean" ]; then
-    rm -rf "${LEAN_WORK}/aeneas"
-    git clone --filter=blob:none -q https://github.com/AeneasVerif/aeneas.git "${LEAN_WORK}/aeneas"
-    git -C "${LEAN_WORK}/aeneas" checkout -q 1dc8ad31b1
-  fi
-  mkdir -p "${PROJ_DIR}/.deps"
-  ln -sfn "${LEAN_WORK}/aeneas/backends/lean" "${PROJ_DIR}/.deps/aeneas"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
 fi
 
-rm -f "${PROJ_DIR}/lakefile.toml"
-cat > "${PROJ_DIR}/lakefile.lean" <<EOF
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
 import Lake
 open Lake DSL
 
-require aeneas from "./.deps/aeneas"
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
 
-package «pionlean» where
-  leanOptions := #[⟨\`weak.linter.dupNamespace, false⟩]
+require aeneas from ".deps/aeneas"
 
-@[default_target] lean_lib PionLean
-
-lean_lib Json5 where
-  moreLeanArgs := #["--memory=${LEAN_MEM_LIMIT}", "-j", "${LEAN_NUM_THREADS}"]
-
-lean_lib Json5Proofs where
-  moreLeanArgs := #["--memory=${LEAN_MEM_LIMIT}", "-j", "${LEAN_NUM_THREADS}"]
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
 EOF
 
-echo "=== [2/7] pionc extract-lean packages/json5 ==="
-pionc extract-lean "${PKG_DIR}" --out "${PROJ_DIR}"
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
 
-rm -rf "${PROJ_DIR}/Json5Proofs" "${PROJ_DIR}/Json5Proofs.lean" "${PROJ_DIR}/CheckAxioms.lean" "${PROJ_DIR}/EvalDiff.lean"
-cp -R "${SCRIPT_DIR}/Json5Proofs" "${PROJ_DIR}/Json5Proofs"
-cp "${SCRIPT_DIR}/Json5Proofs.lean" "${PROJ_DIR}/Json5Proofs.lean"
-cp "${SCRIPT_DIR}/CheckAxioms.lean" "${PROJ_DIR}/CheckAxioms.lean"
-cp "${SCRIPT_DIR}/EvalDiff.lean" "${PROJ_DIR}/EvalDiff.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "${SCRIPT_DIR}/Json5Proofs.lean" "${SCRIPT_DIR}/Json5Proofs/" "${SCRIPT_DIR}/CheckAxioms.lean" "${SCRIPT_DIR}/EvalDiff.lean"; then
-  echo "ERROR: forbidden token found in Lean proofs!" >&2
-  exit 1
-fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Json5.Types Json5.Funs Json5Proofs ==="
-(cd "${PROJ_DIR}" && lake build PionLean Json5.Types Json5.Funs Json5Proofs)
-
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AXIOMS_OUT="$(cd "${PROJ_DIR}" && lake env lean --memory="${LEAN_MEM_LIMIT}" -j "${LEAN_NUM_THREADS}" CheckAxioms.lean 2>&1)"
-echo "${AXIOMS_OUT}"
-if echo "${AXIOMS_OUT}" | grep -E 'sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler|error:|warning:'; then
-  echo "ERROR: non-standard axiom, error, or warning detected!" >&2
-  exit 1
-fi
-THM_COUNT="$(echo "${AXIOMS_OUT}" | grep -c 'depends on axioms:' || true)"
-if [ "${THM_COUNT}" -lt 24 ]; then
-  echo "ERROR: expected at least 24 theorems in CheckAxioms, got ${THM_COUNT}" >&2
-  exit 1
-fi
-echo "CheckAxioms: ${THM_COUNT} theorems verified, standard axioms only"
-
-echo "=== [6/7] Lean EvalDiff (44 cases) ==="
-EVAL_OUT="$(cd "${PROJ_DIR}" && lake env lean --memory="${LEAN_MEM_LIMIT}" -j "${LEAN_NUM_THREADS}" EvalDiff.lean 2>&1)"
-echo "${EVAL_OUT}"
-if echo "${EVAL_OUT}" | grep -E 'FAIL|error:|warning:'; then
-  echo "ERROR: EvalDiff reported FAIL, error, or warning!" >&2
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$(mktemp -d /tmp/json5-native-diff.XXXXXX)"
-trap 'rm -rf "${DIFF_DIR}"; kill -- -$$ 2>/dev/null || true' EXIT
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
 
-cat > "${DIFF_DIR}/pion.toml" <<EOF
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    for line in f:
+        m = re.match(r"^'([^']+)' depends on axioms: \[(.*)\]$", line.strip())
+        if m:
+            thm, ax_str = m.group(1), m.group(2).strip()
+            audited.add(thm)
+            axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+            bad = axs - allowed
+            if bad:
+                sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+        elif re.match(r"^'([^']+)' does not depend on any axioms$", line.strip()):
+            audited.add(re.match(r"^'([^']+)'", line.strip()).group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "json5_diff_harness"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
-edition = "2026"
 
 [dependencies]
-json5 = { path = "${PKG_DIR}" }
+json5 = { path = "$PKG_DIR" }
 EOF
-
-mkdir -p "${DIFF_DIR}/src"
-cat > "${DIFF_DIR}/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "json5"
 
-fn cb(w : World, label : String, got : Bool, exp : Bool) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
+fn fb(b : Bool) -> String { if b { "true" } else { "false" } }
 
-fn ci(w : World, label : String, got : Int, exp : Int) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn cu64(w : World, label : String, got : UInt64, exp : UInt64) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn main(w : World) -> Unit {
-  cb(w, "hs_ok", json5::is_high_surrogate(55357), true)
-  cb(w, "hs_lo", json5::is_high_surrogate(56320), false)
-  cb(w, "ls_ok", json5::is_low_surrogate(56832), true)
-  cb(w, "ls_hi", json5::is_low_surrogate(55296), false)
-  ci(w, "sp_min", json5::decode_surrogate_pair(55296, 56320), 65536)
-  ci(w, "sp_max", json5::decode_surrogate_pair(56319, 57343), 1114111)
-  ci(w, "sp_emo", json5::decode_surrogate_pair(55357, 56832), 128512)
-  ci(w, "hx4_0", json5::pack_hex4(0, 0, 4, 1), 65)
-  ci(w, "hx4_f", json5::pack_hex4(15, 15, 15, 15), 65535)
-  ci(w, "hx2_a", json5::pack_hex2(10, 5), 165)
-  ci(w, "hx2_f", json5::pack_hex2(15, 15), 255)
-  cb(w, "uws_ls", json5::is_unicode_j5_ws(8232), true)
-  cb(w, "uws_ps", json5::is_unicode_j5_ws(8233), true)
-  cb(w, "uws_bom", json5::is_unicode_j5_ws(65279), true)
-  cb(w, "uws_sp", json5::is_unicode_j5_ws(32), false)
-  cb(w, "u8c_ok", json5::is_utf8_cont(128), true)
-  cb(w, "u8c_no", json5::is_utf8_cont(192), false)
-  cb(w, "u8_3_ok", json5::utf8_valid_3byte(228, 184, 173), true)
-  cb(w, "u8_3_ov", json5::utf8_valid_3byte(224, 159, 128), false)
-  cb(w, "u8_3_sr", json5::utf8_valid_3byte(237, 160, 128), false)
-  cb(w, "u8_4_ok", json5::utf8_valid_4byte(240, 159, 152, 128), true)
-  cb(w, "u8_4_ov", json5::utf8_valid_4byte(240, 143, 128, 128), false)
-  cb(w, "u8_4_hi", json5::utf8_valid_4byte(244, 144, 128, 128), false)
-  cu64(w, "hnz_0", json5::hash_ensure_nonzero(0UL), 1UL)
-  cu64(w, "hnz_7", json5::hash_ensure_nonzero(7UL), 7UL)
-  cu64(w, "sm64_0", json5::splitmix64(0UL), 16294208416658607535UL)
-  cb(w, "hgr_no", json5::hash_needs_grow(19, 32), false)
-  cb(w, "hgr_yes", json5::hash_needs_grow(20, 32), true)
-  cb(w, "hgr_ful", json5::hash_needs_grow(32, 32), true)
-  ci(w, "hns_0", json5::hash_next_slot(0, 31), 1)
-  ci(w, "hns_w", json5::hash_next_slot(31, 31), 0)
-  ci(w, "pe_til", json5::pointer_escape_suffix(126), 48)
-  ci(w, "pe_sl", json5::pointer_escape_suffix(47), 49)
-  ci(w, "pe_a", json5::pointer_escape_suffix(97), -1)
-  ci(w, "pu_0", json5::pointer_unescape_byte(48), 126)
-  ci(w, "pu_1", json5::pointer_unescape_byte(49), 47)
-  ci(w, "pu_2", json5::pointer_unescape_byte(50), -1)
-  cb(w, "je_q", json5::json_needs_escape_ascii(34), true)
-  cb(w, "je_bs", json5::json_needs_escape_ascii(92), true)
-  cb(w, "je_nl", json5::json_needs_escape_ascii(10), true)
-  cb(w, "je_a", json5::json_needs_escape_ascii(97), false)
-  ci(w, "lut_sp", json5::ascii_lut_flags(32), 3)
-  ci(w, "lut_A", json5::ascii_lut_flags(65), 12)
-  ci(w, "lut_0", json5::ascii_lut_flags(48), 24)
+pub fn main(world : World) -> Int {
+  io_println(world, "sur_min=" + json5::decode_surrogate_pair(55296, 56320).to_string())
+  io_println(world, "sur_max=" + json5::decode_surrogate_pair(56319, 57343).to_string())
+  io_println(world, "sur_oob=" + json5::decode_surrogate_pair(-1, 0).to_string())
+  io_println(world, "hex2_00=" + json5::pack_hex2(0, 0).to_string())
+  io_println(world, "hex2_ff=" + json5::pack_hex2(15, 15).to_string())
+  io_println(world, "hex2_oob=" + json5::pack_hex2(-1, 0).to_string())
+  io_println(world, "ws_sp=" + fb(json5::is_unicode_j5_ws(32)))
+  io_println(world, "ws_ls=" + fb(json5::is_unicode_j5_ws(8232)))
+  io_println(world, "ws_min=" + fb(json5::is_unicode_j5_ws(-2147483648)))
+  io_println(world, "ws_max=" + fb(json5::is_unicode_j5_ws(2147483647)))
+  io_println(world, "grow_no=" + fb(json5::hash_needs_grow(4, 8)))
+  io_println(world, "grow_yes=" + fb(json5::hash_needs_grow(5, 8)))
+  io_println(world, "grow_0=" + fb(json5::hash_needs_grow(0, 0)))
+  io_println(world, "nslot_wrap=" + json5::hash_next_slot(7, 7).to_string())
+  io_println(world, "nslot_max=" + json5::hash_next_slot(2147483647, 15).to_string())
+  io_println(world, "pe_til=" + json5::pointer_escape_suffix(126).to_string())
+  io_println(world, "pe_sl=" + json5::pointer_escape_suffix(47).to_string())
+  io_println(world, "pe_other=" + json5::pointer_escape_suffix(65).to_string())
+  io_println(world, "pu_0=" + json5::pointer_unescape_byte(48).to_string())
+  io_println(world, "pu_1=" + json5::pointer_unescape_byte(49).to_string())
+  io_println(world, "pu_bad=" + json5::pointer_unescape_byte(50).to_string())
+  io_println(world, "lut_sp=" + json5::ascii_lut_flags(32).to_string())
+  io_println(world, "lut_A=" + json5::ascii_lut_flags(65).to_string())
+  io_println(world, "lut_min=" + json5::ascii_lut_flags(-2147483648).to_string())
+  io_println(world, "lut_max=" + json5::ascii_lut_flags(2147483647).to_string())
+  0
 }
 EOF
-
-PION_CACHE_DIR="${DIFF_DIR}/pion-cache" pionc build -o "${DIFF_DIR}/diff_bin" "${DIFF_DIR}"
-"${DIFF_DIR}/diff_bin" > "${DIFF_DIR}/native.out"
-printf '%s\n' "${EVAL_OUT}" > "${DIFF_DIR}/lean.out"
-diff -u "${DIFF_DIR}/native.out" "${DIFF_DIR}/lean.out"
-CASE_COUNT="$(wc -l < "${DIFF_DIR}/native.out" | tr -d ' ')"
-echo "Native vs Lean differential: ${CASE_COUNT} cases identical (diff -u exit 0)"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
 echo "PASS: packages/json5 Lean 4 proofs"

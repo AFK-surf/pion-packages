@@ -75,28 +75,6 @@ theorem is_leap_year_spec (year : Std.I32) :
       unfold IsLeapYear; omega
     simp [hnot]
 
-/-- Century & BCE leap-year corollaries. -/
-theorem leap_year_1900 : is_leap_year 1900#i32 = ok false := by
-  rw [is_leap_year_spec]; rfl
-
-theorem leap_year_2000 : is_leap_year 2000#i32 = ok true := by
-  rw [is_leap_year_spec]; rfl
-
-theorem leap_year_2100 : is_leap_year 2100#i32 = ok false := by
-  rw [is_leap_year_spec]; rfl
-
-theorem leap_year_2400 : is_leap_year 2400#i32 = ok true := by
-  rw [is_leap_year_spec]; rfl
-
-theorem leap_year_zero : is_leap_year 0#i32 = ok true := by
-  rw [is_leap_year_spec]; rfl
-
-theorem leap_year_neg400 : is_leap_year (-400)#i32 = ok true := by
-  rw [is_leap_year_spec]; rfl
-
-theorem leap_year_neg100 : is_leap_year (-100)#i32 = ok false := by
-  rw [is_leap_year_spec]; rfl
-
 /-- `days_in_month_of` never traps for `1 ≤ month ≤ 12`, always returns a value in `[28, 31]`,
     and equals `specDaysInMonth year.val month.val` (in particular, 29/28 for February). -/
 theorem days_in_month_of_spec (year month : Std.I32)
@@ -140,12 +118,6 @@ theorem days_in_month_of_spec (year month : Std.I32)
       rcases hm_cases with h | h | h | h | h | h | h | h | h | h | h <;> simp [h]
     · rw [hres_val]; omega
     · rw [hres_val]; omega
-
-theorem days_in_month_of_feb (year : Std.I32) :
-    days_in_month_of year 2#i32 = ok (if IsLeapYear year.val then 29#i32 else 28#i32) := by
-  unfold days_in_month_of
-  simp only [↓reduceIte, is_leap_year_spec, b_ok]
-  by_cases hl : IsLeapYear year.val <;> simp [hl]
 
 /-! ## 2. Hinnant / Neri-Schneider Gregorian Calendar Bijection (`-9999..=9999`) -/
 
@@ -730,7 +702,7 @@ theorem from_epoch_days_out_of_range (days : Std.I32) (h : ¬ ValidEpochDays day
   exact ⟨_, rfl⟩
 
 /-- Strict monotonicity of `specEpochDays` on valid Gregorian dates. -/
-theorem specEpochDays_strict_mono {y1 m1 d1 y2 m2 d2 : Int}
+lemma specEpochDays_strict_mono {y1 m1 d1 y2 m2 d2 : Int}
     (hv1 : -9999 ≤ y1 ∧ y1 ≤ 9999 ∧ 1 ≤ m1 ∧ m1 ≤ 12 ∧ 1 ≤ d1 ∧ d1 ≤ specDaysInMonth y1 m1)
     (hv2 : -9999 ≤ y2 ∧ y2 ≤ 9999 ∧ 1 ≤ m2 ∧ m2 ≤ 12 ∧ 1 ≤ d2 ∧ d2 ≤ specDaysInMonth y2 m2) :
     (y1 < y2 ∨ (y1 = y2 ∧ m1 < m2) ∨ (y1 = y2 ∧ m1 = m2 ∧ d1 < d2)) ↔

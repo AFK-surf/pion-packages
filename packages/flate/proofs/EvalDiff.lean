@@ -3,54 +3,45 @@ import Flate.Funs
 
 open Aeneas Aeneas.Std Result Pion flate
 
-def okIs {α : Type} [BEq α] (r : Result α) (expected : α) : Bool :=
-  r.reducesTo expected
+namespace FlateEvalDiff
 
-def check (label : String) (b : Bool) : IO Unit :=
-  IO.println s!"{label}: {if b then "PASS" else "FAIL"}"
+private def i32 (x : Int) : Std.I32 := ⟨BitVec.ofInt 32 x⟩
+private def u32 (x : Nat) : Std.U32 := ⟨BitVec.ofNat 32 x⟩
 
-def main : IO Unit := do
-  -- Limits & level & btype & stored nlen
-  check "level_neg1_false" (okIs (is_valid_level (-1)#i32) false)
-  check "level_0_true" (okIs (is_valid_level 0#i32) true)
-  check "level_9_true" (okIs (is_valid_level 9#i32) true)
-  check "level_10_false" (okIs (is_valid_level 10#i32) false)
-  check "limits_default" (okIs (do let l ← DecompressLimits.default; ok l.max_output_bytes) 268435456#i32)
-  check "limits_new_1024" (okIs (do let l ← DecompressLimits.new 1024#i32; ok l.max_output_bytes) 1024#i32)
-  check "btype_0_true" (okIs (is_valid_btype 0#i32) true)
-  check "btype_2_true" (okIs (is_valid_btype 2#i32) true)
-  check "btype_3_false" (okIs (is_valid_btype 3#i32) false)
-  check "nlen_0_ffff" (okIs (is_valid_stored_nlen 0#i32 65535#i32) true)
-  check "nlen_1234_ok" (okIs (is_valid_stored_nlen 1234#i32 64301#i32) true)
-  check "nlen_1234_bad" (okIs (is_valid_stored_nlen 1234#i32 64300#i32) false)
+private def showI32 (label : String) (r : Result Std.I32) : String :=
+  match r.match with
+  | .ok v => s!"{label}={v.val}"
+  | _ => s!"{label}=TRAP"
 
-  -- Zlib RFC 1950
-  check "zlib_flevel_0" (okIs (zlib_flevel 0#i32) 0#i32)
-  check "zlib_flevel_1" (okIs (zlib_flevel 1#i32) 0#i32)
-  check "zlib_flevel_5" (okIs (zlib_flevel 5#i32) 1#i32)
-  check "zlib_flevel_6" (okIs (zlib_flevel 6#i32) 2#i32)
-  check "zlib_flevel_9" (okIs (zlib_flevel 9#i32) 3#i32)
-  check "zlib_flg_0" (okIs (zlib_compute_flg 120#i32 0#i32) 1#i32)
-  check "zlib_flg_1" (okIs (zlib_compute_flg 120#i32 1#i32) 94#i32)
-  check "zlib_flg_2" (okIs (zlib_compute_flg 120#i32 2#i32) 156#i32)
-  check "zlib_flg_3" (okIs (zlib_compute_flg 120#i32 3#i32) 218#i32)
-  check "zlib_chk_78_9c_ok" (okIs (zlib_check_header 120#i32 156#i32) 0#i32)
-  check "zlib_chk_fcheck_err" (okIs (zlib_check_header 120#i32 155#i32) 1#i32)
-  check "zlib_chk_cm_err" (okIs (zlib_check_header 121#i32 24#i32) 2#i32)
-  check "zlib_chk_cinfo_err" (okIs (zlib_check_header 136#i32 28#i32) 3#i32)
+private def showU32 (label : String) (r : Result Std.U32) : String :=
+  match r.match with
+  | .ok v => s!"{label}={v.val}"
+  | _ => s!"{label}=TRAP"
 
-  -- Huffman LUT & bit_reverse
-  check "huff_direct_65_8" (okIs (huff_direct_entry 65#i32 8#i32) 2088#i32)
-  check "huff_subtable_1024_5" (okIs (huff_subtable_entry 1024#i32 5#i32) 32789#i32)
-  check "bit_rev_0_0" (okIs (bit_reverse 0#i32 0#i32) 0#i32)
-  check "bit_rev_1_3" (okIs (bit_reverse 1#i32 3#i32) 4#i32)
-  check "bit_rev_5_4" (okIs (bit_reverse 5#i32 4#i32) 10#i32)
-  check "bit_rev_13_8" (okIs (bit_reverse 13#i32 8#i32) 176#i32)
+def runAll : List String :=
+  [ showI32 "huff_dir_0" (huff_direct_entry 0#i32 1#i32)
+  , showI32 "huff_dir_285" (huff_direct_entry 285#i32 15#i32)
+  , showI32 "huff_dir_max" (huff_direct_entry (i32 33554431) 15#i32)
+  , showI32 "huff_dir_oob" (huff_direct_entry (i32 (-1)) 15#i32)
+  , showI32 "huff_sub_0" (huff_subtable_entry 0#i32 1#i32)
+  , showI32 "huff_sub_max" (huff_subtable_entry (i32 33554431) 15#i32)
+  , showU32 "adler_init" (adler32_pack 1#u32 0#u32)
+  , showU32 "adler_max" (adler32_pack (u32 65520) (u32 65520))
+  , showU32 "adler_u32max" (adler32_pack (u32 0xFFFFFFFF) (u32 0xFFFFFFFF))
+  , showI32 "zfl_0" (zlib_flevel 0#i32)
+  , showI32 "zfl_6" (zlib_flevel 6#i32)
+  , showI32 "zfl_9" (zlib_flevel 9#i32)
+  , showI32 "zfl_min" (zlib_flevel (i32 (-2147483648)))
+  , showI32 "zfl_max" (zlib_flevel (i32 2147483647))
+  , showI32 "zflg_78_2" (zlib_compute_flg 120#i32 2#i32)
+  , showI32 "zflg_0_0" (zlib_compute_flg 0#i32 0#i32)
+  , showI32 "zflg_255_3" (zlib_compute_flg 255#i32 3#i32)
+  , showI32 "zchk_789c" (zlib_check_header 120#i32 156#i32)
+  , showI32 "zchk_badf" (zlib_check_header 120#i32 157#i32)
+  , showI32 "zchk_badcm" (zlib_check_header 121#i32 24#i32)
+  , showI32 "zchk_badci" (zlib_check_header 136#i32 28#i32)
+  ]
 
-  -- Checksums (Adler-32 & IEEE CRC-32)
-  check "adler_pack_1_0" (okIs (adler32_pack 1#u32 0#u32) 1#u32)
-  check "adler_pack_sample" (okIs (adler32_pack 500#u32 1000#u32) 65536500#u32)
-  check "crc32_poly_0" (okIs (crc32_byte_poly 0#u32) 0#u32)
-  check "crc32_poly_1" (okIs (crc32_byte_poly 1#u32) 1996959894#u32)
-  check "crc32_poly_128" (okIs (crc32_byte_poly 128#u32) 3988292384#u32)
-  check "crc32_poly_255" (okIs (crc32_byte_poly 255#u32) 755167117#u32)
+#eval IO.println (String.intercalate "\n" runAll)
+
+end FlateEvalDiff

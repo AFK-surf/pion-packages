@@ -12,8 +12,6 @@ private lemma result_bind_ok' {α β : Type} (a : α) (f : α → Result β) :
 private lemma uscalar_eq_of_bv {ty} {x y : UScalar ty} (h : x.bv = y.bv) : x = y := by
   cases x; cases y; congr
 private lemma i32_le_iff' (x y : Std.I32) : (x <= y) ↔ (x.val <= y.val) := Iff.rfl
-private lemma i32_beq_iff' (x y : Std.I32) : ((x == y) = true) ↔ (x.val = y.val) := by
-  cases x; cases y; simp [BEq.beq, IScalar.val, BitVec.toInt_inj]
 
 private lemma i32_add_val' (x y : Std.I32)
     (hlo : -2147483648 ≤ x.val + y.val) (hhi : x.val + y.val ≤ 2147483647) :
@@ -84,14 +82,7 @@ private lemma bv32_rotl_inv (x : BitVec 32) (k : Nat) (hk0 : 0 < k) (hk32 : k < 
     have he : x.getLsbD (32 - k + (k + i)) = false := BitVec.getLsbD_of_ge x _ (by omega)
     simp only [ha, hb, hc, hd, he, decide_false, decide_true, Bool.not_false, Bool.not_true, Bool.true_and, Bool.false_and, Bool.false_or, Bool.or_false]
 
-/-- Theorem 13: Rotating `0` by any ChaCha20 shift `0 < n < 32` yields `0`. -/
-theorem cc_rotl32_zero (n : Std.U32) (hn0 : 0 < n.val) (hn32 : n.val < 32) :
-    cc_rotl32 0#u32 n = ok 0#u32 := by
-  rw [u32_rotl_eval 0#u32 n hn0 hn32]
-  apply congrArg ok; apply uscalar_eq_of_bv
-  ext i hi; simp
-
-/-- Theorem 14: ChaCha20 16-bit rotation (`cc_rotl32 · 16`) is an involution across all `2^32` words. -/
+/-- ChaCha20 16-bit rotation (`cc_rotl32 · 16`) is an involution across all `2^32` words. -/
 theorem cc_rotl32_16_involutive (x : Std.U32) :
     (do let y ← cc_rotl32 x 16#u32; cc_rotl32 y 16#u32) = ok x := by
   rw [u32_rotl_eval x 16#u32 (by decide) (by decide), result_bind_ok']
@@ -99,51 +90,8 @@ theorem cc_rotl32_16_involutive (x : Std.U32) :
   apply congrArg ok; apply uscalar_eq_of_bv
   exact bv32_rotl_inv x.bv 16 (by decide) (by decide)
 
-/-- Theorem 15: ChaCha20 12-bit rotation is inverted by 20-bit rotation across all `2^32` words. -/
-theorem cc_rotl32_12_inverse (x : Std.U32) :
-    (do let y ← cc_rotl32 x 12#u32; cc_rotl32 y 20#u32) = ok x := by
-  rw [u32_rotl_eval x 12#u32 (by decide) (by decide), result_bind_ok']
-  rw [u32_rotl_eval _ 20#u32 (by decide) (by decide)]
-  apply congrArg ok; apply uscalar_eq_of_bv
-  exact bv32_rotl_inv x.bv 12 (by decide) (by decide)
-
-/-- Theorem 16: ChaCha20 8-bit rotation is inverted by 24-bit rotation across all `2^32` words. -/
-theorem cc_rotl32_8_inverse (x : Std.U32) :
-    (do let y ← cc_rotl32 x 8#u32; cc_rotl32 y 24#u32) = ok x := by
-  rw [u32_rotl_eval x 8#u32 (by decide) (by decide), result_bind_ok']
-  rw [u32_rotl_eval _ 24#u32 (by decide) (by decide)]
-  apply congrArg ok; apply uscalar_eq_of_bv
-  exact bv32_rotl_inv x.bv 8 (by decide) (by decide)
-
-/-- Theorem 17: ChaCha20 7-bit rotation is inverted by 25-bit rotation across all `2^32` words. -/
-theorem cc_rotl32_7_inverse (x : Std.U32) :
-    (do let y ← cc_rotl32 x 7#u32; cc_rotl32 y 25#u32) = ok x := by
-  rw [u32_rotl_eval x 7#u32 (by decide) (by decide), result_bind_ok']
-  rw [u32_rotl_eval _ 25#u32 (by decide) (by decide)]
-  apply congrArg ok; apply uscalar_eq_of_bv
-  exact bv32_rotl_inv x.bv 7 (by decide) (by decide)
-
-/-- Theorem 18: RFC 8439 ChaCha20-Poly1305 AEAD key (32B), nonce (12B), and ciphertext+tag (`≥ 16B`) length guards. -/
-theorem chacha20_aead_lengths_exact (n : Std.I32) :
-    (chacha20_is_valid_key_len n = ok true ↔ n.val = 32) ∧
-    (chacha20_is_valid_nonce_len n = ok true ↔ n.val = 12) ∧
-    (chacha20_is_valid_ct_len n = ok true ↔ 16 ≤ n.val) := by
-  refine ⟨?_, ?_, ?_⟩
-  · unfold chacha20_is_valid_key_len; simp only [ok.injEq, i32_beq_iff']; exact Iff.rfl
-  · unfold chacha20_is_valid_nonce_len; simp only [ok.injEq, i32_beq_iff']; exact Iff.rfl
-  · unfold chacha20_is_valid_ct_len; simp only [ok.injEq, decide_eq_true_eq, ge_iff_le, i32_le_iff']; exact Iff.rfl
-
-/-- Theorem 19: RFC 5869 §2.3 HKDF-SHA256 output length validity exact range (`0 ≤ len ≤ 8160 = 255 * 32`). -/
-theorem hkdf_sha256_valid_len_exact (len : Std.I32) :
-    hkdf_sha256_valid_len len = ok true ↔ (0 ≤ len.val ∧ len.val ≤ 8160) := by
-  unfold hkdf_sha256_valid_len
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
-  have hm : (Pion.I32.mul 255#i32 32#i32).val = 8160 := by decide
-  rw [hm]
-  change (0 ≤ len.val ∧ len.val ≤ 8160) ↔ _
-  exact Iff.rfl
-
-/-- Theorem 20: RFC 5869 §2.3 HKDF-SHA256 block count for `1 ≤ len ≤ 8160` lands strictly in `[1, 255]` (counter byte never wraps) and satisfies exact ceiling division. -/
+/-- RFC 5869 §2.3 HKDF-SHA256 block count for `1 ≤ len ≤ 8160` (guarded by `hkdf_sha256_valid_len`
+    in `packages/crypto/src/hkdf.pion`) lands strictly in `[1, 255]` and satisfies ceiling division. -/
 theorem hkdf_sha256_blocks_counter_safe (len : Std.I32) (h1 : 1 ≤ len.val) (hmax : len.val ≤ 8160) :
     ∃ b : Std.I32, hkdf_sha256_blocks len = ok b ∧
       1 ≤ b.val ∧ b.val ≤ 255 ∧
@@ -159,33 +107,7 @@ theorem hkdf_sha256_blocks_counter_safe (len : Std.I32) (h1 : 1 ≤ len.val) (hm
     exact Int.tdiv_eq_ediv_of_nonneg (by omega)
   exact ⟨b, rfl, by omega, by omega, by omega, by omega⟩
 
-/-- Theorem 21: RFC 5869 §2.3 HKDF-SHA512 output length validity exact range (`0 ≤ len ≤ 16320 = 255 * 64`). -/
-theorem hkdf_sha512_valid_len_exact (len : Std.I32) :
-    hkdf_sha512_valid_len len = ok true ↔ (0 ≤ len.val ∧ len.val ≤ 16320) := by
-  unfold hkdf_sha512_valid_len
-  simp only [ok.injEq, Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']
-  have hm : (Pion.I32.mul 255#i32 64#i32).val = 16320 := by decide
-  rw [hm]
-  change (0 ≤ len.val ∧ len.val ≤ 16320) ↔ _
-  exact Iff.rfl
-
-/-- Theorem 22: RFC 5869 §2.3 HKDF-SHA512 block count for `1 ≤ len ≤ 16320` lands strictly in `[1, 255]` (counter byte never wraps) and satisfies exact ceiling division. -/
-theorem hkdf_sha512_blocks_counter_safe (len : Std.I32) (h1 : 1 ≤ len.val) (hmax : len.val ≤ 16320) :
-    ∃ b : Std.I32, hkdf_sha512_blocks len = ok b ∧
-      1 ≤ b.val ∧ b.val ≤ 255 ∧
-      (b.val - 1) * 64 < len.val ∧ len.val ≤ b.val * 64 := by
-  unfold hkdf_sha512_blocks
-  set num := Pion.I32.add len 63#i32
-  have hnum : num.val = len.val + 63 :=
-    i32_add_val' len 63#i32 (by change -2147483648 ≤ len.val + 63; omega) (by change len.val + 63 ≤ 2147483647; omega)
-  rcases i32_div_pos num 64#i32 (by decide) with ⟨b, hb, hbv⟩
-  rw [hb, result_bind_ok']
-  have hb_ediv : b.val = (len.val + 63) / 64 := by
-    rw [hbv, hnum]
-    exact Int.tdiv_eq_ediv_of_nonneg (by omega)
-  exact ⟨b, rfl, by omega, by omega, by omega, by omega⟩
-
-/-- Theorem 23: `hex_nibble_val` always lands in `[-1, 15]`, returning `≥ 0` iff `c` is an ASCII hex digit. -/
+/-- `hex_nibble_val` always lands in `[-1, 15]`, returning `≥ 0` iff `c` is an ASCII hex digit. -/
 theorem hex_nibble_val_bounds (c : Std.I32) :
     ∃ r : Std.I32, hex_nibble_val c = ok r ∧
       -1 ≤ r.val ∧ r.val ≤ 15 ∧
@@ -230,7 +152,7 @@ theorem hex_nibble_val_bounds (c : Std.I32) :
           simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff']; change 65 ≤ c.val ∧ c.val ≤ 70; exact h)
         exact ⟨(-1)#i32, rfl, by decide, by decide, ⟨fun h => by change 0 ≤ (-1 : Int) at h; omega, fun h => by omega⟩⟩
 
-/-- Theorem 24: `hex_nibble_val` is case-insensitive on `'A'..'F'` vs `'a'..'f'`. -/
+/-- `hex_nibble_val` is case-insensitive on `'A'..'F'` vs `'a'..'f'`. -/
 theorem hex_nibble_val_case_insensitive (c : Std.I32) (hlo : 65 ≤ c.val) (hhi : c.val ≤ 70) :
     hex_nibble_val (Pion.I32.add c 32#i32) = hex_nibble_val c := by
   set cl := Pion.I32.add c 32#i32

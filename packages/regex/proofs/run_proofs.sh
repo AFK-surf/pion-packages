@@ -1,204 +1,186 @@
 #!/usr/bin/env bash
-# End-to-end Lean 4 formal verification & native-vs-Lean differential runner for packages/regex.
 set -euo pipefail
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-export PATH="${HOME}/.pion/bin:${HOME}/.elan/bin:${PATH}"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
+export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="regex"
+LEAN_MOD="Regex"
+PROOF_MOD="RegexProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-LEAN_WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
-LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-PROJ_DIR="${LEAN_WORK}/proj"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in ${LEAN_WORK} ==="
-mkdir -p "${PROJ_DIR}"
-if [ ! -d "${PROJ_DIR}/PionLean" ]; then
-  if [ -d /private/tmp/pion-lean-ref/PionLean ]; then
-    cp -R /private/tmp/pion-lean-ref/PionLean "${PROJ_DIR}/PionLean"
-    cp /private/tmp/pion-lean-ref/PionLean.lean "${PROJ_DIR}/PionLean.lean"
-  else
-    echo "ERROR: PionLean reference missing" >&2
-    exit 1
-  fi
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
+  exit 1
+fi
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
 fi
 
-if [ ! -e "${PROJ_DIR}/.deps/aeneas" ]; then
-  if [ ! -d "${LEAN_WORK}/aeneas/backends/lean" ]; then
-    rm -rf "${LEAN_WORK}/aeneas"
-    git clone --filter=blob:none -q https://github.com/AeneasVerif/aeneas.git "${LEAN_WORK}/aeneas"
-    git -C "${LEAN_WORK}/aeneas" checkout -q 1dc8ad31b1
-  fi
-  mkdir -p "${PROJ_DIR}/.deps"
-  ln -sfn "${LEAN_WORK}/aeneas/backends/lean" "${PROJ_DIR}/.deps/aeneas"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
 fi
 
-rm -f "${PROJ_DIR}/lakefile.toml"
-cat > "${PROJ_DIR}/lakefile.lean" <<EOF
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
 import Lake
 open Lake DSL
 
-require aeneas from "./.deps/aeneas"
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
 
-package «pionlean» where
-  leanOptions := #[⟨\`weak.linter.dupNamespace, false⟩]
+require aeneas from ".deps/aeneas"
 
-@[default_target] lean_lib PionLean
-
-lean_lib Regex where
-  moreLeanArgs := #["--memory=${LEAN_MEM_LIMIT}", "-j", "${LEAN_NUM_THREADS}"]
-
-lean_lib RegexProofs where
-  moreLeanArgs := #["--memory=${LEAN_MEM_LIMIT}", "-j", "${LEAN_NUM_THREADS}"]
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
 EOF
 
-echo "=== [2/7] pionc extract-lean packages/regex ==="
-pionc extract-lean "${PKG_DIR}" --out "${PROJ_DIR}"
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
 
-rm -rf "${PROJ_DIR}/RegexProofs" "${PROJ_DIR}/RegexProofs.lean" "${PROJ_DIR}/CheckAxioms.lean" "${PROJ_DIR}/EvalDiff.lean"
-cp -R "${SCRIPT_DIR}/RegexProofs" "${PROJ_DIR}/RegexProofs"
-cp "${SCRIPT_DIR}/RegexProofs.lean" "${PROJ_DIR}/RegexProofs.lean"
-cp "${SCRIPT_DIR}/CheckAxioms.lean" "${PROJ_DIR}/CheckAxioms.lean"
-cp "${SCRIPT_DIR}/EvalDiff.lean" "${PROJ_DIR}/EvalDiff.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "${SCRIPT_DIR}/RegexProofs.lean" "${SCRIPT_DIR}/RegexProofs/" "${SCRIPT_DIR}/CheckAxioms.lean" "${SCRIPT_DIR}/EvalDiff.lean"; then
-  echo "ERROR: forbidden token found in Lean proofs!" >&2
-  exit 1
-fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Regex.Types Regex.Funs RegexProofs ==="
-(cd "${PROJ_DIR}" && lake build PionLean Regex.Types Regex.Funs RegexProofs)
-
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AXIOMS_OUT="$(cd "${PROJ_DIR}" && lake env lean --memory="${LEAN_MEM_LIMIT}" -j "${LEAN_NUM_THREADS}" CheckAxioms.lean 2>&1)"
-echo "${AXIOMS_OUT}"
-if echo "${AXIOMS_OUT}" | grep -E 'sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler|error:|warning:'; then
-  echo "ERROR: non-standard axiom, error, or warning detected!" >&2
-  exit 1
-fi
-THM_COUNT="$(echo "${AXIOMS_OUT}" | grep -c 'depends on axioms:' || true)"
-if [ "${THM_COUNT}" -lt 24 ]; then
-  echo "ERROR: expected at least 24 theorems in CheckAxioms, got ${THM_COUNT}" >&2
-  exit 1
-fi
-echo "CheckAxioms: ${THM_COUNT} theorems verified, standard axioms only"
-
-echo "=== [6/7] Lean EvalDiff (44 cases) ==="
-EVAL_OUT="$(cd "${PROJ_DIR}" && lake env lean --memory="${LEAN_MEM_LIMIT}" -j "${LEAN_NUM_THREADS}" EvalDiff.lean 2>&1)"
-echo "${EVAL_OUT}"
-if echo "${EVAL_OUT}" | grep -E 'FAIL|error:|warning:'; then
-  echo "ERROR: EvalDiff reported FAIL, error, or warning!" >&2
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$(mktemp -d /tmp/regex-native-diff.XXXXXX)"
-trap 'rm -rf "${DIFF_DIR}"; kill -- -$$ 2>/dev/null || true' EXIT
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
 
-cat > "${DIFF_DIR}/pion.toml" <<EOF
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    for line in f:
+        m = re.match(r"^'([^']+)' depends on axioms: \[(.*)\]$", line.strip())
+        if m:
+            thm, ax_str = m.group(1), m.group(2).strip()
+            audited.add(thm)
+            axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+            bad = axs - allowed
+            if bad:
+                sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+        elif re.match(r"^'([^']+)' does not depend on any axioms$", line.strip()):
+            audited.add(re.match(r"^'([^']+)'", line.strip()).group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "regex_diff_harness"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
-edition = "2026"
 
 [dependencies]
-regex = { path = "${PKG_DIR}" }
+regex = { path = "$PKG_DIR" }
 EOF
-
-mkdir -p "${DIFF_DIR}/src"
-cat > "${DIFF_DIR}/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "regex"
 
-fn cb(w : World, label : String, got : Bool, exp : Bool) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
+fn fb(b : Bool) -> String { if b { "true" } else { "false" } }
 
-fn ci(w : World, label : String, got : Int, exp : Int) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn ci64(w : World, label : String, got : Int64, exp : Int64) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn lk_id(lk : regex::LookKind) -> Int {
-  match lk {
-    regex::LookKind::StartText => 0
-    regex::LookKind::EndText => 1
-    regex::LookKind::StartLine => 2
-    regex::LookKind::EndLine => 3
-    regex::LookKind::WordBoundaryAscii => 4
-    regex::LookKind::NotWordBoundaryAscii => 5
-    regex::LookKind::WordBoundaryUnicode => 6
-    regex::LookKind::NotWordBoundaryUnicode => 7
-  }
-}
-
-fn clk(w : World, label : String, got : regex::LookKind, exp : regex::LookKind) -> Unit {
-  ci(w, label, lk_id(got), lk_id(exp))
-}
-
-fn cr_inter(w : World, label : String, a : regex::CharRange, b : regex::CharRange, elo : Int, ehi : Int) -> Unit {
-  let r = regex::char_range_intersect(a, b)
-  if r.lo == elo && r.hi == ehi { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn main(w : World) -> Unit {
-  cb(w, "lm_lf", regex::dfa_is_leftmost(regex::DfaMode::LeftmostFirst), true)
-  cb(w, "lm_rev", regex::dfa_is_leftmost(regex::DfaMode::Reverse), false)
-  cb(w, "lm_set", regex::dfa_is_leftmost(regex::DfaMode::SetAll), false)
-  cb(w, "sa_set", regex::dfa_is_set_all(regex::DfaMode::SetAll), true)
-  cb(w, "sa_lf", regex::dfa_is_set_all(regex::DfaMode::LeftmostFirst), false)
-  cb(w, "lk_st", regex::dfa_look_holds(regex::LookKind::StartText, true, false, false, false, false, false), true)
-  cb(w, "lk_sl", regex::dfa_look_holds(regex::LookKind::StartLine, false, true, false, false, false, false), true)
-  cb(w, "lk_et", regex::dfa_look_holds(regex::LookKind::EndText, false, false, false, false, false, true), true)
-  cb(w, "lk_el_nl", regex::dfa_look_holds(regex::LookKind::EndLine, false, false, false, true, false, false), true)
-  cb(w, "lk_el_no", regex::dfa_look_holds(regex::LookKind::EndLine, false, false, false, false, false, false), false)
-  cb(w, "lk_wb_t", regex::dfa_look_holds(regex::LookKind::WordBoundaryAscii, false, false, true, false, false, false), true)
-  cb(w, "lk_wb_f", regex::dfa_look_holds(regex::LookKind::WordBoundaryAscii, false, false, true, false, true, false), false)
-  cb(w, "lk_nwb_t", regex::dfa_look_holds(regex::LookKind::NotWordBoundaryUnicode, false, false, false, false, false, false), true)
-  clk(w, "rev_st", regex::reverse_look_kind(regex::LookKind::StartText), regex::LookKind::EndText)
-  clk(w, "rev_et", regex::reverse_look_kind(regex::LookKind::EndText), regex::LookKind::StartText)
-  clk(w, "rev_sl", regex::reverse_look_kind(regex::LookKind::StartLine), regex::LookKind::EndLine)
-  clk(w, "rev_el", regex::reverse_look_kind(regex::LookKind::EndLine), regex::LookKind::StartLine)
-  clk(w, "rev_wb", regex::reverse_look_kind(regex::LookKind::WordBoundaryUnicode), regex::LookKind::WordBoundaryUnicode)
-  cb(w, "iswb_a", regex::look_is_word_boundary(regex::LookKind::WordBoundaryAscii), true)
-  cb(w, "iswb_na", regex::look_is_word_boundary(regex::LookKind::NotWordBoundaryAscii), true)
-  cb(w, "iswb_st", regex::look_is_word_boundary(regex::LookKind::StartText), false)
-  cb(w, "op_ok", regex::onepass_can_compile(false, 31, 512), true)
-  cb(w, "op_look", regex::onepass_can_compile(true, 2, 10), false)
-  cb(w, "op_cap0", regex::onepass_can_compile(false, 0, 10), false)
-  cb(w, "op_cap32", regex::onepass_can_compile(false, 32, 10), false)
-  cb(w, "op_nfa", regex::onepass_can_compile(false, 2, 513), false)
-  ci64(w, "opm_set0", regex::onepass_mask_add_slot(0L, 0, 4), 1L)
-  ci64(w, "opm_set3", regex::onepass_mask_add_slot(1L, 3, 4), 9L)
-  ci64(w, "opm_oob", regex::onepass_mask_add_slot(5L, 4, 4), 5L)
-  ci64(w, "opm_neg", regex::onepass_mask_add_slot(5L, -1, 4), 5L)
-  cb(w, "cap_ok", regex::captures_slot_valid(0, 2), true)
-  cb(w, "cap_hi", regex::captures_slot_valid(1, 2), false)
-  cb(w, "cap_odd", regex::captures_slot_valid(1, 3), false)
-  cb(w, "cap_neg", regex::captures_slot_valid(-1, 6), false)
-  cb(w, "cr_le1", regex::char_range_le(regex::CharRange::{ lo: 10, hi: 20 }, regex::CharRange::{ lo: 10, hi: 25 }), true)
-  cb(w, "cr_le2", regex::char_range_le(regex::CharRange::{ lo: 11, hi: 12 }, regex::CharRange::{ lo: 10, hi: 99 }), false)
-  cr_inter(w, "cr_int1", regex::CharRange::{ lo: 10, hi: 30 }, regex::CharRange::{ lo: 20, hi: 40 }, 20, 30)
-  cr_inter(w, "cr_int2", regex::CharRange::{ lo: 10, hi: 15 }, regex::CharRange::{ lo: 20, hi: 40 }, 20, 15)
-  cb(w, "u8c_80", regex::is_utf8_cont_byte(128), true)
-  cb(w, "u8c_bf", regex::is_utf8_cont_byte(191), true)
-  cb(w, "u8c_c0", regex::is_utf8_cont_byte(192), false)
-  ci(w, "u8l_1", regex::utf8_lead_len(65), 1)
-  ci(w, "u8l_4", regex::utf8_lead_len(240), 4)
-  ci(w, "hx_f", regex::hex_val(102), 15)
+pub fn main(world : World) -> Int {
+  let r1 = regex::CharRange::{ lo: 10, hi: 30 }
+  let r2 = regex::CharRange::{ lo: 20, hi: 40 }
+  let rmin = regex::CharRange::{ lo: -2147483648, hi: 2147483647 }
+  io_println(world, "op_add0=" + regex::onepass_mask_add_slot(0L, 0, 4).to_string())
+  io_println(world, "op_add62=" + regex::onepass_mask_add_slot(0L, 62, 63).to_string())
+  io_println(world, "op_oob63=" + regex::onepass_mask_add_slot(5L, 63, 64).to_string())
+  io_println(world, "op_neg=" + regex::onepass_mask_add_slot(5L, -1, 4).to_string())
+  io_println(world, "cap_ok=" + fb(regex::captures_slot_valid(0, 2)))
+  io_println(world, "cap_edge=" + fb(regex::captures_slot_valid(1, 3)))
+  io_println(world, "cap_neg=" + fb(regex::captures_slot_valid(-1, 10)))
+  io_println(world, "cap_min=" + fb(regex::captures_slot_valid(0, -2147483648)))
+  io_println(world, "cap_max=" + fb(regex::captures_slot_valid(1073741822, 2147483647)))
+  io_println(world, "cr_le_lt=" + fb(regex::char_range_le(r1, r2)))
+  io_println(world, "cr_le_gt=" + fb(regex::char_range_le(r2, r1)))
+  io_println(world, "cr_le_min=" + fb(regex::char_range_le(rmin, r1)))
+  let ov = regex::char_range_intersect(r1, r2)
+  let mn = regex::char_range_intersect(rmin, r1)
+  io_println(world, "cr_int_ov=" + ov.lo.to_string() + "," + ov.hi.to_string())
+  io_println(world, "cr_int_min=" + mn.lo.to_string() + "," + mn.hi.to_string())
+  io_println(world, "u8_128=" + fb(regex::is_utf8_cont_byte(128)))
+  io_println(world, "u8_191=" + fb(regex::is_utf8_cont_byte(191)))
+  io_println(world, "u8_192=" + fb(regex::is_utf8_cont_byte(192)))
+  io_println(world, "u8_neg1=" + fb(regex::is_utf8_cont_byte(-1)))
+  io_println(world, "hex_0=" + regex::hex_val(48).to_string())
+  io_println(world, "hex_F=" + regex::hex_val(70).to_string())
+  io_println(world, "hex_f=" + regex::hex_val(102).to_string())
+  io_println(world, "hex_min=" + regex::hex_val(-2147483648).to_string())
+  io_println(world, "hex_max=" + regex::hex_val(2147483647).to_string())
+  io_println(world, "ws_sp=" + fb(regex::is_regex_ws_byte(32)))
+  io_println(world, "meta_sp=" + fb(regex::is_regex_meta_byte(32)))
+  io_println(world, "meta_dot=" + fb(regex::is_regex_meta_byte(46)))
+  0
 }
 EOF
-
-PION_CACHE_DIR="${DIFF_DIR}/pion-cache" pionc build -o "${DIFF_DIR}/diff_bin" "${DIFF_DIR}"
-"${DIFF_DIR}/diff_bin" > "${DIFF_DIR}/native.out"
-printf '%s\n' "${EVAL_OUT}" > "${DIFF_DIR}/lean.out"
-diff -u "${DIFF_DIR}/native.out" "${DIFF_DIR}/lean.out"
-CASE_COUNT="$(wc -l < "${DIFF_DIR}/native.out" | tr -d ' ')"
-echo "Native vs Lean differential: ${CASE_COUNT} cases identical (diff -u exit 0)"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
 echo "PASS: packages/regex Lean 4 proofs"

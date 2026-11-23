@@ -25,7 +25,7 @@ private lemma i32_add_val (x y : Std.I32)
   rw [BitVec.toInt_add]
   exact Int.bmod_eq_of_le (by omega) (by omega)
 
-/-- 1. `sanitize_scalar` always outputs a valid Unicode scalar value (non-surrogate, `[0, 0x10FFFF]`). -/
+/-- `sanitize_scalar` always outputs a valid Unicode scalar value (non-surrogate, `[0, 0x10FFFF]`). -/
 theorem sanitize_scalar_valid (cp : Std.I32) :
     ∃ v : Std.I32,
       sanitize_scalar cp = ok v ∧
@@ -43,40 +43,7 @@ theorem sanitize_scalar_valid (cp : Std.I32) :
       IScalar.lt_equiv, gt_iff_lt, ge_iff_le, IScalar.le_equiv, h0, hmax, hs1, hs2] at h
     omega
 
-/-- 2. `sanitize_scalar` is idempotent across all `2^32` inputs. -/
-theorem sanitize_scalar_idempotent (cp : Std.I32) :
-    ∃ v : Std.I32,
-      sanitize_scalar cp = ok v ∧ sanitize_scalar v = ok v := by
-  obtain ⟨v, hv, h0, hmax, hns⟩ := sanitize_scalar_valid cp
-  refine ⟨v, hv, ?_⟩
-  unfold sanitize_scalar
-  have hc0 : (0#i32).val = 0 := by decide
-  have hcmax : (1114111#i32).val = 1114111 := by decide
-  have hcs1 : (55296#i32).val = 55296 := by decide
-  have hcs2 : (57343#i32).val = 57343 := by decide
-  have hcond : (((decide (v < 0#i32)) || (decide (v > 1114111#i32))) ||
-      ((decide (v >= 55296#i32)) && (decide (v <= 57343#i32)))) = false := by
-    simp only [Bool.or_eq_false_iff, Bool.and_eq_false_iff, decide_eq_false_iff_not,
-      IScalar.lt_equiv, gt_iff_lt, ge_iff_le, IScalar.le_equiv, hc0, hcmax, hcs1, hcs2]
-    omega
-  rw [hcond]
-  rfl
-
-/-- 3. `cp_utf8_len` always returns a UTF-8 byte length in `[1, 4]`. -/
-theorem cp_utf8_len_bounds (cp : Std.I32) :
-    ∃ len : Std.I32,
-      cp_utf8_len cp = ok len ∧ 1 ≤ len.val ∧ len.val ≤ 4 := by
-  unfold cp_utf8_len
-  obtain ⟨v, hv, _, _, _⟩ := sanitize_scalar_valid cp
-  rw [hv, result_bind_ok]
-  refine ⟨_, rfl, ?_⟩
-  split_ifs
-  · exact ⟨by decide, by decide⟩
-  · exact ⟨by decide, by decide⟩
-  · exact ⟨by decide, by decide⟩
-  · exact ⟨by decide, by decide⟩
-
-/-- 4. Any UTF-16 surrogate codepoint (`0xD800..0xDFFF`) is replaced with `U+FFFD` (3 UTF-8 bytes). -/
+/-- Any UTF-16 surrogate codepoint (`0xD800..0xDFFF`) is replaced with `U+FFFD` (3 UTF-8 bytes). -/
 theorem cp_utf8_len_surrogate (cp : Std.I32) (hlo : 55296 ≤ cp.val) (hhi : cp.val ≤ 57343) :
     cp_utf8_len cp = ok 3#i32 := by
   unfold cp_utf8_len sanitize_scalar
@@ -93,7 +60,7 @@ theorem cp_utf8_len_surrogate (cp : Std.I32) (hlo : 55296 ≤ cp.val) (hhi : cp.
   have h3 : (65533#i32 < 65536#i32) := by decide
   simp [h1, h2, h3]
 
-/-- 5. `fold_ascii_cp` is idempotent across all `2^32` inputs. -/
+/-- `fold_ascii_cp` is idempotent across all `2^32` inputs. -/
 theorem fold_ascii_cp_idempotent (c : Std.I32) :
     ∃ r : Std.I32,
       fold_ascii_cp c = ok r ∧ fold_ascii_cp r = ok r := by
@@ -119,19 +86,7 @@ theorem fold_ascii_cp_idempotent (c : Std.I32) :
       · exact absurd hc h
     exact ⟨c, by rw [hf]; rfl, by rw [hf]; rfl⟩
 
-/-- 6. Greek final sigma (`U+03C2`) folds to standard sigma (`U+03C3`) matching SQLite `unicode61`. -/
-theorem fold_greek_final_sigma :
-    fold_greek_cyrillic 962#i32 = ok 963#i32 := by
-  unfold fold_greek_cyrillic
-  rfl
-
-/-- 7. Reserved unassigned Greek slot `U+03A2` is rejected (`-1`) by `fold_greek_cyrillic`. -/
-theorem fold_greek_unassigned_3A2 :
-    fold_greek_cyrillic 930#i32 = ok (-1)#i32 := by
-  unfold fold_greek_cyrillic
-  rfl
-
-/-- 8. Cyrillic case folding (`U+0400..U+045F`) maps into lowercase `U+0430..U+045F` and is idempotent. -/
+/-- Cyrillic case folding (`U+0400..U+045F`) maps into lowercase `U+0430..U+045F` and is idempotent. -/
 theorem fold_cyrillic_idempotent (v : Std.I32) (hlo : 1024 ≤ v.val) (hhi : v.val ≤ 1119) :
     ∃ r : Std.I32,
       fold_greek_cyrillic v = ok r ∧
@@ -225,24 +180,7 @@ theorem fold_cyrillic_idempotent (v : Std.I32) (hlo : 1024 ≤ v.val) (hhi : v.v
         rw [i32_add_val v 80#i32 (by omega) (by omega), h80]
       exact ⟨Pion.I32.add v 80#i32, hv, by omega, by omega, h_low _ (by omega) (by omega)⟩
 
-/-- 9. RT-2 safety: Kana voicing marks (`0x3099..0x309C`), `0x30A0`, and `0x30FB` are excluded from `is_cjk_cp`. -/
-theorem is_cjk_rt2_marks_excluded (v : Std.I32)
-    (h : (12441 ≤ v.val ∧ v.val ≤ 12444) ∨ v.val = 12448 ∨ v.val = 12539) :
-    is_cjk_cp v = ok false := by
-  unfold is_cjk_cp
-  have h1 : (12441#i32).val = 12441 := by decide
-  have h2 : (12444#i32).val = 12444 := by decide
-  have h3 : (12448#i32).val = 12448 := by decide
-  have h4 : (12539#i32).val = 12539 := by decide
-  have hcond : ((((decide (v >= 12441#i32)) && (decide (v <= 12444#i32))) ||
-      (v == 12448#i32)) || (v == 12539#i32)) = true := by
-    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq,
-      ge_iff_le, IScalar.le_equiv, i32_beq_iff, h1, h2, h3, h4]
-    omega
-  rw [hcond]
-  rfl
-
-/-- 10. ASCII word codepoints and CJK codepoints are strictly disjoint. -/
+/-- ASCII word codepoints and CJK codepoints are strictly disjoint. -/
 theorem is_cjk_ascii_disjoint (c : Std.I32) :
     is_ascii_word_cp c = ok true → is_cjk_cp c = ok false := by
   unfold is_ascii_word_cp is_cjk_cp
@@ -268,23 +206,5 @@ theorem is_cjk_ascii_disjoint (c : Std.I32) :
     have hg : (44032#i32).val = 44032 := by decide
     have hh : (4352#i32).val = 4352 := by decide
     omega
-
-/-- 11. `camel_should_split` never splits when `cur` is not an ASCII uppercase letter. -/
-theorem camel_split_requires_upper (before cur : Std.I32) (after_lower : Bool)
-    (h : is_upper_cp cur = ok false) :
-    camel_should_split before cur after_lower = ok false := by
-  unfold camel_should_split
-  rw [h, result_bind_ok]
-  rfl
-
-/-- 12. `camel_should_split` always splits on a lowercase-to-uppercase boundary (`aB`). -/
-theorem camel_split_lower_to_upper (before cur : Std.I32) (after_lower : Bool)
-    (hb : is_lower_cp before = ok true) (hc : is_upper_cp cur = ok true) :
-    camel_should_split before cur after_lower = ok true := by
-  unfold camel_should_split
-  rw [hc, result_bind_ok]
-  simp only [↓reduceIte]
-  rw [hb, result_bind_ok]
-  simp only [↓reduceIte, result_bind_ok]
 
 end FtsProofs

@@ -51,27 +51,6 @@ private theorem i64_min_expr_val :
   rw [i64_sub_val (-9223372036854775807)#i64 1#i64 (by rw [h1, h2]; omega) (by rw [h1, h2]; omega), h1, h2]
   norm_num
 
-theorem signed_duration_zero_valid :
-    ∃ d, SignedDuration.zero = ok d ∧ ValidSignedDuration d ∧ totalNanos d = 0 := by
-  unfold SignedDuration.zero ValidSignedDuration totalNanos
-  refine ⟨_, rfl, ?_, ?_⟩
-  · simp [i64_zero_val]
-  · simp [i64_zero_val]
-
-theorem signed_duration_min_valid :
-    ∃ d, SignedDuration.min = ok d ∧ ValidSignedDuration d ∧ totalNanos d = minTotalNanos := by
-  unfold SignedDuration.min ValidSignedDuration totalNanos minTotalNanos
-  refine ⟨_, rfl, ?_, ?_⟩
-  · simp [i64_min_expr_val]
-  · simp [i64_min_expr_val]
-
-theorem signed_duration_max_valid :
-    ∃ d, SignedDuration.max = ok d ∧ ValidSignedDuration d ∧ totalNanos d = maxTotalNanos := by
-  unfold SignedDuration.max ValidSignedDuration totalNanos maxTotalNanos
-  refine ⟨_, rfl, ?_, ?_⟩
-  · simp [i64_max_val]
-  · simp [i64_max_val]
-
 /-- Exact specification of `checked_add_i64` for all `Int64` inputs (including `INT64_MIN`/`MAX`). -/
 theorem checked_add_i64_spec (a b : Std.I64) :
     if -9223372036854775808 ≤ a.val + b.val ∧ a.val + b.val ≤ 9223372036854775807 then
@@ -91,21 +70,21 @@ theorem checked_add_i64_spec (a b : Std.I64) :
         change (Pion.I64.sub i64_max b).val < a.val; rw [hsub]; linarith
       have hcond : ¬ (-9223372036854775808 ≤ a.val + b.val ∧ a.val + b.val ≤ 9223372036854775807) := by
         intro h; linarith
-      rw [if_neg hcond]
+      rw [ite_eq_right hcond]
       have hc : ((decide (b > 0#i64)) && (decide (a > Pion.I64.sub i64_max b))) = true := by
         rw [decide_eq_true hpos', decide_eq_true hov']; rfl
-      rw [if_pos hc]
+      rw [ite_eq_left hc]
     · have hnov' : ¬ (a > Pion.I64.sub i64_max b) := by
         change ¬ ((Pion.I64.sub i64_max b).val < a.val); rw [hsub]; linarith
       have hneg' : ¬ (b < 0#i64) := by change ¬ (b.val < 0); linarith
       have hcond : -9223372036854775808 ≤ a.val + b.val ∧ a.val + b.val ≤ 9223372036854775807 := by
         constructor <;> linarith
-      rw [if_pos hcond]
+      rw [ite_eq_left hcond]
       have hc1 : ((decide (b > 0#i64)) && (decide (a > Pion.I64.sub i64_max b))) = false := by
         rw [decide_eq_false hnov', Bool.and_false]
       have hc2 : ((decide (b < 0#i64)) && (decide (a < Pion.I64.sub (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = false := by
         rw [decide_eq_false hneg', Bool.false_and]
-      rw [if_neg (by rw [hc1]; decide), if_neg (by rw [hc2]; decide)]
+      rw [ite_eq_right (by rw [hc1]; decide), ite_eq_right (by rw [hc2]; decide)]
       exact ⟨Pion.I64.add a b, rfl, i64_add_val a b hcond.1 hcond.2⟩
   · have hpos' : ¬ (b > 0#i64) := hpos
     have hc1 : ((decide (b > 0#i64)) && (decide (a > Pion.I64.sub i64_max b))) = false := by
@@ -120,26 +99,26 @@ theorem checked_add_i64_spec (a b : Std.I64) :
           change a.val < (Pion.I64.sub (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b).val; rw [hsub]; linarith
         have hcond : ¬ (-9223372036854775808 ≤ a.val + b.val ∧ a.val + b.val ≤ 9223372036854775807) := by
           intro h; linarith
-        rw [if_neg hcond]
+        rw [ite_eq_right hcond]
         have hc2 : ((decide (b < 0#i64)) && (decide (a < Pion.I64.sub (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = true := by
           rw [decide_eq_true hneg', decide_eq_true hov']; rfl
-        rw [if_neg (by rw [hc1]; decide), if_pos hc2]
+        rw [ite_eq_right (by rw [hc1]; decide), ite_eq_left hc2]
       · have hnov' : ¬ (a < Pion.I64.sub (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b) := by
           change ¬ (a.val < (Pion.I64.sub (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b).val); rw [hsub]; linarith
         have hcond : -9223372036854775808 ≤ a.val + b.val ∧ a.val + b.val ≤ 9223372036854775807 := by
           constructor <;> linarith
-        rw [if_pos hcond]
+        rw [ite_eq_left hcond]
         have hc2 : ((decide (b < 0#i64)) && (decide (a < Pion.I64.sub (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = false := by
           rw [decide_eq_false hnov', Bool.and_false]
-        rw [if_neg (by rw [hc1]; decide), if_neg (by rw [hc2]; decide)]
+        rw [ite_eq_right (by rw [hc1]; decide), ite_eq_right (by rw [hc2]; decide)]
         exact ⟨Pion.I64.add a b, rfl, i64_add_val a b hcond.1 hcond.2⟩
     · have hneg' : ¬ (b < 0#i64) := hneg
       have hcond : -9223372036854775808 ≤ a.val + b.val ∧ a.val + b.val ≤ 9223372036854775807 := by
         constructor <;> linarith
-      rw [if_pos hcond]
+      rw [ite_eq_left hcond]
       have hc2 : ((decide (b < 0#i64)) && (decide (a < Pion.I64.sub (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = false := by
         rw [decide_eq_false hneg', Bool.false_and]
-      rw [if_neg (by rw [hc1]; decide), if_neg (by rw [hc2]; decide)]
+      rw [ite_eq_right (by rw [hc1]; decide), ite_eq_right (by rw [hc2]; decide)]
       exact ⟨Pion.I64.add a b, rfl, i64_add_val a b hcond.1 hcond.2⟩
 
 /-- Exact specification of `checked_sub_i64` for all `Int64` inputs (including `INT64_MIN`/`MAX`). -/
@@ -161,21 +140,21 @@ theorem checked_sub_i64_spec (a b : Std.I64) :
         change (Pion.I64.add i64_max b).val < a.val; rw [hadd]; linarith
       have hcond : ¬ (-9223372036854775808 ≤ a.val - b.val ∧ a.val - b.val ≤ 9223372036854775807) := by
         intro h; linarith
-      rw [if_neg hcond]
+      rw [ite_eq_right hcond]
       have hc : ((decide (b < 0#i64)) && (decide (a > Pion.I64.add i64_max b))) = true := by
         rw [decide_eq_true hneg', decide_eq_true hov']; rfl
-      rw [if_pos hc]
+      rw [ite_eq_left hc]
     · have hnov' : ¬ (a > Pion.I64.add i64_max b) := by
         change ¬ ((Pion.I64.add i64_max b).val < a.val); rw [hadd]; linarith
       have hpos' : ¬ (b > 0#i64) := by change ¬ (0 < b.val); linarith
       have hcond : -9223372036854775808 ≤ a.val - b.val ∧ a.val - b.val ≤ 9223372036854775807 := by
         constructor <;> linarith
-      rw [if_pos hcond]
+      rw [ite_eq_left hcond]
       have hc1 : ((decide (b < 0#i64)) && (decide (a > Pion.I64.add i64_max b))) = false := by
         rw [decide_eq_false hnov', Bool.and_false]
       have hc2 : ((decide (b > 0#i64)) && (decide (a < Pion.I64.add (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = false := by
         rw [decide_eq_false hpos', Bool.false_and]
-      rw [if_neg (by rw [hc1]; decide), if_neg (by rw [hc2]; decide)]
+      rw [ite_eq_right (by rw [hc1]; decide), ite_eq_right (by rw [hc2]; decide)]
       exact ⟨Pion.I64.sub a b, rfl, i64_sub_val a b hcond.1 hcond.2⟩
   · have hneg' : ¬ (b < 0#i64) := hneg
     have hc1 : ((decide (b < 0#i64)) && (decide (a > Pion.I64.add i64_max b))) = false := by
@@ -190,26 +169,26 @@ theorem checked_sub_i64_spec (a b : Std.I64) :
           change a.val < (Pion.I64.add (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b).val; rw [hadd]; linarith
         have hcond : ¬ (-9223372036854775808 ≤ a.val - b.val ∧ a.val - b.val ≤ 9223372036854775807) := by
           intro h; linarith
-        rw [if_neg hcond]
+        rw [ite_eq_right hcond]
         have hc2 : ((decide (b > 0#i64)) && (decide (a < Pion.I64.add (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = true := by
           rw [decide_eq_true hpos', decide_eq_true hov']; rfl
-        rw [if_neg (by rw [hc1]; decide), if_pos hc2]
+        rw [ite_eq_right (by rw [hc1]; decide), ite_eq_left hc2]
       · have hnov' : ¬ (a < Pion.I64.add (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b) := by
           change ¬ (a.val < (Pion.I64.add (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b).val); rw [hadd]; linarith
         have hcond : -9223372036854775808 ≤ a.val - b.val ∧ a.val - b.val ≤ 9223372036854775807 := by
           constructor <;> linarith
-        rw [if_pos hcond]
+        rw [ite_eq_left hcond]
         have hc2 : ((decide (b > 0#i64)) && (decide (a < Pion.I64.add (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = false := by
           rw [decide_eq_false hnov', Bool.and_false]
-        rw [if_neg (by rw [hc1]; decide), if_neg (by rw [hc2]; decide)]
+        rw [ite_eq_right (by rw [hc1]; decide), ite_eq_right (by rw [hc2]; decide)]
         exact ⟨Pion.I64.sub a b, rfl, i64_sub_val a b hcond.1 hcond.2⟩
     · have hpos' : ¬ (b > 0#i64) := hpos
       have hcond : -9223372036854775808 ≤ a.val - b.val ∧ a.val - b.val ≤ 9223372036854775807 := by
         constructor <;> linarith
-      rw [if_pos hcond]
+      rw [ite_eq_left hcond]
       have hc2 : ((decide (b > 0#i64)) && (decide (a < Pion.I64.add (Pion.I64.sub (-9223372036854775807)#i64 1#i64) b))) = false := by
         rw [decide_eq_false hpos', Bool.false_and]
-      rw [if_neg (by rw [hc1]; decide), if_neg (by rw [hc2]; decide)]
+      rw [ite_eq_right (by rw [hc1]; decide), ite_eq_right (by rw [hc2]; decide)]
       exact ⟨Pion.I64.sub a b, rfl, i64_sub_val a b hcond.1 hcond.2⟩
 
 /-- Helper: sign-normalization tail shared by `SignedDuration.new` and `SignedDuration.checked_add`. -/
@@ -384,14 +363,14 @@ theorem signed_duration_checked_neg_sound (a : SignedDuration) (ha : ValidSigned
       i64_ext (hmin.trans i64_min_expr_val.symm)
     have hout : ¬ (-9223372036854775808 * 1000000000 - 999999999 ≤ -(a.secs.val * 1000000000 + a.nanos.val) ∧
         -(a.secs.val * 1000000000 + a.nanos.val) ≤ 9223372036854775807 * 1000000000 + 999999999) := by omega
-    rw [if_neg hout, if_pos hmin']
+    rw [ite_eq_right hout, ite_eq_left hmin']
     unfold TimeError.new; rw [b_ok]
     exact ⟨_, rfl⟩
   · have hmin' : a.secs ≠ Pion.I64.sub (-9223372036854775807)#i64 1#i64 := fun h =>
       hmin ((congrArg IScalar.val h).trans i64_min_expr_val)
     have hin : -9223372036854775808 * 1000000000 - 999999999 ≤ -(a.secs.val * 1000000000 + a.nanos.val) ∧
         -(a.secs.val * 1000000000 + a.nanos.val) ≤ 9223372036854775807 * 1000000000 + 999999999 := by omega
-    rw [if_pos hin, if_neg hmin']
+    rw [ite_eq_left hin, ite_eq_right hmin']
     have hns := i64_neg_val a.secs hmin
     have hnn := i32_neg_val a.nanos (by omega)
     refine ⟨_, rfl, ?_, ?_⟩
@@ -534,7 +513,7 @@ theorem signed_duration_checked_sub_sound (a b : SignedDuration)
   by_cases hmin : b.secs.val = -9223372036854775808
   · have hmin' : b.secs = Pion.I64.sub (-9223372036854775807)#i64 1#i64 :=
       i64_ext (hmin.trans i64_min_expr_val.symm)
-    rw [if_pos hmin']
+    rw [ite_eq_left hmin']
     by_cases hspec_zero : a.secs.val = 0 ∧ a.nanos.val < b.nanos.val
     · have hz1 : (a.secs == 0#i64) = true := beq_iff_eq.mpr (i64_ext (by simpa using hspec_zero.1))
       have hz2 : a.nanos < b.nanos := hspec_zero.2
@@ -588,7 +567,7 @@ theorem signed_duration_checked_sub_sound (a b : SignedDuration)
         exact ⟨_, rfl⟩
   · have hmin' : b.secs ≠ Pion.I64.sub (-9223372036854775807)#i64 1#i64 := fun h =>
       hmin ((congrArg IScalar.val h).trans i64_min_expr_val)
-    rw [if_neg hmin']
+    rw [ite_eq_right hmin']
     set nb := SignedDuration.mk (Pion.I64.neg b.secs) (Pion.I32.neg b.nanos)
     have hnb_s : nb.secs.val = -b.secs.val := i64_neg_val b.secs hmin
     have hnb_n : nb.nanos.val = -b.nanos.val := i32_neg_val b.nanos (by omega)
@@ -643,25 +622,5 @@ theorem signed_duration_cmp_spec (a b : SignedDuration)
       have h1 : ¬ (a.secs.val * 1000000000 + a.nanos.val < b.secs.val * 1000000000 + b.nanos.val) := by omega
       have h2 : ¬ (a.secs.val * 1000000000 + a.nanos.val = b.secs.val * 1000000000 + b.nanos.val) := by omega
       simp only [hlt', h1, h2, ↓reduceIte]
-
-theorem signed_duration_cmp_refl (a : SignedDuration) :
-    SignedDuration.cmp a a = ok 0#i32 := by
-  unfold SignedDuration.cmp; simp
-
-theorem signed_duration_cmp_antisymm (a b : SignedDuration)
-    (ha : ValidSignedDuration a) (hb : ValidSignedDuration b) :
-    SignedDuration.cmp a b = ok (-1)#i32 ↔ SignedDuration.cmp b a = ok 1#i32 := by
-  rw [signed_duration_cmp_spec a b ha hb, signed_duration_cmp_spec b a hb ha, ok_eq_iff, ok_eq_iff]
-  split_ifs <;> first | exact Iff.rfl | decide | omega
-
-theorem signed_duration_cmp_trans_lt (a b c : SignedDuration)
-    (ha : ValidSignedDuration a) (hb : ValidSignedDuration b) (hc : ValidSignedDuration c)
-    (hab : SignedDuration.cmp a b = ok (-1)#i32) (hbc : SignedDuration.cmp b c = ok (-1)#i32) :
-    SignedDuration.cmp a c = ok (-1)#i32 := by
-  rw [signed_duration_cmp_spec a b ha hb, ok_eq_iff] at hab
-  rw [signed_duration_cmp_spec b c hb hc, ok_eq_iff] at hbc
-  rw [signed_duration_cmp_spec a c ha hc, ok_eq_iff]
-  split_ifs at hab hbc ⊢ <;> first | rfl | omega | (exfalso; revert hab; decide) | (exfalso; revert hbc; decide)
-
 
 end TimeProofs

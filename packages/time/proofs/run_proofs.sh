@@ -1,250 +1,205 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/time`.
-#
-# Builds a throw-away Lake project in /private/tmp/pion-lean-time (zero git
-# worktree pollution), extracts `packages/time` via `pionc extract-lean`,
-# compiles `PionLean`, `Time`, and `TimeProofs`, rejects any
-# `sorry`/`admit`/`native_decide`/`bv_decide`, verifies `#print axioms`
-# (only `propext`, `Classical.choice`, `Quot.sound`), and runs `EvalDiff.lean`
-# + a Pion native differential cross-check.
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-# Clean up any child lake/lean processes on exit/signal (never pkill -f)
-CHILD_PIDS=""
-cleanup() {
-  for p in $CHILD_PIDS; do
-    kill -TERM "$p" 2>/dev/null || true
-  done
-}
-trap cleanup EXIT INT TERM
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="time"
+LEAN_MOD="Time"
+PROOF_MOD="TimeProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-time}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
-
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/time ==="
-rm -rf "$PROJ/Time"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Time/$f.lean" ]; then
-    echo "FAIL: missing Time/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/TimeProofs"
-cp -R "$SCRIPT_DIR/TimeProofs" "$PROJ/TimeProofs"
-cp "$SCRIPT_DIR/TimeProofs.lean" "$PROJ/TimeProofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Time where\n  globs := #[.submodules `Time]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib TimeProofs where\n  globs := #[.andSubmodules `TimeProofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/TimeProofs.lean" "$SCRIPT_DIR/TimeProofs" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
+fi
 
-echo "=== [4/7] lake build PionLean Time TimeProofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Time TimeProofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
   exit 1
 fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Time TimeProofs: exit 0, 0 errors"
 
-echo "=== [5/7] #print axioms audit ==="
-set +e
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-RC=$?
-set -e
-printf '%s\n' "$AXIOMS_OUT"
-if [ "$RC" -ne 0 ]; then
-  echo "FAIL: CheckAxioms.lean (rc=$RC)" >&2
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
   exit 1
 fi
-EXPECTED_THMS=$(grep -c '^#print axioms' "$PROJ/CheckAxioms.lean")
-printf '%s\n' "$AXIOMS_OUT" | python3 -c '
-import re, sys
-text = sys.stdin.read()
-expected = int(sys.argv[1])
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
 allowed = {"propext", "Classical.choice", "Quot.sound"}
-found = re.findall(r"^\x27([^\x27]+)\x27 depends on axioms: \[([^\]]*)\]", text, re.M)
-free = re.findall(r"^\x27([^\x27]+)\x27 does not depend on any axioms", text, re.M)
-bad = [(n, sorted(set(a.replace(",", " ").split()) - allowed)) for n, a in found
-       if set(a.replace(",", " ").split()) - allowed]
-if bad or len(found) + len(free) != expected:
-    print("FAIL: axioms: non-standard=%r, checked %d of %d" % (bad, len(found) + len(free), expected), file=sys.stderr)
-    sys.exit(1)
-print("axioms: %d theorems verified, only propext / Classical.choice / Quot.sound" % expected)
-' "$EXPECTED_THMS"
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
 
-echo "=== [6/7] #eval / #guard on extracted Time.Funs ==="
-set +e
-EVAL_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" EvalDiff.lean 2>&1)
-RC=$?
-set -e
-printf '%s\n' "$EVAL_OUT"
-if [ "$RC" -ne 0 ] || printf '%s' "$EVAL_OUT" | grep -q 'error\|FAIL'; then
-  echo "FAIL: EvalDiff.lean (rc=$RC)" >&2
-  exit 1
-fi
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
 
-echo "=== [7/7] Native Pion vs Lean differential check ==="
-DIFF_DIR="$WORK/native_diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "time_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 time = { path = "$PKG_DIR" }
 EOF
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "time"
 
-fn report(w : World, name : String, ok : Bool) -> Unit {
-  if ok {
-    io_println(w, name + ": PASS")
-  } else {
-    io_println(w, name + ": FAIL")
-  }
-}
-
-fn is_date_ok(r : Result[time::Date, time::TimeError], y : Int, m : Int, d : Int) -> Bool {
+fn fmt_date_res(r : Result[time::Date, time::TimeError]) -> String {
   match r {
-    Ok(dt) => dt.year == y && dt.month == m && dt.day == d
-    Err(_) => false
+    Ok(d) => "Ok(" + d.year.to_string() + "," + d.month.to_string() + "," + d.day.to_string() + ")"
+    Err(_) => "Err"
   }
 }
 
-fn is_date_err(r : Result[time::Date, time::TimeError]) -> Bool {
+fn fmt_dur_res(r : Result[time::SignedDuration, time::TimeError]) -> String {
   match r {
-    Ok(_) => false
-    Err(_) => true
+    Ok(d) => "Ok(" + d.secs.to_string() + "," + d.nanos.to_string() + ")"
+    Err(_) => "Err"
   }
 }
 
-fn is_dur_ok(r : Result[time::SignedDuration, time::TimeError], s : Int64, n : Int) -> Bool {
-  match r {
-    Ok(dur) => dur.secs == s && dur.nanos == n
-    Err(_) => false
-  }
-}
-
-fn is_dur_err(r : Result[time::SignedDuration, time::TimeError]) -> Bool {
-  match r {
-    Ok(_) => false
-    Err(_) => true
-  }
-}
-
-pub fn main(w : World) -> Int {
-  let i64_min : Int64 = -9223372036854775807L - 1L
-  let i64_max : Int64 = 9223372036854775807L
+pub fn main(world : World) -> Int {
+  let i64_min = -9223372036854775807L - 1L
+  let i64_max = 9223372036854775807L
   let dur_min = time::SignedDuration::min()
   let dur_max = time::SignedDuration::max()
   let dur_zero = time::SignedDuration::zero()
-
-  report(w, "leap_1900_false", !time::is_leap_year(1900))
-  report(w, "leap_2000_true", time::is_leap_year(2000))
-  report(w, "leap_0000_true", time::is_leap_year(0))
-  report(w, "leap_neg100_false", !time::is_leap_year(-100))
-  report(w, "leap_neg400_true", time::is_leap_year(-400))
-  report(w, "dim_2000_02", time::days_in_month_of(2000, 2) == 29)
-  report(w, "dim_1900_02", time::days_in_month_of(1900, 2) == 28)
-
-  report(w, "epoch_min_date", time::Date::{ year: -9999, month: 1, day: 1 }.to_epoch_days() == -4371587)
-  report(w, "from_epoch_min_date", is_date_ok(time::Date::from_epoch_days(-4371587), -9999, 1, 1))
-  report(w, "epoch_0000_02_29", time::Date::{ year: 0, month: 2, day: 29 }.to_epoch_days() == -719469)
-  report(w, "from_epoch_0000_02_29", is_date_ok(time::Date::from_epoch_days(-719469), 0, 2, 29))
-  report(w, "epoch_1970_01_01", time::Date::{ year: 1970, month: 1, day: 1 }.to_epoch_days() == 0)
-  report(w, "from_epoch_1970_01_01", is_date_ok(time::Date::from_epoch_days(0), 1970, 1, 1))
-  report(w, "epoch_2000_02_29", time::Date::{ year: 2000, month: 2, day: 29 }.to_epoch_days() == 11016)
-  report(w, "from_epoch_2000_02_29", is_date_ok(time::Date::from_epoch_days(11016), 2000, 2, 29))
-  report(w, "epoch_max_date", time::Date::{ year: 9999, month: 12, day: 31 }.to_epoch_days() == 2932896)
-  report(w, "from_epoch_max_date", is_date_ok(time::Date::from_epoch_days(2932896), 9999, 12, 31))
-  report(w, "from_epoch_underflow_err", is_date_err(time::Date::from_epoch_days(-4371588)))
-  report(w, "from_epoch_overflow_err", is_date_err(time::Date::from_epoch_days(2932897)))
-
-  report(w, "dur_neg_min_err", is_dur_err(dur_min.checked_neg()))
-  report(w, "dur_neg_max_ok", is_dur_ok(dur_max.checked_neg(), -9223372036854775807L, -999999999))
-  report(w, "dur_add_max_overflow", is_dur_err(dur_max.checked_add(time::SignedDuration::{ secs: 0L, nanos: 1 })))
-  report(w, "dur_add_min_underflow", is_dur_err(dur_min.checked_add(time::SignedDuration::{ secs: 0L, nanos: -1 })))
-  report(w, "dur_add_min_max", is_dur_ok(dur_min.checked_add(dur_max), -1L, 0))
-  report(w, "dur_sub_zero_neg1_i64min", is_dur_ok(time::SignedDuration::{ secs: 0L, nanos: -1 }.checked_sub(time::SignedDuration::{ secs: i64_min, nanos: 0 }), i64_max, 999999999))
-  report(w, "dur_sub_zero_min_err", is_dur_err(dur_zero.checked_sub(dur_min)))
-  report(w, "dur_sub_min_min_zero", is_dur_ok(dur_min.checked_sub(dur_min), 0L, 0))
-
-  report(w, "cmp_date_min_max", time::Date::min().cmp(time::Date::max()) == -1)
-  report(w, "cmp_time_max_min", time::Time::max().cmp(time::Time::min()) == 1)
-  report(w, "cmp_ts_neg1_zero", time::Timestamp::{ secs: -1L, nanos: 999999999 }.cmp(time::Timestamp::unix_epoch()) == -1)
-  report(w, "cmp_dur_min_max", dur_min.cmp(dur_max) == -1)
+  io_println(world, "leap_1900=" + time::is_leap_year(1900).to_string())
+  io_println(world, "leap_2000=" + time::is_leap_year(2000).to_string())
+  io_println(world, "leap_0=" + time::is_leap_year(0).to_string())
+  io_println(world, "leap_min=" + time::is_leap_year(-2147483648).to_string())
+  io_println(world, "leap_max=" + time::is_leap_year(2147483647).to_string())
+  io_println(world, "dim_2000_2=" + time::days_in_month_of(2000, 2).to_string())
+  io_println(world, "dim_1900_2=" + time::days_in_month_of(1900, 2).to_string())
+  io_println(world, "dim_2024_12=" + time::days_in_month_of(2024, 12).to_string())
+  io_println(world, "ep_min=" + time::Date::{ year: -9999, month: 1, day: 1 }.to_epoch_days().to_string())
+  io_println(world, "from_ep_min=" + fmt_date_res(time::Date::from_epoch_days(-4371587)))
+  io_println(world, "ep_0000_0229=" + time::Date::{ year: 0, month: 2, day: 29 }.to_epoch_days().to_string())
+  io_println(world, "from_ep_0000_0229=" + fmt_date_res(time::Date::from_epoch_days(-719469)))
+  io_println(world, "ep_1970=" + time::Date::{ year: 1970, month: 1, day: 1 }.to_epoch_days().to_string())
+  io_println(world, "from_ep_1970=" + fmt_date_res(time::Date::from_epoch_days(0)))
+  io_println(world, "ep_max=" + time::Date::{ year: 9999, month: 12, day: 31 }.to_epoch_days().to_string())
+  io_println(world, "from_ep_max=" + fmt_date_res(time::Date::from_epoch_days(2932896)))
+  io_println(world, "from_ep_oob_lo=" + fmt_date_res(time::Date::from_epoch_days(-4371588)))
+  io_println(world, "from_ep_oob_hi=" + fmt_date_res(time::Date::from_epoch_days(2932897)))
+  io_println(world, "from_ep_i32min=" + fmt_date_res(time::Date::from_epoch_days(-2147483648)))
+  io_println(world, "from_ep_i32max=" + fmt_date_res(time::Date::from_epoch_days(2147483647)))
+  io_println(world, "dur_new_norm=" + fmt_dur_res(time::SignedDuration::new(1L, -500000000)))
+  io_println(world, "dur_new_ovf=" + fmt_dur_res(time::SignedDuration::new(i64_max, 1000000000)))
+  io_println(world, "dur_neg_min=" + fmt_dur_res(dur_min.checked_neg()))
+  io_println(world, "dur_neg_max=" + fmt_dur_res(dur_max.checked_neg()))
+  io_println(world, "dur_add_ovf=" + fmt_dur_res(dur_max.checked_add(time::SignedDuration::{ secs: 0L, nanos: 1 })))
+  io_println(world, "dur_add_unf=" + fmt_dur_res(dur_min.checked_add(time::SignedDuration::{ secs: 0L, nanos: -1 })))
+  io_println(world, "dur_add_minmax=" + fmt_dur_res(dur_min.checked_add(dur_max)))
+  io_println(world, "dur_sub_edge=" + fmt_dur_res(time::SignedDuration::{ secs: 0L, nanos: -1 }.checked_sub(time::SignedDuration::{ secs: i64_min, nanos: 0 })))
+  io_println(world, "dur_sub_ovf=" + fmt_dur_res(dur_zero.checked_sub(dur_min)))
+  io_println(world, "dur_sub_self=" + fmt_dur_res(dur_min.checked_sub(dur_min)))
+  io_println(world, "cmp_date=" + time::Date::{ year: -9999, month: 1, day: 1 }.cmp(time::Date::{ year: 9999, month: 12, day: 31 }).to_string())
+  io_println(world, "cmp_time=" + time::Time::{ hour: 23, minute: 59, second: 59, nanosecond: 999999999 }.cmp(time::Time::{ hour: 0, minute: 0, second: 0, nanosecond: 0 }).to_string())
+  io_println(world, "cmp_ts=" + time::Timestamp::{ secs: -1L, nanos: 999999999 }.cmp(time::Timestamp::{ secs: 0L, nanos: 0 }).to_string())
+  io_println(world, "cmp_dur=" + dur_min.cmp(dur_max).to_string())
   0
 }
 EOF
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
 echo "PASS: packages/time Lean 4 proofs"

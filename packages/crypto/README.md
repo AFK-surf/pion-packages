@@ -101,7 +101,7 @@ Measured on `Darwin arm64` with `scripts/bench_compare.py --warmup 1 --rounds 5`
 
 ## Formal Verification (Lean 4)
 
-The core constant-time primitives, RFC 7748 X25519 scalar clamping & ladder swap, Ed25519/X25519 10-limb field addition, RFC 8439 ChaCha20 rotation & AEAD length guards, RFC 5869 HKDF block-counter bounds, and hex decoder kernels (`Fe`, `fe_add`, `fe_cmov`, `fe_cswap_pair`, `ct_diff_acc`, `x25519_clamp_low_byte`, `x25519_clamp_high_byte`, `cc_rotl32`, `chacha20_is_valid_key_len`, `chacha20_is_valid_nonce_len`, `chacha20_is_valid_ct_len`, `hkdf_sha256_valid_len`, `hkdf_sha256_blocks`, `hkdf_sha512_valid_len`, `hkdf_sha512_blocks`, `hex_nibble_val`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (24 `0-sorry` theorems, standard axioms only, 44-case native-vs-Lean differential cross-check):
+8 production cryptographic helper kernels (`Fe`, `fe_cmov`, `fe_cswap_pair`, `ct_diff_acc`, `x25519_clamp_low_byte`, `x25519_clamp_high_byte`, `cc_rotl32`, `hkdf_sha256_blocks`, `hex_nibble_val`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (**12** `0-sorry` theorems, strict standard-axiom whitelist, value-comparing native-vs-Lean differential cross-check including boundary extremes and shift-trap checks):
 
 ```bash
 bash packages/crypto/proofs/run_proofs.sh

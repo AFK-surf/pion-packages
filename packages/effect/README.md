@@ -40,10 +40,10 @@ _Note on W2: Pion spawns 20,000 full structured fibers (`Task` + `Fiber` + `slee
 
 ## Formal Verification (Lean 4)
 
-24 machine-checked, 0-`sorry` Lean 4 theorems (standard axioms only: `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 20 production `#verify` kernels in `packages/effect/src/`:
-- **Runtime, PRNG & RingDeque (`proofs/EffectProofs/RuntimeAndDeque.lean`, 12 theorems)**: xorshift32 non-zero 32-bit state seeding (`[1, 2^32-1]`), transition closure & `0` fixed point, `rng_below_val` range safety, `RingDeque` capacity growth, wraparound slot index bounds `[0, cap)`, `push_front`/`pop_front` index inverse, and `TimerHeap` `(at, seq)` strict partial order (irreflexive, asymmetric, transitive).
-- **Heap, Queue, Scheduler & Fiber (`proofs/EffectProofs/SchedulerAndSync.lean`, 12 theorems)**: binary min-heap `heap_parent` strict descent & left/right child inverse, unbounded/bounded `Queue` room & shutdown rejection, 6-tier priority strict hierarchy, `Scheduler` urgent-room admission, background serialization & idle yielding, non-idle preemption immunity, and `uninterruptible_k` shield cut immunity.
-- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion harness (`diff -u` 44/44 cases identical).
+**10** machine-checked, `0-sorry` Lean 4 theorems (strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 8 production `#verify` kernels in `packages/effect/src/`:
+- **Runtime, PRNG & RingDeque (`proofs/EffectProofs/RuntimeAndDeque.lean`, 8 theorems)**: xorshift32 non-zero 32-bit state seeding (`[1, 2^32-1]`), `rng_below_val` range safety, `RingDeque` capacity growth, wraparound slot index bounds `[0, cap)`, `push_front`/`pop_front` index inverse, and `TimerHeap` `(at, seq)` strict partial order (irreflexive, transitive).
+- **Binary Heap (`proofs/EffectProofs/SchedulerAndSync.lean`, 2 theorems)**: `heap_parent` strict descent & `heap_left` child-parent inverse.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (`diff -u`, including `INT_MIN`/`INT_MAX` extremes and div-by-zero `TRAP` checks).
 
 ```sh
 LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/effect/proofs/run_proofs.sh

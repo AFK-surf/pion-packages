@@ -132,10 +132,10 @@ All scenarios below verified 100% stdout byte-identical against Rust `regex =1.1
 
 ## Formal Verification (Lean 4)
 
-24 machine-checked, 0-`sorry` Lean 4 theorems (standard axioms only: `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 15 production `#verify` kernels in `packages/regex/src/`:
-- **Automata & Captures (`proofs/RegexProofs/AutomataAndCaptures.lean`, 12 theorems)**: Lazy DFA mode exclusivity, ASCII/Unicode `\b`/`\B` lookaround complementarity, `\z → (?m)$` implication, reverse-NFA lookaround involution & word-boundary preservation, One-Pass DFA 64-bit capture slot bitmask bounds & idempotence, and `Captures` slot index memory-safety bounds.
-- **Character Ranges & Syntax (`proofs/RegexProofs/RangesAndSyntax.lean`, 12 theorems)**: `CharRange` lexicographic total order (reflexive, antisymmetric, transitive, total), `char_range_intersect` commutativity/idempotence/exact membership, UTF-8 continuation & lead-length invariants, `hex_val` bounds & case-insensitivity, and `(?x)` whitespace vs `escape()` metacharacter disjointness.
-- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion harness (`diff -u` 44/44 cases identical).
+**9** machine-checked, `0-sorry` Lean 4 theorems (strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover `CharRange` and 8 production `#verify` kernels in `packages/regex/src/`:
+- **Automata & Captures (`proofs/RegexProofs/AutomataAndCaptures.lean`, 2 theorems)**: One-Pass DFA 64-bit capture slot bitmask idempotence and `Captures` slot index memory-safety bounds (`2*idx+1 < slots_len`).
+- **Character Ranges & Syntax (`proofs/RegexProofs/RangesAndSyntax.lean`, 7 theorems)**: `CharRange` lexicographic total order (antisymmetric, transitive, total), `char_range_intersect` exact point-membership semantics, UTF-8 continuation byte mask semantics, `hex_val` bounds `[-1, 15]`, and `(?x)` whitespace vs `escape()` metacharacter disjointness.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (`diff -u`, including `INT32_MIN`/`INT32_MAX` and out-of-precondition cases).
 
 ```sh
 LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/regex/proofs/run_proofs.sh
