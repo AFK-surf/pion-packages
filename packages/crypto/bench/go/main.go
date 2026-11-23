@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -204,6 +206,133 @@ func benchP256() int {
 	return 3
 }
 
+func benchAes256Gcm() int {
+	key, err := hex.DecodeString("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+	if err != nil {
+		return 1
+	}
+	nonce, err := hex.DecodeString("070000004041424344454647")
+	if err != nil {
+		return 1
+	}
+	aad := []byte("pion-crypto-bench-aead-aad")
+	pt := makeBuf(65536)
+	blk, err := aes.NewCipher(key)
+	if err != nil {
+		return 1
+	}
+	aead, err := cipher.NewGCM(blk)
+	if err != nil {
+		return 1
+	}
+	h := sha256.New()
+	for i := 0; i < 1000; i++ {
+		nonce[0] = byte(i & 0xFF)
+		nonce[1] = byte((i >> 8) & 0xFF)
+		sealed := aead.Seal(nil, nonce, pt, aad)
+		opened, err := aead.Open(nil, nonce, sealed, aad)
+		if err != nil || len(opened) != len(pt) {
+			return 2
+		}
+		h.Write(sealed)
+	}
+	fmt.Printf("aes256gcm_sha256=%s\n", hex.EncodeToString(h.Sum(nil)))
+	return 0
+}
+
+func benchAes256GcmSmall() int {
+	key, err := hex.DecodeString("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+	if err != nil {
+		return 1
+	}
+	nonce, err := hex.DecodeString("070000004041424344454647")
+	if err != nil {
+		return 1
+	}
+	aad := []byte("pion-crypto-bench-small-aad")
+	pt := makeBuf(256)
+	blk, err := aes.NewCipher(key)
+	if err != nil {
+		return 1
+	}
+	aead, err := cipher.NewGCM(blk)
+	if err != nil {
+		return 1
+	}
+	h := sha256.New()
+	for i := 0; i < 150000; i++ {
+		nonce[0] = byte(i & 0xFF)
+		nonce[1] = byte((i >> 8) & 0xFF)
+		nonce[2] = byte((i >> 16) & 0xFF)
+		sealed := aead.Seal(nil, nonce, pt, aad)
+		opened, err := aead.Open(nil, nonce, sealed, aad)
+		if err != nil || len(opened) != len(pt) {
+			return 2
+		}
+		h.Write(sealed)
+	}
+	fmt.Printf("aes256gcm_small_sha256=%s\n", hex.EncodeToString(h.Sum(nil)))
+	return 0
+}
+
+func benchP256Ecdh() int {
+	sk, err := hex.DecodeString("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+	if err != nil {
+		return 1
+	}
+	peerBytes, err := hex.DecodeString("04c4cfd4dc14471cbc23f68830495857689ad122d899cc9d9726ea006c335a5122bb97ce9aac19a7a577297ad2654c320a1fb909cc0088793a691495d9aae2de08")
+	if err != nil {
+		return 1
+	}
+	curve := ecdh.P256()
+	h := sha256.New()
+	for i := 0; i < 2000; i++ {
+		sk[31] = byte((int(sk[31]) + 1) & 0xFF)
+		priv, err := curve.NewPrivateKey(sk)
+		if err != nil {
+			return 2
+		}
+		pub, err := curve.NewPublicKey(peerBytes)
+		if err != nil {
+			return 2
+		}
+		shared, err := priv.ECDH(pub)
+		if err != nil {
+			return 2
+		}
+		h.Write(shared)
+	}
+	fmt.Printf("p256_ecdh_sha256=%s\n", hex.EncodeToString(h.Sum(nil)))
+	return 0
+}
+
+func benchP256Validate() int {
+	pubU, err := hex.DecodeString("04c4cfd4dc14471cbc23f68830495857689ad122d899cc9d9726ea006c335a5122bb97ce9aac19a7a577297ad2654c320a1fb909cc0088793a691495d9aae2de08")
+	if err != nil {
+		return 1
+	}
+	pubC, err := hex.DecodeString("02c4cfd4dc14471cbc23f68830495857689ad122d899cc9d9726ea006c335a5122")
+	if err != nil {
+		return 1
+	}
+	curveEcdh := ecdh.P256()
+	curveEll := elliptic.P256()
+	okCount := 0
+	for i := 0; i < 20000; i++ {
+		if _, err := curveEcdh.NewPublicKey(pubU); err == nil {
+			okCount++
+		}
+		if x, _ := elliptic.UnmarshalCompressed(curveEll, pubC); x != nil {
+			okCount++
+		}
+	}
+	fmt.Printf("p256_validate_ok=%d\n", okCount)
+	if okCount == 40000 {
+		return 0
+	}
+	return 2
+}
+
 func main() {
 	mode := "sha256"
 	if len(os.Args) > 1 {
@@ -226,8 +355,16 @@ func main() {
 		os.Exit(benchChaCha20())
 	case "p256":
 		os.Exit(benchP256())
+	case "aes256gcm":
+		os.Exit(benchAes256Gcm())
+	case "aes256gcm_small":
+		os.Exit(benchAes256GcmSmall())
+	case "p256_ecdh":
+		os.Exit(benchP256Ecdh())
+	case "p256_validate":
+		os.Exit(benchP256Validate())
 	default:
-		fmt.Println("usage: crypto_bench_go [sha256|sha512|hmac256|ed25519|x25519|hkdf256|chacha20|p256]")
+		fmt.Println("usage: crypto_bench_go [sha256|sha512|hmac256|ed25519|x25519|hkdf256|chacha20|p256|aes256gcm|aes256gcm_small|p256_ecdh|p256_validate]")
 		os.Exit(1)
 	}
 }
