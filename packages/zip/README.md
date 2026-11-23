@@ -74,6 +74,14 @@ match zip::ZipReader::open(archive) {
 - **Dual-Target Wasm32 Smoke (`packages/zip/wasm_smoke`)**: Native debug/release and Wasm32 debug/release (executed on `node v24.22.2` with `pion_wasm_rt.mjs`) all 4 modes exit `0`.
 - **Formatting & Typecheck**: `pionc fmt --check packages/zip` and `pionc check --json packages/zip` pass with 0 diagnostics.
 
+## Formal Verification (Lean 4)
+
+The core ZIP security invariants and MS-DOS timestamp bitfield codec in `packages/zip/src/` (`in_range64`, `ascii_upper`, `is_zip_path_sep`, `is_zip_forbidden_byte`, `is_zip_forbidden_seg_tail`, `is_win_reserved_3`, `is_win_reserved_4`, `clamp_int`, `days_in_month`, `DosDateTime::default`, `DosDateTime::new`, `DosDateTime::from_dos`, `DosDateTime::to_dos`) are annotated with `#verify`, extracted directly into Lean 4 via `pionc extract-lean`, and mechanically proved in `packages/zip/proofs/` (**22 theorems, 0 `sorry` / `admit` / `bv_decide` / `native_decide`, standard axioms only**):
+
+- **`ZipProofs/Security.lean` (12 theorems)**: `Int64` overflow-safe range checking (`in_range64` rejects negatives and `INT64_MAX` wrap-around without arithmetic overflow), ASCII uppercasing idempotence & lowercase elimination, Zip-Slip path separator / control / colon / DEL / trailing `.` & space byte classification, and complete Windows reserved device name predicates (`CON`/`PRN`/`AUX`/`NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, strictly rejecting `0`).
+- **`ZipProofs/DosTime.lean` (10 theorems)**: `clamp_int` bounds & identity, Gregorian `days_in_month` bounds & leap-year `2000`/`2100` exactness, `DosDateTime::new` clamping & even-second normalization & idempotence, `DosDateTime::from_dos` totality and valid calendar output for all `u32`, `DosDateTime::to_dos` 16-bit range guarantee (`≤ 65535`), default epoch round-trip, and exact lossless `from_dos(to_dos(dt)) = dt` bitfield round-trip for every valid even-second `DosDateTime`.
+- **Differential Cross-Check**: `packages/zip/proofs/EvalDiff.lean` cross-checks 35 cases between Native Pion execution and Lean 4 `#eval` (`diff -u` exit `0`). Run `sh packages/zip/proofs/run_proofs.sh` to reproduce end-to-end.
+
 ## Head-to-Head Benchmarks
 
 Measured on `Darwin arm64` (`tokyo-mac-studio-0`) via `sh packages/zip/bench/run_bench.sh` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) comparing:

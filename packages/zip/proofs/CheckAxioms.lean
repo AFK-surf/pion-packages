@@ -1,0 +1,24 @@
+import ZipProofs
+
+#print axioms ZipProofs.in_range64_iff
+#print axioms ZipProofs.in_range64_rejects_negative
+#print axioms ZipProofs.in_range64_rejects_int64_max_wrap
+#print axioms ZipProofs.ascii_upper_idempotent
+#print axioms ZipProofs.ascii_upper_no_lowercase
+#print axioms ZipProofs.zip_path_sep_iff
+#print axioms ZipProofs.zip_forbidden_byte_iff
+#print axioms ZipProofs.zip_forbidden_seg_tail_iff
+#print axioms ZipProofs.win_reserved_3_catches_all_4_devices
+#print axioms ZipProofs.win_reserved_4_catches_com_lpt
+#print axioms ZipProofs.win_reserved_4_rejects_zero_digit
+#print axioms ZipProofs.win_reserved_4_requires_digit_1_to_9
+#print axioms ZipProofs.clamp_int_bounds
+#print axioms ZipProofs.clamp_int_id_of_in_range
+#print axioms ZipProofs.days_in_month_bounds
+#print axioms ZipProofs.days_in_month_feb_2000_2100
+#print axioms ZipProofs.dos_datetime_new_bounds
+#print axioms ZipProofs.dos_datetime_new_idempotent_on_valid
+#print axioms ZipProofs.dos_datetime_from_dos_total_valid
+#print axioms ZipProofs.dos_datetime_to_dos_u16_range
+#print axioms ZipProofs.dos_datetime_default_roundtrip
+#print axioms ZipProofs.dos_datetime_roundtrip
