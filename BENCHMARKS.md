@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–2 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–9 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–3 + `fts`）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -219,6 +219,10 @@
 | `woff2` | WOFF2 解码 `Arial.woff2`（含 `glyf`/`loca` 全表逐字节一致） | 755 KB SFNT × 10 | 66.423 ms | 36.295 ms (`rust_wuff`) | 0.55x | **7.84 MiB** | 9.80 MiB |
 | `woff2` | WOFF2 解码 `Monaco.woff2`（含 `glyf`/`loca` 全表逐字节一致） | 517 KB SFNT × 10 | 33.235 ms | 19.566 ms (`rust_wuff`) | 0.59x | 5.20 MiB | 4.75 MiB |
 | `woff2` | WOFF1 解码 `Arial.woff`（全表逐字节一致） | 755 KB SFNT × 10 | 43.867 ms | 29.495 ms (`rust_wuff`) | 0.67x | 6.59 MiB | 5.66 MiB |
+| `mp4` | 标准 MP4 解复用（H.264 720p B 帧 + AAC-LC，309 samples × 1,000） | 1,000 iters | **18.043 ms** (`18.04 µs/iter`) | 894.839 ms (`894.84 µs/iter`, `rust_symphonia`) | **49.60x** | **8.86 MiB** | 9.80 MiB |
+| `mp4` | YouTube MSE fMP4 视频（`sidx`+`moof`+`mdat`，60 samples，init+seg × 1,000） | 1,000 iters | **13.992 ms** (`13.99 µs/iter`) | 373.335 ms (`373.33 µs/iter`, `rust_symphonia`) | **26.68x** | **5.30 MiB** | 7.69 MiB |
+| `mp4` | 多 `trun` fMP4 视频（2 `trun`/1 `traf`，60 samples，init+seg × 1,000） | 1,000 iters | **11.052 ms** (`11.05 µs/iter`) | 392.389 ms (`392.39 µs/iter`, `rust_symphonia`) | **35.50x** | **5.30 MiB** | 7.67 MiB |
+| `mp4` | YouTube MSE fMP4 音频（AAC-LC 48kHz，92 samples，init+seg × 2,000） | 2,000 iters | **14.700 ms** (`7.35 µs/iter`) | 43.697 ms (`21.85 µs/iter`, `rust_symphonia`) | **2.97x** | **2.05 MiB** | 2.66 MiB |
 
 ## 各包明细
 
@@ -1684,3 +1688,18 @@ _SHA-256: `bd519a5b90095c9523b1d7ca8d114f327f4b87d62b2eec8f11c1560c84c5ca6b`._
 | WOFF1 Decode: `Arial.woff` (755 KB SFNT × 10) | 43.867 ms (176.27 MB/s) | 29.495 ms (262.15 MB/s) | 6.59 MiB | 5.66 MiB | 0.67x |
 
 红队：35 / 35 单测，`run_audit.sh all` 退出码 0，110 / 110 真实字体（含 `glyf`/`loca`）与 Rust `wuff` 逐字节一致，12k `--release` fuzz 0 crash。领先项：`Arial.woff2` 峰值 RSS 低于 Rust `wuff`（7.84 vs 9.80 MiB）。落后项：3 项吞吐为 `wuff` 的 0.55x / 0.59x / 0.67x（底层分别复用纯 Pion `brotli` 与 `flate`，叠加 SFNT 轮廓重建与边界校验开销）。
+
+### mp4
+
+参考实现：独立纯 Rust [`symphonia-format-isomp4`](https://github.com/pdeljanov/Symphonia) `0.5.5`（`--release`），配合强制 **`ffprobe` 真值校验**（全部 4 组语料在 `pos/size/dts/pts/dur/key` 上与 `ffprobe` 精确一致，含 2-`trun`/1-`traf` 多 `trun` fMP4 分片）。`sh packages/mp4/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替）运行，全轮次 stdout SHA-256 逐字节一致。详见 [`packages/mp4/README.md`](packages/mp4/README.md)。
+
+| Workload | `pion` Median (`µs/iter`) | `rust_symphonia` Median (`µs/iter`) | `pion` Peak RSS | `rust_symphonia` Peak RSS | Speedup vs `rust_symphonia` | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Standard MP4 Demux (H.264 720p B-frames + AAC-LC, 309 samples × 1,000) | **18.043 ms (`18.04 µs/iter`)** | 894.839 ms (`894.84 µs/iter`) | **8.86 MiB** | 9.80 MiB | **49.60×** | `4d2ee24b3c8a09ff...` |
+| YouTube MSE fMP4 Video (`sidx`+`moof`+`mdat`, 60 samples, init+seg × 1,000) | **13.992 ms (`13.99 µs/iter`)** | 373.335 ms (`373.33 µs/iter`) | **5.30 MiB** | 7.69 MiB | **26.68×** | `e65578c1240d7bf2...` |
+| Multi-`trun` fMP4 Video (2 `trun`s/`traf`, 60 samples, init+seg × 1,000) | **11.052 ms (`11.05 µs/iter`)** | 392.389 ms (`392.39 µs/iter`) | **5.30 MiB** | 7.67 MiB | **35.50×** | `e65578c1240d7bf2...` |
+| YouTube MSE fMP4 Audio (AAC-LC 48kHz, 92 samples, init+seg × 2,000) | **14.700 ms (`7.35 µs/iter`)** | 43.697 ms (`21.85 µs/iter`) | **2.05 MiB** | 2.66 MiB | **2.97×** | `5564d952aa7922c1...` |
+
+进程内微基准（`mp4_audit prof-fmp4`，300k 轮 `yt_init_0.m4s` + `yt_seg_0_1.m4s`）：`parse_init_segment` = **0.83 µs/iter**（250 ms / 300k），`parse_media_segment` = **0.87 µs/iter**（262 ms / 300k）。
+
+红队与诚实口径说明：8 / 8 单测，`redteam_test` 22 / 22 全绿，`compare` 37 / 37 与 `ffprobe` 逐样本对齐且 31 条 `elst` 偏移归零，12,000 例 Native / Wasm32 fuzz 0 崩溃 / 0 分歧，`trun`/`stco` 放大炸弹在 1.9 MiB RSS 下 0 ms 拒收。**口径说明**：fMP4 基准每轮均同时解析 init 与 media segment，按 `µs/iter` 而非被 `mdat` 体积虚增的 `MB/s` 报告；`symphonia-format-isomp4` 的 `next_packet()` 会把 `mdat` 载荷拷入逐包 `Vec<u8>`，而 `packages/mp4` 是返回 `(offset, size)` 范围的零拷贝解复用器，倍率同时反映了纯 Pion 元数据解析效率与零拷贝索引设计。

@@ -1,0 +1,465 @@
+///| Red-team differential / fuzz harness CLI for `packages/mp4` (RT-mp4).
+///| Modes:
+///|   dump-mp4 <file.mp4>                 -> full canonical dump (tracks + every sample)
+///|   dump-fmp4 <init.mp4> <seg.m4s>      -> full canonical dump (fragments + every sample + MSE range)
+///|   batch <cases.bin>                   -> one summary line per record (Native vs Wasm32 fuzz diff)
+///|   file <0|1|2> <path>                 -> one summary line for one case (kind as in batch; DoS timing)
+///|   seek <file.mp4>                     -> find_sync_sample_at vs linear reference over every pts
+///|   prof-fmp4 <init> <seg> <iters>      -> wall-clock split: init / media segment
+///| Batch record format: `[u32 LE len][u8 kind][payload]`; kind 0 = parse_mp4(payload),
+///| kind 1 = payload `[u32 LE init_len][init][media]` (init + media segment), kind 2 = parse_top_level_boxes.
+
+import "mp4"
+
+///|
+fn parse_int(s : String) -> Int {
+  let mut acc = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      acc = acc * 10 + (c - 48)
+    }
+    i = i + 1
+  }
+  acc
+}
+
+///|
+fn rd_u32le(b : Bytes, p : Int) -> Int {
+  (b[p].to_int() & 255) |
+  ((b[p + 1].to_int() & 255) << 8) |
+  ((b[p + 2].to_int() & 255) << 16) |
+  ((b[p + 3].to_int() & 255) << 24)
+}
+
+///| FNV-1a style 64-bit mixing over Int64 values (wrapping, identical on Native/Wasm32).
+fn mix(h : Int64, v : Int64) -> Int64 {
+  let mut x = h ^ v
+  x = x * 1099511628211L
+  x ^ (x >> 29)
+}
+
+///|
+fn hex64(v : Int64) -> String {
+  let b = Bytes::new(16)
+  let mut i = 0
+  while i < 16 {
+    let nib = ((v >> ((15 - i) * 4)) & 15L).to_int()
+    b[i] = (if nib < 10 { 48 + nib } else { 87 + nib }).to_byte()
+    i = i + 1
+  }
+  b.to_string()
+}
+
+///|
+fn err_kind(e : mp4::Mp4Error) -> String {
+  match e {
+    mp4::Mp4Error::Truncated(_) => "Truncated"
+    mp4::Mp4Error::InvalidBoxSize(_) => "InvalidBoxSize"
+    mp4::Mp4Error::InvalidSyntax(_) => "InvalidSyntax"
+    mp4::Mp4Error::LimitExceeded(_) => "LimitExceeded"
+    mp4::Mp4Error::Unsupported(_) => "Unsupported"
+  }
+}
+
+///|
+fn kind_str(k : mp4::TrackKind) -> String {
+  match k {
+    mp4::TrackKind::Video => "video"
+    mp4::TrackKind::Audio => "audio"
+    mp4::TrackKind::Subtitle => "subtitle"
+    mp4::TrackKind::Other(h) => "other:" + h
+  }
+}
+
+///|
+fn hash_samples(h0 : Int64, samples : Array[mp4::Sample]) -> Int64 {
+  let mut h = h0
+  let mut i = 0
+  while i < samples.length() {
+    let s = samples[i]
+    h = mix(h, s.offset)
+    h = mix(h, s.size.to_int64())
+    h = mix(h, s.dts)
+    h = mix(h, s.pts)
+    h = mix(h, s.duration.to_int64())
+    h = mix(h, if s.is_sync { 1L } else { 0L })
+    i = i + 1
+  }
+  h
+}
+
+///| Exercise seek on a few targets so fuzzing covers `find_sync_sample_at`.
+fn hash_seek(h0 : Int64, samples : Array[mp4::Sample]) -> Int64 {
+  let mut h = h0
+  let n = samples.length()
+  if n == 0 {
+    return mix(h, -1L)
+  }
+  let targets = [samples[0].pts, samples[n / 2].pts, samples[n - 1].pts + 1L, -1L]
+  let mut i = 0
+  while i < targets.length() {
+    h = match mp4::find_sync_sample_at(samples, targets[i]) {
+      Some(idx) => mix(h, idx.to_int64())
+      None => mix(h, -2L)
+    }
+    i = i + 1
+  }
+  h
+}
+
+///|
+fn hash_str(h0 : Int64, s : String) -> Int64 {
+  let mut h = mix(h0, s.length().to_int64())
+  let mut i = 0
+  while i < s.length() {
+    h = mix(h, s.code_unit_at(i).to_int64())
+    i = i + 1
+  }
+  h
+}
+
+///|
+fn summarize_tracks(tracks : Array[mp4::Track]) -> (String, Int64) {
+  let sb = StringBuilder::new()
+  let mut h = 0L
+  let mut t = 0
+  while t < tracks.length() {
+    let tr = tracks[t]
+    let codec = mp4::probe_codec_string(tr)
+    sb.write_string(" t")
+    sb.write_string(tr.track_id.to_string())
+    sb.write_string(":")
+    sb.write_string(tr.samples.length().to_string())
+    h = mix(h, tr.track_id.to_int64())
+    h = mix(h, tr.timescale.to_int64())
+    h = mix(h, tr.duration)
+    h = mix(h, tr.width.to_int64())
+    h = mix(h, tr.height.to_int64())
+    h = mix(h, tr.sample_rate.to_int64())
+    h = mix(h, tr.channels.to_int64())
+    h = hash_str(h, codec)
+    h = hash_str(h, tr.language)
+    h = hash_samples(h, tr.samples)
+    h = hash_seek(h, tr.samples)
+    t = t + 1
+  }
+  (sb.to_string(), h)
+}
+
+///|
+fn run_case(kind : Int, payload : Bytes) -> String {
+  let lim = mp4::DecodeLimits::default()
+  if kind == 0 {
+    match mp4::parse_mp4(payload) {
+      Ok(f) => {
+        let (s, h) = summarize_tracks(f.tracks)
+        "OK mp4 tracks=" + f.tracks.length().to_string() + s + " h=" + hex64(h)
+      }
+      Err(e) => "ERR " + err_kind(e)
+    }
+  } else if kind == 1 {
+    if payload.length() < 4 {
+      return "ERR short"
+    }
+    let ilen = rd_u32le(payload, 0)
+    if ilen < 0 || 4 + ilen > payload.length() {
+      return "ERR short"
+    }
+    let init_b = payload.slice(4, 4 + ilen)
+    let media_b = payload.slice(4 + ilen, payload.length())
+    match mp4::parse_init_segment(init_b, lim) {
+      Ok(init) =>
+      match mp4::parse_media_segment(init, media_b, lim) {
+        Ok(seg) => {
+          let mut h = 0L
+          let mut total = 0
+          let mut fi = 0
+          while fi < seg.fragments.length() {
+            let f = seg.fragments[fi]
+            h = mix(h, f.sequence_number.to_int64())
+            h = mix(h, f.track_id.to_int64())
+            h = mix(h, f.base_decode_time)
+            h = hash_samples(h, f.samples)
+            h = hash_seek(h, f.samples)
+            total = total + f.samples.length()
+            fi = fi + 1
+          }
+          let mut si = 0
+          while si < seg.sidx.length() {
+            h = mix(h, seg.sidx[si].references.length().to_int64())
+            h = mix(h, seg.sidx[si].earliest_presentation_time)
+            si = si + 1
+          }
+          let (ts, th) = summarize_tracks(init.tracks)
+          "OK fmp4 tracks=" +
+          init.tracks.length().to_string() +
+          ts +
+          " frags=" +
+          seg.fragments.length().to_string() +
+          " samples=" +
+          total.to_string() +
+          " range=" +
+          seg.start_pts_ms.to_string() +
+          ".." +
+          seg.end_pts_ms.to_string() +
+          " h=" +
+          hex64(mix(h, th))
+        }
+        Err(e) => "ERR media " + err_kind(e)
+      }
+      Err(e) => "ERR init " + err_kind(e)
+    }
+  } else {
+    match mp4::parse_top_level_boxes(payload, lim) {
+      Ok(boxes) => {
+        let mut h = 0L
+        let mut i = 0
+        while i < boxes.length() {
+          h = mix(h, boxes[i].box_type_u32.to_int64())
+          h = mix(h, boxes[i].size)
+          h = mix(h, boxes[i].payload_offset)
+          i = i + 1
+        }
+        "OK boxes=" + boxes.length().to_string() + " h=" + hex64(h)
+      }
+      Err(e) => "ERR " + err_kind(e)
+    }
+  }
+}
+
+///|
+fn dump_samples(sb : StringBuilder, samples : Array[mp4::Sample]) -> Unit {
+  let mut i = 0
+  while i < samples.length() {
+    let s = samples[i]
+    sb.write_string("s ")
+    sb.write_string(s.offset.to_string())
+    sb.write_string(" ")
+    sb.write_string(s.size.to_string())
+    sb.write_string(" ")
+    sb.write_string(s.dts.to_string())
+    sb.write_string(" ")
+    sb.write_string(s.pts.to_string())
+    sb.write_string(" ")
+    sb.write_string(s.duration.to_string())
+    sb.write_string(if s.is_sync { " 1\n" } else { " 0\n" })
+    i = i + 1
+  }
+}
+
+///|
+fn dump_track_header(sb : StringBuilder, tr : mp4::Track) -> Unit {
+  sb.write_string("track ")
+  sb.write_string(tr.track_id.to_string())
+  sb.write_string(" kind=")
+  sb.write_string(kind_str(tr.kind))
+  sb.write_string(" ts=")
+  sb.write_string(tr.timescale.to_string())
+  sb.write_string(" codec=")
+  sb.write_string(mp4::probe_codec_string(tr))
+  sb.write_string(" fourcc=")
+  sb.write_string(tr.codec_fourcc)
+  sb.write_string(" w=")
+  sb.write_string(tr.width.to_string())
+  sb.write_string(" h=")
+  sb.write_string(tr.height.to_string())
+  sb.write_string(" sr=")
+  sb.write_string(tr.sample_rate.to_string())
+  sb.write_string(" ch=")
+  sb.write_string(tr.channels.to_string())
+  sb.write_string(" lang=")
+  sb.write_string(tr.language)
+  sb.write_string(" n=")
+  sb.write_string(tr.samples.length().to_string())
+  sb.write_string("\n")
+}
+
+///| Linear reference: last index (in decode order) whose sample is sync with pts <= target and
+///| the maximal pts among such (the nearest sync sample at or before `target`).
+fn seek_reference(samples : Array[mp4::Sample], target : Int64) -> Option[Int] {
+  let mut best = -1
+  let mut i = 0
+  while i < samples.length() {
+    let s = samples[i]
+    if s.is_sync && s.pts <= target {
+      if best < 0 || s.pts >= samples[best].pts {
+        best = i
+      }
+    }
+    i = i + 1
+  }
+  if best < 0 {
+    None
+  } else {
+    Some(best)
+  }
+}
+
+///|
+fn opt_str(o : Option[Int]) -> String {
+  match o {
+    Some(v) => v.to_string()
+    None => "none"
+  }
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 3 {
+    io_println(world, "usage: mp4_audit <dump-mp4|dump-fmp4|batch|file|seek|prof-fmp4> ...")
+    return 2
+  }
+  let mode = args[1]
+  if mode == "batch" {
+    let b = match fs_read_bytes(world, args[2]) {
+      Ok(v) => v
+      Err(_) => return 2
+    }
+    let mut p = 0
+    let mut idx = 0
+    while p + 5 <= b.length() {
+      let len = rd_u32le(b, p)
+      p = p + 4
+      let kind = b[p].to_int() & 255
+      let payload = b.slice(p + 1, p + len)
+      p = p + len
+      io_println(world, idx.to_string() + " " + run_case(kind, payload))
+      idx = idx + 1
+    }
+    return 0
+  }
+  if mode == "file" {
+    let kind = parse_int(args[2])
+    let b = match fs_read_bytes(world, args[3]) {
+      Ok(v) => v
+      Err(_) => return 2
+    }
+    let t0 = clock_now_ms(world)
+    let line = run_case(kind, b)
+    let t1 = clock_now_ms(world)
+    io_println(world, line + " ms=" + (t1 - t0).to_string())
+    return 0
+  }
+  if mode == "dump-mp4" || mode == "seek" {
+    let b = match fs_read_bytes(world, args[2]) {
+      Ok(v) => v
+      Err(_) => return 2
+    }
+    match mp4::parse_mp4(b) {
+      Ok(f) => {
+        let sb = StringBuilder::new()
+        let mut t = 0
+        while t < f.tracks.length() {
+          let tr = f.tracks[t]
+          if mode == "dump-mp4" {
+            dump_track_header(sb, tr)
+            dump_samples(sb, tr.samples)
+          } else {
+            let mut bad = 0
+            let mut first_bad = ""
+            let mut i = 0
+            while i < tr.samples.length() {
+              let target = tr.samples[i].pts
+              let got = mp4::find_sync_sample_at(tr.samples, target)
+              let want = seek_reference(tr.samples, target)
+              if opt_str(got) != opt_str(want) {
+                if bad == 0 {
+                  first_bad = "target=" +
+                  target.to_string() +
+                  " got=" +
+                  opt_str(got) +
+                  " want=" +
+                  opt_str(want)
+                }
+                bad = bad + 1
+              }
+              i = i + 1
+            }
+            sb.write_string("seek track " + tr.track_id.to_string() + " targets=" + tr.samples.length().to_string() + " mismatches=" + bad.to_string() + " " + first_bad + "\n")
+          }
+          t = t + 1
+        }
+        io_print(world, sb.to_string())
+      }
+      Err(e) => io_println(world, "ERR " + mp4::mp4_error_message(e))
+    }
+    return 0
+  }
+  if mode == "dump-fmp4" || mode == "prof-fmp4" {
+    let ib = match fs_read_bytes(world, args[2]) {
+      Ok(v) => v
+      Err(_) => return 2
+    }
+    let mb = match fs_read_bytes(world, args[3]) {
+      Ok(v) => v
+      Err(_) => return 2
+    }
+    let lim = mp4::DecodeLimits::default()
+    if mode == "prof-fmp4" {
+      let iters = parse_int(args[4])
+      let mut acc = 0
+      let t0 = clock_now_ms(world)
+      let mut r = 0
+      while r < iters {
+        match mp4::parse_init_segment(ib, lim) {
+          Ok(i) => acc = acc + i.tracks.length()
+          Err(_) => return 1
+        }
+        r = r + 1
+      }
+      let t1 = clock_now_ms(world)
+      let init = match mp4::parse_init_segment(ib, lim) {
+        Ok(i) => i
+        Err(_) => return 1
+      }
+      r = 0
+      while r < iters {
+        match mp4::parse_media_segment(init, mb, lim) {
+          Ok(s) => acc = acc + s.fragments.length()
+          Err(_) => return 1
+        }
+        r = r + 1
+      }
+      let t2 = clock_now_ms(world)
+      io_println(world, "init_ms=" + (t1 - t0).to_string() + " media_ms=" + (t2 - t1).to_string() + " acc=" + acc.to_string())
+      return 0
+    }
+    match mp4::parse_init_segment(ib, lim) {
+      Ok(init) => {
+        let sb = StringBuilder::new()
+        let mut t = 0
+        while t < init.tracks.length() {
+          dump_track_header(sb, init.tracks[t])
+          t = t + 1
+        }
+        match mp4::parse_media_segment(init, mb, lim) {
+          Ok(seg) => {
+            sb.write_string("range " + seg.start_pts_ms.to_string() + " " + seg.end_pts_ms.to_string() + "\n")
+            let mut si = 0
+            while si < seg.sidx.length() {
+              let x = seg.sidx[si]
+              sb.write_string("sidx v=" + x.version.to_string() + " ept=" + x.earliest_presentation_time.to_string() + " refs=" + x.references.length().to_string() + "\n")
+              si = si + 1
+            }
+            let mut fi = 0
+            while fi < seg.fragments.length() {
+              let f = seg.fragments[fi]
+              sb.write_string("frag " + f.sequence_number.to_string() + " tid=" + f.track_id.to_string() + " bdt=" + f.base_decode_time.to_string() + " n=" + f.samples.length().to_string() + "\n")
+              dump_samples(sb, f.samples)
+              fi = fi + 1
+            }
+          }
+          Err(e) => sb.write_string("ERR media " + mp4::mp4_error_message(e) + "\n")
+        }
+        io_print(world, sb.to_string())
+      }
+      Err(e) => io_println(world, "ERR init " + mp4::mp4_error_message(e))
+    }
+    return 0
+  }
+  io_println(world, "unknown mode " + mode)
+  2
+}
