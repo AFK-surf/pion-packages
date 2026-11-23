@@ -1,0 +1,3466 @@
+///| Core jq evaluator with backtracking streams, persistent lexical environments,
+///| path tracking, update operators, user functions, label/break, and `JqLimits`.
+
+import "json5"
+import "regex"
+
+enum EvalSignal {
+  Error(JqError)
+  Break(String)
+  CapReached
+}
+
+struct VarNode {
+  name : String
+  value : json5::Json5Value
+  prev : Int
+}
+
+struct FuncDef {
+  name : String
+  params : Array[String]
+  body : Int
+  var_env : Int
+  mut func_env : Int
+}
+
+struct FuncNode {
+  name : String
+  arity : Int
+  def_id : Int
+  prev : Int
+}
+
+struct Sink {
+  out : Array[json5::Json5Value]
+  cap : Int
+}
+
+struct EvalCtx {
+  exprs : Array[Expr]
+  limits : JqLimits
+  mut steps : Int
+  mut depth : Int
+  var_nodes : Array[VarNode]
+  func_defs : Array[FuncDef]
+  func_nodes : Array[FuncNode]
+}
+
+fn EvalCtx::new(exprs : Array[Expr], limits : JqLimits) -> EvalCtx {
+  EvalCtx::{
+    exprs: exprs,
+    limits: limits,
+    steps: 0,
+    depth: 0,
+    var_nodes: [],
+    func_defs: [],
+    func_nodes: [],
+  }
+}
+
+fn EvalCtx::step(self : EvalCtx) -> Result[Unit, EvalSignal] {
+  self.steps = self.steps + 1
+  if self.steps > self.limits.max_steps {
+    return Err(EvalSignal::Error(JqError::LimitExceeded("max_steps exceeded")))
+  }
+  Ok(())
+}
+
+fn EvalCtx::enter(self : EvalCtx) -> Result[Unit, EvalSignal] {
+  self.depth = self.depth + 1
+  if self.depth > self.limits.max_depth {
+    return Err(EvalSignal::Error(JqError::LimitExceeded("max_depth exceeded")))
+  }
+  Ok(())
+}
+
+fn EvalCtx::leave(self : EvalCtx) -> Unit {
+  self.depth = self.depth - 1
+}
+
+fn EvalCtx::push_var(self : EvalCtx, env : Int, name : String, value : json5::Json5Value) -> Int {
+  let id = self.var_nodes.length()
+  self.var_nodes.push(VarNode::{ name: name, value: value, prev: env })
+  id
+}
+
+fn EvalCtx::lookup_var(self : EvalCtx, env : Int, name : String) -> Option[json5::Json5Value] {
+  let mut cur = env
+  while cur >= 0 {
+    let node = self.var_nodes[cur]
+    if node.name == name {
+      return Some(node.value)
+    }
+    cur = node.prev
+  }
+  None
+}
+
+fn EvalCtx::push_func(
+  self : EvalCtx,
+  fenv : Int,
+  name : String,
+  params : Array[String],
+  body : Int,
+  venv : Int,
+) -> Int {
+  let def_id = self.func_defs.length()
+  let node_id = self.func_nodes.length()
+  self.func_defs.push(
+    FuncDef::{
+      name: name,
+      params: params,
+      body: body,
+      var_env: venv,
+      func_env: node_id,
+    },
+  )
+  self.func_nodes.push(
+    FuncNode::{ name: name, arity: params.length(), def_id: def_id, prev: fenv },
+  )
+  node_id
+}
+
+fn EvalCtx::lookup_func(self : EvalCtx, fenv : Int, name : String, arity : Int) -> Option[Int] {
+  let mut cur = fenv
+  while cur >= 0 {
+    let node = self.func_nodes[cur]
+    if node.name == name && node.arity == arity {
+      return Some(node.def_id)
+    }
+    cur = node.prev
+  }
+  None
+}
+
+fn EvalCtx::emit(self : EvalCtx, sink : Sink, v : json5::Json5Value) -> Result[Unit, EvalSignal] {
+  if sink.out.length() >= self.limits.max_outputs {
+    return Err(EvalSignal::Error(JqError::LimitExceeded("max_outputs exceeded")))
+  }
+  sink.out.push(v)
+  if sink.cap >= 0 && sink.out.length() >= sink.cap {
+    return Err(EvalSignal::CapReached)
+  }
+  Ok(())
+}
+
+fn EvalCtx::eval_collect(
+  self : EvalCtx,
+  expr_id : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+) -> Result[Array[json5::Json5Value], EvalSignal] {
+  let sink = Sink::{ out: [], cap: -1 }
+  match self.eval(expr_id, input, venv, fenv, sink) {
+    Ok(_) => Ok(sink.out)
+    Err(EvalSignal::CapReached) => Ok(sink.out)
+    Err(e) => Err(e)
+  }
+}
+
+fn EvalCtx::eval_collect_cap(
+  self : EvalCtx,
+  expr_id : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  cap : Int,
+) -> Result[Array[json5::Json5Value], EvalSignal] {
+  let sink = Sink::{ out: [], cap: cap }
+  match self.eval(expr_id, input, venv, fenv, sink) {
+    Ok(_) => Ok(sink.out)
+    Err(EvalSignal::CapReached) => Ok(sink.out)
+    Err(e) => Err(e)
+  }
+}
+
+fn EvalCtx::bind_pattern(
+  self : EvalCtx,
+  pat : Pattern,
+  v : json5::Json5Value,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+) -> Result[Int, EvalSignal] {
+  match pat {
+    Pattern::Var(name) => Ok(self.push_var(venv, name, v))
+    Pattern::ArrayPat(pats) => {
+      let mut cur_env = venv
+      let mut i = 0
+      while i < pats.length() {
+        let elem = match jq_index_val(v, json5::Json5Value::Number(i.to_double())) {
+          Ok(ev) => ev
+          Err(e) => return Err(EvalSignal::Error(e))
+        }
+        cur_env = match self.bind_pattern(pats[i], elem, input, cur_env, fenv) {
+          Ok(ne) => ne
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(cur_env)
+    }
+    Pattern::ObjPat(entries) => {
+      let mut cur_env = venv
+      let mut i = 0
+      while i < entries.length() {
+        let (pk, sub_pat) = entries[i]
+        let key_val = match pk {
+          PatKey::LitKey(s) => json5::Json5Value::Str(s)
+          PatKey::ExprKey(kexpr) => {
+            let ks = match self.eval_collect_cap(kexpr, input, cur_env, fenv, 1) {
+              Ok(xs) => xs
+              Err(e) => return Err(e)
+            }
+            if ks.length() == 0 {
+              return Err(EvalSignal::Error(JqError::RuntimeError("empty key in object pattern")))
+            }
+            ks[0]
+          }
+        }
+        let field_val = match jq_index_val(v, key_val) {
+          Ok(fv) => fv
+          Err(e) => return Err(EvalSignal::Error(e))
+        }
+        cur_env = match self.bind_pattern(sub_pat, field_val, input, cur_env, fenv) {
+          Ok(ne) => ne
+          Err(e) => return Err(e)
+        }
+        i = i + 1
+      }
+      Ok(cur_env)
+    }
+  }
+}
+
+fn EvalCtx::eval(
+  self : EvalCtx,
+  expr_id : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  match self.step() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match self.enter() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let res = self.eval_inner(expr_id, input, venv, fenv, sink)
+  self.leave()
+  res
+}
+
+fn EvalCtx::eval_recurse(
+  self : EvalCtx,
+  v : json5::Json5Value,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  match self.step() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match self.emit(sink, v) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match v {
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      while i < items.length() {
+        match self.eval_recurse(items[i], sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    json5::Json5Value::Object(entries) => {
+      let mut i = 0
+      while i < entries.length() {
+        let (_, ev) = entries[i]
+        match self.eval_recurse(ev, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    _ => Ok(())
+  }
+}
+
+fn EvalCtx::eval_inner(
+  self : EvalCtx,
+  expr_id : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  match self.exprs[expr_id] {
+    Expr::Identity => self.emit(sink, input)
+    Expr::Recurse => self.eval_recurse(input, sink)
+    Expr::NullLit => self.emit(sink, json5::Json5Value::Null)
+    Expr::BoolLit(b) => self.emit(sink, json5::Json5Value::Bool(b))
+    Expr::NumLit(x) => self.emit(sink, json5::Json5Value::Number(x))
+    Expr::StrLit(s) => self.emit(sink, json5::Json5Value::Str(s))
+    Expr::Format(fmt) =>
+    match apply_format(fmt, input) {
+      Ok(s) => self.emit(sink, json5::Json5Value::Str(s))
+      Err(e) => Err(EvalSignal::Error(e))
+    }
+    Expr::StrInterp(fmt, parts) =>
+    self.eval_str_interp(fmt, parts, 0, "", input, venv, fenv, sink)
+    Expr::VarRef(name) =>
+    match self.lookup_var(venv, name) {
+      Some(v) => self.emit(sink, v)
+      None => Err(EvalSignal::Error(JqError::CompileError("undefined variable $" + name)))
+    }
+    Expr::ArrayCons(inner) => {
+      if inner < 0 {
+        return self.emit(sink, json5::Json5Value::Array([]))
+      }
+      let items = match self.eval_collect(inner, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      self.emit(sink, json5::Json5Value::Array(items))
+    }
+    Expr::ObjCons(entries) =>
+    self.eval_obj_cons(entries, 0, [], input, venv, fenv, sink)
+    Expr::Field(target, key, opt) => {
+      let ts = match self.eval_collect(target, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < ts.length() {
+        match jq_index_val(ts[i], json5::Json5Value::Str(key)) {
+          Ok(v) =>
+          match self.emit(sink, v) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+          Err(e) => if !opt { return Err(EvalSignal::Error(e)) }
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Index(target, idx_expr, opt) => {
+      let ts = match self.eval_collect(target, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let idxs = match self.eval_collect(idx_expr, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < ts.length() {
+        let mut j = 0
+        while j < idxs.length() {
+          match jq_index_val(ts[i], idxs[j]) {
+            Ok(v) =>
+            match self.emit(sink, v) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            Err(e) => if !opt { return Err(EvalSignal::Error(e)) }
+          }
+          j = j + 1
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Slice(target, s_expr, e_expr, opt) => {
+      let ts = match self.eval_collect(target, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let starts : Array[Option[json5::Json5Value]] = if s_expr < 0 {
+        [None]
+      } else {
+        let xs = match self.eval_collect(s_expr, input, venv, fenv) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let arr : Array[Option[json5::Json5Value]] = []
+        let mut k = 0
+        while k < xs.length() {
+          arr.push(Some(xs[k]))
+          k = k + 1
+        }
+        arr
+      }
+      let ends : Array[Option[json5::Json5Value]] = if e_expr < 0 {
+        [None]
+      } else {
+        let xs = match self.eval_collect(e_expr, input, venv, fenv) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let arr : Array[Option[json5::Json5Value]] = []
+        let mut k = 0
+        while k < xs.length() {
+          arr.push(Some(xs[k]))
+          k = k + 1
+        }
+        arr
+      }
+      let mut ti = 0
+      while ti < ts.length() {
+        let mut si = 0
+        while si < starts.length() {
+          let mut ei = 0
+          while ei < ends.length() {
+            match jq_slice_val(ts[ti], starts[si], ends[ei]) {
+              Ok(v) =>
+              match self.emit(sink, v) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+              Err(e) => if !opt { return Err(EvalSignal::Error(e)) }
+            }
+            ei = ei + 1
+          }
+          si = si + 1
+        }
+        ti = ti + 1
+      }
+      Ok(())
+    }
+    Expr::Iter(target, opt) => {
+      let ts = match self.eval_collect(target, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut ti = 0
+      while ti < ts.length() {
+        match ts[ti] {
+          json5::Json5Value::Array(items) => {
+            let mut k = 0
+            while k < items.length() {
+              match self.emit(sink, items[k]) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+              k = k + 1
+            }
+          }
+          json5::Json5Value::Object(entries) => {
+            let mut k = 0
+            while k < entries.length() {
+              let (_, ev) = entries[k]
+              match self.emit(sink, ev) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+              k = k + 1
+            }
+          }
+          other =>
+          if !opt {
+            return Err(
+              EvalSignal::Error(
+                JqError::RuntimeError("cannot iterate over " + jq_type_name(other)),
+              ),
+            )
+          }
+        }
+        ti = ti + 1
+      }
+      Ok(())
+    }
+    Expr::Optional(inner) =>
+    match self.eval(inner, input, venv, fenv, sink) {
+      Ok(_) => Ok(())
+      Err(EvalSignal::Error(JqError::LimitExceeded(m))) =>
+      Err(EvalSignal::Error(JqError::LimitExceeded(m)))
+      Err(EvalSignal::Error(JqError::InvalidLimits(m))) =>
+      Err(EvalSignal::Error(JqError::InvalidLimits(m)))
+      Err(EvalSignal::Break(b)) => Err(EvalSignal::Break(b))
+      Err(EvalSignal::CapReached) => Err(EvalSignal::CapReached)
+      Err(EvalSignal::Error(_)) => Ok(())
+    }
+    Expr::Neg(inner) => {
+      let xs = match self.eval_collect(inner, input, venv, fenv) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < xs.length() {
+        match xs[i] {
+          json5::Json5Value::Number(x) =>
+          match self.emit(sink, json5::Json5Value::Number(-x)) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+          other =>
+          return Err(
+            EvalSignal::Error(
+              JqError::RuntimeError(jq_type_name(other) + " cannot be negated"),
+            ),
+          )
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Pos(inner) => self.eval(inner, input, venv, fenv, sink)
+    Expr::Bin(op, lhs, rhs) => self.eval_bin(op, lhs, rhs, input, venv, fenv, sink)
+    Expr::If(cond, then_e, elifs, else_e) =>
+    self.eval_if(cond, then_e, elifs, 0, else_e, input, venv, fenv, sink)
+    Expr::Try(body, catch_e) => {
+      match self.eval(body, input, venv, fenv, sink) {
+        Ok(_) => Ok(())
+        Err(EvalSignal::Error(JqError::LimitExceeded(m))) =>
+        Err(EvalSignal::Error(JqError::LimitExceeded(m)))
+        Err(EvalSignal::Error(JqError::InvalidLimits(m))) =>
+        Err(EvalSignal::Error(JqError::InvalidLimits(m)))
+        Err(EvalSignal::Break(b)) => Err(EvalSignal::Break(b))
+        Err(EvalSignal::CapReached) => Err(EvalSignal::CapReached)
+        Err(EvalSignal::Error(JqError::UserError(uv))) =>
+        if catch_e >= 0 {
+          self.eval(catch_e, uv, venv, fenv, sink)
+        } else {
+          Ok(())
+        }
+        Err(EvalSignal::Error(JqError::RuntimeError(msg))) =>
+        if catch_e >= 0 {
+          self.eval(catch_e, json5::Json5Value::Str(msg), venv, fenv, sink)
+        } else {
+          Ok(())
+        }
+        Err(EvalSignal::Error(other)) =>
+        if catch_e >= 0 {
+          self.eval(catch_e, json5::Json5Value::Str(error_message(other)), venv, fenv, sink)
+        } else {
+          Ok(())
+        }
+      }
+    }
+    Expr::As(val_e, pat, body_e) => {
+      let vs = match self.eval_collect(val_e, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < vs.length() {
+        let new_env = match self.bind_pattern(pat, vs[i], input, venv, fenv) {
+          Ok(ne) => ne
+          Err(e) => return Err(e)
+        }
+        match self.eval(body_e, input, new_env, fenv, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Reduce(src_e, pat, init_e, upd_e) => {
+      let inits = match self.eval_collect(init_e, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let items = match self.eval_collect(src_e, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut ii = 0
+      while ii < inits.length() {
+        let mut acc = inits[ii]
+        let mut j = 0
+        while j < items.length() {
+          match self.step() {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+          let new_env = match self.bind_pattern(pat, items[j], input, venv, fenv) {
+            Ok(ne) => ne
+            Err(e) => return Err(e)
+          }
+          let nexts = match self.eval_collect(upd_e, acc, new_env, fenv) {
+            Ok(xs) => xs
+            Err(e) => return Err(e)
+          }
+          if nexts.length() > 0 {
+            acc = nexts[nexts.length() - 1]
+          }
+          j = j + 1
+        }
+        match self.emit(sink, acc) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        ii = ii + 1
+      }
+      Ok(())
+    }
+    Expr::Foreach(src_e, pat, init_e, upd_e, ext_e) => {
+      let inits = match self.eval_collect(init_e, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let items = match self.eval_collect(src_e, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut ii = 0
+      while ii < inits.length() {
+        let mut acc = inits[ii]
+        let mut j = 0
+        while j < items.length() {
+          match self.step() {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+          let new_env = match self.bind_pattern(pat, items[j], input, venv, fenv) {
+            Ok(ne) => ne
+            Err(e) => return Err(e)
+          }
+          let nexts = match self.eval_collect(upd_e, acc, new_env, fenv) {
+            Ok(xs) => xs
+            Err(e) => return Err(e)
+          }
+          let mut k = 0
+          while k < nexts.length() {
+            acc = nexts[k]
+            if ext_e >= 0 {
+              match self.eval(ext_e, acc, new_env, fenv, sink) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+            } else {
+              match self.emit(sink, acc) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+            }
+            k = k + 1
+          }
+          j = j + 1
+        }
+        ii = ii + 1
+      }
+      Ok(())
+    }
+    Expr::Def(name, params, body, next) => {
+      let new_fenv = self.push_func(fenv, name, params, body, venv)
+      self.eval(next, input, venv, new_fenv, sink)
+    }
+    Expr::Label(name, body) =>
+    match self.eval(body, input, venv, fenv, sink) {
+      Ok(_) => Ok(())
+      Err(EvalSignal::Break(bname)) =>
+      if bname == name {
+        Ok(())
+      } else {
+        Err(EvalSignal::Break(bname))
+      }
+      Err(e) => Err(e)
+    }
+    Expr::Break(name) => Err(EvalSignal::Break(name))
+    Expr::Call(name, args) => self.eval_call(name, args, input, venv, fenv, sink)
+  }
+}
+
+fn EvalCtx::eval_str_interp(
+  self : EvalCtx,
+  fmt : String,
+  parts : Array[StrPart],
+  idx : Int,
+  prefix : String,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  if idx >= parts.length() {
+    if prefix.length() > self.limits.max_output_bytes {
+      return Err(EvalSignal::Error(JqError::LimitExceeded("string interpolation exceeds max_output_bytes")))
+    }
+    return self.emit(sink, json5::Json5Value::Str(prefix))
+  }
+  match parts[idx] {
+    StrPart::Lit(s) =>
+    self.eval_str_interp(fmt, parts, idx + 1, prefix + s, input, venv, fenv, sink)
+    StrPart::Interp(e_id) => {
+      let vs = match self.eval_collect(e_id, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < vs.length() {
+        let s = match apply_format(fmt, vs[i]) {
+          Ok(str) => str
+          Err(e) => return Err(EvalSignal::Error(e))
+        }
+        if prefix.length() + s.length() > self.limits.max_output_bytes {
+          return Err(EvalSignal::Error(JqError::LimitExceeded("string interpolation exceeds max_output_bytes")))
+        }
+        match self.eval_str_interp(fmt, parts, idx + 1, prefix + s, input, venv, fenv, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+  }
+}
+
+fn EvalCtx::eval_obj_cons(
+  self : EvalCtx,
+  entries : Array[ObjEntry],
+  idx : Int,
+  acc : Array[(String, json5::Json5Value)],
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  if idx >= entries.length() {
+    return self.emit(sink, json5::Json5Value::Object(acc))
+  }
+  let entry = entries[idx]
+  let keys : Array[String] = match entry.key {
+    ObjKey::Lit(k) => [k]
+    ObjKey::VarKey(vn) => [vn]
+    ObjKey::Expr(kexpr) => {
+      let kvs = match self.eval_collect(kexpr, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let ks : Array[String] = []
+      let mut i = 0
+      while i < kvs.length() {
+        match kvs[i] {
+          json5::Json5Value::Str(s) => ks.push(s)
+          other =>
+          return Err(
+            EvalSignal::Error(
+              JqError::RuntimeError("object key must be string, got " + jq_type_name(other)),
+            ),
+          )
+        }
+        i = i + 1
+      }
+      ks
+    }
+  }
+  let vals = match self.eval_collect(entry.val_expr, input, venv, fenv) {
+    Ok(xs) => xs
+    Err(e) => return Err(e)
+  }
+  let mut ki = 0
+  while ki < keys.length() {
+    let mut vi = 0
+    while vi < vals.length() {
+      let next_acc = obj_set_entry(acc, keys[ki], vals[vi])
+      match self.eval_obj_cons(entries, idx + 1, next_acc, input, venv, fenv, sink) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      vi = vi + 1
+    }
+    ki = ki + 1
+  }
+  Ok(())
+}
+
+fn EvalCtx::eval_if(
+  self : EvalCtx,
+  cond : Int,
+  then_e : Int,
+  elifs : Array[ElifBranch],
+  elif_idx : Int,
+  else_e : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  let cs = match self.eval_collect(cond, input, venv, fenv) {
+    Ok(xs) => xs
+    Err(e) => return Err(e)
+  }
+  let mut i = 0
+  while i < cs.length() {
+    if jq_truthy(cs[i]) {
+      match self.eval(then_e, input, venv, fenv, sink) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+    } else if elif_idx < elifs.length() {
+      let eb = elifs[elif_idx]
+      match self.eval_if(eb.cond, eb.body, elifs, elif_idx + 1, else_e, input, venv, fenv, sink) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+    } else if else_e >= 0 {
+      match self.eval(else_e, input, venv, fenv, sink) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+    } else {
+      match self.emit(sink, input) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+fn EvalCtx::eval_bin(
+  self : EvalCtx,
+  op : BinOp,
+  lhs : Int,
+  rhs : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  match op {
+    BinOp::Pipe => {
+      let mid = match self.eval_collect(lhs, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < mid.length() {
+        match self.eval(rhs, mid[i], venv, fenv, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    BinOp::Comma => {
+      match self.eval(lhs, input, venv, fenv, sink) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      self.eval(rhs, input, venv, fenv, sink)
+    }
+    BinOp::Alt => {
+      let ls = match self.eval_collect(lhs, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut emitted = false
+      let mut i = 0
+      while i < ls.length() {
+        if jq_truthy(ls[i]) {
+          emitted = true
+          match self.emit(sink, ls[i]) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+        }
+        i = i + 1
+      }
+      if !emitted {
+        self.eval(rhs, input, venv, fenv, sink)
+      } else {
+        Ok(())
+      }
+    }
+    BinOp::And => {
+      let ls = match self.eval_collect(lhs, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < ls.length() {
+        if !jq_truthy(ls[i]) {
+          match self.emit(sink, json5::Json5Value::Bool(false)) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+        } else {
+          let rs = match self.eval_collect(rhs, input, venv, fenv) {
+            Ok(xs) => xs
+            Err(e) => return Err(e)
+          }
+          let mut j = 0
+          while j < rs.length() {
+            match self.emit(sink, json5::Json5Value::Bool(jq_truthy(rs[j]))) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            j = j + 1
+          }
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    BinOp::Or => {
+      let ls = match self.eval_collect(lhs, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < ls.length() {
+        if jq_truthy(ls[i]) {
+          match self.emit(sink, json5::Json5Value::Bool(true)) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+        } else {
+          let rs = match self.eval_collect(rhs, input, venv, fenv) {
+            Ok(xs) => xs
+            Err(e) => return Err(e)
+          }
+          let mut j = 0
+          while j < rs.length() {
+            match self.emit(sink, json5::Json5Value::Bool(jq_truthy(rs[j]))) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            j = j + 1
+          }
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    BinOp::Assign => self.eval_assign(lhs, rhs, input, venv, fenv, sink)
+    BinOp::Update => self.eval_update(lhs, rhs, input, venv, fenv, sink)
+    BinOp::AddAssign | BinOp::SubAssign | BinOp::MulAssign | BinOp::DivAssign | BinOp::ModAssign | BinOp::AltAssign =>
+    self.eval_compound_assign(op, lhs, rhs, input, venv, fenv, sink)
+    _ => {
+      let ls = match self.eval_collect(lhs, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let rs = match self.eval_collect(rhs, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      // In jq, `lhs op rhs` iterates rhs in outer loop or lhs in outer loop?
+      // jq evaluates rhs then lhs for binary ops; for single values identical, for streams:
+      // `(1,2) + (10,20)` -> 11, 12, 21, 22 in jq (rhs outer, lhs inner).
+      let mut j = 0
+      while j < rs.length() {
+        let mut i = 0
+        while i < ls.length() {
+          let res = match op {
+            BinOp::Eq => Ok(json5::Json5Value::Bool(jq_eq(ls[i], rs[j])))
+            BinOp::Ne => Ok(json5::Json5Value::Bool(!jq_eq(ls[i], rs[j])))
+            BinOp::Lt => Ok(json5::Json5Value::Bool(jq_cmp(ls[i], rs[j]) < 0))
+            BinOp::Le => Ok(json5::Json5Value::Bool(jq_cmp(ls[i], rs[j]) <= 0))
+            BinOp::Gt => Ok(json5::Json5Value::Bool(jq_cmp(ls[i], rs[j]) > 0))
+            BinOp::Ge => Ok(json5::Json5Value::Bool(jq_cmp(ls[i], rs[j]) >= 0))
+            BinOp::Add => jq_add(ls[i], rs[j], self.limits.max_output_bytes)
+            BinOp::Sub => jq_sub(ls[i], rs[j])
+            BinOp::Mul => jq_mul(ls[i], rs[j], self.limits)
+            BinOp::Div => jq_div(ls[i], rs[j])
+            BinOp::Mod => jq_mod(ls[i], rs[j])
+            _ => Err(JqError::RuntimeError("unexpected binary operator"))
+          }
+          match res {
+            Ok(v) =>
+            match self.emit(sink, v) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            Err(e) => return Err(EvalSignal::Error(e))
+          }
+          i = i + 1
+        }
+        j = j + 1
+      }
+      Ok(())
+    }
+  }
+}
+
+///| Evaluate path expressions, producing `(path_segments, target_value)` pairs.
+fn EvalCtx::eval_paths(
+  self : EvalCtx,
+  expr_id : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  prefix : Array[json5::Json5Value],
+  out : Array[(Array[json5::Json5Value], json5::Json5Value)],
+) -> Result[Unit, EvalSignal] {
+  match self.step() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match self.enter() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let res = self.eval_paths_inner(expr_id, input, venv, fenv, prefix, out)
+  self.leave()
+  res
+}
+
+fn clone_path_with(
+  base : Array[json5::Json5Value],
+  seg : json5::Json5Value,
+) -> Array[json5::Json5Value] {
+  let out : Array[json5::Json5Value] = []
+  let mut i = 0
+  while i < base.length() {
+    out.push(base[i])
+    i = i + 1
+  }
+  out.push(seg)
+  out
+}
+
+fn EvalCtx::eval_paths_recurse(
+  self : EvalCtx,
+  v : json5::Json5Value,
+  prefix : Array[json5::Json5Value],
+  out : Array[(Array[json5::Json5Value], json5::Json5Value)],
+) -> Result[Unit, EvalSignal] {
+  match self.step() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  out.push((prefix, v))
+  match v {
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      while i < items.length() {
+        let p = clone_path_with(prefix, json5::Json5Value::Number(i.to_double()))
+        match self.eval_paths_recurse(items[i], p, out) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    json5::Json5Value::Object(entries) => {
+      let mut i = 0
+      while i < entries.length() {
+        let (k, ev) = entries[i]
+        let p = clone_path_with(prefix, json5::Json5Value::Str(k))
+        match self.eval_paths_recurse(ev, p, out) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    _ => Ok(())
+  }
+}
+
+fn EvalCtx::eval_paths_inner(
+  self : EvalCtx,
+  expr_id : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  prefix : Array[json5::Json5Value],
+  out : Array[(Array[json5::Json5Value], json5::Json5Value)],
+) -> Result[Unit, EvalSignal] {
+  match self.exprs[expr_id] {
+    Expr::Identity => {
+      out.push((prefix, input))
+      Ok(())
+    }
+    Expr::Recurse => self.eval_paths_recurse(input, prefix, out)
+    Expr::Field(target, key, opt) => {
+      let parents : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+      match self.eval_paths(target, input, venv, fenv, prefix, parents) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let mut i = 0
+      while i < parents.length() {
+        let (pp, pv) = parents[i]
+        match jq_index_val(pv, json5::Json5Value::Str(key)) {
+          Ok(cv) => out.push((clone_path_with(pp, json5::Json5Value::Str(key)), cv))
+          Err(e) => if !opt { return Err(EvalSignal::Error(e)) }
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Index(target, idx_e, opt) => {
+      let parents : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+      match self.eval_paths(target, input, venv, fenv, prefix, parents) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let idxs = match self.eval_collect(idx_e, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < parents.length() {
+        let (pp, pv) = parents[i]
+        let mut j = 0
+        while j < idxs.length() {
+          match jq_index_val(pv, idxs[j]) {
+            Ok(cv) => out.push((clone_path_with(pp, idxs[j]), cv))
+            Err(e) => if !opt { return Err(EvalSignal::Error(e)) }
+          }
+          j = j + 1
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Iter(target, opt) => {
+      let parents : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+      match self.eval_paths(target, input, venv, fenv, prefix, parents) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let mut i = 0
+      while i < parents.length() {
+        let (pp, pv) = parents[i]
+        match pv {
+          json5::Json5Value::Array(items) => {
+            let mut k = 0
+            while k < items.length() {
+              out.push((clone_path_with(pp, json5::Json5Value::Number(k.to_double())), items[k]))
+              k = k + 1
+            }
+          }
+          json5::Json5Value::Object(entries) => {
+            let mut k = 0
+            while k < entries.length() {
+              let (key, ev) = entries[k]
+              out.push((clone_path_with(pp, json5::Json5Value::Str(key)), ev))
+              k = k + 1
+            }
+          }
+          other =>
+          if !opt {
+            return Err(
+              EvalSignal::Error(
+                JqError::RuntimeError("cannot iterate over " + jq_type_name(other)),
+              ),
+            )
+          }
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Bin(BinOp::Comma, lhs, rhs) => {
+      match self.eval_paths(lhs, input, venv, fenv, prefix, out) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      self.eval_paths(rhs, input, venv, fenv, prefix, out)
+    }
+    Expr::Bin(BinOp::Pipe, lhs, rhs) => {
+      let mid : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+      match self.eval_paths(lhs, input, venv, fenv, prefix, mid) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let mut i = 0
+      while i < mid.length() {
+        let (mp, mv) = mid[i]
+        match self.eval_paths(rhs, mv, venv, fenv, mp, out) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    Expr::Call(name, args) => {
+      if name == "select" && args.length() == 1 {
+        let cs = match self.eval_collect(args[0], input, venv, fenv) {
+          Ok(xs) => xs
+          Err(e) => return Err(e)
+        }
+        let mut i = 0
+        while i < cs.length() {
+          if jq_truthy(cs[i]) {
+            out.push((prefix, input))
+          }
+          i = i + 1
+        }
+        Ok(())
+      } else if name == "empty" && args.length() == 0 {
+        Ok(())
+      } else if name == "values" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Null => Ok(())
+          _ => {
+            out.push((prefix, input))
+            Ok(())
+          }
+        }
+      } else if name == "numbers" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Number(_) => {
+            out.push((prefix, input))
+            Ok(())
+          }
+          _ => Ok(())
+        }
+      } else if name == "strings" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Str(_) => {
+            out.push((prefix, input))
+            Ok(())
+          }
+          _ => Ok(())
+        }
+      } else if name == "arrays" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Array(_) => {
+            out.push((prefix, input))
+            Ok(())
+          }
+          _ => Ok(())
+        }
+      } else if name == "objects" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Object(_) => {
+            out.push((prefix, input))
+            Ok(())
+          }
+          _ => Ok(())
+        }
+      } else if name == "booleans" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Bool(_) => {
+            out.push((prefix, input))
+            Ok(())
+          }
+          _ => Ok(())
+        }
+      } else if name == "nulls" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Null => {
+            out.push((prefix, input))
+            Ok(())
+          }
+          _ => Ok(())
+        }
+      } else if name == "iterables" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Array(_) | json5::Json5Value::Object(_) => {
+            out.push((prefix, input))
+            Ok(())
+          }
+          _ => Ok(())
+        }
+      } else if name == "scalars" && args.length() == 0 {
+        match input {
+          json5::Json5Value::Array(_) | json5::Json5Value::Object(_) => Ok(())
+          _ => {
+            out.push((prefix, input))
+            Ok(())
+          }
+        }
+      } else {
+        Err(EvalSignal::Error(JqError::RuntimeError("invalid path expression: " + name)))
+      }
+    }
+    Expr::If(cond, then_e, elifs, else_e) => {
+      let cs = match self.eval_collect(cond, input, venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut i = 0
+      while i < cs.length() {
+        if jq_truthy(cs[i]) {
+          match self.eval_paths(then_e, input, venv, fenv, prefix, out) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+        } else if elifs.length() > 0 {
+          // Simple fallback for elif chain
+          let mut matched = false
+          let mut ei = 0
+          while ei < elifs.length() {
+            let ecs = match self.eval_collect(elifs[ei].cond, input, venv, fenv) {
+              Ok(xs) => xs
+              Err(e) => return Err(e)
+            }
+            if ecs.length() > 0 && jq_truthy(ecs[0]) {
+              match self.eval_paths(elifs[ei].body, input, venv, fenv, prefix, out) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+              matched = true
+              break
+            }
+            ei = ei + 1
+          }
+          if !matched {
+            if else_e >= 0 {
+              match self.eval_paths(else_e, input, venv, fenv, prefix, out) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+            } else {
+              out.push((prefix, input))
+            }
+          }
+        } else if else_e >= 0 {
+          match self.eval_paths(else_e, input, venv, fenv, prefix, out) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+        } else {
+          out.push((prefix, input))
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    _ => Err(EvalSignal::Error(JqError::RuntimeError("invalid path expression")))
+  }
+}
+
+fn EvalCtx::eval_assign(
+  self : EvalCtx,
+  lhs : Int,
+  rhs : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  let rvals = match self.eval_collect(rhs, input, venv, fenv) {
+    Ok(xs) => xs
+    Err(e) => return Err(e)
+  }
+  let paths : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+  match self.eval_paths(lhs, input, venv, fenv, [], paths) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let mut ri = 0
+  while ri < rvals.length() {
+    let mut cur = input
+    let mut pi = 0
+    while pi < paths.length() {
+      let (p, _) = paths[pi]
+      cur = match jq_setpath(cur, p, 0, rvals[ri], self.limits.max_output_bytes) {
+        Ok(v) => v
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      pi = pi + 1
+    }
+    match self.emit(sink, cur) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    ri = ri + 1
+  }
+  Ok(())
+}
+
+fn EvalCtx::eval_update(
+  self : EvalCtx,
+  lhs : Int,
+  rhs : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  let paths : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+  match self.eval_paths(lhs, input, venv, fenv, [], paths) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let mut cur = input
+  let to_delete : Array[Array[json5::Json5Value]] = []
+  let mut pi = 0
+  while pi < paths.length() {
+    let (p, _) = paths[pi]
+    let old_v = match jq_getpath(cur, p) {
+      Ok(v) => v
+      Err(e) => return Err(EvalSignal::Error(e))
+    }
+    let new_vs = match self.eval_collect_cap(rhs, old_v, venv, fenv, 1) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    if new_vs.length() == 0 {
+      to_delete.push(p)
+    } else {
+      cur = match jq_setpath(cur, p, 0, new_vs[0], self.limits.max_output_bytes) {
+        Ok(v) => v
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+    }
+    pi = pi + 1
+  }
+  if to_delete.length() > 0 {
+    cur = match jq_delpaths(cur, to_delete) {
+      Ok(v) => v
+      Err(e) => return Err(EvalSignal::Error(e))
+    }
+  }
+  self.emit(sink, cur)
+}
+
+fn EvalCtx::eval_compound_assign(
+  self : EvalCtx,
+  op : BinOp,
+  lhs : Int,
+  rhs : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  let rvals = match self.eval_collect(rhs, input, venv, fenv) {
+    Ok(xs) => xs
+    Err(e) => return Err(e)
+  }
+  let paths : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+  match self.eval_paths(lhs, input, venv, fenv, [], paths) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let mut ri = 0
+  while ri < rvals.length() {
+    let mut cur = input
+    let mut pi = 0
+    while pi < paths.length() {
+      let (p, _) = paths[pi]
+      let old_v = match jq_getpath(cur, p) {
+        Ok(v) => v
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      let nv = match op {
+        BinOp::AddAssign => jq_add(old_v, rvals[ri], self.limits.max_output_bytes)
+        BinOp::SubAssign => jq_sub(old_v, rvals[ri])
+        BinOp::MulAssign => jq_mul(old_v, rvals[ri], self.limits)
+        BinOp::DivAssign => jq_div(old_v, rvals[ri])
+        BinOp::ModAssign => jq_mod(old_v, rvals[ri])
+        BinOp::AltAssign => Ok(if jq_truthy(old_v) { old_v } else { rvals[ri] })
+        _ => Err(JqError::RuntimeError("unexpected compound assign"))
+      }
+      let new_val = match nv {
+        Ok(v) => v
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      cur = match jq_setpath(cur, p, 0, new_val, self.limits.max_output_bytes) {
+        Ok(v) => v
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      pi = pi + 1
+    }
+    match self.emit(sink, cur) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    ri = ri + 1
+  }
+  Ok(())
+}
+
+fn EvalCtx::eval_call(
+  self : EvalCtx,
+  name : String,
+  args : Array[Int],
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  // 1. Check user-defined functions first (lexical shadowing)
+  match self.lookup_func(fenv, name, args.length()) {
+    Some(def_id) => {
+      let fdef = self.func_defs[def_id]
+      let mut call_fenv = fdef.func_env
+      let mut i = 0
+      while i < fdef.params.length() {
+        // Bind each parameter as a 0-arity closure capturing caller's venv & fenv
+        let arg_def_id = self.func_defs.length()
+        let arg_node_id = self.func_nodes.length()
+        self.func_defs.push(
+          FuncDef::{
+            name: fdef.params[i],
+            params: [],
+            body: args[i],
+            var_env: venv,
+            func_env: fenv,
+          },
+        )
+        self.func_nodes.push(
+          FuncNode::{
+            name: fdef.params[i],
+            arity: 0,
+            def_id: arg_def_id,
+            prev: call_fenv,
+          },
+        )
+        call_fenv = arg_node_id
+        i = i + 1
+      }
+      return self.eval(fdef.body, input, fdef.var_env, call_fenv, sink)
+    }
+    None => ()
+  }
+  // 2. Built-in functions
+  let arity = args.length()
+  if arity == 0 {
+    self.eval_builtin_0(name, input, sink)
+  } else if arity == 1 {
+    self.eval_builtin_1(name, args[0], input, venv, fenv, sink)
+  } else if arity == 2 {
+    self.eval_builtin_2(name, args[0], args[1], input, venv, fenv, sink)
+  } else if arity == 3 {
+    self.eval_builtin_3(name, args[0], args[1], args[2], input, venv, fenv, sink)
+  } else {
+    Err(
+      EvalSignal::Error(
+        JqError::CompileError("unknown function " + name + "/" + arity.to_string()),
+      ),
+    )
+  }
+}
+
+fn EvalCtx::eval_builtin_0(
+  self : EvalCtx,
+  name : String,
+  input : json5::Json5Value,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  if name == "empty" {
+    return Ok(())
+  }
+  if name == "not" {
+    return self.emit(sink, json5::Json5Value::Bool(!jq_truthy(input)))
+  }
+  if name == "type" {
+    return self.emit(sink, json5::Json5Value::Str(jq_type_name(input)))
+  }
+  if name == "length" {
+    let n = match input {
+      json5::Json5Value::Null => 0.0
+      json5::Json5Value::Str(s) => utf8_char_len(s).to_double()
+      json5::Json5Value::Array(xs) => xs.length().to_double()
+      json5::Json5Value::Object(es) => sort_obj_entries(es).length().to_double()
+      json5::Json5Value::Number(x) => if x < 0.0 { -x } else { x }
+      other =>
+      return Err(
+        EvalSignal::Error(
+          JqError::RuntimeError(jq_type_name(other) + " has no length"),
+        ),
+      )
+    }
+    return self.emit(sink, json5::Json5Value::Number(n))
+  }
+  if name == "utf8bytelength" {
+    match input {
+      json5::Json5Value::Str(s) =>
+      return self.emit(sink, json5::Json5Value::Number(s.length().to_double()))
+      other =>
+      return Err(
+        EvalSignal::Error(
+          JqError::RuntimeError(jq_type_name(other) + " only strings have UTF-8 byte length"),
+        ),
+      )
+    }
+  }
+  if name == "keys" || name == "keys_unsorted" {
+    match input {
+      json5::Json5Value::Object(es) => {
+        let out : Array[json5::Json5Value] = []
+        if name == "keys" {
+          let sorted = sort_obj_entries(es)
+          let mut i = 0
+          while i < sorted.length() {
+            let (k, _) = sorted[i]
+            out.push(json5::Json5Value::Str(k))
+            i = i + 1
+          }
+        } else {
+          let seen : Map[String, Bool] = Map::new()
+          let mut i = 0
+          while i < es.length() {
+            let (k, _) = es[i]
+            match seen.get(k) {
+              Some(_) => ()
+              None => {
+                seen.set(k, true)
+                out.push(json5::Json5Value::Str(k))
+              }
+            }
+            i = i + 1
+          }
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      json5::Json5Value::Array(xs) => {
+        let out : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < xs.length() {
+          out.push(json5::Json5Value::Number(i.to_double()))
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      other =>
+      return Err(
+        EvalSignal::Error(
+          JqError::RuntimeError(jq_type_name(other) + " has no keys"),
+        ),
+      )
+    }
+  }
+  if name == "values" {
+    return match input {
+      json5::Json5Value::Null => Ok(())
+      _ => self.emit(sink, input)
+    }
+  }
+  if name == "error" {
+    return Err(EvalSignal::Error(JqError::UserError(input)))
+  }
+  if name == "nan" {
+    return self.emit(sink, json5::Json5Value::Number(0.0 / 0.0))
+  }
+  if name == "infinite" {
+    return self.emit(sink, json5::Json5Value::Number(1.0 / 0.0))
+  }
+  if name == "isnan" {
+    let b = match input {
+      json5::Json5Value::Number(x) => is_nan_f64(x)
+      _ => false
+    }
+    return self.emit(sink, json5::Json5Value::Bool(b))
+  }
+  if name == "isinfinite" {
+    let b = match input {
+      json5::Json5Value::Number(x) => is_inf_f64(x)
+      _ => false
+    }
+    return self.emit(sink, json5::Json5Value::Bool(b))
+  }
+  if name == "isfinite" {
+    let b = match input {
+      json5::Json5Value::Number(x) => is_finite_f64(x)
+      _ => false
+    }
+    return self.emit(sink, json5::Json5Value::Bool(b))
+  }
+  if name == "isnormal" {
+    let b = match input {
+      json5::Json5Value::Number(x) => is_normal_f64(x)
+      _ => false
+    }
+    return self.emit(sink, json5::Json5Value::Bool(b))
+  }
+  if name == "floor" {
+    match input {
+      json5::Json5Value::Number(x) => return self.emit(sink, json5::Json5Value::Number(f64_floor(x)))
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("floor requires a number")))
+    }
+  }
+  if name == "ceil" {
+    match input {
+      json5::Json5Value::Number(x) => return self.emit(sink, json5::Json5Value::Number(f64_ceil(x)))
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("ceil requires a number")))
+    }
+  }
+  if name == "trunc" {
+    match input {
+      json5::Json5Value::Number(x) => return self.emit(sink, json5::Json5Value::Number(f64_trunc(x)))
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("trunc requires a number")))
+    }
+  }
+  if name == "fabs" || name == "abs" {
+    match input {
+      json5::Json5Value::Number(x) =>
+      return self.emit(sink, json5::Json5Value::Number(if x < 0.0 { -x } else { x }))
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("abs requires a number")))
+    }
+  }
+  if name == "add" {
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("add requires an array")))
+    }
+    let mut acc = json5::Json5Value::Null
+    let mut i = 0
+    while i < items.length() {
+      acc = match jq_add(acc, items[i], self.limits.max_output_bytes) {
+        Ok(v) => v
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      i = i + 1
+    }
+    return self.emit(sink, acc)
+  }
+  if name == "any" {
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("any requires an array")))
+    }
+    let mut i = 0
+    while i < items.length() {
+      if jq_truthy(items[i]) {
+        return self.emit(sink, json5::Json5Value::Bool(true))
+      }
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Bool(false))
+  }
+  if name == "all" {
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("all requires an array")))
+    }
+    let mut i = 0
+    while i < items.length() {
+      if !jq_truthy(items[i]) {
+        return self.emit(sink, json5::Json5Value::Bool(false))
+      }
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Bool(true))
+  }
+  if name == "first" {
+    match input {
+      json5::Json5Value::Array(xs) =>
+      return self.emit(sink, if xs.length() > 0 { xs[0] } else { json5::Json5Value::Null })
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("first requires an array")))
+    }
+  }
+  if name == "last" {
+    match input {
+      json5::Json5Value::Array(xs) =>
+      return self.emit(
+        sink,
+        if xs.length() > 0 { xs[xs.length() - 1] } else { json5::Json5Value::Null },
+      )
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("last requires an array")))
+    }
+  }
+  if name == "reverse" {
+    match input {
+      json5::Json5Value::Array(xs) => {
+        let out : Array[json5::Json5Value] = []
+        let mut i = xs.length() - 1
+        while i >= 0 {
+          out.push(xs[i])
+          i = i - 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("reverse requires an array")))
+    }
+  }
+  if name == "sort" {
+    match input {
+      json5::Json5Value::Array(xs) =>
+      return self.emit(sink, json5::Json5Value::Array(sort_values(xs)))
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("sort requires an array")))
+    }
+  }
+  if name == "unique" {
+    match input {
+      json5::Json5Value::Array(xs) => {
+        let sorted = sort_values(xs)
+        let out : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < sorted.length() {
+          if i == 0 || jq_cmp(sorted[i - 1], sorted[i]) != 0 {
+            out.push(sorted[i])
+          }
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("unique requires an array")))
+    }
+  }
+  if name == "min" || name == "max" {
+    match input {
+      json5::Json5Value::Array(xs) => {
+        if xs.length() == 0 {
+          return self.emit(sink, json5::Json5Value::Null)
+        }
+        let mut best = xs[0]
+        let mut i = 1
+        while i < xs.length() {
+          let c = jq_cmp(xs[i], best)
+          if (name == "min" && c < 0) || (name == "max" && c > 0) {
+            best = xs[i]
+          }
+          i = i + 1
+        }
+        return self.emit(sink, best)
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError(name + " requires an array")))
+    }
+  }
+  if name == "flatten" {
+    match input {
+      json5::Json5Value::Array(xs) => {
+        let out : Array[json5::Json5Value] = []
+        match self.flatten_into(xs, -1, out) {
+          Err(e) => return Err(e)
+          Ok(_) => return self.emit(sink, json5::Json5Value::Array(out))
+        }
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("flatten requires an array")))
+    }
+  }
+  if name == "transpose" {
+    match input {
+      json5::Json5Value::Array(rows) => {
+        let mut max_cols = 0
+        let mut i = 0
+        while i < rows.length() {
+          match rows[i] {
+            json5::Json5Value::Array(r) =>
+            if r.length() > max_cols {
+              max_cols = r.length()
+            }
+            _ => return Err(EvalSignal::Error(JqError::RuntimeError("transpose requires array of arrays")))
+          }
+          i = i + 1
+        }
+        let out : Array[json5::Json5Value] = []
+        let mut c = 0
+        while c < max_cols {
+          let col : Array[json5::Json5Value] = []
+          let mut r = 0
+          while r < rows.length() {
+            match rows[r] {
+              json5::Json5Value::Array(row) =>
+              if c < row.length() {
+                col.push(row[c])
+              } else {
+                col.push(json5::Json5Value::Null)
+              }
+              _ => ()
+            }
+            r = r + 1
+          }
+          out.push(json5::Json5Value::Array(col))
+          c = c + 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("transpose requires an array")))
+    }
+  }
+  if name == "combinations" {
+    match input {
+      json5::Json5Value::Array(groups) =>
+      return self.eval_combinations(groups, 0, [], sink)
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("combinations requires an array of arrays")))
+    }
+  }
+  if name == "to_entries" {
+    match input {
+      json5::Json5Value::Object(es) => {
+        let out : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < es.length() {
+          let (k, v) = es[i]
+          out.push(
+            json5::Json5Value::Object([
+              ("key", json5::Json5Value::Str(k)),
+              ("value", v),
+            ]),
+          )
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      json5::Json5Value::Array(xs) => {
+        let out : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < xs.length() {
+          out.push(
+            json5::Json5Value::Object([
+              ("key", json5::Json5Value::Number(i.to_double())),
+              ("value", xs[i]),
+            ]),
+          )
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("to_entries requires object or array")))
+    }
+  }
+  if name == "from_entries" {
+    match input {
+      json5::Json5Value::Array(xs) => {
+        let mut entries : Array[(String, json5::Json5Value)] = []
+        let mut i = 0
+        while i < xs.length() {
+          match xs[i] {
+            json5::Json5Value::Object(es) => {
+              let k_opt = match obj_get_last(es, "key") {
+                Some(v) => Some(v)
+                None => match obj_get_last(es, "Key") {
+                  Some(v) => Some(v)
+                  None => match obj_get_last(es, "name") {
+                    Some(v) => Some(v)
+                    None => obj_get_last(es, "Name")
+                  }
+                }
+              }
+              let key = match k_opt {
+                Some(json5::Json5Value::Str(s)) => s
+                _ => return Err(EvalSignal::Error(JqError::RuntimeError("from_entries requires string key")))
+              }
+              let val_opt = match obj_get_last(es, "value") {
+                Some(v) => Some(v)
+                None => obj_get_last(es, "Value")
+              }
+              let v = match val_opt {
+                Some(x) => x
+                None => json5::Json5Value::Null
+              }
+              entries = obj_set_entry(entries, key, v)
+            }
+            _ => return Err(EvalSignal::Error(JqError::RuntimeError("from_entries requires array of objects")))
+          }
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Object(entries))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("from_entries requires an array")))
+    }
+  }
+  if name == "arrays" {
+    return match input {
+      json5::Json5Value::Array(_) => self.emit(sink, input)
+      _ => Ok(())
+    }
+  }
+  if name == "objects" {
+    return match input {
+      json5::Json5Value::Object(_) => self.emit(sink, input)
+      _ => Ok(())
+    }
+  }
+  if name == "iterables" {
+    return match input {
+      json5::Json5Value::Array(_) | json5::Json5Value::Object(_) => self.emit(sink, input)
+      _ => Ok(())
+    }
+  }
+  if name == "booleans" {
+    return match input {
+      json5::Json5Value::Bool(_) => self.emit(sink, input)
+      _ => Ok(())
+    }
+  }
+  if name == "numbers" {
+    return match input {
+      json5::Json5Value::Number(_) => self.emit(sink, input)
+      _ => Ok(())
+    }
+  }
+  if name == "strings" {
+    return match input {
+      json5::Json5Value::Str(_) => self.emit(sink, input)
+      _ => Ok(())
+    }
+  }
+  if name == "nulls" {
+    return match input {
+      json5::Json5Value::Null => self.emit(sink, input)
+      _ => Ok(())
+    }
+  }
+  if name == "scalars" {
+    return match input {
+      json5::Json5Value::Array(_) | json5::Json5Value::Object(_) => Ok(())
+      _ => self.emit(sink, input)
+    }
+  }
+  if name == "leaf_paths" {
+    return self.emit_leaf_paths(input, [], sink)
+  }
+  if name == "paths" {
+    return self.emit_all_paths(input, [], sink)
+  }
+  if name == "recurse" {
+    return self.eval_recurse(input, sink)
+  }
+  if name == "tostring" {
+    match jq_tostring_val(input) {
+      Ok(s) => return self.emit(sink, json5::Json5Value::Str(s))
+      Err(e) => return Err(EvalSignal::Error(e))
+    }
+  }
+  if name == "tonumber" {
+    match input {
+      json5::Json5Value::Number(_) => return self.emit(sink, input)
+      json5::Json5Value::Str(s) =>
+      match json5::parse_with_options(s, json5::ParseOptions::strict_json()) {
+        Ok(json5::Json5Value::Number(x)) =>
+        return self.emit(sink, json5::Json5Value::Number(x))
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("string cannot be parsed as a number")))
+      }
+      other =>
+      return Err(
+        EvalSignal::Error(
+          JqError::RuntimeError(jq_type_name(other) + " cannot be parsed as a number"),
+        ),
+      )
+    }
+  }
+  if name == "tojson" {
+    match serialize_jq_json(input, false) {
+      Ok(s) => return self.emit(sink, json5::Json5Value::Str(s))
+      Err(e) => return Err(EvalSignal::Error(e))
+    }
+  }
+  if name == "fromjson" {
+    match input {
+      json5::Json5Value::Str(s) =>
+      match parse_json(s) {
+        Ok(v) => return self.emit(sink, v)
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("fromjson requires a string")))
+    }
+  }
+  if name == "ascii_downcase" {
+    match input {
+      json5::Json5Value::Str(s) =>
+      return self.emit(sink, json5::Json5Value::Str(str_ascii_downcase(s)))
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("ascii_downcase requires a string")))
+    }
+  }
+  if name == "ascii_upcase" {
+    match input {
+      json5::Json5Value::Str(s) =>
+      return self.emit(sink, json5::Json5Value::Str(str_ascii_upcase(s)))
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("ascii_upcase requires a string")))
+    }
+  }
+  if name == "explode" {
+    match input {
+      json5::Json5Value::Str(s) => {
+        let cps = utf8_explode(s)
+        let out : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < cps.length() {
+          out.push(json5::Json5Value::Number(cps[i].to_double()))
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("explode requires a string")))
+    }
+  }
+  if name == "implode" {
+    match input {
+      json5::Json5Value::Array(xs) => {
+        let sb = StringBuilder::new()
+        let mut i = 0
+        while i < xs.length() {
+          match xs[i] {
+            json5::Json5Value::Number(x) =>
+            match f64_to_int_index(x) {
+              Some(cp) =>
+              if cp >= 0 && cp <= 0x10FFFF {
+                write_utf8_cp(sb, cp)
+              } else {
+                write_utf8_cp(sb, 0xFFFD)
+              }
+              None => return Err(EvalSignal::Error(JqError::RuntimeError("invalid codepoint in implode")))
+            }
+            _ => return Err(EvalSignal::Error(JqError::RuntimeError("implode requires array of numbers")))
+          }
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Str(sb.to_string()))
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("implode requires an array")))
+    }
+  }
+  Err(EvalSignal::Error(JqError::CompileError("unknown function " + name + "/0")))
+}
+
+fn EvalCtx::flatten_into(
+  self : EvalCtx,
+  xs : Array[json5::Json5Value],
+  depth_left : Int,
+  out : Array[json5::Json5Value],
+) -> Result[Unit, EvalSignal] {
+  let mut i = 0
+  while i < xs.length() {
+    match self.step() {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    match xs[i] {
+      json5::Json5Value::Array(sub) =>
+      if depth_left != 0 {
+        let next_d = if depth_left > 0 { depth_left - 1 } else { -1 }
+        match self.flatten_into(sub, next_d, out) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+      } else {
+        out.push(xs[i])
+      }
+      _ => out.push(xs[i])
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+fn EvalCtx::eval_combinations(
+  self : EvalCtx,
+  groups : Array[json5::Json5Value],
+  idx : Int,
+  prefix : Array[json5::Json5Value],
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  if idx >= groups.length() {
+    let copy : Array[json5::Json5Value] = []
+    let mut i = 0
+    while i < prefix.length() {
+      copy.push(prefix[i])
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Array(copy))
+  }
+  match groups[idx] {
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      while i < items.length() {
+        prefix.push(items[i])
+        match self.eval_combinations(groups, idx + 1, prefix, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        let _ = prefix.pop()
+        i = i + 1
+      }
+      Ok(())
+    }
+    _ => Err(EvalSignal::Error(JqError::RuntimeError("combinations requires array of arrays")))
+  }
+}
+
+fn EvalCtx::emit_leaf_paths(
+  self : EvalCtx,
+  v : json5::Json5Value,
+  prefix : Array[json5::Json5Value],
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  match self.step() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match v {
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      while i < items.length() {
+        let p = clone_path_with(prefix, json5::Json5Value::Number(i.to_double()))
+        match self.emit_leaf_paths(items[i], p, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    json5::Json5Value::Object(entries) => {
+      let mut i = 0
+      while i < entries.length() {
+        let (k, ev) = entries[i]
+        let p = clone_path_with(prefix, json5::Json5Value::Str(k))
+        match self.emit_leaf_paths(ev, p, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    _ => self.emit(sink, json5::Json5Value::Array(prefix))
+  }
+}
+
+fn EvalCtx::emit_all_paths(
+  self : EvalCtx,
+  v : json5::Json5Value,
+  prefix : Array[json5::Json5Value],
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  match self.step() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match v {
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      while i < items.length() {
+        let p = clone_path_with(prefix, json5::Json5Value::Number(i.to_double()))
+        match self.emit(sink, json5::Json5Value::Array(p)) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        match self.emit_all_paths(items[i], p, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    json5::Json5Value::Object(entries) => {
+      let mut i = 0
+      while i < entries.length() {
+        let (k, ev) = entries[i]
+        let p = clone_path_with(prefix, json5::Json5Value::Str(k))
+        match self.emit(sink, json5::Json5Value::Array(p)) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        match self.emit_all_paths(ev, p, sink) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        i = i + 1
+      }
+      Ok(())
+    }
+    _ => Ok(())
+  }
+}
+
+fn EvalCtx::eval_builtin_1(
+  self : EvalCtx,
+  name : String,
+  arg0 : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  if name == "select" {
+    let cs = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < cs.length() {
+      if jq_truthy(cs[i]) {
+        match self.emit(sink, input) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "map" {
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      json5::Json5Value::Object(es) => {
+        let arr : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < es.length() {
+          let (_, ev) = es[i]
+          arr.push(ev)
+          i = i + 1
+        }
+        arr
+      }
+      other =>
+      return Err(
+        EvalSignal::Error(
+          JqError::RuntimeError("cannot iterate over " + jq_type_name(other)),
+        ),
+      )
+    }
+    let out : Array[json5::Json5Value] = []
+    let mut i = 0
+    while i < items.length() {
+      let ys = match self.eval_collect(arg0, items[i], venv, fenv) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let mut j = 0
+      while j < ys.length() {
+        out.push(ys[j])
+        j = j + 1
+      }
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Array(out))
+  }
+  if name == "map_values" {
+    match input {
+      json5::Json5Value::Object(es) => {
+        let out : Array[(String, json5::Json5Value)] = []
+        let mut i = 0
+        while i < es.length() {
+          let (k, ev) = es[i]
+          let ys = match self.eval_collect_cap(arg0, ev, venv, fenv, 1) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          if ys.length() > 0 {
+            out.push((k, ys[0]))
+          }
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Object(out))
+      }
+      json5::Json5Value::Array(xs) => {
+        let out : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < xs.length() {
+          let ys = match self.eval_collect_cap(arg0, xs[i], venv, fenv, 1) {
+            Ok(v) => v
+            Err(e) => return Err(e)
+          }
+          if ys.length() > 0 {
+            out.push(ys[0])
+          }
+          i = i + 1
+        }
+        return self.emit(sink, json5::Json5Value::Array(out))
+      }
+      other =>
+      return Err(
+        EvalSignal::Error(
+          JqError::RuntimeError("cannot iterate over " + jq_type_name(other)),
+        ),
+      )
+    }
+  }
+  if name == "with_entries" {
+    let entries_arr = match input {
+      json5::Json5Value::Object(es) => {
+        let arr : Array[json5::Json5Value] = []
+        let mut i = 0
+        while i < es.length() {
+          let (k, v) = es[i]
+          arr.push(
+            json5::Json5Value::Object([
+              ("key", json5::Json5Value::Str(k)),
+              ("value", v),
+            ]),
+          )
+          i = i + 1
+        }
+        arr
+      }
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("with_entries requires an object")))
+    }
+    let mut out_entries : Array[(String, json5::Json5Value)] = []
+    let mut i = 0
+    while i < entries_arr.length() {
+      let ys = match self.eval_collect(arg0, entries_arr[i], venv, fenv) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let mut j = 0
+      while j < ys.length() {
+        match ys[j] {
+          json5::Json5Value::Object(es) => {
+            let k_opt = match obj_get_last(es, "key") {
+              Some(v) => Some(v)
+              None => match obj_get_last(es, "Key") {
+                Some(v) => Some(v)
+                None => match obj_get_last(es, "name") {
+                  Some(v) => Some(v)
+                  None => obj_get_last(es, "Name")
+                }
+              }
+            }
+            let key = match k_opt {
+              Some(json5::Json5Value::Str(s)) => s
+              _ => return Err(EvalSignal::Error(JqError::RuntimeError("with_entries requires string key")))
+            }
+            let val_opt = match obj_get_last(es, "value") {
+              Some(v) => Some(v)
+              None => obj_get_last(es, "Value")
+            }
+            let v = match val_opt {
+              Some(x) => x
+              None => json5::Json5Value::Null
+            }
+            out_entries = obj_set_entry(out_entries, key, v)
+          }
+          _ => return Err(EvalSignal::Error(JqError::RuntimeError("with_entries expects object entries")))
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Object(out_entries))
+  }
+  if name == "error" {
+    let vs = match self.eval_collect_cap(arg0, input, venv, fenv, 1) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    if vs.length() == 0 {
+      return Ok(())
+    }
+    return Err(EvalSignal::Error(JqError::UserError(vs[0])))
+  }
+  if name == "first" {
+    let vs = match self.eval_collect_cap(arg0, input, venv, fenv, 1) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    if vs.length() > 0 {
+      return self.emit(sink, vs[0])
+    }
+    return Ok(())
+  }
+  if name == "last" {
+    let vs = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    if vs.length() > 0 {
+      return self.emit(sink, vs[vs.length() - 1])
+    }
+    return Ok(())
+  }
+  if name == "isempty" {
+    let vs = match self.eval_collect_cap(arg0, input, venv, fenv, 1) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    return self.emit(sink, json5::Json5Value::Bool(vs.length() == 0))
+  }
+  if name == "any" {
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("any/1 requires an array")))
+    }
+    let mut i = 0
+    while i < items.length() {
+      let cs = match self.eval_collect(arg0, items[i], venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut j = 0
+      while j < cs.length() {
+        if jq_truthy(cs[j]) {
+          return self.emit(sink, json5::Json5Value::Bool(true))
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Bool(false))
+  }
+  if name == "all" {
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("all/1 requires an array")))
+    }
+    let mut i = 0
+    while i < items.length() {
+      let cs = match self.eval_collect(arg0, items[i], venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut j = 0
+      while j < cs.length() {
+        if !jq_truthy(cs[j]) {
+          return self.emit(sink, json5::Json5Value::Bool(false))
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Bool(true))
+  }
+  if name == "range" {
+    let bounds = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < bounds.length() {
+      match bounds[i] {
+        json5::Json5Value::Number(end_v) => {
+          let mut cur = 0.0
+          while cur < end_v {
+            match self.step() {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            match self.emit(sink, json5::Json5Value::Number(cur)) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            cur = cur + 1.0
+          }
+        }
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("range requires number")))
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "sort_by" || name == "group_by" || name == "unique_by" || name == "min_by" || name == "max_by" {
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError(name + " requires an array")))
+    }
+    if items.length() == 0 {
+      if name == "min_by" || name == "max_by" {
+        return self.emit(sink, json5::Json5Value::Null)
+      }
+      return self.emit(sink, json5::Json5Value::Array([]))
+    }
+    let keyed : Array[(json5::Json5Value, json5::Json5Value)] = []
+    let mut i = 0
+    while i < items.length() {
+      let ks = match self.eval_collect(arg0, items[i], venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      keyed.push((json5::Json5Value::Array(ks), items[i]))
+      i = i + 1
+    }
+    if name == "min_by" || name == "max_by" {
+      let (init_k, init_v) = keyed[0]
+      let mut best_k = init_k
+      let mut best_v = init_v
+      let mut j = 1
+      while j < keyed.length() {
+        let (k, v) = keyed[j]
+        let c = jq_cmp(k, best_k)
+        if (name == "min_by" && c < 0) || (name == "max_by" && c > 0) {
+          best_k = k
+          best_v = v
+        }
+        j = j + 1
+      }
+      return self.emit(sink, best_v)
+    }
+    let sorted = sort_keyed_values(keyed)
+    if name == "sort_by" {
+      let out : Array[json5::Json5Value] = []
+      let mut j = 0
+      while j < sorted.length() {
+        let (_, v) = sorted[j]
+        out.push(v)
+        j = j + 1
+      }
+      return self.emit(sink, json5::Json5Value::Array(out))
+    }
+    if name == "unique_by" {
+      let out : Array[json5::Json5Value] = []
+      let mut j = 0
+      while j < sorted.length() {
+        let (k, v) = sorted[j]
+        if j == 0 {
+          out.push(v)
+        } else {
+          let (pk, _) = sorted[j - 1]
+          if jq_cmp(pk, k) != 0 {
+            out.push(v)
+          }
+        }
+        j = j + 1
+      }
+      return self.emit(sink, json5::Json5Value::Array(out))
+    }
+    // group_by
+    let groups : Array[json5::Json5Value] = []
+    let mut cur_group : Array[json5::Json5Value] = []
+    let (init_key, first_v) = sorted[0]
+    let mut cur_key = init_key
+    cur_group.push(first_v)
+    let mut j = 1
+    while j < sorted.length() {
+      let (k, v) = sorted[j]
+      if jq_cmp(cur_key, k) == 0 {
+        cur_group.push(v)
+      } else {
+        groups.push(json5::Json5Value::Array(cur_group))
+        cur_group = [v]
+        cur_key = k
+      }
+      j = j + 1
+    }
+    groups.push(json5::Json5Value::Array(cur_group))
+    return self.emit(sink, json5::Json5Value::Array(groups))
+  }
+  if name == "path" {
+    let paths : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+    match self.eval_paths(arg0, input, venv, fenv, [], paths) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    let mut i = 0
+    while i < paths.length() {
+      let (p, _) = paths[i]
+      match self.emit(sink, json5::Json5Value::Array(p)) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "del" {
+    let paths : Array[(Array[json5::Json5Value], json5::Json5Value)] = []
+    match self.eval_paths(arg0, input, venv, fenv, [], paths) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    let raw_paths : Array[Array[json5::Json5Value]] = []
+    let mut i = 0
+    while i < paths.length() {
+      let (p, _) = paths[i]
+      raw_paths.push(p)
+      i = i + 1
+    }
+    match jq_delpaths(input, raw_paths) {
+      Ok(v) => return self.emit(sink, v)
+      Err(e) => return Err(EvalSignal::Error(e))
+    }
+  }
+  if name == "getpath" {
+    let ps = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < ps.length() {
+      match ps[i] {
+        json5::Json5Value::Array(p) =>
+        match jq_getpath(input, p) {
+          Ok(v) =>
+          match self.emit(sink, v) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+          Err(e) => return Err(EvalSignal::Error(e))
+        }
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("getpath requires array path")))
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "delpaths" {
+    let ps = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < ps.length() {
+      match ps[i] {
+        json5::Json5Value::Array(arr) => {
+          let paths : Array[Array[json5::Json5Value]] = []
+          let mut j = 0
+          while j < arr.length() {
+            match arr[j] {
+              json5::Json5Value::Array(p) => paths.push(p)
+              _ => return Err(EvalSignal::Error(JqError::RuntimeError("delpaths requires array of paths")))
+            }
+            j = j + 1
+          }
+          match jq_delpaths(input, paths) {
+            Ok(v) =>
+            match self.emit(sink, v) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            Err(e) => return Err(EvalSignal::Error(e))
+          }
+        }
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("delpaths requires an array")))
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "has" {
+    let ks = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < ks.length() {
+      let b = match (input, ks[i]) {
+        (json5::Json5Value::Object(es), json5::Json5Value::Str(k)) =>
+        match obj_get_last(es, k) {
+          Some(_) => true
+          None => false
+        }
+        (json5::Json5Value::Array(xs), json5::Json5Value::Number(x)) =>
+        match f64_to_int_index(x) {
+          Some(idx) => idx >= 0 && idx < xs.length()
+          None => false
+        }
+        _ =>
+        return Err(
+          EvalSignal::Error(
+            JqError::RuntimeError("cannot check whether " + jq_type_name(input) + " has " + jq_type_name(ks[i])),
+          ),
+        )
+      }
+      match self.emit(sink, json5::Json5Value::Bool(b)) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "in" {
+    let objs = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < objs.length() {
+      let b = match (objs[i], input) {
+        (json5::Json5Value::Object(es), json5::Json5Value::Str(k)) =>
+        match obj_get_last(es, k) {
+          Some(_) => true
+          None => false
+        }
+        (json5::Json5Value::Array(xs), json5::Json5Value::Number(x)) =>
+        match f64_to_int_index(x) {
+          Some(idx) => idx >= 0 && idx < xs.length()
+          None => false
+        }
+        _ =>
+        return Err(
+          EvalSignal::Error(
+            JqError::RuntimeError("cannot check whether " + jq_type_name(objs[i]) + " has " + jq_type_name(input)),
+          ),
+        )
+      }
+      match self.emit(sink, json5::Json5Value::Bool(b)) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "contains" || name == "inside" {
+    let vs = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < vs.length() {
+      let r = if name == "contains" {
+        jq_contains(input, vs[i])
+      } else {
+        jq_contains(vs[i], input)
+      }
+      match r {
+        Ok(b) =>
+        match self.emit(sink, json5::Json5Value::Bool(b)) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "flatten" {
+    let ds = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let xs = match input {
+      json5::Json5Value::Array(arr) => arr
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("flatten requires an array")))
+    }
+    let mut i = 0
+    while i < ds.length() {
+      match ds[i] {
+        json5::Json5Value::Number(d) => {
+          if d < 0.0 {
+            return Err(EvalSignal::Error(JqError::RuntimeError("flatten depth must not be negative")))
+          }
+          let depth = match f64_to_int_index(d) {
+            Some(n) => n
+            None => 2147483647
+          }
+          let out : Array[json5::Json5Value] = []
+          match self.flatten_into(xs, depth, out) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+          match self.emit(sink, json5::Json5Value::Array(out)) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+        }
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("flatten depth must be number")))
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "indices" || name == "index" || name == "rindex" {
+    let vs = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < vs.length() {
+      let idxs = match jq_indices(input, vs[i]) {
+        Ok(arr) => arr
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      let out_v = if name == "indices" {
+        json5::Json5Value::Array(idxs)
+      } else if name == "index" {
+        if idxs.length() > 0 { idxs[0] } else { json5::Json5Value::Null }
+      } else {
+        if idxs.length() > 0 { idxs[idxs.length() - 1] } else { json5::Json5Value::Null }
+      }
+      match self.emit(sink, out_v) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "ltrimstr" || name == "rtrimstr" || name == "startswith" || name == "endswith" || name == "split" {
+    let vs = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < vs.length() {
+      let arg_s = match vs[i] {
+        json5::Json5Value::Str(s) => s
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError(name + " requires string argument")))
+      }
+      let out_v = match input {
+        json5::Json5Value::Str(s) =>
+        if name == "startswith" {
+          json5::Json5Value::Bool(str_starts_with(s, arg_s))
+        } else if name == "endswith" {
+          json5::Json5Value::Bool(str_ends_with(s, arg_s))
+        } else if name == "ltrimstr" {
+          if str_starts_with(s, arg_s) {
+            json5::Json5Value::Str(s.slice(arg_s.length(), s.length()))
+          } else {
+            input
+          }
+        } else if name == "rtrimstr" {
+          if str_ends_with(s, arg_s) {
+            json5::Json5Value::Str(s.slice(0, s.length() - arg_s.length()))
+          } else {
+            input
+          }
+        } else {
+          json5::Json5Value::Array(str_split_literal(s, arg_s))
+        }
+        _ =>
+        if name == "ltrimstr" || name == "rtrimstr" {
+          input
+        } else {
+          return Err(EvalSignal::Error(JqError::RuntimeError(name + " requires string input")))
+        }
+      }
+      match self.emit(sink, out_v) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "join" {
+    let seps = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let items = match input {
+      json5::Json5Value::Array(xs) => xs
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("join requires an array")))
+    }
+    let mut si = 0
+    while si < seps.length() {
+      let sep = match seps[si] {
+        json5::Json5Value::Str(s) => s
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("join separator must be string")))
+      }
+      let sb = StringBuilder::new()
+      let mut total = 0
+      let mut i = 0
+      while i < items.length() {
+        if i > 0 {
+          sb.write_string(sep)
+          total = total + sep.length()
+        }
+        match items[i] {
+          json5::Json5Value::Null => ()
+          json5::Json5Value::Str(s) => {
+            sb.write_string(s)
+            total = total + s.length()
+          }
+          json5::Json5Value::Number(_) | json5::Json5Value::Bool(_) =>
+          match serialize_jq_json(items[i], false) {
+            Ok(s) => {
+              sb.write_string(s)
+              total = total + s.length()
+            }
+            Err(e) => return Err(EvalSignal::Error(e))
+          }
+          other =>
+          return Err(
+            EvalSignal::Error(
+              JqError::RuntimeError("cannot join " + jq_type_name(other)),
+            ),
+          )
+        }
+        if total > self.limits.max_output_bytes {
+          return Err(EvalSignal::Error(JqError::LimitExceeded("join exceeds max_output_bytes")))
+        }
+        i = i + 1
+      }
+      match self.emit(sink, json5::Json5Value::Str(sb.to_string())) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      si = si + 1
+    }
+    return Ok(())
+  }
+  if name == "test" || name == "match" || name == "capture" || name == "scan" || name == "splits" {
+    return self.eval_regex_builtin(name, arg0, -1, input, venv, fenv, sink)
+  }
+  Err(EvalSignal::Error(JqError::CompileError("unknown function " + name + "/1")))
+}
+
+fn EvalCtx::eval_builtin_2(
+  self : EvalCtx,
+  name : String,
+  arg0 : Int,
+  arg1 : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  if name == "limit" {
+    let ns = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < ns.length() {
+      match ns[i] {
+        json5::Json5Value::Number(x) => {
+          let n = match f64_to_int_index(x) {
+            Some(k) => k
+            None => 0
+          }
+          if n > 0 {
+            let vals = match self.eval_collect_cap(arg1, input, venv, fenv, n) {
+              Ok(xs) => xs
+              Err(e) => return Err(e)
+            }
+            let mut j = 0
+            while j < vals.length() {
+              match self.emit(sink, vals[j]) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+              j = j + 1
+            }
+          }
+        }
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("limit requires a number")))
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "nth" {
+    let ns = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < ns.length() {
+      match ns[i] {
+        json5::Json5Value::Number(x) => {
+          let n = match f64_to_int_index(x) {
+            Some(k) => k
+            None => return Err(EvalSignal::Error(JqError::RuntimeError("invalid nth index")))
+          }
+          if n < 0 {
+            return Err(EvalSignal::Error(JqError::RuntimeError("nth index cannot be negative")))
+          }
+          let vals = match self.eval_collect_cap(arg1, input, venv, fenv, n + 1) {
+            Ok(xs) => xs
+            Err(e) => return Err(e)
+          }
+          if vals.length() > n {
+            match self.emit(sink, vals[n]) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+          }
+        }
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("nth requires a number")))
+      }
+      i = i + 1
+    }
+    return Ok(())
+  }
+  if name == "range" {
+    let starts = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let ends = match self.eval_collect(arg1, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut si = 0
+    while si < starts.length() {
+      let mut ei = 0
+      while ei < ends.length() {
+        match (starts[si], ends[ei]) {
+          (json5::Json5Value::Number(s), json5::Json5Value::Number(e)) => {
+            let mut cur = s
+            while cur < e {
+              match self.step() {
+                Err(err) => return Err(err)
+                Ok(_) => ()
+              }
+              match self.emit(sink, json5::Json5Value::Number(cur)) {
+                Err(err) => return Err(err)
+                Ok(_) => ()
+              }
+              cur = cur + 1.0
+            }
+          }
+          _ => return Err(EvalSignal::Error(JqError::RuntimeError("range requires numbers")))
+        }
+        ei = ei + 1
+      }
+      si = si + 1
+    }
+    return Ok(())
+  }
+  if name == "setpath" {
+    let ps = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let vs = match self.eval_collect(arg1, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut pi = 0
+    while pi < ps.length() {
+      match ps[pi] {
+        json5::Json5Value::Array(p) => {
+          let mut vi = 0
+          while vi < vs.length() {
+            match jq_setpath(input, p, 0, vs[vi], self.limits.max_output_bytes) {
+              Ok(res) =>
+              match self.emit(sink, res) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+              Err(e) => return Err(EvalSignal::Error(e))
+            }
+            vi = vi + 1
+          }
+        }
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("setpath requires array path")))
+      }
+      pi = pi + 1
+    }
+    return Ok(())
+  }
+  if name == "any" || name == "all" {
+    let items = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut i = 0
+    while i < items.length() {
+      let cs = match self.eval_collect(arg1, items[i], venv, fenv) {
+        Ok(xs) => xs
+        Err(e) => return Err(e)
+      }
+      let mut j = 0
+      while j < cs.length() {
+        let t = jq_truthy(cs[j])
+        if name == "any" && t {
+          return self.emit(sink, json5::Json5Value::Bool(true))
+        }
+        if name == "all" && !t {
+          return self.emit(sink, json5::Json5Value::Bool(false))
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    return self.emit(sink, json5::Json5Value::Bool(name == "all"))
+  }
+  if name == "test" || name == "match" || name == "capture" || name == "scan" || name == "splits" {
+    return self.eval_regex_builtin(name, arg0, arg1, input, venv, fenv, sink)
+  }
+  if name == "sub" || name == "gsub" {
+    return self.eval_sub_builtin(name == "gsub", arg0, arg1, -1, input, venv, fenv, sink)
+  }
+  Err(EvalSignal::Error(JqError::CompileError("unknown function " + name + "/2")))
+}
+
+fn EvalCtx::eval_builtin_3(
+  self : EvalCtx,
+  name : String,
+  arg0 : Int,
+  arg1 : Int,
+  arg2 : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  if name == "range" {
+    let starts = match self.eval_collect(arg0, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let ends = match self.eval_collect(arg1, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let steps = match self.eval_collect(arg2, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let mut si = 0
+    while si < starts.length() {
+      let mut ei = 0
+      while ei < ends.length() {
+        let mut bi = 0
+        while bi < steps.length() {
+          match (starts[si], ends[ei], steps[bi]) {
+            (json5::Json5Value::Number(s), json5::Json5Value::Number(e), json5::Json5Value::Number(st)) => {
+              if st == 0.0 {
+                // jq range with step 0 produces nothing
+                ()
+              } else {
+                let mut cur = s
+                while (st > 0.0 && cur < e) || (st < 0.0 && cur > e) {
+                  match self.step() {
+                    Err(err) => return Err(err)
+                    Ok(_) => ()
+                  }
+                  match self.emit(sink, json5::Json5Value::Number(cur)) {
+                    Err(err) => return Err(err)
+                    Ok(_) => ()
+                  }
+                  cur = cur + st
+                }
+              }
+            }
+            _ => return Err(EvalSignal::Error(JqError::RuntimeError("range requires numbers")))
+          }
+          bi = bi + 1
+        }
+        ei = ei + 1
+      }
+      si = si + 1
+    }
+    return Ok(())
+  }
+  if name == "sub" || name == "gsub" {
+    return self.eval_sub_builtin(name == "gsub", arg0, arg1, arg2, input, venv, fenv, sink)
+  }
+  Err(EvalSignal::Error(JqError::CompileError("unknown function " + name + "/3")))
+}
+
+fn EvalCtx::eval_regex_builtin(
+  self : EvalCtx,
+  name : String,
+  pat_e : Int,
+  flags_e : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  let text = match input {
+    json5::Json5Value::Str(s) => s
+    _ => return Err(EvalSignal::Error(JqError::RuntimeError(name + " requires string input")))
+  }
+  let pats = match self.eval_collect(pat_e, input, venv, fenv) {
+    Ok(xs) => xs
+    Err(e) => return Err(e)
+  }
+  let flgs : Array[String] = if flags_e < 0 {
+    [""]
+  } else {
+    let fvs = match self.eval_collect(flags_e, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let arr : Array[String] = []
+    let mut k = 0
+    while k < fvs.length() {
+      match fvs[k] {
+        json5::Json5Value::Str(s) => arr.push(s)
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("regex flags must be string")))
+      }
+      k = k + 1
+    }
+    arr
+  }
+  let mut pi = 0
+  while pi < pats.length() {
+    let pat_s = match pats[pi] {
+      json5::Json5Value::Str(s) => s
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("regex pattern must be string")))
+    }
+    let mut fi = 0
+    while fi < flgs.length() {
+      let (re, is_global, ignore_empty) = match compile_jq_regex(pat_s, flgs[fi]) {
+        Ok(r) => r
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      if name == "test" {
+        match self.emit(sink, json5::Json5Value::Bool(re.is_match(text))) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+      } else if name == "match" {
+        if is_global {
+          let all_caps = re.captures_iter(text)
+          let mut ci = 0
+          while ci < all_caps.length() {
+            let m = all_caps[ci].get(0)
+            let skip = match m {
+              Some(mv) => ignore_empty && mv.start == mv.end
+              None => true
+            }
+            if !skip {
+              match self.emit(sink, captures_to_match_obj(text, re, all_caps[ci])) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+            }
+            ci = ci + 1
+          }
+        } else {
+          match re.captures(text) {
+            Some(caps) =>
+            match self.emit(sink, captures_to_match_obj(text, re, caps)) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            None => ()
+          }
+        }
+      } else if name == "capture" {
+        if is_global {
+          let all_caps = re.captures_iter(text)
+          let mut ci = 0
+          while ci < all_caps.length() {
+            match self.emit(sink, captures_to_named_obj(re, all_caps[ci])) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            ci = ci + 1
+          }
+        } else {
+          match re.captures(text) {
+            Some(caps) =>
+            match self.emit(sink, captures_to_named_obj(re, caps)) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            None => ()
+          }
+        }
+      } else if name == "scan" {
+        let all_caps = re.captures_iter(text)
+        let mut ci = 0
+        while ci < all_caps.length() {
+          let caps = all_caps[ci]
+          if caps.len() > 1 {
+            let arr : Array[json5::Json5Value] = []
+            let mut g = 1
+            while g < caps.len() {
+              match caps.get(g) {
+                Some(m) => arr.push(json5::Json5Value::Str(m.text))
+                None => arr.push(json5::Json5Value::Null)
+              }
+              g = g + 1
+            }
+            match self.emit(sink, json5::Json5Value::Array(arr)) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+          } else {
+            match caps.get(0) {
+              Some(m) =>
+              match self.emit(sink, json5::Json5Value::Str(m.text)) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+              None => ()
+            }
+          }
+          ci = ci + 1
+        }
+      } else if name == "splits" {
+        let parts = re.split(text)
+        let mut k = 0
+        while k < parts.length() {
+          match self.emit(sink, json5::Json5Value::Str(parts[k])) {
+            Err(e) => return Err(e)
+            Ok(_) => ()
+          }
+          k = k + 1
+        }
+      }
+      fi = fi + 1
+    }
+    pi = pi + 1
+  }
+  Ok(())
+}
+
+fn EvalCtx::eval_sub_builtin(
+  self : EvalCtx,
+  is_global : Bool,
+  pat_e : Int,
+  to_e : Int,
+  flags_e : Int,
+  input : json5::Json5Value,
+  venv : Int,
+  fenv : Int,
+  sink : Sink,
+) -> Result[Unit, EvalSignal] {
+  let text = match input {
+    json5::Json5Value::Str(s) => s
+    _ => return Err(EvalSignal::Error(JqError::RuntimeError("sub/gsub requires string input")))
+  }
+  let pats = match self.eval_collect(pat_e, input, venv, fenv) {
+    Ok(xs) => xs
+    Err(e) => return Err(e)
+  }
+  let flgs : Array[String] = if flags_e < 0 {
+    [""]
+  } else {
+    let fvs = match self.eval_collect(flags_e, input, venv, fenv) {
+      Ok(xs) => xs
+      Err(e) => return Err(e)
+    }
+    let arr : Array[String] = []
+    let mut k = 0
+    while k < fvs.length() {
+      match fvs[k] {
+        json5::Json5Value::Str(s) => arr.push(s)
+        _ => return Err(EvalSignal::Error(JqError::RuntimeError("regex flags must be string")))
+      }
+      k = k + 1
+    }
+    arr
+  }
+  let mut pi = 0
+  while pi < pats.length() {
+    let pat_s = match pats[pi] {
+      json5::Json5Value::Str(s) => s
+      _ => return Err(EvalSignal::Error(JqError::RuntimeError("regex pattern must be string")))
+    }
+    let mut fi = 0
+    while fi < flgs.length() {
+      let (re, flag_g, _) = match compile_jq_regex(pat_s, flgs[fi]) {
+        Ok(r) => r
+        Err(e) => return Err(EvalSignal::Error(e))
+      }
+      let do_all = is_global || flag_g
+      let matches = if do_all {
+        re.captures_iter(text)
+      } else {
+        match re.captures(text) {
+          Some(c) => [c]
+          None => []
+        }
+      }
+      let sb = StringBuilder::new()
+      let mut last_end = 0
+      let mut mi = 0
+      while mi < matches.length() {
+        let caps = matches[mi]
+        let full = match caps.get(0) {
+          Some(m) => m
+          None => break
+        }
+        sb.write_string(text.slice(last_end, full.start))
+        let cap_obj = captures_to_named_obj(re, caps)
+        let reps = match self.eval_collect_cap(to_e, cap_obj, venv, fenv, 1) {
+          Ok(xs) => xs
+          Err(e) => return Err(e)
+        }
+        if reps.length() > 0 {
+          let rep_s = match jq_tostring_val(reps[0]) {
+            Ok(s) => s
+            Err(e) => return Err(EvalSignal::Error(e))
+          }
+          sb.write_string(rep_s)
+        }
+        last_end = full.end
+        mi = mi + 1
+      }
+      sb.write_string(text.slice(last_end, text.length()))
+      let out_s = sb.to_string()
+      if out_s.length() > self.limits.max_output_bytes {
+        return Err(EvalSignal::Error(JqError::LimitExceeded("sub/gsub result exceeds max_output_bytes")))
+      }
+      match self.emit(sink, json5::Json5Value::Str(out_s)) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      fi = fi + 1
+    }
+    pi = pi + 1
+  }
+  Ok(())
+}
