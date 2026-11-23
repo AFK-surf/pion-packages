@@ -112,3 +112,16 @@ Run via `sh packages/bson/bench/run_bench.sh` against Rust **`bson 2.15.0` (`--r
 
 - Verified stdout SHA-256: `f3a6ca6a2132d4c515a511e57fcfc1b1c126809eb78834e70af071b89ad9d016`
 - Note: Rust `bson`'s public Extended JSON API goes through `serde_json::Value` (with `preserve_order` / `IndexMap`), and `into_*_extjson(self)` consumes its input (requiring a `doc.clone()` per document). Pion serializes/parses directly between `BsonDocument` and JSON text.
+
+## Formal Verification (Lean 4)
+
+The core BSON 1.1 `BinarySubtype` wire codec, `BsonLimits` defaults, `ObjectId` hex nibble decoder, and IEEE 754-2008 BID `Decimal128` 128-bit ordering & bit-layout classifiers (`src/types.pion`, `src/oid.pion`, `src/decimal128.pion`) are annotated with `#verify`, extracted directly via `pionc extract-lean` (`2` types, `13` functions, `0` externals), and formally verified in Lean 4 with **24 theorems**, **0 `sorry`**, **0 `admit`**, **0 custom `axiom`**, **0 `bv_decide`**, **0 `native_decide`**, and **42/42** native-vs-Lean differential cross-checks:
+
+- `proofs/BsonProofs/SubtypeAndLimits.lean` (12 theorems): full 256-byte `BinarySubtype::from_byte` ↔ `to_byte` wire bijection (for all `0..255` and all canonical subtypes), `to_byte` `[0, 255]` totality, `Reserved (0x0A..0x7F)` vs `UserDefined (0x80..0xFF)` range partitioning, `binary_subtype_eq` equivalence relation (reflexive, symmetric, transitive), `BsonLimits::default` / `with_validate_array_keys` invariants, and `oid_hex_val` `[0, 15]` / `-1` bounds, digit exactness, and `'A'..'F'` case-insensitivity.
+- `proofs/BsonProofs/Decimal128Core.lean` (12 theorems): exact 128-bit unsigned ordering `u128_gt` (`a_hi * 2^64 + a_lo > b_hi * 2^64 + b_lo`, irreflexive, asymmetric, transitive), `ascii_lower` exactness and idempotency, IEEE 754-2008 BID `NaN`/`Infinity`/`Zero` mutual exclusivity across all `2^128` bit patterns, canonical `+0`/`-0` signed zero verification, §3.5.2 non-canonical `comb2 = 3` → zero, and `dec128_hi_is_negative` exact MSB (`hi ≥ 2^63`) characterization.
+- `proofs/CheckAxioms.lean`: verifies all 24 theorems depend only on Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`).
+- `proofs/EvalDiff.lean`: 42-case Lean vs native Pion differential cross-check (`diff -u` zero differences).
+
+```sh
+LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/bson/proofs/run_proofs.sh
+```
