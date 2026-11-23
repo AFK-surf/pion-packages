@@ -37,12 +37,18 @@ CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release \
   --manifest-path "$OUT_DIR/rust-proj/Cargo.toml"
 cp "$OUT_DIR/rust-target/release/glsl-bench-rust" "$BIN_DIR/rust_glsl_bench"
 
-echo "==> Translating all corpus shaders & validating on macOS OpenGL 4.1 Core glCompileShader"
+echo "==> Translating all corpus shaders, printing GLSL 410 SHA-256 & validating on macOS OpenGL 4.1 Core"
 "$BIN_DIR/pion_glsl_bench" vert "$OUT_DIR/threejs_pbr_es100.vert" 1 "$OUT_DIR/threejs_pbr_410.vert" > /dev/null
 "$BIN_DIR/pion_glsl_bench" frag "$OUT_DIR/threejs_pbr_es100.frag" 1 "$OUT_DIR/threejs_pbr_410.frag" > /dev/null
 "$BIN_DIR/pion_glsl_bench" vert "$OUT_DIR/shadertoy_es300.vert" 1 "$OUT_DIR/shadertoy_410.vert" > /dev/null
 "$BIN_DIR/pion_glsl_bench" frag "$OUT_DIR/shadertoy_es300.frag" 1 "$OUT_DIR/shadertoy_410.frag" > /dev/null
 "$BIN_DIR/pion_glsl_bench" frag "$OUT_DIR/postprocess_2d_es100.frag" 1 "$OUT_DIR/postprocess_2d_410.frag" > /dev/null
+shasum -a 256 \
+  "$OUT_DIR/threejs_pbr_410.vert" \
+  "$OUT_DIR/threejs_pbr_410.frag" \
+  "$OUT_DIR/shadertoy_410.vert" \
+  "$OUT_DIR/shadertoy_410.frag" \
+  "$OUT_DIR/postprocess_2d_410.frag"
 
 if [ "$(uname -s)" = "Darwin" ]; then
   clang -O2 -Wall -Wno-deprecated-declarations "$BENCH_DIR/verify_gl41.c" -framework OpenGL -o "$BIN_DIR/verify_gl41"
