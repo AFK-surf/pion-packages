@@ -1,0 +1,703 @@
+///| Red-team differential / crash-depth / adversarial-benchmark driver for `packages/sql`.
+///|
+///| Modes (all inputs are one hex-encoded UTF-8 SQL text per line, so NUL / newlines survive):
+///|   probe <generic|sqlite|postgres> <hexfile>
+///|       per line: `ERR <msg>` or
+///|       `OK <n_stmts> <hex statements_to_sql> <RP_OK|RP_ERR> <stable 0/1> <tables> <placeholders>`
+///|       (tables / placeholders: per statement `|`-joined, statements `;`-joined)
+///|   pexpr <dialect> <hexfile>   fully parenthesised first projection expression (hex), or ERR
+///|   split <hexfile>             `OK <hex piece>,<hex piece>,...` or `ERR <msg>`
+///|   deep <shape> <n> <max_depth> <stages>   build an n-deep input, parse it, then run stages
+///|       (comma list of sql,tables,ph,eq) and drop the AST; prints one line per finished stage
+///|   adv <workload> <file> <rounds>          adversarial benchmark workloads (stdout matches rust_oracle adv)
+
+import "sql"
+
+///|
+fn hexval(b : Int) -> Int {
+  if b >= 48 && b <= 57 {
+    b - 48
+  } else if b >= 97 && b <= 102 {
+    b - 87
+  } else if b >= 65 && b <= 70 {
+    b - 55
+  } else {
+    0
+  }
+}
+
+///|
+fn unhex(h : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i + 1 < h.length() {
+    sb.write_byte(
+      ((hexval(h.code_unit_at(i)) << 4) | hexval(h.code_unit_at(i + 1))).to_byte(),
+    )
+    i = i + 2
+  }
+  sb.to_string()
+}
+
+///|
+fn hexdig(d : Int) -> Byte {
+  if d < 10 {
+    (48 + d).to_byte()
+  } else {
+    (87 + d).to_byte()
+  }
+}
+
+///|
+fn write_hex_str(sb : StringBuilder, s : String) -> Unit {
+  let mut i = 0
+  while i < s.length() {
+    let b = s.code_unit_at(i)
+    sb.write_byte(hexdig((b >> 4) & 15))
+    sb.write_byte(hexdig(b & 15))
+    i = i + 1
+  }
+}
+
+///|
+fn split_lines(content : String) -> Array[String] {
+  let lines : Array[String] = []
+  let n = content.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if content.code_unit_at(i) == 10 {
+      lines.push(content.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if n > start {
+    lines.push(content.slice(start, n))
+  }
+  lines
+}
+
+///|
+fn parse_pos_int(s : String) -> Int {
+  let mut acc = 0
+  let mut i = 0
+  while i < s.length() {
+    let b = s.code_unit_at(i)
+    if b >= 48 && b <= 57 {
+      acc = acc * 10 + (b - 48)
+    }
+    i = i + 1
+  }
+  acc
+}
+
+///|
+fn opts_for(d : String) -> sql::ParseOptions {
+  if d == "sqlite" {
+    sql::ParseOptions::sqlite()
+  } else if d == "postgres" {
+    sql::ParseOptions::postgres()
+  } else {
+    sql::ParseOptions::default()
+  }
+}
+
+///|
+fn one_line(s : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let b = s.code_unit_at(i)
+    if b == 10 || b == 9 || b == 13 {
+      sb.write_byte((32).to_byte())
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn join_strs(sb : StringBuilder, xs : Array[String], sep : Int) -> Unit {
+  let mut i = 0
+  while i < xs.length() {
+    if i > 0 {
+      sb.write_byte(sep.to_byte())
+    }
+    sb.write_string(xs[i])
+    i = i + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fully parenthesised expression printer (independent of the package's
+// formatter): every compound sub-expression is wrapped in `( )`, so the text
+// fixes the tree shape the Pion parser chose and can be evaluated by a real
+// database to compare precedence.
+// ---------------------------------------------------------------------------
+
+///|
+fn pexprs(sb : StringBuilder, xs : Array[sql::Expr]) -> Unit {
+  let mut i = 0
+  while i < xs.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    pexpr(sb, xs[i])
+    i = i + 1
+  }
+}
+
+///|
+fn pexpr(sb : StringBuilder, e : sql::Expr) -> Unit {
+  match e {
+    sql::Expr::UnaryOp(op, x) => {
+      sb.write_string("(")
+      match op {
+        sql::UnaryOperator::Plus => sb.write_string("+ ")
+        sql::UnaryOperator::Minus => sb.write_string("- ")
+        sql::UnaryOperator::Not => sb.write_string("NOT ")
+        sql::UnaryOperator::BitwiseNot => sb.write_string("~ ")
+      }
+      pexpr(sb, x)
+      sb.write_string(")")
+    }
+    sql::Expr::BinaryOp(l, _, r) => {
+      // operator text taken from the package formatter on a two-leaf copy
+      let probe = sql::expr_to_sql(
+        sql::Expr::BinaryOp(
+          sql::Expr::Identifier(sql::Ident::new("L")),
+          op_of(e),
+          sql::Expr::Identifier(sql::Ident::new("R")),
+        ),
+      )
+      let optext = probe.slice(1, probe.length() - 1)
+      sb.write_string("(")
+      pexpr(sb, l)
+      sb.write_string(optext)
+      pexpr(sb, r)
+      sb.write_string(")")
+    }
+    sql::Expr::IsNull(x) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(" IS NULL)")
+    }
+    sql::Expr::IsNotNull(x) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(" IS NOT NULL)")
+    }
+    sql::Expr::IsTrue(x) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(" IS TRUE)")
+    }
+    sql::Expr::IsNotTrue(x) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(" IS NOT TRUE)")
+    }
+    sql::Expr::IsFalse(x) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(" IS FALSE)")
+    }
+    sql::Expr::IsNotFalse(x) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(" IS NOT FALSE)")
+    }
+    sql::Expr::IsDistinctFrom(l, r) => {
+      sb.write_string("(")
+      pexpr(sb, l)
+      sb.write_string(" IS DISTINCT FROM ")
+      pexpr(sb, r)
+      sb.write_string(")")
+    }
+    sql::Expr::IsNotDistinctFrom(l, r) => {
+      sb.write_string("(")
+      pexpr(sb, l)
+      sb.write_string(" IS NOT DISTINCT FROM ")
+      pexpr(sb, r)
+      sb.write_string(")")
+    }
+    sql::Expr::InList(x, list, neg) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(if neg { " NOT IN (" } else { " IN (" })
+      pexprs(sb, list)
+      sb.write_string("))")
+    }
+    sql::Expr::Between(x, neg, lo, hi) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(if neg { " NOT BETWEEN " } else { " BETWEEN " })
+      pexpr(sb, lo)
+      sb.write_string(" AND ")
+      pexpr(sb, hi)
+      sb.write_string(")")
+    }
+    sql::Expr::Like(x, neg, ci, pat, esc) => {
+      sb.write_string("(")
+      pexpr(sb, x)
+      if neg {
+        sb.write_string(" NOT")
+      }
+      sb.write_string(if ci { " ILIKE " } else { " LIKE " })
+      pexpr(sb, pat)
+      match esc {
+        Some(s) => {
+          sb.write_string(" ESCAPE ")
+          sb.write_string(sql::expr_to_sql(sql::Expr::SingleQuotedString(s)))
+        }
+        None => ()
+      }
+      sb.write_string(")")
+    }
+    sql::Expr::Cast(x, dt, pg) => {
+      // render as CAST(... AS T) so the operand shape is explicit
+      let t = sql::expr_to_sql(sql::Expr::Cast(sql::Expr::Null, dt, true))
+      let _ = pg
+      sb.write_string("CAST(")
+      pexpr(sb, x)
+      sb.write_string(" AS ")
+      sb.write_string(t.slice(6, t.length()))
+      sb.write_string(")")
+    }
+    sql::Expr::Nested(x) => pexpr(sb, x)
+    sql::Expr::Tuple(xs) => {
+      sb.write_string("(")
+      pexprs(sb, xs)
+      sb.write_string(")")
+    }
+    sql::Expr::Array(xs) => {
+      sb.write_string("ARRAY[")
+      pexprs(sb, xs)
+      sb.write_string("]")
+    }
+    sql::Expr::Subscript(b, i) => {
+      sb.write_string("(")
+      pexpr(sb, b)
+      sb.write_string(")[")
+      pexpr(sb, i)
+      sb.write_string("]")
+    }
+    sql::Expr::Case(op, branches, er) => {
+      sb.write_string("(CASE")
+      match op {
+        Some(o) => {
+          sb.write_string(" ")
+          pexpr(sb, o)
+        }
+        None => ()
+      }
+      let mut i = 0
+      while i < branches.length() {
+        let (c, r) = branches[i]
+        sb.write_string(" WHEN ")
+        pexpr(sb, c)
+        sb.write_string(" THEN ")
+        pexpr(sb, r)
+        i = i + 1
+      }
+      match er {
+        Some(x) => {
+          sb.write_string(" ELSE ")
+          pexpr(sb, x)
+        }
+        None => ()
+      }
+      sb.write_string(" END)")
+    }
+    sql::Expr::Collate(x, c) => {
+      let t = sql::expr_to_sql(sql::Expr::Collate(sql::Expr::Null, c))
+      sb.write_string("(")
+      pexpr(sb, x)
+      sb.write_string(t.slice(4, t.length()))
+      sb.write_string(")")
+    }
+    _ => sb.write_string(sql::expr_to_sql(e))
+  }
+}
+
+///|
+fn op_of(e : sql::Expr) -> sql::BinaryOperator {
+  match e {
+    sql::Expr::BinaryOp(_, op, _) => op
+    _ => sql::BinaryOperator::Eq
+  }
+}
+
+///|
+fn first_proj_expr(stmt : sql::Statement) -> Option[sql::Expr] {
+  match stmt {
+    sql::Statement::Query(q) =>
+    match q.body {
+      sql::SetExpr::Select(sel) =>
+      if sel.projection.length() == 0 {
+        None
+      } else {
+        match sel.projection[0] {
+          sql::SelectItem::UnnamedExpr(x) => Some(x)
+          sql::SelectItem::ExprWithAlias(x, _) => Some(x)
+          _ => None
+        }
+      }
+      _ => None
+    }
+    _ => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+///|
+fn run_probe(world : World, dialect : String, path : String) -> Int {
+  let content = match fs_read(world, path) {
+    Ok(s) => s
+    Err(_) => return 2
+  }
+  let opts = opts_for(dialect)
+  let lines = split_lines(content)
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < lines.length() {
+    match sql::parse_with_options(unhex(lines[i]), opts) {
+      Err(e) => {
+        sb.write_string("ERR ")
+        sb.write_string(one_line(e.message))
+      }
+      Ok(stmts) => {
+        let text = sql::statements_to_sql(stmts)
+        sb.write_string("OK ")
+        sb.write_string(stmts.length().to_string())
+        sb.write_byte((32).to_byte())
+        write_hex_str(sb, text)
+        match sql::parse_with_options(text, opts) {
+          Ok(re) => {
+            sb.write_string(" RP_OK ")
+            let same = sql::statements_to_sql(re) == text && re.length() == stmts.length()
+            sb.write_string(if same { "1" } else { "0" })
+          }
+          Err(_) => sb.write_string(" RP_ERR 0")
+        }
+        sb.write_byte((32).to_byte())
+        let mut k = 0
+        while k < stmts.length() {
+          if k > 0 {
+            sb.write_byte((59).to_byte())
+          }
+          join_strs(sb, sql::extract_tables(stmts[k]), 124)
+          k = k + 1
+        }
+        sb.write_string(" ")
+        let mut m = 0
+        while m < stmts.length() {
+          if m > 0 {
+            sb.write_byte((59).to_byte())
+          }
+          join_strs(sb, sql::extract_placeholders(stmts[m]), 124)
+          m = m + 1
+        }
+      }
+    }
+    sb.write_byte((10).to_byte())
+    i = i + 1
+  }
+  io_print(world, sb.to_string())
+  0
+}
+
+///|
+fn run_pexpr(world : World, dialect : String, path : String) -> Int {
+  let content = match fs_read(world, path) {
+    Ok(s) => s
+    Err(_) => return 2
+  }
+  let opts = opts_for(dialect)
+  let lines = split_lines(content)
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < lines.length() {
+    match sql::parse_one_with_options(unhex(lines[i]), opts) {
+      Err(_) => sb.write_string("ERR")
+      Ok(stmt) =>
+      match first_proj_expr(stmt) {
+        Some(x) => {
+          let t = StringBuilder::new()
+          pexpr(t, x)
+          sb.write_string("OK ")
+          write_hex_str(sb, t.to_string())
+        }
+        None => sb.write_string("ERR")
+      }
+    }
+    sb.write_byte((10).to_byte())
+    i = i + 1
+  }
+  io_print(world, sb.to_string())
+  0
+}
+
+///|
+fn run_split(world : World, path : String) -> Int {
+  let content = match fs_read(world, path) {
+    Ok(s) => s
+    Err(_) => return 2
+  }
+  let lines = split_lines(content)
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < lines.length() {
+    match sql::split_statements(unhex(lines[i])) {
+      Err(e) => {
+        sb.write_string("ERR ")
+        sb.write_string(one_line(e.message))
+      }
+      Ok(parts) => {
+        sb.write_string("OK ")
+        let mut k = 0
+        while k < parts.length() {
+          if k > 0 {
+            sb.write_byte((44).to_byte())
+          }
+          write_hex_str(sb, parts[k])
+          k = k + 1
+        }
+      }
+    }
+    sb.write_byte((10).to_byte())
+    i = i + 1
+  }
+  io_print(world, sb.to_string())
+  0
+}
+
+// ---------------------------------------------------------------------------
+// Deep / long inputs
+// ---------------------------------------------------------------------------
+
+///|
+fn rep(sb : StringBuilder, s : String, n : Int) -> Unit {
+  let mut i = 0
+  while i < n {
+    sb.write_string(s)
+    i = i + 1
+  }
+}
+
+///|
+pub fn build_shape(shape : String, n : Int) -> String {
+  let sb = StringBuilder::new()
+  if shape == "plus" {
+    sb.write_string("SELECT 1")
+    rep(sb, " + 1", n)
+  } else if shape == "or" {
+    sb.write_string("SELECT * FROM t WHERE a = 1")
+    rep(sb, " OR a = 1", n)
+  } else if shape == "concat" {
+    sb.write_string("SELECT 'x'")
+    rep(sb, " || 'x'", n)
+  } else if shape == "cast" {
+    sb.write_string("SELECT x")
+    rep(sb, "::INT", n)
+  } else if shape == "subscript" {
+    sb.write_string("SELECT x")
+    rep(sb, "[1]", n)
+  } else if shape == "isnull" {
+    sb.write_string("SELECT x")
+    rep(sb, " IS NULL", n)
+  } else if shape == "collate" {
+    sb.write_string("SELECT x")
+    rep(sb, " COLLATE c", n)
+  } else if shape == "union" {
+    sb.write_string("SELECT 1")
+    rep(sb, " UNION SELECT 1", n)
+  } else if shape == "paren" {
+    sb.write_string("SELECT ")
+    rep(sb, "(", n)
+    sb.write_string("1")
+    rep(sb, ")", n)
+  } else if shape == "not" {
+    sb.write_string("SELECT ")
+    rep(sb, "NOT ", n)
+    sb.write_string("TRUE")
+  } else if shape == "neg" {
+    sb.write_string("SELECT ")
+    rep(sb, "- ", n)
+    sb.write_string("1")
+  } else if shape == "subq" {
+    rep(sb, "SELECT (", n)
+    sb.write_string("SELECT 1")
+    rep(sb, ")", n)
+  } else if shape == "from" {
+    rep(sb, "SELECT * FROM (", n)
+    sb.write_string("SELECT 1")
+    rep(sb, ") t", n)
+  } else if shape == "case" {
+    sb.write_string("SELECT ")
+    rep(sb, "CASE WHEN TRUE THEN ", n)
+    sb.write_string("1")
+    rep(sb, " END", n)
+  } else if shape == "func" {
+    sb.write_string("SELECT ")
+    rep(sb, "f(", n)
+    sb.write_string("1")
+    rep(sb, ")", n)
+  } else if shape == "join" {
+    sb.write_string("SELECT * FROM ")
+    rep(sb, "(", n)
+    sb.write_string("a")
+    rep(sb, " JOIN b ON TRUE)", n)
+  } else if shape == "cte" {
+    rep(sb, "WITH c AS (", n)
+    sb.write_string("SELECT 1")
+    rep(sb, ") SELECT * FROM c", n)
+  }
+  sb.to_string()
+}
+
+///|
+fn run_deep(world : World, shape : String, n : Int, max_depth : Int, stages : String) -> Int {
+  let src = build_shape(shape, n)
+  let opts = sql::ParseOptions::{
+    dialect: sql::Dialect::Postgres,
+    max_depth: max_depth,
+    max_tokens: 100000000,
+    max_nodes: 100000000,
+  }
+  let stmt = match sql::parse_one_with_options(src, opts) {
+    Ok(s) => s
+    Err(e) => {
+      io_println(world, "rejected " + one_line(e.message))
+      return 0
+    }
+  }
+  io_println(world, "parsed")
+  let parts = stages.split(",")
+  let mut i = 0
+  while i < parts.length() {
+    let st = parts[i]
+    if st == "sql" {
+      let s = sql::to_sql(stmt)
+      io_println(world, "sql " + s.length().to_string())
+    } else if st == "tables" {
+      io_println(world, "tables " + sql::extract_tables(stmt).length().to_string())
+    } else if st == "ph" {
+      io_println(world, "ph " + sql::extract_placeholders(stmt).length().to_string())
+    } else if st == "eq" {
+      io_println(world, "eq " + sql::stmt_eq(stmt, stmt).to_string())
+    }
+    i = i + 1
+  }
+  0
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial benchmark workloads. stdout is a digest that rust_oracle prints
+// identically (SHA-256 gated by scripts/bench_compare.py).
+// ---------------------------------------------------------------------------
+
+///|
+fn run_adv(world : World, w : String, path : String, rounds : Int) -> Int {
+  let content = match fs_read(world, path) {
+    Ok(s) => s
+    Err(_) => return 2
+  }
+  let opts = sql::ParseOptions::{
+    dialect: sql::Dialect::Postgres,
+    max_depth: 128,
+    max_tokens: 100000000,
+    max_nodes: 100000000,
+  }
+  let mut ok = 0L
+  let mut err = 0L
+  let mut acc = 0L
+  let lines = split_lines(content)
+  let mut r = 0
+  while r < rounds {
+    if w == "split" {
+      match sql::split_statements(content) {
+        Ok(parts) => {
+          ok = ok + 1L
+          acc = acc + parts.length().to_int64()
+        }
+        Err(_) => err = err + 1L
+      }
+    } else if w == "script" {
+      match sql::parse_with_options(content, opts) {
+        Ok(stmts) => {
+          ok = ok + 1L
+          acc = acc + stmts.length().to_int64()
+        }
+        Err(_) => err = err + 1L
+      }
+    } else {
+      // per-line parse (`parse`) or per-line parse + to_sql + reparse (`rt`)
+      let mut i = 0
+      while i < lines.length() {
+        if lines[i].length() > 0 {
+          match sql::parse_with_options(lines[i], opts) {
+            Ok(stmts) => {
+              if w == "tables" {
+                let mut k = 0
+                while k < stmts.length() {
+                  acc = acc + sql::extract_tables(stmts[k]).length().to_int64()
+                  k = k + 1
+                }
+                ok = ok + 1L
+              } else if w == "rt" {
+                match sql::parse_with_options(sql::statements_to_sql(stmts), opts) {
+                  Ok(re) => {
+                    ok = ok + 1L
+                    acc = acc + re.length().to_int64()
+                  }
+                  Err(_) => err = err + 1L
+                }
+              } else {
+                ok = ok + 1L
+                acc = acc + stmts.length().to_int64()
+              }
+            }
+            Err(_) => err = err + 1L
+          }
+        }
+        i = i + 1
+      }
+    }
+    r = r + 1
+  }
+  io_println(
+    world,
+    "workload=" + w + " ok=" + ok.to_string() + " err=" + err.to_string() + " stmts=" +
+    acc.to_string(),
+  )
+  0
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 3 {
+    io_println(world, "usage: driver <probe|pexpr|split|deep|adv> ...")
+    return 1
+  }
+  let mode = args[1]
+  if mode == "probe" && args.length() >= 4 {
+    run_probe(world, args[2], args[3])
+  } else if mode == "pexpr" && args.length() >= 4 {
+    run_pexpr(world, args[2], args[3])
+  } else if mode == "split" {
+    run_split(world, args[2])
+  } else if mode == "deep" && args.length() >= 6 {
+    run_deep(world, args[2], parse_pos_int(args[3]), parse_pos_int(args[4]), args[5])
+  } else if mode == "adv" && args.length() >= 5 {
+    run_adv(world, args[2], args[3], parse_pos_int(args[4]))
+  } else {
+    io_println(world, "bad args")
+    1
+  }
+}
