@@ -1,0 +1,459 @@
+///| Red-team unit tests for `packages/mime` (Wave 10 RT-mime, baseline `feat/pkg-mime` @ 7663d14).
+///| A `redteam_` test asserts the *expected correct* behaviour: it FAILS while the defect exists and PASSES once
+///| fixed. `control_` tests document behaviour that is already correct (several of them where Pion is better than
+///| Go 1.27). The reference behaviour each test cites was measured with `go/main.go` (Go 1.27.3 stdlib) and
+///| `rust/src/main.rs` (mime 0.3.18 / infer 0.16.0); see REDTEAM_REPORT.md for counts and line numbers.
+///| Perf defects (P0-1 quadratic params, P1-4 Horspool worst case) are gated in `run_audit.sh perf`, not here.
+
+import "mime"
+
+///|
+fn bytes_of(xs : Array[Int]) -> Bytes {
+  let mut b = Bytes::new(xs.length())
+  let mut i = 0
+  while i < xs.length() {
+    b[i] = xs[i].to_byte()
+    i = i + 1
+  }
+  b
+}
+
+///|
+fn cd_filename(header : String) -> String {
+  match mime::parse_content_disposition(header) {
+    Ok(cd) =>
+    match cd.filename() {
+      Some(f) => f
+      None => "<none>"
+    }
+    Err(e) => "<err " + mime::mime_error_string(e) + ">"
+  }
+}
+
+///|
+fn mt_param(header : String, name : String) -> String {
+  match mime::parse_media_type(header) {
+    Ok(mt) =>
+    match mt.param(name) {
+      Some(v) => v
+      None => "<none>"
+    }
+    Err(e) => "<err " + mime::mime_error_string(e) + ">"
+  }
+}
+
+///|
+fn read_parts(body : String, boundary : String) -> Array[mime::Part] {
+  match mime::MultipartReader::new(body.to_bytes(), boundary) {
+    Ok(r) =>
+    match r.read_all() {
+      Ok(ps) => ps
+      Err(_) => []
+    }
+    Err(_) => []
+  }
+}
+
+///|
+fn safe(name : String) -> String {
+  let cd = mime::ContentDisposition::{
+    disposition: "attachment",
+    params: [mime::Param::new("filename", name)],
+  }
+  match cd.safe_filename() {
+    Some(s) => s
+    None => "<none>"
+  }
+}
+
+///|
+fn neg(accept : String, sup : Array[String]) -> String {
+  match mime::negotiate_media_type(accept, sup) {
+    Ok(Some(s)) => s
+    Ok(None) => "<none>"
+    Err(e) => "<err " + mime::mime_error_string(e) + ">"
+  }
+}
+
+///|
+fn expect(label : String, got : String, want : String) -> Unit {
+  debug_assert(got == want, label + ": expected [" + want + "], got [" + got + "]")
+}
+
+// ------------------------------------------------------------------------------------------- P1
+
+///| P1-1 multipart parser differential: in a CRLF message a bare `\n--boundary` inside a field value starts a
+///| new part in Pion, while Go 1.27 (and RFC 2046: delimiter = CRLF "--" boundary) keep it as body bytes.
+///| A Go/RFC front end sees one field `a`; a Pion back end sees an extra, attacker-chosen `admin=true` field.
+test "redteam_p1_mp_bare_lf_delimiter_smuggles_part_in_crlf_message" {
+  let body = "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nhello\n--b\r\nContent-Disposition: form-data; name=\"admin\"\r\n\r\ntrue\r\n--b--\r\n"
+  let ps = read_parts(body, "b")
+  expect("part count (Go: 1)", ps.length().to_string(), "1")
+  if ps.length() > 0 {
+    expect(
+      "part 0 body (Go keeps the bare-LF line)",
+      ps[0].body_string(),
+      "hello\n--b\r\nContent-Disposition: form-data; name=\"admin\"\r\n\r\ntrue",
+    )
+  }
+}
+
+///| P1-2 RFC 6266 §4.3 / Appendix D fallback: an undecodable `filename*` (unsupported charset, invalid UTF-8,
+///| empty RFC 2231 charset) must be ignored in favour of `filename`. Pion fails the WHOLE header, so
+///| `Part::filename()` / `form_name()` become None. Go 1.27 returns `filename="fallback.txt"`.
+test "redteam_p1_cd_bad_ext_value_drops_fallback_filename" {
+  expect(
+    "windows-1252 filename*",
+    cd_filename("attachment; filename=\"fallback.txt\"; filename*=windows-1252''na%EFve.txt"),
+    "fallback.txt",
+  )
+  expect(
+    "invalid UTF-8 filename*",
+    cd_filename("attachment; filename=\"fallback.txt\"; filename*=UTF-8''%ff.txt"),
+    "fallback.txt",
+  )
+  expect(
+    "bad percent filename*",
+    cd_filename("attachment; filename=\"fallback.txt\"; filename*=UTF-8''%zz.txt"),
+    "fallback.txt",
+  )
+  // The same happens through the multipart API: the part loses its form name entirely.
+  let body = "--b\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"a.txt\"; filename*=koi8-r''%E1\r\n\r\nx\r\n--b--\r\n"
+  let ps = read_parts(body, "b")
+  expect("parts", ps.length().to_string(), "1")
+  if ps.length() == 1 {
+    expect(
+      "form_name survives an unknown filename* charset",
+      match ps[0].form_name() {
+        Some(n) => n
+        None => "<none>"
+      },
+      "upload",
+    )
+  }
+}
+
+///| P1-3 `ContentDisposition::safe_filename()` is documented as the safe basename API but passes names that
+///| are dangerous on Windows / SMB targets or in UIs: reserved DOS devices, trailing dot/space (Windows strips
+///| them: `evil.exe.` -> `evil.exe`, bypassing extension allow-lists), NTFS alternate data streams / drive-
+///| relative `C:x`, U+202E bidi override spoofing, names longer than NAME_MAX (255), and whitespace-only names.
+test "redteam_p1_safe_filename_windows_and_spoofing_bypasses" {
+  let bad = [
+    "CON", "nul", "COM1", "LPT9.log", "aux.txt", "evil.exe.", "evil.exe ", " ", "a:b:$DATA", "C:evil",
+    "\u{202E}gnp.exe",
+  ]
+  let mut i = 0
+  while i < bad.length() {
+    let got = safe(bad[i])
+    debug_assert(got == "<none>" || got != bad[i], "safe_filename passed dangerous name unchanged: [" + bad[i] + "]")
+    i = i + 1
+  }
+  let mut long = ""
+  let mut k = 0
+  while k < 300 {
+    long = long + "x"
+    k = k + 1
+  }
+  debug_assert(safe(long).length() <= 255, "safe_filename returned a 300-byte name (NAME_MAX 255)")
+}
+
+///| P1-5 writer part injection: `MultipartWriter` takes a caller-chosen boundary (no random constructor, unlike
+///| Go's `NewWriter`) and never checks bodies for the delimiter, so a field value containing `\r\n--<boundary>`
+///| injects attacker-defined parts. Expected: write_field refuses (or the round trip still yields one part).
+test "redteam_p1_writer_field_value_injects_parts" {
+  let w = match mime::MultipartWriter::new("fixed-boundary") {
+    Ok(x) => x
+    Err(_) => return
+  }
+  let evil = "hi\r\n--fixed-boundary\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nadmin"
+  match w.write_field("comment", evil) {
+    Err(_) => () // refusing is a valid fix
+    Ok(_) => {
+      let out = w.finish()
+      let ps = match mime::MultipartReader::new(out, "fixed-boundary") {
+        Ok(r) =>
+        match r.read_all() {
+          Ok(x) => x
+          Err(_) => []
+        }
+        Err(_) => []
+      }
+      expect("round-trip part count", ps.length().to_string(), "1")
+    }
+  }
+}
+
+///| P1-6 `sniff_mime` upgrades untrusted bytes to a scriptable type: `<svg` (and `<?xml` + `<svg` within 512 B)
+///| is sniffed as `image/svg+xml`. WHATWG MIME Sniffing never sniffs SVG; Go `DetectContentType` returns
+///| text/plain / text/xml and infer returns None / text/xml. Serving an upload with the sniffed type is stored XSS.
+test "redteam_p1_sniff_promotes_untrusted_bytes_to_svg" {
+  let s1 = mime::sniff_mime("<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>".to_bytes())
+  let s2 = mime::sniff_mime("<?xml version='1.0'?>\n<svg onload='alert(1)'/>".to_bytes())
+  debug_assert(s1 != "image/svg+xml", "bare <svg sniffed as image/svg+xml")
+  debug_assert(s2 != "image/svg+xml", "<?xml ... <svg sniffed as image/svg+xml")
+}
+
+// ------------------------------------------------------------------------------------------- P2
+
+///| P2-1 Java class files (`CA FE BA BE` + major version >= 45) are reported as Mach-O fat binaries.
+///| infer 0.16: application/java. A fat header's nfat_arch is small (< 20), a class file's major is >= 45.
+test "redteam_p2_sniff_java_class_misread_as_macho_fat" {
+  let cls = bytes_of([0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34])
+  debug_assert(mime::sniff_mime(cls) != "application/x-mach-binary", "Java class sniffed as Mach-O")
+}
+
+///| P2-2 WHATWG HTML sniffing is not followed: tag-terminating byte is not checked (`<htmlfoo>` -> html) and
+///| `<b `, `<br>`, `<p ` / `<a>` are missed; UTF-16 BOM text and PostScript fall to the wrong class.
+test "redteam_p2_sniff_whatwg_text_rules" {
+  expect("<br>", mime::sniff_mime("<br>".to_bytes()), "text/html; charset=utf-8")
+  expect("<b>", mime::sniff_mime("<b>bold</b>".to_bytes()), "text/html; charset=utf-8")
+  expect("<p class>", mime::sniff_mime("<p class=x>hi</p>".to_bytes()), "text/html; charset=utf-8")
+  debug_assert(mime::sniff_mime("<htmlfoo>".to_bytes()) != "text/html; charset=utf-8", "<htmlfoo> sniffed as HTML")
+  expect(
+    "UTF-16LE BOM",
+    mime::sniff_mime(bytes_of([0xFF, 0xFE, 0x68, 0x00, 0x69, 0x00])),
+    "text/plain; charset=utf-16le",
+  )
+  expect("%!PS", mime::sniff_mime("%!PS-Adobe-3.0".to_bytes()), "application/postscript")
+}
+
+///| P2-3 Accept parsing is all-or-nothing: one malformed element (q with 4 decimals, a bare token, a comment,
+///| a repeated accept-ext) makes `negotiate_media_type` fail instead of skipping that element.
+test "redteam_p2_accept_one_bad_item_kills_negotiation" {
+  expect("q=0.5555", neg("text/html;q=0.5555, application/json", ["application/json"]), "application/json")
+  expect("garbage item", neg("text/html, garbage", ["text/html"]), "text/html")
+  expect("dup accept-ext", neg("application/json;q=0.5;ext=1;ext=2", ["application/json"]), "application/json")
+}
+
+///| P2-4 One bad RFC 2231 section kills unrelated params: orphan `a*1` without `a*0`, `a*01`, `a*b`, empty-charset
+///| `a*=''x` (valid RFC 2231: charset may be empty) all make parse_media_type fail; Go keeps `charset`.
+test "redteam_p2_mt_rfc2231_section_errors_are_fatal" {
+  expect("orphan section", mt_param("text/plain; charset=utf-8; a*1=y", "charset"), "utf-8")
+  expect("leading zero", mt_param("text/plain; charset=utf-8; a*01=y", "charset"), "utf-8")
+  expect("non-numeric section", mt_param("text/plain; charset=utf-8; a*b=y", "charset"), "utf-8")
+  expect("empty charset (RFC 2231 allows)", mt_param("text/plain; a*=''abc", "a"), "abc")
+}
+
+///| P2-5 Duplicates Go accepts: equal-valued repeats and `a*` alongside `a*0` (Go: `a*` wins).
+test "redteam_p2_mt_benign_duplicates_rejected" {
+  expect("equal repeat", mt_param("text/plain; charset=utf-8; charset=utf-8", "charset"), "utf-8")
+  expect("a* + a*0", mt_param("text/plain; a*=utf-8''x; a*0=y", "a"), "x")
+}
+
+///| P2-6 MSIE intranet paths: Go keeps backslashes that precede non-tspecials (`"C:\dev\x.txt"`); Pion eats
+///| them (`C:devx.txt`), so the basename logic in safe_filename never sees the separators.
+test "redteam_p2_cd_msie_backslash_path" {
+  expect("MSIE path", cd_filename("attachment; filename=\"C:\\dev\\x.txt\""), "C:\\dev\\x.txt")
+}
+
+///| P2-7 Close delimiter followed by garbage (`--b--garbage`) is accepted as the end of the message and every
+///| later part is silently ignored; RFC 2046 allows only transport padding then CRLF/EOF (Go: error).
+test "redteam_p2_mp_close_delimiter_with_garbage_accepted" {
+  let body = "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n--b--garbage\r\n--b\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\ny\r\n--b--\r\n"
+  let ok = match mime::MultipartReader::new(body.to_bytes(), "b") {
+    Ok(r) =>
+    match r.read_all() {
+      Ok(_) => true
+      Err(_) => false
+    }
+    Err(_) => false
+  }
+  debug_assert(!ok, "--b--garbage accepted as close delimiter")
+}
+
+///| P2-8 Part header values may contain NUL / CTLs (Go textproto rejects the line): `name="a\x00b"` reaches
+///| `form_name()` verbatim and truncates in any C/FFI consumer.
+test "redteam_p2_mp_nul_in_part_header_accepted" {
+  let body = "--b\r\nContent-Disposition: form-data; name=\"a\u{0}b\"\r\n\r\nx\r\n--b--\r\n"
+  let ps = read_parts(body, "b")
+  debug_assert(ps.length() == 0, "NUL inside a part header value accepted")
+}
+
+///| P2-9 Quoted-printable decoding is all-or-nothing: a single `=ZZ`, `= ` or a trailing `=` at EOF fails the
+///| whole body. RFC 2045 §6.7 note (2) recommends passing `=` through; Go decodes `=ZZ` as literal and treats
+///| a final `=` as a soft break.
+test "redteam_p2_qp_one_bad_escape_loses_whole_body" {
+  let r1 = match mime::qp_decode("price=ZZ ok".to_bytes()) {
+    Ok(b) => b.to_string()
+    Err(_) => "<err>"
+  }
+  let r2 = match mime::qp_decode("soft at eof=".to_bytes()) {
+    Ok(b) => b.to_string()
+    Err(_) => "<err>"
+  }
+  expect("=ZZ literal", r1, "price=ZZ ok")
+  expect("trailing = soft break", r2, "soft at eof")
+}
+
+///| P2-10 Encoded-words that split one UTF-8 character across adjacent words (common in real mailers) are left
+///| undecoded; Go and Python join the octets before charset conversion.
+test "redteam_p2_rfc2047_split_multibyte_across_words" {
+  let got = match mime::decode_rfc2047("=?utf-8?Q?=E2=82?= =?utf-8?Q?=AC?=") {
+    Ok(s) => s
+    Err(_) => "<err>"
+  }
+  expect("split euro sign", got, "\u{20AC}")
+}
+
+///| P2-11 `format_media_type` accepts param names containing `*` (token chars) and emits headers that do not
+///| re-parse (`title*` -> `title**=utf-8''...` or `title*=x`). Go shares this; the formatter should reject them.
+test "redteam_p2_format_star_names_do_not_roundtrip" {
+  let r = match mime::format_media_type("text/plain", [mime::Param::new("title*", "x")]) {
+    Ok(s) =>
+    match mime::parse_media_type(s) {
+      Ok(_) => "roundtrip-ok"
+      Err(_) => "roundtrip-broken"
+    }
+    Err(_) => "rejected"
+  }
+  debug_assert(r != "roundtrip-broken", "format_media_type produced a header that does not re-parse")
+}
+
+// ------------------------------------------------------------------------------------------- controls
+
+///|
+test "control_accept_q_grammar_and_explicit_exclusion" {
+  expect("q=1.001 rejected", neg("text/html;q=1.001", ["text/html"]), "<err invalid quality (q) value>")
+  expect("q=.5 rejected", neg("text/html;q=.5", ["text/html"]), "<err invalid quality (q) value>")
+  expect("q=NaN rejected", neg("text/html;q=NaN", ["text/html"]), "<err invalid quality (q) value>")
+  expect("q=1. accepted", neg("text/html;q=1.", ["text/html"]), "text/html")
+  expect("q=0 beats */*", neg("text/html;q=0, */*", ["text/html"]), "<none>")
+  expect("q=0.000", neg("text/html;q=0.000", ["text/html"]), "<none>")
+  expect("text/*;q=0 vs text/html", neg("text/*, text/html;q=0", ["text/html", "text/plain"]), "text/plain")
+  expect(
+    "level specificity",
+    neg("text/html;q=0.5, text/html;level=1", ["text/html", "text/html;level=1"]),
+    "text/html;level=1",
+  )
+  expect(
+    "accept-ext after q ignored",
+    neg("application/json;q=0.5;charset=utf-8", ["application/json"]),
+    "application/json",
+  )
+  expect("*/subtype rejected", neg("*/html", ["text/html"]), "<err invalid Accept header>")
+}
+
+///| Pion beats Go 1.27 here: Go's quotedprintable.Writer loses the LF of a `\r ... \n` pair when encoded bytes
+///| sit between them (`w.cr` is not reset by `encode`), dropping a line break.
+test "control_qp_encode_cr_encoded_lf_keeps_line_break" {
+  let out = mime::qp_encode(bytes_of([0xFF, 0x0D, 0x3D, 0x0A, 0x7E])).to_string()
+  expect("qp text-mode", out, "=FF\r\n=3D\r\n~")
+}
+
+///| Pion beats Go 1.27 here: Go only knows utf-8/us-ascii in RFC 2231 and *blanks* the plain param when a
+///| `*0*` section uses latin1; Pion decodes ISO-8859-1.
+test "control_rfc2231_latin1_continuation" {
+  expect("latin1 *0*", mt_param("text/plain; title=x; title*0*=ISO-8859-1''caf%E9", "title"), "caf\u{E9}")
+}
+
+///| Pion beats Go 1.27 here: an unknown charset in one encoded-word makes Go's DecodeHeader fail the whole
+///| header; Pion leaves that word literal and decodes the rest.
+test "control_rfc2047_unknown_charset_left_literal" {
+  let got = match mime::decode_rfc2047("=?bogus?q?x?= =?utf-8?q?caf=C3=A9?=") {
+    Ok(s) => s
+    Err(_) => "<err>"
+  }
+  expect("partial decode", got, "=?bogus?q?x?= caf\u{E9}")
+}
+
+///|
+test "control_rfc2047_encoded_text_with_space_not_decoded" {
+  let got = match mime::decode_rfc2047("=?utf-8?q?a b?=") {
+    Ok(s) => s
+    Err(_) => "<err>"
+  }
+  expect("RFC 2047 §2 forbids SP inside encoded-word", got, "=?utf-8?q?a b?=")
+}
+
+///|
+test "control_safe_filename_traversal_and_separators" {
+  expect("unix traversal", safe("../../etc/passwd"), "passwd")
+  expect("windows traversal", safe("..\\..\\win.ini"), "win.ini")
+  expect("mixed", safe("a/b\\c"), "c")
+  expect("dot", safe("."), "<none>")
+  expect("dotdot", safe(".."), "<none>")
+  expect("trailing slash", safe("dir/"), "<none>")
+  expect("controls only", safe("\u{1}\u{2}"), "<none>")
+}
+
+///|
+test "control_writer_rejects_crlf_and_escapes_quotes" {
+  let w = match mime::MultipartWriter::new("bnd") {
+    Ok(x) => x
+    Err(_) => return
+  }
+  debug_assert(w.write_field("a\r\nX-Evil: 1", "v") is Err(_), "CRLF in field name accepted")
+  debug_assert(
+    w.write_file("f", "x\"; name=\"admin", "text/plain", "d".to_bytes()) is Ok(_),
+    "quote in filename should be escaped, not rejected",
+  )
+  let ps = match mime::MultipartReader::new(w.finish(), "bnd") {
+    Ok(r) =>
+    match r.read_all() {
+      Ok(x) => x
+      Err(_) => []
+    }
+    Err(_) => []
+  }
+  expect("parts", ps.length().to_string(), "1")
+  if ps.length() == 1 {
+    expect("form name not hijacked", match ps[0].form_name() { Some(n) => n; None => "<none>" }, "f")
+    expect("filename round trip", match ps[0].filename() { Some(n) => n; None => "<none>" }, "x\"; name=\"admin")
+  }
+}
+
+///|
+test "control_mt_rfc9110_token_and_case" {
+  expect("brace is not tchar (Go accepts)", mt_param("text/plain; a={x}", "a"), "<err invalid parameter value>")
+  expect("case-insensitive duplicate", mt_param("text/plain; charset=a; CHARSET=b", "charset"), "<err duplicate parameter name>")
+  expect("continuation joins", mt_param("text/plain; a*0*=utf-8''%e2%82; a*1*=%ac", "a"), "\u{20AC}")
+  expect("ext overrides plain (RFC 6266 §4.3)", mt_param("text/plain; a=fb; a*=utf-8''real", "a"), "real")
+}
+
+///|
+test "control_qp_encode_never_splits_escape_and_wraps_at_76" {
+  let mut src = Bytes::new(300)
+  let mut i = 0
+  while i < 300 {
+    src[i] = (if i % 3 == 0 { 0xE9 } else { 0x61 }).to_byte()
+    i = i + 1
+  }
+  let enc = mime::qp_encode(src)
+  let mut col = 0
+  let mut j = 0
+  while j < enc.length() {
+    let c = enc[j].to_int()
+    if c == 10 {
+      col = 0
+    } else if c != 13 {
+      col = col + 1
+      debug_assert(col <= 76, "line longer than 76 columns")
+    }
+    j = j + 1
+  }
+  match mime::qp_decode(enc) {
+    Ok(d) => debug_assert(d.to_string() == src.to_string(), "qp round trip")
+    Err(_) => debug_assert(false, "qp round trip failed")
+  }
+}
+
+///|
+test "control_mp_strict_header_syntax" {
+  // Folded (obs-fold) and space-before-colon headers are rejected rather than mis-attributed (Go folds them).
+  expect(
+    "obs-fold",
+    read_parts("--b\r\nContent-Disposition: form-data;\r\n name=\"a\"\r\n\r\nx\r\n--b--\r\n", "b").length().to_string(),
+    "0",
+  )
+  expect(
+    "space before colon",
+    read_parts("--b\r\nContent-Disposition : form-data; name=\"a\"\r\n\r\nx\r\n--b--\r\n", "b").length().to_string(),
+    "0",
+  )
+  // Epilogue containing a fake delimiter is not parsed as a part.
+  expect(
+    "epilogue fake part",
+    read_parts("--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n--b--\r\n--b\r\nContent-Disposition: form-data; name=\"evil\"\r\n\r\ny\r\n--b--\r\n", "b").length().to_string(),
+    "1",
+  )
+}

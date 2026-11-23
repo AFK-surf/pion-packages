@@ -1,0 +1,2641 @@
+///| Pure Pion ISO/IEC 14496-12 (MP4 / fMP4) demuxer and W3C MSE Segment parser.
+///| Zero `extern "C"`, zero `World`, explicit `DecodeLimits` + input-proportional sample caps.
+
+///| Mutable parse budget state threaded through box/sample decoding.
+struct ParseCtx {
+  limits : DecodeLimits
+  effective_max_samples : Int
+  mut box_count : Int
+  mut sample_count : Int
+  mut moof_count : Int
+}
+
+///| Validate that all `DecodeLimits` fields are non-negative.
+fn validate_limits(limits : DecodeLimits) -> Result[Unit, Mp4Error] {
+  if limits.max_boxes < 0 {
+    return Err(Mp4Error::LimitExceeded("negative max_boxes"))
+  }
+  if limits.max_depth < 0 {
+    return Err(Mp4Error::LimitExceeded("negative max_depth"))
+  }
+  if limits.max_tracks < 0 {
+    return Err(Mp4Error::LimitExceeded("negative max_tracks"))
+  }
+  if limits.max_samples < 0 {
+    return Err(Mp4Error::LimitExceeded("negative max_samples"))
+  }
+  if limits.max_moof_fragments < 0 {
+    return Err(Mp4Error::LimitExceeded("negative max_moof_fragments"))
+  }
+  Ok(())
+}
+
+///| Create a fresh `ParseCtx` with input-proportional sample cap (`min(max_samples, 2 * input_bytes)`).
+fn make_ctx(limits : DecodeLimits, input_bytes : Int) -> Result[ParseCtx, Mp4Error] {
+  match validate_limits(limits) {
+    Ok(_) => {
+      let input_cap = if input_bytes > 1073741823 {
+        2147483647
+      } else if input_bytes < 0 {
+        0
+      } else {
+        input_bytes * 2
+      }
+      let eff = if limits.max_samples < input_cap {
+        limits.max_samples
+      } else {
+        input_cap
+      }
+      Ok(ParseCtx::{
+        limits: limits,
+        effective_max_samples: eff,
+        box_count: 0,
+        sample_count: 0,
+        moof_count: 0,
+      })
+    }
+    Err(e) => Err(e)
+  }
+}
+
+///| Charge one box against `max_boxes`.
+fn charge_box(ctx : ParseCtx) -> Result[Unit, Mp4Error] {
+  if ctx.box_count >= ctx.limits.max_boxes {
+    return Err(Mp4Error::LimitExceeded("max_boxes exceeded"))
+  }
+  ctx.box_count = ctx.box_count + 1
+  Ok(())
+}
+
+///| Charge `n` samples against `effective_max_samples` (bounded by both `limits.max_samples` and input size).
+fn charge_samples(ctx : ParseCtx, n : Int) -> Result[Unit, Mp4Error] {
+  if n < 0 {
+    return Err(Mp4Error::InvalidSyntax("negative sample count"))
+  }
+  if n > ctx.effective_max_samples - ctx.sample_count {
+    return Err(Mp4Error::LimitExceeded("max_samples exceeded"))
+  }
+  ctx.sample_count = ctx.sample_count + n
+  Ok(())
+}
+
+///| Charge one `moof` fragment against `max_moof_fragments`.
+fn charge_moof(ctx : ParseCtx) -> Result[Unit, Mp4Error] {
+  if ctx.moof_count >= ctx.limits.max_moof_fragments {
+    return Err(Mp4Error::LimitExceeded("max_moof_fragments exceeded"))
+  }
+  ctx.moof_count = ctx.moof_count + 1
+  Ok(())
+}
+
+///| Check container nesting depth against `max_depth`.
+fn check_depth(ctx : ParseCtx, depth : Int) -> Result[Unit, Mp4Error] {
+  if depth > ctx.limits.max_depth {
+    return Err(Mp4Error::LimitExceeded("max_depth exceeded"))
+  }
+  Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Low-level big-endian binary helpers
+// ---------------------------------------------------------------------------
+
+///|
+fn read_u8(data : Bytes, off : Int) -> Int {
+  data[off].to_int() & 255
+}
+
+///|
+fn read_u16_be(data : Bytes, off : Int) -> Int {
+  ((data[off].to_int() & 255) << 8) | (data[off + 1].to_int() & 255)
+}
+
+///|
+fn read_i16_be(data : Bytes, off : Int) -> Int {
+  let u = read_u16_be(data, off)
+  if (u & 32768) != 0 {
+    u - 65536
+  } else {
+    u
+  }
+}
+
+///|
+fn read_u24_be(data : Bytes, off : Int) -> Int {
+  ((data[off].to_int() & 255) << 16) |
+  ((data[off + 1].to_int() & 255) << 8) |
+  (data[off + 2].to_int() & 255)
+}
+
+///|
+fn read_u32_be(data : Bytes, off : Int) -> UInt {
+  let b0 = (data[off].to_int() & 255).to_uint()
+  let b1 = (data[off + 1].to_int() & 255).to_uint()
+  let b2 = (data[off + 2].to_int() & 255).to_uint()
+  let b3 = (data[off + 3].to_int() & 255).to_uint()
+  (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+///|
+fn read_i32_be(data : Bytes, off : Int) -> Int {
+  read_u32_be(data, off).to_int()
+}
+
+///|
+fn read_u64_be(data : Bytes, off : Int) -> Int64 {
+  let hi = read_u32_be(data, off).to_int64() & 4294967295L
+  let lo = read_u32_be(data, off + 4).to_int64() & 4294967295L
+  (hi << 32) | lo
+}
+
+///| Read a 4-byte ASCII FourCC at `off`.
+fn read_fourcc(data : Bytes, off : Int) -> String {
+  let b = Bytes::new(4)
+  b[0] = data[off]
+  b[1] = data[off + 1]
+  b[2] = data[off + 2]
+  b[3] = data[off + 3]
+  b.to_string()
+}
+
+///| Format a byte (0..255) as 2 lowercase hex characters.
+fn hex2_lower(v : Int) -> String {
+  let hi = (v >> 4) & 15
+  let lo = v & 15
+  let b = Bytes::new(2)
+  b[0] = (if hi < 10 { 48 + hi } else { 87 + hi }).to_byte()
+  b[1] = (if lo < 10 { 48 + lo } else { 87 + lo }).to_byte()
+  b.to_string()
+}
+
+///| Format a non-negative integer as 2 decimal digits with leading zero.
+fn dec2(v : Int) -> String {
+  if v < 10 {
+    "0" + v.to_string()
+  } else {
+    v.to_string()
+  }
+}
+
+///| Format a 32-bit unsigned integer as minimal uppercase hex (for HEVC compat flags).
+fn hex_u32_upper_trim(v : UInt) -> String {
+  if v == 0U {
+    return "0"
+  }
+  let buf : Array[Byte] = []
+  let mut started = false
+  let mut shift = 28
+  while shift >= 0 {
+    let nib = ((v >> shift) & 15U).to_int()
+    if nib != 0 || started {
+      started = true
+      buf.push((if nib < 10 { 48 + nib } else { 55 + nib }).to_byte())
+    }
+    shift = shift - 4
+  }
+  let out = Bytes::new(buf.length())
+  let mut i = 0
+  while i < buf.length() {
+    out[i] = buf[i]
+    i = i + 1
+  }
+  out.to_string()
+}
+
+///| Decode ISO-639-2 15-bit packed language code (zero-alloc fast path for "und"/"eng").
+fn decode_language(code : Int) -> String {
+  if code == 21956 || code == 0 {
+    return "und"
+  }
+  if code == 5575 {
+    return "eng"
+  }
+  let c0 = (code >> 10) & 31
+  let c1 = (code >> 5) & 31
+  let c2 = code & 31
+  if c0 == 0 || c1 == 0 || c2 == 0 {
+    return "und"
+  }
+  let b = Bytes::new(3)
+  b[0] = (c0 + 96).to_byte()
+  b[1] = (c1 + 96).to_byte()
+  b[2] = (c2 + 96).to_byte()
+  b.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Overflow-free Floor/Ceil Millisecond Conversion
+// ---------------------------------------------------------------------------
+
+///| Floor-divide `num` by positive `den` (`den > 0`).
+fn floor_div_i64(num : Int64, den : Int64) -> Int64 {
+  let q = num / den
+  let r = num % den
+  if r != 0L && num < 0L {
+    q - 1L
+  } else {
+    q
+  }
+}
+
+///| Ceiling-divide `num` by positive `den` (`den > 0`).
+fn ceil_div_i64(num : Int64, den : Int64) -> Int64 {
+  let q = num / den
+  let r = num % den
+  if r != 0L && num > 0L {
+    q + 1L
+  } else {
+    q
+  }
+}
+
+///| Overflow-free floor((ticks * 1000) / ts) for positive `ts`.
+fn ticks_to_ms_floor(ticks : Int64, ts : Int64) -> Int64 {
+  let q = floor_div_i64(ticks, ts)
+  let r = ticks - q * ts
+  q * 1000L + (r * 1000L) / ts
+}
+
+///| Overflow-free ceil((ticks * 1000) / ts) for positive `ts`.
+fn ticks_to_ms_ceil(ticks : Int64, ts : Int64) -> Int64 {
+  let q = floor_div_i64(ticks, ts)
+  let r = ticks - q * ts
+  q * 1000L + ceil_div_i64(r * 1000L, ts)
+}
+
+// ---------------------------------------------------------------------------
+// Box Header & Top-Level Parsing
+// ---------------------------------------------------------------------------
+
+///| Shared empty `Bytes` instance to avoid per-box zero-length allocations.
+let empty_bytes : Bytes = Bytes::new(0)
+
+// Compile-time big-endian FourCC constants for zero-allocation box dispatch.
+let fcc_ftyp : UInt = 1718909296U // "ftyp"
+let fcc_styp : UInt = 1937013104U // "styp"
+let fcc_moov : UInt = 1836019574U // "moov"
+let fcc_mvhd : UInt = 1836476516U // "mvhd"
+let fcc_trak : UInt = 1953653099U // "trak"
+let fcc_tkhd : UInt = 1953196132U // "tkhd"
+let fcc_edts : UInt = 1701082227U // "edts"
+let fcc_elst : UInt = 1701606260U // "elst"
+let fcc_mdia : UInt = 1835297121U // "mdia"
+let fcc_mdhd : UInt = 1835296868U // "mdhd"
+let fcc_hdlr : UInt = 1751411826U // "hdlr"
+let fcc_minf : UInt = 1835626086U // "minf"
+let fcc_stbl : UInt = 1937007212U // "stbl"
+let fcc_stsd : UInt = 1937011556U // "stsd"
+let fcc_stts : UInt = 1937011827U // "stts"
+let fcc_ctts : UInt = 1668576371U // "ctts"
+let fcc_stsc : UInt = 1937011555U // "stsc"
+let fcc_stsz : UInt = 1937011578U // "stsz"
+let fcc_stz2 : UInt = 1937013298U // "stz2"
+let fcc_stco : UInt = 1937007471U // "stco"
+let fcc_co64 : UInt = 1668232756U // "co64"
+let fcc_stss : UInt = 1937011571U // "stss"
+let fcc_mvex : UInt = 1836475768U // "mvex"
+let fcc_trex : UInt = 1953654136U // "trex"
+let fcc_sidx : UInt = 1936286840U // "sidx"
+let fcc_moof : UInt = 1836019558U // "moof"
+let fcc_mfhd : UInt = 1835427940U // "mfhd"
+let fcc_traf : UInt = 1953653094U // "traf"
+let fcc_tfhd : UInt = 1952868452U // "tfhd"
+let fcc_tfdt : UInt = 1952867444U // "tfdt"
+let fcc_trun : UInt = 1953658222U // "trun"
+let fcc_avcc : UInt = 1635148611U // "avcC"
+let fcc_hvcc : UInt = 1752589123U // "hvcC"
+let fcc_av1c : UInt = 1635135811U // "av1C"
+let fcc_vpcc : UInt = 1987076931U // "vpcC"
+let fcc_esds : UInt = 1702061171U // "esds"
+let fcc_dops : UInt = 1682927731U // "dOps"
+let fcc_dfla : UInt = 1684425793U // "dfLa"
+let fcc_wave : UInt = 2002876005U // "wave"
+let fcc_uuid : UInt = 1970628964U // "uuid"
+
+// Handler FourCC constants for zero-allocation `hdlr` dispatch.
+let fcc_vide : UInt = 1986618469U // "vide"
+let fcc_soun : UInt = 1936684398U // "soun"
+let fcc_subt : UInt = 1937072756U // "subt"
+let fcc_text : UInt = 1952807028U // "text"
+let fcc_sbtl : UInt = 1935832172U // "sbtl"
+
+// Sample entry FourCC constants for zero-allocation common codecs.
+let fcc_avc1 : UInt = 1635148593U // "avc1"
+let fcc_avc3 : UInt = 1635148595U // "avc3"
+let fcc_hvc1 : UInt = 1752589105U // "hvc1"
+let fcc_hev1 : UInt = 1751479857U // "hev1"
+let fcc_av01 : UInt = 1635135537U // "av01"
+let fcc_vp09 : UInt = 1987063865U // "vp09"
+let fcc_vp08 : UInt = 1987063864U // "vp08"
+let fcc_mp4a : UInt = 1836069985U // "mp4a"
+let fcc_opus : UInt = 1332770163U // "Opus"
+let fcc_flac : UInt = 1716281667U // "fLaC"
+let fcc_dotmp3 : UInt = 778924083U // ".mp3"
+let fcc_mp3sp : UInt = 1836069664U // "mp3 "
+
+///| Stack-allocated zero-allocation box header for internal parsing.
+val struct RawBox {
+  type_u32 : UInt
+  offset : Int64
+  size : Int64
+  header_size : Int
+  payload_offset : Int64
+  payload_size : Int64
+}
+
+///| Fast zero-allocation internal box header reader.
+fn read_raw_box(
+  data : Bytes,
+  offset : Int64,
+  end : Int64,
+) -> Result[RawBox, Mp4Error] {
+  let data_len = data.length().to_int64()
+  let bound = if end < data_len { end } else { data_len }
+  if offset < 0L || offset > bound {
+    return Err(Mp4Error::Truncated("box offset out of range"))
+  }
+  if bound - offset < 8L {
+    return Err(Mp4Error::Truncated("box header requires at least 8 bytes"))
+  }
+  let off = offset.to_int()
+  let size32 = read_u32_be(data, off)
+  let type_u32 = read_u32_be(data, off + 4)
+
+  let mut hdr_size = 8
+  let mut total_size : Int64 = 0L
+
+  if size32 == 0U {
+    total_size = bound - offset
+  } else if size32 == 1U {
+    if bound - offset < 16L {
+      return Err(Mp4Error::Truncated("64-bit largesize box header truncated"))
+    }
+    let large = read_u64_be(data, off + 8)
+    if large < 16L {
+      return Err(Mp4Error::InvalidBoxSize("largesize < 16"))
+    }
+    hdr_size = 16
+    total_size = large
+  } else {
+    let s64 = size32.to_int64() & 4294967295L
+    if s64 < 8L {
+      return Err(Mp4Error::InvalidBoxSize("box size in 2..7"))
+    }
+    total_size = s64
+  }
+
+  if type_u32 == fcc_uuid {
+    if bound - offset < (hdr_size + 16).to_int64() {
+      return Err(Mp4Error::Truncated("uuid box extended type truncated"))
+    }
+    if total_size < (hdr_size + 16).to_int64() {
+      return Err(Mp4Error::InvalidBoxSize("uuid box smaller than header"))
+    }
+    hdr_size = hdr_size + 16
+  }
+
+  if total_size < hdr_size.to_int64() {
+    return Err(Mp4Error::InvalidBoxSize("box size smaller than header"))
+  }
+  if total_size > bound - offset {
+    return Err(Mp4Error::Truncated("box extends past container boundary"))
+  }
+
+  let payload_off = offset + hdr_size.to_int64()
+  let payload_sz = total_size - hdr_size.to_int64()
+
+  Ok(RawBox::{
+    type_u32: type_u32,
+    offset: offset,
+    size: total_size,
+    header_size: hdr_size,
+    payload_offset: payload_off,
+    payload_size: payload_sz,
+  })
+}
+
+///| Parse a single ISO BMFF box header at `offset` within `[0, end)`.
+pub fn read_box_header(
+  data : Bytes,
+  offset : Int64,
+  end : Int64,
+) -> Result[BoxHeader, Mp4Error] {
+  let raw = match read_raw_box(data, offset, end) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  let off = raw.offset.to_int()
+  let uuid_bytes = if raw.type_u32 == fcc_uuid {
+    let uoff = off + raw.header_size - 16
+    data.slice(uoff, uoff + 16)
+  } else {
+    empty_bytes
+  }
+  Ok(BoxHeader::{
+    box_type: read_fourcc(data, off + 4),
+    box_type_u32: raw.type_u32,
+    offset: raw.offset,
+    size: raw.size,
+    header_size: raw.header_size,
+    payload_offset: raw.payload_offset,
+    payload_size: raw.payload_size,
+    uuid: uuid_bytes,
+  })
+}
+
+///| Parse all top-level boxes in `data` under `limits`.
+pub fn parse_top_level_boxes(
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[Array[BoxHeader], Mp4Error] {
+  let ctx = match make_ctx(limits, data.length()) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  let end = data.length().to_int64()
+  let out : Array[BoxHeader] = []
+  let mut pos = 0L
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let hdr = match read_box_header(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    out.push(hdr)
+    pos = pos + hdr.size
+  }
+  Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Individual Box Parsers
+// ---------------------------------------------------------------------------
+
+///| Parse `ftyp` or `styp` box payload.
+fn parse_ftyp(data : Bytes, hdr : RawBox) -> Result[FtypBox, Mp4Error] {
+  if hdr.payload_size < 8L {
+    return Err(Mp4Error::Truncated("ftyp/styp payload < 8 bytes"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let major = read_fourcc(data, off)
+  let minor = read_u32_be(data, off + 4)
+  let compat : Array[String] = []
+  let end = (hdr.payload_offset + hdr.payload_size).to_int()
+  let mut pos = off + 8
+  while pos + 4 <= end {
+    compat.push(read_fourcc(data, pos))
+    pos = pos + 4
+  }
+  Ok(FtypBox::{
+    major_brand: major,
+    minor_version: minor,
+    compatible_brands: compat,
+  })
+}
+
+///| Parse `mvhd` box payload (v0 or v1).
+fn parse_mvhd(data : Bytes, hdr : RawBox) -> Result[MovieHeader, Mp4Error] {
+  if hdr.payload_size < 4L {
+    return Err(Mp4Error::Truncated("mvhd header truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let version = read_u8(data, off)
+  if version == 0 {
+    if hdr.payload_size < 24L {
+      return Err(Mp4Error::Truncated("mvhd v0 truncated"))
+    }
+    let timescale = read_u32_be(data, off + 12)
+    let duration = read_u32_be(data, off + 16).to_int64() & 4294967295L
+    Ok(MovieHeader::{ version: 0, timescale: timescale, duration: duration })
+  } else if version == 1 {
+    if hdr.payload_size < 36L {
+      return Err(Mp4Error::Truncated("mvhd v1 truncated"))
+    }
+    let timescale = read_u32_be(data, off + 20)
+    let duration = read_u64_be(data, off + 24)
+    Ok(MovieHeader::{ version: 1, timescale: timescale, duration: duration })
+  } else {
+    Err(Mp4Error::Unsupported("mvhd version " + version.to_string()))
+  }
+}
+
+///| Parse `trex` box payload.
+fn parse_trex(data : Bytes, hdr : RawBox) -> Result[TrexBox, Mp4Error] {
+  if hdr.payload_size < 24L {
+    return Err(Mp4Error::Truncated("trex truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  Ok(TrexBox::{
+    track_id: read_u32_be(data, off + 4),
+    default_sample_description_index: read_u32_be(data, off + 8),
+    default_sample_duration: read_u32_be(data, off + 12),
+    default_sample_size: read_u32_be(data, off + 16),
+    default_sample_flags: read_u32_be(data, off + 20),
+  })
+}
+
+///| Parse `tkhd` fields.
+val struct TkhdInfo {
+  track_id : UInt
+  duration : Int64
+  width : Int
+  height : Int
+}
+
+///| Parse `tkhd` box payload (v0 or v1).
+fn parse_tkhd(data : Bytes, hdr : RawBox) -> Result[TkhdInfo, Mp4Error] {
+  if hdr.payload_size < 4L {
+    return Err(Mp4Error::Truncated("tkhd header truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let version = read_u8(data, off)
+  if version == 0 {
+    if hdr.payload_size < 84L {
+      return Err(Mp4Error::Truncated("tkhd v0 truncated"))
+    }
+    let track_id = read_u32_be(data, off + 12)
+    let duration = read_u32_be(data, off + 20).to_int64() & 4294967295L
+    let width = (read_u32_be(data, off + 76) >> 16).to_int()
+    let height = (read_u32_be(data, off + 80) >> 16).to_int()
+    Ok(TkhdInfo::{ track_id: track_id, duration: duration, width: width, height: height })
+  } else if version == 1 {
+    if hdr.payload_size < 96L {
+      return Err(Mp4Error::Truncated("tkhd v1 truncated"))
+    }
+    let track_id = read_u32_be(data, off + 20)
+    let duration = read_u64_be(data, off + 28)
+    let width = (read_u32_be(data, off + 88) >> 16).to_int()
+    let height = (read_u32_be(data, off + 92) >> 16).to_int()
+    Ok(TkhdInfo::{ track_id: track_id, duration: duration, width: width, height: height })
+  } else {
+    Err(Mp4Error::Unsupported("tkhd version " + version.to_string()))
+  }
+}
+
+///| Parse `elst` box payload (v0 or v1).
+fn parse_elst(
+  data : Bytes,
+  ctx : ParseCtx,
+  hdr : RawBox,
+  out : Array[EditEntry],
+) -> Result[Unit, Mp4Error] {
+  if hdr.payload_size < 8L {
+    return Err(Mp4Error::Truncated("elst header truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let version = read_u8(data, off)
+  let cnt_u = read_u32_be(data, off + 4)
+  let cnt64 = cnt_u.to_int64() & 4294967295L
+  if cnt64 > ctx.effective_max_samples.to_int64() {
+    return Err(Mp4Error::LimitExceeded("elst entry_count exceeds limit"))
+  }
+  let entry_sz = if version == 1 { 20L } else if version == 0 { 12L } else {
+    return Err(Mp4Error::Unsupported("elst version " + version.to_string()))
+  }
+  if cnt64 * entry_sz > hdr.payload_size - 8L {
+    return Err(Mp4Error::Truncated("elst entries truncated"))
+  }
+  let cnt = cnt64.to_int()
+  let mut i = 0
+  let mut p = off + 8
+  while i < cnt {
+    if version == 0 {
+      let seg_dur = read_u32_be(data, p).to_int64() & 4294967295L
+      let media_time = read_i32_be(data, p + 4).to_int64()
+      let rate_int = read_i16_be(data, p + 8)
+      let rate_frac = read_i16_be(data, p + 10)
+      out.push(EditEntry::{
+        segment_duration: seg_dur,
+        media_time: media_time,
+        media_rate_integer: rate_int,
+        media_rate_fraction: rate_frac,
+      })
+      p = p + 12
+    } else {
+      let seg_dur = read_u64_be(data, p)
+      let media_time = read_u64_be(data, p + 8)
+      let rate_int = read_i16_be(data, p + 16)
+      let rate_frac = read_i16_be(data, p + 18)
+      out.push(EditEntry::{
+        segment_duration: seg_dur,
+        media_time: media_time,
+        media_rate_integer: rate_int,
+        media_rate_fraction: rate_frac,
+      })
+      p = p + 20
+    }
+    i = i + 1
+  }
+  Ok(())
+}
+
+///| Compute timeline shift in track timescale ticks from a track's `edit_list`.
+///| Matches FFmpeg / Chromium: leading empty edits (`media_time == -1`) delay presentation,
+///| and the first non-empty edit (`media_time >= 0`) shifts presentation by `-media_time`.
+fn compute_edit_offset(
+  edits : Array[EditEntry],
+  movie_timescale : UInt,
+  track_timescale : UInt,
+) -> Int64 {
+  if edits.length() == 0 {
+    return 0L
+  }
+  let m_ts = movie_timescale.to_int64() & 4294967295L
+  let t_ts = track_timescale.to_int64() & 4294967295L
+  let mut empty_delay = 0L
+  let mut i = 0
+  while i < edits.length() {
+    let e = edits[i]
+    if e.media_time == -1L {
+      if m_ts > 0L && t_ts > 0L && e.segment_duration > 0L {
+        let q = e.segment_duration / m_ts
+        let r = e.segment_duration % m_ts
+        empty_delay = empty_delay + q * t_ts + (r * t_ts) / m_ts
+      }
+    } else if e.media_time >= 0L {
+      return empty_delay - e.media_time
+    }
+    i = i + 1
+  }
+  empty_delay
+}
+
+///| Parse `mdhd` fields.
+struct MdhdInfo {
+  timescale : UInt
+  duration : Int64
+  language : String
+}
+
+///| Parse `mdhd` box payload (v0 or v1).
+fn parse_mdhd(data : Bytes, hdr : RawBox) -> Result[MdhdInfo, Mp4Error] {
+  if hdr.payload_size < 4L {
+    return Err(Mp4Error::Truncated("mdhd header truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let version = read_u8(data, off)
+  if version == 0 {
+    if hdr.payload_size < 24L {
+      return Err(Mp4Error::Truncated("mdhd v0 truncated"))
+    }
+    let timescale = read_u32_be(data, off + 12)
+    let duration = read_u32_be(data, off + 16).to_int64() & 4294967295L
+    let lang = decode_language(read_u16_be(data, off + 20))
+    Ok(MdhdInfo::{ timescale: timescale, duration: duration, language: lang })
+  } else if version == 1 {
+    if hdr.payload_size < 36L {
+      return Err(Mp4Error::Truncated("mdhd v1 truncated"))
+    }
+    let timescale = read_u32_be(data, off + 20)
+    let duration = read_u64_be(data, off + 24)
+    let lang = decode_language(read_u16_be(data, off + 32))
+    Ok(MdhdInfo::{ timescale: timescale, duration: duration, language: lang })
+  } else {
+    Err(Mp4Error::Unsupported("mdhd version " + version.to_string()))
+  }
+}
+
+///| Parse `hdlr` box payload -> (TrackKind, handler_type FourCC string) with zero-alloc fast path.
+fn parse_hdlr(data : Bytes, hdr : RawBox) -> Result[(TrackKind, String), Mp4Error] {
+  if hdr.payload_size < 12L {
+    return Err(Mp4Error::Truncated("hdlr truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let h_u32 = read_u32_be(data, off + 8)
+  if h_u32 == fcc_vide {
+    Ok((TrackKind::Video, "vide"))
+  } else if h_u32 == fcc_soun {
+    Ok((TrackKind::Audio, "soun"))
+  } else if h_u32 == fcc_subt {
+    Ok((TrackKind::Subtitle, "subt"))
+  } else if h_u32 == fcc_text {
+    Ok((TrackKind::Subtitle, "text"))
+  } else if h_u32 == fcc_sbtl {
+    Ok((TrackKind::Subtitle, "sbtl"))
+  } else {
+    let s = read_fourcc(data, off + 8)
+    Ok((TrackKind::Other(s), s))
+  }
+}
+
+///| Convert common sample entry FourCC `UInt` to static literal without allocation.
+fn sample_entry_fourcc(data : Bytes, off : Int, type_u32 : UInt) -> String {
+  if type_u32 == fcc_avc1 {
+    "avc1"
+  } else if type_u32 == fcc_avc3 {
+    "avc3"
+  } else if type_u32 == fcc_mp4a {
+    "mp4a"
+  } else if type_u32 == fcc_hvc1 {
+    "hvc1"
+  } else if type_u32 == fcc_hev1 {
+    "hev1"
+  } else if type_u32 == fcc_av01 {
+    "av01"
+  } else if type_u32 == fcc_vp09 {
+    "vp09"
+  } else if type_u32 == fcc_vp08 {
+    "vp08"
+  } else if type_u32 == fcc_opus {
+    "Opus"
+  } else if type_u32 == fcc_flac {
+    "fLaC"
+  } else if type_u32 == fcc_dotmp3 {
+    ".mp3"
+  } else if type_u32 == fcc_mp3sp {
+    "mp3 "
+  } else {
+    read_fourcc(data, off)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `stsd` & Codec Config Parsers (`avcC`, `hvcC`, `av1C`, `vpcC`, `esds`, `dOps`, `dfLa`)
+// ---------------------------------------------------------------------------
+
+///| Read MPEG-4 expandable descriptor length (1..4 bytes). Returns (length, new_pos).
+fn read_mp4_descr_len(data : Bytes, start : Int, end : Int) -> Option[(Int, Int)] {
+  let mut pos = start
+  let mut len = 0
+  let mut count = 0
+  while pos < end && count < 4 {
+    let b = read_u8(data, pos)
+    pos = pos + 1
+    count = count + 1
+    len = (len << 7) | (b & 127)
+    if (b & 128) == 0 {
+      return Some((len, pos))
+    }
+  }
+  None
+}
+
+///| Parse `esds` FullBox payload to extract objectTypeIndication & AudioSpecificConfig.
+fn parse_esds(data : Bytes, start : Int, end : Int) -> CodecConfig {
+  let mut pos = start + 4
+  if pos >= end {
+    return CodecConfig::Unknown("esds", empty_bytes)
+  }
+  if read_u8(data, pos) == 3 {
+    pos = pos + 1
+    match read_mp4_descr_len(data, pos, end) {
+      Some((_, next_pos)) => {
+        pos = next_pos
+        if pos + 3 > end {
+          return CodecConfig::Unknown("esds", empty_bytes)
+        }
+        let flags = read_u8(data, pos + 2)
+        pos = pos + 3
+        if (flags & 128) != 0 {
+          pos = pos + 2
+        }
+        if (flags & 64) != 0 {
+          if pos >= end {
+            return CodecConfig::Unknown("esds", empty_bytes)
+          }
+          let url_len = read_u8(data, pos)
+          pos = pos + 1 + url_len
+        }
+        if (flags & 32) != 0 {
+          pos = pos + 2
+        }
+      }
+      None => return CodecConfig::Unknown("esds", empty_bytes)
+    }
+  }
+  if pos >= end || read_u8(data, pos) != 4 {
+    return CodecConfig::Unknown("esds", empty_bytes)
+  }
+  pos = pos + 1
+  let dcd_end = match read_mp4_descr_len(data, pos, end) {
+    Some((dlen, next_pos)) => {
+      pos = next_pos
+      let e = pos + dlen
+      if e < end { e } else { end }
+    }
+    None => return CodecConfig::Unknown("esds", empty_bytes)
+  }
+  if pos + 13 > dcd_end {
+    return CodecConfig::Unknown("esds", empty_bytes)
+  }
+  let oti = read_u8(data, pos)
+  pos = pos + 13
+  if oti == 105 || oti == 107 {
+    return CodecConfig::Mp3(oti)
+  }
+  if pos < dcd_end && read_u8(data, pos) == 5 {
+    pos = pos + 1
+    match read_mp4_descr_len(data, pos, dcd_end) {
+      Some((asc_len, next_pos)) => {
+        pos = next_pos
+        if pos + asc_len <= dcd_end && asc_len >= 1 {
+          let asc = data.slice(pos, pos + asc_len)
+          let b0 = read_u8(data, pos)
+          let mut aot = (b0 >> 3) & 31
+          if aot == 31 && asc_len >= 2 {
+            let b1 = read_u8(data, pos + 1)
+            aot = 32 + (((b0 & 7) << 3) | ((b1 >> 5) & 7))
+          }
+          return CodecConfig::Aac(asc, oti, aot)
+        }
+      }
+      None => ()
+    }
+  }
+  CodecConfig::Aac(empty_bytes, oti, 2)
+}
+
+///| Parsed `stsd` sample entry summary.
+struct StsdInfo {
+  codec_fourcc : String
+  codec_config : CodecConfig
+  width : Int
+  height : Int
+  sample_rate : Int
+  channels : Int
+}
+
+///| Parse visual sample entry child boxes (`avcC`, `hvcC`, `av1C`, `vpcC`).
+fn parse_visual_entry(
+  data : Bytes,
+  ctx : ParseCtx,
+  entry : RawBox,
+  entry_fourcc : String,
+  depth : Int,
+) -> Result[StsdInfo, Mp4Error] {
+  match check_depth(ctx, depth) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  if entry.payload_size < 78L {
+    return Err(Mp4Error::Truncated("visual sample entry < 78 bytes"))
+  }
+  let off = entry.payload_offset.to_int()
+  let width = read_u16_be(data, off + 24)
+  let height = read_u16_be(data, off + 26)
+  let child_end = entry.payload_offset + entry.payload_size
+  let mut pos = entry.payload_offset + 78L
+  let mut cfg = CodecConfig::Unknown(entry_fourcc, empty_bytes)
+
+  while pos + 8L <= child_end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let ch = match read_raw_box(data, pos, child_end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    let c_off = ch.payload_offset.to_int()
+    let c_end = (ch.payload_offset + ch.payload_size).to_int()
+    if ch.type_u32 == fcc_avcc && ch.payload_size >= 4L {
+      let raw = data.slice(c_off, c_end)
+      let profile = read_u8(data, c_off + 1)
+      let compat = read_u8(data, c_off + 2)
+      let level = read_u8(data, c_off + 3)
+      cfg = CodecConfig::Avc(raw, profile, compat, level)
+    } else if ch.type_u32 == fcc_hvcc && ch.payload_size >= 13L {
+      let raw = data.slice(c_off, c_end)
+      let b1 = read_u8(data, c_off + 1)
+      let tier = (b1 >> 5) & 1
+      let profile = b1 & 31
+      let level = read_u8(data, c_off + 12)
+      cfg = CodecConfig::Hevc(raw, profile, tier, level)
+    } else if ch.type_u32 == fcc_av1c && ch.payload_size >= 4L {
+      let raw = data.slice(c_off, c_end)
+      let b1 = read_u8(data, c_off + 1)
+      let b2 = read_u8(data, c_off + 2)
+      let seq_profile = (b1 >> 5) & 7
+      let level_idx = b1 & 31
+      let tier = (b2 >> 7) & 1
+      let high_bd = (b2 >> 6) & 1
+      let twelve_b = (b2 >> 5) & 1
+      let bd = if high_bd == 0 {
+        8
+      } else if twelve_b == 1 {
+        12
+      } else {
+        10
+      }
+      cfg = CodecConfig::Av1(raw, seq_profile, level_idx, tier, bd)
+    } else if ch.type_u32 == fcc_vpcc && ch.payload_size >= 7L {
+      let raw = data.slice(c_off, c_end)
+      if entry.type_u32 == fcc_vp08 {
+        cfg = CodecConfig::Vp8(raw)
+      } else {
+        let profile = read_u8(data, c_off + 4)
+        let level = read_u8(data, c_off + 5)
+        let bd = (read_u8(data, c_off + 6) >> 4) & 15
+        cfg = CodecConfig::Vp9(raw, profile, level, bd)
+      }
+    }
+    pos = pos + ch.size
+  }
+
+  Ok(StsdInfo::{
+    codec_fourcc: entry_fourcc,
+    codec_config: cfg,
+    width: width,
+    height: height,
+    sample_rate: 0,
+    channels: 0,
+  })
+}
+
+///| Parse audio sample entry child boxes (`esds`, `dOps`, `dfLa`, `wave`).
+fn parse_audio_entry(
+  data : Bytes,
+  ctx : ParseCtx,
+  entry : RawBox,
+  entry_fourcc : String,
+  depth : Int,
+) -> Result[StsdInfo, Mp4Error] {
+  match check_depth(ctx, depth) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  if entry.payload_size < 28L {
+    return Err(Mp4Error::Truncated("audio sample entry < 28 bytes"))
+  }
+  let off = entry.payload_offset.to_int()
+  let qt_version = read_u16_be(data, off + 8)
+  let mut channels = read_u16_be(data, off + 16)
+  let sample_rate = (read_u32_be(data, off + 24) >> 16).to_int()
+  let mut header_bytes = 28L
+  if qt_version == 1 {
+    header_bytes = 44L
+  } else if qt_version == 2 {
+    header_bytes = 64L
+  }
+  if entry.payload_size < header_bytes {
+    header_bytes = 28L
+  }
+
+  let mut cfg = if entry.type_u32 == fcc_dotmp3 || entry.type_u32 == fcc_mp3sp {
+    CodecConfig::Mp3(0)
+  } else {
+    CodecConfig::Unknown(entry_fourcc, empty_bytes)
+  }
+
+  let child_end = entry.payload_offset + entry.payload_size
+  let mut pos = entry.payload_offset + header_bytes
+  while pos + 8L <= child_end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let ch = match read_raw_box(data, pos, child_end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    let c_off = ch.payload_offset.to_int()
+    let c_end = (ch.payload_offset + ch.payload_size).to_int()
+    if ch.type_u32 == fcc_esds {
+      cfg = parse_esds(data, c_off, c_end)
+    } else if ch.type_u32 == fcc_dops && ch.payload_size >= 11L {
+      let raw = data.slice(c_off, c_end)
+      let out_ch = read_u8(data, c_off + 1)
+      let pre_skip = read_u16_be(data, c_off + 2)
+      if out_ch > 0 {
+        channels = out_ch
+      }
+      cfg = CodecConfig::Opus(raw, out_ch, pre_skip)
+    } else if ch.type_u32 == fcc_dfla {
+      cfg = CodecConfig::Flac(data.slice(c_off, c_end))
+    } else if ch.type_u32 == fcc_wave {
+      let mut wpos = ch.payload_offset
+      let wend = ch.payload_offset + ch.payload_size
+      while wpos + 8L <= wend {
+        match charge_box(ctx) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let wch = match read_raw_box(data, wpos, wend) {
+          Ok(h) => h
+          Err(e) => return Err(e)
+        }
+        if wch.type_u32 == fcc_esds {
+          cfg = parse_esds(
+            data,
+            wch.payload_offset.to_int(),
+            (wch.payload_offset + wch.payload_size).to_int(),
+          )
+        }
+        wpos = wpos + wch.size
+      }
+    }
+    pos = pos + ch.size
+  }
+
+  Ok(StsdInfo::{
+    codec_fourcc: entry_fourcc,
+    codec_config: cfg,
+    width: 0,
+    height: 0,
+    sample_rate: sample_rate,
+    channels: channels,
+  })
+}
+
+///| Parse `stsd` box payload (first sample entry).
+fn parse_stsd(
+  data : Bytes,
+  ctx : ParseCtx,
+  hdr : RawBox,
+  kind : TrackKind,
+  depth : Int,
+) -> Result[StsdInfo, Mp4Error] {
+  if hdr.payload_size < 8L {
+    return Err(Mp4Error::Truncated("stsd truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let count = read_u32_be(data, off + 4)
+  if count == 0U {
+    return Ok(StsdInfo::{
+      codec_fourcc: "",
+      codec_config: CodecConfig::Unknown("", empty_bytes),
+      width: 0,
+      height: 0,
+      sample_rate: 0,
+      channels: 0,
+    })
+  }
+  match charge_box(ctx) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let entry = match read_raw_box(
+    data,
+    hdr.payload_offset + 8L,
+    hdr.payload_offset + hdr.payload_size,
+  ) {
+    Ok(h) => h
+    Err(e) => return Err(e)
+  }
+  let entry_fourcc = sample_entry_fourcc(data, entry.offset.to_int() + 4, entry.type_u32)
+  match kind {
+    TrackKind::Video => parse_visual_entry(data, ctx, entry, entry_fourcc, depth + 1)
+    TrackKind::Audio => parse_audio_entry(data, ctx, entry, entry_fourcc, depth + 1)
+    _ =>
+    Ok(StsdInfo::{
+      codec_fourcc: entry_fourcc,
+      codec_config: CodecConfig::Unknown(entry_fourcc, empty_bytes),
+      width: 0,
+      height: 0,
+      sample_rate: 0,
+      channels: 0,
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `stbl` Sample Table Parsing (`stts`, `ctts`, `stsc`, `stsz`/`stz2`, `stco`/`co64`, `stss`)
+// ---------------------------------------------------------------------------
+
+///|
+val struct SttsEntry {
+  count : Int
+  delta : Int64
+}
+
+///|
+val struct CttsEntry {
+  count : Int
+  offset : Int64
+}
+
+///|
+val struct StscEntry {
+  first_chunk : Int
+  samples_per_chunk : Int
+}
+
+///| Parse `stbl` container into track codec info and sample table.
+struct StblResult {
+  stsd : StsdInfo
+  samples : Array[Sample]
+}
+
+///| Parse `stbl` box (lazy table allocation: zero heap arrays allocated for empty fMP4 init `stbl`).
+fn parse_stbl(
+  data : Bytes,
+  ctx : ParseCtx,
+  hdr : RawBox,
+  kind : TrackKind,
+  edit_offset : Int64,
+  depth : Int,
+) -> Result[StblResult, Mp4Error] {
+  match check_depth(ctx, depth) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let mut stsd = StsdInfo::{
+    codec_fourcc: "",
+    codec_config: CodecConfig::Unknown("", empty_bytes),
+    width: 0,
+    height: 0,
+    sample_rate: 0,
+    channels: 0,
+  }
+  let mut stts_opt : Option[Array[SttsEntry]] = None
+  let mut ctts_opt : Option[Array[CttsEntry]] = None
+  let mut stsc_opt : Option[Array[StscEntry]] = None
+  let mut sample_sizes_opt : Option[Array[Int]] = None
+  let mut const_sample_size = 0
+  let mut sample_count = 0
+  let mut chunk_offsets_opt : Option[Array[Int64]] = None
+  let mut has_stss = false
+  let mut stss_nums_opt : Option[Array[Int]] = None
+
+  let end = hdr.payload_offset + hdr.payload_size
+  let mut pos = hdr.payload_offset
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let ch = match read_raw_box(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    let off = ch.payload_offset.to_int()
+    let plen = ch.payload_size
+
+    if ch.type_u32 == fcc_stsd {
+      stsd = match parse_stsd(data, ctx, ch, kind, depth + 1) {
+        Ok(s) => s
+        Err(e) => return Err(e)
+      }
+    } else if ch.type_u32 == fcc_stts {
+      if plen < 8L {
+        return Err(Mp4Error::Truncated("stts truncated"))
+      }
+      let cnt_u = read_u32_be(data, off + 4)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 * 8L > plen - 8L {
+        return Err(Mp4Error::Truncated("stts entries truncated"))
+      }
+      let cnt = cnt64.to_int()
+      if cnt > 0 {
+        let arr = match stts_opt {
+          Some(a) => a
+          None => {
+            let a : Array[SttsEntry] = []
+            stts_opt = Some(a)
+            a
+          }
+        }
+        let mut i = 0
+        while i < cnt {
+          let eoff = off + 8 + i * 8
+          let sc = read_u32_be(data, eoff)
+          let sd = read_u32_be(data, eoff + 4)
+          if sc.to_int() < 0 {
+            return Err(Mp4Error::InvalidSyntax("stts sample_count overflow"))
+          }
+          arr.push(SttsEntry::{
+            count: sc.to_int(),
+            delta: sd.to_int64() & 4294967295L,
+          })
+          i = i + 1
+        }
+      }
+    } else if ch.type_u32 == fcc_ctts {
+      if plen < 8L {
+        return Err(Mp4Error::Truncated("ctts truncated"))
+      }
+      let cnt_u = read_u32_be(data, off + 4)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 * 8L > plen - 8L {
+        return Err(Mp4Error::Truncated("ctts entries truncated"))
+      }
+      let cnt = cnt64.to_int()
+      if cnt > 0 {
+        let arr = match ctts_opt {
+          Some(a) => a
+          None => {
+            let a : Array[CttsEntry] = []
+            ctts_opt = Some(a)
+            a
+          }
+        }
+        let mut i = 0
+        while i < cnt {
+          let eoff = off + 8 + i * 8
+          let sc = read_u32_be(data, eoff)
+          if sc.to_int() < 0 {
+            return Err(Mp4Error::InvalidSyntax("ctts sample_count overflow"))
+          }
+          // Both v0 and v1 read as signed int32 (aligns with FFmpeg, Chromium, GPAC)
+          let cto = read_i32_be(data, eoff + 4).to_int64()
+          arr.push(CttsEntry::{ count: sc.to_int(), offset: cto })
+          i = i + 1
+        }
+      }
+    } else if ch.type_u32 == fcc_stsc {
+      if plen < 8L {
+        return Err(Mp4Error::Truncated("stsc truncated"))
+      }
+      let cnt_u = read_u32_be(data, off + 4)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 * 12L > plen - 8L {
+        return Err(Mp4Error::Truncated("stsc entries truncated"))
+      }
+      let cnt = cnt64.to_int()
+      if cnt > 0 {
+        let arr = match stsc_opt {
+          Some(a) => a
+          None => {
+            let a : Array[StscEntry] = []
+            stsc_opt = Some(a)
+            a
+          }
+        }
+        let mut i = 0
+        while i < cnt {
+          let eoff = off + 8 + i * 12
+          let fc = read_u32_be(data, eoff)
+          let spc = read_u32_be(data, eoff + 4)
+          if fc == 0U || fc.to_int() < 0 || spc.to_int() < 0 {
+            return Err(Mp4Error::InvalidSyntax("invalid stsc entry"))
+          }
+          arr.push(StscEntry::{
+            first_chunk: fc.to_int(),
+            samples_per_chunk: spc.to_int(),
+          })
+          i = i + 1
+        }
+      }
+    } else if ch.type_u32 == fcc_stsz {
+      if plen < 12L {
+        return Err(Mp4Error::Truncated("stsz truncated"))
+      }
+      let sz_u = read_u32_be(data, off + 4)
+      let cnt_u = read_u32_be(data, off + 8)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 > ctx.effective_max_samples.to_int64() {
+        return Err(Mp4Error::LimitExceeded("stsz sample_count exceeds max_samples"))
+      }
+      sample_count = cnt64.to_int()
+      if sz_u != 0U {
+        if sz_u.to_int() < 0 {
+          return Err(Mp4Error::InvalidSyntax("stsz constant size overflow"))
+        }
+        const_sample_size = sz_u.to_int()
+      } else if sample_count > 0 {
+        if cnt64 * 4L > plen - 12L {
+          return Err(Mp4Error::Truncated("stsz table truncated"))
+        }
+        let sizes : Array[Int] = []
+        let mut i = 0
+        while i < sample_count {
+          let s = read_u32_be(data, off + 12 + i * 4)
+          if s.to_int() < 0 {
+            return Err(Mp4Error::InvalidSyntax("stsz entry overflow"))
+          }
+          sizes.push(s.to_int())
+          i = i + 1
+        }
+        sample_sizes_opt = Some(sizes)
+      }
+    } else if ch.type_u32 == fcc_stz2 {
+      if plen < 12L {
+        return Err(Mp4Error::Truncated("stz2 truncated"))
+      }
+      let field_size = read_u8(data, off + 7)
+      let cnt_u = read_u32_be(data, off + 8)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 > ctx.effective_max_samples.to_int64() {
+        return Err(Mp4Error::LimitExceeded("stz2 sample_count exceeds max_samples"))
+      }
+      sample_count = cnt64.to_int()
+      let sizes : Array[Int] = []
+      if field_size == 4 {
+        let need = (cnt64 + 1L) / 2L
+        if need > plen - 12L {
+          return Err(Mp4Error::Truncated("stz2 4-bit table truncated"))
+        }
+        let mut i = 0
+        while i < sample_count {
+          let b = read_u8(data, off + 12 + (i >> 1))
+          let v = if (i & 1) == 0 { (b >> 4) & 15 } else { b & 15 }
+          sizes.push(v)
+          i = i + 1
+        }
+      } else if field_size == 8 {
+        if cnt64 > plen - 12L {
+          return Err(Mp4Error::Truncated("stz2 8-bit table truncated"))
+        }
+        let mut i = 0
+        while i < sample_count {
+          sizes.push(read_u8(data, off + 12 + i))
+          i = i + 1
+        }
+      } else if field_size == 16 {
+        if cnt64 * 2L > plen - 12L {
+          return Err(Mp4Error::Truncated("stz2 16-bit table truncated"))
+        }
+        let mut i = 0
+        while i < sample_count {
+          sizes.push(read_u16_be(data, off + 12 + i * 2))
+          i = i + 1
+        }
+      } else {
+        return Err(Mp4Error::InvalidSyntax("invalid stz2 field_size"))
+      }
+      sample_sizes_opt = Some(sizes)
+    } else if ch.type_u32 == fcc_stco {
+      if plen < 8L {
+        return Err(Mp4Error::Truncated("stco truncated"))
+      }
+      let cnt_u = read_u32_be(data, off + 4)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 * 4L > plen - 8L {
+        return Err(Mp4Error::Truncated("stco entries truncated"))
+      }
+      let cnt = cnt64.to_int()
+      if cnt > 0 {
+        let arr = match chunk_offsets_opt {
+          Some(a) => a
+          None => {
+            let a : Array[Int64] = []
+            chunk_offsets_opt = Some(a)
+            a
+          }
+        }
+        let mut i = 0
+        while i < cnt {
+          arr.push(read_u32_be(data, off + 8 + i * 4).to_int64() & 4294967295L)
+          i = i + 1
+        }
+      }
+    } else if ch.type_u32 == fcc_co64 {
+      if plen < 8L {
+        return Err(Mp4Error::Truncated("co64 truncated"))
+      }
+      let cnt_u = read_u32_be(data, off + 4)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 * 8L > plen - 8L {
+        return Err(Mp4Error::Truncated("co64 entries truncated"))
+      }
+      let cnt = cnt64.to_int()
+      if cnt > 0 {
+        let arr = match chunk_offsets_opt {
+          Some(a) => a
+          None => {
+            let a : Array[Int64] = []
+            chunk_offsets_opt = Some(a)
+            a
+          }
+        }
+        let mut i = 0
+        while i < cnt {
+          let co = read_u64_be(data, off + 8 + i * 8)
+          if co < 0L {
+            return Err(Mp4Error::InvalidSyntax("co64 offset overflow"))
+          }
+          arr.push(co)
+          i = i + 1
+        }
+      }
+    } else if ch.type_u32 == fcc_stss {
+      if plen < 8L {
+        return Err(Mp4Error::Truncated("stss truncated"))
+      }
+      has_stss = true
+      let cnt_u = read_u32_be(data, off + 4)
+      let cnt64 = cnt_u.to_int64() & 4294967295L
+      if cnt64 * 4L > plen - 8L {
+        return Err(Mp4Error::Truncated("stss entries truncated"))
+      }
+      let cnt = cnt64.to_int()
+      if cnt > 0 {
+        let arr = match stss_nums_opt {
+          Some(a) => a
+          None => {
+            let a : Array[Int] = []
+            stss_nums_opt = Some(a)
+            a
+          }
+        }
+        let mut i = 0
+        while i < cnt {
+          let sn = read_u32_be(data, off + 8 + i * 4)
+          if sn.to_int() > 0 {
+            arr.push(sn.to_int())
+          }
+          i = i + 1
+        }
+      }
+    }
+    pos = pos + ch.size
+  }
+
+  if sample_count == 0 {
+    return Ok(StblResult::{ stsd: stsd, samples: [] })
+  }
+
+  let chunk_offsets = match chunk_offsets_opt {
+    Some(a) => a
+    None => return Err(Mp4Error::InvalidSyntax("stsz non-empty without stco/co64"))
+  }
+  let stsc = match stsc_opt {
+    Some(a) => a
+    None => return Err(Mp4Error::InvalidSyntax("stsz non-empty without stsc"))
+  }
+  if chunk_offsets.length() == 0 || stsc.length() == 0 {
+    return Err(Mp4Error::InvalidSyntax("stsc/stco empty for non-zero sample_count"))
+  }
+
+  match charge_samples(ctx, sample_count) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  let stts = match stts_opt {
+    Some(a) => a
+    None => []
+  }
+  let ctts = match ctts_opt {
+    Some(a) => a
+    None => []
+  }
+  let sample_sizes = match sample_sizes_opt {
+    Some(a) => a
+    None => []
+  }
+
+  // Build sync-sample lookup bitmap if `stss` is present
+  let sync_flags : FixedArray[Bool] = FixedArray::make(sample_count, !has_stss)
+  if has_stss {
+    match stss_nums_opt {
+      Some(stss_nums) => {
+        let mut i = 0
+        while i < stss_nums.length() {
+          let idx = stss_nums[i] - 1
+          if idx >= 0 && idx < sample_count {
+            sync_flags[idx] = true
+          }
+          i = i + 1
+        }
+      }
+      None => ()
+    }
+  }
+
+  // Synthesize per-sample offset, size, dts, pts, duration, is_sync
+  let zero_sample = Sample::{
+    offset: 0L,
+    size: 0,
+    dts: 0L,
+    pts: 0L,
+    duration: 0L,
+    is_sync: false,
+  }
+  let samples : Array[Sample] = Array::make(sample_count, zero_sample)
+  let data_len = data.length().to_int64()
+
+  let mut stts_idx = 0
+  let mut stts_rem = if stts.length() > 0 { stts[0].count } else { 0 }
+  let mut stts_delta = if stts.length() > 0 { stts[0].delta } else { 0L }
+
+  let mut ctts_idx = 0
+  let mut ctts_rem = if ctts.length() > 0 { ctts[0].count } else { 0 }
+  let mut ctts_off = if ctts.length() > 0 { ctts[0].offset } else { 0L }
+
+  let mut stsc_idx = 0
+  let mut cur_chunk = 1
+  let mut chunk_rem = 0
+  let mut cur_offset = 0L
+  let num_chunks = chunk_offsets.length()
+
+  let mut cur_dts = 0L
+  let mut s = 0
+  while s < sample_count {
+    while chunk_rem == 0 {
+      if cur_chunk < 1 || cur_chunk > num_chunks {
+        return Err(Mp4Error::InvalidSyntax("stsc/stco chunk count mismatch"))
+      }
+      while stsc_idx + 1 < stsc.length() && stsc[stsc_idx + 1].first_chunk <= cur_chunk {
+        stsc_idx = stsc_idx + 1
+      }
+      if stsc_idx >= stsc.length() || stsc[stsc_idx].first_chunk > cur_chunk {
+        return Err(Mp4Error::InvalidSyntax("missing stsc entry for chunk"))
+      }
+      chunk_rem = stsc[stsc_idx].samples_per_chunk
+      cur_offset = chunk_offsets[cur_chunk - 1]
+      cur_chunk = cur_chunk + 1
+      if chunk_rem == 0 {
+        continue
+      }
+    }
+
+    let sz = if const_sample_size > 0 {
+      const_sample_size
+    } else {
+      sample_sizes[s]
+    }
+    if cur_offset < 0L || cur_offset > data_len || sz.to_int64() > data_len - cur_offset {
+      return Err(Mp4Error::Truncated("sample byte range exceeds file size"))
+    }
+
+    while stts_rem == 0 && stts_idx + 1 < stts.length() {
+      stts_idx = stts_idx + 1
+      stts_rem = stts[stts_idx].count
+      stts_delta = stts[stts_idx].delta
+    }
+    let dur = if stts_rem > 0 {
+      stts_rem = stts_rem - 1
+      stts_delta
+    } else {
+      0L
+    }
+
+    while ctts_rem == 0 && ctts_idx + 1 < ctts.length() {
+      ctts_idx = ctts_idx + 1
+      ctts_rem = ctts[ctts_idx].count
+      ctts_off = ctts[ctts_idx].offset
+    }
+    let cto = if ctts_rem > 0 {
+      ctts_rem = ctts_rem - 1
+      ctts_off
+    } else {
+      0L
+    }
+
+    samples[s] = Sample::{
+      offset: cur_offset,
+      size: sz,
+      dts: cur_dts + edit_offset,
+      pts: cur_dts + cto + edit_offset,
+      duration: dur,
+      is_sync: sync_flags[s],
+    }
+
+    cur_offset = cur_offset + sz.to_int64()
+    chunk_rem = chunk_rem - 1
+    cur_dts = cur_dts + dur
+    s = s + 1
+  }
+
+  Ok(StblResult::{ stsd: stsd, samples: samples })
+}
+
+// ---------------------------------------------------------------------------
+// `trak` & `moov` Container Parsing
+// ---------------------------------------------------------------------------
+
+///| Parse a single `trak` container box.
+fn parse_trak(
+  data : Bytes,
+  ctx : ParseCtx,
+  hdr : RawBox,
+  movie_timescale : UInt,
+  depth : Int,
+) -> Result[Track, Mp4Error] {
+  match check_depth(ctx, depth) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let mut tkhd = TkhdInfo::{ track_id: 0U, duration: 0L, width: 0, height: 0 }
+  let mut mdhd = MdhdInfo::{ timescale: 0U, duration: 0L, language: "und" }
+  let mut kind = TrackKind::Other("")
+  let mut handler_type = ""
+  let mut stbl_hdr : Option[RawBox] = None
+  let edits : Array[EditEntry] = []
+
+  let end = hdr.payload_offset + hdr.payload_size
+  let mut pos = hdr.payload_offset
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let ch = match read_raw_box(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    if ch.type_u32 == fcc_tkhd {
+      tkhd = match parse_tkhd(data, ch) {
+        Ok(t) => t
+        Err(e) => return Err(e)
+      }
+    } else if ch.type_u32 == fcc_edts {
+      match check_depth(ctx, depth + 1) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let eend = ch.payload_offset + ch.payload_size
+      let mut epos = ch.payload_offset
+      while epos < eend {
+        match charge_box(ctx) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let ech = match read_raw_box(data, epos, eend) {
+          Ok(h) => h
+          Err(e) => return Err(e)
+        }
+        if ech.type_u32 == fcc_elst {
+          match parse_elst(data, ctx, ech, edits) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        epos = epos + ech.size
+      }
+    } else if ch.type_u32 == fcc_mdia {
+      match check_depth(ctx, depth + 1) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let mend = ch.payload_offset + ch.payload_size
+      let mut mpos = ch.payload_offset
+      while mpos < mend {
+        match charge_box(ctx) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let mch = match read_raw_box(data, mpos, mend) {
+          Ok(h) => h
+          Err(e) => return Err(e)
+        }
+        if mch.type_u32 == fcc_mdhd {
+          mdhd = match parse_mdhd(data, mch) {
+            Ok(m) => m
+            Err(e) => return Err(e)
+          }
+        } else if mch.type_u32 == fcc_hdlr {
+          match parse_hdlr(data, mch) {
+            Ok((k, h)) => {
+              kind = k
+              handler_type = h
+            }
+            Err(e) => return Err(e)
+          }
+        } else if mch.type_u32 == fcc_minf {
+          match check_depth(ctx, depth + 2) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          let minf_end = mch.payload_offset + mch.payload_size
+          let mut minf_pos = mch.payload_offset
+          while minf_pos < minf_end {
+            match charge_box(ctx) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            let minf_ch = match read_raw_box(data, minf_pos, minf_end) {
+              Ok(h) => h
+              Err(e) => return Err(e)
+            }
+            if minf_ch.type_u32 == fcc_stbl {
+              stbl_hdr = Some(minf_ch)
+            }
+            minf_pos = minf_pos + minf_ch.size
+          }
+        }
+        mpos = mpos + mch.size
+      }
+    }
+    pos = pos + ch.size
+  }
+
+  let edit_offset = compute_edit_offset(edits, movie_timescale, mdhd.timescale)
+
+  let stbl_res = match stbl_hdr {
+    Some(sh) =>
+    match parse_stbl(data, ctx, sh, kind, edit_offset, depth + 3) {
+      Ok(r) => r
+      Err(e) => return Err(e)
+    }
+    None =>
+    StblResult::{
+      stsd: StsdInfo::{
+        codec_fourcc: "",
+        codec_config: CodecConfig::Unknown("", empty_bytes),
+        width: 0,
+        height: 0,
+        sample_rate: 0,
+        channels: 0,
+      },
+      samples: [],
+    }
+  }
+
+  let width = if tkhd.width > 0 { tkhd.width } else { stbl_res.stsd.width }
+  let height = if tkhd.height > 0 { tkhd.height } else { stbl_res.stsd.height }
+
+  Ok(Track::{
+    track_id: tkhd.track_id,
+    kind: kind,
+    handler_type: handler_type,
+    timescale: mdhd.timescale,
+    duration: mdhd.duration,
+    tkhd_duration: tkhd.duration,
+    language: mdhd.language,
+    width: width,
+    height: height,
+    sample_rate: stbl_res.stsd.sample_rate,
+    channels: stbl_res.stsd.channels,
+    codec_fourcc: stbl_res.stsd.codec_fourcc,
+    codec_config: stbl_res.stsd.codec_config,
+    edit_list: edits,
+    samples: stbl_res.samples,
+  })
+}
+
+///| Parsed `moov` box contents.
+struct MoovResult {
+  mvhd : MovieHeader
+  tracks : Array[Track]
+  trex : Array[TrexBox]
+}
+
+///| Parse `moov` container box.
+fn parse_moov(
+  data : Bytes,
+  ctx : ParseCtx,
+  hdr : RawBox,
+  depth : Int,
+) -> Result[MoovResult, Mp4Error] {
+  match check_depth(ctx, depth) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let mut mvhd_opt : Option[MovieHeader] = None
+  let trak_boxes : Array[RawBox] = []
+  let trex_list : Array[TrexBox] = []
+
+  let end = hdr.payload_offset + hdr.payload_size
+  let mut pos = hdr.payload_offset
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let ch = match read_raw_box(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    if ch.type_u32 == fcc_mvhd {
+      match parse_mvhd(data, ch) {
+        Ok(m) => mvhd_opt = Some(m)
+        Err(e) => return Err(e)
+      }
+    } else if ch.type_u32 == fcc_trak {
+      if trak_boxes.length() >= ctx.limits.max_tracks {
+        return Err(Mp4Error::LimitExceeded("max_tracks exceeded"))
+      }
+      trak_boxes.push(ch)
+    } else if ch.type_u32 == fcc_mvex {
+      match check_depth(ctx, depth + 1) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let mvex_end = ch.payload_offset + ch.payload_size
+      let mut mpos = ch.payload_offset
+      while mpos < mvex_end {
+        match charge_box(ctx) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let mch = match read_raw_box(data, mpos, mvex_end) {
+          Ok(h) => h
+          Err(e) => return Err(e)
+        }
+        if mch.type_u32 == fcc_trex {
+          match parse_trex(data, mch) {
+            Ok(tr) => trex_list.push(tr)
+            Err(e) => return Err(e)
+          }
+        }
+        mpos = mpos + mch.size
+      }
+    }
+    pos = pos + ch.size
+  }
+
+  let mvhd = match mvhd_opt {
+    Some(m) => m
+    None => return Err(Mp4Error::InvalidSyntax("moov missing mvhd"))
+  }
+
+  // Parse `trak` boxes after `mvhd` is known so `elst` empty edits can use `mvhd.timescale`
+  let tracks : Array[Track] = []
+  let mut ti = 0
+  while ti < trak_boxes.length() {
+    match parse_trak(data, ctx, trak_boxes[ti], mvhd.timescale, depth + 1) {
+      Ok(t) => tracks.push(t)
+      Err(e) => return Err(e)
+    }
+    ti = ti + 1
+  }
+
+  Ok(MoovResult::{ mvhd: mvhd, tracks: tracks, trex: trex_list })
+}
+
+// ---------------------------------------------------------------------------
+// Public Traditional MP4 API
+// ---------------------------------------------------------------------------
+
+///| Parse a traditional MP4 file using default limits.
+pub fn parse_mp4(data : Bytes) -> Result[Mp4File, Mp4Error] {
+  parse_mp4_with_limits(data, DecodeLimits::default())
+}
+
+///| Parse a traditional MP4 file using explicit limits.
+pub fn parse_mp4_with_limits(
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[Mp4File, Mp4Error] {
+  let ctx = match make_ctx(limits, data.length()) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  let end = data.length().to_int64()
+  let mut ftyp_opt : Option[FtypBox] = None
+  let mut moov_opt : Option[MoovResult] = None
+
+  let mut pos = 0L
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let hdr = match read_raw_box(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    if hdr.type_u32 == fcc_ftyp {
+      match parse_ftyp(data, hdr) {
+        Ok(f) => ftyp_opt = Some(f)
+        Err(e) => return Err(e)
+      }
+    } else if hdr.type_u32 == fcc_moov {
+      match parse_moov(data, ctx, hdr, 1) {
+        Ok(m) => moov_opt = Some(m)
+        Err(e) => return Err(e)
+      }
+    }
+    pos = pos + hdr.size
+  }
+
+  match moov_opt {
+    Some(m) =>
+    Ok(Mp4File::{
+      ftyp: ftyp_opt,
+      mvhd: m.mvhd,
+      tracks: m.tracks,
+      trex: m.trex,
+    })
+    None => Err(Mp4Error::InvalidSyntax("missing moov box"))
+  }
+}
+
+///| Extract the sample table for `track_id` from a parsed `Mp4File`.
+pub fn Mp4File::extract_samples(
+  self : Mp4File,
+  track_id : UInt,
+) -> Result[Array[Sample], Mp4Error] {
+  let mut i = 0
+  while i < self.tracks.length() {
+    if self.tracks[i].track_id == track_id {
+      return Ok(self.tracks[i].samples)
+    }
+    i = i + 1
+  }
+  Err(Mp4Error::InvalidSyntax("track_id not found: " + track_id.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// fMP4 / MSE Initialization & Media Segment Parsing
+// ---------------------------------------------------------------------------
+
+///| Parse an fMP4 / MSE initialization segment (`ftyp` + `moov`).
+pub fn parse_init_segment(
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[InitSegment, Mp4Error] {
+  let ctx = match make_ctx(limits, data.length()) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  let end = data.length().to_int64()
+  let mut ftyp_opt : Option[FtypBox] = None
+  let mut moov_opt : Option[MoovResult] = None
+
+  let mut pos = 0L
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let hdr = match read_raw_box(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    if hdr.type_u32 == fcc_ftyp {
+      match parse_ftyp(data, hdr) {
+        Ok(f) => ftyp_opt = Some(f)
+        Err(e) => return Err(e)
+      }
+    } else if hdr.type_u32 == fcc_moov {
+      match parse_moov(data, ctx, hdr, 1) {
+        Ok(m) => moov_opt = Some(m)
+        Err(e) => return Err(e)
+      }
+    }
+    pos = pos + hdr.size
+  }
+
+  let ftyp = match ftyp_opt {
+    Some(f) => f
+    None => return Err(Mp4Error::InvalidSyntax("init segment missing ftyp"))
+  }
+  let moov = match moov_opt {
+    Some(m) => m
+    None => return Err(Mp4Error::InvalidSyntax("init segment missing moov"))
+  }
+  Ok(InitSegment::{
+    ftyp: ftyp,
+    mvhd: moov.mvhd,
+    tracks: moov.tracks,
+    trex: moov.trex,
+  })
+}
+
+///| Parse `sidx` box payload (v0 or v1).
+fn parse_sidx(data : Bytes, ctx : ParseCtx, hdr : RawBox) -> Result[SidxBox, Mp4Error] {
+  if hdr.payload_size < 24L {
+    return Err(Mp4Error::Truncated("sidx header truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let version = read_u8(data, off)
+  let ref_id = read_u32_be(data, off + 4)
+  let timescale = read_u32_be(data, off + 8)
+
+  let mut pos = off + 12
+  let mut earliest_pts = 0L
+  let mut first_off = 0L
+  if version == 0 {
+    earliest_pts = read_u32_be(data, pos).to_int64() & 4294967295L
+    first_off = read_u32_be(data, pos + 4).to_int64() & 4294967295L
+    pos = pos + 8
+  } else if version == 1 {
+    if hdr.payload_size < 32L {
+      return Err(Mp4Error::Truncated("sidx v1 truncated"))
+    }
+    earliest_pts = read_u64_be(data, pos)
+    first_off = read_u64_be(data, pos + 8)
+    if earliest_pts < 0L || first_off < 0L {
+      return Err(Mp4Error::InvalidSyntax("sidx v1 64-bit value >= 2^63"))
+    }
+    pos = pos + 16
+  } else {
+    return Err(Mp4Error::Unsupported("sidx version " + version.to_string()))
+  }
+
+  let ref_count = read_u16_be(data, pos + 2)
+  pos = pos + 4
+  let end = (hdr.payload_offset + hdr.payload_size).to_int()
+  if ref_count > ctx.effective_max_samples {
+    return Err(Mp4Error::LimitExceeded("sidx reference_count exceeds limit"))
+  }
+  if ref_count * 12 > end - pos {
+    return Err(Mp4Error::Truncated("sidx references truncated"))
+  }
+
+  let refs : Array[SidxReference] = []
+  let mut i = 0
+  while i < ref_count {
+    let w0 = read_u32_be(data, pos)
+    let w1 = read_u32_be(data, pos + 4)
+    let w2 = read_u32_be(data, pos + 8)
+    refs.push(SidxReference::{
+      reference_type: ((w0 >> 31) & 1U).to_int(),
+      referenced_size: w0 & 2147483647U,
+      subsegment_duration: w1,
+      starts_with_sap: ((w2 >> 31) & 1U) != 0U,
+      sap_type: ((w2 >> 28) & 7U).to_int(),
+      sap_delta_time: w2 & 268435455U,
+    })
+    pos = pos + 12
+    i = i + 1
+  }
+
+  Ok(SidxBox::{
+    version: version,
+    reference_id: ref_id,
+    timescale: timescale,
+    earliest_presentation_time: earliest_pts,
+    first_offset: first_off,
+    references: refs,
+  })
+}
+
+///| Look up `trex` defaults for `track_id` in `init.trex`.
+fn find_trex(init : InitSegment, track_id : UInt) -> Option[TrexBox] {
+  let mut i = 0
+  while i < init.trex.length() {
+    if init.trex[i].track_id == track_id {
+      return Some(init.trex[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+///| Look up track index by `track_id` in `init.tracks` (-1 if not declared).
+fn find_track_idx(init : InitSegment, track_id : UInt) -> Int {
+  let mut i = 0
+  while i < init.tracks.length() {
+    if init.tracks[i].track_id == track_id {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///| Determine whether ISO 14496-12 `sample_flags` indicates a sync (keyframe) sample.
+fn sample_flags_is_sync(flags : UInt) -> Bool {
+  let non_sync = ((flags >> 16) & 1U) != 0U
+  let depends_on = (flags >> 24) & 3U
+  !non_sync && depends_on != 1U
+}
+
+///| Parsed `tfhd` box fields.
+val struct TfhdInfo {
+  track_id : UInt
+  has_base_data_offset : Bool
+  base_data_offset : Int64
+  default_sample_duration : UInt
+  default_sample_size : UInt
+  default_sample_flags : UInt
+  duration_is_empty : Bool
+  default_base_is_moof : Bool
+}
+
+///| Parse `tfhd` box payload.
+fn parse_tfhd(
+  data : Bytes,
+  hdr : RawBox,
+  init : InitSegment,
+) -> Result[TfhdInfo, Mp4Error] {
+  if hdr.payload_size < 8L {
+    return Err(Mp4Error::Truncated("tfhd truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let end = (hdr.payload_offset + hdr.payload_size).to_int()
+  let flags = read_u24_be(data, off + 1)
+  let track_id = read_u32_be(data, off + 4)
+
+  let mut def_dur = 0U
+  let mut def_size = 0U
+  let mut def_flags = 0U
+  match find_trex(init, track_id) {
+    Some(tr) => {
+      def_dur = tr.default_sample_duration
+      def_size = tr.default_sample_size
+      def_flags = tr.default_sample_flags
+    }
+    None => ()
+  }
+
+  let mut pos = off + 8
+  let has_bdo = (flags & 1) != 0
+  let mut bdo = 0L
+  if has_bdo {
+    if pos + 8 > end {
+      return Err(Mp4Error::Truncated("tfhd base_data_offset truncated"))
+    }
+    bdo = read_u64_be(data, pos)
+    pos = pos + 8
+  }
+  if (flags & 2) != 0 {
+    if pos + 4 > end {
+      return Err(Mp4Error::Truncated("tfhd sample_description_index truncated"))
+    }
+    pos = pos + 4
+  }
+  if (flags & 8) != 0 {
+    if pos + 4 > end {
+      return Err(Mp4Error::Truncated("tfhd default_sample_duration truncated"))
+    }
+    def_dur = read_u32_be(data, pos)
+    pos = pos + 4
+  }
+  if (flags & 16) != 0 {
+    if pos + 4 > end {
+      return Err(Mp4Error::Truncated("tfhd default_sample_size truncated"))
+    }
+    def_size = read_u32_be(data, pos)
+    pos = pos + 4
+  }
+  if (flags & 32) != 0 {
+    if pos + 4 > end {
+      return Err(Mp4Error::Truncated("tfhd default_sample_flags truncated"))
+    }
+    def_flags = read_u32_be(data, pos)
+  }
+
+  Ok(TfhdInfo::{
+    track_id: track_id,
+    has_base_data_offset: has_bdo,
+    base_data_offset: bdo,
+    default_sample_duration: def_dur,
+    default_sample_size: def_size,
+    default_sample_flags: def_flags,
+    duration_is_empty: (flags & 65536) != 0,
+    default_base_is_moof: (flags & 131072) != 0,
+  })
+}
+
+///| Parse `tfdt` box payload (v0 or v1, rejecting v1 >= 2^63).
+fn parse_tfdt(data : Bytes, hdr : RawBox) -> Result[Int64, Mp4Error] {
+  if hdr.payload_size < 8L {
+    return Err(Mp4Error::Truncated("tfdt truncated"))
+  }
+  let off = hdr.payload_offset.to_int()
+  let version = read_u8(data, off)
+  if version == 0 {
+    Ok(read_u32_be(data, off + 4).to_int64() & 4294967295L)
+  } else if version == 1 {
+    if hdr.payload_size < 12L {
+      return Err(Mp4Error::Truncated("tfdt v1 truncated"))
+    }
+    let v = read_u64_be(data, off + 4)
+    if v < 0L {
+      return Err(Mp4Error::InvalidSyntax("tfdt v1 >= 2^63"))
+    }
+    Ok(v)
+  } else {
+    Err(Mp4Error::Unsupported("tfdt version " + version.to_string()))
+  }
+}
+
+///| Parse a single `moof` box and append its `Fragment`s to `out_frags`.
+fn parse_moof(
+  data : Bytes,
+  ctx : ParseCtx,
+  init : InitSegment,
+  hdr : RawBox,
+  out_frags : Array[Fragment],
+) -> Result[Unit, Mp4Error] {
+  match check_depth(ctx, 1) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match charge_moof(ctx) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let moof_offset = hdr.offset
+  let data_len = data.length().to_int64()
+  let mut seq_num = 0U
+  let mut has_prev_traf = false
+  let mut prev_traf_end = moof_offset
+
+  let end = hdr.payload_offset + hdr.payload_size
+  let mut pos = hdr.payload_offset
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let ch = match read_raw_box(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    if ch.type_u32 == fcc_mfhd {
+      if ch.payload_size < 8L {
+        return Err(Mp4Error::Truncated("mfhd truncated"))
+      }
+      seq_num = read_u32_be(data, ch.payload_offset.to_int() + 4)
+    } else if ch.type_u32 == fcc_traf {
+      match check_depth(ctx, 2) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let mut tfhd_opt : Option[TfhdInfo] = None
+      let mut base_decode_time = 0L
+      let trun_boxes : Array[RawBox] = []
+
+      let tend = ch.payload_offset + ch.payload_size
+      let mut tpos = ch.payload_offset
+      while tpos < tend {
+        match charge_box(ctx) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        let tch = match read_raw_box(data, tpos, tend) {
+          Ok(h) => h
+          Err(e) => return Err(e)
+        }
+        if tch.type_u32 == fcc_tfhd {
+          match parse_tfhd(data, tch, init) {
+            Ok(info) => tfhd_opt = Some(info)
+            Err(e) => return Err(e)
+          }
+        } else if tch.type_u32 == fcc_tfdt {
+          match parse_tfdt(data, tch) {
+            Ok(t) => base_decode_time = t
+            Err(e) => return Err(e)
+          }
+        } else if tch.type_u32 == fcc_trun {
+          trun_boxes.push(tch)
+        }
+        tpos = tpos + tch.size
+      }
+
+      let tfhd = match tfhd_opt {
+        Some(t) => t
+        None => return Err(Mp4Error::InvalidSyntax("traf missing tfhd"))
+      }
+
+      // Reject fragments targeting a track_id not declared in `init.tracks` (MSE spec)
+      let tidx = find_track_idx(init, tfhd.track_id)
+      if tidx < 0 {
+        return Err(
+          Mp4Error::InvalidSyntax(
+            "traf references undeclared track_id: " + tfhd.track_id.to_string(),
+          ),
+        )
+      }
+      let track = init.tracks[tidx]
+      let edit_offset = compute_edit_offset(
+        track.edit_list,
+        init.mvhd.timescale,
+        track.timescale,
+      )
+
+      let base_offset = if tfhd.has_base_data_offset {
+        tfhd.base_data_offset
+      } else if tfhd.default_base_is_moof || !has_prev_traf {
+        moof_offset
+      } else {
+        prev_traf_end
+      }
+
+      let mut traf_total_samples = 0
+      let mut pre_i = 0
+      while pre_i < trun_boxes.length() {
+        let tb = trun_boxes[pre_i]
+        if tb.payload_size < 8L {
+          return Err(Mp4Error::Truncated("trun header truncated"))
+        }
+        let sc_u = read_u32_be(data, tb.payload_offset.to_int() + 4)
+        let sc64 = sc_u.to_int64() & 4294967295L
+        if sc64 > ctx.effective_max_samples.to_int64() {
+          return Err(Mp4Error::LimitExceeded("trun sample_count exceeds max_samples"))
+        }
+        let sc = sc64.to_int()
+        match charge_samples(ctx, sc) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        traf_total_samples = traf_total_samples + sc
+        pre_i = pre_i + 1
+      }
+
+      let zero_sample = Sample::{
+        offset: 0L,
+        size: 0,
+        dts: 0L,
+        pts: 0L,
+        duration: 0L,
+        is_sync: false,
+      }
+      let samples : Array[Sample] = if traf_total_samples > 0 {
+        Array::make(traf_total_samples, zero_sample)
+      } else {
+        []
+      }
+      let mut out_idx = 0
+      let mut cur_dts = base_decode_time
+      let mut running_offset = base_offset
+
+      let mut ti = 0
+      while ti < trun_boxes.length() {
+        let tb = trun_boxes[ti]
+        let toff = tb.payload_offset.to_int()
+        let tend_i = (tb.payload_offset + tb.payload_size).to_int()
+        let tr_flags = read_u24_be(data, toff + 1)
+        let sc = (read_u32_be(data, toff + 4).to_int64() & 4294967295L).to_int()
+        let sc64 = sc.to_int64()
+
+        let mut p = toff + 8
+        let has_data_offset = (tr_flags & 1) != 0
+        let has_first_flags = (tr_flags & 4) != 0
+        let has_dur = (tr_flags & 256) != 0
+        let has_size = (tr_flags & 512) != 0
+        let has_flags = (tr_flags & 1024) != 0
+        let has_cto = (tr_flags & 2048) != 0
+
+        if has_data_offset {
+          if p + 4 > tend_i {
+            return Err(Mp4Error::Truncated("trun data_offset truncated"))
+          }
+          let data_off = read_i32_be(data, p).to_int64()
+          running_offset = base_offset + data_off
+          p = p + 4
+        }
+        let mut first_flags = tfhd.default_sample_flags
+        if has_first_flags {
+          if p + 4 > tend_i {
+            return Err(Mp4Error::Truncated("trun first_sample_flags truncated"))
+          }
+          first_flags = read_u32_be(data, p)
+          p = p + 4
+        }
+
+        let per_sample_bytes = (if has_dur { 4 } else { 0 }) +
+        (if has_size { 4 } else { 0 }) +
+        (if has_flags { 4 } else { 0 }) +
+        (if has_cto { 4 } else { 0 })
+        if sc64 * per_sample_bytes.to_int64() > (tend_i - p).to_int64() {
+          return Err(Mp4Error::Truncated("trun sample entries truncated"))
+        }
+
+        let mut si = 0
+        while si < sc {
+          let dur_u = if has_dur {
+            let v = read_u32_be(data, p)
+            p = p + 4
+            v
+          } else {
+            tfhd.default_sample_duration
+          }
+          let sz_u = if has_size {
+            let v = read_u32_be(data, p)
+            p = p + 4
+            v
+          } else {
+            tfhd.default_sample_size
+          }
+          let sflags = if has_flags {
+            let v = read_u32_be(data, p)
+            p = p + 4
+            v
+          } else if si == 0 && has_first_flags {
+            first_flags
+          } else {
+            tfhd.default_sample_flags
+          }
+          let cto = if has_cto {
+            // Both v0 and v1 read as signed int32 (aligns with FFmpeg & Chromium)
+            let v = read_i32_be(data, p).to_int64()
+            p = p + 4
+            v
+          } else {
+            0L
+          }
+
+          let dur = dur_u.to_int64() & 4294967295L
+          let sz = sz_u.to_int()
+          if sz < 0 {
+            return Err(Mp4Error::InvalidSyntax("trun size overflow"))
+          }
+          if running_offset < 0L || running_offset > data_len || sz.to_int64() > data_len - running_offset {
+            return Err(Mp4Error::Truncated("fragment sample exceeds segment bounds"))
+          }
+
+          samples[out_idx] = Sample::{
+            offset: running_offset,
+            size: sz,
+            dts: cur_dts + edit_offset,
+            pts: cur_dts + cto + edit_offset,
+            duration: dur,
+            is_sync: sample_flags_is_sync(sflags),
+          }
+          out_idx = out_idx + 1
+
+          running_offset = running_offset + sz.to_int64()
+          cur_dts = cur_dts + dur
+          si = si + 1
+        }
+        ti = ti + 1
+      }
+
+      has_prev_traf = true
+      prev_traf_end = running_offset
+      out_frags.push(Fragment::{
+        sequence_number: seq_num,
+        track_id: tfhd.track_id,
+        base_decode_time: base_decode_time,
+        samples: samples,
+      })
+    }
+    pos = pos + ch.size
+  }
+
+  Ok(())
+}
+
+///| Parse an fMP4 / MSE media segment (`styp` / `sidx` / `moof` + `mdat`).
+pub fn parse_media_segment(
+  init : InitSegment,
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[MediaSegment, Mp4Error] {
+  let ctx = match make_ctx(limits, data.length()) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  let end = data.length().to_int64()
+  let mut styp_opt : Option[FtypBox] = None
+  let sidx_list : Array[SidxBox] = []
+  let fragments : Array[Fragment] = []
+
+  let mut pos = 0L
+  while pos < end {
+    match charge_box(ctx) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let hdr = match read_raw_box(data, pos, end) {
+      Ok(h) => h
+      Err(e) => return Err(e)
+    }
+    if hdr.type_u32 == fcc_styp {
+      match parse_ftyp(data, hdr) {
+        Ok(s) => styp_opt = Some(s)
+        Err(e) => return Err(e)
+      }
+    } else if hdr.type_u32 == fcc_sidx {
+      match parse_sidx(data, ctx, hdr) {
+        Ok(s) => sidx_list.push(s)
+        Err(e) => return Err(e)
+      }
+    } else if hdr.type_u32 == fcc_moof {
+      match parse_moof(data, ctx, init, hdr, fragments) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+    pos = pos + hdr.size
+  }
+
+  // Compute media timeline [start_pts_ms, end_pts_ms] per fragment (1 floor/ceil div per fragment)
+  let mut has_pts = false
+  let mut min_ms = 0L
+  let mut max_ms = 0L
+  let mut fi = 0
+  while fi < fragments.length() {
+    let frag = fragments[fi]
+    let tidx = find_track_idx(init, frag.track_id)
+    let ts_u = if tidx >= 0 { init.tracks[tidx].timescale } else { 0U }
+    let ts = ts_u.to_int64() & 4294967295L
+    let n = frag.samples.length()
+    if ts > 0L && n > 0 {
+      let s0 = frag.samples[0]
+      let mut frag_min = s0.pts
+      let mut frag_max = s0.pts + s0.duration
+      let mut si = 1
+      while si < n {
+        let sm = frag.samples[si]
+        if sm.pts < frag_min {
+          frag_min = sm.pts
+        }
+        let e = sm.pts + sm.duration
+        if e > frag_max {
+          frag_max = e
+        }
+        si = si + 1
+      }
+      let s_ms = ticks_to_ms_floor(frag_min, ts)
+      let e_ms = ticks_to_ms_ceil(frag_max, ts)
+      if !has_pts {
+        has_pts = true
+        min_ms = s_ms
+        max_ms = e_ms
+      } else {
+        if s_ms < min_ms {
+          min_ms = s_ms
+        }
+        if e_ms > max_ms {
+          max_ms = e_ms
+        }
+      }
+    }
+    fi = fi + 1
+  }
+
+  Ok(MediaSegment::{
+    styp: styp_opt,
+    sidx: sidx_list,
+    fragments: fragments,
+    start_pts_ms: min_ms,
+    end_pts_ms: max_ms,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Utility Helpers: RFC 6381 Codec String & Seek
+// ---------------------------------------------------------------------------
+
+///| Reverse bits of a 32-bit unsigned integer (for HEVC general_profile_compatibility_flags).
+fn reverse_bits_u32(v : UInt) -> UInt {
+  let mut x = v
+  let mut r = 0U
+  let mut i = 0
+  while i < 32 {
+    r = (r << 1) | (x & 1U)
+    x = x >> 1
+    i = i + 1
+  }
+  r
+}
+
+///| Produce a standard RFC 6381 / ISO 14496-15 Annex E / MSE codec string for a track.
+pub fn probe_codec_string(track : Track) -> String {
+  match track.codec_config {
+    CodecConfig::Avc(_, profile, compat, level) => {
+      let prefix = if track.codec_fourcc == "avc3" { "avc3" } else { "avc1" }
+      prefix + "." + hex2_lower(profile) + hex2_lower(compat) + hex2_lower(level)
+    }
+    CodecConfig::Hevc(raw, profile, tier, level) => {
+      let prefix = if track.codec_fourcc == "hev1" { "hev1" } else { "hvc1" }
+      let tier_ch = if tier == 1 { "H" } else { "L" }
+      if raw.length() >= 13 {
+        let space = (read_u8(raw, 1) >> 6) & 3
+        let space_str = if space == 1 {
+          "A"
+        } else if space == 2 {
+          "B"
+        } else if space == 3 {
+          "C"
+        } else {
+          ""
+        }
+        let compat_raw = read_u32_be(raw, 2)
+        let compat_rev = reverse_bits_u32(compat_raw)
+        let mut s = prefix + "." + space_str + profile.to_string() + "." + hex_u32_upper_trim(compat_rev) + "." + tier_ch + level.to_string()
+        let mut last_nz = 11
+        while last_nz >= 6 && read_u8(raw, last_nz) == 0 {
+          last_nz = last_nz - 1
+        }
+        let mut i = 6
+        while i <= last_nz {
+          s = s + "." + hex_u32_upper_trim(read_u8(raw, i).to_uint())
+          i = i + 1
+        }
+        s
+      } else {
+        prefix + "." + profile.to_string() + ".0." + tier_ch + level.to_string()
+      }
+    }
+    CodecConfig::Av1(_, seq_profile, level_idx, tier, bit_depth) => {
+      let tier_ch = if tier == 1 { "H" } else { "M" }
+      "av01." + seq_profile.to_string() + "." + dec2(level_idx) + tier_ch + "." + dec2(bit_depth)
+    }
+    CodecConfig::Vp9(_, profile, level, bit_depth) =>
+    "vp09." + dec2(profile) + "." + dec2(level) + "." + dec2(bit_depth)
+    CodecConfig::Vp8(_) => "vp08"
+    CodecConfig::Aac(_, oti, aot) =>
+    if oti == 64 && aot > 0 {
+      "mp4a.40." + aot.to_string()
+    } else {
+      "mp4a." + hex2_lower(oti) + "." + aot.to_string()
+    }
+    CodecConfig::Opus(_, _, _) => "opus"
+    CodecConfig::Flac(_) => "fLaC"
+    CodecConfig::Mp3(oti) =>
+    if oti != 0 {
+      "mp4a." + hex2_lower(oti)
+    } else {
+      "mp3"
+    }
+    CodecConfig::Unknown(fourcc, _) => fourcc
+  }
+}
+
+///| Find the nearest sync sample at or before `target_pts` (safe under non-monotonic B-frame PTS).
+pub fn find_sync_sample_at(
+  samples : Array[Sample],
+  target_pts : Int64,
+) -> Option[Int] {
+  let n = samples.length()
+  let mut best = -1
+  let mut best_pts = 0L
+  let mut i = 0
+  while i < n {
+    let s = samples[i]
+    if s.is_sync && s.pts <= target_pts {
+      if best < 0 || s.pts >= best_pts {
+        best = i
+        best_pts = s.pts
+      }
+    }
+    i = i + 1
+  }
+  if best < 0 {
+    None
+  } else {
+    Some(best)
+  }
+}

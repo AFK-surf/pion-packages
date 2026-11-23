@@ -1,0 +1,468 @@
+///| RFC 9113 §5.1 Stream State Machine, Flow Control, §8.2 Header Semantics,
+///| and Day-1 CVE Red-Team Defense Suite (Rapid Reset, CONTINUATION Flood,
+///| HPACK Bomb, Padding Overflow, Interleaved Header Block).
+
+///|
+test "rfc9113_header_semantics_validation" {
+  // Valid request
+  let valid_req = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "example.com"),
+    HeaderField::new(":path", "/hello"),
+    HeaderField::new("accept", "*/*"),
+    HeaderField::new("te", "trailers"),
+  ]
+  match validate_request_headers(valid_req) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "valid request rejected: " + h2_error_message(e))
+  }
+
+  // Valid response
+  let valid_resp = [
+    HeaderField::new(":status", "200"),
+    HeaderField::new("content-type", "text/plain"),
+  ]
+  match validate_response_headers(valid_resp) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "valid response rejected: " + h2_error_message(e))
+  }
+
+  // Valid trailers (no pseudo-headers)
+  match validate_trailers([HeaderField::new("grpc-status", "0")]) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "valid trailers rejected: " + h2_error_message(e))
+  }
+
+  // Reject pseudo-header after regular header
+  let bad_order = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new("host", "example.com"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":path", "/"),
+  ]
+  match validate_request_headers(bad_order) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "must reject pseudo-header after regular header")
+  }
+
+  // Reject duplicate pseudo-header
+  let dup_pseudo = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new(":method", "POST"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":path", "/"),
+  ]
+  match validate_request_headers(dup_pseudo) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "must reject duplicate pseudo-header")
+  }
+
+  // Reject uppercase header name
+  let upper_name = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":path", "/"),
+    HeaderField::new("Content-Type", "text/plain"),
+  ]
+  match validate_request_headers(upper_name) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "must reject uppercase header name")
+  }
+
+  // Reject connection-specific forbidden headers
+  let forbidden = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]
+  let mut i = 0
+  while i < forbidden.length() {
+    let bad = [
+      HeaderField::new(":method", "GET"),
+      HeaderField::new(":scheme", "https"),
+      HeaderField::new(":path", "/"),
+      HeaderField::new(forbidden[i], "val"),
+    ]
+    match validate_request_headers(bad) {
+      Err(_) => ()
+      Ok(_) => debug_assert(false, "must reject forbidden header " + forbidden[i])
+    }
+    i = i + 1
+  }
+
+  // Reject TE != "trailers"
+  let bad_te = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":path", "/"),
+    HeaderField::new("te", "gzip"),
+  ]
+  match validate_request_headers(bad_te) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "must reject te: gzip")
+  }
+
+  // Reject CR, LF, NUL in header value
+  let bad_vals = ["ok\r\nInjected: 1", "ok\nline2", "ok\rline2", "bad\u{0}nul"]
+  let mut vi = 0
+  while vi < bad_vals.length() {
+    let bad = [
+      HeaderField::new(":status", "200"),
+      HeaderField::new("x-test", bad_vals[vi]),
+    ]
+    match validate_response_headers(bad) {
+      Err(_) => ()
+      Ok(_) => debug_assert(false, "must reject CR/LF/NUL in header value")
+    }
+    vi = vi + 1
+  }
+}
+
+///|
+test "rfc9113_stream_state_machine_and_flow_control" {
+  let conn = Connection::server()
+  let enc = HpackEncoder::new(4096)
+  let req_block = enc.encode([
+    HeaderField::new(":method", "POST"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "example.com"),
+    HeaderField::new(":path", "/upload"),
+  ])
+
+  debug_assert(stream_state_eq(conn.stream_state(1), StreamState::Idle), "initial Idle")
+
+  // Receive HEADERS (end_stream=false, end_headers=true) -> Open
+  match conn.receive_frame(Frame::Headers(1, req_block, false, true, None)) {
+    Ok(Some(ConnectionEvent::Headers(sid, hs, es))) => {
+      debug_assert(sid == 1 && !es && hs.length() == 4, "received HEADERS")
+    }
+    _ => debug_assert(false, "expected Headers event")
+  }
+  debug_assert(stream_state_eq(conn.stream_state(1), StreamState::Open), "state Open")
+
+  // Receive DATA (10 bytes, end_stream=true) -> HalfClosedRemote, recv windows decremented
+  let body = "0123456789".to_bytes()
+  match conn.receive_frame(Frame::Data(1, body, true)) {
+    Ok(Some(ConnectionEvent::Data(sid, d, es))) => {
+      debug_assert(sid == 1 && es && d.length() == 10, "received DATA")
+    }
+    _ => debug_assert(false, "expected Data event")
+  }
+  debug_assert(stream_state_eq(conn.stream_state(1), StreamState::HalfClosedRemote), "state HalfClosedRemote")
+  debug_assert(conn.conn_recv_window() == 65525L, "conn recv window 65525")
+  debug_assert(conn.stream_recv_window(1) == 65525L, "stream recv window 65525")
+
+  // Receiving DATA on HalfClosedRemote -> StreamClosed error!
+  match conn.receive_frame(Frame::Data(1, "x".to_bytes(), false)) {
+    Err(H2Error::StreamClosed(_)) => ()
+    _ => debug_assert(false, "DATA on HalfClosedRemote must fail with StreamClosed")
+  }
+
+  // Local send_data with end_stream=true transitions HalfClosedRemote -> Closed
+  match conn.send_data(1, 5, true) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "send_data failed: " + h2_error_message(e))
+  }
+  debug_assert(stream_state_eq(conn.stream_state(1), StreamState::Closed), "state Closed")
+  debug_assert(conn.conn_send_window() == 65530L, "conn send window 65530")
+
+  // Flow control window overflow (> 2^31 - 1) -> FlowControlError
+  match conn.receive_frame(Frame::WindowUpdate(0, 2147483647)) {
+    Err(H2Error::FlowControlError(_)) => ()
+    _ => debug_assert(false, "WINDOW_UPDATE overflow > 2^31-1 must fail with FlowControlError")
+  }
+}
+
+///|
+test "redteam_cve_2023_44487_rapid_reset" {
+  let cfg = ConnectionConfig::{
+    is_server: true,
+    max_frame_size: default_max_frame_size,
+    max_header_list_size: 65536,
+    max_dynamic_table_size: 4096,
+    initial_window_size: 65535,
+    max_concurrent_streams: 100,
+    max_rapid_resets: 5,
+    max_continuation_frames: 8,
+    validate_headers: true,
+  }
+  let conn = Connection::new(cfg)
+  let enc = HpackEncoder::new(4096)
+  let hdrs = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "victim.example"),
+    HeaderField::new(":path", "/"),
+  ]
+  let mut triggered = false
+  // Open a concurrent burst of streams, then rapidly reset them (CVE-2023-44487)
+  let mut k = 0
+  while k < 10 {
+    let sid = k * 2 + 1
+    let block = enc.encode(hdrs)
+    match conn.receive_frame(Frame::Headers(sid, block, false, true, None)) {
+      Ok(_) => ()
+      Err(e) => debug_assert(false, "unexpected error on HEADERS: " + h2_error_message(e))
+    }
+    k = k + 1
+  }
+  k = 0
+  while k < 10 {
+    let sid = k * 2 + 1
+    match conn.receive_frame(Frame::RstStream(sid, err_cancel)) {
+      Ok(_) => ()
+      Err(H2Error::EnhanceYourCalm(_)) => {
+        triggered = true
+        break
+      }
+      Err(e) => debug_assert(false, "unexpected error on RST_STREAM: " + h2_error_message(e))
+    }
+    k = k + 1
+  }
+  debug_assert(triggered, "CVE-2023-44487 Rapid Reset must trigger EnhanceYourCalm")
+}
+
+///|
+test "redteam_continuation_flood_and_interleaving" {
+  // 1. Interleaving non-CONTINUATION frame before END_HEADERS -> ProtocolError
+  let conn1 = Connection::server()
+  match conn1.receive_frame(Frame::Headers(1, bytes_from_hex("8286"), false, false, None)) {
+    Ok(None) => ()
+    _ => debug_assert(false, "incomplete HEADERS should buffer and return Ok(None)")
+  }
+  match conn1.receive_frame(Frame::Ping(bytes_from_hex("0102030405060708"), false)) {
+    Err(H2Error::ProtocolError(_)) => ()
+    _ => debug_assert(false, "PING interleaved inside HEADERS..CONTINUATION must fail with ProtocolError")
+  }
+
+  // 2. Interleaving CONTINUATION with wrong stream_id -> ProtocolError
+  let conn2 = Connection::server()
+  let _ = conn2.receive_frame(Frame::Headers(1, bytes_from_hex("8286"), false, false, None))
+  match conn2.receive_frame(Frame::Continuation(3, bytes_from_hex("84"), true)) {
+    Err(H2Error::ProtocolError(_)) => ()
+    _ => debug_assert(false, "CONTINUATION for different stream_id must fail with ProtocolError")
+  }
+
+  // 3. CONTINUATION Flood (> max_continuation_frames) -> EnhanceYourCalm
+  let cfg = ConnectionConfig::{
+    is_server: true,
+    max_frame_size: default_max_frame_size,
+    max_header_list_size: 65536,
+    max_dynamic_table_size: 4096,
+    initial_window_size: 65535,
+    max_concurrent_streams: 100,
+    max_rapid_resets: 100,
+    max_continuation_frames: 3,
+    validate_headers: true,
+  }
+  let conn3 = Connection::new(cfg)
+  let _ = conn3.receive_frame(Frame::Headers(1, bytes_from_hex("82"), false, false, None))
+  let mut flood_caught = false
+  let mut c = 0
+  while c < 6 {
+    match conn3.receive_frame(Frame::Continuation(1, bytes_from_hex("86"), false)) {
+      Ok(_) => ()
+      Err(H2Error::EnhanceYourCalm(_)) => {
+        flood_caught = true
+        break
+      }
+      Err(e) => debug_assert(false, "unexpected error: " + h2_error_message(e))
+    }
+    c = c + 1
+  }
+  debug_assert(flood_caught, "CONTINUATION flood must trigger EnhanceYourCalm")
+}
+
+///|
+test "redteam_hpack_bomb_and_padding_overflow" {
+  // HPACK compression bomb: insert one ~4000B header into dynamic table,
+  // then repeat 0xbe (1 byte -> ~4032 bytes uncompressed) 100 times (~400KB from 100B!).
+  // With max_header_list_size = 8192, decoder MUST reject immediately!
+  let enc = HpackEncoder::with_huffman(4096, false)
+  let mut big_val = Bytes::new(3800)
+  let mut i = 0
+  while i < 3800 {
+    big_val[i] = 97.to_byte() // 'a'
+    i = i + 1
+  }
+  let seed_block = enc.encode([HeaderField::new("x-bomb", big_val.to_string())])
+  let dec = HpackDecoder::with_limits(4096, 8192)
+  match dec.decode(seed_block) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "seed decode failed: " + h2_error_message(e))
+  }
+  // Now 100 bytes of 0xbe (index 62 = x-bomb: 3800 'a's) -> 100 * (6 + 3800 + 32) = 383,800B > 8192B
+  let mut bomb = Bytes::new(100)
+  i = 0
+  while i < 100 {
+    bomb[i] = 0xbe.to_byte()
+    i = i + 1
+  }
+  match dec.decode(bomb) {
+    Err(H2Error::EnhanceYourCalm(_)) | Err(H2Error::CompressionError(_)) => ()
+    _ => debug_assert(false, "HPACK bomb must be rejected immediately")
+  }
+
+  // Padding >= payload_len on DATA -> ProtocolError
+  // payload_len = 4, flags = PADDED (0x08), pad_len = 4 (>= 4!)
+  match decode_frame(bytes_from_hex("000004 00 08 00000001 04 00 00 00"), 0, default_max_frame_size) {
+    Err(H2Error::ProtocolError(_)) => ()
+    _ => debug_assert(false, "DATA pad_len >= payload_len must fail with ProtocolError")
+  }
+
+  // Padding >= payload_len on HEADERS -> ProtocolError
+  match decode_frame(bytes_from_hex("000003 01 0c 00000001 03 00 00"), 0, default_max_frame_size) {
+    Err(H2Error::ProtocolError(_)) => ()
+    _ => debug_assert(false, "HEADERS pad_len >= payload_len must fail with ProtocolError")
+  }
+}
+
+///|
+test "regression_p0_p1_hpack_64bit_index_bounds" {
+  let dec = HpackDecoder::new(4096)
+  // P0-1: 0xFFFFFFFF (wraps to -1 in 32-bit Int) across indexed / literal / never-indexed paths
+  match dec.decode(hpack_encode_int(0xFFFFFFFFL, 7, 0x80)) {
+    Err(H2Error::CompressionError(_)) => ()
+    _ => debug_assert(false, "indexed 0xFFFFFFFF must fail with CompressionError")
+  }
+  match dec.decode(hpack_encode_int(4294967298L, 7, 0x80)) {
+    Err(H2Error::CompressionError(_)) => ()
+    _ => debug_assert(false, "indexed 2^32+2 alias must fail with CompressionError")
+  }
+  // P2-7: decoder set_max_table_size must not evict before peer sends size update
+  let enc = HpackEncoder::with_huffman(4096, true)
+  let b1 = enc.encode([HeaderField::new("x-k", "val1")])
+  match dec.decode(b1) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup b1: " + h2_error_message(e))
+  }
+  dec.set_max_table_size(0)
+  let b2 = enc.encode([HeaderField::new("x-k", "val1")])
+  match dec.decode(b2) {
+    Ok(hs) => debug_assert(hs.length() == 1 && hs[0].value == "val1", "in-flight block decodes before size update")
+    Err(e) => debug_assert(false, "b2 should decode: " + h2_error_message(e))
+  }
+}
+
+///|
+test "regression_p1_p2_headers_path_cl_ctl_protocol" {
+  // P1-9: conflicting and non-numeric content-length rejected
+  let cl_bad1 = [
+    HeaderField::new(":method", "POST"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "a.example"),
+    HeaderField::new(":path", "/"),
+    HeaderField::new("content-length", "5"),
+    HeaderField::new("content-length", "6"),
+  ]
+  match validate_request_headers(cl_bad1) {
+    Err(H2Error::InvalidHeader(_)) => ()
+    _ => debug_assert(false, "conflicting content-length must fail")
+  }
+  let cl_bad2 = [
+    HeaderField::new(":method", "POST"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "a.example"),
+    HeaderField::new(":path", "/"),
+    HeaderField::new("content-length", "+5"),
+  ]
+  match validate_request_headers(cl_bad2) {
+    Err(H2Error::InvalidHeader(_)) => ()
+    _ => debug_assert(false, "non-digit content-length must fail")
+  }
+  // P1-10 & P2-4: :path origin-form and OPTIONS *
+  let opt_ok = [
+    HeaderField::new(":method", "OPTIONS"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "a.example"),
+    HeaderField::new(":path", "*"),
+  ]
+  match validate_request_headers(opt_ok) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "OPTIONS * must be valid: " + h2_error_message(e))
+  }
+  let get_star = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "a.example"),
+    HeaderField::new(":path", "*"),
+  ]
+  match validate_request_headers(get_star) {
+    Err(H2Error::InvalidHeader(_)) => ()
+    _ => debug_assert(false, "GET * must fail")
+  }
+  // P2-3: :protocol allowed on Extended CONNECT, rejected on GET
+  let ext_conn = [
+    HeaderField::new(":method", "CONNECT"),
+    HeaderField::new(":protocol", "websocket"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "a.example"),
+    HeaderField::new(":path", "/ws"),
+  ]
+  match validate_request_headers(ext_conn) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "Extended CONNECT must be valid: " + h2_error_message(e))
+  }
+  let get_proto = [
+    HeaderField::new(":method", "GET"),
+    HeaderField::new(":protocol", "websocket"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "a.example"),
+    HeaderField::new(":path", "/"),
+  ]
+  match validate_request_headers(get_proto) {
+    Err(H2Error::InvalidHeader(_)) => ()
+    _ => debug_assert(false, ":protocol on GET must fail")
+  }
+  // P2-1 & P2-2: CTL bytes and leading/trailing whitespace rejected
+  match validate_response_headers([HeaderField::new(":status", "200"), HeaderField::new("x", "a\u{7f}b")]) {
+    Err(H2Error::InvalidHeader(_)) => ()
+    _ => debug_assert(false, "DEL byte must fail")
+  }
+  match validate_response_headers([HeaderField::new(":status", "200"), HeaderField::new("x", " lead")]) {
+    Err(H2Error::InvalidHeader(_)) => ()
+    _ => debug_assert(false, "leading space must fail")
+  }
+}
+
+///|
+test "regression_p1_p2_connection_windows_goaway_settings_gc" {
+  // P1-8: explicit send_window_update / consume_recv_window replenishes receive windows
+  let srv = Connection::server()
+  let enc = HpackEncoder::with_huffman(4096, false)
+  let req = enc.encode([
+    HeaderField::new(":method", "POST"),
+    HeaderField::new(":scheme", "https"),
+    HeaderField::new(":authority", "a.example"),
+    HeaderField::new(":path", "/up"),
+  ])
+  let _ = srv.receive_frame(Frame::Headers(1, req, false, true, None))
+  let _ = srv.receive_frame(Frame::Data(1, Bytes::new(1000), false))
+  debug_assert(srv.conn_recv_window() == 64535L, "conn recv win after 1000B")
+  debug_assert(srv.stream_recv_window(1) == 64535L, "stream recv win after 1000B")
+  match srv.send_window_update(0, 1000) {
+    Ok(b) => debug_assert(b.length() == 13, "WINDOW_UPDATE frame is 13 bytes")
+    Err(e) => debug_assert(false, "send_window_update(0): " + h2_error_message(e))
+  }
+  match srv.send_window_update(1, 1000) {
+    Ok(b) => debug_assert(b.length() == 13, "stream WINDOW_UPDATE frame is 13 bytes")
+    Err(e) => debug_assert(false, "send_window_update(1): " + h2_error_message(e))
+  }
+  debug_assert(srv.conn_recv_window() == 65535L, "conn recv win replenished")
+  debug_assert(srv.stream_recv_window(1) == 65535L, "stream recv win replenished")
+
+  // P2-10 & P2-11: GOAWAY blocks open_stream; client rejects ENABLE_PUSH=1
+  let cli = Connection::client()
+  match cli.receive_frame(Frame::Settings([Setting::new(setting_enable_push, 1L)], false)) {
+    Err(H2Error::ProtocolError(_)) => ()
+    _ => debug_assert(false, "client must reject ENABLE_PUSH=1")
+  }
+  let _ = cli.receive_frame(Frame::GoAway(0, err_no_error, Bytes::new(0)))
+  match cli.open_stream(1, true) {
+    Err(H2Error::ProtocolError(_)) => ()
+    _ => debug_assert(false, "open_stream after GOAWAY must fail")
+  }
+
+  // P2-12: SETTINGS_ENABLE_CONNECT_PROTOCOL=2 rejected at frame layer
+  match decode_frame(bytes_from_hex("000006 04 00 00000000 0008 00000002"), 0, default_max_frame_size) {
+    Err(H2Error::ProtocolError(_)) => ()
+    _ => debug_assert(false, "SETTINGS_ENABLE_CONNECT_PROTOCOL=2 must fail")
+  }
+}
