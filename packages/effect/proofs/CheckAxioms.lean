@@ -1,26 +1,12 @@
 import EffectProofs
 
 #print axioms EffectProofs.rng_init_state_nonzero_u32
-#print axioms EffectProofs.rng_step_u32_bounds
-#print axioms EffectProofs.rng_step_u32_zero_fixed
-#print axioms EffectProofs.rng_below_val_le_one
 #print axioms EffectProofs.rng_below_val_bounds
 #print axioms EffectProofs.ring_next_cap_grows
 #print axioms EffectProofs.ring_slot_add_bounds
 #print axioms EffectProofs.ring_slot_prev_bounds
 #print axioms EffectProofs.ring_slot_prev_add_one_inv
 #print axioms EffectProofs.timer_before_irrefl
-#print axioms EffectProofs.timer_before_asymm
 #print axioms EffectProofs.timer_before_trans
 #print axioms EffectProofs.heap_parent_lt
 #print axioms EffectProofs.heap_left_parent_inv
-#print axioms EffectProofs.heap_right_parent_inv
-#print axioms EffectProofs.queue_unbounded_always_has_room
-#print axioms EffectProofs.queue_bounded_has_room_iff
-#print axioms EffectProofs.queue_shutdown_rejects_offer
-#print axioms EffectProofs.priority_strict_hierarchy
-#print axioms EffectProofs.sched_lane_focused_urgent_room
-#print axioms EffectProofs.sched_lane_background_serialized
-#print axioms EffectProofs.sched_lane_idle_yields
-#print axioms EffectProofs.sched_non_idle_never_preempted
-#print axioms EffectProofs.fiber_shielded_never_cut

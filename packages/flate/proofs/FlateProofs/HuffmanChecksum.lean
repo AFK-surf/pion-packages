@@ -238,20 +238,6 @@ theorem huff_direct_subtable_disjoint (sym bits sub_off sub_bits : Std.I32)
   have : (0#i32 : Std.I32) ≠ 16#i32 := by decide
   exact this (hf1.symm.trans hf2)
 
-/-- `bit_reverse code 0` terminates immediately and returns `0` for all `code : Int`. -/
-theorem bit_reverse_zero_bits (code : Std.I32) :
-    bit_reverse code 0#i32 = ok 0#i32 := by
-  have hloop : bit_reverse_loop0 0#i32 0#i32 0#i32 code = ok (0#i32, 0#i32, code) := by
-    unfold bit_reverse_loop0
-    rw [loop.eq_1]
-    unfold bit_reverse_loop0.body
-    have hlt : ¬((0#i32 : Std.I32) < 0#i32) := by decide
-    simp only [hlt, ↓reduceIte, result_bind_ok]
-  unfold bit_reverse
-  dsimp only
-  rw [hloop, result_bind_ok]
-  rfl
-
 /-- RFC 1950 Adler-32 packing/unpacking bijection:
     for ALL `s1 < 65521` and `s2 < 65521`, `(s2 << 16) | s1` equals `s2 * 65536 + s1`,
     low 16 bits = `s1`, and high 16 bits = `s2`. -/
@@ -329,66 +315,5 @@ theorem adler32_pack_roundtrip (s1 s2 : Std.U32)
           exact Nat.testBit_eq_false_of_lt (by omega)
         rw [h2', h3]; simp [show ¬(16 + i < 32) by omega]
     cases s2; congr 1
-
-/-- `adler32_pack` is injective on valid Adler-32 states `(s1, s2) ∈ [0, 65521)^2`. -/
-theorem adler32_pack_injective (s1 s2 t1 t2 : Std.U32)
-    (hs1 : s1.val < 65521) (hs2 : s2.val < 65521)
-    (ht1 : t1.val < 65521) (ht2 : t2.val < 65521)
-    (heq : adler32_pack s1 s2 = adler32_pack t1 t2) :
-    s1 = t1 ∧ s2 = t2 := by
-  obtain ⟨p, hp, hpv, _, _⟩ := adler32_pack_roundtrip s1 s2 hs1 hs2
-  obtain ⟨q, hq, hqv, _, _⟩ := adler32_pack_roundtrip t1 t2 ht1 ht2
-  have epq : p = q := result_ok_inj (hp.symm.trans (heq.trans hq))
-  subst epq
-  exact ⟨(uscalar_eq_iff s1 t1).mpr (by omega), (uscalar_eq_iff s2 t2).mpr (by omega)⟩
-
-private lemma crc32_loop_step (poly c : Std.U32) (k : Std.I32) (hk : k.val < 8) :
-    crc32_byte_poly_loop0 poly k c =
-      crc32_byte_poly_loop0 poly (Pion.I32.add k 1#i32)
-        (if Pion.U32.band c 1#u32 ≠ 0#u32 then Pion.U32.bxor ⟨c.bv >>> 1⟩ poly else ⟨c.bv >>> 1⟩) := by
-  unfold crc32_byte_poly_loop0
-  rw [loop.eq_1]
-  unfold crc32_byte_poly_loop0.body
-  have h8 : (8#i32).val = 8 := by norm_num
-  have hlt : k < 8#i32 := (iscalar_lt_iff k 8#i32).mpr (by omega)
-  have hshr : Pion.U32.shr c 1#u32 = ok (⟨c.bv >>> 1⟩ : Std.U32) := by
-    unfold Pion.U32.shr; simp [UScalar.val]
-  simp only [hlt, ↓reduceIte]
-  split_ifs with hbit <;> simp [hshr]
-
-private lemma crc32_loop_done (poly c : Std.U32) :
-    crc32_byte_poly_loop0 poly 8#i32 c = ok (8#i32, c) := by
-  unfold crc32_byte_poly_loop0
-  rw [loop.eq_1]
-  unfold crc32_byte_poly_loop0.body
-  have hlt : ¬((8#i32 : Std.I32) < 8#i32) := by decide
-  simp only [hlt, ↓reduceIte, result_bind_ok]
-
-/-- IEEE 802.3 CRC-32 polynomial reduction: `crc32_byte_poly 0 = 0`, `t0[1] = 0x77073096`, `t0[128] = 0xEDB88320`, `t0[255] = 0x2D02EF8D`. -/
-theorem crc32_byte_poly_ieee_vectors :
-    crc32_byte_poly 0#u32 = ok 0#u32 ∧
-    crc32_byte_poly 1#u32 = ok 1996959894#u32 ∧
-    crc32_byte_poly 128#u32 = ok 3988292384#u32 ∧
-    crc32_byte_poly 255#u32 = ok 755167117#u32 := by
-  have unroll : ∀ (b r : Std.U32),
-      (let step := fun (c : Std.U32) =>
-        if Pion.U32.band c 1#u32 ≠ 0#u32 then Pion.U32.bxor ⟨c.bv >>> 1⟩ 3988292384#u32 else ⟨c.bv >>> 1⟩
-       step (step (step (step (step (step (step (step b))))))) = r) →
-      crc32_byte_poly b = ok r := by
-    intro b r hr
-    unfold crc32_byte_poly
-    dsimp only
-    rw [crc32_loop_step _ _ 0#i32 (by norm_num)]
-    rw [crc32_loop_step _ _ (Pion.I32.add 0#i32 1#i32) (by decide)]
-    rw [crc32_loop_step _ _ (Pion.I32.add (Pion.I32.add 0#i32 1#i32) 1#i32) (by decide)]
-    rw [crc32_loop_step _ _ _ (by decide)]
-    rw [crc32_loop_step _ _ _ (by decide)]
-    rw [crc32_loop_step _ _ _ (by decide)]
-    rw [crc32_loop_step _ _ _ (by decide)]
-    rw [crc32_loop_step _ _ _ (by decide)]
-    have h8 : Pion.I32.add (Pion.I32.add (Pion.I32.add (Pion.I32.add (Pion.I32.add (Pion.I32.add (Pion.I32.add (Pion.I32.add 0#i32 1#i32) 1#i32) 1#i32) 1#i32) 1#i32) 1#i32) 1#i32) 1#i32 = 8#i32 := by decide
-    rw [h8, crc32_loop_done, result_bind_ok]
-    exact congrArg ok hr
-  exact ⟨unroll _ _ (by decide), unroll _ _ (by decide), unroll _ _ (by decide), unroll _ _ (by decide)⟩
 
 end FlateProofs

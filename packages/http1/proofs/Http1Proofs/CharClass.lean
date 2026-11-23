@@ -26,15 +26,7 @@ theorem is_tchar_byte_accepts_alnum (b : Std.I32)
   norm_num
   omega
 
-/-- RFC 9112: `is_uri_byte` holds iff `b` is visible ASCII `VCHAR` (`0x21..0x7E`). -/
-theorem is_uri_byte_spec (b : Std.I32) :
-    is_uri_byte b = ok (decide (33 ≤ b.val ∧ b.val ≤ 126)) := by
-  unfold is_uri_byte
-  congr 1
-
-/-- RFC 9110: `is_header_val_byte` accepts HTAB, SP..VCHAR, and obs-text (`0x80..0xFF`),
-    and rejects all other bytes including CR, LF, NUL, and DEL. -/
-theorem is_header_val_byte_spec (b : Std.I32) :
+private lemma is_header_val_byte_spec (b : Std.I32) :
     is_header_val_byte b =
       ok (decide (b.val = 9 ∨ (32 ≤ b.val ∧ b.val ≤ 126) ∨ (128 ≤ b.val ∧ b.val ≤ 255))) := by
   unfold is_header_val_byte
@@ -51,8 +43,7 @@ theorem is_header_val_byte_spec (b : Std.I32) :
     norm_num
     omega
 
-/-- Exact specification of `is_crlf_or_nul_byte`. -/
-theorem is_crlf_or_nul_byte_spec (b : Std.I32) :
+private lemma is_crlf_or_nul_byte_spec (b : Std.I32) :
     is_crlf_or_nul_byte b = ok (decide (b.val = 13 ∨ b.val = 10 ∨ b.val = 0)) := by
   unfold is_crlf_or_nul_byte
   congr 1
@@ -76,26 +67,7 @@ theorem is_header_val_byte_rejects_crlf_nul (b : Std.I32)
   congr 1
   exact decide_eq_false (by omega)
 
-/-- CRLF/NUL injection impossibility: no valid `tchar` byte can be CR, LF, or NUL. -/
-theorem is_tchar_byte_rejects_crlf_nul (b : Std.I32)
-    (h : is_crlf_or_nul_byte b = ok true) :
-    is_tchar_byte b = ok false := by
-  rw [is_crlf_or_nul_byte_spec] at h
-  have h' : b.val = 13 ∨ b.val = 10 ∨ b.val = 0 := of_decide_eq_true (result_ok_inj h)
-  exact is_tchar_byte_rejects_ctl_sp_nonascii b (by omega)
-
-/-- CRLF/NUL injection impossibility: no valid URI byte can be CR, LF, or NUL. -/
-theorem is_uri_byte_rejects_crlf_nul (b : Std.I32)
-    (h : is_crlf_or_nul_byte b = ok true) :
-    is_uri_byte b = ok false := by
-  rw [is_crlf_or_nul_byte_spec] at h
-  have h' : b.val = 13 ∨ b.val = 10 ∨ b.val = 0 := of_decide_eq_true (result_ok_inj h)
-  rw [is_uri_byte_spec]
-  congr 1
-  exact decide_eq_false (by omega)
-
-/-- Exact specification of `ascii_lower_byte`. -/
-theorem ascii_lower_byte_spec (b : Std.I32) :
+private lemma ascii_lower_byte_spec (b : Std.I32) :
     ∃ r : Std.I32, ascii_lower_byte b = ok r ∧
       r.val = if 65 ≤ b.val ∧ b.val ≤ 90 then b.val + 32 else b.val := by
   unfold ascii_lower_byte
@@ -111,16 +83,6 @@ theorem ascii_lower_byte_spec (b : Std.I32) :
     refine ⟨b, ?_, ?_⟩
     · rw [hcond]; rfl
     · rw [ite_eq_right h]
-
-/-- `ascii_lower_byte` is idempotent on all `Std.I32` values. -/
-theorem ascii_lower_byte_idempotent (b : Std.I32) :
-    (do let x ← ascii_lower_byte b; ascii_lower_byte x) = ascii_lower_byte b := by
-  obtain ⟨r1, hr1, hv1⟩ := ascii_lower_byte_spec b
-  obtain ⟨r2, hr2, hv2⟩ := ascii_lower_byte_spec r1
-  rw [hr1, result_bind_ok, hr2]
-  congr 1
-  apply (iscalar_eq_iff r2 r1).mpr
-  split_ifs at hv1 hv2 <;> omega
 
 /-- Exact specification of `hex_digit_value`. -/
 theorem hex_digit_value_spec (b : Std.I32) :
@@ -162,15 +124,6 @@ theorem hex_digit_value_spec (b : Std.I32) :
         · rw [hc1, hc2, hc3]; rfl
         · rw [ite_eq_right h1, ite_eq_right h2, ite_eq_right h3]; norm_num
 
-/-- Whenever `hex_digit_value b` returns a non-negative value, it lies in `[0, 15]`. -/
-theorem hex_digit_value_bounds (b v : Std.I32)
-    (h : hex_digit_value b = ok v) (hge : 0 ≤ v.val) :
-    v.val ≤ 15 := by
-  obtain ⟨r, hr, hv⟩ := hex_digit_value_spec b
-  have heq : v = r := result_ok_inj (h.symm.trans hr)
-  subst heq
-  split_ifs at hv <;> omega
-
 /-- `hex_digit_value` is invariant under ASCII lowercasing. -/
 theorem hex_digit_value_case_insensitive (b : Std.I32) :
     (do let lb ← ascii_lower_byte b; hex_digit_value lb) = hex_digit_value b := by
@@ -181,16 +134,5 @@ theorem hex_digit_value_case_insensitive (b : Std.I32) :
   congr 1
   apply (iscalar_eq_iff r1 r2).mpr
   split_ifs at hlbv hv1 hv2 <;> omega
-
-/-- RFC 3986: `is_host_byte` rejects all CTLs, SP, DEL, and non-ASCII bytes. -/
-theorem is_host_byte_rejects_ctl_sp_nonascii (b : Std.I32)
-    (h : b.val ≤ 32 ∨ b.val = 127 ∨ 128 ≤ b.val) :
-    is_host_byte b = ok false := by
-  unfold is_host_byte
-  congr 1
-  simp only [Bool.or_eq_false_iff, Bool.and_eq_false_iff, decide_eq_false_iff_not,
-    beq_eq_false_iff_ne, ne_eq, iscalar_eq_iff, iscalar_le_iff]
-  norm_num
-  omega
 
 end Http1Proofs

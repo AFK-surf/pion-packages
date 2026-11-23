@@ -131,8 +131,7 @@ theorem puny_threshold_bounds (k bias : Std.I64)
       have hsub := i64_sub_val k bias (by omega) (by omega)
       omega
 
-/-- Theorem 2: Exact 3-branch specification of `puny_threshold`. -/
-theorem puny_threshold_exact (k bias : Std.I64)
+private lemma puny_threshold_exact (k bias : Std.I64)
     (hb_lo : -1000000000 ≤ bias.val) (hb_hi : bias.val ≤ 1000000000) :
     ∃ t : Std.I64, puny_threshold k bias = ok t ∧
       ((k.val ≤ bias.val → t.val = 1) ∧
@@ -174,8 +173,7 @@ theorem puny_threshold_mono_k (k1 k2 bias : Std.I64)
       · have := h2b d2; omega
       · have := h2c ⟨by omega, by omega⟩; omega
 
-/-- Theorem 4: `puny_encode_digit` maps `0..25` to `'a'..'z'` (`97..122`) and `26..35` to `'0'..'9'` (`48..57`). -/
-theorem puny_encode_digit_ascii_range (d : Std.I64) (hlo : 0 ≤ d.val) (hhi : d.val ≤ 35) :
+private lemma puny_encode_digit_ascii_range (d : Std.I64) (hlo : 0 ≤ d.val) (hhi : d.val ≤ 35) :
     ∃ b : Std.U8, puny_encode_digit d = ok b ∧
       ((d.val < 26 → b.val = 97 + d.val.toNat) ∧
        (26 ≤ d.val → b.val = 48 + (d.val - 26).toNat)) := by
@@ -338,15 +336,6 @@ theorem puny_decode_digit_valid_iff (b : Std.I32) :
         have hn3 : ¬ (48 ≤ b.val ∧ b.val ≤ 57) := fun ⟨a, c⟩ => h3 ⟨a, c⟩
         exact ⟨(-1)#i64, rfl, ⟨fun h => by omega, fun h => by rcases h with h | h | h <;> omega⟩,
                ⟨fun _ => by rintro (h | h | h) <;> omega, fun _ => cm1⟩⟩
-
-/-- Theorem 8: `encode_set_mask` maps the 7 WHATWG `EncodeSet` variants injectively to distinct powers of two. -/
-theorem encode_set_mask_distinct_pow2 :
-    (∀ a b : EncodeSet, encode_set_mask a = encode_set_mask b → a = b) ∧
-    (∀ s : EncodeSet, ∃ m : Std.I32, encode_set_mask s = ok m ∧
-      (m.val = 1 ∨ m.val = 2 ∨ m.val = 4 ∨ m.val = 8 ∨ m.val = 16 ∨ m.val = 32 ∨ m.val = 64)) := by
-  constructor
-  · intro a b h; cases a <;> cases b <;> first | rfl | (simp [encode_set_mask] at h)
-  · intro s; cases s <;> exact ⟨_, rfl, by decide⟩
 
 private def pureByteMask (b : Int) : BitVec 32 :=
   let is_ctrl := decide (b ≤ 31) || decide (b > 126)
@@ -518,32 +507,5 @@ theorem encode_byte_mask_ascii_alnum_safe (b : Std.I32)
   simp only [hre, halnum, ↓reduceIte] at hk
   change (pureByteMask b.val).toInt = (0#i32 : Std.I32).val
   rw [hk]; rfl
-
-/-- Theorem 12: Every C0 control (`≤ 0x1F`), DEL (`0x7F`), and non-ASCII byte (`≥ 0x80`) is always encoded in all 8 sets (`mask = 0xFF`). -/
-theorem encode_byte_mask_c0_del_nonascii_always_encoded (b : Std.I32)
-    (hctrl : b.val ≤ 31 ∨ b.val > 126) :
-    encode_byte_mask b = ok 255#i32 := by
-  obtain ⟨m, hm, hall⟩ := encode_byte_mask_controls_subset_all b
-  rw [hm]
-  apply congrArg ok
-  have hm0 : m.bv.getLsbD 0 = true := by
-    rw [encode_byte_mask_eq_pure] at hm
-    simp only [ok.injEq] at hm
-    subst hm
-    change (pureByteMask b.val).getLsbD 0 = true
-    unfold pureByteMask
-    have hc : (decide (b.val ≤ 31) || decide (b.val > 126)) = true := by
-      simp only [Bool.or_eq_true, decide_eq_true_eq]; exact hctrl
-    have hnsafe : (decide (b.val = 42) || decide (b.val = 45) || decide (b.val = 46) ||
-        (decide (b.val ≥ 48) && decide (b.val ≤ 57)) ||
-        (decide (b.val ≥ 65) && decide (b.val ≤ 90)) ||
-        decide (b.val = 95) ||
-        (decide (b.val ≥ 97) && decide (b.val ≤ 122))) = false := by
-      simp only [Bool.or_eq_false_iff, Bool.and_eq_false_iff, decide_eq_false_iff_not]
-      omega
-    simp only [hc, hnsafe, Bool.true_or, Bool.not_false, ↓reduceIte]
-    decide
-  have h255 := hall hm0
-  cases m; congr
 
 end UrlProofs

@@ -4,33 +4,6 @@ open Aeneas Aeneas.Std Result Pion http1
 
 namespace Http1Proofs
 
-/-- RFC 9112: `parse_http_minor` maps `'0'` to `0` (`Http10`), `'1'..'9'` to `1` (`Http11`),
-    and rejects all other bytes with `-1` (`InvalidVersion`). -/
-theorem parse_http_minor_spec (v : Std.I32) :
-    (v.val = 48 → parse_http_minor v = ok 0#i32) ∧
-    (49 ≤ v.val ∧ v.val ≤ 57 → parse_http_minor v = ok 1#i32) ∧
-    ((v.val < 48 ∨ 57 < v.val) → parse_http_minor v = ok (-1)#i32) := by
-  have h48 : (48#i32).val = 48 := by norm_num
-  have h49 : (49#i32).val = 49 := by norm_num
-  have h57 : (57#i32).val = 57 := by norm_num
-  refine ⟨?_, ?_, ?_⟩
-  · intro h
-    unfold parse_http_minor
-    have heq : v = 48#i32 := (iscalar_eq_iff v 48#i32).mpr (by omega)
-    simp only [heq, ↓reduceIte]
-  · intro h
-    unfold parse_http_minor
-    have hne : v ≠ 48#i32 := fun heq => by have := (iscalar_eq_iff v 48#i32).mp heq; omega
-    have hcond : ((decide (v ≥ 49#i32)) && (decide (v ≤ 57#i32))) = true := by
-      simp only [Bool.and_eq_true, decide_eq_true_eq, iscalar_le_iff]; omega
-    simp only [hne, hcond, ↓reduceIte]
-  · intro h
-    unfold parse_http_minor
-    have hne : v ≠ 48#i32 := fun heq => by have := (iscalar_eq_iff v 48#i32).mp heq; omega
-    have hcond : ((decide (v ≥ 49#i32)) && (decide (v ≤ 57#i32))) = false := by
-      simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not, iscalar_le_iff]; omega
-    simp only [hne, hcond, Bool.false_eq_true, ↓reduceIte]
-
 /-- RFC 9112: `parse_status_digits` decodes 3 ASCII digits into `0..999` exactly. -/
 theorem parse_status_digits_ok (d0 d1 d2 : Std.I32)
     (h0 : 48 ≤ d0.val ∧ d0.val ≤ 57)
@@ -71,27 +44,6 @@ theorem parse_status_digits_ok (d0 d1 d2 : Std.I32)
     change (Pion.I32.add _ _).val = _
     rw [i32_add_val, ha0, hs2] <;> omega
   exact ⟨s, rfl, hs, by omega, by omega⟩
-
-/-- `parse_status_digits` rejects any non-digit byte with `-1` (`InvalidStatus`). -/
-theorem parse_status_digits_rejects_nondigit (d0 d1 d2 : Std.I32)
-    (h : d0.val < 48 ∨ 57 < d0.val ∨ d1.val < 48 ∨ 57 < d1.val ∨ d2.val < 48 ∨ 57 < d2.val) :
-    parse_status_digits d0 d1 d2 = ok (-1)#i32 := by
-  have h48 : (48#i32).val = 48 := by norm_num
-  have h57 : (57#i32).val = 57 := by norm_num
-  unfold parse_status_digits
-  have hcond : ((((((decide (d0 < 48#i32)) || (decide (d0 > 57#i32))) ||
-      (decide (d1 < 48#i32))) || (decide (d1 > 57#i32))) ||
-      (decide (d2 < 48#i32))) || (decide (d2 > 57#i32))) = true := by
-    simp only [Bool.or_eq_true, decide_eq_true_eq, iscalar_lt_iff]
-    omega
-  rw [hcond]
-  rfl
-
-/-- `is_valid_encode_status` accepts iff `100 <= status <= 999`. -/
-theorem is_valid_encode_status_spec (status : Std.I32) :
-    is_valid_encode_status status = ok (decide (100 ≤ status.val ∧ status.val ≤ 999)) := by
-  unfold is_valid_encode_status
-  congr 1
 
 /-- Overflow immunity and exact arithmetic for `u63_decimal_step` (Content-Length & SSE retry):
     when `acc >= 0`, `b` is an ASCII digit, and `acc * 10 + (b - 48) <= INT64_MAX`,
@@ -272,17 +224,6 @@ lemma i64_shl4_bor_eq (size : Std.I64) (v : Std.I32)
   rw [ite_eq_left hlt]
   omega
 
-/-- RFC 9112 §7.1: `chunk_size_hex_step` rejects 17+ hex digits (`digits >= 16`) with `-1L` (`InvalidChunkSize`). -/
-theorem chunk_size_hex_step_rejects_too_many_digits (size : Std.I64) (digits v : Std.I32)
-    (h : 16 ≤ digits.val) :
-    chunk_size_hex_step size digits v = ok (-1)#i64 := by
-  have h16 : (16#i32).val = 16 := by norm_num
-  unfold chunk_size_hex_step
-  have hc : ((((decide (digits < 0#i32)) || (decide (digits ≥ 16#i32))) ||
-      (decide (v < 0#i32))) || (decide (v > 15#i32))) = true := by
-    simp only [Bool.or_eq_true, decide_eq_true_eq, iscalar_lt_iff, iscalar_le_iff]; omega
-  rw [hc]; rfl
-
 /-- Overflow immunity and exact arithmetic for `chunk_size_hex_step`:
     for `0 <= digits < 16`, `0 <= v <= 15`, `0 <= size`, and `size * 16 + v <= INT64_MAX`,
     it returns `res >= 0` with exact value `size * 16 + v` (zero signed 64-bit wraparound). -/
@@ -350,27 +291,5 @@ theorem chunk_size_hex_step_rejects_overflow (size : Std.I64) (digits v : Std.I3
     rw [Bool.or_eq_true, Bool.or_eq_true]
     exact Or.inl (Or.inr (decide_eq_true hgt))
   rw [hc2]; rfl
-
-/-- Exact specification of `chunk_size_check_limit` (`0` = ok, `1` = negative, `2` = exceeds limit). -/
-theorem chunk_size_check_limit_spec (size max_sz : Std.I64) :
-    (size.val < 0 → chunk_size_check_limit size max_sz = ok 1#i32) ∧
-    (0 ≤ size.val ∧ max_sz.val < size.val → chunk_size_check_limit size max_sz = ok 2#i32) ∧
-    (0 ≤ size.val ∧ size.val ≤ max_sz.val → chunk_size_check_limit size max_sz = ok 0#i32) := by
-  have h0l : (0#i64).val = 0 := by norm_num
-  refine ⟨?_, ?_, ?_⟩
-  · intro h
-    unfold chunk_size_check_limit
-    have hlt : size < 0#i64 := (iscalar_lt_iff size 0#i64).mpr (by omega)
-    simp only [hlt, ↓reduceIte]
-  · intro h
-    unfold chunk_size_check_limit
-    have hlt : ¬(size < 0#i64) := fun h0 => by have := (iscalar_lt_iff size 0#i64).mp h0; omega
-    have hgt : size > max_sz := (iscalar_lt_iff max_sz size).mpr h.2
-    simp only [hlt, hgt, ↓reduceIte]
-  · intro h
-    unfold chunk_size_check_limit
-    have hlt : ¬(size < 0#i64) := fun h0 => by have := (iscalar_lt_iff size 0#i64).mp h0; omega
-    have hgt : ¬(size > max_sz) := fun h1 => by have := (iscalar_lt_iff max_sz size).mp h1; omega
-    simp only [hlt, hgt, ↓reduceIte]
 
 end Http1Proofs

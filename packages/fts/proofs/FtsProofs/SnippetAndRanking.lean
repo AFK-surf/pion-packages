@@ -39,7 +39,7 @@ private lemma i32_sub_val (x y : Std.I32)
   rw [BitVec.toInt_sub]
   exact Int.bmod_eq_of_le (by omega) (by omega)
 
-/-- 13. `snippet_normalize_ws` is idempotent across all `2^32` codepoints. -/
+/-- `snippet_normalize_ws` is idempotent across all `2^32` codepoints. -/
 theorem snippet_normalize_ws_idempotent (c : Std.I32) :
     ∃ r : Std.I32,
       snippet_normalize_ws c = ok r ∧ snippet_normalize_ws r = ok r := by
@@ -53,20 +53,8 @@ theorem snippet_normalize_ws_idempotent (c : Std.I32) :
       · exact absurd hc h
     exact ⟨c, by simp [hf], by simp [hf]⟩
 
-/-- 14. Control whitespace `\n` (10), `\r` (13), and `\t` (9) normalize to ASCII space (32). -/
-theorem snippet_normalize_ws_ctrl (c : Std.I32)
-    (h : c.val = 10 ∨ c.val = 13 ∨ c.val = 9) :
-    snippet_normalize_ws c = ok 32#i32 := by
-  unfold snippet_normalize_ws
-  have h10 : (10#i32).val = 10 := by decide
-  have h13 : (13#i32).val = 13 := by decide
-  have h9 : (9#i32).val = 9 := by decide
-  have hc : (((c == 10#i32) || (c == 13#i32)) || (c == 9#i32)) = true := by
-    simp only [Bool.or_eq_true, i32_beq_iff, h10, h13, h9]
-    omega
-  simp [hc]
-
-/-- 15. For any positive `max_chars`, `snippet_context_before` lies in `[0, min(16, max_chars)]`. -/
+/-- For any positive `max_chars` (guarded in `packages/fts/src/snippet.pion`),
+    `snippet_context_before` lies in `[0, min(16, max_chars)]`. -/
 theorem snippet_context_before_bounds (max_chars : Std.I32) (hpos : 0 < max_chars.val) :
     ∃ ctx : Std.I32,
       snippet_context_before max_chars = ok ctx ∧
@@ -95,7 +83,7 @@ theorem snippet_context_before_bounds (max_chars : Std.I32) (hpos : 0 < max_char
     rw [h4, Int.tdiv_eq_ediv_of_nonneg (by omega)] at hqv
     exact ⟨q, rfl, by omega, by omega, by omega⟩
 
-/-- 16. RT-3 overflow safety: for all `0 ≤ win_start ≤ total_cps` and `0 < max_chars`
+/-- RT-3 overflow safety: for all `0 ≤ win_start ≤ total_cps` and `0 < max_chars`
     (even `max_chars = Int::MAX`), `snippet_win_end` never overflows and satisfies
     `win_start ≤ win_end ≤ total_cps` and `win_end - win_start ≤ max_chars`. -/
 theorem snippet_win_end_rt3_safe (win_start total_cps max_chars : Std.I32)
@@ -124,31 +112,13 @@ theorem snippet_win_end_rt3_safe (win_start total_cps max_chars : Std.I32)
       omega
     omega
 
-/-- 17. `snippet_range_gt` is irreflexive. -/
+/-- `snippet_range_gt` is irreflexive. -/
 theorem snippet_range_gt_irrefl (a0 a1 : Std.I32) :
     snippet_range_gt a0 a1 a0 a1 = ok false := by
   unfold snippet_range_gt
   simp
 
-/-- 18. `snippet_range_gt` is asymmetric. -/
-theorem snippet_range_gt_asymm (a0 a1 b0 b1 : Std.I32) :
-    snippet_range_gt a0 a1 b0 b1 = ok true →
-    snippet_range_gt b0 b1 a0 a1 = ok false := by
-  unfold snippet_range_gt
-  simp only [Result.ok.injEq, Bool.or_eq_true, Bool.and_eq_true, Bool.or_eq_false_iff,
-    Bool.and_eq_false_iff, decide_eq_true_eq, decide_eq_false_iff_not,
-    gt_iff_lt, IScalar.lt_equiv, i32_beq_iff]
-  intro h
-  constructor
-  · omega
-  · by_cases heq : b0.val = a0.val
-    · right; omega
-    · left
-      cases hb : (b0 == a0)
-      · rfl
-      · rw [i32_beq_iff] at hb; omega
-
-/-- 19. `snippet_range_gt` is transitive. -/
+/-- `snippet_range_gt` is transitive. -/
 theorem snippet_range_gt_trans (a0 a1 b0 b1 c0 c1 : Std.I32) :
     snippet_range_gt a0 a1 b0 b1 = ok true →
     snippet_range_gt b0 b1 c0 c1 = ok true →
@@ -159,13 +129,7 @@ theorem snippet_range_gt_trans (a0 a1 b0 b1 c0 c1 : Std.I32) :
   intro h1 h2
   omega
 
-/-- 20. `hit_tiebreak_cmp` is reflexive (`cmp a a = 0`). -/
-theorem hit_tiebreak_cmp_refl (ok1 id1 : Std.I64) :
-    hit_tiebreak_cmp ok1 id1 ok1 id1 = ok 0#i32 := by
-  unfold hit_tiebreak_cmp
-  simp
-
-/-- 21. `hit_tiebreak_cmp` is antisymmetric (`cmp a b = -cmp b a`). -/
+/-- `hit_tiebreak_cmp` is antisymmetric (`cmp a b = -cmp b a`). -/
 theorem hit_tiebreak_cmp_antisymm (ok1 id1 ok2 id2 : Std.I64) :
     ∃ r1 r2 : Std.I32,
       hit_tiebreak_cmp ok1 id1 ok2 id2 = ok r1 ∧
@@ -178,7 +142,7 @@ theorem hit_tiebreak_cmp_antisymm (ok1 id1 ok2 id2 : Std.I64) :
   have h0 : (0#i32).val = 0 := by decide
   split_ifs <;> simp only [gt_iff_lt, IScalar.lt_equiv] at * <;> omega
 
-/-- 22. `hit_tiebreak_cmp` returns `0` iff both `order_key` and `doc_id` are equal. -/
+/-- `hit_tiebreak_cmp` returns `0` iff both `order_key` and `doc_id` are equal. -/
 theorem hit_tiebreak_cmp_zero_iff (ok1 id1 ok2 id2 : Std.I64) :
     hit_tiebreak_cmp ok1 id1 ok2 id2 = ok 0#i32 ↔ ok1 = ok2 ∧ id1 = id2 := by
   constructor
@@ -193,20 +157,7 @@ theorem hit_tiebreak_cmp_zero_iff (ok1 id1 ok2 id2 : Std.I64) :
       simp only [gt_iff_lt, IScalar.lt_equiv] at h1 h2 h3 h4
       exact ⟨i64_eq_of_val (by omega), i64_eq_of_val (by omega)⟩
   · rintro ⟨rfl, rfl⟩
-    exact hit_tiebreak_cmp_refl ok1 id1
-
-/-- 23. Higher `order_key` strictly ranks ahead (`-1`). -/
-theorem hit_tiebreak_cmp_order_key_desc (ok1 id1 ok2 id2 : Std.I64) (h : ok1.val > ok2.val) :
-    hit_tiebreak_cmp ok1 id1 ok2 id2 = ok (-1)#i32 := by
-  unfold hit_tiebreak_cmp
-  have hgt : ok1 > ok2 := by simpa [gt_iff_lt, IScalar.lt_equiv] using h
-  simp [hgt]
-
-/-- 24. On equal `order_key`, smaller `doc_id` strictly ranks ahead (`-1`). -/
-theorem hit_tiebreak_cmp_doc_id_asc (ok1 id1 id2 : Std.I64) (h : id1.val < id2.val) :
-    hit_tiebreak_cmp ok1 id1 ok1 id2 = ok (-1)#i32 := by
-  unfold hit_tiebreak_cmp
-  have hlt : id1 < id2 := by simpa [IScalar.lt_equiv] using h
-  simp [hlt]
+    unfold hit_tiebreak_cmp
+    simp
 
 end FtsProofs

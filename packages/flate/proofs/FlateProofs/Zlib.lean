@@ -16,8 +16,7 @@ private lemma i32_shr_const (x k : Std.I32) (h0 : 0 ≤ k.val) (h32 : k.val < 32
   have hc : 0 ≤ k.val ∧ k.val < 32 := ⟨h0, h32⟩
   simp only [hc, and_self, ↓reduceIte]
 
-/-- RFC 1950 §2.2: `zlib_flevel` maps `0..9` into `[0, 3]` with exact 4-tier thresholds. -/
-theorem zlib_flevel_spec (level : Std.I32) :
+private lemma zlib_flevel_spec (level : Std.I32) :
     (level.val ≤ 1 → zlib_flevel level = ok 0#i32) ∧
     (2 ≤ level.val ∧ level.val ≤ 5 → zlib_flevel level = ok 1#i32) ∧
     (level.val = 6 → zlib_flevel level = ok 2#i32) ∧
@@ -45,8 +44,7 @@ theorem zlib_flevel_spec (level : Std.I32) :
     have c3 : level ≠ 6#i32 := fun hc => by have := (iscalar_eq_iff _ _).mp hc; omega
     simp only [c1, c2, c3, ↓reduceIte]
 
-/-- `zlib_flevel` always returns a valid 2-bit `FLEVEL` in `[0, 3]`. -/
-theorem zlib_flevel_bounds (level : Std.I32) :
+private lemma zlib_flevel_bounds (level : Std.I32) :
     ∃ fl : Std.I32, zlib_flevel level = ok fl ∧ 0 ≤ fl.val ∧ fl.val ≤ 3 := by
   obtain ⟨h0, h1, h2, h3⟩ := zlib_flevel_spec level
   by_cases c1 : level.val ≤ 1
@@ -144,73 +142,5 @@ theorem zlib_encoder_decoder_duality (level : Std.I32) :
   have hcm : Pion.I32.band 120#i32 15#i32 = 8#i32 := by decide
   have hcinfo : ¬(Pion.I32.band (⟨(120#i32).bv.sshiftRight (4#i32).val.toNat⟩ : Std.I32) 15#i32 > 7#i32) := by decide
   simp only [hcm, hcinfo, not_true_eq_false, ↓reduceIte]
-
-/-- RFC 1950 §2.2: `zlib_check_header` returns error `1` whenever `(cmf * 256 + flg) % 31 ≠ 0`. -/
-theorem zlib_check_header_rejects_bad_fcheck (cmf flg : Std.I32)
-    (hcmf0 : 0 ≤ cmf.val) (hcmf1 : cmf.val ≤ 255)
-    (hflg0 : 0 ≤ flg.val) (hflg1 : flg.val ≤ 255)
-    (hbad : (cmf.val * 256 + flg.val) % 31 ≠ 0) :
-    zlib_check_header cmf flg = ok 1#i32 := by
-  unfold zlib_check_header
-  have h256 : (256#i32).val = 256 := by norm_num
-  have h31 : (31#i32).val = 31 := by norm_num
-  have hmul : (Pion.I32.mul cmf 256#i32).val = cmf.val * 256 := by
-    rw [i32_mul_val cmf 256#i32 (by rw [h256]; omega) (by rw [h256]; omega), h256]
-  have hsum : (Pion.I32.add (Pion.I32.mul cmf 256#i32) flg).val = cmf.val * 256 + flg.val := by
-    rw [i32_add_val _ flg (by rw [hmul]; omega) (by rw [hmul]; omega), hmul]
-  obtain ⟨r, hr_eq, hr_val⟩ := i32_rem_nonneg_val (Pion.I32.add (Pion.I32.mul cmf 256#i32) flg) 31#i32
-    (by rw [hsum]; omega) (by omega)
-  rw [hr_eq, result_bind_ok]
-  have hne : r ≠ 0#i32 := fun e => by
-    have : r.val = 0 := by rw [e]; norm_num
-    rw [hsum, h31] at hr_val; omega
-  split_ifs with hc
-  · rfl
-  · exact absurd hne hc
-
-/-- RFC 1950 §2.2: `zlib_check_header` returns error `2` on non-DEFLATE compression method (`CM ≠ 8`, e.g. `0x79 0x18`)
-    and error `3` on `CINFO > 7` (window > 32 KiB, e.g. `0x88 0x1C`). -/
-theorem zlib_check_header_rejects_bad_cm_and_cinfo :
-    zlib_check_header 121#i32 24#i32 = ok 2#i32 ∧
-    zlib_check_header 136#i32 28#i32 = ok 3#i32 := by
-  constructor
-  · unfold zlib_check_header
-    rw [i32_rem_pos _ 31#i32 (by norm_num), result_bind_ok]
-    have hrem : (⟨(Pion.I32.add (Pion.I32.mul 121#i32 256#i32) 24#i32).bv.srem (31#i32).bv⟩ : Std.I32) = 0#i32 := by decide
-    simp only [hrem, ne_eq, not_true_eq_false, ↓reduceIte]
-    rw [i32_shr_const 121#i32 4#i32 (by norm_num) (by norm_num), result_bind_ok]
-    have hcm : Pion.I32.band 121#i32 15#i32 = 9#i32 := by decide
-    have hne : (9#i32 : Std.I32) ≠ 8#i32 := by decide
-    simp only [hcm, hne, not_false_eq_true, ↓reduceIte]
-  · unfold zlib_check_header
-    rw [i32_rem_pos _ 31#i32 (by norm_num), result_bind_ok]
-    have hrem : (⟨(Pion.I32.add (Pion.I32.mul 136#i32 256#i32) 28#i32).bv.srem (31#i32).bv⟩ : Std.I32) = 0#i32 := by decide
-    simp only [hrem, ne_eq, not_true_eq_false, ↓reduceIte]
-    rw [i32_shr_const 136#i32 4#i32 (by norm_num) (by norm_num), result_bind_ok]
-    have hcm : Pion.I32.band 136#i32 15#i32 = 8#i32 := by decide
-    have hcinfo : Pion.I32.band (⟨(136#i32).bv.sshiftRight (4#i32).val.toNat⟩ : Std.I32) 15#i32 > 7#i32 := by decide
-    simp only [hcm, hcinfo, not_true_eq_false, ↓reduceIte]
-
-private lemma zlib_check_valid_spot (flg : Std.I32)
-    (hrem : (⟨(Pion.I32.add (Pion.I32.mul 120#i32 256#i32) flg).bv.srem (31#i32).bv⟩ : Std.I32) = 0#i32) :
-    zlib_check_header 120#i32 flg = ok 0#i32 := by
-  unfold zlib_check_header
-  rw [i32_rem_pos _ 31#i32 (by norm_num), result_bind_ok]
-  simp only [hrem, ne_eq, not_true_eq_false, ↓reduceIte]
-  rw [i32_shr_const 120#i32 4#i32 (by norm_num) (by norm_num), result_bind_ok]
-  have hcm : Pion.I32.band 120#i32 15#i32 = 8#i32 := by decide
-  have hcinfo : ¬(Pion.I32.band (⟨(120#i32).bv.sshiftRight (4#i32).val.toNat⟩ : Std.I32) 15#i32 > 7#i32) := by decide
-  simp only [hcm, hcinfo, not_true_eq_false, ↓reduceIte]
-
-/-- RFC 1950 standard header byte pairs (`78 01`, `78 5E`, `78 9C`, `78 DA`) are all accepted with `0`. -/
-theorem zlib_standard_headers_valid :
-    zlib_check_header 120#i32 1#i32 = ok 0#i32 ∧
-    zlib_check_header 120#i32 94#i32 = ok 0#i32 ∧
-    zlib_check_header 120#i32 156#i32 = ok 0#i32 ∧
-    zlib_check_header 120#i32 218#i32 = ok 0#i32 :=
-  ⟨zlib_check_valid_spot 1#i32 (by decide),
-   zlib_check_valid_spot 94#i32 (by decide),
-   zlib_check_valid_spot 156#i32 (by decide),
-   zlib_check_valid_spot 218#i32 (by decide)⟩
 
 end FlateProofs

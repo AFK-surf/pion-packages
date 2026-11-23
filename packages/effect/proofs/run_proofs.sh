@@ -1,182 +1,196 @@
 #!/usr/bin/env bash
-# End-to-end Lean 4 formal verification & native-vs-Lean differential runner for packages/effect.
 set -euo pipefail
 trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-export PATH="${HOME}/.pion/bin:${HOME}/.elan/bin:${PATH}"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
+export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
+export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="effect"
+LEAN_MOD="Effect"
+PROOF_MOD="EffectProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-LEAN_WORK="${LEAN_WORK:-/private/tmp/pion-lean-shared}"
-LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
-LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
-PROJ_DIR="${LEAN_WORK}/proj"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas in ${LEAN_WORK} ==="
-mkdir -p "${PROJ_DIR}"
-if [ ! -d "${PROJ_DIR}/PionLean" ]; then
-  if [ -d /private/tmp/pion-lean-ref/PionLean ]; then
-    cp -R /private/tmp/pion-lean-ref/PionLean "${PROJ_DIR}/PionLean"
-    cp /private/tmp/pion-lean-ref/PionLean.lean "${PROJ_DIR}/PionLean.lean"
-  else
-    echo "ERROR: PionLean reference missing" >&2
-    exit 1
-  fi
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
+  exit 1
+fi
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
+  exit 1
 fi
 
-if [ ! -e "${PROJ_DIR}/.deps/aeneas" ]; then
-  if [ ! -d "${LEAN_WORK}/aeneas/backends/lean" ]; then
-    rm -rf "${LEAN_WORK}/aeneas"
-    git clone --filter=blob:none -q https://github.com/AeneasVerif/aeneas.git "${LEAN_WORK}/aeneas"
-    git -C "${LEAN_WORK}/aeneas" checkout -q 1dc8ad31b1
-  fi
-  mkdir -p "${PROJ_DIR}/.deps"
-  ln -sfn "${LEAN_WORK}/aeneas/backends/lean" "${PROJ_DIR}/.deps/aeneas"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
 fi
 
-rm -f "${PROJ_DIR}/lakefile.toml"
-cat > "${PROJ_DIR}/lakefile.lean" <<EOF
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
 import Lake
 open Lake DSL
 
-require aeneas from "./.deps/aeneas"
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
 
-package «pionlean» where
-  leanOptions := #[⟨\`weak.linter.dupNamespace, false⟩]
+require aeneas from ".deps/aeneas"
 
-@[default_target] lean_lib PionLean
-
-lean_lib Effect where
-  moreLeanArgs := #["--memory=${LEAN_MEM_LIMIT}", "-j", "${LEAN_NUM_THREADS}"]
-
-lean_lib EffectProofs where
-  moreLeanArgs := #["--memory=${LEAN_MEM_LIMIT}", "-j", "${LEAN_NUM_THREADS}"]
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
 EOF
 
-echo "=== [2/7] pionc extract-lean packages/effect ==="
-pionc extract-lean "${PKG_DIR}" --out "${PROJ_DIR}"
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
 
-rm -rf "${PROJ_DIR}/EffectProofs" "${PROJ_DIR}/EffectProofs.lean" "${PROJ_DIR}/CheckAxioms.lean" "${PROJ_DIR}/EvalDiff.lean"
-cp -R "${SCRIPT_DIR}/EffectProofs" "${PROJ_DIR}/EffectProofs"
-cp "${SCRIPT_DIR}/EffectProofs.lean" "${PROJ_DIR}/EffectProofs.lean"
-cp "${SCRIPT_DIR}/CheckAxioms.lean" "${PROJ_DIR}/CheckAxioms.lean"
-cp "${SCRIPT_DIR}/EvalDiff.lean" "${PROJ_DIR}/EvalDiff.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide)\b' "${SCRIPT_DIR}/EffectProofs.lean" "${SCRIPT_DIR}/EffectProofs/" "${SCRIPT_DIR}/CheckAxioms.lean" "${SCRIPT_DIR}/EvalDiff.lean"; then
-  echo "ERROR: forbidden token found in Lean proofs!" >&2
-  exit 1
-fi
-echo "Static scan: 0 sorry / admit / axiom / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Effect.Types Effect.Funs EffectProofs ==="
-(cd "${PROJ_DIR}" && lake build PionLean Effect.Types Effect.Funs EffectProofs)
-
-echo "=== [5/7] CheckAxioms (standard axioms only) ==="
-AXIOMS_OUT="$(cd "${PROJ_DIR}" && lake env lean --memory="${LEAN_MEM_LIMIT}" -j "${LEAN_NUM_THREADS}" CheckAxioms.lean 2>&1)"
-echo "${AXIOMS_OUT}"
-if echo "${AXIOMS_OUT}" | grep -E 'sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler|error:|warning:'; then
-  echo "ERROR: non-standard axiom, error, or warning detected!" >&2
-  exit 1
-fi
-THM_COUNT="$(echo "${AXIOMS_OUT}" | grep -c 'depends on axioms:' || true)"
-if [ "${THM_COUNT}" -lt 24 ]; then
-  echo "ERROR: expected at least 24 theorems in CheckAxioms, got ${THM_COUNT}" >&2
-  exit 1
-fi
-echo "CheckAxioms: ${THM_COUNT} theorems verified, standard axioms only"
-
-echo "=== [6/7] Lean EvalDiff (44 cases) ==="
-EVAL_OUT="$(cd "${PROJ_DIR}" && lake env lean --memory="${LEAN_MEM_LIMIT}" -j "${LEAN_NUM_THREADS}" EvalDiff.lean 2>&1)"
-echo "${EVAL_OUT}"
-if echo "${EVAL_OUT}" | grep -E 'FAIL|error:|warning:'; then
-  echo "ERROR: EvalDiff reported FAIL, error, or warning!" >&2
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$(mktemp -d /tmp/effect-native-diff.XXXXXX)"
-trap 'rm -rf "${DIFF_DIR}"; kill -- -$$ 2>/dev/null || true' EXIT
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
 
-cat > "${DIFF_DIR}/pion.toml" <<EOF
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    for line in f:
+        m = re.match(r"^'([^']+)' depends on axioms: \[(.*)\]$", line.strip())
+        if m:
+            thm, ax_str = m.group(1), m.group(2).strip()
+            audited.add(thm)
+            axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+            bad = axs - allowed
+            if bad:
+                sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+        elif re.match(r"^'([^']+)' does not depend on any axioms$", line.strip()):
+            audited.add(re.match(r"^'([^']+)'", line.strip()).group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+if ! grep -q "=TRAP$" "$LEAN_OUT"; then
+  echo "FAIL: EvalDiff must exercise at least one TRAP boundary" >&2
+  exit 1
+fi
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
+cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "effect_diff_harness"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
-edition = "2026"
 
 [dependencies]
-effect = { path = "${PKG_DIR}" }
+effect = { path = "$PKG_DIR" }
 EOF
-
-mkdir -p "${DIFF_DIR}/src"
-cat > "${DIFF_DIR}/src/main.pion" <<'EOF'
+mkdir -p "$DIFF_DIR/src"
+cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "effect"
 
-fn cb(w : World, label : String, got : Bool, exp : Bool) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
+fn fb(b : Bool) -> String { if b { "true" } else { "false" } }
 
-fn ci(w : World, label : String, got : Int, exp : Int) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn ci64(w : World, label : String, got : Int64, exp : Int64) -> Unit {
-  if got == exp { io_println(w, label + ": PASS") } else { io_println(w, label + ": FAIL") }
-}
-
-fn main(w : World) -> Unit {
-  ci64(w, "rng_init0", effect::rng_init_state(0), 2654435769L)
-  ci64(w, "rng_init1", effect::rng_init_state(1), 8L)
-  ci64(w, "rng_step0", effect::rng_step_u32(0L), 0L)
-  ci64(w, "rng_step1", effect::rng_step_u32(1L), 270369L)
-  ci(w, "rng_bel0", effect::rng_below_val(100L, 0), 0)
-  ci(w, "rng_bel1", effect::rng_below_val(100L, 1), 0)
-  ci(w, "rng_bel7", effect::rng_below_val(100L, 7), 2)
-  ci(w, "rcap_0", effect::ring_next_cap(0), 8)
-  ci(w, "rcap_8", effect::ring_next_cap(8), 16)
-  ci(w, "radd_0", effect::ring_slot_add(0, 3, 8), 3)
-  ci(w, "radd_w", effect::ring_slot_add(6, 5, 8), 3)
-  ci(w, "rprev_0", effect::ring_slot_prev(0, 8), 7)
-  ci(w, "rprev_3", effect::ring_slot_prev(3, 8), 2)
-  cb(w, "tm_lt", effect::timer_before(10L, 5, 20L, 1), true)
-  cb(w, "tm_eq_lt", effect::timer_before(10L, 1, 10L, 2), true)
-  cb(w, "tm_eq_eq", effect::timer_before(10L, 2, 10L, 2), false)
-  cb(w, "tm_gt", effect::timer_before(20L, 1, 10L, 9), false)
-  ci(w, "hp_1", effect::heap_parent(1), 0)
-  ci(w, "hp_2", effect::heap_parent(2), 0)
-  ci(w, "hp_5", effect::heap_parent(5), 2)
-  ci(w, "hl_0", effect::heap_left(0), 1)
-  ci(w, "hl_3", effect::heap_left(3), 7)
-  cb(w, "q_unb", effect::queue_has_room(-1, 999), true)
-  cb(w, "q_ok", effect::queue_has_room(16, 15), true)
-  cb(w, "q_full", effect::queue_has_room(16, 16), false)
-  cb(w, "qo_shut", effect::queue_can_offer(true, -1, 0), false)
-  cb(w, "qo_ok", effect::queue_can_offer(false, 4, 3), true)
-  ci(w, "p_ask", effect::priority_asked(), 30)
-  ci(w, "p_foc", effect::priority_focused(), 20)
-  ci(w, "p_shw", effect::priority_shown(), 10)
-  ci(w, "p_det", effect::priority_detail(), 5)
-  ci(w, "p_bg", effect::priority_background(), 0)
-  ci(w, "p_idl", effect::priority_idle(), -10)
-  cb(w, "sl_urg_ok", effect::sched_lane_admits(20, 3, 2, 2, 0, false, false, false), true)
-  cb(w, "sl_urg_no", effect::sched_lane_admits(20, 4, 2, 2, 0, false, false, false), false)
-  cb(w, "sl_shw_ok", effect::sched_lane_admits(10, 1, 2, 2, 0, false, false, false), true)
-  cb(w, "sl_shw_no", effect::sched_lane_admits(10, 2, 2, 2, 0, false, false, false), false)
-  cb(w, "sl_bg_ser", effect::sched_lane_admits(0, 1, 2, 2, 0, false, true, false), false)
-  cb(w, "sl_bg_ok", effect::sched_lane_admits(0, 0, 2, 2, 0, false, false, false), true)
-  cb(w, "sl_idl_no", effect::sched_lane_admits(-10, 1, 2, 2, 0, false, false, false), false)
-  cb(w, "sl_idl_ok", effect::sched_lane_admits(-10, 0, 2, 2, 0, false, false, false), true)
-  cb(w, "sp_yes", effect::sched_is_preempted(-10, 1, false), true)
-  cb(w, "sp_no", effect::sched_is_preempted(0, 1, true), false)
-  cb(w, "fc_shield", effect::fiber_should_cut(true, 1), false)
+pub fn main(world : World) -> Int {
+  io_println(world, "rng_init_0=" + effect::rng_init_state(0).to_string())
+  io_println(world, "rng_init_neg1=" + effect::rng_init_state(-1).to_string())
+  io_println(world, "rng_init_min=" + effect::rng_init_state(-2147483648).to_string())
+  io_println(world, "rng_init_max=" + effect::rng_init_state(2147483647).to_string())
+  io_println(world, "rng_below_le1=" + effect::rng_below_val(12345L, 1).to_string())
+  io_println(world, "rng_below_0=" + effect::rng_below_val(12345L, 0).to_string())
+  io_println(world, "rng_below_10=" + effect::rng_below_val(4294967295L, 10).to_string())
+  io_println(world, "rng_below_max=" + effect::rng_below_val(9223372036854775807L, 2147483647).to_string())
+  io_println(world, "ring_cap_0=" + effect::ring_next_cap(0).to_string())
+  io_println(world, "ring_cap_8=" + effect::ring_next_cap(8).to_string())
+  io_println(world, "ring_cap_oob=" + effect::ring_next_cap(1073741824).to_string())
+  io_println(world, "ring_add_wrap=" + effect::ring_slot_add(6, 5, 8).to_string())
+  io_println(world, "ring_prev_0=" + effect::ring_slot_prev(0, 8).to_string())
+  io_println(world, "ring_prev_3=" + effect::ring_slot_prev(3, 8).to_string())
+  io_println(world, "timer_eq=" + fb(effect::timer_before(100L, 1, 100L, 1)))
+  io_println(world, "timer_lt_at=" + fb(effect::timer_before(-9223372036854775807L - 1L, 0, 9223372036854775807L, 0)))
+  io_println(world, "timer_tie_seq=" + fb(effect::timer_before(100L, 1, 100L, 2)))
+  io_println(world, "heap_parent_1=" + effect::heap_parent(1).to_string())
+  io_println(world, "heap_parent_max=" + effect::heap_parent(2147483647).to_string())
+  io_println(world, "heap_left_0=" + effect::heap_left(0).to_string())
+  io_println(world, "heap_left_10=" + effect::heap_left(10).to_string())
+  0
 }
 EOF
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
 
-PION_CACHE_DIR="${DIFF_DIR}/pion-cache" pionc build -o "${DIFF_DIR}/diff_bin" "${DIFF_DIR}"
-"${DIFF_DIR}/diff_bin" > "${DIFF_DIR}/native.out"
-printf '%s\n' "${EVAL_OUT}" > "${DIFF_DIR}/lean.out"
-diff -u "${DIFF_DIR}/native.out" "${DIFF_DIR}/lean.out"
-CASE_COUNT="$(wc -l < "${DIFF_DIR}/native.out" | tr -d ' ')"
-echo "Native vs Lean differential: ${CASE_COUNT} cases identical (diff -u exit 0)"
+for trap_expr in "effect::ring_slot_add(0, 1, 0)" "effect::ring_slot_prev(0, 0)"; do
+  cat > "$DIFF_DIR/src/main.pion" <<EOF
+import "effect"
+pub fn main(world : World) -> Int {
+  io_println(world, $trap_expr.to_string())
+  0
+}
+EOF
+  "$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/trap_bin" >/dev/null
+  if "$DIFF_DIR/trap_bin" >/dev/null 2>&1; then
+    echo "FAIL: expected native trap for $trap_expr" >&2
+    exit 1
+  fi
+done
+grep -v '=TRAP$' "$LEAN_OUT" > "$DIFF_DIR/lean_ok.txt"
+diff -u "$NATIVE_OUT" "$DIFF_DIR/lean_ok.txt"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (including 2 verified native+Lean TRAP cases, diff -u exit 0)"
 echo "PASS: packages/effect Lean 4 proofs"

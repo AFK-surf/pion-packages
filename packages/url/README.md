@@ -109,16 +109,14 @@ sh packages/url/bench/run_bench.sh
 
 ## Formal Verification (Lean 4)
 
-Production pure kernels in `src/types.pion`, `src/host.pion`, `src/percent.pion`, and `src/idna.pion` are annotated with `#verify` and extracted directly to Lean 4 via `pionc extract-lean` (**3 types**, **13 functions**, **0 externals**):
+Production pure kernels in `src/types.pion`, `src/percent.pion`, and `src/idna.pion` are annotated with `#verify` and extracted directly to Lean 4 via `pionc extract-lean` (**2 types**, **7 functions**, **0 externals**):
 
-- **Annotated types**: `Ipv4Addr`, `Ipv6Addr`, `EncodeSet`.
-- **Annotated hot-path functions**: `puny_threshold`, `puny_encode_digit`, `puny_decode_digit`, `encode_byte_mask`, `encode_set_mask`, `Ipv4Addr::new`, `Ipv4Addr::from_u32`, `Ipv4Addr::to_u32`, `Ipv4Addr::octets`, `Ipv4Addr::eq`, `Ipv6Addr::new`, `Ipv6Addr::eq`, `ipv6_seg`.
-- **Machine-checked proofs** (`proofs/UrlProofs/PunycodeAndPercent.lean`, `proofs/UrlProofs/IpAddrs.lean`): **24 theorems**, **0 `sorry` / `admit` / `axiom` / `bv_decide` / `native_decide`**, verified by `proofs/CheckAxioms.lean` to depend solely on standard Lean axioms (`[propext, Classical.choice, Quot.sound]`):
-  - **RFC 3492 Punycode bootstring arithmetic**: `puny_threshold` bounds `[tmin=1, tmax=26]`, exact 3-branch spec, and monotonicity in `k`; base-36 digit encode ASCII ranges (`'a'..'z'`, `'0'..'9'`), full 36-digit encode→decode roundtrip, case-insensitive `'A'..'Z'` decoding, and exact validity iff.
-  - **WHATWG URL §1.3 percent-encoding sets**: `encode_set_mask` injective power-of-two mapping; `Controls` (`≤ 0x1F` or `> 0x7E`, zero C0/CR/LF/TAB smuggling) encoded in all 8 sets (`0xFF`); full 256-byte inclusion hierarchy (`Query ⊆ SpecialQuery`, `Query ⊆ Path ⊆ Userinfo ⊆ Component`); ASCII alphanumerics never percent-encoded (`mask = 0`).
-  - **IPv4 / IPv6 kernels**: full `2^32` bidirectional bijection between `Ipv4Addr::new` and `Ipv4Addr::octets` (exact big-endian `a·2^24 + b·2^16 + c·2^8 + d`), `from_u32`/`to_u32` identity, `Ipv6Addr::new` 16-bit `[0, 65535]` masking & idempotence, `ipv6_seg` exact 8-segment indexing, and structural equality / reflexivity / symmetry.
-- **Differential cross-check**: `proofs/EvalDiff.lean` checks **36 cases** against native Pion execution via `diff -u` (0 differences).
+- **Machine-checked proofs** (`proofs/UrlProofs/PunycodeAndPercent.lean`, `proofs/UrlProofs/IpAddrs.lean`): **12** `0-sorry` theorems (strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`):
+  - **RFC 3492 Punycode bootstring arithmetic**: `puny_threshold` bounds `[1, 26]` & monotonicity in `k`; 36-digit encode→decode roundtrip, case-insensitive `'A'..'Z'` decoding, and exact validity iff.
+  - **WHATWG URL §1.3 percent-encoding sets**: `Controls` (`≤ 0x1F` or `> 0x7E`) encoded in all 8 sets (`0xFF`), 256-byte inclusion hierarchy (`Query ⊆ SpecialQuery`, `Query ⊆ Path ⊆ Userinfo ⊆ Component`), and ASCII alphanumeric safety (`mask = 0`).
+  - **IPv4 / IPv6 kernels**: full `2^32` bidirectional bijection between `Ipv4Addr::new` and `Ipv4Addr::octets` (exact big-endian `a·2^24 + b·2^16 + c·2^8 + d`) and `Ipv6Addr::new` idempotence on `[0, 65535]`.
+- **Differential cross-check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (`diff -u`, including `INT32_MIN`/`INT32_MAX`/`INT64_MIN` and out-of-range cases).
 
 ```sh
-packages/url/proofs/run_proofs.sh
+bash packages/url/proofs/run_proofs.sh
 ```

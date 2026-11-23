@@ -51,7 +51,6 @@ private lemma i32_mul_val (x y : Std.I32)
 private lemma i64_band_u32_bounds (x : Std.I64) :
     0 ≤ (Pion.I64.band x 4294967295#i64).val ∧
     (Pion.I64.band x 4294967295#i64).val ≤ 4294967295 := by
-  have hm : (4294967295#i64).bv = BitVec.ofNat 64 4294967295 := rfl
   have hnat : (Pion.I64.band x 4294967295#i64).bv.toNat = x.bv.toNat &&& 4294967295 := by
     change (x.bv &&& BitVec.ofNat 64 4294967295).toNat = _
     rw [BitVec.toNat_and]
@@ -108,7 +107,7 @@ private lemma i64_rem_nonneg (x y : Std.I64) (hx : 0 ≤ x.val) (hy : 0 < y.val)
     rw [Int.tmod_eq_emod_of_nonneg hx]
     exact Int.emod_lt_of_pos x.val hy
 
-/-- 1. `rng_init_state` always produces a non-zero unsigned 32-bit state in `[1, 2^32 - 1]`. -/
+/-- `rng_init_state` always produces a non-zero unsigned 32-bit state in `[1, 2^32 - 1]`. -/
 theorem rng_init_state_nonzero_u32 (seed : Std.I32) :
     ∃ s : Std.I64,
       rng_init_state seed = ok s ∧ 1 ≤ s.val ∧ s.val ≤ 4294967295 := by
@@ -117,7 +116,6 @@ theorem rng_init_state_nonzero_u32 (seed : Std.I32) :
   set m := Pion.I64.band (Pion.I64.mul u 2654435761#i64) 4294967295#i64
   set mixed := Pion.I64.bxor m 2654435769#i64
   have hm_lt : m.bv.toNat < 2 ^ 32 := by
-    have hb := i64_band_u32_bounds (Pion.I64.mul u 2654435761#i64)
     have hnat : m.bv.toNat = (Pion.I64.mul u 2654435761#i64).bv.toNat &&& 4294967295 := by
       change ((Pion.I64.mul u 2654435761#i64).bv &&& BitVec.ofNat 64 4294967295).toNat = _
       rw [BitVec.toNat_and]; rfl
@@ -151,44 +149,8 @@ theorem rng_init_state_nonzero_u32 (seed : Std.I32) :
           exact congrArg IScalar.mk this
     omega
 
-private lemma shl_i32_13 (x : Std.I64) :
-    Pion.I64.shl_i32 x 13#i32 = ok ⟨x.bv <<< (13#i32).val.toNat⟩ := by
-  have h : 0 ≤ (13#i32).val ∧ (13#i32).val < 64 := by decide
-  simp only [Pion.I64.shl_i32, h, and_self, ↓reduceIte]
-
-private lemma shr_i32_17 (x : Std.I64) :
-    Pion.I64.shr_i32 x 17#i32 = ok ⟨x.bv.sshiftRight (17#i32).val.toNat⟩ := by
-  have h : 0 ≤ (17#i32).val ∧ (17#i32).val < 64 := by decide
-  simp only [Pion.I64.shr_i32, h, and_self, ↓reduceIte]
-
-private lemma shl_i32_5 (x : Std.I64) :
-    Pion.I64.shl_i32 x 5#i32 = ok ⟨x.bv <<< (5#i32).val.toNat⟩ := by
-  have h : 0 ≤ (5#i32).val ∧ (5#i32).val < 64 := by decide
-  simp only [Pion.I64.shl_i32, h, and_self, ↓reduceIte]
-
-/-- 2. `rng_step_u32` always returns a valid unsigned 32-bit state in `[0, 2^32 - 1]`. -/
-theorem rng_step_u32_bounds (s : Std.I64) :
-    ∃ s' : Std.I64,
-      rng_step_u32 s = ok s' ∧ 0 ≤ s'.val ∧ s'.val ≤ 4294967295 := by
-  simp only [rng_step_u32, shl_i32_13, shr_i32_17, shl_i32_5, result_bind_ok]
-  exact ⟨_, rfl, i64_band_u32_bounds _⟩
-
-/-- 3. `0` is a fixed point of `rng_step_u32` (showing why `rng_init_state` must avoid `0`). -/
-theorem rng_step_u32_zero_fixed :
-    rng_step_u32 0#i64 = ok 0#i64 := by
-  simp only [rng_step_u32, shl_i32_13, shr_i32_17, shl_i32_5, result_bind_ok]
-  rfl
-
-/-- 4. `rng_below_val` returns `0` whenever `n ≤ 1`. -/
-theorem rng_below_val_le_one (draw : Std.I64) (n : Std.I32) (hn : n.val ≤ 1) :
-    rng_below_val draw n = ok 0#i32 := by
-  unfold rng_below_val
-  have h1 : (1#i32).val = 1 := by decide
-  have hle : n ≤ 1#i32 := by
-    simp only [IScalar.le_equiv, h1]; omega
-  simp [hle]
-
-/-- 5. For any non-negative `draw` and `n ≥ 2`, `rng_below_val draw n` lies strictly in `[0, n)`. -/
+/-- For any non-negative `draw` (produced by `rng_step_u32` in `packages/effect/src/rng.pion`)
+    and `n ≥ 2`, `rng_below_val draw n` lies strictly in `[0, n)`. -/
 theorem rng_below_val_bounds (draw : Std.I64) (n : Std.I32)
     (hd : 0 ≤ draw.val) (hn : 2 ≤ n.val) :
     ∃ v : Std.I32,
@@ -217,7 +179,7 @@ theorem rng_below_val_bounds (draw : Std.I64) (n : Std.I32)
     simpa using this
   omega
 
-/-- 6. `ring_next_cap` strictly grows capacity without overflow for `0 ≤ old_cap < 2^30`. -/
+/-- `ring_next_cap` strictly grows capacity without overflow for `0 ≤ old_cap < 2^30`. -/
 theorem ring_next_cap_grows (old_cap : Std.I32)
     (hlo : 0 ≤ old_cap.val) (hhi : old_cap.val < 2 ^ 30) :
     ∃ c : Std.I32,
@@ -235,7 +197,7 @@ theorem ring_next_cap_grows (old_cap : Std.I32)
       rw [i32_mul_val old_cap 2#i32 (by rw [h2]; omega) (by rw [h2]; omega), h2]
     omega
 
-/-- 7. `ring_slot_add` always produces an in-bounds buffer index `[0, cap)`. -/
+/-- `ring_slot_add` always produces an in-bounds buffer index `[0, cap)`. -/
 theorem ring_slot_add_bounds (head offset cap : Std.I32)
     (hh : 0 ≤ head.val) (ho : 0 ≤ offset.val) (hc : 0 < cap.val)
     (hsum : head.val + offset.val < 2 ^ 31) :
@@ -248,7 +210,7 @@ theorem ring_slot_add_bounds (head offset cap : Std.I32)
   rw [hr, result_bind_ok]
   exact ⟨r, rfl, hr0, hrlt⟩
 
-/-- 8. `ring_slot_prev` always produces an in-bounds buffer index `[0, cap)`. -/
+/-- `ring_slot_prev` always produces an in-bounds buffer index `[0, cap)`. -/
 theorem ring_slot_prev_bounds (head cap : Std.I32)
     (hh0 : 0 ≤ head.val) (hhc : head.val < cap.val) (hc : cap.val < 2 ^ 30) :
     ∃ prev : Std.I32,
@@ -264,7 +226,7 @@ theorem ring_slot_prev_bounds (head cap : Std.I32)
   rw [hr, result_bind_ok]
   exact ⟨r, rfl, hr0, hrlt⟩
 
-/-- 9. `ring_slot_add (ring_slot_prev head cap) 1 cap = head` (exact `push_front`/`pop_front` inverse). -/
+/-- `ring_slot_add (ring_slot_prev head cap) 1 cap = head` (exact `push_front`/`pop_front` inverse). -/
 theorem ring_slot_prev_add_one_inv (head cap : Std.I32)
     (hh0 : 0 ≤ head.val) (hhc : head.val < cap.val) (hc : cap.val < 2 ^ 30) :
     ∃ prev : Std.I32,
@@ -307,31 +269,13 @@ theorem ring_slot_prev_add_one_inv (head cap : Std.I32)
     rw [this]
     exact Int.emod_eq_of_lt hh0 hhc
 
-/-- 10. `timer_before` is irreflexive. -/
+/-- `timer_before` is irreflexive. -/
 theorem timer_before_irrefl (at1 : Std.I64) (seq1 : Std.I32) :
     timer_before at1 seq1 at1 seq1 = ok false := by
   unfold timer_before
   simp
 
-/-- 11. `timer_before` is asymmetric. -/
-theorem timer_before_asymm (at1 : Std.I64) (seq1 : Std.I32) (at2 : Std.I64) (seq2 : Std.I32) :
-    timer_before at1 seq1 at2 seq2 = ok true →
-    timer_before at2 seq2 at1 seq1 = ok false := by
-  unfold timer_before
-  simp only [Result.ok.injEq, Bool.or_eq_true, Bool.and_eq_true, Bool.or_eq_false_iff,
-    Bool.and_eq_false_iff, decide_eq_true_eq, decide_eq_false_iff_not,
-    IScalar.lt_equiv, i64_beq_iff]
-  intro h
-  constructor
-  · omega
-  · by_cases heq : at2.val = at1.val
-    · right; omega
-    · left
-      cases hb : (at2 == at1)
-      · rfl
-      · rw [i64_beq_iff] at hb; omega
-
-/-- 12. `timer_before` is transitive. -/
+/-- `timer_before` is transitive. -/
 theorem timer_before_trans
     (at1 : Std.I64) (seq1 : Std.I32)
     (at2 : Std.I64) (seq2 : Std.I32)

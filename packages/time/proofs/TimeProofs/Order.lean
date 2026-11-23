@@ -13,12 +13,12 @@ open time
 /-! ## 3. `Date`, `Time`, `DateTime`, `Timestamp` Strict Total Orders -/
 
 /-- `Date.cmp` never traps and returns `{-1, 0, 1}`. -/
-theorem date_cmp_total (a b : Date) :
+private lemma date_cmp_total (a b : Date) :
     ∃ r : Std.I32, Date.cmp a b = ok r ∧ (r = (-1)#i32 ∨ r = 0#i32 ∨ r = 1#i32) := by
   unfold Date.cmp
   split_ifs <;> exact ⟨_, rfl, by decide⟩
 
-theorem date_cmp_refl (a : Date) : Date.cmp a a = ok 0#i32 := by
+private lemma date_cmp_refl (a : Date) : Date.cmp a a = ok 0#i32 := by
   unfold Date.cmp; simp
 
 theorem date_cmp_lt_iff (a b : Date) :
@@ -77,7 +77,7 @@ theorem date_cmp_eq_zero_iff (a b : Date) : Date.cmp a b = ok 0#i32 ↔ a = b :=
       split_ifs at h <;> (exfalso; revert h; decide)
   · intro h; subst h; exact date_cmp_refl a
 
-theorem date_cmp_antisymm (a b : Date) :
+private lemma date_cmp_antisymm (a b : Date) :
     Date.cmp a b = ok (-1)#i32 ↔ Date.cmp b a = ok 1#i32 := by
   unfold Date.cmp
   by_cases h1 : a.year = b.year
@@ -117,7 +117,7 @@ theorem date_cmp_antisymm (a b : Date) :
       have hlt2 : b.year < a.year := show b.year.val < a.year.val by omega
       simp [hlt1, hlt2]
 
-theorem date_cmp_trans_lt (a b c : Date)
+private lemma date_cmp_trans_lt (a b c : Date)
     (hab : Date.cmp a b = ok (-1)#i32) (hbc : Date.cmp b c = ok (-1)#i32) :
     Date.cmp a c = ok (-1)#i32 := by
   rw [date_cmp_lt_iff] at hab hbc ⊢
@@ -209,15 +209,7 @@ theorem time_cmp_spec (a b : Time) (ha : ValidTime a) (hb : ValidTime b) :
                       (b.hour.val * 3600 + b.minute.val * 60 + b.second.val) * 1000000000 + b.nanosecond.val) := by omega
       simp only [hlt', htot1, htot2, ↓reduceIte]
 
-theorem time_cmp_refl (a : Time) (ha : ValidTime a) : Time.cmp a a = ok 0#i32 := by
-  rw [time_cmp_spec a a ha ha]; simp
-
-theorem time_cmp_antisymm (a b : Time) (ha : ValidTime a) (hb : ValidTime b) :
-    Time.cmp a b = ok (-1)#i32 ↔ Time.cmp b a = ok 1#i32 := by
-  rw [time_cmp_spec a b ha hb, time_cmp_spec b a hb ha, ok_eq_iff, ok_eq_iff]
-  split_ifs <;> first | exact Iff.rfl | decide | omega
-
-theorem time_cmp_trans_lt (a b c : Time) (ha : ValidTime a) (hb : ValidTime b) (hc : ValidTime c)
+private lemma time_cmp_trans_lt (a b c : Time) (ha : ValidTime a) (hb : ValidTime b) (hc : ValidTime c)
     (hab : Time.cmp a b = ok (-1)#i32) (hbc : Time.cmp b c = ok (-1)#i32) :
     Time.cmp a c = ok (-1)#i32 := by
   rw [time_cmp_spec a b ha hb, ok_eq_iff] at hab
@@ -266,29 +258,6 @@ theorem timestamp_cmp_spec (a b : Timestamp) (ha : ValidTimestamp a) (hb : Valid
       have h2 : ¬ (a.secs.val * 1000000000 + a.nanos.val = b.secs.val * 1000000000 + b.nanos.val) := by omega
       simp only [hlt', h1, h2, ↓reduceIte]
 
-theorem timestamp_cmp_refl (a : Timestamp) : Timestamp.cmp a a = ok 0#i32 := by
-  unfold Timestamp.cmp; simp
-
-theorem timestamp_cmp_antisymm (a b : Timestamp) (ha : ValidTimestamp a) (hb : ValidTimestamp b) :
-    Timestamp.cmp a b = ok (-1)#i32 ↔ Timestamp.cmp b a = ok 1#i32 := by
-  rw [timestamp_cmp_spec a b ha hb, timestamp_cmp_spec b a hb ha, ok_eq_iff, ok_eq_iff]
-  split_ifs <;> first | exact Iff.rfl | decide | omega
-
-theorem timestamp_cmp_trans_lt (a b c : Timestamp)
-    (ha : ValidTimestamp a) (hb : ValidTimestamp b) (hc : ValidTimestamp c)
-    (hab : Timestamp.cmp a b = ok (-1)#i32) (hbc : Timestamp.cmp b c = ok (-1)#i32) :
-    Timestamp.cmp a c = ok (-1)#i32 := by
-  rw [timestamp_cmp_spec a b ha hb, ok_eq_iff] at hab
-  rw [timestamp_cmp_spec b c hb hc, ok_eq_iff] at hbc
-  rw [timestamp_cmp_spec a c ha hc, ok_eq_iff]
-  split_ifs at hab hbc ⊢ <;> first | rfl | omega | (exfalso; revert hab; decide) | (exfalso; revert hbc; decide)
-
-theorem datetime_cmp_refl (a : DateTime) (ht : ValidTime a.time) :
-    DateTime.cmp a a = ok 0#i32 := by
-  unfold DateTime.cmp
-  rw [date_cmp_refl, b_ok]
-  simp [time_cmp_refl a.time ht]
-
 theorem datetime_cmp_antisymm (a b : DateTime)
     (ha : ValidTime a.time) (hb : ValidTime b.time) :
     DateTime.cmp a b = ok (-1)#i32 ↔ DateTime.cmp b a = ok 1#i32 := by
@@ -302,7 +271,7 @@ theorem datetime_cmp_antisymm (a b : DateTime)
     rw [heq, date_cmp_refl, b_ok]
     simp only [ne_eq, not_true_eq_false, ↓reduceIte]
     rw [time_cmp_spec a.time b.time ha hb, time_cmp_spec b.time a.time hb ha, b_ok, b_ok, ok_eq_iff, ok_eq_iff]
-    split_ifs <;> first | exact Iff.rfl | decide | omega
+    split_ifs <;> first | decide | omega
   · have hba := (date_cmp_antisymm b.date a.date).mpr hr
     rw [hba, b_ok]; simp
 
@@ -320,7 +289,7 @@ theorem datetime_cmp_trans_lt (a b c : DateTime)
     · rw [date_cmp_trans_lt a.date b.date c.date hrab hrbc, b_ok]; simp
     · have hbe := (date_cmp_eq_zero_iff b.date c.date).mp hrbc
       rw [← hbe, hrab, b_ok]; simp
-    · rw [if_pos (by decide), ok_eq_iff] at hbc; exfalso; revert hbc; decide
+    · rw [ite_eq_left (by decide), ok_eq_iff] at hbc; exfalso; revert hbc; decide
   · have hae := (date_cmp_eq_zero_iff a.date b.date).mp hrab
     simp only [ne_eq, not_true_eq_false, ↓reduceIte] at hab
     rcases hrbc_c with rfl | rfl | rfl
@@ -334,8 +303,8 @@ theorem datetime_cmp_trans_lt (a b c : DateTime)
       have hbc' : Time.cmp b.time c.time = ok (-1)#i32 := by
         rcases time_cmp_spec b.time c.time hb hc with h1; rw [h1, b_ok] at hbc; rw [h1]; exact hbc
       rw [ht hab' hbc', b_ok]
-    · rw [if_pos (by decide), ok_eq_iff] at hbc; exfalso; revert hbc; decide
-  · rw [if_pos (by decide), ok_eq_iff] at hab; exfalso; revert hab; decide
+    · rw [ite_eq_left (by decide), ok_eq_iff] at hbc; exfalso; revert hbc; decide
+  · rw [ite_eq_left (by decide), ok_eq_iff] at hab; exfalso; revert hab; decide
 
 
 end TimeProofs

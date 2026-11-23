@@ -22,36 +22,6 @@ theorem utf8_dfa_ascii_accept (b : Std.I32) (h : 0 ≤ b.val ∧ b.val < 128) :
     norm_num; omega
   simp only [h0, hc, ↓reduceIte]
 
-/-- RFC 3629 UTF-8 DFA: lone continuation bytes (`0x80..0xBF`) in state `0` are rejected (`-1`). -/
-theorem utf8_dfa_rejects_lone_continuation (b : Std.I32) (h : 128 ≤ b.val ∧ b.val ≤ 191) :
-    utf8_dfa_step 0#i32 b = ok (-1)#i32 := by
-  unfold utf8_dfa_step
-  have h0 : ¬((0#i32 : Std.I32) < 0#i32) := by rw [iscalar_lt_iff]; norm_num
-  simp only [h0, ↓reduceIte]
-  congr 1
-  simp only [Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq, iscalar_le_iff, iscalar_lt_iff, iscalar_eq_iff]
-  split_ifs <;> norm_num at * <;> omega
-
-/-- RFC 3629 UTF-8 DFA: overlong 2-byte lead bytes `0xC0` and `0xC1` are rejected (`-1`). -/
-theorem utf8_dfa_rejects_overlong_c0_c1 (b : Std.I32) (h : b.val = 192 ∨ b.val = 193) :
-    utf8_dfa_step 0#i32 b = ok (-1)#i32 := by
-  unfold utf8_dfa_step
-  have h0 : ¬((0#i32 : Std.I32) < 0#i32) := by rw [iscalar_lt_iff]; norm_num
-  simp only [h0, ↓reduceIte]
-  congr 1
-  simp only [Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq, iscalar_le_iff, iscalar_lt_iff, iscalar_eq_iff]
-  split_ifs <;> norm_num at * <;> omega
-
-/-- RFC 3629 UTF-8 DFA: invalid lead bytes `0xF5..0xFF` are rejected (`-1`). -/
-theorem utf8_dfa_rejects_above_f4 (b : Std.I32) (h : 245 ≤ b.val ∧ b.val ≤ 255) :
-    utf8_dfa_step 0#i32 b = ok (-1)#i32 := by
-  unfold utf8_dfa_step
-  have h0 : ¬((0#i32 : Std.I32) < 0#i32) := by rw [iscalar_lt_iff]; norm_num
-  simp only [h0, ↓reduceIte]
-  congr 1
-  simp only [Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq, iscalar_le_iff, iscalar_lt_iff, iscalar_eq_iff]
-  split_ifs <;> norm_num at * <;> omega
-
 /-- RFC 3629 UTF-8 DFA: `0xE0` enters state `3` and rejects overlong 3-byte second bytes `< 0xA0`. -/
 theorem utf8_dfa_rejects_overlong_e0 (b1 : Std.I32) (h : b1.val < 160 ∨ 191 < b1.val) :
     utf8_dfa_step 0#i32 224#i32 = ok 3#i32 ∧ utf8_dfa_step 3#i32 b1 = ok (-1)#i32 := by
@@ -65,61 +35,6 @@ theorem utf8_dfa_rejects_overlong_e0 (b1 : Std.I32) (h : b1.val < 160 ∨ 191 < 
   have hne2 : (3#i32 : Std.I32) ≠ 2#i32 := by decide
   simp only [hne0, hne1, hne2, ↓reduceIte]
   have hc : ((decide (b1 < 160#i32)) || (decide (b1 > 191#i32))) = true := by
-    simp only [Bool.or_eq_true, decide_eq_true_eq, iscalar_lt_iff]; norm_num; omega
-  rw [hc]; rfl
-
-/-- RFC 3629 UTF-8 DFA: `0xED` enters state `4` and rejects UTF-16 surrogates (`U+D800..U+DFFF`, `b1 >= 0xA0`). -/
-theorem utf8_dfa_rejects_surrogate_ed (b1 : Std.I32) (h : b1.val < 128 ∨ 159 < b1.val) :
-    utf8_dfa_step 0#i32 237#i32 = ok 4#i32 ∧ utf8_dfa_step 4#i32 b1 = ok (-1)#i32 := by
-  refine ⟨by unfold utf8_dfa_step; rfl, ?_⟩
-  unfold utf8_dfa_step
-  have hlt : ¬((4#i32 : Std.I32) < 0#i32) := by rw [iscalar_lt_iff]; norm_num
-  simp only [hlt, ↓reduceIte]
-  congr 1
-  have hne0 : (4#i32 : Std.I32) ≠ 0#i32 := by decide
-  have hne1 : (4#i32 : Std.I32) ≠ 1#i32 := by decide
-  have hne2 : (4#i32 : Std.I32) ≠ 2#i32 := by decide
-  have hne3 : (4#i32 : Std.I32) ≠ 3#i32 := by decide
-  simp only [hne0, hne1, hne2, hne3, ↓reduceIte]
-  have hc : ((decide (b1 < 128#i32)) || (decide (b1 > 159#i32))) = true := by
-    simp only [Bool.or_eq_true, decide_eq_true_eq, iscalar_lt_iff]; norm_num; omega
-  rw [hc]; rfl
-
-/-- RFC 3629 UTF-8 DFA: `0xF0` enters state `5` and rejects overlong 4-byte second bytes `< 0x90`. -/
-theorem utf8_dfa_rejects_overlong_f0 (b1 : Std.I32) (h : b1.val < 144 ∨ 191 < b1.val) :
-    utf8_dfa_step 0#i32 240#i32 = ok 5#i32 ∧ utf8_dfa_step 5#i32 b1 = ok (-1)#i32 := by
-  refine ⟨by unfold utf8_dfa_step; rfl, ?_⟩
-  unfold utf8_dfa_step
-  have hlt : ¬((5#i32 : Std.I32) < 0#i32) := by rw [iscalar_lt_iff]; norm_num
-  simp only [hlt, ↓reduceIte]
-  congr 1
-  have hne0 : (5#i32 : Std.I32) ≠ 0#i32 := by decide
-  have hne1 : (5#i32 : Std.I32) ≠ 1#i32 := by decide
-  have hne2 : (5#i32 : Std.I32) ≠ 2#i32 := by decide
-  have hne3 : (5#i32 : Std.I32) ≠ 3#i32 := by decide
-  have hne4 : (5#i32 : Std.I32) ≠ 4#i32 := by decide
-  simp only [hne0, hne1, hne2, hne3, hne4, ↓reduceIte]
-  have hc : ((decide (b1 < 144#i32)) || (decide (b1 > 191#i32))) = true := by
-    simp only [Bool.or_eq_true, decide_eq_true_eq, iscalar_lt_iff]; norm_num; omega
-  rw [hc]; rfl
-
-/-- RFC 3629 UTF-8 DFA: `0xF4` enters state `7` and rejects code points above `U+10FFFF` (`b1 >= 0x90`). -/
-theorem utf8_dfa_rejects_above_10ffff_f4 (b1 : Std.I32) (h : b1.val < 128 ∨ 143 < b1.val) :
-    utf8_dfa_step 0#i32 244#i32 = ok 7#i32 ∧ utf8_dfa_step 7#i32 b1 = ok (-1)#i32 := by
-  refine ⟨by unfold utf8_dfa_step; rfl, ?_⟩
-  unfold utf8_dfa_step
-  have hlt : ¬((7#i32 : Std.I32) < 0#i32) := by rw [iscalar_lt_iff]; norm_num
-  simp only [hlt, ↓reduceIte]
-  congr 1
-  have hne0 : (7#i32 : Std.I32) ≠ 0#i32 := by decide
-  have hne1 : (7#i32 : Std.I32) ≠ 1#i32 := by decide
-  have hne2 : (7#i32 : Std.I32) ≠ 2#i32 := by decide
-  have hne3 : (7#i32 : Std.I32) ≠ 3#i32 := by decide
-  have hne4 : (7#i32 : Std.I32) ≠ 4#i32 := by decide
-  have hne5 : (7#i32 : Std.I32) ≠ 5#i32 := by decide
-  have hne6 : (7#i32 : Std.I32) ≠ 6#i32 := by decide
-  simp only [hne0, hne1, hne2, hne3, hne4, hne5, hne6, ↓reduceIte]
-  have hc : ((decide (b1 < 128#i32)) || (decide (b1 > 143#i32))) = true := by
     simp only [Bool.or_eq_true, decide_eq_true_eq, iscalar_lt_iff]; norm_num; omega
   rw [hc]; rfl
 

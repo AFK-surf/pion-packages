@@ -1,234 +1,188 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/websocket`.
-#
-# Builds a throw-away Lake project in /private/tmp/pion-lean-websocket (zero git
-# worktree pollution), extracts `packages/websocket` via `pionc extract-lean`,
-# compiles `PionLean`, `Websocket`, and `WebsocketProofs`, rejects any
-# `sorry`/`admit`/`native_decide`/`bv_decide`, verifies `#print axioms`
-# (only `propext`, `Classical.choice`, `Quot.sound`), and runs `EvalDiff.lean`
-# + a Pion native differential cross-check (`diff -u`).
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-websocket}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="websocket"
+LEAN_MOD="Websocket"
+PROOF_MOD="WebsocketProofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/websocket ==="
-rm -rf "$PROJ/Websocket"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Websocket/$f.lean" ]; then
-    echo "FAIL: missing Websocket/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/WebsocketProofs"
-cp -R "$SCRIPT_DIR/WebsocketProofs" "$PROJ/WebsocketProofs"
-cp "$SCRIPT_DIR/WebsocketProofs.lean" "$PROJ/WebsocketProofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Websocket where\n  globs := #[.submodules `Websocket]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib WebsocketProofs where\n  globs := #[.andSubmodules `WebsocketProofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/WebsocketProofs.lean" "$SCRIPT_DIR/WebsocketProofs" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Websocket WebsocketProofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Websocket WebsocketProofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
-  exit 1
-fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Websocket WebsocketProofs: exit 0, 0 errors"
-
-echo "=== [5/7] #print axioms audit ==="
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-echo "$AXIOMS_OUT"
-BAD_AXIOMS=$(printf '%s\n' "$AXIOMS_OUT" | grep -E "depends on axioms:" | sed 's/.*\[//;s/\].*//;s/,/\n/g' | tr -d ' ' | sort -u | grep -v -E '^(propext|Classical\.choice|Quot\.sound)$' || true)
-if [ -n "$BAD_AXIOMS" ]; then
-  echo "FAIL: unexpected axioms found: $BAD_AXIOMS" >&2
-  exit 1
-fi
-if printf '%s\n' "$AXIOMS_OUT" | grep -q "error:"; then
-  echo "FAIL: CheckAxioms.lean reported errors" >&2
-  exit 1
-fi
-echo "Axioms audit: ONLY standard axioms (propext, Classical.choice, Quot.sound)"
-
-echo "=== [6/7] EvalDiff.lean (#eval) ==="
-EVAL_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" EvalDiff.lean 2>&1)
-echo "$EVAL_OUT"
-if printf '%s\n' "$EVAL_OUT" | grep -q "error:"; then
-  echo "FAIL: EvalDiff.lean reported errors" >&2
-  exit 1
-fi
-if printf '%s\n' "$EVAL_OUT" | grep -q ': FAIL$'; then
-  echo "FAIL: EvalDiff.lean had a FAIL check" >&2
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$WORK/native-diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "websocket_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 websocket = { path = "$PKG_DIR" }
 EOF
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "websocket"
 
-fn report(w : World, label : String, passed : Bool) -> Unit {
-  if passed {
-    io_println(w, label + ": PASS")
-  } else {
-    io_println(w, label + ": FAIL")
+fn fmt_opt_op(o : Option[websocket::Opcode]) -> String {
+  match o {
+    Some(op) => "Some(" + websocket::opcode_to_int(op).to_string() + ")"
+    None => "None"
   }
 }
 
-pub fn main(w : World) -> Int {
-  report(w, "xor_involution", websocket::mask_byte_xor(websocket::mask_byte_xor(0xAB, 0x5C), 0x5C) == 0xAB)
-  report(w, "xor_zero_id", websocket::mask_byte_xor(0x7F, 0) == 0x7F)
-  report(w, "mask_key_b0", websocket::mask_key_byte(0x12345678U, 0) == 0x12)
-  report(w, "mask_key_b3", websocket::mask_key_byte(0x12345678U, 3) == 0x78)
-  report(w, "mask_key_periodic", websocket::mask_key_byte(0x12345678U, 7) == 0x78)
-  report(w, "ext_len_125", websocket::encoded_ext_len(125) == 0)
-  report(w, "ext_len_126", websocket::encoded_ext_len(126) == 2)
-  report(w, "ext_len_65535", websocket::encoded_ext_len(65535) == 2)
-  report(w, "ext_len_65536", websocket::encoded_ext_len(65536) == 8)
-  report(w, "hdr_len_small_unmasked", websocket::encoded_header_len(10, false) == 2)
-  report(w, "hdr_len_large_masked", websocket::encoded_header_len(70000, true) == 14)
-  report(
-    w,
-    "opcode_text",
-    match websocket::opcode_from_int(1) {
-      Some(websocket::Opcode::Text) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "opcode_pong",
-    match websocket::opcode_from_int(10) {
-      Some(websocket::Opcode::Pong) => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "opcode_reserved_3",
-    match websocket::opcode_from_int(3) {
-      None => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "opcode_reserved_15",
-    match websocket::opcode_from_int(15) {
-      None => true
-      _ => false
-    },
-  )
-  report(w, "ctrl_close", websocket::is_control_opcode(websocket::Opcode::Close) == true)
-  report(w, "ctrl_text_false", websocket::is_control_opcode(websocket::Opcode::Text) == false)
-  report(w, "role_srv_unmasked", websocket::check_role_mask(websocket::Role::Server, false) == 1)
-  report(w, "role_cli_masked", websocket::check_role_mask(websocket::Role::Client, true) == 2)
-  report(w, "ctrl_frag_err", websocket::check_control_frame(true, false, 5) == 1)
-  report(w, "ctrl_126_err", websocket::check_control_frame(true, true, 126) == 2)
-  report(w, "ctrl_125_ok", websocket::check_control_frame(true, true, 125) == 0)
-  report(w, "min_len16_125_false", websocket::is_minimal_len16(125) == false)
-  report(w, "min_len16_126_true", websocket::is_minimal_len16(126) == true)
-  report(w, "len64_msb_err", websocket::check_ext_len64(0x80, 70000L, 100000) == 1)
-  report(w, "len64_nonmin_err", websocket::check_ext_len64(0, 65535L, 100000) == 2)
-  report(w, "len64_toolarge_err", websocket::check_ext_len64(0, 200000L, 100000) == 3)
-  report(w, "len64_ok", websocket::check_ext_len64(0, 70000L, 100000) == 0)
-  report(w, "clamp_over_i32", websocket::clamp_i64_to_i32_max(3000000000L) == 2147483647)
-  report(w, "frame_total_no_ovf", websocket::frame_total_bytes(10, true, 2147483647) == 2147483661L)
-  report(w, "frag_sum_no_ovf", websocket::frag_sum_i64(2000000000, 2000000000) == 4000000000L)
-  report(w, "close_1000_ok", websocket::is_valid_close_code(1000) == true)
-  report(w, "close_1005_false", websocket::is_valid_close_code(1005) == false)
-  report(w, "close_1006_false", websocket::is_valid_close_code(1006) == false)
-  report(w, "close_1015_false", websocket::is_valid_close_code(1015) == false)
-  report(w, "close_4999_ok", websocket::is_valid_close_code(4999) == true)
-  report(w, "close_5000_false", websocket::is_valid_close_code(5000) == false)
-  report(w, "utf8_ascii_0", websocket::utf8_dfa_step(0, 65) == 0)
-  report(w, "utf8_overlong_c0", websocket::utf8_dfa_step(0, 0xC0) == -1)
-  report(w, "utf8_surrogate_ed_a0", websocket::utf8_dfa_step(websocket::utf8_dfa_step(0, 0xED), 0xA0) == -1)
-  report(w, "utf8_above_10ffff", websocket::utf8_dfa_step(websocket::utf8_dfa_step(0, 0xF4), 0x90) == -1)
-  report(w, "utf8_2byte_ok", websocket::utf8_dfa_step(websocket::utf8_dfa_step(0, 0xC3), 0xA9) == 0)
+pub fn main(world : World) -> Int {
+  io_println(world, "xor_ab=" + websocket::mask_byte_xor(0xAB, 0x55).to_string())
+  io_println(world, "xor_min=" + websocket::mask_byte_xor(-2147483648, 2147483647).to_string())
+  io_println(world, "mkey_0=" + websocket::mask_key_byte(0x37FA213DU, 0).to_string())
+  io_println(world, "mkey_3=" + websocket::mask_key_byte(0x37FA213DU, 3).to_string())
+  io_println(world, "mkey_neg1=" + websocket::mask_key_byte(0x37FA213DU, -1).to_string())
+  io_println(world, "mkey_min=" + websocket::mask_key_byte(0xFFFFFFFFU, -2147483648).to_string())
+  io_println(world, "hlen_0_f=" + websocket::encoded_header_len(0, false).to_string())
+  io_println(world, "hlen_125_t=" + websocket::encoded_header_len(125, true).to_string())
+  io_println(world, "hlen_126_f=" + websocket::encoded_header_len(126, false).to_string())
+  io_println(world, "hlen_65536_t=" + websocket::encoded_header_len(65536, true).to_string())
+  io_println(world, "hlen_min_f=" + websocket::encoded_header_len(-2147483648, false).to_string())
+  io_println(world, "hlen_max_t=" + websocket::encoded_header_len(2147483647, true).to_string())
+  io_println(world, "ext64_msb=" + websocket::check_ext_len64(0x80, 65536L, 1048576).to_string())
+  io_println(world, "ext64_nonmin=" + websocket::check_ext_len64(0, 65535L, 1048576).to_string())
+  io_println(world, "ext64_big=" + websocket::check_ext_len64(0, 2000000L, 1048576).to_string())
+  io_println(world, "ext64_ok=" + websocket::check_ext_len64(0, 65536L, 1048576).to_string())
+  io_println(world, "ext64_i64max=" + websocket::check_ext_len64(0, 9223372036854775807L, 2147483647).to_string())
+  io_println(world, "op_1=" + fmt_opt_op(websocket::opcode_from_int(1)))
+  io_println(world, "op_8=" + fmt_opt_op(websocket::opcode_from_int(8)))
+  io_println(world, "op_3=" + fmt_opt_op(websocket::opcode_from_int(3)))
+  io_println(world, "op_min=" + fmt_opt_op(websocket::opcode_from_int(-2147483648)))
+  io_println(world, "op_max=" + fmt_opt_op(websocket::opcode_from_int(2147483647)))
+  io_println(world, "utf8_ascii=" + websocket::utf8_dfa_step(0, 65).to_string())
+  io_println(world, "utf8_e0=" + websocket::utf8_dfa_step(0, 224).to_string())
+  io_println(world, "utf8_e0_ovl=" + websocket::utf8_dfa_step(3, 159).to_string())
+  io_println(world, "utf8_2b_lead=" + websocket::utf8_dfa_step(0, 194).to_string())
+  io_println(world, "utf8_2b_cont=" + websocket::utf8_dfa_step(1, 128).to_string())
+  io_println(world, "utf8_sticky=" + websocket::utf8_dfa_step(-1, 65).to_string())
+  io_println(world, "utf8_min=" + websocket::utf8_dfa_step(-2147483648, -1).to_string())
   0
 }
 EOF
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
 echo "PASS: packages/websocket Lean 4 proofs"

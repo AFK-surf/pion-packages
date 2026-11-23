@@ -1,219 +1,202 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'kill -- -$$ 2>/dev/null || true' INT TERM
 
-# End-to-end Lean 4 formal verification gate for `packages/http1`.
-#
-# Builds a throw-away Lake project in /private/tmp/pion-lean-http1 (zero git
-# worktree pollution), extracts `packages/http1` via `pionc extract-lean`,
-# compiles `PionLean`, `Http1`, and `Http1Proofs`, rejects any
-# `sorry`/`admit`/`native_decide`/`bv_decide`, verifies `#print axioms`
-# (only `propext`, `Classical.choice`, `Quot.sound`), and runs `EvalDiff.lean`
-# + a Pion native differential cross-check (`diff -u`).
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PKG_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-export PATH="$HOME/.pion/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.elan/bin:$HOME/.pion/bin:$PATH"
 export LEAN_NUM_THREADS="${LEAN_NUM_THREADS:-2}"
 export LEAN_MEM_LIMIT="${LEAN_MEM_LIMIT:-8192}"
 
-WORK="${LEAN_WORK:-/private/tmp/pion-lean-http1}"
-PROJ="$WORK/proj"
-PION_REF="${PION_LEAN_REF:-$WORK/pion-ref}"
-AENEAS_REV=1dc8ad31b1
-PIONC="${PIONC:-pionc}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PKG_NAME="http1"
+LEAN_MOD="Http1"
+PROOF_MOD="Http1Proofs"
+PIONC_BIN="${PIONC:-$(command -v pionc 2>/dev/null || echo "$HOME/.pion/bin/pionc")}"
+LEAN_CACHE="${LEAN_CACHE:-/private/tmp/pion-lean-shared}"
+PION_LEAN_REF="${PION_LEAN_REF:-/private/tmp/pion-lean-ref/lean}"
+WORK_DIR="${LEAN_WORK:-/private/tmp/pion-lean-work/$PKG_NAME}"
 
-mkdir -p "$WORK"
-
-echo "=== [1/7] Prepare Pion lean/ runtime & Aeneas@$AENEAS_REV in $WORK ==="
-if [ ! -d "$PION_REF/lean" ]; then
-  if [ -d "/private/tmp/pion-lean-ref/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref"
-  elif [ -d "/private/tmp/pion-lean-ref-semver/lean" ]; then
-    PION_REF="/private/tmp/pion-lean-ref-semver"
-  else
-    git clone --depth 1 -q https://github.com/AFK-surf/pion.git "$PION_REF"
-  fi
-fi
-
-if [ -z "${AENEAS_DIR:-}" ]; then
-  if [ -d "/private/tmp/pion-lean-semver/aeneas/backends/lean" ]; then
-    AENEAS_DIR="/private/tmp/pion-lean-semver/aeneas/backends/lean"
-  else
-    if [ ! -d "$WORK/aeneas/.git" ]; then
-      git clone -q https://github.com/AeneasVerif/aeneas.git "$WORK/aeneas"
-    fi
-    git -C "$WORK/aeneas" checkout -q "$AENEAS_REV"
-    AENEAS_DIR="$WORK/aeneas/backends/lean"
-  fi
-fi
-
-if [ ! -f "$PROJ/lakefile.lean" ] || [ ! -d "$PROJ/.lake/packages/mathlib" ]; then
-  rm -rf "$PROJ"
-  mkdir -p "$PROJ/.deps" "$PROJ/.lake"
-  (cd "$PION_REF/lean" && tar -cf - --exclude .lake --exclude .deps .) | (cd "$PROJ" && tar -xf -)
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-  (cd "$PROJ" && lake exe cache get)
-else
-  cp "$PION_REF/lean/lakefile.lean" "$PROJ/lakefile.lean"
-  ln -sfn "$AENEAS_DIR" "$PROJ/.deps/aeneas"
-fi
-
-echo "=== [2/7] pionc extract-lean packages/http1 ==="
-rm -rf "$PROJ/Http1"
-EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$PKG_DIR" 2>&1)
-echo "$EXTRACT_JSON"
-for f in Types Funs FunsExternal FunsExternal_Template; do
-  if [ ! -f "$PROJ/Http1/$f.lean" ]; then
-    echo "FAIL: missing Http1/$f.lean" >&2
-    exit 1
-  fi
-done
-
-rm -rf "$PROJ/Http1Proofs"
-cp -R "$SCRIPT_DIR/Http1Proofs" "$PROJ/Http1Proofs"
-cp "$SCRIPT_DIR/Http1Proofs.lean" "$PROJ/Http1Proofs.lean"
-cp "$SCRIPT_DIR/CheckAxioms.lean" "$PROJ/CheckAxioms.lean"
-cp "$SCRIPT_DIR/EvalDiff.lean" "$PROJ/EvalDiff.lean"
-
-printf '\nlean_lib Http1 where\n  globs := #[.submodules `Http1]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-printf '\nlean_lib Http1Proofs where\n  globs := #[.andSubmodules `Http1Proofs]\n  moreLeanArgs := #["--memory=%s", "-j", "%s"]\n' "$LEAN_MEM_LIMIT" "$LEAN_NUM_THREADS" >> "$PROJ/lakefile.lean"
-
-echo "=== [3/7] Static scan for forbidden tactics/axioms ==="
-if grep -rnwE "sorry|admit|bv_decide|native_decide" "$SCRIPT_DIR/Http1Proofs.lean" "$SCRIPT_DIR/Http1Proofs" "$SCRIPT_DIR/CheckAxioms.lean" "$SCRIPT_DIR/EvalDiff.lean" >/dev/null; then
-  echo "FAIL: proofs must not use sorry / admit / bv_decide / native_decide" >&2
+if [ ! -d "$LEAN_CACHE/aeneas/backends/lean" ] || [ ! -d "$LEAN_CACHE/proj/.lake/packages" ]; then
+  echo "ERROR: shared Aeneas/Mathlib cache not found under $LEAN_CACHE" >&2
   exit 1
 fi
-echo "Static scan: 0 sorry / admit / bv_decide / native_decide"
-
-echo "=== [4/7] lake build PionLean Http1 Http1Proofs ==="
-cd "$PROJ"
-set +e
-lake build PionLean Http1 Http1Proofs > "$WORK/build.log" 2>&1
-RC=$?
-set -e
-grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80 || true
-if [ "$RC" -ne 0 ] || grep -q '^error' "$WORK/build.log"; then
-  echo "FAIL: lake build failed (rc=$RC)" >&2
-  cat "$WORK/build.log" >&2
-  exit 1
-fi
-if grep -q "declaration uses .sorry" "$WORK/build.log"; then
-  echo "FAIL: declaration uses sorry" >&2
-  exit 1
-fi
-echo "lake build PionLean Http1 Http1Proofs: exit 0, 0 errors"
-
-echo "=== [5/7] #print axioms audit ==="
-AXIOMS_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" CheckAxioms.lean 2>&1)
-echo "$AXIOMS_OUT"
-BAD_AXIOMS=$(printf '%s\n' "$AXIOMS_OUT" | grep -E "depends on axioms:" | sed 's/.*\[//;s/\].*//;s/,/\n/g' | tr -d ' ' | sort -u | grep -v -E '^(propext|Classical\.choice|Quot\.sound)$' || true)
-if [ -n "$BAD_AXIOMS" ]; then
-  echo "FAIL: unexpected axioms found: $BAD_AXIOMS" >&2
-  exit 1
-fi
-if printf '%s\n' "$AXIOMS_OUT" | grep -q "error:"; then
-  echo "FAIL: CheckAxioms.lean reported errors" >&2
-  exit 1
-fi
-echo "Axioms audit: ONLY standard axioms (propext, Classical.choice, Quot.sound)"
-
-echo "=== [6/7] EvalDiff.lean (#eval) ==="
-EVAL_OUT=$(lake env lean --memory="$LEAN_MEM_LIMIT" -j "$LEAN_NUM_THREADS" EvalDiff.lean 2>&1)
-echo "$EVAL_OUT"
-if printf '%s\n' "$EVAL_OUT" | grep -q "error:"; then
-  echo "FAIL: EvalDiff.lean reported errors" >&2
-  exit 1
-fi
-if printf '%s\n' "$EVAL_OUT" | grep -q ': FAIL$'; then
-  echo "FAIL: EvalDiff.lean had a FAIL check" >&2
+if [ ! -d "$PION_LEAN_REF/PionLean" ] || [ ! -f "$PION_LEAN_REF/PionLean.lean" ]; then
+  echo "ERROR: PionLean reference not found at $PION_LEAN_REF/PionLean" >&2
   exit 1
 fi
 
-echo "=== [7/7] Native Pion vs Lean differential cross-check (diff -u) ==="
-DIFF_DIR="$WORK/native-diff"
-rm -rf "$DIFF_DIR"
-mkdir -p "$DIFF_DIR/src"
+echo "=== [1/7] Checking forbidden proof tokens ==="
+if grep -rnE '\b(sorry|admit|axiom|bv_decide|native_decide|unsafe|implemented_by|opaque|extern)\b' \
+    "$SCRIPT_DIR/$PROOF_MOD.lean" "$SCRIPT_DIR/$PROOF_MOD"; then
+  echo "FAIL: forbidden token found in proofs" >&2
+  exit 1
+fi
+
+echo "=== [2/7] Preparing isolated workspace $WORK_DIR and extracting Lean 4 model ==="
+mkdir -p "$WORK_DIR/.deps" "$WORK_DIR/.lake"
+ln -sfn "$LEAN_CACHE/aeneas/backends/lean" "$WORK_DIR/.deps/aeneas"
+ln -sfn "$LEAN_CACHE/proj/.lake/packages" "$WORK_DIR/.lake/packages"
+cp -f "$PION_LEAN_REF/lean-toolchain" "$WORK_DIR/lean-toolchain"
+cp -f "$LEAN_CACHE/proj/lake-manifest.json" "$WORK_DIR/lake-manifest.json"
+rm -rf "$WORK_DIR/PionLean" "$WORK_DIR/PionLean.lean"
+cp -f "$PION_LEAN_REF/PionLean.lean" "$WORK_DIR/PionLean.lean"
+cp -R "$PION_LEAN_REF/PionLean" "$WORK_DIR/PionLean"
+rm -rf "$WORK_DIR/$LEAN_MOD" "$WORK_DIR/$LEAN_MOD.lean" "$WORK_DIR/$PROOF_MOD" "$WORK_DIR/$PROOF_MOD.lean" \
+       "$WORK_DIR/CheckAxioms.lean" "$WORK_DIR/EvalDiff.lean"
+
+"$PIONC_BIN" extract-lean "$PKG_DIR" --out "$WORK_DIR"
+if [ -f "$WORK_DIR/$LEAN_MOD/FunsExternal.lean" ] && grep -qE '^\s*axiom\b' "$WORK_DIR/$LEAN_MOD/FunsExternal.lean"; then
+  echo "FAIL: unexpected axiom found in generated $LEAN_MOD/FunsExternal.lean" >&2
+  exit 1
+fi
+
+echo "=== [3/7] Staging $PROOF_MOD into $WORK_DIR ==="
+cp "$SCRIPT_DIR/$PROOF_MOD.lean" "$WORK_DIR/"
+cp -R "$SCRIPT_DIR/$PROOF_MOD" "$WORK_DIR/"
+cp "$SCRIPT_DIR/CheckAxioms.lean" "$WORK_DIR/"
+cp "$SCRIPT_DIR/EvalDiff.lean" "$WORK_DIR/"
+
+cat > "$WORK_DIR/lakefile.lean" <<EOF
+import Lake
+open Lake DSL
+
+package pion_proofs where
+  moreLeanArgs := #["-DwarningAsError=false"]
+
+require aeneas from ".deps/aeneas"
+
+lean_lib PionLean
+lean_lib $LEAN_MOD
+lean_lib $PROOF_MOD
+EOF
+
+echo "=== [4/7] Building $LEAN_MOD + $PROOF_MOD (0 errors, 0 warnings) ==="
+BUILD_LOG="$(mktemp /tmp/${PKG_NAME}_lean_build.XXXXXX)"
+AXIOM_LOG="$(mktemp /tmp/${PKG_NAME}_axioms.XXXXXX)"
+LEAN_OUT="$(mktemp /tmp/${PKG_NAME}_lean_eval.XXXXXX)"
+NATIVE_OUT="$(mktemp /tmp/${PKG_NAME}_native_eval.XXXXXX)"
+DIFF_DIR="$(mktemp -d /tmp/${PKG_NAME}_diff.XXXXXX)"
+trap 'rm -rf "$BUILD_LOG" "$AXIOM_LOG" "$LEAN_OUT" "$NATIVE_OUT" "$DIFF_DIR"; kill -- -$$ 2>/dev/null || true' EXIT INT TERM
+
+(cd "$WORK_DIR" && lake build "$LEAN_MOD.Types" "$LEAN_MOD.Funs" "$PROOF_MOD") 2>&1 | tee "$BUILD_LOG"
+if grep -E '^warning:|^error:' "$BUILD_LOG"; then
+  echo "FAIL: Lean build emitted warnings or errors" >&2
+  exit 1
+fi
+
+echo "=== [5/7] Auditing 1:1 theorem coverage & strict axiom whitelist (CheckAxioms.lean) ==="
+(cd "$WORK_DIR" && lake env lean CheckAxioms.lean) 2>&1 | tee "$AXIOM_LOG"
+python3 - "$SCRIPT_DIR" "$PROOF_MOD" "$AXIOM_LOG" <<'PYEOF'
+import os, re, sys
+
+script_dir, proof_mod, axiom_log = sys.argv[1], sys.argv[2], sys.argv[3]
+declared = set()
+for root, _, files in os.walk(os.path.join(script_dir, proof_mod)):
+    for fn in files:
+        if not fn.endswith(".lean"):
+            continue
+        with open(os.path.join(root, fn)) as f:
+            for line in f:
+                m = re.match(r"^\s*theorem\s+([A-Za-z0-9_']+)", line)
+                if m:
+                    declared.add(f"{proof_mod}.{m.group(1)}")
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+audited = set()
+with open(axiom_log) as f:
+    text = f.read()
+for m in re.finditer(r"'([^']+)' depends on axioms: \[([^\]]*)\]", text, re.S):
+    thm, ax_str = m.group(1), m.group(2)
+    audited.add(thm)
+    axs = {a.strip() for a in ax_str.split(",") if a.strip()}
+    bad = axs - allowed
+    if bad:
+        sys.exit(f"FAIL: {thm} uses non-standard axioms: {sorted(bad)}")
+for m in re.finditer(r"'([^']+)' does not depend on any axioms", text):
+    audited.add(m.group(1))
+
+if not declared:
+    sys.exit("FAIL: no non-private theorems declared")
+if declared != audited:
+    missing = sorted(declared - audited)
+    extra = sorted(audited - declared)
+    sys.exit(f"FAIL: CheckAxioms mismatch (missing={missing}, extra={extra})")
+print(f"Axiom whitelist OK: {len(audited)}/{len(declared)} theorems verified (standard axioms only)")
+PYEOF
+
+echo "=== [6/7] Running Lean differential evaluator (EvalDiff.lean) ==="
+(cd "$WORK_DIR" && lake env lean EvalDiff.lean) | tee "$LEAN_OUT"
+
+echo "=== [7/7] Native Pion vs Lean value differential cross-check (diff -u) ==="
 cat > "$DIFF_DIR/pion.toml" <<EOF
 [package]
-name = "http1_lean_diff"
+name = "${PKG_NAME}_diff"
 version = "0.1.0"
 
 [dependencies]
 http1 = { path = "$PKG_DIR" }
 EOF
+mkdir -p "$DIFF_DIR/src"
 cat > "$DIFF_DIR/src/main.pion" <<'EOF'
 import "http1"
 
-fn report(w : World, name : String, ok : Bool) -> Unit {
-  if ok {
-    io_println(w, name + ": PASS")
-  } else {
-    io_println(w, name + ": FAIL")
+fn fmt_framing(f : http1::Framing) -> String {
+  match f {
+    http1::Framing::None => "None"
+    http1::Framing::ContentLength(n) => "CL(" + n.to_string() + ")"
+    http1::Framing::Chunked => "Chunked"
   }
 }
 
-pub fn main(w : World) -> Int {
-  report(w, "tchar_A", http1::is_tchar_byte(65) == true)
-  report(w, "tchar_sp_false", http1::is_tchar_byte(32) == false)
-  report(w, "tchar_cr_false", http1::is_tchar_byte(13) == false)
-  report(w, "uri_slash", http1::is_uri_byte(47) == true)
-  report(w, "uri_sp_false", http1::is_uri_byte(32) == false)
-  report(w, "hdrval_htab", http1::is_header_val_byte(9) == true)
-  report(w, "hdrval_obstext", http1::is_header_val_byte(200) == true)
-  report(w, "hdrval_cr_false", http1::is_header_val_byte(13) == false)
-  report(w, "hdrval_nul_false", http1::is_header_val_byte(0) == false)
-  report(w, "hex_0", http1::hex_digit_value(48) == 0)
-  report(w, "hex_F", http1::hex_digit_value(70) == 15)
-  report(w, "hex_f", http1::hex_digit_value(102) == 15)
-  report(w, "hex_g_neg1", http1::hex_digit_value(103) == -1)
-  report(w, "lower_Z", http1::ascii_lower_byte(90) == 122)
-  report(w, "lower_a", http1::ascii_lower_byte(97) == 97)
-  report(w, "bodyless_101", http1::is_bodyless_status(101) == true)
-  report(w, "bodyless_204", http1::is_bodyless_status(204) == true)
-  report(w, "bodyless_304", http1::is_bodyless_status(304) == true)
-  report(w, "bodyless_200_false", http1::is_bodyless_status(200) == false)
-  report(
-    w,
-    "eff_framing_204",
-    match http1::effective_response_framing(204, http1::Framing::ContentLength(99L)) {
-      http1::Framing::None => true
-      _ => false
-    },
-  )
-  report(
-    w,
-    "eff_framing_200",
-    match http1::effective_response_framing(200, http1::Framing::ContentLength(99L)) {
-      http1::Framing::ContentLength(v) => v == 99L
-      _ => false
-    },
-  )
-  report(w, "te_after_chunked_neg1", http1::te_coding_step(1, true, false) == -1)
-  report(w, "te_gzip_then_chunked", http1::te_coding_step(0, true, false) == 1)
-  report(w, "minor_0", http1::parse_http_minor(48) == 0)
-  report(w, "minor_1", http1::parse_http_minor(49) == 1)
-  report(w, "minor_x", http1::parse_http_minor(120) == -1)
-  report(w, "status_200", http1::parse_status_digits(50, 48, 48) == 200)
-  report(w, "status_bad", http1::parse_status_digits(50, 65, 48) == -1)
-  report(w, "u63_step_ok", http1::u63_decimal_step(123L, 52) == 1234L)
-  report(w, "u63_step_max_ok", http1::u63_decimal_step(922337203685477580L, 55) == 9223372036854775807L)
-  report(w, "u63_step_max_ovf", http1::u63_decimal_step(922337203685477580L, 56) == -1L)
-  report(w, "chunk_hex_ok", http1::chunk_size_hex_step(16L, 2, 10) == 266L)
-  report(w, "chunk_hex_16dig_err", http1::chunk_size_hex_step(0L, 16, 1) == -1L)
-  report(w, "chunk_hex_ovf", http1::chunk_size_hex_step(576460752303423488L, 15, 0) == -2L)
-  report(w, "smuggle_cl_after_te", http1::check_framing_cl(true, false, 5L) == 1)
-  report(w, "smuggle_te_after_cl", http1::check_framing_te(true, http1::Version::Http11, 1) == 1)
-  report(w, "smuggle_http10_te", http1::check_framing_te(false, http1::Version::Http10, 1) == 2)
-  report(w, "smuggle_dup_host", http1::check_framing_host(1, true) == 1)
-  report(w, "finalize_missing_host", http1::check_framing_finalize(false, false, 0, 0, true, http1::Version::Http11) == -1)
-  report(w, "finalize_chunked_ok", http1::check_framing_finalize(false, true, 1, 1, true, http1::Version::Http11) == 2)
-  report(w, "finalize_cl_ok", http1::check_framing_finalize(true, false, 0, 1, true, http1::Version::Http11) == 1)
+pub fn main(world : World) -> Int {
+  let i64_min = -9223372036854775807L - 1L
+  io_println(world, "tchar_A=" + http1::is_tchar_byte(65).to_string())
+  io_println(world, "tchar_sp=" + http1::is_tchar_byte(32).to_string())
+  io_println(world, "tchar_cr=" + http1::is_tchar_byte(13).to_string())
+  io_println(world, "tchar_min=" + http1::is_tchar_byte(-2147483648).to_string())
+  io_println(world, "tchar_max=" + http1::is_tchar_byte(2147483647).to_string())
+  io_println(world, "hdrval_htab=" + http1::is_header_val_byte(9).to_string())
+  io_println(world, "hdrval_obstext=" + http1::is_header_val_byte(200).to_string())
+  io_println(world, "hdrval_cr=" + http1::is_header_val_byte(13).to_string())
+  io_println(world, "hdrval_nul=" + http1::is_header_val_byte(0).to_string())
+  io_println(world, "hdrval_neg1=" + http1::is_header_val_byte(-1).to_string())
+  io_println(world, "hex_0=" + http1::hex_digit_value(48).to_string())
+  io_println(world, "hex_F=" + http1::hex_digit_value(70).to_string())
+  io_println(world, "hex_f=" + http1::hex_digit_value(102).to_string())
+  io_println(world, "hex_min=" + http1::hex_digit_value(-2147483648).to_string())
+  io_println(world, "hex_max=" + http1::hex_digit_value(2147483647).to_string())
+  io_println(world, "lower_Z=" + http1::ascii_lower_byte(90).to_string())
+  io_println(world, "lower_min=" + http1::ascii_lower_byte(-2147483648).to_string())
+  io_println(world, "eff_204=" + fmt_framing(http1::effective_response_framing(204, http1::Framing::ContentLength(99L))))
+  io_println(world, "eff_200=" + fmt_framing(http1::effective_response_framing(200, http1::Framing::ContentLength(99L))))
+  io_println(world, "eff_min=" + fmt_framing(http1::effective_response_framing(-2147483648, http1::Framing::Chunked)))
+  io_println(world, "te_after_ch=" + http1::te_coding_step(1, true, false).to_string())
+  io_println(world, "te_gz_ch=" + http1::te_coding_step(0, true, false).to_string())
+  io_println(world, "status_200=" + http1::parse_status_digits(50, 48, 48).to_string())
+  io_println(world, "status_bad=" + http1::parse_status_digits(50, 65, 48).to_string())
+  io_println(world, "status_min=" + http1::parse_status_digits(-2147483648, 48, 48).to_string())
+  io_println(world, "u63_ok=" + http1::u63_decimal_step(123L, 52).to_string())
+  io_println(world, "u63_max_ok=" + http1::u63_decimal_step(922337203685477580L, 55).to_string())
+  io_println(world, "u63_max_ovf=" + http1::u63_decimal_step(922337203685477580L, 56).to_string())
+  io_println(world, "u63_min_acc=" + http1::u63_decimal_step(i64_min, 48).to_string())
+  io_println(world, "chunk_ok=" + http1::chunk_size_hex_step(16L, 2, 10).to_string())
+  io_println(world, "chunk_16dig=" + http1::chunk_size_hex_step(0L, 16, 1).to_string())
+  io_println(world, "chunk_ovf=" + http1::chunk_size_hex_step(576460752303423488L, 15, 0).to_string())
+  io_println(world, "chunk_max=" + http1::chunk_size_hex_step(9223372036854775807L, 1, 1).to_string())
+  io_println(world, "cl_after_te=" + http1::check_framing_cl(true, false, 5L).to_string())
+  io_println(world, "cl_neg_min=" + http1::check_framing_cl(false, false, i64_min).to_string())
+  io_println(world, "te_after_cl=" + http1::check_framing_te(true, http1::Version::Http11, 1).to_string())
+  io_println(world, "te_http10=" + http1::check_framing_te(false, http1::Version::Http10, 1).to_string())
+  io_println(world, "host_dup=" + http1::check_framing_host(1, true).to_string())
+  io_println(world, "fin_no_host=" + http1::check_framing_finalize(false, false, 0, 0, true, http1::Version::Http11).to_string())
+  io_println(world, "fin_chunked=" + http1::check_framing_finalize(false, true, 1, 1, true, http1::Version::Http11).to_string())
+  io_println(world, "fin_cl=" + http1::check_framing_finalize(true, false, 0, 1, true, http1::Version::Http11).to_string())
   0
 }
 EOF
-"$PIONC" build --release -o "$DIFF_DIR/runner" "$DIFF_DIR"
-"$DIFF_DIR/runner" > "$DIFF_DIR/native.out"
-printf '%s\n' "$EVAL_OUT" | grep -E ': (PASS|FAIL)$' > "$DIFF_DIR/lean.out"
-diff -u "$DIFF_DIR/native.out" "$DIFF_DIR/lean.out"
-echo "Native vs Lean differential: $(wc -l < "$DIFF_DIR/native.out" | tr -d ' ') cases identical (diff -u exit 0)"
+"$PIONC_BIN" build "$DIFF_DIR" -o "$DIFF_DIR/diff_bin" >/dev/null
+"$DIFF_DIR/diff_bin" > "$NATIVE_OUT"
+diff -u "$NATIVE_OUT" "$LEAN_OUT"
+CASES="$(wc -l < "$LEAN_OUT" | tr -d ' ')"
+echo "Native vs Lean value differential: $CASES cases identical (diff -u exit 0)"
 echo "PASS: packages/http1 Lean 4 proofs"

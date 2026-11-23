@@ -89,10 +89,10 @@ shasum -a 256 "$W"/*.out
 
 ## Formal Verification (Lean 4)
 
-24 machine-checked, 0-`sorry` Lean 4 theorems (standard axioms only: `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 15 production `#verify` kernels in `packages/fts/src/`:
-- **UTF-8 & Tokenizer (`proofs/FtsProofs/Utf8AndTokenizer.lean`, 12 theorems)**: Unicode scalar sanitization validity & idempotence, `cp_utf8_len ∈ [1, 4]` & surrogate replacement to 3 bytes, ASCII/Greek/Cyrillic SQLite `unicode61` case-folding (final sigma `ς → σ`, unassigned `U+03A2`, Cyrillic idempotence), RT-2 Kana voicing/punctuation exclusion, ASCII-word vs CJK disjointness, and CamelCase split invariants.
-- **Snippet & Ranking (`proofs/FtsProofs/SnippetAndRanking.lean`, 12 theorems)**: whitespace normalization idempotence, leading context bounds, RT-3 overflow-proof window end (`snippet_win_end` safe even for `max_chars = Int::MAX`), highlight range strict partial order, and deterministic `hit_tiebreak_cmp` reflexivity, antisymmetry, zero-iff, `order_key` desc, and `doc_id` asc invariants.
-- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion harness (`diff -u` 44/44 cases identical).
+**12** machine-checked, `0-sorry` Lean 4 theorems (strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 11 production `#verify` kernels in `packages/fts/src/`:
+- **UTF-8 & Tokenizer (`proofs/FtsProofs/Utf8AndTokenizer.lean`, 5 theorems)**: Unicode scalar sanitization validity, surrogate replacement to 3 UTF-8 bytes, ASCII & Cyrillic case-folding idempotence, and ASCII-word vs CJK disjointness.
+- **Snippet & Ranking (`proofs/FtsProofs/SnippetAndRanking.lean`, 7 theorems)**: whitespace normalization idempotence, leading context bounds, RT-3 overflow-proof window end (`snippet_win_end` safe even for `max_chars = Int::MAX`), highlight range strict partial order (irreflexive, transitive), and deterministic `hit_tiebreak_cmp` antisymmetry & zero-iff invariants.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (`diff -u`, including `INT32_MIN`/`INT32_MAX`/`INT64_MIN`/`INT64_MAX` extremes and out-of-precondition cases).
 
 ```sh
 LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/fts/proofs/run_proofs.sh

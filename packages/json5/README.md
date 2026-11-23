@@ -212,10 +212,10 @@ sh packages/json5/bench/run_bench.sh
 
 ## Formal Verification (Lean 4)
 
-24 machine-checked, 0-`sorry` Lean 4 theorems (standard axioms only: `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 17 production `#verify` kernels in `packages/json5/src/`:
-- **Unicode & RFC 3629 UTF-8 (`proofs/Json5Proofs/UnicodeAndUtf8.lean`, 12 theorems)**: UTF-16 high/low surrogate disjointness, `decode_surrogate_pair` bounds (`[0x10000, 0x10FFFF]`) & injectivity, `pack_hex2`/`pack_hex4` bit-width bounds, JSON5 Unicode whitespace (`U+2028`/`U+2029`/`U+FEFF` & ASCII disjointness), and RFC 3629 3-/4-byte overlong, surrogate, `> U+10FFFF`, and continuation-byte rejection.
-- **HashIndex, RFC 6901 Pointer & Syntax (`proofs/Json5Proofs/HashPointerAndSyntax.lean`, 12 theorems)**: SplitMix64 & `hash_ensure_nonzero` non-zero/idempotence, open-addressing 62.5% load-factor empty-slot termination guarantee, `hash_next_slot` memory-safe bounds `[0, mask]`, RFC 6901 `~0 ↔ ~` / `~1 ↔ /` escape-unescape bijection, RFC 8259 control-char escaping, and 7-bit `ascii_lut_flags` bounds.
-- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion harness (`diff -u` 44/44 cases identical).
+**8** machine-checked, `0-sorry` Lean 4 theorems (strict standard-axiom whitelist `[propext, Classical.choice, Quot.sound]`, verified via `pionc extract-lean` + Aeneas) cover 10 production `#verify` kernels in `packages/json5/src/`:
+- **Unicode (`proofs/Json5Proofs/UnicodeAndUtf8.lean`, 4 theorems)**: `decode_surrogate_pair` exact formula, supplementary-plane bounds (`[0x10000, 0x10FFFF]`) & injectivity, `pack_hex2` byte-range bounds, and JSON5 Unicode whitespace ASCII disjointness.
+- **HashIndex, RFC 6901 Pointer & LUT (`proofs/Json5Proofs/HashPointerAndSyntax.lean`, 4 theorems)**: open-addressing 62.5% load-factor empty-slot termination guarantee, `hash_next_slot` memory-safe bounds `[0, mask]`, RFC 6901 `pointer_unescape_byte`/`pointer_escape_suffix` round-trip, and 7-bit `ascii_lut_flags` bounds.
+- **Differential Cross-Check**: `proofs/EvalDiff.lean` + native Pion value-comparing harness (`diff -u`, including `INT32_MIN`/`INT32_MAX` and out-of-precondition cases).
 
 ```sh
 LEAN_NUM_THREADS=2 LEAN_MEM_LIMIT=8192 bash packages/json5/proofs/run_proofs.sh

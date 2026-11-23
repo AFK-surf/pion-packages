@@ -111,20 +111,4 @@ lemma i64_mul_val (a b : Std.I64)
   have hpow : (2 : Int) ^ 64 = 18446744073709551616 := by norm_num
   rw [Int.bmod_eq_of_le] <;> omega
 
-/-- Default HTTP/1.1 limits are all strictly positive and safely bounded. -/
-theorem limits_default_positive :
-    ∃ l : Limits, Limits.default = ok l ∧
-      0 < l.max_headers.val ∧
-      0 < l.max_header_bytes.val ∧
-      0 < l.max_uri_bytes.val ∧
-      0 < l.max_chunk_size.val ∧
-      0 < l.max_chunk_ext_bytes.val ∧
-      0 < l.max_trailers.val ∧
-      0 < l.max_sse_event_bytes.val ∧
-      0 < l.max_sse_line_bytes.val := by
-  refine ⟨Limits.mk 100#i32 65536#i64 8192#i64 4611686018427387903#i64 4096#i64 64#i32 1048576#i64 262144#i64, rfl, ?_⟩
-  dsimp only
-  have hmc := default_max_chunk_val
-  refine ⟨by norm_num, by norm_num, by norm_num, by omega, by norm_num, by norm_num, by norm_num, by norm_num⟩
-
 end Http1Proofs

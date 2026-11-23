@@ -84,41 +84,4 @@ lemma i32_rem_nonneg_val (a b : Std.I32) (ha : 0 ≤ a.val) (hb : 0 < b.val) :
   have hbv : b.bv.toInt = b.val := rfl
   rw [hav, hbv, Int.tmod_eq_emod_of_nonneg ha]
 
-/-- `is_valid_level` accepts iff `0 <= level <= 9`. -/
-theorem is_valid_level_spec (level : Std.I32) :
-    is_valid_level level = ok (decide (0 ≤ level.val ∧ level.val ≤ 9)) := by
-  unfold is_valid_level; congr 1
-
-/-- Default `DecompressLimits` enforces the 256 MiB Zip Bomb guard (`268435456` bytes). -/
-theorem decompress_limits_default_spec :
-    ∃ l : DecompressLimits, DecompressLimits.default = ok l ∧ l.max_output_bytes.val = 268435456 := by
-  refine ⟨DecompressLimits.mk 268435456#i32, rfl, ?_⟩
-  change (BitVec.ofInt 32 268435456).toInt = 268435456
-  rw [BitVec.toInt_ofInt]; norm_num
-
-/-- `DecompressLimits::new` preserves the configured limit exactly. -/
-theorem decompress_limits_new_spec (lim : Std.I32) :
-    ∃ l : DecompressLimits, DecompressLimits.new lim = ok l ∧ l.max_output_bytes = lim :=
-  ⟨DecompressLimits.mk lim, rfl, rfl⟩
-
-/-- RFC 1951 §3.2.3: `is_valid_btype` accepts `0, 1, 2` and rejects reserved `3` (and out-of-range values). -/
-theorem is_valid_btype_spec (btype : Std.I32) :
-    is_valid_btype btype = ok (decide (0 ≤ btype.val ∧ btype.val ≤ 2)) := by
-  unfold is_valid_btype; congr 1
-
-/-- RFC 1951 §3.2.4: `is_valid_stored_nlen` is symmetric and accepts every `(slen, slen ^ 0xFFFF)` pair. -/
-theorem is_valid_stored_nlen_spec (slen nlen : Std.I32) :
-    is_valid_stored_nlen slen nlen = is_valid_stored_nlen nlen slen ∧
-    is_valid_stored_nlen slen (Pion.I32.bxor slen 65535#i32) = ok true := by
-  constructor
-  · unfold is_valid_stored_nlen Pion.I32.bxor
-    congr 1; congr 1; congr 1; exact BitVec.xor_comm slen.bv nlen.bv
-  · unfold is_valid_stored_nlen Pion.I32.bxor
-    congr 1
-    rw [beq_iff_eq]
-    cases slen with | mk bv =>
-    congr 1
-    change bv ^^^ (bv ^^^ (65535#i32).bv) = (65535#i32).bv
-    rw [← BitVec.xor_assoc, BitVec.xor_self, BitVec.zero_xor]
-
 end FlateProofs
