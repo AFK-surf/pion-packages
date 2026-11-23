@@ -4,10 +4,16 @@
 ///|
 struct StreamEntry {
   stream_id : Int
+  is_remote : Bool
   mut state : StreamState
   mut send_window : Int64
   mut recv_window : Int64
   mut headers_received : Bool
+  mut final_headers_received : Bool
+  mut expected_content_length : Int64
+  mut received_data_bytes : Int64
+  mut delivered_data_bytes : Int64
+  mut pending_feed_data : Int64
 }
 
 ///|
@@ -20,9 +26,21 @@ pub struct Connection {
   mut local_initial_window_size : Int64
   mut conn_send_win : Int64
   mut conn_recv_win : Int64
+  mut delivered_conn_data : Int64
+  mut pending_feed_conn_data : Int64
   mut last_remote_stream_id : Int
+  mut last_local_stream_id : Int
+  mut active_remote_streams : Int
+  mut goaway_received : Bool
+  mut goaway_last_stream_id : Int
   mut rapid_reset_count : Int
+  // Compact dense list of active (non-Closed) streams + O(1) open-addressing hash map
   mut streams : Array[StreamEntry]
+  mut slot_cap : Int
+  mut slot_mask : Int
+  mut slot_used : Int
+  mut slot_keys : Array[Int]
+  mut slot_vals : Array[Int]
   // Pending HEADERS / PUSH_PROMISE reassembly across CONTINUATION frames
   mut pending_stream_id : Int
   mut pending_end_stream : Bool
@@ -35,6 +53,7 @@ pub struct Connection {
 ///|
 pub fn Connection::new(config : ConnectionConfig) -> Connection {
   let init_win = config.initial_window_size.to_int64()
+  let cap = 16
   Connection::{
     config: config,
     hpack_decoder: HpackDecoder::with_limits(
@@ -46,10 +65,22 @@ pub fn Connection::new(config : ConnectionConfig) -> Connection {
     remote_initial_window_size: default_initial_window_size.to_int64(),
     local_initial_window_size: init_win,
     conn_send_win: default_initial_window_size.to_int64(),
-    conn_recv_win: init_win,
+    // RFC 9113 §6.9.2: connection-level initial flow-control window is always 65,535
+    conn_recv_win: default_initial_window_size.to_int64(),
+    delivered_conn_data: 0L,
+    pending_feed_conn_data: 0L,
     last_remote_stream_id: 0,
+    last_local_stream_id: 0,
+    active_remote_streams: 0,
+    goaway_received: false,
+    goaway_last_stream_id: max_stream_id,
     rapid_reset_count: 0,
     streams: [],
+    slot_cap: cap,
+    slot_mask: cap - 1,
+    slot_used: 0,
+    slot_keys: Array::make(cap, 0),
+    slot_vals: Array::make(cap, -1),
     pending_stream_id: 0,
     pending_end_stream: false,
     pending_is_push: false,
@@ -69,71 +100,201 @@ pub fn Connection::client() -> Connection {
   Connection::new(ConnectionConfig::client())
 }
 
+///| Mix stream_id for open-addressing hash slot.
+fn stream_slot_hash(sid : Int) -> Int {
+  ((sid * 2654435761) >> 1) & 0x7FFFFFFF
+}
+
 ///|
-fn Connection::find_stream_idx(self : Connection, stream_id : Int) -> Int {
+fn Connection::rehash_streams(self : Connection, new_cap : Int) -> Unit {
+  let keys = Array::make(new_cap, 0)
+  let vals = Array::make(new_cap, -1)
+  let mask = new_cap - 1
   let n = self.streams.length()
-  if n == 0 {
+  let mut i = 0
+  while i < n {
+    let sid = self.streams[i].stream_id
+    let mut slot = stream_slot_hash(sid) & mask
+    while keys[slot] != 0 {
+      slot = (slot + 1) & mask
+    }
+    keys[slot] = sid
+    vals[slot] = i
+    i = i + 1
+  }
+  self.slot_cap = new_cap
+  self.slot_mask = mask
+  self.slot_used = n
+  self.slot_keys = keys
+  self.slot_vals = vals
+}
+
+///| O(1) lookup of active stream index in `self.streams`, or -1 if not active.
+fn Connection::find_stream_idx(self : Connection, stream_id : Int) -> Int {
+  if self.streams.length() == 0 || stream_id <= 0 {
     return -1
   }
-  // Fast path: check most recently created stream first (common sequential stream pattern)
-  if self.streams[n - 1].stream_id == stream_id {
-    return n - 1
-  }
-  // If stream_id > max existing stream_id, it cannot exist yet (O(1) miss for new streams!)
-  if stream_id > self.streams[n - 1].stream_id && self.streams[n - 1].stream_id > 0 {
-    // Only safe if streams are appended in increasing order; fall back if not
-    // Actually scan last 8, or binary search if monotonic!
-    let mut i = n - 2
-    let mut monotonic = true
-    if i >= 0 && self.streams[i].stream_id > self.streams[n - 1].stream_id {
-      monotonic = false
+  let keys = self.slot_keys
+  let mask = self.slot_mask
+  let mut slot = stream_slot_hash(stream_id) & mask
+  while true {
+    let k = keys[slot]
+    if k == stream_id {
+      return self.slot_vals[slot]
     }
-    if monotonic && stream_id > self.last_remote_stream_id {
-      // Check if any stream has stream_id >= this? Still check quick tail
-      let lo_check = if n > 4 { n - 4 } else { 0 }
-      while i >= lo_check {
-        if self.streams[i].stream_id == stream_id {
-          return i
-        }
-        i = i - 1
-      }
+    if k == 0 {
       return -1
     }
-  }
-  let mut i = n - 2
-  while i >= 0 {
-    if self.streams[i].stream_id == stream_id {
-      return i
-    }
-    i = i - 1
+    slot = (slot + 1) & mask
   }
   -1
 }
 
-///|
-fn Connection::get_or_create_stream(self : Connection, stream_id : Int) -> Int {
-  let idx = self.find_stream_idx(stream_id)
-  if idx >= 0 {
-    return idx
+///| Insert a new active StreamEntry into the dense array and hash table.
+fn Connection::insert_stream(self : Connection, entry : StreamEntry) -> Int {
+  if (self.slot_used + 1) * 4 >= self.slot_cap * 3 {
+    let target_cap = if self.streams.length() * 2 >= self.slot_cap {
+      self.slot_cap * 2
+    } else {
+      self.slot_cap
+    }
+    self.rehash_streams(target_cap)
   }
+  let idx = self.streams.length()
+  self.streams.push(entry)
+  if entry.is_remote {
+    self.active_remote_streams = self.active_remote_streams + 1
+  }
+  let sid = entry.stream_id
+  let keys = self.slot_keys
+  let vals = self.slot_vals
+  let mask = self.slot_mask
+  let mut slot = stream_slot_hash(sid) & mask
+  while keys[slot] > 0 {
+    slot = (slot + 1) & mask
+  }
+  if keys[slot] == 0 {
+    self.slot_used = self.slot_used + 1
+  }
+  keys[slot] = sid
+  vals[slot] = idx
+  idx
+}
+
+///| O(1) swap-remove a closed stream from the active stream table.
+fn Connection::remove_stream_at(self : Connection, idx : Int) -> Unit {
+  let n = self.streams.length()
+  if idx < 0 || idx >= n {
+    return
+  }
+  let removed = self.streams[idx]
+  if removed.is_remote && self.active_remote_streams > 0 {
+    self.active_remote_streams = self.active_remote_streams - 1
+  }
+  let removed_sid = removed.stream_id
+  let keys = self.slot_keys
+  let vals = self.slot_vals
+  let mask = self.slot_mask
+  // Mark removed_sid slot as tombstone (-1)
+  let mut rslot = stream_slot_hash(removed_sid) & mask
+  while true {
+    let k = keys[rslot]
+    if k == removed_sid {
+      keys[rslot] = -1
+      vals[rslot] = -1
+      break
+    }
+    if k == 0 {
+      break
+    }
+    rslot = (rslot + 1) & mask
+  }
+  let last_idx = n - 1
+  if idx != last_idx {
+    let moved = self.streams[last_idx]
+    self.streams[idx] = moved
+    let moved_sid = moved.stream_id
+    let mut mslot = stream_slot_hash(moved_sid) & mask
+    while true {
+      let k = keys[mslot]
+      if k == moved_sid {
+        vals[mslot] = idx
+        break
+      }
+      if k == 0 {
+        break
+      }
+      mslot = (mslot + 1) & mask
+    }
+  }
+  let _ = self.streams.pop()
+  // Reset hash table cleanly when empty so tombstones never accumulate
+  if self.streams.length() == 0 && self.slot_used > 0 {
+    if self.slot_cap > 64 {
+      self.rehash_streams(16)
+    } else {
+      let mut i = 0
+      while i < self.slot_cap {
+        self.slot_keys[i] = 0
+        self.slot_vals[i] = -1
+        i = i + 1
+      }
+      self.slot_used = 0
+    }
+  }
+}
+
+///|
+fn Connection::create_stream(
+  self : Connection,
+  stream_id : Int,
+  is_remote : Bool,
+) -> Int {
   let entry = StreamEntry::{
     stream_id: stream_id,
+    is_remote: is_remote,
     state: StreamState::Idle,
     send_window: self.remote_initial_window_size,
     recv_window: self.local_initial_window_size,
     headers_received: false,
+    final_headers_received: false,
+    expected_content_length: -1L,
+    received_data_bytes: 0L,
+    delivered_data_bytes: 0L,
+    pending_feed_data: 0L,
   }
-  self.streams.push(entry)
-  self.streams.length() - 1
+  self.insert_stream(entry)
+}
+
+///|
+fn Connection::is_remote_parity(self : Connection, stream_id : Int) -> Bool {
+  if self.config.is_server {
+    (stream_id & 1) == 1
+  } else {
+    (stream_id & 1) == 0
+  }
 }
 
 ///|
 pub fn Connection::stream_state(self : Connection, stream_id : Int) -> StreamState {
-  let idx = self.find_stream_idx(stream_id)
-  if idx < 0 {
+  if stream_id <= 0 {
     return StreamState::Idle
   }
-  self.streams[idx].state
+  let idx = self.find_stream_idx(stream_id)
+  if idx >= 0 {
+    return self.streams[idx].state
+  }
+  // Not in active table: check if implicitly or explicitly closed per RFC 9113 §5.1.1
+  if self.is_remote_parity(stream_id) {
+    if stream_id <= self.last_remote_stream_id {
+      return StreamState::Closed
+    }
+  } else {
+    if stream_id <= self.last_local_stream_id {
+      return StreamState::Closed
+    }
+  }
+  StreamState::Idle
 }
 
 ///|
@@ -164,6 +325,72 @@ pub fn Connection::stream_recv_window(self : Connection, stream_id : Int) -> Int
   self.streams[idx].recv_window
 }
 
+///| Credit the local receive flow-control window (stream_id == 0 for connection window).
+pub fn Connection::consume_recv_window(
+  self : Connection,
+  stream_id : Int,
+  increment : Int,
+) -> Result[Unit, H2Error] {
+  if increment <= 0 || increment > max_window_size {
+    return Err(H2Error::ProtocolError("WINDOW_UPDATE increment must be 1..2^31-1"))
+  }
+  let inc64 = increment.to_int64()
+  if stream_id == 0 {
+    let nw = self.conn_recv_win + inc64
+    if nw > max_window_size.to_int64() {
+      return Err(H2Error::FlowControlError("connection recv window overflow > 2^31-1"))
+    }
+    self.conn_recv_win = nw
+    if inc64 >= self.delivered_conn_data {
+      self.delivered_conn_data = 0L
+    } else {
+      self.delivered_conn_data = self.delivered_conn_data - inc64
+    }
+    return Ok(())
+  }
+  let idx = self.find_stream_idx(stream_id)
+  if idx < 0 {
+    return Err(H2Error::ProtocolError("consume_recv_window on inactive stream"))
+  }
+  let nw = self.streams[idx].recv_window + inc64
+  if nw > max_window_size.to_int64() {
+    return Err(H2Error::FlowControlError("stream recv window overflow > 2^31-1"))
+  }
+  self.streams[idx].recv_window = nw
+  if inc64 >= self.streams[idx].delivered_data_bytes {
+    self.streams[idx].delivered_data_bytes = 0L
+  } else {
+    self.streams[idx].delivered_data_bytes = self.streams[idx].delivered_data_bytes - inc64
+  }
+  Ok(())
+}
+
+///| Credit the local receive flow-control window and encode the wire WINDOW_UPDATE frame.
+pub fn Connection::send_window_update(
+  self : Connection,
+  stream_id : Int,
+  increment : Int,
+) -> Result[Bytes, H2Error] {
+  match self.consume_recv_window(stream_id, increment) {
+    Ok(_) => encode_frame(Frame::WindowUpdate(stream_id, increment))
+    Err(e) => Err(e)
+  }
+}
+
+///| Check if a response header list is a 1xx informational response.
+fn is_informational_response(headers : Array[HeaderField]) -> Bool {
+  let n = headers.length()
+  let mut i = 0
+  while i < n {
+    if headers[i].name == ":status" {
+      let v = headers[i].value
+      return v.length() == 3 && v.code_unit_at(0) == 49
+    }
+    i = i + 1
+  }
+  false
+}
+
 ///|
 fn Connection::finish_header_block(
   self : Connection,
@@ -178,86 +405,187 @@ fn Connection::finish_header_block(
     Err(e) => return Err(e)
   }
   if is_push {
+    // Role & promised_id already checked on PUSH_PROMISE receipt; re-verify invariants
+    if self.config.is_server {
+      return Err(H2Error::ProtocolError("server received PUSH_PROMISE"))
+    }
+    if (promised_id & 1) != 0 || promised_id <= self.last_remote_stream_id || self.find_stream_idx(promised_id) >= 0 {
+      return Err(H2Error::ProtocolError("invalid PUSH_PROMISE promised_stream_id"))
+    }
     if self.config.validate_headers {
       match validate_request_headers(headers) {
         Ok(_) => ()
-        Err(e) => return Err(e)
+        Err(_) => {
+          self.last_remote_stream_id = promised_id
+          return Ok(Some(ConnectionEvent::RstStream(promised_id, err_protocol_error)))
+        }
       }
     }
-    let pidx = self.get_or_create_stream(promised_id)
+    self.last_remote_stream_id = promised_id
+    let pidx = self.create_stream(promised_id, true)
     self.streams[pidx].state = StreamState::ReservedRemote
     return Ok(Some(ConnectionEvent::PushPromise(sid, promised_id, headers)))
   }
 
-  let idx = self.get_or_create_stream(sid)
-  let st = self.streams[idx].state
-  let is_trailer = self.streams[idx].headers_received && end_stream
-
-  if self.config.validate_headers {
-    if is_trailer {
-      match validate_trailers(headers) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
+  let existing_idx = self.find_stream_idx(sid)
+  if existing_idx < 0 {
+    // New stream (not currently active)
+    if self.config.is_server {
+      // RFC 9113 §5.1.1: client-initiated streams MUST be odd and strictly increasing
+      if (sid & 1) == 0 {
+        return Err(H2Error::ProtocolError("client-initiated stream_id must be odd"))
       }
-    } else if self.config.is_server {
-      match validate_request_headers(headers) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
+      if sid <= self.last_remote_stream_id {
+        return Err(H2Error::ProtocolError("stream_id must be strictly greater than previous remote streams"))
+      }
+      if self.active_remote_streams >= self.config.max_concurrent_streams {
+        return Err(H2Error::ProtocolError("max_concurrent_streams exceeded"))
       }
     } else {
-      match validate_response_headers(headers) {
+      // Client cannot receive HEADERS opening an idle stream without PUSH_PROMISE
+      if sid <= self.last_local_stream_id || sid <= self.last_remote_stream_id {
+        return Err(H2Error::StreamClosed(sid))
+      }
+      return Err(H2Error::ProtocolError("server cannot initiate stream with HEADERS"))
+    }
+
+    // Validate request headers (RFC 9113 §8.1.1: malformed request is a stream error, not connection-fatal)
+    if self.config.validate_headers {
+      match validate_request_headers(headers) {
         Ok(_) => ()
-        Err(e) => return Err(e)
+        Err(_) => {
+          self.last_remote_stream_id = sid
+          return Ok(Some(ConnectionEvent::RstStream(sid, err_protocol_error)))
+        }
       }
     }
+    let cl = extract_content_length(headers)
+    if end_stream && cl > 0L {
+      self.last_remote_stream_id = sid
+      return Ok(Some(ConnectionEvent::RstStream(sid, err_protocol_error)))
+    }
+    self.last_remote_stream_id = sid
+    let idx = self.create_stream(sid, true)
+    self.streams[idx].headers_received = true
+    self.streams[idx].final_headers_received = true
+    self.streams[idx].expected_content_length = cl
+    self.streams[idx].state = if end_stream {
+      StreamState::HalfClosedRemote
+    } else {
+      StreamState::Open
+    }
+    return Ok(Some(ConnectionEvent::Headers(sid, headers, end_stream)))
   }
 
+  // Existing active stream
+  let st = self.streams[existing_idx].state
   match st {
-    StreamState::Idle => {
-      if sid > self.last_remote_stream_id {
-        self.last_remote_stream_id = sid
-      }
-      self.streams[idx].headers_received = true
-      self.streams[idx].state = if end_stream {
-        StreamState::HalfClosedRemote
-      } else {
-        StreamState::Open
-      }
-    }
-    StreamState::ReservedRemote => {
-      self.streams[idx].headers_received = true
-      self.streams[idx].state = if end_stream {
-        StreamState::Closed
-      } else {
-        StreamState::HalfClosedLocal
-      }
-    }
-    StreamState::Open => {
-      self.streams[idx].headers_received = true
-      if end_stream {
-        self.streams[idx].state = StreamState::HalfClosedRemote
-      }
-    }
-    StreamState::HalfClosedLocal => {
-      self.streams[idx].headers_received = true
-      if end_stream {
-        self.streams[idx].state = StreamState::Closed
-      }
-    }
     StreamState::HalfClosedRemote | StreamState::Closed => {
       return Err(H2Error::StreamClosed(sid))
     }
     StreamState::ReservedLocal => {
       return Err(H2Error::ProtocolError("received HEADERS on ReservedLocal stream"))
     }
+    _ => ()
+  }
+
+  let already_final = self.streams[existing_idx].final_headers_received
+  if already_final {
+    // Only trailers are allowed after initial request / final response headers, and trailers MUST carry END_STREAM
+    if !end_stream {
+      return Err(H2Error::ProtocolError("second HEADERS without END_STREAM on open stream"))
+    }
+    if self.config.validate_headers {
+      match validate_trailers(headers) {
+        Ok(_) => ()
+        Err(_) => {
+          self.remove_stream_at(existing_idx)
+          return Ok(Some(ConnectionEvent::RstStream(sid, err_protocol_error)))
+        }
+      }
+    }
+    // RFC 9113 §8.1.1: check content-length at END_STREAM
+    let expected_cl = self.streams[existing_idx].expected_content_length
+    if expected_cl >= 0L && self.streams[existing_idx].received_data_bytes != expected_cl {
+      return Err(H2Error::ProtocolError("DATA length does not match declared content-length"))
+    }
+    if stream_state_eq(st, StreamState::HalfClosedLocal) {
+      if self.rapid_reset_count > 0 {
+        self.rapid_reset_count = self.rapid_reset_count - 1
+      }
+      self.remove_stream_at(existing_idx)
+    } else {
+      self.streams[existing_idx].state = StreamState::HalfClosedRemote
+    }
+    return Ok(Some(ConnectionEvent::Headers(sid, headers, end_stream)))
+  }
+
+  // First final headers on an already-created stream (e.g., client receiving response on Open/HalfClosedLocal/ReservedRemote)
+  if self.config.validate_headers {
+    if self.config.is_server {
+      match validate_request_headers(headers) {
+        Ok(_) => ()
+        Err(_) => {
+          self.remove_stream_at(existing_idx)
+          return Ok(Some(ConnectionEvent::RstStream(sid, err_protocol_error)))
+        }
+      }
+    } else {
+      match validate_response_headers(headers) {
+        Ok(_) => ()
+        Err(_) => {
+          self.remove_stream_at(existing_idx)
+          return Ok(Some(ConnectionEvent::RstStream(sid, err_protocol_error)))
+        }
+      }
+    }
+  }
+
+  let is_1xx = !self.config.is_server && is_informational_response(headers)
+  if is_1xx && end_stream {
+    return Err(H2Error::ProtocolError("1xx informational response cannot set END_STREAM"))
+  }
+
+  self.streams[existing_idx].headers_received = true
+  if !is_1xx {
+    self.streams[existing_idx].final_headers_received = true
+    self.streams[existing_idx].expected_content_length = extract_content_length(headers)
+  }
+
+  match st {
+    StreamState::ReservedRemote => {
+      if end_stream {
+        if self.rapid_reset_count > 0 {
+          self.rapid_reset_count = self.rapid_reset_count - 1
+        }
+        self.remove_stream_at(existing_idx)
+      } else {
+        self.streams[existing_idx].state = StreamState::HalfClosedLocal
+      }
+    }
+    StreamState::Open => {
+      if end_stream {
+        self.streams[existing_idx].state = StreamState::HalfClosedRemote
+      }
+    }
+    StreamState::HalfClosedLocal => {
+      if end_stream {
+        if self.rapid_reset_count > 0 {
+          self.rapid_reset_count = self.rapid_reset_count - 1
+        }
+        self.remove_stream_at(existing_idx)
+      }
+    }
+    _ => ()
   }
   Ok(Some(ConnectionEvent::Headers(sid, headers, end_stream)))
 }
 
-///| Process one decoded RFC 9113 frame through the connection state machine.
-pub fn Connection::receive_frame(
+///| Internal frame processor with exact wire payload length for DATA flow-control accounting.
+fn Connection::receive_frame_with_wire_len(
   self : Connection,
   frame : Frame,
+  wire_payload_len : Int,
 ) -> Result[Option[ConnectionEvent], H2Error] {
   // If we are in the middle of a HEADERS/PUSH_PROMISE block awaiting END_HEADERS,
   // ONLY a CONTINUATION frame for the exact same stream_id is permitted!
@@ -316,6 +644,25 @@ pub fn Connection::receive_frame(
       self.finish_header_block(sid, frag, end_stream, false, 0)
     }
     Frame::PushPromise(sid, promised_id, frag, end_headers) => {
+      // RFC 9113 §8.4: servers MUST treat receipt of PUSH_PROMISE as PROTOCOL_ERROR
+      if self.config.is_server {
+        return Err(H2Error::ProtocolError("server received PUSH_PROMISE"))
+      }
+      // RFC 9113 §6.6: associated stream must be Open or HalfClosedLocal,
+      // and promised_id must be a new, even, idle stream > last_remote_stream_id
+      let aidx = self.find_stream_idx(sid)
+      if aidx < 0 {
+        return Err(H2Error::ProtocolError("PUSH_PROMISE on idle or closed stream"))
+      }
+      match self.streams[aidx].state {
+        StreamState::Open | StreamState::HalfClosedLocal => ()
+        _ => return Err(H2Error::ProtocolError("PUSH_PROMISE on invalid associated stream state"))
+      }
+      if (promised_id & 1) != 0 ||
+      promised_id <= self.last_remote_stream_id ||
+      self.find_stream_idx(promised_id) >= 0 {
+        return Err(H2Error::ProtocolError("PUSH_PROMISE promised_stream_id must be new, even, and idle"))
+      }
       if !end_headers {
         if frag.length() > self.config.max_header_list_size {
           return Err(H2Error::EnhanceYourCalm("push promise header block too large"))
@@ -337,6 +684,9 @@ pub fn Connection::receive_frame(
     Frame::Data(sid, data, end_stream) => {
       let idx = self.find_stream_idx(sid)
       if idx < 0 {
+        if stream_state_eq(self.stream_state(sid), StreamState::Closed) {
+          return Err(H2Error::StreamClosed(sid))
+        }
         return Err(H2Error::ProtocolError("DATA received on idle stream"))
       }
       let st = self.streams[idx].state
@@ -347,16 +697,54 @@ pub fn Connection::receive_frame(
         }
         _ => return Err(H2Error::ProtocolError("DATA received in invalid stream state"))
       }
-      let dlen = data.length().to_int64()
-      if dlen > self.conn_recv_win || dlen > self.streams[idx].recv_window {
+      // RFC 9113 §6.9.1: entire DATA frame payload (including pad_length and padding) counts toward flow control
+      let fc_len = wire_payload_len.to_int64()
+      let body_len = data.length().to_int64()
+      // Replenish from previously delivered real application DATA (never padding) if caller sent WINDOW_UPDATE out-of-band
+      if fc_len > self.conn_recv_win && self.delivered_conn_data > 0L {
+        let credit = self.delivered_conn_data
+        if self.conn_recv_win + credit <= max_window_size.to_int64() {
+          self.conn_recv_win = self.conn_recv_win + credit
+          self.delivered_conn_data = 0L
+        }
+      }
+      if fc_len > self.streams[idx].recv_window && self.streams[idx].delivered_data_bytes > 0L {
+        let credit = self.streams[idx].delivered_data_bytes
+        if self.streams[idx].recv_window + credit <= max_window_size.to_int64() {
+          self.streams[idx].recv_window = self.streams[idx].recv_window + credit
+          self.streams[idx].delivered_data_bytes = 0L
+        }
+      }
+      if fc_len > self.conn_recv_win || fc_len > self.streams[idx].recv_window {
         return Err(H2Error::FlowControlError("received DATA exceeds flow control window"))
       }
-      self.conn_recv_win = self.conn_recv_win - dlen
-      self.streams[idx].recv_window = self.streams[idx].recv_window - dlen
+      self.conn_recv_win = self.conn_recv_win - fc_len
+      self.streams[idx].recv_window = self.streams[idx].recv_window - fc_len
+      self.pending_feed_conn_data = self.pending_feed_conn_data + body_len
+      self.streams[idx].pending_feed_data = self.streams[idx].pending_feed_data + body_len
+
+      // RFC 9113 §8.1.1: enforce declared content-length against unpadded DATA body bytes
+      self.streams[idx].received_data_bytes = self.streams[idx].received_data_bytes + body_len
+      let expected_cl = self.streams[idx].expected_content_length
+      if expected_cl >= 0L {
+        if self.streams[idx].received_data_bytes > expected_cl {
+          self.remove_stream_at(idx)
+          return Err(H2Error::ProtocolError("DATA exceeds declared content-length"))
+        }
+        if end_stream && self.streams[idx].received_data_bytes != expected_cl {
+          self.remove_stream_at(idx)
+          return Err(H2Error::ProtocolError("DATA length does not match declared content-length"))
+        }
+      }
       if end_stream {
-        self.streams[idx].state = match st {
-          StreamState::Open => StreamState::HalfClosedRemote
-          _ => StreamState::Closed
+        match st {
+          StreamState::Open => self.streams[idx].state = StreamState::HalfClosedRemote
+          _ => {
+            if self.rapid_reset_count > 0 {
+              self.rapid_reset_count = self.rapid_reset_count - 1
+            }
+            self.remove_stream_at(idx)
+          }
         }
       }
       Ok(Some(ConnectionEvent::Data(sid, data, end_stream)))
@@ -364,14 +752,21 @@ pub fn Connection::receive_frame(
     Frame::RstStream(sid, code) => {
       let idx = self.find_stream_idx(sid)
       if idx < 0 {
+        if stream_state_eq(self.stream_state(sid), StreamState::Closed) {
+          // RFC 9113 §5.1: RST_STREAM on already-closed stream is ignored
+          return Ok(Some(ConnectionEvent::RstStream(sid, code)))
+        }
         return Err(H2Error::ProtocolError("RST_STREAM on idle stream"))
       }
-      // CVE-2023-44487 Rapid Reset defense
-      self.rapid_reset_count = self.rapid_reset_count + 1
-      if self.rapid_reset_count > self.config.max_rapid_resets {
-        return Err(H2Error::EnhanceYourCalm("CVE-2023-44487 rapid reset limit exceeded"))
+      // CVE-2023-44487 Rapid Reset defense: count concurrent reset bursts without false-positiving
+      // sequential concurrency-1 cancellations on long-lived channels.
+      if self.streams.length() > 1 {
+        self.rapid_reset_count = self.rapid_reset_count + 1
+        if self.rapid_reset_count > self.config.max_rapid_resets {
+          return Err(H2Error::EnhanceYourCalm("CVE-2023-44487 rapid reset limit exceeded"))
+        }
       }
-      self.streams[idx].state = StreamState::Closed
+      self.remove_stream_at(idx)
       Ok(Some(ConnectionEvent::RstStream(sid, code)))
     }
     Frame::Settings(settings, ack) => {
@@ -379,7 +774,10 @@ pub fn Connection::receive_frame(
         let mut i = 0
         while i < settings.length() {
           let s = settings[i]
-          if s.id == setting_header_table_size {
+          if s.id == setting_enable_push && !self.config.is_server && s.value == 1L {
+            // RFC 9113 §6.5.2: client MUST treat SETTINGS_ENABLE_PUSH=1 from server as PROTOCOL_ERROR
+            return Err(H2Error::ProtocolError("server sent SETTINGS_ENABLE_PUSH=1 to client"))
+          } else if s.id == setting_header_table_size {
             let max_s = if s.value > self.config.max_dynamic_table_size.to_int64() {
               self.config.max_dynamic_table_size
             } else {
@@ -428,6 +826,9 @@ pub fn Connection::receive_frame(
       } else {
         let idx = self.find_stream_idx(sid)
         if idx < 0 {
+          if stream_state_eq(self.stream_state(sid), StreamState::Closed) {
+            return Ok(Some(ConnectionEvent::WindowUpdate(sid, inc)))
+          }
           return Err(H2Error::ProtocolError("WINDOW_UPDATE on idle stream"))
         }
         let nw = self.streams[idx].send_window + inc64
@@ -440,6 +841,10 @@ pub fn Connection::receive_frame(
     }
     Frame::Ping(opaque, ack) => Ok(Some(ConnectionEvent::Ping(opaque, ack))),
     Frame::GoAway(last_sid, code, dbg) => {
+      self.goaway_received = true
+      if last_sid < self.goaway_last_stream_id {
+        self.goaway_last_stream_id = last_sid
+      }
       Ok(Some(ConnectionEvent::GoAway(last_sid, code, dbg)))
     }
     Frame::Priority(sid, spec) => Ok(Some(ConnectionEvent::Priority(sid, spec))),
@@ -447,8 +852,37 @@ pub fn Connection::receive_frame(
   }
 }
 
+///| Process one decoded RFC 9113 frame through the connection state machine.
+pub fn Connection::receive_frame(
+  self : Connection,
+  frame : Frame,
+) -> Result[Option[ConnectionEvent], H2Error] {
+  let wire_len = match frame {
+    Frame::Data(_, d, _) => d.length()
+    _ => 0
+  }
+  self.receive_frame_with_wire_len(frame, wire_len)
+}
+
+///| Commit delivered real-DATA bytes after a feed() batch returns events to the caller.
+fn Connection::commit_delivered_data(self : Connection) -> Unit {
+  if self.pending_feed_conn_data > 0L {
+    self.delivered_conn_data = self.delivered_conn_data + self.pending_feed_conn_data
+    self.pending_feed_conn_data = 0L
+    let mut i = 0
+    while i < self.streams.length() {
+      if self.streams[i].pending_feed_data > 0L {
+        self.streams[i].delivered_data_bytes = self.streams[i].delivered_data_bytes + self.streams[i].pending_feed_data
+        self.streams[i].pending_feed_data = 0L
+      }
+      i = i + 1
+    }
+  }
+}
+
 ///| Feed a chunk of wire bytes, decoding and processing as many complete frames as possible.
-///| Returns `Ok((events, bytes_consumed))`.
+///| Returns `Ok((events, bytes_consumed))`. If a later frame errors after earlier frames already
+///| produced events, returns `Ok((events, pos_before_bad_frame))` so applied events are never lost.
 pub fn Connection::feed(
   self : Connection,
   data : Bytes,
@@ -459,21 +893,37 @@ pub fn Connection::feed(
   while pos < n {
     match decode_frame(data, pos, self.config.max_frame_size) {
       Ok((frame, next_pos)) => {
-        match self.receive_frame(frame) {
-          Ok(Some(ev)) => events.push(ev)
-          Ok(None) => ()
-          Err(e) => return Err(e)
+        let wire_payload_len = next_pos - pos - 9
+        match self.receive_frame_with_wire_len(frame, wire_payload_len) {
+          Ok(Some(ev)) => {
+            events.push(ev)
+            pos = next_pos
+          }
+          Ok(None) => pos = next_pos
+          Err(e) => {
+            if events.length() > 0 {
+              self.commit_delivered_data()
+              return Ok((events, pos))
+            }
+            return Err(e)
+          }
         }
-        pos = next_pos
       }
       Err(H2Error::Incomplete) => break
-      Err(e) => return Err(e)
+      Err(e) => {
+        if events.length() > 0 {
+          self.commit_delivered_data()
+          return Ok((events, pos))
+        }
+        return Err(e)
+      }
     }
   }
+  self.commit_delivered_data()
   Ok((events, pos))
 }
 
-///| Local state transition when opening a stream (sending HEADERS).
+///| Local state transition when opening/responding on a stream (sending HEADERS).
 pub fn Connection::open_stream(
   self : Connection,
   stream_id : Int,
@@ -482,21 +932,52 @@ pub fn Connection::open_stream(
   if stream_id <= 0 || stream_id > max_stream_id {
     return Err(H2Error::ProtocolError("invalid stream_id"))
   }
-  let idx = self.get_or_create_stream(stream_id)
-  match self.streams[idx].state {
-    StreamState::Idle => {
-      self.streams[idx].state = if end_stream {
-        StreamState::HalfClosedLocal
+  let existing = self.find_stream_idx(stream_id)
+  if existing < 0 {
+    // Opening a brand-new Idle stream
+    if self.goaway_received {
+      return Err(H2Error::ProtocolError("cannot open new stream after receiving GOAWAY"))
+    }
+    if stream_state_eq(self.stream_state(stream_id), StreamState::Closed) {
+      return Err(H2Error::StreamClosed(stream_id))
+    }
+    if stream_id > self.last_local_stream_id {
+      self.last_local_stream_id = stream_id
+    }
+    let idx = self.create_stream(stream_id, false)
+    self.streams[idx].state = if end_stream {
+      StreamState::HalfClosedLocal
+    } else {
+      StreamState::Open
+    }
+    return Ok(())
+  }
+  match self.streams[existing].state {
+    StreamState::ReservedLocal => {
+      if end_stream {
+        if self.rapid_reset_count > 0 {
+          self.rapid_reset_count = self.rapid_reset_count - 1
+        }
+        self.remove_stream_at(existing)
       } else {
-        StreamState::Open
+        self.streams[existing].state = StreamState::HalfClosedRemote
       }
       Ok(())
     }
-    StreamState::ReservedLocal => {
-      self.streams[idx].state = if end_stream {
-        StreamState::Closed
-      } else {
-        StreamState::HalfClosedRemote
+    StreamState::HalfClosedRemote => {
+      // Server sending response HEADERS on a client-ended stream
+      if end_stream {
+        if self.rapid_reset_count > 0 {
+          self.rapid_reset_count = self.rapid_reset_count - 1
+        }
+        self.remove_stream_at(existing)
+      }
+      Ok(())
+    }
+    StreamState::Open => {
+      // Server sending response HEADERS on an open stream
+      if end_stream {
+        self.streams[existing].state = StreamState::HalfClosedLocal
       }
       Ok(())
     }
@@ -516,6 +997,9 @@ pub fn Connection::send_data(
   }
   let idx = self.find_stream_idx(stream_id)
   if idx < 0 {
+    if stream_state_eq(self.stream_state(stream_id), StreamState::Closed) {
+      return Err(H2Error::StreamClosed(stream_id))
+    }
     return Err(H2Error::ProtocolError("send_data on idle stream"))
   }
   let st = self.streams[idx].state
@@ -530,9 +1014,14 @@ pub fn Connection::send_data(
   self.conn_send_win = self.conn_send_win - len64
   self.streams[idx].send_window = self.streams[idx].send_window - len64
   if end_stream {
-    self.streams[idx].state = match st {
-      StreamState::Open => StreamState::HalfClosedLocal
-      _ => StreamState::Closed
+    match st {
+      StreamState::Open => self.streams[idx].state = StreamState::HalfClosedLocal
+      _ => {
+        if self.rapid_reset_count > 0 {
+          self.rapid_reset_count = self.rapid_reset_count - 1
+        }
+        self.remove_stream_at(idx)
+      }
     }
   }
   Ok(())
@@ -545,8 +1034,11 @@ pub fn Connection::send_rst_stream(
 ) -> Result[Unit, H2Error] {
   let idx = self.find_stream_idx(stream_id)
   if idx < 0 {
+    if stream_state_eq(self.stream_state(stream_id), StreamState::Closed) {
+      return Ok(())
+    }
     return Err(H2Error::ProtocolError("send_rst_stream on idle stream"))
   }
-  self.streams[idx].state = StreamState::Closed
+  self.remove_stream_at(idx)
   Ok(())
 }

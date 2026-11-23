@@ -53,21 +53,68 @@ fn validate_regular_name(name : String) -> Result[Unit, H2Error] {
   Ok(())
 }
 
-///| Validate an HTTP/2 header value (no CR, LF, NUL; RFC 9113 §8.2.1).
+///| Validate an HTTP/2 header value (RFC 9110 §5.5 & RFC 9113 §8.2.1):
+///| forbids CTL bytes (0x00..0x08, 0x0A..0x1F, 0x7F) and leading/trailing SP/HTAB.
 fn validate_header_value(value : String) -> Result[Unit, H2Error] {
   let n = value.length()
+  if n > 0 {
+    let first = value.code_unit_at(0)
+    let last = value.code_unit_at(n - 1)
+    if first == 32 || first == 9 || last == 32 || last == 9 {
+      return Err(H2Error::InvalidHeader("leading or trailing whitespace in HTTP/2 header value"))
+    }
+  }
   let mut i = 0
   while i < n {
     let ch = value.code_unit_at(i)
-    if ch == 0 || ch == 10 || ch == 13 {
-      return Err(H2Error::InvalidHeader("CR/LF/NUL forbidden in HTTP/2 header value"))
+    if (ch < 32 && ch != 9) || ch == 127 {
+      return Err(H2Error::InvalidHeader("CTL byte forbidden in HTTP/2 header value"))
     }
     i = i + 1
   }
   Ok(())
 }
 
-///| Validate HTTP/2 request headers (RFC 9113 §8.2 & §8.3.1).
+///| Parse a strict RFC 9110 content-length value (1+ ASCII digits, non-negative Int64).
+fn parse_content_length_value(value : String) -> Result[Int64, H2Error] {
+  let n = value.length()
+  if n == 0 {
+    return Err(H2Error::InvalidHeader("empty content-length"))
+  }
+  let mut acc = 0L
+  let mut i = 0
+  while i < n {
+    let ch = value.code_unit_at(i)
+    if ch < 48 || ch > 57 {
+      return Err(H2Error::InvalidHeader("non-numeric content-length"))
+    }
+    let d = (ch - 48).to_int64()
+    if acc > (0x7FFFFFFFFFFFFFFFL - d) / 10L {
+      return Err(H2Error::InvalidHeader("content-length overflow"))
+    }
+    acc = acc * 10L + d
+    i = i + 1
+  }
+  Ok(acc)
+}
+
+///| Extract validated content-length from an already-validated header list (-1 if absent).
+fn extract_content_length(headers : Array[HeaderField]) -> Int64 {
+  let n = headers.length()
+  let mut i = 0
+  while i < n {
+    if headers[i].name == "content-length" {
+      match parse_content_length_value(headers[i].value) {
+        Ok(v) => return v
+        Err(_) => return -1L
+      }
+    }
+    i = i + 1
+  }
+  -1L
+}
+
+///| Validate HTTP/2 request headers (RFC 9113 §8.2 & §8.3.1, RFC 8441 §4).
 pub fn validate_request_headers(
   headers : Array[HeaderField],
 ) -> Result[Unit, H2Error] {
@@ -78,6 +125,11 @@ pub fn validate_request_headers(
   let mut seen_path = false
   let mut seen_protocol = false
   let mut is_connect = false
+  let mut method_val = ""
+  let mut scheme_val = ""
+  let mut path_val = ""
+  let mut has_cl = false
+  let mut cl_val = 0L
 
   let n = headers.length()
   let mut i = 0
@@ -105,6 +157,7 @@ pub fn validate_request_headers(
           return Err(H2Error::InvalidHeader("empty :method"))
         }
         seen_method = true
+        method_val = value
         if value == "CONNECT" {
           is_connect = true
         }
@@ -116,6 +169,7 @@ pub fn validate_request_headers(
           return Err(H2Error::InvalidHeader("empty :scheme"))
         }
         seen_scheme = true
+        scheme_val = value
       } else if name == ":authority" {
         if seen_authority {
           return Err(H2Error::InvalidHeader("duplicate :authority pseudo-header"))
@@ -129,9 +183,13 @@ pub fn validate_request_headers(
           return Err(H2Error::InvalidHeader("empty :path"))
         }
         seen_path = true
+        path_val = value
       } else if name == ":protocol" {
         if seen_protocol {
           return Err(H2Error::InvalidHeader("duplicate :protocol pseudo-header"))
+        }
+        if value.length() == 0 {
+          return Err(H2Error::InvalidHeader("empty :protocol"))
         }
         seen_protocol = true
       } else {
@@ -146,12 +204,26 @@ pub fn validate_request_headers(
       if name == "te" && value != "trailers" {
         return Err(H2Error::InvalidHeader("TE header in HTTP/2 may only be 'trailers'"))
       }
+      if name == "content-length" {
+        let parsed = match parse_content_length_value(value) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if has_cl && parsed != cl_val {
+          return Err(H2Error::InvalidHeader("conflicting content-length values"))
+        }
+        has_cl = true
+        cl_val = parsed
+      }
     }
     i = i + 1
   }
 
   if !seen_method {
     return Err(H2Error::InvalidHeader("missing required :method pseudo-header"))
+  }
+  if seen_protocol && !is_connect {
+    return Err(H2Error::InvalidHeader(":protocol pseudo-header is only valid for CONNECT"))
   }
   if is_connect && !seen_protocol {
     if !seen_authority || seen_scheme || seen_path {
@@ -165,6 +237,24 @@ pub fn validate_request_headers(
     if !seen_scheme || !seen_path {
       return Err(H2Error::InvalidHeader("missing required :scheme or :path pseudo-header"))
     }
+    if is_connect && seen_protocol && !seen_authority {
+      return Err(H2Error::InvalidHeader("extended CONNECT requires :authority"))
+    }
+    // RFC 9113 §8.3.1: for http/https, :path must be origin-form ('/'..., not '//'...) or '*' for OPTIONS
+    if scheme_val == "http" || scheme_val == "https" {
+      if path_val == "*" {
+        if method_val != "OPTIONS" {
+          return Err(H2Error::InvalidHeader(":path '*' is only valid for OPTIONS"))
+        }
+      } else {
+        if path_val.code_unit_at(0) != 47 {
+          return Err(H2Error::InvalidHeader(":path must be origin-form starting with '/'"))
+        }
+        if path_val.length() >= 2 && path_val.code_unit_at(1) == 47 {
+          return Err(H2Error::InvalidHeader(":path must not start with '//'"))
+        }
+      }
+    }
   }
   Ok(())
 }
@@ -175,6 +265,8 @@ pub fn validate_response_headers(
 ) -> Result[Unit, H2Error] {
   let mut seen_regular = false
   let mut seen_status = false
+  let mut has_cl = false
+  let mut cl_val = 0L
 
   let n = headers.length()
   let mut i = 0
@@ -218,6 +310,17 @@ pub fn validate_response_headers(
       }
       if name == "te" && value != "trailers" {
         return Err(H2Error::InvalidHeader("TE header in HTTP/2 may only be 'trailers'"))
+      }
+      if name == "content-length" {
+        let parsed = match parse_content_length_value(value) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if has_cl && parsed != cl_val {
+          return Err(H2Error::InvalidHeader("conflicting content-length values"))
+        }
+        has_cl = true
+        cl_val = parsed
       }
     }
     i = i + 1
