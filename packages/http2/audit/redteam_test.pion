@@ -1,0 +1,984 @@
+///| Red-team unit tests for `packages/http2` (Wave 10 RT-http2, baseline feat/pkg-http2 @ 10811e1).
+///| Every `p0_` / `p1_` / `p2_` test asserts the behaviour required by RFC 7541 / RFC 9113 (and what
+///| Go `x/net/http2` + Rust `h2` do); it FAILS (or panics) while the defect exists and PASSES once fixed.
+///| `control_` tests document attack surface that is already handled correctly and must stay green.
+///| Cross-implementation evidence (Go x/net/http2 + Rust h2 0.4.20) lives in `diff/`, `conn/` and REDTEAM_REPORT.md.
+
+import "http2"
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+///|
+fn rt_cat(parts : Array[Bytes]) -> Bytes {
+  let mut n = 0
+  let mut i = 0
+  while i < parts.length() {
+    n = n + parts[i].length()
+    i = i + 1
+  }
+  let out = Bytes::new(n)
+  let mut pos = 0
+  i = 0
+  while i < parts.length() {
+    let p = parts[i]
+    let mut j = 0
+    while j < p.length() {
+      out[pos] = p[j]
+      pos = pos + 1
+      j = j + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn rt_bytes(xs : Array[Int]) -> Bytes {
+  let out = Bytes::new(xs.length())
+  let mut i = 0
+  while i < xs.length() {
+    out[i] = (xs[i] & 0xFF).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn rt_fill(n : Int, b : Int) -> Bytes {
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = b.to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///| Raw 9-byte frame header + payload (no validation: lets us build illegal frames).
+fn rt_frame(ftype : Int, flags : Int, sid : Int, payload : Bytes) -> Bytes {
+  let len = payload.length()
+  let hdr = rt_bytes([
+    len >> 16,
+    len >> 8,
+    len,
+    ftype,
+    flags,
+    (sid >> 24) & 0x7F,
+    sid >> 16,
+    sid >> 8,
+    sid,
+  ])
+  rt_cat([hdr, payload])
+}
+
+///| PADDED DATA frame: [pad_len][data][pad_len zero bytes].
+fn rt_padded_data(sid : Int, data : Bytes, pad : Int, end_stream : Bool) -> Bytes {
+  let flags = 0x08 | (if end_stream { 0x01 } else { 0 })
+  rt_frame(0x0, flags, sid, rt_cat([rt_bytes([pad]), data, rt_fill(pad, 0)]))
+}
+
+///|
+fn rt_req(path : String) -> Array[http2::HeaderField] {
+  [
+    http2::HeaderField::new(":method", "POST"),
+    http2::HeaderField::new(":scheme", "https"),
+    http2::HeaderField::new(":authority", "example.com"),
+    http2::HeaderField::new(":path", path),
+  ]
+}
+
+///| Plain (non-Huffman, never indexed in practice) block so each call is self-contained.
+fn rt_block(hs : Array[http2::HeaderField]) -> Bytes {
+  let enc = http2::HpackEncoder::with_huffman(0, false)
+  enc.encode(hs)
+}
+
+///|
+fn rt_headers(sid : Int, hs : Array[http2::HeaderField], end_stream : Bool) -> Bytes {
+  let flags = 0x04 | (if end_stream { 0x01 } else { 0 })
+  rt_frame(0x1, flags, sid, rt_block(hs))
+}
+
+///| Feed `wire` in one go; Ok(events) only if every byte was consumed without error.
+fn rt_feed(
+  conn : http2::Connection,
+  wire : Bytes,
+) -> Result[Array[http2::ConnectionEvent], http2::H2Error] {
+  match conn.feed(wire) {
+    Ok((evs, used)) => {
+      if used != wire.length() {
+        return Err(http2::H2Error::Incomplete)
+      }
+      Ok(evs)
+    }
+    Err(e) => Err(e)
+  }
+}
+
+///|
+fn rt_is_err(r : Result[Array[http2::ConnectionEvent], http2::H2Error]) -> Bool {
+  match r {
+    Err(_) => true
+    Ok(_) => false
+  }
+}
+
+///|
+fn rt_err_msg(r : Result[Array[http2::ConnectionEvent], http2::H2Error]) -> String {
+  match r {
+    Err(e) => http2::h2_error_message(e)
+    Ok(evs) => "Ok(" + evs.length().to_string() + " events)"
+  }
+}
+
+///| HPACK block: one indexed field (1xxxxxxx) with an arbitrary 64-bit index.
+fn rt_indexed(idx : Int64) -> Bytes {
+  http2::hpack_encode_int(idx, 7, 0x80)
+}
+
+///|
+fn rt_decode_desc(r : Result[Array[http2::HeaderField], http2::H2Error]) -> String {
+  match r {
+    Err(e) => "Err(" + http2::h2_error_message(e) + ")"
+    Ok(hs) => {
+      let mut s = "Ok["
+      let mut i = 0
+      while i < hs.length() {
+        s = s + hs[i].name + ": " + hs[i].value + ";"
+        i = i + 1
+      }
+      s + "]"
+    }
+  }
+}
+
+///|
+fn rt_decode_is_err(r : Result[Array[http2::HeaderField], http2::H2Error]) -> Bool {
+  match r {
+    Err(_) => true
+    Ok(_) => false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P0: remotely triggerable process abort
+// ---------------------------------------------------------------------------
+
+///| RFC 7541 §2.3.3: an index beyond static+dynamic table MUST be a decoding error.
+///| hpack.pion:776 `idx64.to_int()` truncates Int64 -> 32-bit Int; index 0xFFFFFFFF becomes -1, passes
+///| `idx <= static_table_len` and then `static_names[-1]` aborts the whole process (5-byte HPACK block).
+test "p0_hpack_indexed_index_2pow32_minus1_aborts" {
+  let dec = http2::HpackDecoder::new(4096)
+  let r = dec.decode(rt_indexed(0xFFFFFFFFL))
+  debug_assert(rt_decode_is_err(r), "index 0xFFFFFFFF must be COMPRESSION_ERROR, got " + rt_decode_desc(r))
+}
+
+///| Same truncation on the 6-bit literal-name index (hpack.pion:820-822): 0x7F 0xC0.. => idx -1 => abort.
+test "p0_hpack_literal_name_index_negative_aborts" {
+  let dec = http2::HpackDecoder::new(4096)
+  let block = rt_cat([http2::hpack_encode_int(0xFFFFFFFFL, 6, 0x40), rt_bytes([0x01, 0x61])])
+  let r = dec.decode(block)
+  debug_assert(rt_decode_is_err(r), "literal name index 0xFFFFFFFF must be an error, got " + rt_decode_desc(r))
+}
+
+///| 4-bit (without-indexing / never-indexed) name index path (hpack.pion:888-890).
+test "p0_hpack_never_indexed_name_index_negative_aborts" {
+  let dec = http2::HpackDecoder::new(4096)
+  let block = rt_cat([http2::hpack_encode_int(0xFFFFFFFFL, 4, 0x10), rt_bytes([0x01, 0x61])])
+  let r = dec.decode(block)
+  debug_assert(rt_decode_is_err(r), "never-indexed name index 0xFFFFFFFF must be an error, got " + rt_decode_desc(r))
+}
+
+///| The abort is reachable through Connection::feed with a single 14-byte HEADERS frame.
+test "p0_connection_feed_hpack_index_abort" {
+  let conn = http2::Connection::server()
+  let wire = rt_frame(0x1, 0x05, 1, rt_indexed(0xFFFFFFFFL))
+  let r = rt_feed(conn, wire)
+  debug_assert(rt_is_err(r), "HEADERS with HPACK index 2^32-1 must be a COMPRESSION_ERROR")
+}
+
+// ---------------------------------------------------------------------------
+// P1: HPACK
+// ---------------------------------------------------------------------------
+
+///| Index 2^32+2 aliases static index 2 (`:method: GET`) instead of failing (Go/h2: index out of range).
+test "p1_hpack_index_2pow32_plus2_aliases_static" {
+  let dec = http2::HpackDecoder::new(4096)
+  let r = dec.decode(rt_indexed(4294967298L))
+  debug_assert(rt_decode_is_err(r), "index 2^32+2 must be rejected, got " + rt_decode_desc(r))
+}
+
+///| Index 2^32+62 aliases the newest dynamic entry; a smuggled header that no other decoder sees.
+test "p1_hpack_index_alias_dynamic_entry" {
+  let dec = http2::HpackDecoder::new(4096)
+  // Literal w/ incremental indexing "x-role: admin" (new name), then indexed 2^32+62.
+  let lit = rt_cat([
+    rt_bytes([0x40, 0x06]),
+    "x-role".to_bytes(),
+    rt_bytes([0x05]),
+    "admin".to_bytes(),
+  ])
+  match dec.decode(lit) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup failed: " + http2::h2_error_message(e))
+  }
+  let r = dec.decode(rt_indexed(4294967358L))
+  debug_assert(rt_decode_is_err(r), "index 2^32+62 must be rejected, got " + rt_decode_desc(r))
+}
+
+// ---------------------------------------------------------------------------
+// P1: RFC 9113 stream identifiers / concurrency / state machine
+// ---------------------------------------------------------------------------
+
+///| RFC 9113 §5.1.1: streams initiated by a client MUST use odd identifiers (Go: PROTOCOL_ERROR).
+test "p1_server_accepts_even_client_stream_id" {
+  let conn = http2::Connection::server()
+  let r = rt_feed(conn, rt_headers(2, rt_req("/"), true))
+  debug_assert(rt_is_err(r), "server must reject HEADERS on even stream 2, got " + rt_err_msg(r))
+}
+
+///| RFC 9113 §5.1.1: a new stream id MUST be greater than all previously opened ones; lower = PROTOCOL_ERROR.
+test "p1_server_accepts_decreasing_stream_id" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(5, rt_req("/a"), true)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let r = rt_feed(conn, rt_headers(3, rt_req("/b"), true))
+  debug_assert(rt_is_err(r), "HEADERS on stream 3 after 5 must be PROTOCOL_ERROR, got " + rt_err_msg(r))
+}
+
+///| RFC 9113 §5.1.2: SETTINGS_MAX_CONCURRENT_STREAMS is never enforced (config field unused).
+test "p1_max_concurrent_streams_not_enforced" {
+  let cfg = http2::ConnectionConfig::{ ..http2::ConnectionConfig::server(), max_concurrent_streams: 4 }
+  let conn = http2::Connection::new(cfg)
+  let mut accepted = 0
+  let mut sid = 1
+  while sid <= 19 {
+    match rt_feed(conn, rt_headers(sid, rt_req("/"), false)) {
+      Ok(_) => accepted = accepted + 1
+      Err(_) => ()
+    }
+    sid = sid + 2
+  }
+  debug_assert(accepted <= 4, "max_concurrent_streams=4 but " + accepted.to_string() + " concurrent streams opened")
+}
+
+///| RFC 9113 §8.1: a second HEADERS without END_STREAM on a request stream is malformed
+///| (only trailers may follow, and they MUST carry END_STREAM). Pion emits a second *request*.
+test "p1_second_request_headers_on_same_stream" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(1, rt_req("/public"), false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let r = rt_feed(conn, rt_headers(1, rt_req("/admin"), false))
+  debug_assert(rt_is_err(r), "second request HEADERS on stream 1 must be rejected, got " + rt_err_msg(r))
+}
+
+///| RFC 9113 §8.4: servers MUST treat receipt of PUSH_PROMISE as connection error PROTOCOL_ERROR.
+test "p1_server_accepts_push_promise" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(1, rt_req("/"), false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let pp = rt_frame(0x5, 0x04, 1, rt_cat([rt_bytes([0, 0, 0, 2]), rt_block(rt_req("/pushed"))]))
+  let r = rt_feed(conn, pp)
+  debug_assert(rt_is_err(r), "server must reject PUSH_PROMISE, got " + rt_err_msg(r))
+}
+
+///| RFC 9113 §6.6: promised id must be a new, even, idle stream. Pion lets a server PUSH_PROMISE
+///| an id the client already opened and silently overwrites it to ReservedRemote.
+test "p1_push_promise_hijacks_open_client_stream" {
+  let conn = http2::Connection::client()
+  match conn.open_stream(1, false) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "open 1")
+  }
+  match conn.open_stream(3, false) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "open 3")
+  }
+  let pp = rt_frame(0x5, 0x04, 1, rt_cat([rt_bytes([0, 0, 0, 3]), rt_block(rt_req("/x"))]))
+  let r = rt_feed(conn, pp)
+  let hijacked = http2::stream_state_eq(conn.stream_state(3), http2::StreamState::ReservedRemote)
+  debug_assert(rt_is_err(r) && !hijacked, "PUSH_PROMISE promising open stream 3 must be PROTOCOL_ERROR; got " + rt_err_msg(r) + (if hijacked { ", stream 3 now ReservedRemote" } else { "" }))
+}
+
+///| find_stream_idx (connection.pion:83-98) only scans the last 4 entries when the id is above the
+///| tail and above last_remote_stream_id: after pushes 2,4,6,8 the client's own stream 15 is "lost".
+test "p1_stream_lookup_loses_client_stream_after_pushes" {
+  let conn = http2::Connection::client()
+  match conn.open_stream(1, false) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "open 1")
+  }
+  match conn.open_stream(15, false) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "open 15")
+  }
+  let mut p = 2
+  while p <= 8 {
+    let pp = rt_frame(0x5, 0x04, 1, rt_cat([rt_bytes([0, 0, 0, p]), rt_block(rt_req("/p"))]))
+    match rt_feed(conn, pp) {
+      Ok(_) => ()
+      Err(e) => debug_assert(false, "setup push: " + http2::h2_error_message(e))
+    }
+    p = p + 2
+  }
+  let st = conn.stream_state(15)
+  let r = conn.send_data(15, 10, false)
+  let ok = match r {
+    Ok(_) => true
+    Err(_) => false
+  }
+  debug_assert(http2::stream_state_eq(st, http2::StreamState::Open) && ok, "client stream 15 must still be Open and writable after 4 pushes")
+}
+
+// ---------------------------------------------------------------------------
+// P1: Flow control
+// ---------------------------------------------------------------------------
+
+///| RFC 9113 §6.9.1: "The entire DATA frame payload is included in flow control, including the
+///| Pad Length and Padding fields". Pion charges only the unpadded body (connection.pion:350).
+test "p1_padded_data_bypasses_flow_control_accounting" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(1, rt_req("/"), false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  match rt_feed(conn, rt_padded_data(1, "0123456789".to_bytes(), 100, false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "padded DATA: " + http2::h2_error_message(e))
+  }
+  // payload = 1 (pad length) + 10 + 100 = 111
+  let w = conn.conn_recv_window()
+  debug_assert(w == 65535L - 111L, "connection recv window must drop by 111 (whole payload), now " + w.to_string())
+}
+
+///| Exploit form: 300 frames of pure padding (256-byte payloads, 76,800 B) against a 65,535 window.
+test "p1_padding_only_data_exceeds_window_without_error" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(1, rt_req("/"), false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let mut i = 0
+  let mut failed = false
+  while i < 300 && !failed {
+    match rt_feed(conn, rt_padded_data(1, Bytes::new(0), 255, false)) {
+      Ok(_) => ()
+      Err(_) => failed = true
+    }
+    i = i + 1
+  }
+  debug_assert(failed, "76,800 bytes of padded DATA over a 65,535 window must be FLOW_CONTROL_ERROR")
+}
+
+///| There is no API that credits the receive windows (no `send_window_update`/`consume`): once
+///| 65,535 bytes have arrived, the connection can never receive DATA again, even after the
+///| application has emitted WINDOW_UPDATE frames on the wire (Go: inflow.add on send; h2: release_capacity).
+test "p1_recv_window_can_never_be_replenished" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(1, rt_req("/upload"), false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let mut i = 0
+  while i < 4 {
+    let len = if i < 3 { 16384 } else { 16383 }
+    match rt_feed(conn, rt_frame(0x0, 0, 1, rt_fill(len, 0x61))) {
+      Ok(_) => ()
+      Err(e) => debug_assert(false, "first 65,535 bytes are legal: " + http2::h2_error_message(e))
+    }
+    i = i + 1
+  }
+  // Application grants more credit the only way the API allows: by writing WINDOW_UPDATE frames itself.
+  let _wu0 = http2::encode_frame(http2::Frame::WindowUpdate(0, 65535))
+  let _wu1 = http2::encode_frame(http2::Frame::WindowUpdate(1, 65535))
+  let r = rt_feed(conn, rt_frame(0x0, 0, 1, rt_fill(1000, 0x62)))
+  debug_assert(!rt_is_err(r), "after granting WINDOW_UPDATE the peer's next DATA must be accepted, got " + rt_err_msg(r))
+}
+
+// ---------------------------------------------------------------------------
+// P1: HTTP/2 -> HTTP/1.1 smuggling surface (RFC 9113 §8.1.1 / §8.3.1)
+// ---------------------------------------------------------------------------
+
+///| RFC 9113 §8.1.1: content-length not equal to the sum of DATA payloads is malformed (Go: PROTOCOL_ERROR).
+test "p1_content_length_mismatch_accepted" {
+  let conn = http2::Connection::server()
+  let hs = rt_req("/")
+  hs.push(http2::HeaderField::new("content-length", "5"))
+  match rt_feed(conn, rt_headers(1, hs, false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let r = rt_feed(conn, rt_frame(0x0, 0x01, 1, "hello, smuggled request".to_bytes()))
+  debug_assert(rt_is_err(r), "content-length: 5 with 23 DATA bytes must be malformed, got " + rt_err_msg(r))
+}
+
+///| Two different content-length values (CL.CL desync on HTTP/1.1 downgrade).
+test "p1_conflicting_content_length_accepted" {
+  let hs = rt_req("/")
+  hs.push(http2::HeaderField::new("content-length", "5"))
+  hs.push(http2::HeaderField::new("content-length", "50"))
+  let r = http2::validate_request_headers(hs)
+  let ok = match r {
+    Ok(_) => true
+    Err(_) => false
+  }
+  debug_assert(!ok, "conflicting content-length values must be malformed")
+}
+
+///| Non-numeric content-length.
+test "p1_non_numeric_content_length_accepted" {
+  let hs = rt_req("/")
+  hs.push(http2::HeaderField::new("content-length", "5, 6"))
+  let ok = match http2::validate_request_headers(hs) {
+    Ok(_) => true
+    Err(_) => false
+  }
+  debug_assert(!ok, "content-length '5, 6' must be malformed")
+}
+
+///| RFC 9113 §8.3.1: :path for http/https MUST be origin-form ('/'...) or '*' (OPTIONS).
+///| Go `validPseudoPath` rejects; Pion forwards `foo`, `http://evil/` and `//evil` as request targets.
+test "p1_non_origin_form_path_accepted" {
+  let bad = ["foo", "http://evil.example/x", "//evil.example/x", "?q=1"]
+  let mut i = 0
+  let mut accepted = ""
+  while i < bad.length() {
+    let hs = [
+      http2::HeaderField::new(":method", "GET"),
+      http2::HeaderField::new(":scheme", "https"),
+      http2::HeaderField::new(":authority", "a.example"),
+      http2::HeaderField::new(":path", bad[i]),
+    ]
+    match http2::validate_request_headers(hs) {
+      Ok(_) => accepted = accepted + "'" + bad[i] + "' "
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  debug_assert(accepted == "", "non origin-form :path accepted: " + accepted)
+}
+
+///| RFC 9113 §8.3.1 / RFC 9110 §7.1: asterisk-form only for OPTIONS (strict-RFC gap: Go also accepts).
+test "p2_asterisk_path_for_get_accepted" {
+  let hs = [
+    http2::HeaderField::new(":method", "GET"),
+    http2::HeaderField::new(":scheme", "https"),
+    http2::HeaderField::new(":authority", "a.example"),
+    http2::HeaderField::new(":path", "*"),
+  ]
+  let ok = match http2::validate_request_headers(hs) {
+    Ok(_) => true
+    Err(_) => false
+  }
+  debug_assert(!ok, ":path '*' with :method GET must be malformed")
+}
+
+// ---------------------------------------------------------------------------
+// P2
+// ---------------------------------------------------------------------------
+
+///| RFC 9110 §5.5 field-value excludes CTLs except HTAB; Go httpguts.ValidHeaderFieldValue and
+///| h2 HeaderValue reject 0x01..0x08, 0x0B..0x1F, 0x7F. Pion only rejects NUL/CR/LF.
+test "p2_header_value_ctl_bytes_accepted" {
+  let ctl = [0x01, 0x08, 0x0B, 0x0C, 0x1B, 0x1F, 0x7F]
+  let mut i = 0
+  let mut accepted = ""
+  while i < ctl.length() {
+    let v = rt_cat(["a".to_bytes(), rt_bytes([ctl[i]]), "b".to_bytes()]).to_string()
+    match http2::validate_response_headers([http2::HeaderField::new(":status", "200"), http2::HeaderField::new("x", v)]) {
+      Ok(_) => accepted = accepted + ctl[i].to_string() + " "
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  debug_assert(accepted == "", "CTL bytes accepted in field value: " + accepted)
+}
+
+///| RFC 9113 §8.2.1: "A field value MUST NOT start or end with an ASCII whitespace character" -> malformed.
+///| (Go and h2 are equally lenient here; strict-RFC gap, not a regression vs references.)
+test "p2_header_value_leading_trailing_whitespace_accepted" {
+  let vals = [" lead", "trail ", "\ttab", "tab\t"]
+  let mut i = 0
+  let mut accepted = 0
+  while i < vals.length() {
+    match http2::validate_response_headers([http2::HeaderField::new(":status", "200"), http2::HeaderField::new("x", vals[i])]) {
+      Ok(_) => accepted = accepted + 1
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  debug_assert(accepted == 0, accepted.to_string() + "/4 values with leading/trailing SP/HTAB accepted")
+}
+
+///| RFC 8441 §4: `:protocol` is only valid with :method CONNECT (and only after SETTINGS_ENABLE_CONNECT_PROTOCOL).
+test "p2_protocol_pseudo_header_on_get_accepted" {
+  let hs = [
+    http2::HeaderField::new(":method", "GET"),
+    http2::HeaderField::new(":protocol", "websocket"),
+    http2::HeaderField::new(":scheme", "https"),
+    http2::HeaderField::new(":authority", "a.example"),
+    http2::HeaderField::new(":path", "/"),
+  ]
+  let ok = match http2::validate_request_headers(hs) {
+    Ok(_) => true
+    Err(_) => false
+  }
+  debug_assert(!ok, ":protocol with :method GET must be malformed")
+}
+
+///| Rapid-reset counter (connection.pion:370) never decays and counts every RST_STREAM for the
+///| life of the connection: a long-lived gRPC channel with 101 ordinary cancellations is killed
+///| with ENHANCE_YOUR_CALM although only one stream was ever concurrently open.
+test "p2_rapid_reset_counter_never_decays_false_positive" {
+  let conn = http2::Connection::server()
+  let mut sid = 1
+  let mut killed_at = -1
+  while sid <= 2 * 150 && killed_at < 0 {
+    // complete request/response exchange, then the client cancels the finished stream's sibling
+    match rt_feed(conn, rt_headers(sid, rt_req("/rpc"), false)) {
+      Ok(_) => ()
+      Err(_) => killed_at = sid
+    }
+    if killed_at < 0 {
+      match rt_feed(conn, rt_frame(0x3, 0, sid, rt_bytes([0, 0, 0, 8]))) {
+        Ok(_) => ()
+        Err(_) => killed_at = sid
+      }
+    }
+    sid = sid + 2
+  }
+  debug_assert(killed_at < 0, "sequential (concurrency 1) cancel pattern killed at stream " + killed_at.to_string())
+}
+
+///| Connection window starts at config.initial_window_size instead of the fixed 65,535 of RFC 9113 §6.9.2.
+///| With initial_window_size=16384 a peer that legally uses 4 streams x 16,383 bytes gets FLOW_CONTROL_ERROR.
+test "p2_conn_window_initialised_from_stream_setting" {
+  let cfg = http2::ConnectionConfig::{ ..http2::ConnectionConfig::server(), initial_window_size: 16384 }
+  let conn = http2::Connection::new(cfg)
+  let mut sid = 1
+  let mut err = ""
+  while sid <= 7 && err == "" {
+    match rt_feed(conn, rt_headers(sid, rt_req("/"), false)) {
+      Ok(_) => ()
+      Err(e) => err = http2::h2_error_message(e)
+    }
+    match rt_feed(conn, rt_frame(0x0, 0, sid, rt_fill(16383, 0x61))) {
+      Ok(_) => ()
+      Err(e) => err = "stream " + sid.to_string() + ": " + http2::h2_error_message(e)
+    }
+    sid = sid + 2
+  }
+  debug_assert(err == "", "4 x 16,383 bytes <= 65,535 connection window must be accepted; " + err)
+}
+
+///| RFC 7541 §4.2 / Go SetAllowedMaxDynamicTableSize: lowering the allowed max must not evict until the
+///| encoder's size update arrives; otherwise in-flight blocks that reference index 62 fail.
+test "p2_decoder_set_max_table_size_evicts_before_size_update" {
+  let enc = http2::HpackEncoder::with_huffman(4096, false)
+  let dec = http2::HpackDecoder::new(4096)
+  let b1 = enc.encode([http2::HeaderField::new("x-trace", "abc")])
+  match dec.decode(b1) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "setup")
+  }
+  // Local side sends SETTINGS_HEADER_TABLE_SIZE=0; the peer has not seen it yet and keeps indexing.
+  dec.set_max_table_size(0)
+  let b2 = enc.encode([http2::HeaderField::new("x-trace", "abc")])
+  let r = dec.decode(b2)
+  debug_assert(!rt_decode_is_err(r), "block sent before the peer saw SETTINGS must still decode, got " + rt_decode_desc(r))
+}
+
+///| feed() returns Err and discards the events of frames it already applied (state mutated, events lost).
+test "p2_feed_error_discards_applied_events" {
+  let conn = http2::Connection::server()
+  let wire = rt_cat([
+    rt_headers(1, rt_req("/ok"), false),
+    rt_frame(0x6, 0, 0, rt_fill(8, 0)),
+    rt_frame(0x6, 0, 0, rt_fill(7, 0)),
+  ])
+  let r = conn.feed(wire)
+  let opened = http2::stream_state_eq(conn.stream_state(1), http2::StreamState::Open)
+  let lost = match r {
+    Err(_) => opened
+    Ok(_) => false
+  }
+  debug_assert(!lost, "stream 1 was opened by feed() but its Headers/Ping events were dropped with the error")
+}
+
+///| RFC 9113 §6.8: after receiving GOAWAY a client MUST NOT open new streams; Pion's open_stream still succeeds.
+test "p2_open_stream_after_goaway_allowed" {
+  let conn = http2::Connection::client()
+  match rt_feed(conn, rt_frame(0x7, 0, 0, rt_bytes([0, 0, 0, 0, 0, 0, 0, 0]))) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "GOAWAY: " + http2::h2_error_message(e))
+  }
+  let ok = match conn.open_stream(1, true) {
+    Ok(_) => true
+    Err(_) => false
+  }
+  debug_assert(!ok, "open_stream after GOAWAY(last_stream_id=0) must be refused")
+}
+
+///| RFC 9113 §6.5.2: a client MUST treat SETTINGS_ENABLE_PUSH=1 from a server as PROTOCOL_ERROR.
+test "p2_client_accepts_enable_push_1_from_server" {
+  let conn = http2::Connection::client()
+  let r = rt_feed(conn, rt_frame(0x4, 0, 0, rt_bytes([0, 2, 0, 0, 0, 1])))
+  debug_assert(rt_is_err(r), "client must reject ENABLE_PUSH=1 from server, got " + rt_err_msg(r))
+}
+
+///| A single malformed request kills the whole connection: feed() returns a bare H2Error (no stream id,
+///| no partial events), so the caller cannot answer RST_STREAM(PROTOCOL_ERROR) for that stream only as
+///| RFC 9113 §8.1.1 requires; Go answers RST_STREAM(3) and still serves stream 1 (conn/ scenario
+///| malformed_stream3_keeps_stream1).
+test "p2_malformed_request_is_connection_fatal" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(1, rt_req("/healthy"), false)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let bad = [http2::HeaderField::new(":method", "GET"), http2::HeaderField::new(":path", "/x")]
+  let r = rt_feed(conn, rt_cat([rt_headers(3, bad, true), rt_frame(0x0, 0x01, 1, "body".to_bytes())]))
+  debug_assert(!rt_is_err(r), "malformed stream 3 must be a stream error (stream 1 DATA still delivered), got " + rt_err_msg(r))
+}
+
+///| RFC 8441 §3: SETTINGS_ENABLE_CONNECT_PROTOCOL (0x8) values other than 0/1 are PROTOCOL_ERROR (Go rejects).
+test "p2_settings_enable_connect_protocol_2_accepted" {
+  let r = rt_feed(http2::Connection::server(), rt_frame(0x4, 0, 0, rt_bytes([0, 8, 0, 0, 0, 2])))
+  debug_assert(rt_is_err(r), "SETTINGS_ENABLE_CONNECT_PROTOCOL=2 must be PROTOCOL_ERROR, got " + rt_err_msg(r))
+}
+
+// ---------------------------------------------------------------------------
+// Controls (already correct; must stay green)
+// ---------------------------------------------------------------------------
+
+///| RFC 7541 §6.1: index 0 is a decoding error.
+test "control_hpack_index_zero_rejected" {
+  let dec = http2::HpackDecoder::new(4096)
+  debug_assert(rt_decode_is_err(dec.decode(rt_bytes([0x80]))), "index 0")
+}
+
+///| Out of range: 62 with empty dynamic table, and 61 + len + 1.
+test "control_hpack_index_out_of_range_rejected" {
+  let dec = http2::HpackDecoder::new(4096)
+  debug_assert(rt_decode_is_err(dec.decode(rt_bytes([0xBE]))), "62 with empty table")
+  match dec.decode(rt_cat([rt_bytes([0x40, 0x01]), "a".to_bytes(), rt_bytes([0x01]), "b".to_bytes()])) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "setup")
+  }
+  debug_assert(!rt_decode_is_err(dec.decode(rt_bytes([0xBE]))), "62 with 1 entry")
+  debug_assert(rt_decode_is_err(dec.decode(rt_bytes([0xBF]))), "63 with 1 entry")
+}
+
+///| RFC 7541 §4.1 bomb: one 4 KB entry referenced 10,000 times (10 KB block -> 40 MB) is cut off in-flight.
+test "control_hpack_compression_bomb_cut_off_in_flight" {
+  let dec = http2::HpackDecoder::with_limits(65536, 65536)
+  let v = rt_fill(4000, 0x61)
+  let setup = rt_cat([rt_bytes([0x40, 0x01]), "x".to_bytes(), http2::hpack_encode_int(4000L, 7, 0), v])
+  match dec.decode(setup) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "setup: " + http2::h2_error_message(e))
+  }
+  let bomb = rt_fill(10000, 0xBE)
+  match dec.decode(bomb) {
+    Err(http2::H2Error::EnhanceYourCalm(_)) => ()
+    Err(e) => debug_assert(false, "unexpected error class: " + http2::h2_error_message(e))
+    Ok(hs) => debug_assert(false, "bomb accepted, " + hs.length().to_string() + " headers")
+  }
+}
+
+///| Size update after a field, size update above SETTINGS, and decrease-then-increase eviction.
+test "control_hpack_size_update_rules" {
+  let dec = http2::HpackDecoder::new(4096)
+  debug_assert(rt_decode_is_err(dec.decode(rt_bytes([0x82, 0x20]))), "size update after field")
+  debug_assert(rt_decode_is_err(dec.decode(http2::hpack_encode_int(4097L, 5, 0x20))), "size update > SETTINGS")
+  match dec.decode(rt_cat([rt_bytes([0x40, 0x01]), "a".to_bytes(), rt_bytes([0x01]), "b".to_bytes()])) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "setup")
+  }
+  // 0 then 4096: table must be emptied by the intermediate 0, so index 62 is now invalid.
+  let blk = rt_cat([rt_bytes([0x20]), http2::hpack_encode_int(4096L, 5, 0x20), rt_bytes([0xBE])])
+  debug_assert(rt_decode_is_err(dec.decode(blk)), "0 then 4096 must evict; index 62 invalid")
+  debug_assert(dec.dynamic_table_len() == 0, "table empty")
+}
+
+///| HPACK integer overflow / overlong continuation.
+test "control_hpack_integer_overflow_rejected" {
+  let dec = http2::HpackDecoder::new(4096)
+  let mut b = [0xFF]
+  let mut i = 0
+  while i < 12 {
+    b.push(0xFF)
+    i = i + 1
+  }
+  b.push(0x01)
+  debug_assert(rt_decode_is_err(dec.decode(rt_bytes(b))), "2^84 index")
+  let mut z = [0xFF]
+  i = 0
+  while i < 40 {
+    z.push(0x80)
+    i = i + 1
+  }
+  debug_assert(rt_decode_is_err(dec.decode(rt_bytes(z))), "endless 0x80 continuation")
+}
+
+///| Huffman: EOS, >7 bit padding, non-1 padding rejected; 1..7 bit all-1 padding accepted for every symbol.
+test "control_huffman_padding_and_eos" {
+  debug_assert(rt_is_huff_err(rt_bytes([0xFF, 0xFF, 0xFF, 0xFF])), "explicit EOS")
+  debug_assert(rt_is_huff_err(rt_bytes([0xFF])), "8 bits padding")
+  debug_assert(rt_is_huff_err(rt_bytes([0x1F, 0xFF])), "'a' + 11 bit padding")
+  debug_assert(rt_is_huff_err(rt_bytes([0x1E])), "'a'(00011) + padding 110 (not all ones)")
+  let mut sym = 0
+  while sym < 256 {
+    let raw = rt_bytes([sym])
+    match http2::huffman_decode(http2::huffman_encode(raw)) {
+      Ok(d) => debug_assert(http2::bytes_equal(d, raw), "roundtrip sym " + sym.to_string())
+      Err(_) => debug_assert(false, "roundtrip sym " + sym.to_string())
+    }
+    sym = sym + 1
+  }
+}
+
+///|
+fn rt_is_huff_err(b : Bytes) -> Bool {
+  match http2::huffman_decode(b) {
+    Err(_) => true
+    Ok(_) => false
+  }
+}
+
+///| Sensitive fields are emitted as Never Indexed (0001xxxx) and never enter either dynamic table.
+test "control_sensitive_never_indexed" {
+  let enc = http2::HpackEncoder::with_huffman(4096, false)
+  let dec = http2::HpackDecoder::new(4096)
+  let blk = enc.encode([http2::HeaderField::sensitive("x-secret", "s3cr3t")])
+  debug_assert((blk[0].to_int() & 0xF0) == 0x10, "never-indexed representation")
+  debug_assert(enc.dynamic_table_len() == 0, "encoder table untouched")
+  match dec.decode(blk) {
+    Ok(hs) => debug_assert(hs.length() == 1 && hs[0].sensitive, "sensitive flag preserved")
+    Err(_) => debug_assert(false, "decode")
+  }
+  debug_assert(dec.dynamic_table_len() == 0, "decoder table untouched")
+}
+
+///| FNV-1a prefilter never merges distinct keys: two values with identical 31-bit str_hash.
+///| ("v-i6pf" and "v-uIta" collide in str_hash (0x0f1c73d2); see diff/fnv_collide.py.)
+fn rt_collide_a() -> String {
+  "v-i6pf"
+}
+
+///|
+fn rt_collide_b() -> String {
+  "v-uIta"
+}
+
+///|
+test "control_dynamic_table_hash_collision_safe" {
+  let enc = http2::HpackEncoder::with_huffman(4096, false)
+  let dec = http2::HpackDecoder::new(4096)
+  let a = http2::HeaderField::new("x-k", rt_collide_a())
+  let b = http2::HeaderField::new("x-k", rt_collide_b())
+  let _ = dec.decode(enc.encode([a]))
+  match dec.decode(enc.encode([b])) {
+    Ok(hs) => debug_assert(hs.length() == 1 && hs[0].value == rt_collide_b(), "collision partner decoded as itself")
+    Err(_) => debug_assert(false, "decode")
+  }
+}
+
+///| SETTINGS: unknown ids ignored; duplicates applied in order; INITIAL_WINDOW_SIZE may drive windows negative.
+test "control_settings_unknown_duplicates_negative_window" {
+  let conn = http2::Connection::server()
+  match rt_feed(conn, rt_headers(1, rt_req("/"), false)) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "setup")
+  }
+  match conn.send_data(1, 60000, false) {
+    Ok(_) => ()
+    Err(_) => debug_assert(false, "send 60000")
+  }
+  let s = rt_bytes([0xFF, 0xFF, 0, 0, 0, 7, 0, 4, 0, 0, 0x10, 0, 0, 4, 0, 0, 0x03, 0xE8])
+  match rt_feed(conn, rt_frame(0x4, 0, 0, s)) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "SETTINGS: " + http2::h2_error_message(e))
+  }
+  // 65535 - 60000 = 5535; last INITIAL_WINDOW_SIZE=1000 wins -> 5535 + (1000 - 65535) = -59000
+  let w = conn.stream_send_window(1)
+  debug_assert(w == -59000L, "negative send window expected -59000, got " + w.to_string())
+  // overflow past 2^31-1 via WINDOW_UPDATE
+  debug_assert(rt_is_err(rt_feed(conn, rt_frame(0x8, 0, 0, rt_bytes([0x7F, 0xFF, 0xFF, 0xFF])))), "conn WINDOW_UPDATE overflow")
+}
+
+///| SETTINGS_INITIAL_WINDOW_SIZE > 2^31-1 is FLOW_CONTROL_ERROR.
+test "control_settings_initial_window_too_large" {
+  let r = rt_feed(http2::Connection::server(), rt_frame(0x4, 0, 0, rt_bytes([0, 4, 0x80, 0, 0, 0])))
+  match r {
+    Err(http2::H2Error::FlowControlError(_)) => ()
+    _ => debug_assert(false, "expected FLOW_CONTROL_ERROR, got " + rt_err_msg(r))
+  }
+}
+
+///| Header block integrity: interleaved PING / other-stream CONTINUATION / orphan CONTINUATION rejected.
+test "control_header_block_interleaving" {
+  let frag = rt_block(rt_req("/"))
+  let open = rt_frame(0x1, 0x00, 1, frag)
+  debug_assert(rt_is_err(rt_feed(http2::Connection::server(), rt_cat([open, rt_frame(0x6, 0, 0, rt_fill(8, 0))]))), "PING inside block")
+  debug_assert(rt_is_err(rt_feed(http2::Connection::server(), rt_cat([open, rt_frame(0x9, 0x04, 3, Bytes::new(0))]))), "CONTINUATION other stream")
+  debug_assert(rt_is_err(rt_feed(http2::Connection::server(), rt_frame(0x9, 0x04, 1, frag))), "orphan CONTINUATION")
+  debug_assert(rt_is_err(rt_feed(http2::Connection::server(), rt_cat([open, rt_frame(0x0, 0, 1, rt_fill(3, 0))]))), "DATA inside block")
+}
+
+///| CONTINUATION flood (0-byte frames) is bounded.
+test "control_continuation_zero_length_flood" {
+  let conn = http2::Connection::server()
+  let parts : Array[Bytes] = [rt_frame(0x1, 0x00, 1, Bytes::new(0))]
+  let mut i = 0
+  while i < 10000 {
+    parts.push(rt_frame(0x9, 0x00, 1, Bytes::new(0)))
+    i = i + 1
+  }
+  match conn.feed(rt_cat(parts)) {
+    Err(http2::H2Error::EnhanceYourCalm(_)) => ()
+    _ => debug_assert(false, "CONTINUATION flood must be ENHANCE_YOUR_CALM")
+  }
+}
+
+///| Frame-level padding / priority bounds.
+test "control_frame_padding_priority_bounds" {
+  debug_assert(rt_frame_err(rt_frame(0x0, 0x08, 1, rt_bytes([1]))), "DATA pad_len == payload_len")
+  debug_assert(rt_frame_err(rt_frame(0x0, 0x08, 1, Bytes::new(0))), "DATA PADDED with empty payload")
+  debug_assert(rt_frame_err(rt_frame(0x1, 0x24, 1, rt_bytes([0, 0, 0, 0]))), "HEADERS PRIORITY < 5 bytes")
+  debug_assert(rt_frame_err(rt_frame(0x1, 0x2C, 1, rt_bytes([3, 0, 0, 0, 0, 16, 0x82]))), "PADDED+PRIORITY 1+5+3 > 7")
+  debug_assert(rt_frame_err(rt_frame(0x0, 0, 1, rt_fill(16385, 0))), "frame > SETTINGS_MAX_FRAME_SIZE")
+  debug_assert(!rt_frame_err(rt_frame(0x0, 0x08, 1, rt_bytes([0]))), "DATA pad_len 0, payload 1 is legal")
+}
+
+///|
+fn rt_frame_err(b : Bytes) -> Bool {
+  match http2::decode_frame(b, 0, 16384) {
+    Err(_) => true
+    Ok(_) => false
+  }
+}
+
+///| Idle stream DATA / RST_STREAM / WINDOW_UPDATE; closed stream DATA / HEADERS.
+test "control_idle_and_closed_stream_frames" {
+  debug_assert(rt_is_err(rt_feed(http2::Connection::server(), rt_frame(0x0, 0, 1, rt_fill(1, 0)))), "DATA idle")
+  debug_assert(rt_is_err(rt_feed(http2::Connection::server(), rt_frame(0x3, 0, 1, rt_bytes([0, 0, 0, 8])))), "RST idle")
+  debug_assert(rt_is_err(rt_feed(http2::Connection::server(), rt_frame(0x8, 0, 1, rt_bytes([0, 0, 0, 1])))), "WU idle")
+  let conn = http2::Connection::server()
+  let _ = rt_feed(conn, rt_headers(1, rt_req("/"), true))
+  debug_assert(rt_is_err(rt_feed(conn, rt_frame(0x0, 0, 1, rt_fill(1, 0)))), "DATA half-closed(remote)")
+  debug_assert(rt_is_err(rt_feed(conn, rt_headers(1, rt_req("/"), true))), "HEADERS half-closed(remote)")
+}
+
+///| Pseudo-header placement / response pseudo in request / CONNECT rules / trailer pseudo.
+test "control_pseudo_header_rules" {
+  let bad_req = [http2::HeaderField::new(":status", "200")]
+  debug_assert(rt_vreq_err(rt_cat_h(rt_req("/"), bad_req)), ":status in request")
+  debug_assert(rt_vresp_err([http2::HeaderField::new(":status", "200"), http2::HeaderField::new(":method", "GET")]), ":method in response")
+  debug_assert(rt_vreq_err([http2::HeaderField::new(":method", "CONNECT"), http2::HeaderField::new(":authority", "a:443"), http2::HeaderField::new(":path", "/")]), "CONNECT with :path")
+  debug_assert(rt_vreq_err([http2::HeaderField::new(":method", "CONNECT")]), "CONNECT without :authority")
+  debug_assert(!rt_vreq_err([http2::HeaderField::new(":method", "CONNECT"), http2::HeaderField::new(":authority", "a:443")]), "valid CONNECT")
+  debug_assert(rt_vreq_err([http2::HeaderField::new(":method", "GET"), http2::HeaderField::new(":scheme", "https"), http2::HeaderField::new(":path", "")]), "empty :path")
+  let tr = match http2::validate_trailers([http2::HeaderField::new(":path", "/")]) {
+    Err(_) => true
+    Ok(_) => false
+  }
+  debug_assert(tr, "pseudo-header in trailers")
+  debug_assert(rt_vreq_err(rt_cat_h(rt_req("/"), [http2::HeaderField::new("x y", "1")])), "space in name")
+  debug_assert(rt_vreq_err(rt_cat_h(rt_req("/"), [http2::HeaderField::new("X-Up", "1")])), "uppercase name")
+  debug_assert(rt_vreq_err(rt_cat_h(rt_req("/"), [http2::HeaderField::new("te", "trailers, chunked")])), "te: trailers, chunked")
+}
+
+///|
+fn rt_cat_h(a : Array[http2::HeaderField], b : Array[http2::HeaderField]) -> Array[http2::HeaderField] {
+  let out : Array[http2::HeaderField] = []
+  let mut i = 0
+  while i < a.length() {
+    out.push(a[i])
+    i = i + 1
+  }
+  i = 0
+  while i < b.length() {
+    out.push(b[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn rt_vreq_err(hs : Array[http2::HeaderField]) -> Bool {
+  match http2::validate_request_headers(hs) {
+    Err(_) => true
+    Ok(_) => false
+  }
+}
+
+///|
+fn rt_vresp_err(hs : Array[http2::HeaderField]) -> Bool {
+  match http2::validate_response_headers(hs) {
+    Err(_) => true
+    Ok(_) => false
+  }
+}
+
+///| obs-text (0x80..0xFF) survives decode byte-exact (Pion strings are byte strings; no U+FFFD loss),
+///| so dynamic-table entry sizes stay in sync with the peer encoder.
+test "control_obs_text_byte_exact_and_size_sync" {
+  let v = rt_bytes([0xC3, 0x28, 0xFF, 0x80, 0xE9])
+  let blk = rt_cat([rt_bytes([0x40, 0x01]), "x".to_bytes(), rt_bytes([0x05]), v])
+  let dec = http2::HpackDecoder::new(4096)
+  match dec.decode(blk) {
+    Ok(hs) => debug_assert(http2::bytes_equal(hs[0].value.to_bytes(), v), "byte exact")
+    Err(_) => debug_assert(false, "decode")
+  }
+  debug_assert(dec.dynamic_table_size() == 1 + 5 + 32, "entry size = 38")
+}
+
+///| Byte-by-byte drip feed (caller keeps unconsumed tail) yields exactly the bulk event sequence.
+test "control_drip_feed_equals_bulk" {
+  let wire = rt_cat([
+    rt_frame(0x4, 0, 0, rt_bytes([0, 3, 0, 0, 0, 100])),
+    rt_headers(1, rt_req("/a"), false),
+    rt_padded_data(1, "hello".to_bytes(), 7, false),
+    rt_frame(0x6, 0, 0, rt_fill(8, 9)),
+    rt_frame(0x0, 1, 1, "world".to_bytes()),
+  ])
+  let bulk = match http2::Connection::server().feed(wire) {
+    Ok((evs, _)) => evs.length()
+    Err(_) => -1
+  }
+  let conn = http2::Connection::server()
+  let mut buf = Bytes::new(0)
+  let mut drip = 0
+  let mut i = 0
+  while i < wire.length() {
+    buf = rt_cat([buf, wire.slice(i, i + 1)])
+    match conn.feed(buf) {
+      Ok((evs, used)) => {
+        drip = drip + evs.length()
+        buf = buf.slice(used, buf.length())
+      }
+      Err(_) => drip = -1000
+    }
+    i = i + 1
+  }
+  debug_assert(bulk == 5 && drip == bulk && buf.length() == 0, "bulk=" + bulk.to_string() + " drip=" + drip.to_string())
+}
+
+///| Encoder output is an owned copy: a later encode() on the same encoder (shared scratch ByteBuf)
+///| does not mutate a block the caller still holds (`Bytes::slice` copies).
+test "control_encoder_output_not_aliased" {
+  let enc = http2::HpackEncoder::with_huffman(4096, false)
+  let w1 = enc.encode([http2::HeaderField::new("x-a", "first-value")])
+  let snap = rt_cat([w1])
+  let _ = enc.encode([http2::HeaderField::new("x-b", "SECOND-VALUE-LONGER")])
+  debug_assert(http2::bytes_equal(w1, snap), "first block mutated by second encode")
+}
