@@ -1,0 +1,384 @@
+///| RFC 3550 RTP + RFC 5285 Header Extensions + RFC 7983 Demux.
+
+///|
+fn read_u16_be(data : Bytes, off : Int) -> Int {
+  ((data[off].to_int() & 0xFF) << 8) | (data[off + 1].to_int() & 0xFF)
+}
+
+///|
+fn read_u32_be(data : Bytes, off : Int) -> UInt {
+  (data[off].to_int().to_uint() << 24U) |
+  (data[off + 1].to_int().to_uint() << 16U) |
+  (data[off + 2].to_int().to_uint() << 8U) |
+  data[off + 3].to_int().to_uint()
+}
+
+///|
+fn slice_bytes(data : Bytes, start : Int, end : Int) -> Bytes {
+  let len = end - start
+  if len <= 0 {
+    return Bytes::new(0)
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = data[start + i]
+    i = i + 1
+  }
+  out
+}
+
+///| RFC 7983 §7 + RFC 5761 §4: returns true if `data` is an RTCP packet.
+pub fn is_rtcp_packet(data : Bytes) -> Bool {
+  if data.length() < 8 {
+    return false
+  }
+  let b0 = data[0].to_int() & 0xFF
+  if b0 < 128 || b0 > 191 {
+    return false
+  }
+  let pt = data[1].to_int() & 0x7F
+  pt >= 64 && pt <= 95
+}
+
+///| RFC 7983 §7 + RFC 5761 §4: returns true if `data` is an RTP packet (not RTCP, STUN, or DTLS).
+pub fn is_rtp_packet(data : Bytes) -> Bool {
+  if data.length() < 12 {
+    return false
+  }
+  let b0 = data[0].to_int() & 0xFF
+  if b0 < 128 || b0 > 191 {
+    return false
+  }
+  let pt = data[1].to_int() & 0x7F
+  !(pt >= 64 && pt <= 95)
+}
+
+///| Compute the byte length of the RTP header (fixed 12B + CSRCs + optional extension block).
+pub fn rtp_header_len(data : Bytes) -> Result[Int, RtpError] {
+  let n = data.length()
+  if n < 12 {
+    return Err(RtpError::Truncated("RTP packet shorter than 12-byte fixed header"))
+  }
+  let b0 = data[0].to_int() & 0xFF
+  let version = (b0 >> 6) & 0x03
+  if version != 2 {
+    return Err(RtpError::InvalidVersion(version))
+  }
+  let has_ext = (b0 & 0x10) != 0
+  let cc = b0 & 0x0F
+  let mut off = 12 + cc * 4
+  if off > n {
+    return Err(RtpError::Truncated("RTP CSRC list truncated"))
+  }
+  if has_ext {
+    if off + 4 > n {
+      return Err(RtpError::Truncated("RTP header extension prefix truncated"))
+    }
+    let ext_words = read_u16_be(data, off + 2)
+    let ext_bytes = ext_words * 4
+    off = off + 4 + ext_bytes
+    if off > n {
+      return Err(RtpError::Truncated("RTP header extension body truncated"))
+    }
+  }
+  Ok(off)
+}
+
+///|
+pub fn parse_rtp(data : Bytes) -> Result[RtpPacket, RtpError] {
+  parse_rtp_with_limits(data, DecodeLimits::default())
+}
+
+///|
+pub fn parse_rtp_with_limits(data : Bytes, limits : DecodeLimits) -> Result[RtpPacket, RtpError] {
+  match validate_limits(limits) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let n = data.length()
+  if n < 12 {
+    return Err(RtpError::Truncated("RTP packet shorter than 12 bytes"))
+  }
+  let b0 = data[0].to_int() & 0xFF
+  let b1 = data[1].to_int() & 0xFF
+  let version = (b0 >> 6) & 0x03
+  if version != 2 {
+    return Err(RtpError::InvalidVersion(version))
+  }
+  let padding = (b0 & 0x20) != 0
+  let extension = (b0 & 0x10) != 0
+  let cc = b0 & 0x0F
+  if cc > limits.max_csrcs {
+    return Err(RtpError::LimitExceeded("CSRC count exceeds max_csrcs"))
+  }
+  let marker = (b1 & 0x80) != 0
+  let payload_type = b1 & 0x7F
+  let sequence_number = read_u16_be(data, 2)
+  let timestamp = read_u32_be(data, 4)
+  let ssrc = read_u32_be(data, 8)
+
+  let mut off = 12
+  if off + cc * 4 > n {
+    return Err(RtpError::Truncated("RTP CSRC list exceeds packet length"))
+  }
+  let csrcs : Array[UInt] = []
+  let mut ci = 0
+  while ci < cc {
+    csrcs.push(read_u32_be(data, off))
+    off = off + 4
+    ci = ci + 1
+  }
+
+  let mut extension_profile = 0
+  let extensions : Array[HeaderExtension] = []
+  let mut raw_extension_payload = Bytes::new(0)
+
+  if extension {
+    if off + 4 > n {
+      return Err(RtpError::Truncated("RTP extension header truncated"))
+    }
+    extension_profile = read_u16_be(data, off)
+    let ext_words = read_u16_be(data, off + 2)
+    let ext_len = ext_words * 4
+    if ext_len > limits.max_extension_bytes {
+      return Err(RtpError::LimitExceeded("extension size exceeds max_extension_bytes"))
+    }
+    off = off + 4
+    let ext_end = off + ext_len
+    if ext_end > n {
+      return Err(RtpError::Truncated("RTP extension payload exceeds packet length"))
+    }
+    if extension_profile == 0xBEDE {
+      // RFC 5285 §4.2 One-Byte Header
+      let mut pos = off
+      while pos < ext_end {
+        let hdr = data[pos].to_int() & 0xFF
+        if hdr == 0 {
+          pos = pos + 1
+          continue
+        }
+        let id = (hdr >> 4) & 0x0F
+        if id == 15 {
+          break
+        }
+        let elen = (hdr & 0x0F) + 1
+        if pos + 1 + elen > ext_end {
+          return Err(RtpError::InvalidExtension("one-byte extension overflows extension block"))
+        }
+        if extensions.length() >= limits.max_extensions {
+          return Err(RtpError::LimitExceeded("extension count exceeds max_extensions"))
+        }
+        extensions.push(HeaderExtension::{ id: id, payload: slice_bytes(data, pos + 1, pos + 1 + elen) })
+        pos = pos + 1 + elen
+      }
+    } else if (extension_profile & 0xFFF0) == 0x1000 {
+      // RFC 5285 §4.3 Two-Byte Header
+      let mut pos = off
+      while pos < ext_end {
+        let id = data[pos].to_int() & 0xFF
+        if id == 0 {
+          pos = pos + 1
+          continue
+        }
+        if pos + 2 > ext_end {
+          return Err(RtpError::InvalidExtension("two-byte extension header truncated"))
+        }
+        let elen = data[pos + 1].to_int() & 0xFF
+        if pos + 2 + elen > ext_end {
+          return Err(RtpError::InvalidExtension("two-byte extension overflows extension block"))
+        }
+        if extensions.length() >= limits.max_extensions {
+          return Err(RtpError::LimitExceeded("extension count exceeds max_extensions"))
+        }
+        extensions.push(HeaderExtension::{ id: id, payload: slice_bytes(data, pos + 2, pos + 2 + elen) })
+        pos = pos + 2 + elen
+      }
+    } else {
+      raw_extension_payload = slice_bytes(data, off, ext_end)
+    }
+    off = ext_end
+  }
+
+  let mut payload_end = n
+  let mut padding_size = 0
+  if padding {
+    if payload_end <= off {
+      return Err(RtpError::InvalidPadding("padding bit set on empty payload"))
+    }
+    let pad_len = data[n - 1].to_int() & 0xFF
+    if pad_len == 0 || pad_len > payload_end - off {
+      return Err(RtpError::InvalidPadding("invalid RTP padding length"))
+    }
+    padding_size = pad_len
+    payload_end = payload_end - pad_len
+  }
+
+  let payload_len = payload_end - off
+  if payload_len > limits.max_payload_bytes {
+    return Err(RtpError::LimitExceeded("payload exceeds max_payload_bytes"))
+  }
+
+  Ok(RtpPacket::{
+    header: RtpHeader::{
+      version: version,
+      padding: padding,
+      extension: extension,
+      marker: marker,
+      payload_type: payload_type,
+      sequence_number: sequence_number,
+      timestamp: timestamp,
+      ssrc: ssrc,
+      csrcs: csrcs,
+      extension_profile: extension_profile,
+      extensions: extensions,
+      raw_extension_payload: raw_extension_payload,
+    },
+    payload: slice_bytes(data, off, payload_end),
+    padding_size: padding_size,
+  })
+}
+
+///|
+pub fn marshal_rtp(pkt : RtpPacket) -> Result[Bytes, RtpError] {
+  let h = pkt.header
+  if h.version != 2 {
+    return Err(RtpError::InvalidVersion(h.version))
+  }
+  if h.payload_type < 0 || h.payload_type > 127 {
+    return Err(RtpError::InvalidPayloadType(h.payload_type))
+  }
+  if h.csrcs.length() > 15 {
+    return Err(RtpError::LimitExceeded("RTP header supports at most 15 CSRCs"))
+  }
+  if h.padding && (pkt.padding_size < 1 || pkt.padding_size > 255) {
+    return Err(RtpError::InvalidPadding("padding_size must be in 1..255 when padding=true"))
+  }
+  if !h.padding && pkt.padding_size != 0 {
+    return Err(RtpError::InvalidPadding("padding_size must be 0 when padding=false"))
+  }
+
+  // Build extension bytes if enabled
+  let ext_buf : Array[Byte] = []
+  let has_ext = h.extension
+  if has_ext {
+    if h.extension_profile == 0xBEDE {
+      let mut i = 0
+      while i < h.extensions.length() {
+        let e = h.extensions[i]
+        let elen = e.payload.length()
+        if e.id < 1 || e.id > 14 {
+          return Err(RtpError::InvalidExtension("one-byte extension id must be 1..14"))
+        }
+        if elen < 1 || elen > 16 {
+          return Err(RtpError::InvalidExtension("one-byte extension length must be 1..16"))
+        }
+        ext_buf.push((((e.id & 0x0F) << 4) | ((elen - 1) & 0x0F)).to_byte())
+        let mut j = 0
+        while j < elen {
+          ext_buf.push(e.payload[j])
+          j = j + 1
+        }
+        i = i + 1
+      }
+      while (ext_buf.length() & 3) != 0 {
+        ext_buf.push(0.to_byte())
+      }
+    } else if (h.extension_profile & 0xFFF0) == 0x1000 {
+      let mut i = 0
+      while i < h.extensions.length() {
+        let e = h.extensions[i]
+        let elen = e.payload.length()
+        if e.id < 1 || e.id > 255 {
+          return Err(RtpError::InvalidExtension("two-byte extension id must be 1..255"))
+        }
+        if elen > 255 {
+          return Err(RtpError::InvalidExtension("two-byte extension length must be <= 255"))
+        }
+        ext_buf.push((e.id & 0xFF).to_byte())
+        ext_buf.push((elen & 0xFF).to_byte())
+        let mut j = 0
+        while j < elen {
+          ext_buf.push(e.payload[j])
+          j = j + 1
+        }
+        i = i + 1
+      }
+      while (ext_buf.length() & 3) != 0 {
+        ext_buf.push(0.to_byte())
+      }
+    } else {
+      let rlen = h.raw_extension_payload.length()
+      if (rlen & 3) != 0 {
+        return Err(RtpError::InvalidExtension("raw extension payload must be 32-bit aligned"))
+      }
+      let mut j = 0
+      while j < rlen {
+        ext_buf.push(h.raw_extension_payload[j])
+        j = j + 1
+      }
+    }
+  }
+
+  let ext_total = if has_ext { 4 + ext_buf.length() } else { 0 }
+  let total_len = 12 + h.csrcs.length() * 4 + ext_total + pkt.payload.length() + pkt.padding_size
+  let out = Bytes::new(total_len)
+
+  let b0 = (2 << 6) |
+  (if h.padding { 0x20 } else { 0 }) |
+  (if has_ext { 0x10 } else { 0 }) |
+  (h.csrcs.length() & 0x0F)
+  let b1 = (if h.marker { 0x80 } else { 0 }) | (h.payload_type & 0x7F)
+  out[0] = b0.to_byte()
+  out[1] = b1.to_byte()
+  out[2] = ((h.sequence_number >> 8) & 0xFF).to_byte()
+  out[3] = (h.sequence_number & 0xFF).to_byte()
+  out[4] = ((h.timestamp >> 24U) & 0xFFU).to_int().to_byte()
+  out[5] = ((h.timestamp >> 16U) & 0xFFU).to_int().to_byte()
+  out[6] = ((h.timestamp >> 8U) & 0xFFU).to_int().to_byte()
+  out[7] = (h.timestamp & 0xFFU).to_int().to_byte()
+  out[8] = ((h.ssrc >> 24U) & 0xFFU).to_int().to_byte()
+  out[9] = ((h.ssrc >> 16U) & 0xFFU).to_int().to_byte()
+  out[10] = ((h.ssrc >> 8U) & 0xFFU).to_int().to_byte()
+  out[11] = (h.ssrc & 0xFFU).to_int().to_byte()
+
+  let mut off = 12
+  let mut ci = 0
+  while ci < h.csrcs.length() {
+    let c = h.csrcs[ci]
+    out[off] = ((c >> 24U) & 0xFFU).to_int().to_byte()
+    out[off + 1] = ((c >> 16U) & 0xFFU).to_int().to_byte()
+    out[off + 2] = ((c >> 8U) & 0xFFU).to_int().to_byte()
+    out[off + 3] = (c & 0xFFU).to_int().to_byte()
+    off = off + 4
+    ci = ci + 1
+  }
+
+  if has_ext {
+    let ext_words = ext_buf.length() >> 2
+    out[off] = ((h.extension_profile >> 8) & 0xFF).to_byte()
+    out[off + 1] = (h.extension_profile & 0xFF).to_byte()
+    out[off + 2] = ((ext_words >> 8) & 0xFF).to_byte()
+    out[off + 3] = (ext_words & 0xFF).to_byte()
+    off = off + 4
+    let mut ei = 0
+    while ei < ext_buf.length() {
+      out[off + ei] = ext_buf[ei]
+      ei = ei + 1
+    }
+    off = off + ext_buf.length()
+  }
+
+  let mut pi = 0
+  while pi < pkt.payload.length() {
+    out[off + pi] = pkt.payload[pi]
+    pi = pi + 1
+  }
+  off = off + pkt.payload.length()
+
+  if pkt.padding_size > 0 {
+    // Bytes::new zero-initializes; only set last byte to padding_size
+    out[total_len - 1] = (pkt.padding_size & 0xFF).to_byte()
+  }
+  Ok(out)
+}

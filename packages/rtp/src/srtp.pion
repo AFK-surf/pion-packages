@@ -1,0 +1,716 @@
+///| RFC 3711 SRTP/SRTCP + RFC 7714 AEAD-AES-128-GCM.
+
+import "crypto"
+
+///|
+fn profile_salt_len(profile : ProtectionProfile) -> Int {
+  match profile {
+    ProtectionProfile::Aes128CmHmacSha1_80 => 14
+    ProtectionProfile::Aes128CmHmacSha1_32 => 14
+    ProtectionProfile::AeadAes128Gcm => 12
+  }
+}
+
+///|
+fn profile_rtp_auth_tag_len(profile : ProtectionProfile) -> Int {
+  match profile {
+    ProtectionProfile::Aes128CmHmacSha1_80 => 10
+    ProtectionProfile::Aes128CmHmacSha1_32 => 4
+    ProtectionProfile::AeadAes128Gcm => 16
+  }
+}
+
+///|
+fn profile_rtcp_auth_tag_len(profile : ProtectionProfile) -> Int {
+  match profile {
+    ProtectionProfile::Aes128CmHmacSha1_80 => 10
+    ProtectionProfile::Aes128CmHmacSha1_32 => 10
+    ProtectionProfile::AeadAes128Gcm => 16
+  }
+}
+
+///| RFC 3711 §4.3.1 / RFC 7714 §13 AES-CM Key Derivation Function (with r = 0).
+fn kdf_derive(aes_k : Aes128Key, master_salt : Bytes, label : Int, out_len : Int) -> Bytes {
+  let slen = master_salt.length()
+  let iv : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut i = 0
+  while i < slen {
+    iv[i] = master_salt[i].to_int() & 0xFF
+    i = i + 1
+  }
+  // key_id = label || r (56 bits) XORed right-aligned with master_salt (14B -> index 7, 12B -> index 5)
+  // Wait: RFC 3711 §4.3.1 puts label at byte 7 for 14B salt; RFC 7714 §13 pads 12B salt with
+  // 2 zero bytes on the right to 14B (so label is at byte 7 in libsrtp & webrtc-rs/srtp).
+  iv[7] = iv[7] ^ (label & 0xFF)
+  aes128_ctr_keystream(aes_k, iv, out_len)
+}
+
+///|
+fn validate_master_material(
+  profile : ProtectionProfile,
+  master_key : Bytes,
+  master_salt : Bytes,
+) -> Result[Unit, RtpError] {
+  if master_key.length() != 16 {
+    return Err(RtpError::InvalidKeyLength("AES-128 master key must be 16 bytes"))
+  }
+  let want_salt = profile_salt_len(profile)
+  if master_salt.length() != want_salt {
+    return Err(
+      RtpError::InvalidSaltLength(
+        "master salt must be " + want_salt.to_string() + " bytes for this profile",
+      ),
+    )
+  }
+  Ok(())
+}
+
+///|
+pub fn derive_srtp_keys(
+  profile : ProtectionProfile,
+  master_key : Bytes,
+  master_salt : Bytes,
+) -> Result[SrtpSessionKeys, RtpError] {
+  match validate_master_material(profile, master_key, master_salt) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let aes_k = aes128_expand_key(master_key)
+  let enc_key = kdf_derive(aes_k, master_salt, 0x00, 16)
+  let salt_len = profile_salt_len(profile)
+  let salt = kdf_derive(aes_k, master_salt, 0x02, salt_len)
+  let auth_key = match profile {
+    ProtectionProfile::AeadAes128Gcm => Bytes::new(0)
+    _ => kdf_derive(aes_k, master_salt, 0x01, 20)
+  }
+  Ok(SrtpSessionKeys::{ enc_key: enc_key, auth_key: auth_key, salt: salt })
+}
+
+///|
+pub fn derive_srtcp_keys(
+  profile : ProtectionProfile,
+  master_key : Bytes,
+  master_salt : Bytes,
+) -> Result[SrtpSessionKeys, RtpError] {
+  match validate_master_material(profile, master_key, master_salt) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let aes_k = aes128_expand_key(master_key)
+  let enc_key = kdf_derive(aes_k, master_salt, 0x03, 16)
+  let salt_len = profile_salt_len(profile)
+  let salt = kdf_derive(aes_k, master_salt, 0x05, salt_len)
+  let auth_key = match profile {
+    ProtectionProfile::AeadAes128Gcm => Bytes::new(0)
+    _ => kdf_derive(aes_k, master_salt, 0x04, 20)
+  }
+  Ok(SrtpSessionKeys::{ enc_key: enc_key, auth_key: auth_key, salt: salt })
+}
+
+///|
+pub fn SrtpContext::new(
+  profile : ProtectionProfile,
+  master_key : Bytes,
+  master_salt : Bytes,
+) -> Result[SrtpContext, RtpError] {
+  let srtp_keys = match derive_srtp_keys(profile, master_key, master_salt) {
+    Ok(k) => k
+    Err(e) => return Err(e)
+  }
+  let srtcp_keys = match derive_srtcp_keys(profile, master_key, master_salt) {
+    Ok(k) => k
+    Err(e) => return Err(e)
+  }
+  SrtpContext::from_session_keys(profile, srtp_keys, srtcp_keys)
+}
+
+///|
+pub fn SrtpContext::from_session_keys(
+  profile : ProtectionProfile,
+  srtp_keys : SrtpSessionKeys,
+  srtcp_keys : SrtpSessionKeys,
+) -> Result[SrtpContext, RtpError] {
+  let want_salt = profile_salt_len(profile)
+  if srtp_keys.enc_key.length() != 16 || srtcp_keys.enc_key.length() != 16 {
+    return Err(RtpError::InvalidKeyLength("session encryption key must be 16 bytes"))
+  }
+  if srtp_keys.salt.length() != want_salt || srtcp_keys.salt.length() != want_salt {
+    return Err(RtpError::InvalidSaltLength("session salt length mismatch for profile"))
+  }
+  let srtp_aes = aes128_expand_key(srtp_keys.enc_key)
+  let srtcp_aes = aes128_expand_key(srtcp_keys.enc_key)
+  let srtp_ghash = ghash_table_new(srtp_aes)
+  let srtcp_ghash = ghash_table_new(srtcp_aes)
+  let (srtp_hmac_ipad, srtp_hmac_opad) = hmac_sha1_pads(srtp_keys.auth_key)
+  let (srtcp_hmac_ipad, srtcp_hmac_opad) = hmac_sha1_pads(srtcp_keys.auth_key)
+  Ok(SrtpContext::{
+    profile: profile,
+    srtp_keys: srtp_keys,
+    srtcp_keys: srtcp_keys,
+    srtp_aes: srtp_aes,
+    srtcp_aes: srtcp_aes,
+    srtp_ghash: srtp_ghash,
+    srtcp_ghash: srtcp_ghash,
+    srtp_hmac_ipad: srtp_hmac_ipad,
+    srtp_hmac_opad: srtp_hmac_opad,
+    srtcp_hmac_ipad: srtcp_hmac_ipad,
+    srtcp_hmac_opad: srtcp_hmac_opad,
+    ssrc_states: [],
+    srtcp_index: 0U,
+    srtcp_max_index: 0U,
+    srtcp_has_index: false,
+    srtcp_replay_mask: 0UL,
+  })
+}
+
+///|
+fn get_or_create_ssrc_state(ctx : SrtpContext, ssrc : UInt) -> SsrcState {
+  let mut i = 0
+  while i < ctx.ssrc_states.length() {
+    if ctx.ssrc_states[i].ssrc == ssrc {
+      return ctx.ssrc_states[i]
+    }
+    i = i + 1
+  }
+  let st = SsrcState::{
+    ssrc: ssrc,
+    roc: 0U,
+    s_l: 0,
+    has_seq: false,
+    replay_mask: 0UL,
+  }
+  ctx.ssrc_states.push(st)
+  st
+}
+
+///|
+pub fn SrtpContext::get_roc(self : SrtpContext, ssrc : UInt) -> UInt {
+  let mut i = 0
+  while i < self.ssrc_states.length() {
+    if self.ssrc_states[i].ssrc == ssrc {
+      return self.ssrc_states[i].roc
+    }
+    i = i + 1
+  }
+  0U
+}
+
+///|
+pub fn SrtpContext::set_roc(self : SrtpContext, ssrc : UInt, roc : UInt) -> Unit {
+  let st = get_or_create_ssrc_state(self, ssrc)
+  st.roc = roc
+}
+
+///| RFC 3711 Appendix A: estimate ROC `v` for incoming sequence number `seq`.
+fn estimate_roc(st : SsrcState, seq : Int) -> UInt {
+  if !st.has_seq {
+    return st.roc
+  }
+  let s_l = st.s_l
+  if s_l < 32768 {
+    if seq - s_l > 32768 {
+      if st.roc > 0U {
+        st.roc - 1U
+      } else {
+        0U
+      }
+    } else {
+      st.roc
+    }
+  } else if s_l - 32768 > seq {
+    st.roc + 1U
+  } else {
+    st.roc
+  }
+}
+
+///| Build 16-byte AES-CM IV for SRTP (RFC 3711 §4.1.1).
+fn build_srtp_cm_iv(salt : Bytes, ssrc : UInt, roc : UInt, seq : Int) -> FixedArray[Int] {
+  let iv : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut i = 0
+  while i < 14 {
+    iv[i] = salt[i].to_int() & 0xFF
+    i = i + 1
+  }
+  iv[4] = iv[4] ^ ((ssrc >> 24U) & 0xFFU).to_int()
+  iv[5] = iv[5] ^ ((ssrc >> 16U) & 0xFFU).to_int()
+  iv[6] = iv[6] ^ ((ssrc >> 8U) & 0xFFU).to_int()
+  iv[7] = iv[7] ^ (ssrc & 0xFFU).to_int()
+  iv[8] = iv[8] ^ ((roc >> 24U) & 0xFFU).to_int()
+  iv[9] = iv[9] ^ ((roc >> 16U) & 0xFFU).to_int()
+  iv[10] = iv[10] ^ ((roc >> 8U) & 0xFFU).to_int()
+  iv[11] = iv[11] ^ (roc & 0xFFU).to_int()
+  iv[12] = iv[12] ^ ((seq >> 8) & 0xFF)
+  iv[13] = iv[13] ^ (seq & 0xFF)
+  iv
+}
+
+///| Build 12-byte AES-GCM IV for SRTP (RFC 7714 §8.1).
+fn build_srtp_gcm_iv(salt : Bytes, ssrc : UInt, roc : UInt, seq : Int) -> FixedArray[Int] {
+  let iv : FixedArray[Int] = FixedArray::make(12, 0)
+  let mut i = 0
+  while i < 12 {
+    iv[i] = salt[i].to_int() & 0xFF
+    i = i + 1
+  }
+  iv[2] = iv[2] ^ ((ssrc >> 24U) & 0xFFU).to_int()
+  iv[3] = iv[3] ^ ((ssrc >> 16U) & 0xFFU).to_int()
+  iv[4] = iv[4] ^ ((ssrc >> 8U) & 0xFFU).to_int()
+  iv[5] = iv[5] ^ (ssrc & 0xFFU).to_int()
+  iv[6] = iv[6] ^ ((roc >> 24U) & 0xFFU).to_int()
+  iv[7] = iv[7] ^ ((roc >> 16U) & 0xFFU).to_int()
+  iv[8] = iv[8] ^ ((roc >> 8U) & 0xFFU).to_int()
+  iv[9] = iv[9] ^ (roc & 0xFFU).to_int()
+  iv[10] = iv[10] ^ ((seq >> 8) & 0xFF)
+  iv[11] = iv[11] ^ (seq & 0xFF)
+  iv
+}
+
+///| Build 16-byte AES-CM IV for SRTCP (RFC 3711 §3.4).
+fn build_srtcp_cm_iv(salt : Bytes, ssrc : UInt, srtcp_idx : UInt) -> FixedArray[Int] {
+  let iv : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut i = 0
+  while i < 14 {
+    iv[i] = salt[i].to_int() & 0xFF
+    i = i + 1
+  }
+  iv[4] = iv[4] ^ ((ssrc >> 24U) & 0xFFU).to_int()
+  iv[5] = iv[5] ^ ((ssrc >> 16U) & 0xFFU).to_int()
+  iv[6] = iv[6] ^ ((ssrc >> 8U) & 0xFFU).to_int()
+  iv[7] = iv[7] ^ (ssrc & 0xFFU).to_int()
+  let idx = srtcp_idx & 0x7FFFFFFFU
+  iv[10] = iv[10] ^ ((idx >> 24U) & 0xFFU).to_int()
+  iv[11] = iv[11] ^ ((idx >> 16U) & 0xFFU).to_int()
+  iv[12] = iv[12] ^ ((idx >> 8U) & 0xFFU).to_int()
+  iv[13] = iv[13] ^ (idx & 0xFFU).to_int()
+  iv
+}
+
+///| Build 12-byte AES-GCM IV for SRTCP (RFC 7714 §9.1).
+fn build_srtcp_gcm_iv(salt : Bytes, ssrc : UInt, srtcp_idx : UInt) -> FixedArray[Int] {
+  let iv : FixedArray[Int] = FixedArray::make(12, 0)
+  let mut i = 0
+  while i < 12 {
+    iv[i] = salt[i].to_int() & 0xFF
+    i = i + 1
+  }
+  iv[2] = iv[2] ^ ((ssrc >> 24U) & 0xFFU).to_int()
+  iv[3] = iv[3] ^ ((ssrc >> 16U) & 0xFFU).to_int()
+  iv[4] = iv[4] ^ ((ssrc >> 8U) & 0xFFU).to_int()
+  iv[5] = iv[5] ^ (ssrc & 0xFFU).to_int()
+  let idx = srtcp_idx & 0x7FFFFFFFU
+  iv[8] = iv[8] ^ ((idx >> 24U) & 0xFFU).to_int()
+  iv[9] = iv[9] ^ ((idx >> 16U) & 0xFFU).to_int()
+  iv[10] = iv[10] ^ ((idx >> 8U) & 0xFFU).to_int()
+  iv[11] = iv[11] ^ (idx & 0xFFU).to_int()
+  iv
+}
+
+///|
+fn u32_to_be4(v : UInt) -> Bytes {
+  let b = Bytes::new(4)
+  b[0] = ((v >> 24U) & 0xFFU).to_int().to_byte()
+  b[1] = ((v >> 16U) & 0xFFU).to_int().to_byte()
+  b[2] = ((v >> 8U) & 0xFFU).to_int().to_byte()
+  b[3] = (v & 0xFFU).to_int().to_byte()
+  b
+}
+
+///|
+pub fn SrtpContext::encrypt_rtp(self : SrtpContext, plaintext_rtp : Bytes) -> Result[Bytes, RtpError] {
+  let hdr_len = match rtp_header_len(plaintext_rtp) {
+    Ok(l) => l
+    Err(e) => return Err(e)
+  }
+  let seq = read_u16_be(plaintext_rtp, 2)
+  let ssrc = read_u32_be(plaintext_rtp, 8)
+  let st = get_or_create_ssrc_state(self, ssrc)
+  let v = estimate_roc(st, seq)
+  if !st.has_seq {
+    st.has_seq = true
+    st.s_l = seq
+    st.roc = v
+  } else {
+    let est_idx = (v.to_int64() << 16) | seq.to_int64()
+    let top_idx = (st.roc.to_int64() << 16) | st.s_l.to_int64()
+    if est_idx > top_idx {
+      st.roc = v
+      st.s_l = seq
+    }
+  }
+
+  let payload_len = plaintext_rtp.length() - hdr_len
+  let tag_len = profile_rtp_auth_tag_len(self.profile)
+  let out = Bytes::new(plaintext_rtp.length() + tag_len)
+  let mut i = 0
+  while i < hdr_len {
+    out[i] = plaintext_rtp[i]
+    i = i + 1
+  }
+
+  let aes_k = self.srtp_aes
+  match self.profile {
+    ProtectionProfile::AeadAes128Gcm => {
+      let iv = build_srtp_gcm_iv(self.srtp_keys.salt, ssrc, v, seq)
+      aes128_gcm_crypt_into(aes_k, iv, plaintext_rtp, hdr_len, payload_len, out, hdr_len)
+      let tag = aes128_gcm_tag(aes_k, self.srtp_ghash, iv, out, 0, hdr_len, out, hdr_len, payload_len)
+      let mut ti = 0
+      while ti < 16 {
+        out[hdr_len + payload_len + ti] = tag[ti]
+        ti = ti + 1
+      }
+      Ok(out)
+    }
+    _ => {
+      let iv = build_srtp_cm_iv(self.srtp_keys.salt, ssrc, v, seq)
+      aes128_ctr_xor_into(aes_k, iv, plaintext_rtp, hdr_len, payload_len, out, hdr_len)
+      let mac = hmac_sha1_pads_with_suffix(
+        self.srtp_hmac_ipad,
+        self.srtp_hmac_opad,
+        out,
+        0,
+        plaintext_rtp.length(),
+        u32_to_be4(v),
+      )
+      let mut ti = 0
+      while ti < tag_len {
+        out[plaintext_rtp.length() + ti] = mac[ti]
+        ti = ti + 1
+      }
+      Ok(out)
+    }
+  }
+}
+
+///|
+pub fn SrtpContext::decrypt_rtp(self : SrtpContext, srtp_packet : Bytes) -> Result[Bytes, RtpError] {
+  let tag_len = profile_rtp_auth_tag_len(self.profile)
+  let n = srtp_packet.length()
+  if n < 12 + tag_len {
+    return Err(RtpError::Truncated("SRTP packet shorter than header + auth tag"))
+  }
+  let hdr_len = match rtp_header_len(srtp_packet) {
+    Ok(l) => l
+    Err(e) => return Err(e)
+  }
+  let ct_end = n - tag_len
+  if hdr_len > ct_end {
+    return Err(RtpError::Truncated("SRTP header overlaps auth tag"))
+  }
+  let payload_len = ct_end - hdr_len
+  let seq = read_u16_be(srtp_packet, 2)
+  let ssrc = read_u32_be(srtp_packet, 8)
+  let st = get_or_create_ssrc_state(self, ssrc)
+  let v = estimate_roc(st, seq)
+
+  // Replay window check BEFORE auth/decrypt
+  let est_idx = (v.to_int64() << 16) | seq.to_int64()
+  let top_idx = (st.roc.to_int64() << 16) | st.s_l.to_int64()
+  let delta = est_idx - top_idx
+  if st.has_seq && delta <= 0L {
+    let age = -delta
+    if age >= 64L {
+      return Err(RtpError::ReplayDetected("SRTP packet older than 64-packet replay window"))
+    }
+    if ((st.replay_mask >> age.to_int()) & 1UL) != 0UL {
+      return Err(RtpError::ReplayDetected("duplicate SRTP packet"))
+    }
+  }
+
+  let aes_k = self.srtp_aes
+  let recv_tag = slice_bytes(srtp_packet, ct_end, n)
+  let out = Bytes::new(ct_end)
+  let mut i = 0
+  while i < hdr_len {
+    out[i] = srtp_packet[i]
+    i = i + 1
+  }
+
+  match self.profile {
+    ProtectionProfile::AeadAes128Gcm => {
+      let iv = build_srtp_gcm_iv(self.srtp_keys.salt, ssrc, v, seq)
+      let expected_tag = aes128_gcm_tag(
+        aes_k,
+        self.srtp_ghash,
+        iv,
+        srtp_packet,
+        0,
+        hdr_len,
+        srtp_packet,
+        hdr_len,
+        payload_len,
+      )
+      if !crypto::constant_time_eq(expected_tag, recv_tag) {
+        return Err(RtpError::AuthenticationFailed("SRTP AES-GCM authentication tag mismatch"))
+      }
+      aes128_gcm_crypt_into(aes_k, iv, srtp_packet, hdr_len, payload_len, out, hdr_len)
+    }
+    _ => {
+      let mac = hmac_sha1_pads_with_suffix(
+        self.srtp_hmac_ipad,
+        self.srtp_hmac_opad,
+        srtp_packet,
+        0,
+        ct_end,
+        u32_to_be4(v),
+      )
+      let expected_tag = slice_bytes(mac, 0, tag_len)
+      if !crypto::constant_time_eq(expected_tag, recv_tag) {
+        return Err(RtpError::AuthenticationFailed("SRTP HMAC-SHA1 authentication tag mismatch"))
+      }
+      let iv = build_srtp_cm_iv(self.srtp_keys.salt, ssrc, v, seq)
+      aes128_ctr_xor_into(aes_k, iv, srtp_packet, hdr_len, payload_len, out, hdr_len)
+    }
+  }
+
+  // Commit ROC & replay window only AFTER authentication succeeds
+  if !st.has_seq {
+    st.has_seq = true
+    st.roc = v
+    st.s_l = seq
+    st.replay_mask = 1UL
+  } else if delta > 0L {
+    if delta >= 64L {
+      st.replay_mask = 1UL
+    } else {
+      st.replay_mask = (st.replay_mask << delta.to_int()) | 1UL
+    }
+    st.roc = v
+    st.s_l = seq
+  } else {
+    let age = (-delta).to_int()
+    st.replay_mask = st.replay_mask | (1UL << age)
+  }
+
+  Ok(out)
+}
+
+///|
+pub fn SrtpContext::encrypt_rtcp(
+  self : SrtpContext,
+  plaintext_rtcp : Bytes,
+) -> Result[Bytes, RtpError] {
+  let n = plaintext_rtcp.length()
+  if n < 8 {
+    return Err(RtpError::Truncated("RTCP packet shorter than 8-byte header"))
+  }
+  let ssrc = read_u32_be(plaintext_rtcp, 4)
+  let idx = self.srtcp_index & 0x7FFFFFFFU
+  self.srtcp_index = (idx + 1U) & 0x7FFFFFFFU
+  let e_idx = 0x80000000U | idx
+  let body_len = n - 8
+  let aes_k = self.srtcp_aes
+
+  match self.profile {
+    ProtectionProfile::AeadAes128Gcm => {
+      // RFC 7714 §10: Header (8B) || Ciphertext || Tag (16B) || (E || idx) (4B)
+      // AAD = Header (8B) || (E || idx) (4B)
+      let out = Bytes::new(n + 16 + 4)
+      let aad = Bytes::new(12)
+      let mut i = 0
+      while i < 8 {
+        out[i] = plaintext_rtcp[i]
+        aad[i] = plaintext_rtcp[i]
+        i = i + 1
+      }
+      let e_bytes = u32_to_be4(e_idx)
+      aad[8] = e_bytes[0]
+      aad[9] = e_bytes[1]
+      aad[10] = e_bytes[2]
+      aad[11] = e_bytes[3]
+
+      let iv = build_srtcp_gcm_iv(self.srtcp_keys.salt, ssrc, idx)
+      aes128_gcm_crypt_into(aes_k, iv, plaintext_rtcp, 8, body_len, out, 8)
+      let tag = aes128_gcm_tag(aes_k, self.srtcp_ghash, iv, aad, 0, 12, out, 8, body_len)
+      let mut ti = 0
+      while ti < 16 {
+        out[n + ti] = tag[ti]
+        ti = ti + 1
+      }
+      out[n + 16] = e_bytes[0]
+      out[n + 17] = e_bytes[1]
+      out[n + 18] = e_bytes[2]
+      out[n + 19] = e_bytes[3]
+      Ok(out)
+    }
+    _ => {
+      // RFC 3711 §3.4: Header (8B) || Encrypted Body || (E || idx) (4B) || HMAC-SHA1-80 (10B)
+      let tag_len = profile_rtcp_auth_tag_len(self.profile)
+      let out = Bytes::new(n + 4 + tag_len)
+      let mut i = 0
+      while i < 8 {
+        out[i] = plaintext_rtcp[i]
+        i = i + 1
+      }
+      let iv = build_srtcp_cm_iv(self.srtcp_keys.salt, ssrc, idx)
+      aes128_ctr_xor_into(aes_k, iv, plaintext_rtcp, 8, body_len, out, 8)
+      let e_bytes = u32_to_be4(e_idx)
+      out[n] = e_bytes[0]
+      out[n + 1] = e_bytes[1]
+      out[n + 2] = e_bytes[2]
+      out[n + 3] = e_bytes[3]
+      let mac = hmac_sha1_pads_with_suffix(
+        self.srtcp_hmac_ipad,
+        self.srtcp_hmac_opad,
+        out,
+        0,
+        n + 4,
+        Bytes::new(0),
+      )
+      let mut ti = 0
+      while ti < tag_len {
+        out[n + 4 + ti] = mac[ti]
+        ti = ti + 1
+      }
+      Ok(out)
+    }
+  }
+}
+
+///|
+pub fn SrtpContext::decrypt_rtcp(
+  self : SrtpContext,
+  srtcp_packet : Bytes,
+) -> Result[Bytes, RtpError] {
+  let tag_len = profile_rtcp_auth_tag_len(self.profile)
+  let n = srtcp_packet.length()
+  if n < 8 + 4 + tag_len {
+    return Err(RtpError::Truncated("SRTCP packet shorter than header + index + auth tag"))
+  }
+  let ssrc = read_u32_be(srtcp_packet, 4)
+  let aes_k = self.srtcp_aes
+
+  let e_idx = match self.profile {
+    ProtectionProfile::AeadAes128Gcm => read_u32_be(srtcp_packet, n - 4)
+    _ => read_u32_be(srtcp_packet, n - tag_len - 4)
+  }
+  let is_encrypted = (e_idx & 0x80000000U) != 0U
+  let idx = e_idx & 0x7FFFFFFFU
+
+  // SRTCP replay window check
+  let delta = idx.to_int64() - self.srtcp_max_index.to_int64()
+  if self.srtcp_has_index && delta <= 0L {
+    let age = -delta
+    if age >= 64L {
+      return Err(RtpError::ReplayDetected("SRTCP packet older than 64-packet replay window"))
+    }
+    if ((self.srtcp_replay_mask >> age.to_int()) & 1UL) != 0UL {
+      return Err(RtpError::ReplayDetected("duplicate SRTCP packet"))
+    }
+  }
+
+  let plain_len = n - 4 - tag_len
+  let body_len = plain_len - 8
+  let out = Bytes::new(plain_len)
+  let mut i = 0
+  while i < 8 {
+    out[i] = srtcp_packet[i]
+    i = i + 1
+  }
+
+  match self.profile {
+    ProtectionProfile::AeadAes128Gcm => {
+      let recv_tag = slice_bytes(srtcp_packet, plain_len, plain_len + 16)
+      let iv = build_srtcp_gcm_iv(self.srtcp_keys.salt, ssrc, idx)
+      let e_bytes = u32_to_be4(e_idx)
+      if is_encrypted {
+        let aad = Bytes::new(12)
+        let mut ai = 0
+        while ai < 8 {
+          aad[ai] = srtcp_packet[ai]
+          ai = ai + 1
+        }
+        aad[8] = e_bytes[0]
+        aad[9] = e_bytes[1]
+        aad[10] = e_bytes[2]
+        aad[11] = e_bytes[3]
+        let expected_tag = aes128_gcm_tag(
+          aes_k,
+          self.srtcp_ghash,
+          iv,
+          aad,
+          0,
+          12,
+          srtcp_packet,
+          8,
+          body_len,
+        )
+        if !crypto::constant_time_eq(expected_tag, recv_tag) {
+          return Err(RtpError::AuthenticationFailed("SRTCP AES-GCM authentication tag mismatch"))
+        }
+        aes128_gcm_crypt_into(aes_k, iv, srtcp_packet, 8, body_len, out, 8)
+      } else {
+        // E=0: entire RTCP packet + (E || idx) is AAD, ciphertext is empty
+        let aad = Bytes::new(plain_len + 4)
+        let mut ai = 0
+        while ai < plain_len {
+          aad[ai] = srtcp_packet[ai]
+          out[ai] = srtcp_packet[ai]
+          ai = ai + 1
+        }
+        aad[plain_len] = e_bytes[0]
+        aad[plain_len + 1] = e_bytes[1]
+        aad[plain_len + 2] = e_bytes[2]
+        aad[plain_len + 3] = e_bytes[3]
+        let expected_tag = aes128_gcm_tag(
+          aes_k,
+          self.srtcp_ghash,
+          iv,
+          aad,
+          0,
+          plain_len + 4,
+          Bytes::new(0),
+          0,
+          0,
+        )
+        if !crypto::constant_time_eq(expected_tag, recv_tag) {
+          return Err(RtpError::AuthenticationFailed("SRTCP AES-GCM authentication tag mismatch"))
+        }
+      }
+    }
+    _ => {
+      let recv_tag = slice_bytes(srtcp_packet, n - tag_len, n)
+      let mac = hmac_sha1_pads_with_suffix(
+        self.srtcp_hmac_ipad,
+        self.srtcp_hmac_opad,
+        srtcp_packet,
+        0,
+        n - tag_len,
+        Bytes::new(0),
+      )
+      let expected_tag = slice_bytes(mac, 0, tag_len)
+      if !crypto::constant_time_eq(expected_tag, recv_tag) {
+        return Err(RtpError::AuthenticationFailed("SRTCP HMAC-SHA1 authentication tag mismatch"))
+      }
+      if is_encrypted {
+        let iv = build_srtcp_cm_iv(self.srtcp_keys.salt, ssrc, idx)
+        aes128_ctr_xor_into(aes_k, iv, srtcp_packet, 8, body_len, out, 8)
+      } else {
+        let mut bi = 8
+        while bi < plain_len {
+          out[bi] = srtcp_packet[bi]
+          bi = bi + 1
+        }
+      }
+    }
+  }
+
+  // Commit SRTCP replay window after authentication succeeds
+  if !self.srtcp_has_index {
+    self.srtcp_has_index = true
+    self.srtcp_max_index = idx
+    self.srtcp_replay_mask = 1UL
+  } else if delta > 0L {
+    if delta >= 64L {
+      self.srtcp_replay_mask = 1UL
+    } else {
+      self.srtcp_replay_mask = (self.srtcp_replay_mask << delta.to_int()) | 1UL
+    }
+    self.srtcp_max_index = idx
+  } else {
+    let age = (-delta).to_int()
+    self.srtcp_replay_mask = self.srtcp_replay_mask | (1UL << age)
+  }
+
+  Ok(out)
+}
