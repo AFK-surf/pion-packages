@@ -53,12 +53,368 @@ pub struct Document {
   pub front_matter : Option[FrontMatter]
 }
 
+///| Internal inline container frame for iterative inline AST construction.
+enum InlineFrameKind {
+  Root
+  Emphasis
+  Strong
+  Strikethrough
+  Link(String, String)
+  Image(String, String)
+}
+
+///|
+struct InlineFrame {
+  kind : InlineFrameKind
+  children : Array[Inline]
+}
+
+///| Append an `Inline` to `out`, coalescing adjacent `Inline::Text` nodes.
+fn push_inline_coalesced(out : Array[Inline], item : Inline) -> Unit {
+  match item {
+    Inline::Text(s) => {
+      if s.length() == 0 {
+        return ()
+      }
+      let n = out.length()
+      if n > 0 {
+        match out[n - 1] {
+          Inline::Text(prev) => {
+            out[n - 1] = Inline::Text(prev + s)
+            return ()
+          }
+          _ => ()
+        }
+      }
+      out.push(item)
+    }
+    _ => out.push(item)
+  }
+}
+
+///| Close top inline container frame and attach its finished node to the parent frame.
+fn close_top_inline_frame(frames : Array[InlineFrame]) -> Unit {
+  if frames.length() <= 1 {
+    return ()
+  }
+  match frames.pop() {
+    Some(frame) => {
+      let parent = frames[frames.length() - 1]
+      match frame.kind {
+        InlineFrameKind::Emphasis => parent.children.push(Inline::Emphasis(frame.children))
+        InlineFrameKind::Strong => parent.children.push(Inline::Strong(frame.children))
+        InlineFrameKind::Strikethrough => parent.children.push(Inline::Strikethrough(frame.children))
+        InlineFrameKind::Link(url, title) => parent.children.push(Inline::Link(url, title, frame.children))
+        InlineFrameKind::Image(url, title) => parent.children.push(Inline::Image(url, title, frame.children))
+        InlineFrameKind::Root => ()
+      }
+    }
+    None => ()
+  }
+}
+
+///| Fold a flat inline `Event` stream into `Array[Inline]` iteratively (zero recursion).
+fn events_to_inlines(events : Array[Event]) -> Array[Inline] {
+  let frames : Array[InlineFrame] = Array::with_capacity(8)
+  frames.push(InlineFrame::{ kind: InlineFrameKind::Root, children: Array::with_capacity(events.length()) })
+  let n = events.length()
+  let mut i = 0
+  while i < n {
+    let ev = events[i]
+    let top = frames[frames.length() - 1]
+    match ev {
+      Event::Text(t) => push_inline_coalesced(top.children, Inline::Text(t))
+      Event::Code(c) => top.children.push(Inline::Code(c))
+      Event::InlineHtml(h) => top.children.push(Inline::HtmlInline(h))
+      Event::SoftBreak => top.children.push(Inline::SoftBreak)
+      Event::HardBreak => top.children.push(Inline::HardBreak)
+      Event::FootnoteReference(lbl) => top.children.push(Inline::FootnoteReference(lbl))
+      Event::Start(tag) => match tag {
+        Tag::Emphasis => frames.push(InlineFrame::{ kind: InlineFrameKind::Emphasis, children: Array::new() })
+        Tag::Strong => frames.push(InlineFrame::{ kind: InlineFrameKind::Strong, children: Array::new() })
+        Tag::Strikethrough => frames.push(InlineFrame::{ kind: InlineFrameKind::Strikethrough, children: Array::new() })
+        Tag::Link(link_type, dest, title, _id) => {
+          let url = match link_type {
+            LinkType::Email => "mailto:" + dest
+            _ => dest
+          }
+          frames.push(InlineFrame::{ kind: InlineFrameKind::Link(url, title), children: Array::new() })
+        }
+        Tag::Image(_link_type, dest, title, _id) => {
+          frames.push(InlineFrame::{ kind: InlineFrameKind::Image(dest, title), children: Array::new() })
+        }
+        _ => ()
+      }
+      Event::End(tag_end) => match tag_end {
+        TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link | TagEnd::Image => {
+          close_top_inline_frame(frames)
+        }
+        _ => ()
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  while frames.length() > 1 {
+    close_top_inline_frame(frames)
+  }
+  frames[0].children
+}
+
+///| Parse paragraph/heading lines into `Array[Inline]`, optionally rewriting footnote references.
+fn parse_para_inlines_ast(
+  doc : BlockDoc,
+  m : BlockMeta,
+  ctx : InlineCtx,
+  opts : Options,
+  has_footnotes : Bool,
+  def_bodies : Map[String, String],
+) -> Array[Inline] {
+  let evs : Array[Event] = Array::new()
+  emit_para_lines_events(doc, m, ctx, opts, evs)
+  if has_footnotes {
+    events_to_inlines(rewrite_footnote_refs(evs, def_bodies))
+  } else {
+    events_to_inlines(evs)
+  }
+}
+
+///| Parse a single table cell span into `TableCell`.
+fn parse_table_cell_ast(
+  doc : BlockDoc,
+  sp : LineSpan,
+  ctx : InlineCtx,
+  opts : Options,
+  has_footnotes : Bool,
+  def_bodies : Map[String, String],
+) -> TableCell {
+  let evs : Array[Event] = Array::new()
+  if sp.pad < 0 {
+    let cs = doc.extra_strs[sp.start]
+    parse_inlines_with_ctx(ctx, cs, 0, cs.length(), doc.ref_defs, opts, evs)
+  } else if sp.start < sp.end {
+    parse_inlines_with_ctx(ctx, doc.src, sp.start, sp.end, doc.ref_defs, opts, evs)
+  }
+  let inlines = if has_footnotes {
+    events_to_inlines(rewrite_footnote_refs(evs, def_bodies))
+  } else {
+    events_to_inlines(evs)
+  }
+  TableCell::{ inlines }
+}
+
+///| Explicit stack frame for iterative block AST construction (zero native recursion).
+struct AstBlockFrame {
+  kind : Int // 0=Root, 1=BlockQuote, 2=List, 3=Item
+  next_child : Int
+  list_start : Option[Int64]
+  list_tight : Bool
+  item_checked : Option[Bool]
+  blocks : Array[Block]
+  items : Array[ListItem]
+}
+
+///| Build `Array[Block]` from `BlockDoc` rooted at node 0 iteratively (zero recursion).
+fn build_blocks_from_doc(
+  doc : BlockDoc,
+  ctx : InlineCtx,
+  opts : Options,
+  has_footnotes : Bool,
+  def_bodies : Map[String, String],
+) -> Array[Block] {
+  let stack : Array[AstBlockFrame] = Array::with_capacity(16)
+  stack.push(AstBlockFrame::{
+    kind: 0,
+    next_child: doc.tree[0].first_child,
+    list_start: None,
+    list_tight: false,
+    item_checked: None,
+    blocks: Array::new(),
+    items: Array::new(),
+  })
+
+  while stack.length() > 0 {
+    let sp_idx = stack.length() - 1
+    let frame = stack[sp_idx]
+    let c = frame.next_child
+    if c < 0 {
+      if sp_idx == 0 {
+        return frame.blocks
+      }
+      let _ = stack.pop()
+      let parent = stack[stack.length() - 1]
+      if frame.kind == 1 {
+        parent.blocks.push(Block::BlockQuote(frame.blocks))
+      } else if frame.kind == 2 {
+        parent.blocks.push(Block::List(frame.list_start, frame.list_tight, frame.items))
+      } else if frame.kind == 3 {
+        parent.items.push(ListItem::{ checked: frame.item_checked, blocks: frame.blocks })
+      }
+      continue
+    }
+
+    let next_sib = doc.tree[c].next_sibling
+    stack[sp_idx] = AstBlockFrame::{
+      kind: frame.kind,
+      next_child: next_sib,
+      list_start: frame.list_start,
+      list_tight: frame.list_tight,
+      item_checked: frame.item_checked,
+      blocks: frame.blocks,
+      items: frame.items,
+    }
+
+    let m = doc.meta[c]
+    let t = doc.tree[c]
+    let ck = m.kf & 15
+
+    if ck == 4 {
+      // Paragraph
+      let inlines = parse_para_inlines_ast(doc, m, ctx, opts, has_footnotes, def_bodies)
+      frame.blocks.push(Block::Paragraph(inlines))
+    } else if ck == 5 {
+      // Heading
+      let level = (m.kf >> 10) & 255
+      let inlines = parse_para_inlines_ast(doc, m, ctx, opts, has_footnotes, def_bodies)
+      frame.blocks.push(Block::Heading(level, inlines))
+    } else if ck == 6 {
+      // IndentedCode
+      let code = join_block_spans_nl(doc, m, ctx)
+      frame.blocks.push(Block::CodeBlock(CodeBlockKind::Indented, "", code))
+    } else if ck == 7 {
+      // FencedCode
+      let info = if m.extra < 0 { "" } else { doc.extra_strs[m.extra] }
+      let code = join_block_spans_nl(doc, m, ctx)
+      frame.blocks.push(Block::CodeBlock(CodeBlockKind::Fenced(info), info, code))
+    } else if ck == 8 {
+      // HtmlBlock
+      let html = join_block_spans_nl(doc, m, ctx)
+      frame.blocks.push(Block::HtmlBlock(html))
+    } else if ck == 9 {
+      // ThematicBreak
+      frame.blocks.push(Block::ThematicBreak)
+    } else if ck == 10 {
+      // Table
+      let aligns = doc.table_aligns[t.extra2]
+      let cells_start = m.extra
+      let ncols = m.line_start
+      let num_rows = m.line_len
+      let headers : Array[TableCell] = Array::with_capacity(ncols)
+      let mut hi = 0
+      while hi < ncols {
+        headers.push(parse_table_cell_ast(doc, doc.table_cells[cells_start + hi], ctx, opts, has_footnotes, def_bodies))
+        hi = hi + 1
+      }
+      let rows : Array[Array[TableCell]] = Array::with_capacity(num_rows)
+      let mut ri = 0
+      while ri < num_rows {
+        let row : Array[TableCell] = Array::with_capacity(ncols)
+        let row_base = cells_start + (ri + 1) * ncols
+        let mut ci = 0
+        while ci < ncols {
+          row.push(parse_table_cell_ast(doc, doc.table_cells[row_base + ci], ctx, opts, has_footnotes, def_bodies))
+          ci = ci + 1
+        }
+        rows.push(row)
+        ri = ri + 1
+      }
+      frame.blocks.push(Block::Table(aligns, headers, rows))
+    } else if ck == 1 {
+      // BlockQuote container
+      stack.push(AstBlockFrame::{
+        kind: 1,
+        next_child: t.first_child,
+        list_start: None,
+        list_tight: false,
+        item_checked: None,
+        blocks: Array::new(),
+        items: Array::new(),
+      })
+    } else if ck == 2 {
+      // List container
+      let ordered = (m.kf & 512) != 0
+      let start = if ordered { Some(m.extra.to_int64()) } else { None }
+      let tight = (m.kf & 32) != 0
+      stack.push(AstBlockFrame::{
+        kind: 2,
+        next_child: t.first_child,
+        list_start: start,
+        list_tight: tight,
+        item_checked: None,
+        blocks: Array::new(),
+        items: Array::new(),
+      })
+    } else if ck == 3 {
+      // ListItem container
+      let task_state = (m.kf >> 7) & 3
+      let checked : Option[Bool] = if task_state == 2 {
+        Some(true)
+      } else if task_state == 1 {
+        Some(false)
+      } else {
+        None
+      }
+      stack.push(AstBlockFrame::{
+        kind: 3,
+        next_child: t.first_child,
+        list_start: None,
+        list_tight: false,
+        item_checked: checked,
+        blocks: Array::new(),
+        items: Array::new(),
+      })
+    }
+  }
+  Array::new()
+}
+
 ///| Parse Markdown into a structured tree `Document` AST (CommonMark / GFM).
-pub fn parse_document(_src : String, _opts : Options) -> Document {
-  Document::{ blocks: Array::new(), front_matter: None }
+pub fn parse_document(src : String, opts : Options) -> Document {
+  let doc = parse_blocks(src, opts)
+  let ctx = new_inline_ctx(opts, true)
+  let empty_defs : Map[String, String] = Map::new()
+  let blocks = build_blocks_from_doc(doc, ctx, opts, false, empty_defs)
+  Document::{ blocks, front_matter: None }
 }
 
 ///| Parse Markdown into a structured tree `Document` AST with extended features (frontmatter, footnotes).
-pub fn parse_document_extended(_src : String, _opts : ExtendedOptions) -> Document {
-  Document::{ blocks: Array::new(), front_matter: None }
+pub fn parse_document_extended(src : String, opts : ExtendedOptions) -> Document {
+  let mut body = src
+  let mut front_matter : Option[FrontMatter] = None
+  if opts.yaml_frontmatter || opts.pluses_frontmatter {
+    match scan_frontmatter(src, opts.yaml_frontmatter, opts.pluses_frontmatter) {
+      Some((kind, content, after)) => {
+        front_matter = Some(FrontMatter::{ kind, content })
+        body = src.slice(after, src.length())
+      }
+      None => ()
+    }
+  }
+  if !opts.footnotes {
+    let doc = parse_blocks(body, opts.base)
+    let ctx = new_inline_ctx(opts.base, true)
+    let empty_defs : Map[String, String] = Map::new()
+    let blocks = build_blocks_from_doc(doc, ctx, opts.base, false, empty_defs)
+    return Document::{ blocks, front_matter }
+  }
+  let (cleaned, def_order, def_bodies) = extract_footnote_defs(body)
+  let has_fn = def_order.length() > 0
+  let doc = parse_blocks(cleaned, opts.base)
+  let ctx = new_inline_ctx(opts.base, true)
+  let blocks = build_blocks_from_doc(doc, ctx, opts.base, has_fn, def_bodies)
+  let mut di = 0
+  while di < def_order.length() {
+    let lbl = def_order[di]
+    match def_bodies.get(lbl) {
+      Some(def_src) => {
+        let def_doc = parse_blocks(def_src, opts.base)
+        let empty_defs : Map[String, String] = Map::new()
+        let def_blocks = build_blocks_from_doc(def_doc, ctx, opts.base, false, empty_defs)
+        blocks.push(Block::FootnoteDefinition(lbl, def_blocks))
+      }
+      None => ()
+    }
+    di = di + 1
+  }
+  Document::{ blocks, front_matter }
 }
