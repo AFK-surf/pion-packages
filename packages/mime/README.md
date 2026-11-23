@@ -71,6 +71,14 @@ let kind = mime::sniff_mime(raw_bytes)
   - Wasm32 debug (`pionc build --target wasm32` + `node`): exit `0`
   - Wasm32 release (`pionc build --release --target wasm32` + `node`): exit `0`
 
+## Formal Verification (Lean 4)
+
+Run `sh packages/mime/proofs/run_proofs.sh` (or `sh scripts/verify-lean.sh mime`) to extract `packages/mime/src/*.pion` via `pionc extract-lean` and machine-check **22 production theorems** (`0 sorry`, `0 admit`, `0 native_decide`, `0 bv_decide`, only `{propext, Classical.choice, Quot.sound}`):
+
+- **Hex, Case Normalization & Quoted-Printable Codec (`MimeProofs/Codec.lean`, 11 theorems)**: `hex_upper_digit` / `hex_nibble_val` 4-bit roundtrip bijection, bounds (`-1` or `0..15`) & case-insensitivity; `ascii_lower_byte` idempotence & uppercase elimination; RFC 2045 §6.7 Quoted-Printable nibble bounds & full 8-bit byte pack/unpack bijection, literal encoder exclusion of `=`/CTLs/DEL/non-ASCII & trailing whitespace before EOL, decoder NUL/C0/DEL rejection, and 76-column soft-wrap bound (`col + width ≤ 75`).
+- **RFC Grammars & Filename Security (`MimeProofs/GrammarSecurity.lean`, 11 theorems)**: RFC 5987 `attr-char ⊂ tchar` strict inclusion & exclusion of `'`, `*`, `%`; RFC 9110 `tchar` rejection of CTLs/SP/non-ASCII/`/`/`;`/`=`/`"`; RFC 2046 `bcharsnospace` rejection of CTLs/SP/non-ASCII/`"`/`\`; alphanumeric acceptance across all three grammars; RFC 6266 `safe_filename` path separator, C0/DEL stripping (preserving printable ASCII), UTF-8 C1 (`C2 80..9F`) exact characterization, and Trojan-Source / RLO 3-byte UTF-8 bidi control detection (`U+202E`, `U+202D`, `U+2066`, `U+2069`).
+- **Native vs Lean Differential**: `45/45` cases byte-identical (`diff -u` exit `0`).
+
 ## Head-to-Head Benchmarks
 
 Run with `sh packages/mime/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `go.sum` / `Cargo.lock`, mandatory stdout SHA-256 verification) on **Darwin arm64** against:
