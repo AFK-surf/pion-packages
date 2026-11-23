@@ -8,19 +8,20 @@ Pure Pion, zero-dependency, zero-`World` Sans-IO implementation of the complete 
   - RESP2: `SimpleString (+)`, `SimpleError (-)`, `Integer (:)`, `BulkString ($)`, `Array (*)`, plus lossless `NullBulk ($-1)` and `NullArray (*-1)`.
   - RESP3: `Null (_)`, `Boolean (#t/#f)`, `Double (,)` (including `inf`, `-inf`, `nan`), `BigNumber (()`, `BulkError (!)`, `VerbatimString (=)`, `Map (%)`, `Set (~)`, `Attribute (|)` (out-of-band metadata attached to the following target frame, including nested and streamed attributes), and `Push (>)`.
   - **Streamed Chunked Types**: streamed `BulkString` (`$?` + `;len\r\n...\r\n;0\r\n`), streamed `Array` (`*?`), `Map` (`%?`), `Set` (`~?`), and `Attribute` (`|?`) terminated by `.\r\n`.
-  - **Redis Inline Commands**: `decode_inline` and top-level inline support in `StreamDecoder` with Redis `sdssplitargs` double-quote (`\n`, `\r`, `\t`, `\b`, `\a`, `\xHH`, `\"`, `\\`) and single-quote (`\'`, `\\`) escaping.
+  - **Redis Inline Commands**: `decode_inline` and opt-in top-level inline support in `StreamDecoder` (`set_allow_inline(true)` / `with_allow_inline(true)`) strictly matching Redis `sdssplitargs` double-quote (`\n`, `\r`, `\t`, `\b`, `\a`, `\xHH`, `\"`, `\\`), single-quote (`\'` only; `\\` stays literal), mid-token quotes, and C `isspace()` (`\v`, `\f`) rules, capped by `max_inline_len` (default 64 KiB).
 - **Sans-IO Streaming Pipeline (`StreamDecoder`)**:
-  - Handles arbitrary TCP fragmentation (down to 1-byte trickle) and coalesced multi-frame pipelines (`next_frame()` / `drain_frames()`).
+  - Incremental **O(n)** parser with persistent frame stack, streamed-bulk accumulator, and inline scan cursor (handles arbitrary TCP fragmentation down to 1-byte trickle and coalesced multi-frame pipelines via `next_frame()` / `drain_frames()`).
+  - Client-safe by default (`allow_inline = false`); rejects non-RESP prefix bytes immediately.
   - Automatic prefix compaction and buffer shrinking (`0` memory leak across long-lived connections).
 - **DoS & Security Hardening (`RespLimits`)**:
-  - Explicit `max_depth`, `max_bulk_len`, `max_collection_len`, `max_buffer_bytes`, and `max_total_nodes`.
-  - Pre-allocation OOM bomb defense (rejects oversized `$999999999` / `*999999999` headers before allocating).
-  - Iterative stack-safe decoding and encoding (`0` call-stack recursion, `0` stack overflow on 20,000-layer nested payloads on both Native and Wasm32).
-  - CRLF injection rejection in `SimpleString` / `SimpleError` encoding.
+  - Explicit `max_depth`, `max_bulk_len`, `max_collection_len`, `max_buffer_bytes`, `max_total_nodes`, and `max_inline_len` (64 KiB default).
+  - Overflow-safe length bounds checks (safe even with `Int::max` limits on Native and Wasm32) and pre-allocation OOM bomb defense.
+  - Iterative stack-safe decoding and encoding (`0` call-stack recursion, `0` stack overflow on 100,000-layer nested payloads on both Native and Wasm32).
+  - Strict CRLF validation (rejects lone `\r` / `\n` in `SimpleString` / `SimpleError` on both decode and encode), strict RESP3 `Double` grammar, and `+`/`-` `BigNumber` support.
 - **Command Builder & Redis Cluster Routing**:
   - `encode_command`, `encode_command_strings`, and reusable `PipelineBuilder` with direct ASCII integer formatting.
-  - Standard **CRC16-XMODEM (`poly 0x1021`, init `0x0000`)** and Redis `{hash_tag}` slot calculation `key_slot` (`0..16383`, strictly honoring Redis's first-`{` to first-`}` non-empty tag rule).
-  - `MOVED <slot> <host>:<port>` / `ASK <slot> <host>:<port>` parser (IPv4, hostname, and `[IPv6]:port`), `CLUSTER SLOTS` topology parser, and O(1) 16384-slot `ClusterRouter`.
+  - Single-pass **CRC16-XMODEM (`poly 0x1021`, init `0x0000`)** and Redis `{hash_tag}` slot calculation `key_slot` / `key_slot_string` (`0..16383`, strictly honoring Redis's first-`{` to first-`}` non-empty tag rule with zero `String -> Bytes` allocation).
+  - `MOVED <slot> <host>:<port>` / `ASK <slot> <host>:<port>` parser (IPv4, hostname, bracketed/unbracketed IPv6, and Redis 7 `unknown-endpoint` empty host `:<port>`), `CLUSTER SLOTS` topology parser (supporting Redis 7 `Null` preferred endpoints and rejecting overlapping/duplicate slot ranges), and O(1) 16384-slot `ClusterRouter`.
 
 ## API Overview
 
@@ -52,8 +53,9 @@ pub val struct RespLimits {
   pub max_depth : Int           // default: 128
   pub max_bulk_len : Int        // default: 67108864 (64 MiB)
   pub max_collection_len : Int  // default: 1048576
-  pub max_buffer_bytes : Int    // default: 67108864 (64 MiB)
-  pub max_total_nodes : Int     // default: 1048576
+  pub max_buffer_bytes : Int    // default: 67108928 (64 MiB + 64 B framing overhead)
+  pub max_total_nodes : Int     // default: 2097153 (1 + 2 * max_collection_len)
+  pub max_inline_len : Int      // default: 65536 (64 KiB, Redis PROTO_INLINE_MAX_SIZE)
 }
 
 // Codec & streaming
@@ -87,7 +89,8 @@ pub struct ClusterRouter { ... } // new, from_slots, update_from_slots, apply_mo
 sh scripts/verify.sh packages/resp
 ```
 
-- **Package Test Suite**: 13/13 tests pass across `resp_spec_test.pion`, `command_cluster_test.pion`, and `security_test.pion`.
+- **Package Test Suite**: 14/14 tests pass across `resp_spec_test.pion`, `command_cluster_test.pion`, and `security_test.pion`.
+- **Red-Team Audit Suite**: `sh packages/resp/audit/run_audit.sh` — **1,044/1,044 PASS** (`0 FAIL`, exit `0`), 4-mode byte-identical, 900k-iteration fuzz 0 mismatches / 0 panics, flat RSS, linear O(n) complexity.
 
 ### 4-Mode `wasm_smoke` Verification
 
@@ -110,8 +113,8 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Input: `5,731,182 B` | Op
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_redis_protocol`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | **57.031** | 55.652 | 58.544 | **100.49** | **285.16** | 12.69 MiB | **1.21x** |
-| `rust_redis_protocol` (`6.0.0`, `--release`) | 68.720 | 68.008 | 73.192 | 83.40 | 343.60 | **7.70 MiB** | 1.00x (baseline) |
+| `pion` (`--release`) | 53.333 | 53.107 | 53.644 | 107.46 | 266.66 | 12.67 MiB | 0.94x |
+| `rust_redis_protocol` (`6.0.0`, `--release`) | **50.346** | **49.699** | **50.428** | **113.84** | **251.73** | **7.55 MiB** | **1.00x (baseline)** |
 
 ### W2: 500,000 Pipelined Commands Encode + Decode Roundtrip (`SET`/`GET`/`HSET`/`MGET`)
 
@@ -119,19 +122,19 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `500,000` | Stdout S
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_redis_protocol`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 284.623 | 271.536 | 414.568 | 569.24 | 2.80 MiB | 0.82x |
-| `rust_redis_protocol` (`6.0.0`, `--release`) | **233.693** | 225.732 | 257.232 | **467.39** | **2.33 MiB** | **1.00x (baseline)** |
+| `pion` (`--release`) | 278.751 | 278.111 | 298.877 | 557.50 | 2.80 MiB | 0.75x |
+| `rust_redis_protocol` (`6.0.0`, `--release`) | **207.744** | **206.120** | **214.488** | **415.49** | **2.31 MiB** | **1.00x (baseline)** |
 
-### W3: 2,000,000 Cluster `key_slot` (`{hash_tag}`) + 500,000 `MOVED` Redirect Parse
+### W3: 2,000,000 Cluster `key_slot` (`{hash_tag}`) + 500,000 `MOVED`/`ASK` Redirect Parse
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000,000` | Stdout SHA-256: `97429500fae4ba83cf0e155836eba3777635bd7a1b3f90455971b8909b1d492c`
+Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000,000` | Stdout SHA-256: `dcb9d7eab4bae30aa394d5aab73c52a40d4545a0665a28eca07c9b94285ebf00`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_redis_protocol`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 109.895 | 81.091 | 376.485 | 54.95 | **1.78 MiB** | 0.31x |
-| `rust_redis_protocol` (`6.0.0`, `--release`) | **34.497** | 32.440 | 78.675 | **17.25** | 1.92 MiB | **1.00x (baseline)** |
+| `pion` (`--release`) | 48.325 | 47.142 | 48.850 | 24.16 | **1.73 MiB** | 0.67x |
+| `rust_redis_protocol` (`6.0.0`, `--release`) | **32.137** | **31.968** | **32.798** | **16.07** | 1.94 MiB | **1.00x (baseline)** |
 
 > **Honest Performance Analysis**:
-> - **W1 (1.21x faster than Rust `redis-protocol`)**: Pion's `StreamDecoder` scans directly in a compacted single-allocation byte buffer without cloning a `BytesMut` view per chunk, outperforming `redis-protocol` on fragmented 137B streaming RESP3 decode.
-> - **W2 (0.82x)**: `redis-protocol` uses zero-copy `bytes::Bytes` reference-counted sub-slicing during batch decode, whereas Pion currently allocates owned `Bytes` slices per `BulkString`.
-> - **W3 (0.31x)**: `parse_cluster_redirect` converts `String -> Bytes -> String` for owned `host` extraction on each `MOVED` parse (500k allocations), whereas Rust's zero-copy `&str` slicing avoids allocations on the redirect string.
+> - **W1 (0.94x vs Rust `redis-protocol` zero-copy `decode_bytes_mut`)**: After fixing the Rust harness to use idiomatic zero-copy `decode_bytes_mut` (eliminating `buf.clone().freeze()`) and upgrading Pion's `StreamDecoder` to an O(n) incremental state machine, Pion reaches near parity with Rust (`53.3 ms` vs `50.3 ms`, `107.5 MB/s` vs `113.8 MB/s`).
+> - **W2 (0.75x)**: `redis-protocol` uses zero-copy `bytes::Bytes` reference-counted sub-slicing during batch decode, whereas Pion allocates owned `Bytes` slices per `BulkString`.
+> - **W3 (0.67x, improved from 0.31x)**: Both sides now parse `MOVED` and `ASK` and materialize an owned `host` string; Pion's single-pass `key_slot` and zero-`to_bytes()` `parse_cluster_redirect` cut median runtime from `109.9 ms` to `48.3 ms` (`2.27x` faster), with the remaining gap due to bounds-checked CRC16 table lookups vs Rust's `crc16` crate.

@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use redis_protocol::redis_keyslot;
-use redis_protocol::resp3::decode::complete::decode_bytes;
+use redis_protocol::resp3::decode::complete::{decode_bytes, decode_bytes_mut};
 use redis_protocol::resp3::encode::complete::extend_encode;
 use redis_protocol::resp3::types::BytesFrame;
 use std::env;
@@ -108,10 +108,8 @@ fn run_w1(path: &str) {
             if buf.is_empty() {
                 break;
             }
-            let view = buf.clone().freeze();
-            match decode_bytes(&view) {
-                Ok(Some((frame, consumed))) => {
-                    let _ = buf.split_to(consumed);
+            match decode_bytes_mut(&mut buf) {
+                Ok(Some((frame, _consumed, _raw))) => {
                     let (n, h) = walk_frame(&frame);
                     frames += 1;
                     nodes += n;
@@ -225,25 +223,40 @@ fn run_w2() {
     println!("checksum={}", checksum);
 }
 
-fn parse_moved_rust(s: &str) -> Option<(u16, u16)> {
-    let rest = s.strip_prefix("MOVED ")?;
+enum RedirectRust {
+    Moved(u16, String, u16),
+    Ask(u16, String, u16),
+}
+
+fn parse_redirect_rust(s: &str) -> Option<RedirectRust> {
+    let (is_moved, rest) = if let Some(r) = s.strip_prefix("MOVED ") {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix("ASK ") {
+        (false, r)
+    } else {
+        return None;
+    };
     let (slot_s, addr) = rest.split_once(' ')?;
     let slot: u16 = slot_s.parse().ok()?;
     if slot > 16383 {
         return None;
     }
-    let port_s = if let Some(after) = addr.strip_prefix('[') {
-        let (_, tail) = after.split_once("]:")?;
-        tail
+    let (host, port_s) = if let Some(after) = addr.strip_prefix('[') {
+        let (h, tail) = after.split_once("]:")?;
+        (h.to_owned(), tail)
     } else {
-        let (_, tail) = addr.rsplit_once(':')?;
-        tail
+        let (h, tail) = addr.rsplit_once(':')?;
+        (h.to_owned(), tail)
     };
     let port: u16 = port_s.parse().ok()?;
     if port == 0 {
         return None;
     }
-    Some((slot, port))
+    if is_moved {
+        Some(RedirectRust::Moved(slot, host, port))
+    } else {
+        Some(RedirectRust::Ask(slot, host, port))
+    }
 }
 
 fn run_w3() {
@@ -267,9 +280,9 @@ fn run_w3() {
     ];
     let redirects: [&str; 4] = [
         "MOVED 3999 127.0.0.1:6381",
-        "MOVED 12182 10.0.0.3:6379",
+        "ASK 12182 10.0.0.3:6379",
         "MOVED 5061 [::1]:7002",
-        "MOVED 3443 redis-node-1:6379",
+        "ASK 3443 redis-node-1:6379",
     ];
     let ops = 2_000_000usize;
     let mut slot_sum: u64 = 0;
@@ -278,8 +291,15 @@ fn run_w3() {
         let s = redis_keyslot(keys[i & 15]);
         slot_sum = slot_sum.wrapping_add(s as u64);
         if (i & 3) == 0 {
-            let (ms, port) = parse_moved_rust(redirects[(i >> 2) & 3]).expect("moved parse");
-            moved_sum = moved_sum.wrapping_add(ms as u64).wrapping_add(port as u64);
+            let (tag, ms, host, port) = match parse_redirect_rust(redirects[(i >> 2) & 3]).expect("redirect parse") {
+                RedirectRust::Moved(s, h, p) => (1u64, s, h, p),
+                RedirectRust::Ask(s, h, p) => (2u64, s, h, p),
+            };
+            moved_sum = moved_sum
+                .wrapping_add(tag)
+                .wrapping_add(ms as u64)
+                .wrapping_add(host.len() as u64)
+                .wrapping_add(port as u64);
         }
     }
     println!("ops={}", ops);

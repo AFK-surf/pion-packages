@@ -8,7 +8,7 @@ export PATH="${HOME}/.pion/bin:${HOME}/.cargo/bin:${PATH}"
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/tmp/w13-resp-bench"
+OUT_DIR="${RESP_BENCH_OUT:-/private/tmp/fix-resp-bench}"
 BIN_DIR="$OUT_DIR/bin"
 W1_CORPUS="$OUT_DIR/w1_resp3_200k.bin"
 
