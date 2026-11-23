@@ -31,6 +31,23 @@ pionc test --json packages/time
 pionc build --target wasm32 -o /tmp/time_wasm_smoke.wasm packages/time/wasm_smoke
 ```
 
+## Formal Verification (Lean 4)
+
+The pure calendar, duration, and ordering kernels in `packages/time/src/{types,civil,timestamp}.pion` are annotated with `#verify`, extracted to Lean 4 via `pionc extract-lean` (`Time.Funs`), and machine-checked in `packages/time/proofs/`:
+
+- **`packages/time/proofs/TimeProofs.lean`** — end-to-end proofs with **0 `sorry`, 0 `admit`, 0 `native_decide`, 0 `bv_decide`**:
+  - **Gregorian leap year & month lengths**: `is_leap_year_spec` (full `Int32` equivalence to `(y % 4 = 0 ∧ y % 100 ≠ 0) ∨ y % 400 = 0`, including negative BCE years and `1900`/`2000`/`2100`/`2400`/`0`/`-100`/`-400` corollaries), `days_in_month_of_spec` (`1 ≤ m ≤ 12 → 28 ≤ days_in_month_of y m ≤ 31`), `days_in_month_of_feb`.
+  - **Proleptic Gregorian calendar ↔ Unix epoch days bijection (`-9999-01-01 ..= 9999-12-31`)**: `to_epoch_days_spec`, `from_epoch_days_spec`, `from_epoch_days_out_of_range`, `from_epoch_days_to_epoch_days` (forward roundtrip), `to_epoch_days_from_epoch_days` (inverse roundtrip + output validity), `to_epoch_days_strict_mono` (strict order preservation `Date.cmp d1 d2 = -1 ↔ to_epoch_days d1 < to_epoch_days d2`).
+  - **`SignedDuration` normalization & overflow-free checked arithmetic**: `signed_duration_{zero,min,max}_valid`, `checked_add_i64_spec`, `checked_sub_i64_spec`, `signed_duration_new_sound`, `signed_duration_checked_neg_sound`, `signed_duration_checked_add_sound`, `signed_duration_checked_sub_sound` (exact iff soundness over all `Int64` boundaries including `INT64_MIN`/`INT64_MAX`, preserving same-sign nanosecond normalization and exact `totalNanos`), and `signed_duration_cmp_{spec,refl,antisymm,trans_lt}`.
+  - **`Date` / `Time` / `DateTime` / `Timestamp` strict total orders**: `date_cmp_*`, `time_to_second_of_day_spec`, `time_cmp_*`, `datetime_cmp_*`, `timestamp_cmp_*`.
+- **`packages/time/proofs/CheckAxioms.lean`** — `#print axioms` audit confirming all 47 verified theorems depend **only** on standard Lean 4 axioms (`propext`, `Classical.choice`, `Quot.sound`).
+- **`packages/time/proofs/EvalDiff.lean`** — `#guard` + `#eval` differential suite (31 boundary/overflow cases including `-9999-01-01`, `0000-02-29`, `1970-01-01`, `2000-02-29`, `9999-12-31`, `SignedDuration::min`/`max`) cross-checked via `diff -u` against native Pion execution.
+- **`packages/time/proofs/run_proofs.sh`** — one-command verification gate (builds in `/private/tmp/pion-lean-time` with zero git worktree pollution):
+
+```sh
+sh packages/time/proofs/run_proofs.sh
+```
+
 ## Head-to-Head Benchmarks (`Darwin arm64`, `--warmup 1 --rounds 5`)
 
 Measured via `sh packages/time/audit/run_audit.sh` (strictly interleaved rounds, SHA-256 verified byte-identical stdout across all implementations). Both idiomatic typed APIs and specialized raw/packed APIs are reported side-by-side:
