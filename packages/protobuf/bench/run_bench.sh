@@ -23,17 +23,17 @@ SPAN_PAYLOAD_BYTES=$(( (CORPUS_RAW_BYTES - 8000) * 50 ))
 echo "==> Building Pion Native benchmark (--release)"
 pionc build --release -o "$BIN_DIR/pion_bench" "$BENCH_DIR/pion_bench"
 
-echo "==> Building Rust prost 0.13.5 benchmark (--release, target/Cargo.lock in /private/tmp)"
+echo "==> Building Rust prost 0.13.5 benchmark (--release --locked, target in /private/tmp)"
 rm -rf "$OUT_DIR/rust-build"
 cp -R "$BENCH_DIR/rust" "$OUT_DIR/rust-build"
-CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release \
+CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release --locked \
   --manifest-path "$OUT_DIR/rust-build/Cargo.toml"
 cp "$OUT_DIR/rust-target/release/protobuf_bench_rust" "$BIN_DIR/rust_bench"
 
-echo "==> Building Go google.golang.org/protobuf benchmark (go.sum in /private/tmp)"
+echo "==> Building Go google.golang.org/protobuf benchmark (pinned via go.sum)"
 rm -rf "$OUT_DIR/go-build"
 cp -R "$BENCH_DIR/go" "$OUT_DIR/go-build"
-(cd "$OUT_DIR/go-build" && go mod tidy && go build -o "$BIN_DIR/go_bench" .)
+(cd "$OUT_DIR/go-build" && go build -o "$BIN_DIR/go_bench" .)
 
 echo ""
 echo "=== WORKLOAD 1: OTel/RPC Nested Span Batch Decode (100,000 spans) ==="
