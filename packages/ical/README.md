@@ -56,7 +56,17 @@ fn example() -> Result[Unit, ical::IcalError] {
 
 ## Verification
 
-- **Unit & compliance tests**: `sh scripts/verify.sh packages/ical` — **21/21 `ical` tests** (283/283 including `time`) covering RFC 5545 §3.8.5.3 official examples, `rrule.js`/`dateutil` edge cases, RFC 6868, UTF-8 3-byte/4-byte folding, DST gaps/folds, `VTIMEZONE`, and DoS limits.
+- **Unit & compliance tests**: `sh scripts/verify.sh packages/ical` — **23/23 `ical` tests** (285/285 including `time`) covering RFC 5545 §3.8.5.3 official examples, `rrule.js`/`dateutil` edge cases, RFC 6868, UTF-8 3-byte/4-byte folding, DST gaps/folds, `VTIMEZONE`, security/injection regressions, and DoS limits.
+- **Red-team audit suite (`packages/ical/audit`)**:
+  - **38/38 PASS (0 FAIL)** — all 24 red-team defect tests (2 P0 / 4 tests, 6 P1 / 12 tests, 8 P2 / 8 tests) + 14/14 fairness control tests pass.
+  - **4,000-rule three-way differential** (`python-dateutil 3.0.0` + Rust `rrule 0.14.0`, seed 5545): `agree` improved from **3,017 (75.4%) → 3,505 (87.6%)**; `consensus_diff` dropped from **545 (13.6%) → 54 (1.4%)**, with **0** remaining real bugs (the 54 diffs are 17 RFC-faithful `WEEKLY+BYSETPOS` full-first-week rules where `dateutil`/Rust truncate the first week, plus 37 `YEARLY+BYWEEKNO` boundary rules caused by `dateutil`'s `self.yearlen` typo in `lnumweeks` copied by Rust `rrule`).
+  - **DoS cliff remediation (`packages/ical/audit/dos.sh`)**:
+    - `D1a` (`YEARLY` full timeset `COUNT=1`): **4,107 MiB / 1.29s → 2.8 MiB / 0.01s** (**1,467× RSS reduction**; Wasm32 `--release` exits `0` instead of OOM crash).
+    - `D1b` (`MONTHLY` full timeset `COUNT=1`): **354 MiB / 0.11s → 2.8 MiB / 0.00s**.
+    - `D1c` (`YEARLY` full timeset + `BYSETPOS=1`): **3,624 MiB / 0.97s → 2.8 MiB / 0.00s**.
+    - `D2a`–`D2c` (unsatisfiable / sparse sub-daily rules): **0.00s / 1.9 MiB** (`dateutil` times out at 3.17s on `D2a`).
+    - `D3` (`VTIMEZONE` `FREQ=SECONDLY` 5-year `offset_at` DoS): **15.4s → 0.00s / 1.9 MiB**.
+  - **4-mode determinism** (`run_audit.sh wasm`, 4,000-rule corpus, clean `PION_CACHE_DIR`): all 4 modes identical SHA-256 `5bc10b0aae0075378b0eb9258210825cf56a0334d2c916790a869d0f490d31af`.
 - **4-Mode `wasm_smoke`** (Native debug, Native release, Wasm32 debug, Wasm32 release) with clean `PION_CACHE_DIR`:
   - All 4 modes exit `0` with byte-identical stdout SHA-256:
     `c3578280c103a1c71e96726e26bec2682ac90a92337c0986a99764e562269a5d`
@@ -67,15 +77,16 @@ Run via `sh packages/ical/bench/run_bench.sh` (`scripts/bench_compare.py --warmu
 
 | Workload | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput / Latency | Peak RSS | Speedup | Stdout SHA-256 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| **W1**: 4,000-VEVENT `.ics` Parse + Serialize Roundtrip (`1.93 MB`, folded + UTF-8) | **`pion`** | **76.85** | 60.41 | 97.50 | **25.07 MB/s** | **15.72 MiB** | **2.33x** | `a9ed4a3fbc0e51ca…` |
-| | `rust_icalendar` (`0.16.17`) | 179.27 | 122.53 | 183.25 | 10.75 MB/s | 51.34 MiB | 1.00x | `a9ed4a3fbc0e51ca…` |
-| **W2**: Complex `RRULE` Expansion (80 rules: `BYDAY` ordinals, `BYSETPOS`, `WKST`, leap, `58,000` occs) | **`pion`** | **27.11** | 20.94 | 29.02 | **467.49 ns/op** | **2.22 MiB** | **1.37x** | `8a01a8a0a03b5cbc…` |
-| | `rust_rrule` (`0.14.0`) | 37.17 | 34.63 | 42.82 | 640.77 ns/op | 7.75 MiB | 1.00x | `8a01a8a0a03b5cbc…` |
-| **W3**: `RRuleSet` Window Query Batch (`200` sets × 2 `RRULE`s + 4 `RDATE`s + 6 `EXDATE`s, 2y window, `72,200` occs) | **`pion`** | **36.67** | 33.17 | 49.91 | **183.36 µs/set** | **2.36 MiB** | **1.48x** | `f79e28a0fac65a54…` |
-| | `rust_rrule` (`0.14.0`) | 54.33 | 42.66 | 63.86 | 271.65 µs/set | 7.78 MiB | 1.00x | `f79e28a0fac65a54…` |
+| **W1**: 4,000-VEVENT `.ics` Parse + Serialize Roundtrip (`1.93 MB`, folded + UTF-8, all TEXT props unescaped) | **`pion`** | **47.27** | 45.59 | 49.21 | **40.76 MB/s** | **15.73 MiB** | **1.57x** | `e4e48bf0c572404c…` |
+| | `rust_icalendar` (`0.16.17`) | 74.34 | 70.98 | 78.51 | 25.92 MB/s | 51.06 MiB | 1.00x | `e4e48bf0c572404c…` |
+| **W2**: Complex `RRULE` Expansion (80 rules: `BYDAY` ordinals, `BYSETPOS`, `WKST`, leap, `58,000` occs) | **`pion`** | **14.72** | 13.82 | 15.04 | **253.85 ns/op** | **2.27 MiB** | **1.68x** | `8a01a8a0a03b5cbc…` |
+| | `rust_rrule` (`0.14.0`) | 24.70 | 24.03 | 29.12 | 425.86 ns/op | 7.78 MiB | 1.00x | `8a01a8a0a03b5cbc…` |
+| **W3**: `RRuleSet` Window Query Batch (`200` sets × 2 `RRULE`s + 4 `RDATE`s + 6 `EXDATE`s, 2y window, `72,200` occs) | **`pion`** | 26.04 | 25.70 | 26.29 | 130.21 µs/set | **2.42 MiB** | 0.93x | `f79e28a0fac65a54…` |
+| | `rust_rrule` (`0.14.0`) | **24.18** | 23.08 | 24.75 | **120.90 µs/set** | 7.81 MiB | 1.00x | `f79e28a0fac65a54…` |
 
 ### Honest Analysis
 
-- **W1 (`.ics` Parse + Roundtrip, 2.33x faster, 3.27x lower RSS)**: `ical`'s single-pass streaming unfolder + flat `Array[Property]` avoids `nom` combinator backtracking and per-component `BTreeMap` allocations that Rust `icalendar` constructs eagerly. Note that `ical` keeps property values raw until `unescape_text` is called (W1 explicitly calls `unescape_text` on `SUMMARY` and `DESCRIPTION` to match Rust `icalendar`'s output byte-for-byte).
-- **W2 & W3 (`RRULE` & `RRuleSet`, 1.37x–1.48x faster, 3.3x–3.5x lower RSS)**: Direct epoch-day integer arithmetic (backed by `packages/time`'s branchless Neri-Schneider calendar math) and streaming k-way merge avoid per-year lookup-table allocations and `chrono-tz` binary size overhead.
+- **W1 (`.ics` Parse + Roundtrip, 1.57x faster, 3.25x lower RSS)**: `ical`'s single-pass streaming unfolder + flat `Array[Property]` avoids `nom` combinator backtracking and per-component `BTreeMap` allocations that Rust `icalendar` constructs eagerly. For fairness, W1 unescapes and hashes every VEVENT TEXT property (`SUMMARY`, `DESCRIPTION`, `LOCATION`) in Pion to match Rust `icalendar`'s eager TEXT unescaping; note that Rust `icalendar` still eagerly builds typed property maps for non-TEXT properties.
+- **W2 (`RRULE` Expansion, 1.68x faster, 3.43x lower RSS)**: Lazy `(days × timeset)` streaming avoids per-period `DateTime` array allocations while direct epoch-day integer arithmetic (backed by `packages/time`'s branchless Neri-Schneider calendar math) avoids per-year lookup-table allocations.
+- **W3 (`RRuleSet` Window Query, 0.93x vs Rust, 3.23x lower RSS)**: Pion is within 1.8 ms of Rust `rrule` at 3.23x lower RSS (`2.42 MiB` vs `7.81 MiB`); the small time margin reflects Pion's streaming `ZonedRuleStream` wrapper and per-occurrence timezone resolution overhead. Note that W2/W3 corpora are UTC-only; zoned DST/UTC-`UNTIL` paths are verified by the unit and red-team test suites.
 - **Scope tradeoff**: Rust `rrule` bundles the entire IANA `chrono-tz` database in the binary; `packages/ical` stays lean and `wasm32`-friendly by delegating timezone definitions to `packages/time::TimeZone` (POSIX TZ strings & TZif binary blobs) and parsed `VTIMEZONE` components.

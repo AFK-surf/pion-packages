@@ -140,10 +140,120 @@ pub fn VTimeZone::from_component(comp : Component) -> Result[VTimeZone, IcalErro
   Ok(VTimeZone::{ tzid: tzid, observances: observances })
 }
 
+///| Check if an `RRule` has no `BY*` filter/expansion parts.
+fn rrule_has_no_by_parts(r : RRule) -> Bool {
+  r.bysetpos.length() == 0 &&
+  r.bymonth.length() == 0 &&
+  r.bymonthday.length() == 0 &&
+  r.byyearday.length() == 0 &&
+  r.byweekno.length() == 0 &&
+  r.byday.length() == 0 &&
+  r.byhour.length() == 0 &&
+  r.byminute.length() == 0 &&
+  r.bysecond.length() == 0
+}
+
+///| Fast, DoS-safe evaluation of the last observance transition `<= dt` for an `RRule`.
+fn vtz_rrule_last_before(
+  r : RRule,
+  dtstart : time::DateTime,
+  dt : time::DateTime,
+) -> Option[time::DateTime] {
+  if dtstart.cmp(dt) > 0 {
+    return None
+  }
+  // Effective upper bound: min(dt, rule.until)
+  let cap = match r.until {
+    Some(u) => if u.cmp(dt) < 0 { u } else { dt }
+    None => dt
+  }
+  if dtstart.cmp(cap) > 0 {
+    return None
+  }
+  // O(1) closed form for plain DAILY / HOURLY / MINUTELY / SECONDLY rules without BY* parts
+  if rrule_has_no_by_parts(r) {
+    let unit_sec = match r.freq {
+      Freq::Daily => 86400L
+      Freq::Hourly => 3600L
+      Freq::Minutely => 60L
+      Freq::Secondly => 1L
+      _ => 0L
+    }
+    if unit_sec > 0L {
+      let step = r.interval.to_int64() * unit_sec
+      if step > 0L {
+        let start_s = dt_to_epoch_sec(dtstart)
+        let cap_s = dt_to_epoch_sec(cap)
+        let mut steps = (cap_s - start_s) / step
+        match r.count {
+          Some(c) => {
+            if c <= 0 {
+              return None
+            }
+            let max_steps = (c - 1).to_int64()
+            if steps > max_steps {
+              steps = max_steps
+            }
+          }
+          None => ()
+        }
+        let target_s = start_s + steps * step
+        let ed = floor_div_86400(target_s)
+        let sod = (target_s - ed.to_int64() * 86400L).to_int()
+        return Some(ed_sec_to_datetime(ed, sod))
+      }
+    }
+  }
+  // Fast-forward YEARLY rules without COUNT when dtstart is far before cap (e.g. 1601 Microsoft VTIMEZONE)
+  let start_for_iter = match (r.freq, r.count) {
+    (Freq::Yearly, None) => {
+      let gap_years = cap.date.year - dtstart.date.year
+      if gap_years > 16 && r.interval > 0 {
+        let skip_periods = (gap_years - 8) / r.interval
+        let jump_year = dtstart.date.year + skip_periods * r.interval
+        if jump_year > dtstart.date.year && jump_year <= cap.date.year {
+          let dim = time::days_in_month_of(jump_year, dtstart.date.month)
+          let d = if dtstart.date.day <= dim { dtstart.date.day } else { dim }
+          match time::Date::new(jump_year, dtstart.date.month, d) {
+            Ok(jd) => time::DateTime::from_parts(jd, dtstart.time)
+            Err(_) => dtstart
+          }
+        } else {
+          dtstart
+        }
+      } else {
+        dtstart
+      }
+    }
+    _ => dtstart
+  }
+  // Bounded iteration (protects against adversarial sub-daily VTIMEZONE RRULEs)
+  let it = r.iter(start_for_iter)
+  let mut last : Option[time::DateTime] = None
+  let mut steps = 0
+  let max_steps = 4096
+  while steps < max_steps {
+    match it.next() {
+      Ok(Some(v)) => {
+        if v.cmp(cap) > 0 {
+          return last
+        }
+        last = Some(v)
+      }
+      Ok(None) => return last
+      Err(_) => return last
+    }
+    steps = steps + 1
+  }
+  last
+}
+
 ///| Resolve the UTC offset active for a given civil `DateTime` according to this `VTimeZone`.
+///| Per RFC 5545 §3.3.5, nonexistent local times in a spring-forward gap use the pre-gap offset (`TZOFFSETFROM`).
 pub fn VTimeZone::offset_at(self : VTimeZone, dt : time::DateTime) -> Option[time::Offset] {
   let mut best_trans : Option[time::DateTime] = None
-  let mut best_offset : Option[time::Offset] = None
+  let mut best_from : Option[time::Offset] = None
+  let mut best_to : Option[time::Offset] = None
   let mut i = 0
   while i < self.observances.length() {
     let obs = self.observances[i]
@@ -155,7 +265,8 @@ pub fn VTimeZone::offset_at(self : VTimeZone, dt : time::DateTime) -> Option[tim
       }
       if better {
         best_trans = Some(obs.dtstart)
-        best_offset = Some(obs.offset_to)
+        best_from = Some(obs.offset_from)
+        best_to = Some(obs.offset_to)
       }
     }
     // Candidate 2: explicit RDATEs
@@ -169,7 +280,8 @@ pub fn VTimeZone::offset_at(self : VTimeZone, dt : time::DateTime) -> Option[tim
         }
         if better {
           best_trans = Some(rd)
-          best_offset = Some(obs.offset_to)
+          best_from = Some(obs.offset_from)
+          best_to = Some(obs.offset_to)
         }
       }
       j = j + 1
@@ -177,22 +289,37 @@ pub fn VTimeZone::offset_at(self : VTimeZone, dt : time::DateTime) -> Option[tim
     // Candidate 3: RRULEs
     let mut k = 0
     while k < obs.rrules.length() {
-      match obs.rrules[k].before(obs.dtstart, dt, true) {
-        Ok(Some(occ)) => {
+      match vtz_rrule_last_before(obs.rrules[k], obs.dtstart, dt) {
+        Some(occ) => {
           let better = match best_trans {
             None => true
             Some(prev) => occ.cmp(prev) > 0
           }
           if better {
             best_trans = Some(occ)
-            best_offset = Some(obs.offset_to)
+            best_from = Some(obs.offset_from)
+            best_to = Some(obs.offset_to)
           }
         }
-        _ => ()
+        None => ()
       }
       k = k + 1
     }
     i = i + 1
   }
-  best_offset
+  match (best_trans, best_from, best_to) {
+    (Some(tr), Some(off_from), Some(off_to)) => {
+      let delta = off_to.seconds - off_from.seconds
+      if delta > 0 {
+        // Spring-forward gap: local wall times in [tr, tr + delta) do not exist;
+        // RFC 5545 §3.3.5 requires interpreting them with the pre-gap offset (off_from).
+        let diff_sec = dt_to_epoch_sec(dt) - dt_to_epoch_sec(tr)
+        if diff_sec >= 0L && diff_sec < delta.to_int64() {
+          return Some(off_from)
+        }
+      }
+      Some(off_to)
+    }
+    _ => None
+  }
 }

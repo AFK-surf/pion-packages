@@ -52,6 +52,9 @@ fn bench_ics_roundtrip(raw: &str) {
             if let Some(desc) = ev.property_value("DESCRIPTION") {
                 checksum = hash_str(checksum, desc);
             }
+            if let Some(loc) = ev.property_value("LOCATION") {
+                checksum = hash_str(checksum, loc);
+            }
         }
     }
     println!("events={}", events);

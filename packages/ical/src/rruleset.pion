@@ -11,6 +11,9 @@ pub struct RRuleSet {
   pub exdates : Array[time::DateTime]
   pub exrules : Array[RRule]
   pub disambiguation : time::Disambiguation
+  dtstart_is_utc : Bool
+  utc_rdates : Array[time::Timestamp]
+  utc_exdates : Array[time::Timestamp]
 }
 
 ///| Construct a UTC `RRuleSet`.
@@ -23,6 +26,9 @@ pub fn RRuleSet::new(dtstart : time::DateTime) -> RRuleSet {
     exdates: [],
     exrules: [],
     disambiguation: time::Disambiguation::Compatible,
+    dtstart_is_utc: false,
+    utc_rdates: [],
+    utc_exdates: [],
   }
 }
 
@@ -36,6 +42,9 @@ pub fn RRuleSet::with_tz(dtstart : time::DateTime, tz : time::TimeZone) -> RRule
     exdates: [],
     exrules: [],
     disambiguation: time::Disambiguation::Compatible,
+    dtstart_is_utc: false,
+    utc_rdates: [],
+    utc_exdates: [],
   }
 }
 
@@ -59,7 +68,7 @@ pub fn RRuleSet::add_exrule(self : RRuleSet, rule : RRule) -> Unit {
   self.exrules.push(rule)
 }
 
-///| Parse a comma-separated list of iCalendar DATE/DATE-TIME values into `out`.
+///| Parse a comma-separated list of iCalendar DATE/DATE-TIME values into `out` (used by VTIMEZONE).
 fn parse_datetime_csv(
   raw : String,
   tzid : Option[String],
@@ -87,6 +96,58 @@ fn parse_datetime_csv(
   Ok(())
 }
 
+///| Parse a comma-separated list of `RDATE`/`EXDATE` values (supporting `Z`, `TZID`, and `VALUE=PERIOD`).
+fn parse_rset_datetime_csv(
+  raw : String,
+  tzid : Option[String],
+  is_period : Bool,
+  local_out : Array[time::DateTime],
+  utc_out : Array[time::Timestamp],
+) -> Result[Unit, IcalError] {
+  let n = raw.length()
+  let mut pos = 0
+  while pos < n {
+    let mut comma = pos
+    while comma < n && raw.code_unit_at(comma) != 44 {
+      comma = comma + 1
+    }
+    // For VALUE=PERIOD (RFC 5545 §3.8.5.2), extract the start date-time before '/'.
+    let mut tok_end = comma
+    if is_period {
+      let mut slash = pos
+      while slash < comma && raw.code_unit_at(slash) != 47 {
+        slash = slash + 1
+      }
+      if slash < comma {
+        if slash + 1 >= comma {
+          return Err(IcalError::InvalidDateTime("empty duration/end in PERIOD value"))
+        }
+        tok_end = slash
+      }
+    }
+    let sb = StringBuilder::new()
+    let mut k = pos
+    while k < tok_end {
+      sb.write_byte(raw.code_unit_at(k).to_byte())
+      k = k + 1
+    }
+    match parse_ical_datetime(sb.to_string(), tzid) {
+      Ok(idt) =>
+      match idt {
+        IcalDateTime::Utc(udt) =>
+        match time::Offset::utc().to_timestamp(udt) {
+          Ok(ts) => utc_out.push(ts)
+          Err(e) => return Err(IcalError::InvalidDateTime(e.message))
+        }
+        _ => local_out.push(ical_datetime_to_datetime(idt))
+      }
+      Err(e) => return Err(e)
+    }
+    pos = comma + 1
+  }
+  Ok(())
+}
+
 ///| Build an `RRuleSet` from a parsed `VEVENT` / `VTODO` component.
 pub fn RRuleSet::from_component(
   comp : Component,
@@ -100,7 +161,22 @@ pub fn RRuleSet::from_component(
     Ok(v) => v
     Err(e) => return Err(e)
   }
-  let set = RRuleSet::with_tz(ical_datetime_to_datetime(dtstart_idt), tz)
+  let dtstart_is_utc = match dtstart_idt {
+    IcalDateTime::Utc(_) => true
+    _ => false
+  }
+  let set = RRuleSet::{
+    dtstart: ical_datetime_to_datetime(dtstart_idt),
+    tz: tz,
+    rrules: [],
+    rdates: [],
+    exdates: [],
+    exrules: [],
+    disambiguation: time::Disambiguation::Compatible,
+    dtstart_is_utc: dtstart_is_utc,
+    utc_rdates: [],
+    utc_exdates: [],
+  }
 
   let rrule_props = comp.get_properties("RRULE")
   let mut i = 0
@@ -125,7 +201,17 @@ pub fn RRuleSet::from_component(
   let rdate_props = comp.get_properties("RDATE")
   let mut k = 0
   while k < rdate_props.length() {
-    match parse_datetime_csv(rdate_props[k].value, rdate_props[k].get_param_first("TZID"), set.rdates) {
+    let is_period = match rdate_props[k].get_param_first("VALUE") {
+      Some(v) => ascii_eq_ignore_case(v, "PERIOD")
+      None => false
+    }
+    match parse_rset_datetime_csv(
+      rdate_props[k].value,
+      rdate_props[k].get_param_first("TZID"),
+      is_period,
+      set.rdates,
+      set.utc_rdates,
+    ) {
       Ok(_) => ()
       Err(e) => return Err(e)
     }
@@ -135,7 +221,13 @@ pub fn RRuleSet::from_component(
   let exdate_props = comp.get_properties("EXDATE")
   let mut m = 0
   while m < exdate_props.length() {
-    match parse_datetime_csv(exdate_props[m].value, exdate_props[m].get_param_first("TZID"), set.exdates) {
+    match parse_rset_datetime_csv(
+      exdate_props[m].value,
+      exdate_props[m].get_param_first("TZID"),
+      false,
+      set.exdates,
+      set.utc_exdates,
+    ) {
       Ok(_) => ()
       Err(e) => return Err(e)
     }
@@ -208,15 +300,160 @@ fn zoned_array_contains_ts(arr : Array[time::Zoned], ts : time::Timestamp) -> Bo
   false
 }
 
-///| Streaming k-way merge state for `RRuleSet`.
-struct RRuleSetMerger {
+///| Resolve a civil `DateTime` in `tz` using `mode`, or as UTC if `as_utc` is true.
+fn resolve_rule_dt(
+  dt : time::DateTime,
+  tz : time::TimeZone,
+  mode : time::Disambiguation,
+  as_utc : Bool,
+) -> Result[time::Zoned, IcalError] {
+  if as_utc {
+    match time::Offset::utc().to_timestamp(dt) {
+      Ok(ts) => Ok(tz.to_zoned(ts))
+      Err(e) => Err(IcalError::InvalidDateTime(e.message))
+    }
+  } else {
+    resolve_zoned(dt, tz, mode)
+  }
+}
+
+///| Monotone, deduplicated `Zoned` stream wrapper around an `RRuleIter`.
+///| Uses a bounded 4-hour lookahead reorder buffer for non-UTC zoned streams so spring-forward
+///| DST gaps never emit out-of-order or duplicated UTC instants.
+struct ZonedRuleStream {
+  iter : RRuleIter
   tz : time::TimeZone
   mode : time::Disambiguation
-  inc_iters : Array[RRuleIter]
+  as_utc : Bool
+  needs_reorder : Bool
+  mut buf : Array[time::Zoned]
+  mut max_seen_sec : Int64
+  mut has_max : Bool
+  mut exhausted : Bool
+  mut last_emitted : Option[time::Timestamp]
+}
+
+///| Create a `ZonedRuleStream` for an `RRule` in `set`.
+fn ZonedRuleStream::new(rule : RRule, set : RRuleSet) -> ZonedRuleStream {
+  let iter = if set.dtstart_is_utc {
+    rule.iter(set.dtstart)
+  } else {
+    rule.iter_with_tz(set.dtstart, set.tz, set.disambiguation)
+  }
+  let is_utc_tz = set.tz.iana_name() == "UTC"
+  let needs_reorder = !set.dtstart_is_utc && !is_utc_tz
+  ZonedRuleStream::{
+    iter: iter,
+    tz: set.tz,
+    mode: set.disambiguation,
+    as_utc: set.dtstart_is_utc,
+    needs_reorder: needs_reorder,
+    buf: [],
+    max_seen_sec: 0L,
+    has_max: false,
+    exhausted: false,
+    last_emitted: None,
+  }
+}
+
+///| Insert `z` into `self.buf` in ascending timestamp order, ignoring duplicate timestamps.
+fn ZonedRuleStream::insert_sorted(self : ZonedRuleStream, z : time::Zoned) -> Unit {
+  let n = self.buf.length()
+  let mut pos = n
+  while pos > 0 {
+    let c = self.buf[pos - 1].timestamp.cmp(z.timestamp)
+    if c == 0 {
+      return
+    }
+    if c < 0 {
+      break
+    }
+    pos = pos - 1
+  }
+  self.buf.push(z)
+  let mut k = n
+  while k > pos {
+    self.buf[k] = self.buf[k - 1]
+    k = k - 1
+  }
+  self.buf[pos] = z
+}
+
+///| Pop the next strictly-ascending `time::Zoned` from this stream.
+fn ZonedRuleStream::next(self : ZonedRuleStream) -> Result[Option[time::Zoned], IcalError] {
+  if !self.needs_reorder {
+    while true {
+      match self.iter.next() {
+        Ok(Some(dt)) =>
+        match resolve_rule_dt(dt, self.tz, self.mode, self.as_utc) {
+          Ok(z) =>
+          match self.last_emitted {
+            Some(prev) => if z.timestamp.cmp(prev) == 0 { continue } else {
+              self.last_emitted = Some(z.timestamp)
+              return Ok(Some(z))
+            }
+            None => {
+              self.last_emitted = Some(z.timestamp)
+              return Ok(Some(z))
+            }
+          }
+          Err(e) => return Err(e)
+        }
+        Ok(None) => return Ok(None)
+        Err(e) => return Err(e)
+      }
+    }
+  }
+  // Lookahead reorder window (14400s = 4 hours > any DST spring-forward gap).
+  while true {
+    while !self.exhausted &&
+    (self.buf.length() == 0 || !self.has_max || self.max_seen_sec - self.buf[0].timestamp.as_second() < 14400L) {
+      match self.iter.next() {
+        Ok(Some(dt)) =>
+        match resolve_rule_dt(dt, self.tz, self.mode, false) {
+          Ok(z) => {
+            let s = z.timestamp.as_second()
+            if !self.has_max || s > self.max_seen_sec {
+              self.max_seen_sec = s
+              self.has_max = true
+            }
+            self.insert_sorted(z)
+          }
+          Err(e) => return Err(e)
+        }
+        Ok(None) => self.exhausted = true
+        Err(e) => return Err(e)
+      }
+    }
+    if self.buf.length() == 0 {
+      return Ok(None)
+    }
+    let chosen = self.buf[0]
+    // Shift left (buf is tiny: typically 1..8 elements)
+    let new_buf : Array[time::Zoned] = []
+    let mut i = 1
+    while i < self.buf.length() {
+      new_buf.push(self.buf[i])
+      i = i + 1
+    }
+    self.buf = new_buf
+    match self.last_emitted {
+      Some(prev) => if chosen.timestamp.cmp(prev) <= 0 { continue }
+      None => ()
+    }
+    self.last_emitted = Some(chosen.timestamp)
+    return Ok(Some(chosen))
+  }
+  Ok(None)
+}
+
+///| Streaming k-way merge state for `RRuleSet`.
+struct RRuleSetMerger {
+  inc_streams : Array[ZonedRuleStream]
   inc_heads : Array[Option[time::Zoned]]
   rdates : Array[time::Zoned]
   mut rdate_idx : Int
-  ex_iters : Array[RRuleIter]
+  ex_streams : Array[ZonedRuleStream]
   ex_heads : Array[Option[time::Zoned]]
   exdates : Array[time::Zoned]
   mut exdate_idx : Int
@@ -225,21 +462,16 @@ struct RRuleSetMerger {
 
 ///| Initialize a streaming `RRuleSetMerger`.
 fn RRuleSetMerger::new(set : RRuleSet) -> Result[RRuleSetMerger, IcalError] {
-  let inc_iters : Array[RRuleIter] = []
+  let inc_streams : Array[ZonedRuleStream] = []
   let inc_heads : Array[Option[time::Zoned]] = []
   let mut i = 0
   while i < set.rrules.length() {
-    let it = set.rrules[i].iter(set.dtstart)
-    let head = match it.next() {
-      Ok(Some(dt)) =>
-      match resolve_zoned(dt, set.tz, set.disambiguation) {
-        Ok(z) => Some(z)
-        Err(e) => return Err(e)
-      }
-      Ok(None) => None
+    let st = ZonedRuleStream::new(set.rrules[i], set)
+    let head = match st.next() {
+      Ok(v) => v
       Err(e) => return Err(e)
     }
-    inc_iters.push(it)
+    inc_streams.push(st)
     inc_heads.push(head)
     i = i + 1
   }
@@ -253,23 +485,23 @@ fn RRuleSetMerger::new(set : RRuleSet) -> Result[RRuleSetMerger, IcalError] {
     }
     j = j + 1
   }
+  let mut j2 = 0
+  while j2 < set.utc_rdates.length() {
+    rdates_raw.push(set.tz.to_zoned(set.utc_rdates[j2]))
+    j2 = j2 + 1
+  }
   let rdates = sort_dedup_zoned(rdates_raw)
 
-  let ex_iters : Array[RRuleIter] = []
+  let ex_streams : Array[ZonedRuleStream] = []
   let ex_heads : Array[Option[time::Zoned]] = []
   let mut k = 0
   while k < set.exrules.length() {
-    let it = set.exrules[k].iter(set.dtstart)
-    let head = match it.next() {
-      Ok(Some(dt)) =>
-      match resolve_zoned(dt, set.tz, set.disambiguation) {
-        Ok(z) => Some(z)
-        Err(e) => return Err(e)
-      }
-      Ok(None) => None
+    let st = ZonedRuleStream::new(set.exrules[k], set)
+    let head = match st.next() {
+      Ok(v) => v
       Err(e) => return Err(e)
     }
-    ex_iters.push(it)
+    ex_streams.push(st)
     ex_heads.push(head)
     k = k + 1
   }
@@ -283,16 +515,19 @@ fn RRuleSetMerger::new(set : RRuleSet) -> Result[RRuleSetMerger, IcalError] {
     }
     m = m + 1
   }
+  let mut m2 = 0
+  while m2 < set.utc_exdates.length() {
+    exdates_raw.push(set.tz.to_zoned(set.utc_exdates[m2]))
+    m2 = m2 + 1
+  }
   let exdates = sort_dedup_zoned(exdates_raw)
 
   Ok(RRuleSetMerger::{
-    tz: set.tz,
-    mode: set.disambiguation,
-    inc_iters: inc_iters,
+    inc_streams: inc_streams,
     inc_heads: inc_heads,
     rdates: rdates,
     rdate_idx: 0,
-    ex_iters: ex_iters,
+    ex_streams: ex_streams,
     ex_heads: ex_heads,
     exdates: exdates,
     exdate_idx: 0,
@@ -300,7 +535,7 @@ fn RRuleSetMerger::new(set : RRuleSet) -> Result[RRuleSetMerger, IcalError] {
   })
 }
 
-///| Check whether `ts` is excluded by `exdates` or `ex_iters` (advancing exclusion streams up to `ts`).
+///| Check whether `ts` is excluded by `exdates` or `ex_streams` (advancing exclusion streams up to `ts`).
 fn RRuleSetMerger::is_excluded(self : RRuleSetMerger, ts : time::Timestamp) -> Result[Bool, IcalError] {
   while self.exdate_idx < self.exdates.length() {
     let c = self.exdates[self.exdate_idx].timestamp.cmp(ts)
@@ -313,20 +548,15 @@ fn RRuleSetMerger::is_excluded(self : RRuleSetMerger, ts : time::Timestamp) -> R
     }
   }
   let mut i = 0
-  while i < self.ex_iters.length() {
+  while i < self.ex_streams.length() {
     while true {
       match self.ex_heads[i] {
         None => break
         Some(h) => {
           let c = h.timestamp.cmp(ts)
           if c < 0 {
-            match self.ex_iters[i].next() {
-              Ok(Some(dt)) =>
-              match resolve_zoned(dt, self.tz, self.mode) {
-                Ok(z) => self.ex_heads[i] = Some(z)
-                Err(e) => return Err(e)
-              }
-              Ok(None) => self.ex_heads[i] = None
+            match self.ex_streams[i].next() {
+              Ok(v) => self.ex_heads[i] = v
               Err(e) => return Err(e)
             }
           } else if c == 0 {
@@ -347,7 +577,7 @@ fn RRuleSetMerger::next(self : RRuleSetMerger) -> Result[Option[time::Zoned], Ic
   while true {
     // Pick minimum among inc_heads and rdates[rdate_idx]
     let mut best : Option[time::Zoned] = None
-    let mut best_src = -2 // -1 = rdates, >=0 = inc_iters[idx]
+    let mut best_src = -2 // -1 = rdates, >=0 = inc_streams[idx]
     if self.rdate_idx < self.rdates.length() {
       best = Some(self.rdates[self.rdate_idx])
       best_src = -1
@@ -379,19 +609,14 @@ fn RRuleSetMerger::next(self : RRuleSetMerger) -> Result[Option[time::Zoned], Ic
     if best_src == -1 {
       self.rdate_idx = self.rdate_idx + 1
     } else {
-      match self.inc_iters[best_src].next() {
-        Ok(Some(dt)) =>
-        match resolve_zoned(dt, self.tz, self.mode) {
-          Ok(z) => self.inc_heads[best_src] = Some(z)
-          Err(e) => return Err(e)
-        }
-        Ok(None) => self.inc_heads[best_src] = None
+      match self.inc_streams[best_src].next() {
+        Ok(v) => self.inc_heads[best_src] = v
         Err(e) => return Err(e)
       }
     }
     // Deduplicate against last_emitted
     match self.last_emitted {
-      Some(prev) => if chosen.timestamp.cmp(prev) == 0 { continue }
+      Some(prev) => if chosen.timestamp.cmp(prev) <= 0 { continue }
       None => ()
     }
     // Check exclusions
