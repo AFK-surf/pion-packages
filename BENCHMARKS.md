@@ -30,7 +30,7 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–6 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–10 + `base64` + `effect` + `crypto` + Farview 沉淀波 1–7 + `fts`）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 Farview 沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。本榜数据如实摘录自各包 `packages/<name>/README.md`，均在 `tokyo-mac-studio-0`（Apple M5 Max，`Darwin arm64`）上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
 
@@ -247,6 +247,10 @@
 | `sdp` | Google Meet SFU Answer 解析 + CRLF 往返（9,370 B × 2,000） | 18.74 MB | **85.317 ms** (219.65 MB/s) | 141.306 ms (`rust_sdp 0.9.0`) | **1.66x** | **2.31 MiB** | 2.55 MiB |
 | `stun` | STUN 编码 + 签名（`MI` + `FP`，100k WebRTC ICE 混合包） | 100,000 pkts | 331.526 ms (`3315.26 ns/op`) | 198.978 ms (`rust_webrtc_stun 0.8.0`) | 0.60x | **1.86 MiB** | 2.08 MiB |
 | `stun` | STUN 解码 + 校验 `FP` + 校验 `MI`（100k WebRTC ICE 混合包） | 100,000 pkts | 368.555 ms (`3685.55 ns/op`) | 142.332 ms (`rust_webrtc_stun 0.8.0`) | 0.39x | **1.89 MiB** | 2.11 MiB |
+| `rtp` | RTP 解析 + 封装（1,200 B + 3 RFC 5285 扩展 × 50,000） | 50,000 pkts | 82.330 ms (`1646.61 ns/op`) | 32.447 ms (`rust_webrtc_rtp 0.12.0`) | 0.39x | **1.80 MiB** | 2.08 MiB |
+| `rtp` | RTCP 复合包解析 + 封装（SR + PLI + NACK × 50,000） | 50,000 pkts | 72.339 ms (`1446.79 ns/op`) | 62.501 ms (`rust_webrtc_rtcp 0.12.0`) | 0.86x | **1.84 MiB** | 2.20 MiB |
+| `rtp` | SRTP `AES128_CM_HMAC_SHA1_80` 加密 + 解密（5,000 × 1,200 B） | 12 MB | 271.028 ms (44.28 MB/s) | 131.295 ms (`rust_webrtc_srtp 0.14.0`) | 0.48x | **1.88 MiB** | 2.08 MiB |
+| `rtp` | SRTP `AEAD_AES_128_GCM` 加密 + 解密（5,000 × 1,200 B） | 12 MB | 247.303 ms (48.52 MB/s) | 120.209 ms (`rust_webrtc_srtp 0.14.0`) | 0.49x | **1.86 MiB** | 2.11 MiB |
 
 ## 各包明细
 
@@ -2013,3 +2017,16 @@ Single-certificate extension cliff (`N = 64,000` distinct extensions, `1.2 MB` D
 | Decode + Verify `FP` + Verify `MI` (100k pkts) | 368.555 ms (`3685.55 ns/op`) | **142.332 ms (`1423.31 ns/op`)** | **1.89 MiB** | 2.11 MiB | 0.39x | `2739a0786b801d32...` |
 
 红队：12 / 12 单测（复用 `crypto` 69 / 69），`audit unit` **30 / 30** 全绿（5 P1 + 12 P2 全部修复：DoS 36.1 s → 0.01 s、fuzz 60k × 4 0 崩 0 diff、compare 30,126 条 0 安全差异）。领先项：两项峰值 RSS 均低于 Rust（1.86 / 1.89 vs 2.08 / 2.11 MiB）。落后项：编码签名 0.60×、解码验签 0.39×，根因是本包使用 Native/Wasm32 共用的纯标量 Pion `crypto::Sha1` + 查表 CRC-32，而 `webrtc-rs/stun` 底层调用 `ring` ARM64 汇编 SHA-1。
+
+### rtp
+
+参考实现：Rust [`webrtc-rs`](https://github.com/webrtc-rs/webrtc)（`rtp 0.12.0`、`rtcp 0.12.0`、`webrtc-srtp 0.14.0`，`--release`）。`sh packages/rtp/bench/run_bench.sh` 在 `Darwin arm64` 上经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替）运行，全部 4 项负载经 stdout SHA-256 逐字节一致校验（证明线格式与密文/认证标签精确互通）。详见 [`packages/rtp/README.md`](packages/rtp/README.md)。
+
+| Workload | Pion Median (ms) | Rust `webrtc-rs` Median (ms) | Pion Rate / Throughput | Pion Peak RSS | Rust Peak RSS | Speedup vs Rust | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| RTP Parse + Marshal (1,200 B + 3 RFC 5285 1-byte exts × 50,000) | 82.330 | **32.447** | 1,646.61 ns/op | **1.80 MiB** | 2.08 MiB | 0.39x | `1490e46b1e6d14d1…` (exact) |
+| RTCP Compound Parse + Marshal (SR + PLI + NACK × 50,000) | 72.339 | **62.501** | 1,446.79 ns/op | **1.84 MiB** | 2.20 MiB | 0.86x | `5727aeb0e46e2972…` (exact) |
+| SRTP `AES128_CM_HMAC_SHA1_80` Protect + Unprotect (5,000 × 1,200 B = 12 MB) | 271.028 | **131.295** | 44.28 MB/s | **1.88 MiB** | 2.08 MiB | 0.48x | `3a80d94aed49bb1f…` (exact) |
+| SRTP `AEAD_AES_128_GCM` Protect + Unprotect (5,000 × 1,200 B = 12 MB) | 247.303 | **120.209** | 48.52 MB/s | **1.86 MiB** | 2.11 MiB | 0.49x | `9709ef15a59a9dfc…` (exact) |
+
+红队与诚实说明：10 / 10 单测（复用 `crypto` 69 / 69），`audit/` 零改动且 `run_audit.sh all` 全绿（**22 / 22** unit = 14 / 14 control + 8 / 8 redteam、Rust `webrtc-rs` 双向 **282 / 282 + 492 / 492** 互通、12k fuzz 0 崩 / 0 trap / 0 diff、10 万伪造 SSRC DoS 从 10.0 s / 9.1 MiB 降至 **0.24 s / 1.9 MiB**）。领先项：全部 4 项峰值 RSS 均低于 Rust（1.80–1.88 vs 2.08–2.20 MiB），RTCP 复合包达 Rust 的 0.86×。落后项：RTP 1,200 B 为 0.39×（Rust 用零拷贝引用计数 `bytes::Bytes::slice()`，Pion 拷贝载荷至自有 `Bytes`）；SRTP CM-SHA1（44.28 MB/s，0.48×）与 GCM（48.52 MB/s，0.49×）由 Native/Wasm32 通用纯标量 Pion 代码在开启收发双向重放保护下跑出，对照 Rust 硬件 AES/PMULL/SHA1 指令（且未开重放窗），吞吐仍达 >350 Mbps。
