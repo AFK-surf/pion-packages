@@ -1,9 +1,9 @@
-///| JSON Schema (Draft 2020-12 & Draft-07) compiler into flat `CompiledSchema` IR.
-///| Handles `$id` scopes, `$anchor`, RFC 6901 JSON Pointer + percent-decoding `$ref`,
-///| cyclic `$ref` reservation, regex precompilation, and compile-time schema validation.
+///| JSON Schema (Draft 2020-12, Draft 2019-09, Draft-07 & Draft-04) compiler into flat `CompiledSchema` IR.
+///| Handles `$id` scopes, two-pass `$anchor` & `$dynamicAnchor`, RFC 6901 JSON Pointer with embedded
+///| resource scope tracking, cyclic `$ref` worklist compilation, ECMA-262 regex precompilation,
+///| offline meta-schemas, and stack-safe compile depth limits.
 
 import "json5"
-import "regex"
 
 fn is_finite_f64(x : Double) -> Bool {
   x == x && x != 1.0 / 0.0 && x != -1.0 / 0.0
@@ -104,18 +104,77 @@ fn split_uri_fragment(uri : String) -> (String, String) {
   }
 }
 
+///| Normalize `.` and `..` path segments in a URI (RFC 3986 §5.2.4).
+fn normalize_uri_path(uri : String) -> String {
+  let scheme_end = str_find_byte(uri, 58)
+  if scheme_end <= 0 || scheme_end + 2 >= uri.length() ||
+  uri.code_unit_at(scheme_end + 1) != 47 || uri.code_unit_at(scheme_end + 2) != 47 {
+    return uri
+  }
+  let mut path_start = scheme_end + 3
+  let n = uri.length()
+  while path_start < n && uri.code_unit_at(path_start) != 47 {
+    path_start = path_start + 1
+  }
+  if path_start >= n {
+    return uri
+  }
+  let prefix = uri.slice(0, path_start)
+  let path = uri.slice(path_start, n)
+  let segs : Array[String] = []
+  let plen = path.length()
+  let mut pos = 1
+  let mut trailing_slash = plen > 0 && path.code_unit_at(plen - 1) == 47
+  while pos <= plen {
+    let mut next_s = pos
+    while next_s < plen && path.code_unit_at(next_s) != 47 {
+      next_s = next_s + 1
+    }
+    let seg = path.slice(pos, next_s)
+    if seg == "." {
+      if next_s >= plen {
+        trailing_slash = true
+      }
+    } else if seg == ".." {
+      if segs.length() > 0 {
+        let _ = segs.pop()
+      }
+      if next_s >= plen {
+        trailing_slash = true
+      }
+    } else if seg.length() > 0 {
+      segs.push(seg)
+    }
+    if next_s >= plen {
+      break
+    }
+    pos = next_s + 1
+  }
+  let sb = StringBuilder::new()
+  sb.write_string(prefix)
+  let mut i = 0
+  while i < segs.length() {
+    sb.write_byte(47.to_byte())
+    sb.write_string(segs[i])
+    i = i + 1
+  }
+  if trailing_slash || segs.length() == 0 {
+    sb.write_byte(47.to_byte())
+  }
+  sb.to_string()
+}
+
 ///| Resolve a relative URI reference against a base URI (RFC 3986 subset for `$id` / `$ref`).
 fn resolve_uri(base : String, rel : String) -> String {
   if rel.length() == 0 {
     return base
   }
   if is_abs_uri(rel) {
-    return rel
+    return normalize_uri_path(rel)
   }
   if base.length() == 0 {
     return rel
   }
-  // If rel starts with '/', attach to scheme://authority
   if rel.code_unit_at(0) == 47 {
     let scheme_end = str_find_byte(base, 58)
     if scheme_end > 0 && scheme_end + 2 < base.length() &&
@@ -126,14 +185,13 @@ fn resolve_uri(base : String, rel : String) -> String {
       while auth_end < bn && base.code_unit_at(auth_end) != 47 {
         auth_end = auth_end + 1
       }
-      return base.slice(0, auth_end) + rel
+      return normalize_uri_path(base.slice(0, auth_end) + rel)
     }
     return rel
   }
-  // Relative path: replace after last '/' in base
   let last_slash = str_rfind_byte(base, 47)
   if last_slash >= 0 {
-    base.slice(0, last_slash + 1) + rel
+    normalize_uri_path(base.slice(0, last_slash + 1) + rel)
   } else {
     rel
   }
@@ -194,46 +252,262 @@ fn escape_ptr_token(token : String) -> String {
   json5::pointer_escape(token)
 }
 
+///| Unescape a single RFC 6901 JSON Pointer token (`~1` -> `/`, `~0` -> `~`).
+fn unescape_ptr_token(token : String) -> Result[String, SchemaError] {
+  let n = token.length()
+  let mut has_tilde = false
+  let mut i = 0
+  while i < n {
+    if token.code_unit_at(i) == 126 {
+      has_tilde = true
+      break
+    }
+    i = i + 1
+  }
+  if !has_tilde {
+    return Ok(token)
+  }
+  let sb = StringBuilder::new()
+  i = 0
+  while i < n {
+    let b = token.code_unit_at(i)
+    if b == 126 {
+      if i + 1 >= n {
+        return Err(SchemaError::new(SchemaErrorKind::InvalidPointer, token, "trailing ~ in JSON pointer"))
+      }
+      let nxt = token.code_unit_at(i + 1)
+      if nxt == 48 {
+        sb.write_byte(126.to_byte())
+      } else if nxt == 49 {
+        sb.write_byte(47.to_byte())
+      } else {
+        return Err(SchemaError::new(SchemaErrorKind::InvalidPointer, token, "invalid ~ escape in JSON pointer"))
+      }
+      i = i + 2
+    } else {
+      sb.write_byte(b.to_byte())
+      i = i + 1
+    }
+  }
+  Ok(sb.to_string())
+}
+
+fn parse_array_index(tok : String) -> Int {
+  let n = tok.length()
+  if n == 0 {
+    return -1
+  }
+  if n > 1 && tok.code_unit_at(0) == 48 {
+    return -1
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    let b = tok.code_unit_at(i)
+    if !is_ascii_digit(b) {
+      return -1
+    }
+    acc = acc * 10 + (b - 48)
+    i = i + 1
+  }
+  acc
+}
+
+///| Resolve a JSON Pointer starting from `root_val` with base URI `start_scope`,
+///| updating `cur_scope` whenever an intermediate object defines an active `$id` (fixes P1-6).
+fn resolve_pointer_with_scope(
+  root_val : json5::Json5Value,
+  ptr : String,
+  start_scope : String,
+  draft : ResolvedDraft,
+) -> Result[Option[(json5::Json5Value, String)], SchemaError] {
+  if ptr.length() == 0 {
+    return Ok(Some((root_val, start_scope)))
+  }
+  if ptr.code_unit_at(0) != 47 {
+    return Err(SchemaError::new(SchemaErrorKind::InvalidPointer, ptr, "JSON pointer must start with '/'"))
+  }
+  let mut cur = root_val
+  let mut cur_scope = start_scope
+  let n = ptr.length()
+  let mut pos = 1
+  while pos <= n {
+    let mut next_slash = pos
+    while next_slash < n && ptr.code_unit_at(next_slash) != 47 {
+      next_slash = next_slash + 1
+    }
+    let raw_tok = ptr.slice(pos, next_slash)
+    let tok = match unescape_ptr_token(raw_tok) {
+      Ok(t) => t
+      Err(e) => return Err(e)
+    }
+    match cur {
+      json5::Json5Value::Object(entries) => {
+        // Update cur_scope if this object defines an active `$id` (or `id` in Draft-04)
+        let id_key = if resolved_is_draft4(draft) { "id" } else { "$id" }
+        let mut has_ref = false
+        let mut id_str_opt : Option[String] = None
+        let mut found_val : Option[json5::Json5Value] = None
+        let mut i = 0
+        let elen = entries.length()
+        while i < elen {
+          let (ek, ev) = entries[i]
+          if ek == "$ref" {
+            has_ref = true
+          } else if ek == id_key {
+            match ev {
+              json5::Json5Value::Str(s) => id_str_opt = Some(s)
+              _ => ()
+            }
+          }
+          if ek == tok {
+            found_val = Some(ev)
+          }
+          i = i + 1
+        }
+        if !(has_ref && resolved_is_draft7_or_earlier(draft)) {
+          match id_str_opt {
+            Some(id_s) => {
+              let (base_part, _) = split_uri_fragment(id_s)
+              if base_part.length() > 0 {
+                cur_scope = resolve_uri(cur_scope, base_part)
+              }
+            }
+            None => ()
+          }
+        }
+        match found_val {
+          Some(nv) => cur = nv
+          None => return Ok(None)
+        }
+      }
+      json5::Json5Value::Array(items) => {
+        let idx = parse_array_index(tok)
+        if idx < 0 || idx >= items.length() {
+          return Ok(None)
+        }
+        cur = items[idx]
+      }
+      _ => return Ok(None)
+    }
+    if next_slash >= n {
+      break
+    }
+    pos = next_slash + 1
+  }
+  Ok(Some((cur, cur_scope)))
+}
+
 ///| Registered `$id` resource scope.
 struct ScopeResource {
   uri : String
   root_val : json5::Json5Value
   schema_path : String
+  dyn_anchors : Array[(String, json5::Json5Value, String)]
 }
 
-///| Registered `$anchor` target.
+///| Registered `$anchor` or `$dynamicAnchor` target.
 struct AnchorTarget {
   scope_uri : String
   anchor : String
   jval : json5::Json5Value
   schema_path : String
   target_scope_uri : String
+  is_dynamic : Bool
+}
+
+///| Pending `$ref` / `$dynamicRef` target queued for worklist compilation (O(1) stack).
+struct PendingCompile {
+  node_id : Int
+  jval : json5::Json5Value
+  cur_scope : String
+  schema_path : String
 }
 
 ///| Compilation state across the schema document.
 struct CompilerState {
   draft : Draft
+  resolved_draft : ResolvedDraft
   max_depth : Int
   validate_formats : Bool
   scopes : Array[ScopeResource]
+  scope_map : StrHashMap
   anchors : Array[AnchorTarget]
-  ///| Memoized compiled node IDs keyed by `scope_uri + "\u0000" + ptr_or_anchor`
-  compiled_keys : Array[String]
-  compiled_ids : Array[Int]
+  anchor_map : StrHashMap
+  compiled_map : StrHashMap
+  defs_vals : Array[(json5::Json5Value, String)]
+  defs_map : StrHashMap
+  pending : Array[PendingCompile]
   nodes : Array[SchemaNode]
   mut has_unevaluated : Bool
+  mut has_dynamic_ref : Bool
 }
 
-fn CompilerState::find_scope(self : CompilerState, uri : String) -> Option[ScopeResource] {
-  let mut i = 0
-  let n = self.scopes.length()
-  while i < n {
-    if self.scopes[i].uri == uri {
-      return Some(self.scopes[i])
-    }
-    i = i + 1
+fn CompilerState::register_scope(
+  self : CompilerState,
+  uri : String,
+  root_val : json5::Json5Value,
+  schema_path : String,
+) -> Int {
+  let existing = self.scope_map.get(uri)
+  if existing >= 0 {
+    return existing
   }
-  None
+  let idx = self.scopes.length()
+  self.scopes.push(ScopeResource::{
+    uri: uri,
+    root_val: root_val,
+    schema_path: schema_path,
+    dyn_anchors: [],
+  })
+  self.scope_map.set(uri, idx)
+  idx
+}
+
+fn CompilerState::find_scope_idx(self : CompilerState, uri : String) -> Int {
+  self.scope_map.get(uri)
+}
+
+fn CompilerState::register_anchor(
+  self : CompilerState,
+  scope_uri : String,
+  anchor : String,
+  jval : json5::Json5Value,
+  schema_path : String,
+  is_dynamic : Bool,
+) -> Unit {
+  let key = scope_uri + "\u{0}" + anchor
+  if self.anchor_map.get(key) < 0 {
+    let idx = self.anchors.length()
+    self.anchors.push(AnchorTarget::{
+      scope_uri: scope_uri,
+      anchor: anchor,
+      jval: jval,
+      schema_path: schema_path,
+      target_scope_uri: scope_uri,
+      is_dynamic: is_dynamic,
+    })
+    self.anchor_map.set(key, idx)
+  }
+  if is_dynamic {
+    let sidx = self.scope_map.get(scope_uri)
+    if sidx >= 0 {
+      let da = self.scopes[sidx].dyn_anchors
+      let mut exists = false
+      let mut i = 0
+      while i < da.length() {
+        let (an, _, _) = da[i]
+        if an == anchor {
+          exists = true
+          break
+        }
+        i = i + 1
+      }
+      if !exists {
+        da.push((anchor, jval, schema_path))
+      }
+    }
+  }
 }
 
 fn CompilerState::find_anchor(
@@ -241,125 +515,285 @@ fn CompilerState::find_anchor(
   scope_uri : String,
   anchor : String,
 ) -> Option[AnchorTarget] {
+  let key = scope_uri + "\u{0}" + anchor
+  let idx = self.anchor_map.get(key)
+  if idx >= 0 {
+    Some(self.anchors[idx])
+  } else {
+    None
+  }
+}
+
+fn CompilerState::scope_has_dynamic_anchor(
+  self : CompilerState,
+  scope_uri : String,
+  anchor : String,
+) -> Bool {
+  let sidx = self.scope_map.get(scope_uri)
+  if sidx < 0 {
+    return false
+  }
+  let da = self.scopes[sidx].dyn_anchors
   let mut i = 0
-  let n = self.anchors.length()
-  while i < n {
-    let a = self.anchors[i]
-    if a.scope_uri == scope_uri && a.anchor == anchor {
-      return Some(a)
+  while i < da.length() {
+    let (an, _, _) = da[i]
+    if an == anchor {
+      return true
     }
     i = i + 1
   }
-  None
+  false
 }
 
-fn CompilerState::find_compiled(self : CompilerState, key : String) -> Int {
-  let mut i = 0
-  let n = self.compiled_keys.length()
-  while i < n {
-    if self.compiled_keys[i] == key {
-      return self.compiled_ids[i]
-    }
-    i = i + 1
+///| Check if `k` is a known single-subschema keyword for `draft`.
+fn is_single_subschema_kw(k : String, draft : ResolvedDraft) -> Bool {
+  if k == "not" || k == "if" || k == "then" || k == "else" ||
+  k == "additionalProperties" || k == "propertyNames" || k == "contains" ||
+  k == "items" {
+    return true
   }
-  -1
+  if resolved_is_draft7_or_earlier(draft) {
+    return k == "additionalItems"
+  }
+  k == "unevaluatedProperties" || k == "unevaluatedItems" || k == "contentSchema" ||
+  k == "additionalItems"
 }
 
-fn CompilerState::record_compiled(self : CompilerState, key : String, id : Int) -> Unit {
-  self.compiled_keys.push(key)
-  self.compiled_ids.push(id)
+///| Check if `k` is a known array-of-subschemas keyword for `draft`.
+fn is_array_subschema_kw(k : String, draft : ResolvedDraft) -> Bool {
+  if k == "allOf" || k == "anyOf" || k == "oneOf" {
+    return true
+  }
+  if resolved_is_202012(draft) {
+    return k == "prefixItems"
+  }
+  k == "items"
 }
 
-///| Walk schema tree to collect all `$id` scopes and `$anchor` targets.
+///| Check if `k` is a known map-of-subschemas keyword for `draft`.
+fn is_map_subschema_kw(k : String, draft : ResolvedDraft) -> Bool {
+  if k == "properties" || k == "patternProperties" || k == "definitions" {
+    return true
+  }
+  if resolved_is_draft7_or_earlier(draft) {
+    return k == "dependencies"
+  }
+  k == "$defs" || k == "dependentSchemas" || k == "dependencies"
+}
+
+struct CollectItem {
+  jval : json5::Json5Value
+  cur_scope : String
+  path : String
+  depth : Int
+}
+
+///| Iterative schema tree walk to collect all `$id` scopes, `$anchor`, `$dynamicAnchor`,
+///| and `$recursiveAnchor` targets.
+///| - Two-pass per object so `$anchor` before `$id` uses the object's own `$id` (fixes P1-5).
+///| - Only recurses into known subschema keywords so `$id` in unknown keywords is ignored (fixes P2-2).
+///| - Respects Draft-07 sibling `$id` ignoring beside `$ref` (fixes P1-7).
+///| - 100% iterative so deep schemas never overflow the call stack (fixes P2-5 & P2-11).
 fn collect_resources(
   state : CompilerState,
-  jval : json5::Json5Value,
-  cur_scope : String,
-  path : String,
-  depth : Int,
+  root_val : json5::Json5Value,
+  root_scope : String,
+  root_path : String,
 ) -> Result[Unit, SchemaError] {
-  if depth > state.max_depth {
-    return Err(SchemaError::new(SchemaErrorKind::LimitExceeded, path, "schema nesting exceeds max_depth"))
-  }
-  match jval {
-    json5::Json5Value::Object(entries) => {
-      let mut next_scope = cur_scope
-      // First check `$id` and `$anchor`
-      let mut i = 0
-      let n = entries.length()
-      while i < n {
-        let (k, v) = entries[i]
-        if k == "$id" {
-          match v {
-            json5::Json5Value::Str(id_str) => {
+  let stack : Array[CollectItem] = [
+    CollectItem::{ jval: root_val, cur_scope: root_scope, path: root_path, depth: 0 },
+  ]
+  let id_key = if resolved_is_draft4(state.resolved_draft) { "id" } else { "$id" }
+  let allow_anchor = !resolved_is_draft7_or_earlier(state.resolved_draft)
+
+  while stack.length() > 0 {
+    let item = match stack.pop() {
+      Some(it) => it
+      None => break
+    }
+    if item.depth > state.max_depth {
+      return Err(SchemaError::new(SchemaErrorKind::LimitExceeded, item.path, "schema nesting exceeds max_depth"))
+    }
+    match item.jval {
+      json5::Json5Value::Object(entries) => {
+        let n = entries.length()
+        let mut next_scope = item.cur_scope
+
+        // Pass 1: check `$ref` (for Draft-07 sibling ignoring) and `$id`
+        let mut has_ref = false
+        let mut id_str_opt : Option[String] = None
+        let mut i = 0
+        while i < n {
+          let (k, v) = entries[i]
+          if k == "$ref" {
+            has_ref = true
+          } else if k == id_key {
+            match v {
+              json5::Json5Value::Str(s) => id_str_opt = Some(s)
+              _ => ()
+            }
+          }
+          i = i + 1
+        }
+
+        if !(has_ref && resolved_is_draft7_or_earlier(state.resolved_draft)) {
+          match id_str_opt {
+            Some(id_str) => {
               let (base_part, frag_part) = split_uri_fragment(id_str)
               if base_part.length() > 0 {
-                let resolved = resolve_uri(cur_scope, base_part)
+                let resolved = resolve_uri(item.cur_scope, base_part)
                 next_scope = resolved
-                state.scopes.push(ScopeResource::{
-                  uri: resolved,
-                  root_val: jval,
-                  schema_path: path,
-                })
+                let _ = state.register_scope(resolved, item.jval, item.path)
               }
               if frag_part.length() > 0 && frag_part.code_unit_at(0) != 47 {
-                state.anchors.push(AnchorTarget::{
-                  scope_uri: next_scope,
-                  anchor: frag_part,
-                  jval: jval,
-                  schema_path: path,
-                  target_scope_uri: next_scope,
-                })
+                state.register_anchor(next_scope, frag_part, item.jval, item.path, false)
               }
             }
-            _ => ()
+            None => ()
           }
-        } else if k == "$anchor" {
-          match v {
-            json5::Json5Value::Str(anchor_str) => {
-              if anchor_str.length() > 0 {
-                state.anchors.push(AnchorTarget::{
-                  scope_uri: next_scope,
-                  anchor: anchor_str,
-                  jval: jval,
-                  schema_path: path,
-                  target_scope_uri: next_scope,
-                })
+        }
+
+        // Pass 2: register `$anchor`, `$dynamicAnchor`, `$recursiveAnchor` using finalized `next_scope`
+        if allow_anchor {
+          i = 0
+          while i < n {
+            let (k, v) = entries[i]
+            if k == "$anchor" {
+              match v {
+                json5::Json5Value::Str(anchor_str) => {
+                  if anchor_str.length() > 0 {
+                    state.register_anchor(next_scope, anchor_str, item.jval, item.path, false)
+                  }
+                }
+                _ => ()
+              }
+            } else if k == "$dynamicAnchor" && resolved_is_202012(state.resolved_draft) {
+              match v {
+                json5::Json5Value::Str(anchor_str) => {
+                  if anchor_str.length() > 0 {
+                    state.register_anchor(next_scope, anchor_str, item.jval, item.path, true)
+                  }
+                }
+                _ => ()
+              }
+            } else if k == "$recursiveAnchor" && resolved_is_201909(state.resolved_draft) {
+              match v {
+                json5::Json5Value::Bool(true) => {
+                  state.register_anchor(next_scope, "#recursive", item.jval, item.path, true)
+                }
+                _ => ()
               }
             }
-            _ => ()
+            i = i + 1
           }
         }
-        i = i + 1
+
+        // Pass 3: push ONLY known subschema children (in reverse order so stack pops left-to-right!)
+        i = n - 1
+        while i >= 0 {
+          let (k, v) = entries[i]
+          let child_path = item.path + "/" + escape_ptr_token(k)
+          if is_map_subschema_kw(k, state.resolved_draft) {
+            match v {
+              json5::Json5Value::Object(sub_entries) => {
+                let cache_defs = (k == "$defs" || k == "definitions") && sub_entries.length() >= 32
+                let mut j = sub_entries.length() - 1
+                while j >= 0 {
+                  let (sk, sv) = sub_entries[j]
+                  let entry_path = child_path + "/" + escape_ptr_token(sk)
+                  if cache_defs && item.path == "#" {
+                    let dkey = next_scope + "#" + "/" + k + "/" + escape_ptr_token(sk)
+                    if state.defs_map.get(dkey) < 0 {
+                      let didx = state.defs_vals.length()
+                      state.defs_vals.push((sv, next_scope))
+                      state.defs_map.set(dkey, didx)
+                    }
+                  }
+                  match sv {
+                    json5::Json5Value::Object(_) => {
+                      stack.push(CollectItem::{
+                        jval: sv,
+                        cur_scope: next_scope,
+                        path: entry_path,
+                        depth: item.depth + 1,
+                      })
+                    }
+                    _ => ()
+                  }
+                  j = j - 1
+                }
+              }
+              _ => ()
+            }
+          } else if is_array_subschema_kw(k, state.resolved_draft) {
+            match v {
+              json5::Json5Value::Array(arr) => {
+                let mut j = arr.length() - 1
+                while j >= 0 {
+                  match arr[j] {
+                    json5::Json5Value::Object(_) => {
+                      stack.push(CollectItem::{
+                        jval: arr[j],
+                        cur_scope: next_scope,
+                        path: child_path + "/" + j.to_string(),
+                        depth: item.depth + 1,
+                      })
+                    }
+                    _ => ()
+                  }
+                  j = j - 1
+                }
+              }
+              json5::Json5Value::Object(_) => {
+                if k == "items" {
+                  stack.push(CollectItem::{
+                    jval: v,
+                    cur_scope: next_scope,
+                    path: child_path,
+                    depth: item.depth + 1,
+                  })
+                }
+              }
+              _ => ()
+            }
+          } else if is_single_subschema_kw(k, state.resolved_draft) {
+            match v {
+              json5::Json5Value::Object(_) => {
+                stack.push(CollectItem::{
+                  jval: v,
+                  cur_scope: next_scope,
+                  path: child_path,
+                  depth: item.depth + 1,
+                })
+              }
+              _ => ()
+            }
+          }
+          i = i - 1
+        }
       }
-      // Recurse into subschema containers (skip const / enum raw data)
-      i = 0
-      while i < n {
-        let (k, v) = entries[i]
-        if k != "const" && k != "enum" && k != "default" && k != "examples" {
-          let child_path = path + "/" + escape_ptr_token(k)
-          match collect_resources(state, v, next_scope, child_path, depth + 1) {
-            Ok(_) => ()
-            Err(e) => return Err(e)
+      _ => ()
+    }
+  }
+  Ok(())
+}
+
+///| Lazily load a bundled offline meta-schema into `state` if `target_scope` is a known meta-schema URI.
+fn try_load_metaschema(state : CompilerState, target_scope : String) -> Result[Bool, SchemaError] {
+  match get_bundled_metaschema_json(target_scope) {
+    Some(json_str) => {
+      match json5::parse_with_options(json_str, json5::ParseOptions::strict_json()) {
+        Ok(v) => {
+          let _ = state.register_scope(target_scope, v, target_scope)
+          match collect_resources(state, v, target_scope, target_scope) {
+            Ok(_) => Ok(true)
+            Err(e) => Err(e)
           }
         }
-        i = i + 1
+        Err(e) => Err(SchemaError::new(SchemaErrorKind::ParseError, target_scope, e.message))
       }
-      Ok(())
     }
-    json5::Json5Value::Array(items) => {
-      let mut i = 0
-      let n = items.length()
-      while i < n {
-        match collect_resources(state, items[i], cur_scope, path + "/" + i.to_string(), depth + 1) {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-        i = i + 1
-      }
-      Ok(())
-    }
-    _ => Ok(())
+    None => Ok(false)
   }
 }
 
@@ -383,13 +817,13 @@ fn parse_type_name(name : String) -> Int {
   }
 }
 
-///| Resolve a `$ref` string against `cur_scope`, returning the compiled target node ID.
+///| Resolve a `$ref` string against `cur_scope`, returning the reserved target node ID
+///| and queueing it for worklist compilation (O(1) call stack even for 200+ hop `$ref` chains!).
 fn compile_ref(
   state : CompilerState,
   ref_str : String,
   cur_scope : String,
   schema_path : String,
-  depth : Int,
 ) -> Result[Int, SchemaError] {
   let (uri_part, frag_part) = split_uri_fragment(ref_str)
   let target_scope = if uri_part.length() == 0 {
@@ -397,10 +831,19 @@ fn compile_ref(
   } else {
     resolve_uri(cur_scope, uri_part)
   }
+
+  // Ensure bundled offline meta-schema is loaded if referenced
+  if state.find_scope_idx(target_scope) < 0 {
+    match try_load_metaschema(state, target_scope) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+
   // Check anchor vs JSON pointer
   if frag_part.length() > 0 && frag_part.code_unit_at(0) != 47 {
     let key = target_scope + "#" + frag_part
-    let cached = state.find_compiled(key)
+    let cached = state.compiled_map.get(key)
     if cached >= 0 {
       return Ok(cached)
     }
@@ -408,11 +851,14 @@ fn compile_ref(
       Some(anc) => {
         let node_id = state.nodes.length()
         state.nodes.push(SchemaNode::empty(anc.schema_path, 0))
-        state.record_compiled(key, node_id)
-        match compile_into(state, node_id, anc.jval, anc.target_scope_uri, anc.schema_path, depth + 1) {
-          Ok(_) => Ok(node_id)
-          Err(e) => Err(e)
-        }
+        state.compiled_map.set(key, node_id)
+        state.pending.push(PendingCompile::{
+          node_id: node_id,
+          jval: anc.jval,
+          cur_scope: anc.target_scope_uri,
+          schema_path: anc.schema_path,
+        })
+        Ok(node_id)
       }
       None => Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref anchor: " + ref_str))
     }
@@ -423,21 +869,27 @@ fn compile_ref(
       Err(e) => return Err(e)
     }
     let key = target_scope + "#" + decoded_ptr
-    let cached = state.find_compiled(key)
+    let cached = state.compiled_map.get(key)
     if cached >= 0 {
       return Ok(cached)
     }
-    let scope_res = match state.find_scope(target_scope) {
-      Some(s) => s
-      None => return Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref scope: " + ref_str))
+    let sidx = state.find_scope_idx(target_scope)
+    if sidx < 0 {
+      return Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref scope: " + ref_str))
     }
-    let target_val = if decoded_ptr.length() == 0 {
-      scope_res.root_val
+    let scope_res = state.scopes[sidx]
+    let (target_val, eff_target_scope) = if decoded_ptr.length() == 0 {
+      (scope_res.root_val, target_scope)
     } else {
-      match json5::pointer_get(scope_res.root_val, decoded_ptr) {
-        Ok(Some(v)) => v
-        Ok(None) => return Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref pointer: " + ref_str))
-        Err(e) => return Err(SchemaError::new(SchemaErrorKind::InvalidPointer, schema_path, e.message))
+      let cached_def = state.defs_map.get(key)
+      if cached_def >= 0 {
+        state.defs_vals[cached_def]
+      } else {
+        match resolve_pointer_with_scope(scope_res.root_val, decoded_ptr, target_scope, state.resolved_draft) {
+          Ok(Some(pair)) => pair
+          Ok(None) => return Err(SchemaError::new(SchemaErrorKind::UnresolvedRef, schema_path, "unresolved $ref pointer: " + ref_str))
+          Err(e) => return Err(e)
+        }
       }
     }
     let target_path = if decoded_ptr.length() == 0 {
@@ -447,11 +899,14 @@ fn compile_ref(
     }
     let node_id = state.nodes.length()
     state.nodes.push(SchemaNode::empty(target_path, 0))
-    state.record_compiled(key, node_id)
-    match compile_into(state, node_id, target_val, target_scope, target_path, depth + 1) {
-      Ok(_) => Ok(node_id)
-      Err(e) => Err(e)
-    }
+    state.compiled_map.set(key, node_id)
+    state.pending.push(PendingCompile::{
+      node_id: node_id,
+      jval: target_val,
+      cur_scope: eff_target_scope,
+      schema_path: target_path,
+    })
+    Ok(node_id)
   }
 }
 
@@ -484,6 +939,9 @@ fn compile_keyword(
   kw_path : String,
   depth : Int,
 ) -> Result[Unit, SchemaError] {
+  let is_d7 = resolved_is_draft7_or_earlier(state.resolved_draft)
+  let is_d4 = resolved_is_draft4(state.resolved_draft)
+
   if k == "type" {
     match v {
       json5::Json5Value::Str(tn) => {
@@ -519,8 +977,10 @@ fn compile_keyword(
       _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "type must be string or array of strings"))
     }
   } else if k == "const" {
-    node.const_val = Some(v)
-    node.kw_mask = node.kw_mask | kw_const
+    if !is_d4 {
+      node.const_val = Some(v)
+      node.kw_mask = node.kw_mask | kw_const
+    }
   } else if k == "enum" {
     match v {
       json5::Json5Value::Array(arr) => {
@@ -560,6 +1020,11 @@ fn compile_keyword(
         node.exclusive_minimum = x
         node.kw_mask = node.kw_mask | kw_excl_min
       }
+      json5::Json5Value::Bool(_) => {
+        if !is_d4 {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMinimum must be a number"))
+        }
+      }
       _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMinimum must be a number"))
     }
   } else if k == "exclusiveMaximum" {
@@ -570,6 +1035,11 @@ fn compile_keyword(
         }
         node.exclusive_maximum = x
         node.kw_mask = node.kw_mask | kw_excl_max
+      }
+      json5::Json5Value::Bool(_) => {
+        if !is_d4 {
+          return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMaximum must be a number"))
+        }
       }
       _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "exclusiveMaximum must be a number"))
     }
@@ -603,13 +1073,13 @@ fn compile_keyword(
   } else if k == "pattern" {
     match v {
       json5::Json5Value::Str(pat) => {
-        match regex::compile(pat) {
+        match compile_ecma_regex(pat) {
           Ok(re) => {
             node.pattern_str = pat
             node.pattern_re = Some(re)
             node.kw_mask = node.kw_mask | kw_pattern
           }
-          Err(e) => return Err(SchemaError::new(SchemaErrorKind::InvalidRegex, kw_path, e.message))
+          Err(msg) => return Err(SchemaError::new(SchemaErrorKind::InvalidRegex, kw_path, msg))
         }
       }
       _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "pattern must be a string"))
@@ -649,37 +1119,45 @@ fn compile_keyword(
       _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "uniqueItems must be a boolean"))
     }
   } else if k == "prefixItems" {
-    match v {
-      json5::Json5Value::Array(arr) => {
-        let mut j = 0
-        while j < arr.length() {
-          match compile_subschema(state, arr[j], eff_scope, kw_path + "/" + j.to_string(), depth + 1) {
-            Ok(cid) => node.prefix_items.push(cid)
-            Err(e) => return Err(e)
+    if !is_d7 {
+      match v {
+        json5::Json5Value::Array(arr) => {
+          let mut j = 0
+          while j < arr.length() {
+            match compile_subschema(state, arr[j], eff_scope, kw_path + "/" + j.to_string(), depth + 1) {
+              Ok(cid) => node.prefix_items.push(cid)
+              Err(e) => return Err(e)
+            }
+            j = j + 1
           }
-          j = j + 1
+          node.kw_mask = node.kw_mask | kw_prefix_items
         }
-        node.kw_mask = node.kw_mask | kw_prefix_items
+        _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "prefixItems must be an array of schemas"))
       }
-      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "prefixItems must be an array of schemas"))
     }
   } else if k == "contains" {
-    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
-      Ok(cid) => {
-        node.contains_node = cid
-        node.kw_mask = node.kw_mask | kw_contains
+    if !is_d4 {
+      match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+        Ok(cid) => {
+          node.contains_node = cid
+          node.kw_mask = node.kw_mask | kw_contains
+        }
+        Err(e) => return Err(e)
       }
-      Err(e) => return Err(e)
     }
   } else if k == "minContains" {
-    match as_non_neg_int(v) {
-      Some(iv) => node.min_contains = iv
-      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minContains must be a non-negative integer"))
+    if !is_d7 {
+      match as_non_neg_int(v) {
+        Some(iv) => node.min_contains = iv
+        None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "minContains must be a non-negative integer"))
+      }
     }
   } else if k == "maxContains" {
-    match as_non_neg_int(v) {
-      Some(iv) => node.max_contains = iv
-      None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maxContains must be a non-negative integer"))
+    if !is_d7 {
+      match as_non_neg_int(v) {
+        Some(iv) => node.max_contains = iv
+        None => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "maxContains must be a non-negative integer"))
+      }
     }
   } else if k == "minProperties" {
     match as_non_neg_int(v) {
@@ -738,9 +1216,9 @@ fn compile_keyword(
         let mut j = 0
         while j < pp_entries.length() {
           let (ppat, pv) = pp_entries[j]
-          let re = match regex::compile(ppat) {
+          let re = match compile_ecma_regex(ppat) {
             Ok(r) => r
-            Err(e) => return Err(SchemaError::new(SchemaErrorKind::InvalidRegex, kw_path, e.message))
+            Err(msg) => return Err(SchemaError::new(SchemaErrorKind::InvalidRegex, kw_path, msg))
           }
           match compile_subschema(state, pv, eff_scope, kw_path + "/" + escape_ptr_token(ppat), depth + 1) {
             Ok(cid) => node.pattern_properties.push(CompiledPatternProp::{ pattern: ppat, compiled: re, node_id: cid })
@@ -763,59 +1241,65 @@ fn compile_keyword(
       Err(e) => return Err(e)
     }
   } else if k == "propertyNames" {
-    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
-      Ok(cid) => {
-        node.property_names = cid
-        node.kw_mask = node.kw_mask | kw_property_names
+    if !is_d4 {
+      match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+        Ok(cid) => {
+          node.property_names = cid
+          node.kw_mask = node.kw_mask | kw_property_names
+        }
+        Err(e) => return Err(e)
       }
-      Err(e) => return Err(e)
     }
   } else if k == "dependentRequired" {
-    match v {
-      json5::Json5Value::Object(dr_entries) => {
-        let mut j = 0
-        while j < dr_entries.length() {
-          let (dk, dv) = dr_entries[j]
-          match dv {
-            json5::Json5Value::Array(req_arr) => {
-              let reqs : Array[String] = []
-              let mut m = 0
-              while m < req_arr.length() {
-                match req_arr[m] {
-                  json5::Json5Value::Str(rs) => reqs.push(rs)
-                  _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired values must be string arrays"))
+    if !is_d7 {
+      match v {
+        json5::Json5Value::Object(dr_entries) => {
+          let mut j = 0
+          while j < dr_entries.length() {
+            let (dk, dv) = dr_entries[j]
+            match dv {
+              json5::Json5Value::Array(req_arr) => {
+                let reqs : Array[String] = []
+                let mut m = 0
+                while m < req_arr.length() {
+                  match req_arr[m] {
+                    json5::Json5Value::Str(rs) => reqs.push(rs)
+                    _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired values must be string arrays"))
+                  }
+                  m = m + 1
                 }
-                m = m + 1
+                node.dep_required.push(CompiledDepReq::{ key: dk, required: reqs })
               }
-              node.dep_required.push(CompiledDepReq::{ key: dk, required: reqs })
+              _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired values must be arrays"))
             }
-            _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired values must be arrays"))
+            j = j + 1
           }
-          j = j + 1
+          if node.dep_required.length() > 0 {
+            node.kw_mask = node.kw_mask | kw_dep_required
+          }
         }
-        if node.dep_required.length() > 0 {
-          node.kw_mask = node.kw_mask | kw_dep_required
-        }
+        _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired must be an object"))
       }
-      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentRequired must be an object"))
     }
   } else if k == "dependentSchemas" {
-    match v {
-      json5::Json5Value::Object(ds_entries) => {
-        let mut j = 0
-        while j < ds_entries.length() {
-          let (dk, dv) = ds_entries[j]
-          match compile_subschema(state, dv, eff_scope, kw_path + "/" + escape_ptr_token(dk), depth + 1) {
-            Ok(cid) => node.dep_schemas.push(CompiledDepSchema::{ key: dk, node_id: cid })
-            Err(e) => return Err(e)
+    if !is_d7 {
+      match v {
+        json5::Json5Value::Object(ds_entries) => {
+          let mut j = 0
+          while j < ds_entries.length() {
+            let (dk, dv) = ds_entries[j]
+            match compile_subschema(state, dv, eff_scope, kw_path + "/" + escape_ptr_token(dk), depth + 1) {
+              Ok(cid) => node.dep_schemas.push(CompiledDepSchema::{ key: dk, node_id: cid })
+              Err(e) => return Err(e)
+            }
+            j = j + 1
           }
-          j = j + 1
+          if node.dep_schemas.length() > 0 {
+            node.kw_mask = node.kw_mask | kw_dep_schemas
+          }
         }
-        if node.dep_schemas.length() > 0 {
-          node.kw_mask = node.kw_mask | kw_dep_schemas
-        }
+        _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentSchemas must be an object"))
       }
-      _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, kw_path, "dependentSchemas must be an object"))
     }
   } else if k == "dependencies" {
     match v {
@@ -906,40 +1390,50 @@ fn compile_keyword(
       Err(e) => return Err(e)
     }
   } else if k == "if" {
-    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
-      Ok(cid) => {
-        node.if_node = cid
-        node.kw_mask = node.kw_mask | kw_conditional
+    if !is_d4 {
+      match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+        Ok(cid) => {
+          node.if_node = cid
+          node.kw_mask = node.kw_mask | kw_conditional
+        }
+        Err(e) => return Err(e)
       }
-      Err(e) => return Err(e)
     }
   } else if k == "then" {
-    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
-      Ok(cid) => node.then_node = cid
-      Err(e) => return Err(e)
+    if !is_d4 {
+      match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+        Ok(cid) => node.then_node = cid
+        Err(e) => return Err(e)
+      }
     }
   } else if k == "else" {
-    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
-      Ok(cid) => node.else_node = cid
-      Err(e) => return Err(e)
+    if !is_d4 {
+      match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+        Ok(cid) => node.else_node = cid
+        Err(e) => return Err(e)
+      }
     }
   } else if k == "unevaluatedProperties" {
-    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
-      Ok(cid) => {
-        node.unevaluated_properties = cid
-        node.kw_mask = node.kw_mask | kw_unevaluated
-        state.has_unevaluated = true
+    if !is_d7 {
+      match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+        Ok(cid) => {
+          node.unevaluated_properties = cid
+          node.kw_mask = node.kw_mask | kw_unevaluated
+          state.has_unevaluated = true
+        }
+        Err(e) => return Err(e)
       }
-      Err(e) => return Err(e)
     }
   } else if k == "unevaluatedItems" {
-    match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
-      Ok(cid) => {
-        node.unevaluated_items = cid
-        node.kw_mask = node.kw_mask | kw_unevaluated
-        state.has_unevaluated = true
+    if !is_d7 {
+      match compile_subschema(state, v, eff_scope, kw_path, depth + 1) {
+        Ok(cid) => {
+          node.unevaluated_items = cid
+          node.kw_mask = node.kw_mask | kw_unevaluated
+          state.has_unevaluated = true
+        }
+        Err(e) => return Err(e)
       }
-      Err(e) => return Err(e)
     }
   }
   Ok(())
@@ -964,20 +1458,25 @@ fn compile_into(
     }
     json5::Json5Value::Object(entries) => {
       let node = state.nodes[node_id]
+      let is_d7 = resolved_is_draft7_or_earlier(state.resolved_draft)
+      let is_d4 = resolved_is_draft4(state.resolved_draft)
+      let id_key = if is_d4 { "id" } else { "$id" }
+
       let mut eff_scope = cur_scope
       let mut ref_str_opt : Option[String] = None
+      let mut dyn_ref_opt : Option[String] = None
+      let mut rec_ref_opt : Option[String] = None
+      let mut d4_excl_min = false
+      let mut d4_excl_max = false
+      let mut id_str_opt : Option[String] = None
+
       let mut i = 0
       let n = entries.length()
       while i < n {
         let (k, v) = entries[i]
-        if k == "$id" {
+        if k == id_key {
           match v {
-            json5::Json5Value::Str(id_s) => {
-              let (base_part, _) = split_uri_fragment(id_s)
-              if base_part.length() > 0 {
-                eff_scope = resolve_uri(cur_scope, base_part)
-              }
-            }
+            json5::Json5Value::Str(id_s) => id_str_opt = Some(id_s)
             _ => ()
           }
         } else if k == "$ref" {
@@ -985,23 +1484,127 @@ fn compile_into(
             json5::Json5Value::Str(rs) => ref_str_opt = Some(rs)
             _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, schema_path + "/$ref", "$ref must be a string"))
           }
+        } else if k == "$dynamicRef" && resolved_is_202012(state.resolved_draft) {
+          match v {
+            json5::Json5Value::Str(rs) => dyn_ref_opt = Some(rs)
+            _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, schema_path + "/$dynamicRef", "$dynamicRef must be a string"))
+          }
+        } else if k == "$recursiveRef" && resolved_is_201909(state.resolved_draft) {
+          match v {
+            json5::Json5Value::Str(rs) => rec_ref_opt = Some(rs)
+            _ => return Err(SchemaError::new(SchemaErrorKind::InvalidSchema, schema_path + "/$recursiveRef", "$recursiveRef must be a string"))
+          }
+        } else if is_d4 && k == "exclusiveMinimum" {
+          match v {
+            json5::Json5Value::Bool(b) => d4_excl_min = b
+            _ => ()
+          }
+        } else if is_d4 && k == "exclusiveMaximum" {
+          match v {
+            json5::Json5Value::Bool(b) => d4_excl_max = b
+            _ => ()
+          }
         }
         i = i + 1
       }
 
-      // Compile `$ref` if present
+      // Draft-07 & Draft-04: if `$ref` is present, ignore sibling `$id` and all other siblings (fixes P1-7)
       match ref_str_opt {
         Some(rs) => {
-          match compile_ref(state, rs, eff_scope, schema_path + "/$ref", depth) {
+          if is_d7 {
+            node.scope_id = state.find_scope_idx(cur_scope)
+            match compile_ref(state, rs, cur_scope, schema_path + "/$ref") {
+              Ok(tid) => {
+                node.ref_node = tid
+                node.kw_mask = node.kw_mask | kw_ref
+              }
+              Err(e) => return Err(e)
+            }
+            return Ok(())
+          }
+        }
+        None => ()
+      }
+
+      // Apply `$id` for non-ignored objects
+      match id_str_opt {
+        Some(id_s) => {
+          let (base_part, _) = split_uri_fragment(id_s)
+          if base_part.length() > 0 {
+            eff_scope = resolve_uri(cur_scope, base_part)
+          }
+        }
+        None => ()
+      }
+      node.scope_id = state.find_scope_idx(eff_scope)
+
+      // Compile `$ref` (2019-09 / 2020-12: siblings apply!)
+      match ref_str_opt {
+        Some(rs) => {
+          match compile_ref(state, rs, eff_scope, schema_path + "/$ref") {
             Ok(tid) => {
               node.ref_node = tid
               node.kw_mask = node.kw_mask | kw_ref
             }
             Err(e) => return Err(e)
           }
-          // Draft-07: sibling keywords alongside `$ref` are ignored
-          if draft_eq(state.draft, Draft::Draft7) {
-            return Ok(())
+        }
+        None => ()
+      }
+
+      // Compile Draft 2020-12 `$dynamicRef`
+      match dyn_ref_opt {
+        Some(rs) => {
+          let (uri_part, frag_part) = split_uri_fragment(rs)
+          let target_scope = if uri_part.length() == 0 {
+            eff_scope
+          } else {
+            resolve_uri(eff_scope, uri_part)
+          }
+          let fallback_id = match compile_ref(state, rs, eff_scope, schema_path + "/$dynamicRef") {
+            Ok(tid) => tid
+            Err(e) => return Err(e)
+          }
+          // Per Draft 2020-12 §8.2.3.2: dynamic dispatch ONLY applies if fragment is a plain-name
+          // AND the statically resolved target resource defines a matching `$dynamicAnchor`.
+          if frag_part.length() > 0 && frag_part.code_unit_at(0) != 47 &&
+          state.scope_has_dynamic_anchor(target_scope, frag_part) {
+            node.dynamic_ref_anchor = frag_part
+            node.dynamic_ref_fallback = fallback_id
+            state.has_dynamic_ref = true
+            node.kw_mask = node.kw_mask | kw_ref
+          } else {
+            // Behaves as static `$ref`
+            if node.ref_node < 0 {
+              node.ref_node = fallback_id
+            } else {
+              node.dynamic_ref_fallback = fallback_id
+            }
+            node.kw_mask = node.kw_mask | kw_ref
+          }
+        }
+        None => ()
+      }
+
+      // Compile Draft 2019-09 `$recursiveRef`
+      match rec_ref_opt {
+        Some(rs) => {
+          let fallback_id = match compile_ref(state, rs, eff_scope, schema_path + "/$recursiveRef") {
+            Ok(tid) => tid
+            Err(e) => return Err(e)
+          }
+          if rs == "#" && state.scope_has_dynamic_anchor(eff_scope, "#recursive") {
+            node.dynamic_ref_anchor = "#recursive"
+            node.dynamic_ref_fallback = fallback_id
+            state.has_dynamic_ref = true
+            node.kw_mask = node.kw_mask | kw_ref
+          } else {
+            if node.ref_node < 0 {
+              node.ref_node = fallback_id
+            } else {
+              node.dynamic_ref_fallback = fallback_id
+            }
+            node.kw_mask = node.kw_mask | kw_ref
           }
         }
         None => ()
@@ -1048,6 +1651,18 @@ fn compile_into(
         i = i + 1
       }
 
+      // Draft-04 boolean exclusiveMinimum / exclusiveMaximum
+      if is_d4 {
+        if d4_excl_min && (node.kw_mask & kw_min) != 0 {
+          node.exclusive_minimum = node.minimum
+          node.kw_mask = (node.kw_mask ^ kw_min) | kw_excl_min
+        }
+        if d4_excl_max && (node.kw_mask & kw_max) != 0 {
+          node.exclusive_maximum = node.maximum
+          node.kw_mask = (node.kw_mask ^ kw_max) | kw_excl_max
+        }
+      }
+
       if has_draft7_tuple_items {
         match additional_items_val {
           Some(av) => {
@@ -1072,19 +1687,28 @@ fn compile_into(
   }
 }
 
-fn detect_draft(schema : json5::Json5Value, requested : Draft) -> Draft {
-  if !draft_eq(requested, Draft::Auto) {
-    return requested
-  }
-  match json5::get(schema, "$schema") {
-    Some(json5::Json5Value::Str(s)) => {
-      if str_contains(s, "draft-07") || str_contains(s, "draft-06") {
-        Draft::Draft7
-      } else {
-        Draft::Draft202012
+fn detect_resolved_draft(schema : json5::Json5Value, requested : Draft) -> (Draft, ResolvedDraft) {
+  match requested {
+    Draft::Draft202012 => (Draft::Draft202012, ResolvedDraft::Draft202012)
+    Draft::Draft7 => (Draft::Draft7, ResolvedDraft::Draft7)
+    Draft::Auto => {
+      match json5::get(schema, "$schema") {
+        Some(json5::Json5Value::Str(s)) => {
+          if str_contains(s, "draft-04") {
+            (Draft::Draft7, ResolvedDraft::Draft4)
+          } else if str_contains(s, "draft-06") {
+            (Draft::Draft7, ResolvedDraft::Draft6)
+          } else if str_contains(s, "draft-07") {
+            (Draft::Draft7, ResolvedDraft::Draft7)
+          } else if str_contains(s, "2019-09") {
+            (Draft::Draft202012, ResolvedDraft::Draft201909)
+          } else {
+            (Draft::Draft202012, ResolvedDraft::Draft202012)
+          }
+        }
+        _ => (Draft::Draft202012, ResolvedDraft::Draft202012)
       }
     }
-    _ => Draft::Draft202012
   }
 }
 
@@ -1092,44 +1716,51 @@ fn compile_schema_impl(
   schema : json5::Json5Value,
   opts : CompileOptions,
 ) -> Result[CompiledSchema, SchemaError] {
-  let eff_draft = detect_draft(schema, opts.draft)
-  let max_d = if opts.max_depth > 0 { opts.max_depth } else { 128 }
+  let (eff_draft, resolved) = detect_resolved_draft(schema, opts.draft)
+  let req_d = if opts.max_depth > 0 { opts.max_depth } else { 128 }
+  // Hard compile depth cap (192) guarantees stack safety on both Native and Wasm32 even when caller passes 1e6 (fixes P2-11)
+  let compile_max_d = if req_d > 192 { 192 } else { req_d }
+
   let state = CompilerState::{
     draft: eff_draft,
-    max_depth: max_d,
+    resolved_draft: resolved,
+    max_depth: compile_max_d,
     validate_formats: opts.validate_formats,
     scopes: [],
+    scope_map: StrHashMap::new(),
     anchors: [],
-    compiled_keys: [],
-    compiled_ids: [],
+    anchor_map: StrHashMap::new(),
+    compiled_map: StrHashMap::new(),
+    defs_vals: [],
+    defs_map: StrHashMap::new(),
+    pending: [],
     nodes: [],
     has_unevaluated: false,
+    has_dynamic_ref: false,
   }
 
-  // Root scope URI (from root `$id` if present, else "")
+  // Root scope URI (from root `$id` or Draft-04 `id` if present, else "")
   let mut root_scope = ""
-  match json5::get(schema, "$id") {
-    Some(json5::Json5Value::Str(id_s)) => {
-      let (base_part, _) = split_uri_fragment(id_s)
-      root_scope = base_part
-    }
-    _ => ()
+  let id_key = if resolved_is_draft4(resolved) { "id" } else { "$id" }
+  let has_root_ref = match json5::get(schema, "$ref") {
+    Some(_) => true
+    None => false
   }
-  state.scopes.push(ScopeResource::{
-    uri: root_scope,
-    root_val: schema,
-    schema_path: "#",
-  })
+  if !(has_root_ref && resolved_is_draft7_or_earlier(resolved)) {
+    match json5::get(schema, id_key) {
+      Some(json5::Json5Value::Str(id_s)) => {
+        let (base_part, _) = split_uri_fragment(id_s)
+        root_scope = base_part
+      }
+      _ => ()
+    }
+  }
+  let _ = state.register_scope(root_scope, schema, "#")
   if root_scope.length() > 0 {
-    // Also register empty URI pointing to root for bare `#` lookups
-    state.scopes.push(ScopeResource::{
-      uri: "",
-      root_val: schema,
-      schema_path: "#",
-    })
+    let _ = state.register_scope("", schema, "#")
   }
 
-  match collect_resources(state, schema, root_scope, "#", 0) {
+  match collect_resources(state, schema, root_scope, "#") {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
@@ -1137,9 +1768,9 @@ fn compile_schema_impl(
   // Reserve root node 0 before compiling so `#` self-references resolve cleanly!
   let root_id = 0
   state.nodes.push(SchemaNode::empty("#", 0))
-  state.record_compiled(root_scope + "#", root_id)
+  state.compiled_map.set(root_scope + "#", root_id)
   if root_scope.length() > 0 {
-    state.record_compiled("#", root_id)
+    state.compiled_map.set("#", root_id)
   }
 
   match compile_into(state, root_id, schema, root_scope, "#", 0) {
@@ -1147,12 +1778,68 @@ fn compile_schema_impl(
     Err(e) => return Err(e)
   }
 
+  // Drain pending `$ref` worklist iteratively (O(1) stack even for 200+ hop chains!)
+  let mut pi = 0
+  while pi < state.pending.length() {
+    let item = state.pending[pi]
+    pi = pi + 1
+    match compile_into(state, item.node_id, item.jval, item.cur_scope, item.schema_path, 0) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+
+  // Build dynamic scope tables if any `$dynamicRef` / `$recursiveRef` was compiled
+  let dynamic_scopes : Array[DynamicScopeTable] = []
+  if state.has_dynamic_ref {
+    let mut si = 0
+    while si < state.scopes.length() {
+      let sc = state.scopes[si]
+      let pairs : Array[(String, Int)] = []
+      let mut ai = 0
+      while ai < sc.dyn_anchors.length() {
+        let (aname, aval, apath) = sc.dyn_anchors[ai]
+        let key = sc.uri + "#" + aname
+        let cached = state.compiled_map.get(key)
+        let nid = if cached >= 0 {
+          cached
+        } else {
+          let new_id = state.nodes.length()
+          state.nodes.push(SchemaNode::empty(apath, 0))
+          state.compiled_map.set(key, new_id)
+          state.pending.push(PendingCompile::{
+            node_id: new_id,
+            jval: aval,
+            cur_scope: sc.uri,
+            schema_path: apath,
+          })
+          new_id
+        }
+        pairs.push((aname, nid))
+        ai = ai + 1
+      }
+      dynamic_scopes.push(DynamicScopeTable::{ anchors: pairs })
+      si = si + 1
+    }
+    // Drain any newly queued dynamic anchor targets
+    while pi < state.pending.length() {
+      let item = state.pending[pi]
+      pi = pi + 1
+      match compile_into(state, item.node_id, item.jval, item.cur_scope, item.schema_path, 0) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  }
+
   Ok(CompiledSchema::{
     draft: eff_draft,
     default_validate_formats: opts.validate_formats,
-    default_max_depth: max_d,
+    default_max_depth: req_d,
     root: root_id,
     has_unevaluated: state.has_unevaluated,
+    has_dynamic_ref: state.has_dynamic_ref,
+    dynamic_scopes: dynamic_scopes,
     nodes: state.nodes,
   })
 }

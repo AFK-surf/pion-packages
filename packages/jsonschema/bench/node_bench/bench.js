@@ -41,13 +41,13 @@ function runE2e(pairsPath, iters) {
     .filter((l) => l.length > 0);
   const pairs = lines.map((l) => JSON.parse(l));
 
+  const ajv = new Ajv2020({ strict: false });
   let compiled = 0;
   let valid = 0;
   let invalid = 0;
   let checksum = 2166136261 >>> 0;
   for (let it = 0; it < iters; it++) {
     for (let j = 0; j < pairs.length; j++) {
-      const ajv = new Ajv2020({ strict: false });
       const validate = ajv.compile(pairs[j].schema);
       compiled++;
       if (validate(pairs[j].instance)) {

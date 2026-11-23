@@ -1,6 +1,6 @@
 #!/bin/sh
 # Head-to-head steady-state benchmark runner for packages/jsonschema:
-# Pion Native (`packages/jsonschema` --release) vs Rust `jsonschema =0.29.0` (--locked --release) vs Node.js `ajv@8.17.1` (ajv/dist/2020).
+# Pion Native (`packages/jsonschema` --release) vs Rust `jsonschema =0.29.1` (--locked --release) vs Node.js `ajv@8.17.1` (ajv/dist/2020).
 # All build artifacts and temporary inputs live in /private/tmp/w10-jsonschema to keep git worktree clean.
 set -eu
 
