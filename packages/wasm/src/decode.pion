@@ -1,0 +1,1701 @@
+///| Streaming WebAssembly 1.0/2.0 binary parser and full module decoder.
+
+fn section_order_rank(id : Int) -> Int {
+  match id {
+    1 => 1 // Type
+    2 => 2 // Import
+    3 => 3 // Function
+    4 => 4 // Table
+    5 => 5 // Memory
+    6 => 6 // Global
+    7 => 7 // Export
+    8 => 8 // Start
+    9 => 9 // Element
+    12 => 10 // DataCount (between Element and Code)
+    10 => 11 // Code
+    11 => 12 // Data
+    _ => -1
+  }
+}
+
+fn decode_val_type(r : ByteReader) -> Result[ValType, WasmError] {
+  let off = r.pos
+  let b = match r.read_byte() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match b {
+    0x7F => Ok(ValType::I32)
+    0x7E => Ok(ValType::I64)
+    0x7D => Ok(ValType::F32)
+    0x7C => Ok(ValType::F64)
+    0x7B => Ok(ValType::V128)
+    0x70 => Ok(ValType::FuncRef)
+    0x6F => Ok(ValType::ExternRef)
+    _ => Err(WasmError::InvalidType(off, "unknown valtype byte " + b.to_string()))
+  }
+}
+
+fn decode_ref_type(r : ByteReader) -> Result[RefType, WasmError] {
+  let off = r.pos
+  let b = match r.read_byte() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match b {
+    0x70 => Ok(RefType::FuncRef)
+    0x6F => Ok(RefType::ExternRef)
+    _ => Err(WasmError::InvalidType(off, "unknown reftype byte " + b.to_string()))
+  }
+}
+
+fn decode_block_type(r : ByteReader) -> Result[BlockType, WasmError] {
+  let off = r.pos
+  if r.pos >= r.end {
+    return Err(WasmError::UnexpectedEof(off))
+  }
+  let b = r.data[r.pos].to_int()
+  if b == 0x40 {
+    r.pos = r.pos + 1
+    return Ok(BlockType::Empty)
+  }
+  if b == 0x7F || b == 0x7E || b == 0x7D || b == 0x7C || b == 0x7B || b == 0x70 || b == 0x6F {
+    let vt = match decode_val_type(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(BlockType::Value(vt))
+  }
+  let idx = match r.read_varint33() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if idx < 0L || idx > 2147483647L {
+    return Err(WasmError::InvalidType(off, "invalid block type s33: " + idx.to_string()))
+  }
+  Ok(BlockType::FuncType(idx.to_int()))
+}
+
+fn decode_limits(r : ByteReader, allow_memory64 : Bool) -> Result[Limits, WasmError] {
+  let _ = allow_memory64
+  let off = r.pos
+  let flags = match r.read_byte() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if flags != 0x00 && flags != 0x01 {
+    return Err(WasmError::InvalidImmediate(off, "invalid limits flags " + flags.to_string()))
+  }
+  let has_max = flags == 0x01
+  let min_v = match r.read_varuint32() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let max_v = if has_max {
+    match r.read_varuint32() {
+      Ok(v) => Some(v)
+      Err(e) => return Err(e)
+    }
+  } else {
+    None
+  }
+  Ok(Limits::{ min: min_v, max: max_v, is_memory64: false, shared: false })
+}
+
+fn decode_table_type(r : ByteReader) -> Result[TableType, WasmError] {
+  let et = match decode_ref_type(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let lim = match decode_limits(r, false) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  Ok(TableType::{ elem_type: et, limits: lim })
+}
+
+fn decode_mem_type(r : ByteReader) -> Result[MemType, WasmError] {
+  let lim = match decode_limits(r, true) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  Ok(MemType::{ limits: lim })
+}
+
+fn decode_global_type(r : ByteReader) -> Result[GlobalType, WasmError] {
+  let vt = match decode_val_type(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let off = r.pos
+  let mut_b = match r.read_byte() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if mut_b != 0 && mut_b != 1 {
+    return Err(WasmError::InvalidType(off, "invalid global mutability byte " + mut_b.to_string()))
+  }
+  Ok(GlobalType::{ val_type: vt, mutable: mut_b == 1 })
+}
+
+fn decode_memarg(r : ByteReader) -> Result[MemArg, WasmError] {
+  let off = r.pos
+  let raw_align = match r.read_varuint32() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if raw_align >= 64L {
+    return Err(WasmError::InvalidImmediate(off, "alignment too large"))
+  }
+  let align = raw_align.to_int()
+  let offset = match r.read_varuint32() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  Ok(MemArg::{ align: align, offset: offset, mem_idx: 0 })
+}
+
+fn decode_fc_instr(r : ByteReader, off : Int) -> Result[Instr, WasmError] {
+  let sub = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match sub {
+    0 => Ok(Instr::I32TruncSatF32S)
+    1 => Ok(Instr::I32TruncSatF32U)
+    2 => Ok(Instr::I32TruncSatF64S)
+    3 => Ok(Instr::I32TruncSatF64U)
+    4 => Ok(Instr::I64TruncSatF32S)
+    5 => Ok(Instr::I64TruncSatF32U)
+    6 => Ok(Instr::I64TruncSatF64S)
+    7 => Ok(Instr::I64TruncSatF64U)
+    8 => {
+      let data_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let mem_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::MemoryInit(data_idx, mem_idx))
+    }
+    9 => {
+      let data_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::DataDrop(data_idx))
+    }
+    10 => {
+      let dst = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let src = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::MemoryCopy(dst, src))
+    }
+    11 => {
+      let mem_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::MemoryFill(mem_idx))
+    }
+    12 => {
+      let elem_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let table_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::TableInit(elem_idx, table_idx))
+    }
+    13 => {
+      let elem_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::ElemDrop(elem_idx))
+    }
+    14 => {
+      let dst = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let src = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::TableCopy(dst, src))
+    }
+    15 => {
+      let table_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::TableGrow(table_idx))
+    }
+    16 => {
+      let table_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::TableSize(table_idx))
+    }
+    17 => {
+      let table_idx = match r.read_u32_as_int() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(Instr::TableFill(table_idx))
+    }
+    _ => Err(WasmError::InvalidOpcode(off, 0xFC00 + sub))
+  }
+}
+
+fn is_unassigned_simd_op(sub : Int) -> Bool {
+  match sub {
+    0x9A
+    | 0xA2
+    | 0xA5
+    | 0xA6
+    | 0xAF
+    | 0xB0
+    | 0xB2
+    | 0xB3
+    | 0xB4
+    | 0xBB
+    | 0xC2
+    | 0xC5
+    | 0xC6
+    | 0xCF
+    | 0xD0
+    | 0xD2
+    | 0xD3
+    | 0xD4
+    | 0xE2
+    | 0xEE => true
+    _ => false
+  }
+}
+
+fn is_valid_simd_plain_op(sub : Int) -> Bool {
+  if sub < 14 || sub > 255 {
+    return false
+  }
+  if (sub >= 21 && sub <= 34) || (sub >= 84 && sub <= 93) {
+    return false
+  }
+  !is_unassigned_simd_op(sub)
+}
+
+fn decode_fd_instr(r : ByteReader, off : Int) -> Result[Instr, WasmError] {
+  let sub = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if (sub >= 0 && sub <= 11) || sub == 92 || sub == 93 {
+    let ma = match decode_memarg(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(Instr::SimdMem(sub, ma))
+  }
+  if sub == 12 {
+    let bs = match r.read_bytes(16) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(Instr::V128Const(bs))
+  }
+  if sub == 13 {
+    let lanes = match r.read_bytes(16) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(Instr::I8x16Shuffle(lanes))
+  }
+  if sub >= 21 && sub <= 34 {
+    let lane = match r.read_byte() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(Instr::SimdLane(sub, lane))
+  }
+  if sub >= 84 && sub <= 91 {
+    let ma = match decode_memarg(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let lane = match r.read_byte() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(Instr::SimdMemLane(sub, ma, lane))
+  }
+  if is_valid_simd_plain_op(sub) {
+    return Ok(Instr::SimdOp(sub))
+  }
+  Err(WasmError::InvalidOpcode(off, 0xFD00 + sub))
+}
+
+fn decode_expr(r : ByteReader, limits : DecodeLimits) -> Result[Array[Instr], WasmError] {
+  let instrs : Array[Instr] = []
+  let mut depth = 1
+  while depth > 0 {
+    if instrs.length() >= limits.max_instructions_per_func {
+      return Err(WasmError::LimitExceeded("max instructions per function exceeded"))
+    }
+    let off = r.pos
+    let op = match r.read_byte() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let ins = match op {
+      0x00 => Instr::Unreachable
+      0x01 => Instr::Nop
+      0x02 => {
+        if depth >= limits.max_control_depth {
+          return Err(WasmError::LimitExceeded("max control depth exceeded"))
+        }
+        depth = depth + 1
+        match decode_block_type(r) {
+          Ok(bt) => Instr::Block(bt)
+          Err(e) => return Err(e)
+        }
+      }
+      0x03 => {
+        if depth >= limits.max_control_depth {
+          return Err(WasmError::LimitExceeded("max control depth exceeded"))
+        }
+        depth = depth + 1
+        match decode_block_type(r) {
+          Ok(bt) => Instr::Loop(bt)
+          Err(e) => return Err(e)
+        }
+      }
+      0x04 => {
+        if depth >= limits.max_control_depth {
+          return Err(WasmError::LimitExceeded("max control depth exceeded"))
+        }
+        depth = depth + 1
+        match decode_block_type(r) {
+          Ok(bt) => Instr::If(bt)
+          Err(e) => return Err(e)
+        }
+      }
+      0x05 => Instr::Else
+      0x0B => {
+        depth = depth - 1
+        Instr::End
+      }
+      0x0C =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::Br(v)
+        Err(e) => return Err(e)
+      }
+      0x0D =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::BrIf(v)
+        Err(e) => return Err(e)
+      }
+      0x0E => {
+        let count = match r.read_u32_as_int() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if count > limits.max_br_table_targets {
+          return Err(WasmError::LimitExceeded("max br_table targets exceeded"))
+        }
+        let targets : Array[Int] = []
+        let mut i = 0
+        while i < count {
+          match r.read_u32_as_int() {
+            Ok(v) => targets.push(v)
+            Err(e) => return Err(e)
+          }
+          i = i + 1
+        }
+        let def_t = match r.read_u32_as_int() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        Instr::BrTable(targets, def_t)
+      }
+      0x0F => Instr::Return
+      0x10 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::Call(v)
+        Err(e) => return Err(e)
+      }
+      0x11 => {
+        let type_idx = match r.read_u32_as_int() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let table_idx = match r.read_u32_as_int() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        Instr::CallIndirect(type_idx, table_idx)
+      }
+      0x1A => Instr::Drop
+      0x1B => Instr::Select
+      0x1C => {
+        let count = match r.read_u32_as_int() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        if count > limits.max_results {
+          return Err(WasmError::LimitExceeded("typed select too many types"))
+        }
+        let ts : Array[ValType] = []
+        let mut i = 0
+        while i < count {
+          match decode_val_type(r) {
+            Ok(vt) => ts.push(vt)
+            Err(e) => return Err(e)
+          }
+          i = i + 1
+        }
+        Instr::TypedSelect(ts)
+      }
+      0x20 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::LocalGet(v)
+        Err(e) => return Err(e)
+      }
+      0x21 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::LocalSet(v)
+        Err(e) => return Err(e)
+      }
+      0x22 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::LocalTee(v)
+        Err(e) => return Err(e)
+      }
+      0x23 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::GlobalGet(v)
+        Err(e) => return Err(e)
+      }
+      0x24 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::GlobalSet(v)
+        Err(e) => return Err(e)
+      }
+      0x25 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::TableGet(v)
+        Err(e) => return Err(e)
+      }
+      0x26 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::TableSet(v)
+        Err(e) => return Err(e)
+      }
+      0x28 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Load(ma)
+        Err(e) => return Err(e)
+      }
+      0x29 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Load(ma)
+        Err(e) => return Err(e)
+      }
+      0x2A =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::F32Load(ma)
+        Err(e) => return Err(e)
+      }
+      0x2B =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::F64Load(ma)
+        Err(e) => return Err(e)
+      }
+      0x2C =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Load8S(ma)
+        Err(e) => return Err(e)
+      }
+      0x2D =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Load8U(ma)
+        Err(e) => return Err(e)
+      }
+      0x2E =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Load16S(ma)
+        Err(e) => return Err(e)
+      }
+      0x2F =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Load16U(ma)
+        Err(e) => return Err(e)
+      }
+      0x30 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Load8S(ma)
+        Err(e) => return Err(e)
+      }
+      0x31 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Load8U(ma)
+        Err(e) => return Err(e)
+      }
+      0x32 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Load16S(ma)
+        Err(e) => return Err(e)
+      }
+      0x33 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Load16U(ma)
+        Err(e) => return Err(e)
+      }
+      0x34 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Load32S(ma)
+        Err(e) => return Err(e)
+      }
+      0x35 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Load32U(ma)
+        Err(e) => return Err(e)
+      }
+      0x36 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Store(ma)
+        Err(e) => return Err(e)
+      }
+      0x37 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Store(ma)
+        Err(e) => return Err(e)
+      }
+      0x38 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::F32Store(ma)
+        Err(e) => return Err(e)
+      }
+      0x39 =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::F64Store(ma)
+        Err(e) => return Err(e)
+      }
+      0x3A =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Store8(ma)
+        Err(e) => return Err(e)
+      }
+      0x3B =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I32Store16(ma)
+        Err(e) => return Err(e)
+      }
+      0x3C =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Store8(ma)
+        Err(e) => return Err(e)
+      }
+      0x3D =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Store16(ma)
+        Err(e) => return Err(e)
+      }
+      0x3E =>
+      match decode_memarg(r) {
+        Ok(ma) => Instr::I64Store32(ma)
+        Err(e) => return Err(e)
+      }
+      0x3F => {
+        let zoff = r.pos
+        match r.read_byte() {
+          Ok(0) => Instr::MemorySize(0)
+          Ok(_) => return Err(WasmError::InvalidImmediate(zoff, "zero byte expected"))
+          Err(e) => return Err(e)
+        }
+      }
+      0x40 => {
+        let zoff = r.pos
+        match r.read_byte() {
+          Ok(0) => Instr::MemoryGrow(0)
+          Ok(_) => return Err(WasmError::InvalidImmediate(zoff, "zero byte expected"))
+          Err(e) => return Err(e)
+        }
+      }
+      0x41 =>
+      match r.read_varint32() {
+        Ok(v) => Instr::I32Const(v)
+        Err(e) => return Err(e)
+      }
+      0x42 =>
+      match r.read_varint64() {
+        Ok(v) => Instr::I64Const(v)
+        Err(e) => return Err(e)
+      }
+      0x43 =>
+      match r.read_u32_le() {
+        Ok(v) => Instr::F32Const(v)
+        Err(e) => return Err(e)
+      }
+      0x44 =>
+      match r.read_u64_le() {
+        Ok(v) => Instr::F64Const(v)
+        Err(e) => return Err(e)
+      }
+      0x45 => Instr::I32Eqz
+      0x46 => Instr::I32Eq
+      0x47 => Instr::I32Ne
+      0x48 => Instr::I32LtS
+      0x49 => Instr::I32LtU
+      0x4A => Instr::I32GtS
+      0x4B => Instr::I32GtU
+      0x4C => Instr::I32LeS
+      0x4D => Instr::I32LeU
+      0x4E => Instr::I32GeS
+      0x4F => Instr::I32GeU
+      0x50 => Instr::I64Eqz
+      0x51 => Instr::I64Eq
+      0x52 => Instr::I64Ne
+      0x53 => Instr::I64LtS
+      0x54 => Instr::I64LtU
+      0x55 => Instr::I64GtS
+      0x56 => Instr::I64GtU
+      0x57 => Instr::I64LeS
+      0x58 => Instr::I64LeU
+      0x59 => Instr::I64GeS
+      0x5A => Instr::I64GeU
+      0x5B => Instr::F32Eq
+      0x5C => Instr::F32Ne
+      0x5D => Instr::F32Lt
+      0x5E => Instr::F32Gt
+      0x5F => Instr::F32Le
+      0x60 => Instr::F32Ge
+      0x61 => Instr::F64Eq
+      0x62 => Instr::F64Ne
+      0x63 => Instr::F64Lt
+      0x64 => Instr::F64Gt
+      0x65 => Instr::F64Le
+      0x66 => Instr::F64Ge
+      0x67 => Instr::I32Clz
+      0x68 => Instr::I32Ctz
+      0x69 => Instr::I32Popcnt
+      0x6A => Instr::I32Add
+      0x6B => Instr::I32Sub
+      0x6C => Instr::I32Mul
+      0x6D => Instr::I32DivS
+      0x6E => Instr::I32DivU
+      0x6F => Instr::I32RemS
+      0x70 => Instr::I32RemU
+      0x71 => Instr::I32And
+      0x72 => Instr::I32Or
+      0x73 => Instr::I32Xor
+      0x74 => Instr::I32Shl
+      0x75 => Instr::I32ShrS
+      0x76 => Instr::I32ShrU
+      0x77 => Instr::I32Rotl
+      0x78 => Instr::I32Rotr
+      0x79 => Instr::I64Clz
+      0x7A => Instr::I64Ctz
+      0x7B => Instr::I64Popcnt
+      0x7C => Instr::I64Add
+      0x7D => Instr::I64Sub
+      0x7E => Instr::I64Mul
+      0x7F => Instr::I64DivS
+      0x80 => Instr::I64DivU
+      0x81 => Instr::I64RemS
+      0x82 => Instr::I64RemU
+      0x83 => Instr::I64And
+      0x84 => Instr::I64Or
+      0x85 => Instr::I64Xor
+      0x86 => Instr::I64Shl
+      0x87 => Instr::I64ShrS
+      0x88 => Instr::I64ShrU
+      0x89 => Instr::I64Rotl
+      0x8A => Instr::I64Rotr
+      0x8B => Instr::F32Abs
+      0x8C => Instr::F32Neg
+      0x8D => Instr::F32Ceil
+      0x8E => Instr::F32Floor
+      0x8F => Instr::F32Trunc
+      0x90 => Instr::F32Nearest
+      0x91 => Instr::F32Sqrt
+      0x92 => Instr::F32Add
+      0x93 => Instr::F32Sub
+      0x94 => Instr::F32Mul
+      0x95 => Instr::F32Div
+      0x96 => Instr::F32Min
+      0x97 => Instr::F32Max
+      0x98 => Instr::F32Copysign
+      0x99 => Instr::F64Abs
+      0x9A => Instr::F64Neg
+      0x9B => Instr::F64Ceil
+      0x9C => Instr::F64Floor
+      0x9D => Instr::F64Trunc
+      0x9E => Instr::F64Nearest
+      0x9F => Instr::F64Sqrt
+      0xA0 => Instr::F64Add
+      0xA1 => Instr::F64Sub
+      0xA2 => Instr::F64Mul
+      0xA3 => Instr::F64Div
+      0xA4 => Instr::F64Min
+      0xA5 => Instr::F64Max
+      0xA6 => Instr::F64Copysign
+      0xA7 => Instr::I32WrapI64
+      0xA8 => Instr::I32TruncF32S
+      0xA9 => Instr::I32TruncF32U
+      0xAA => Instr::I32TruncF64S
+      0xAB => Instr::I32TruncF64U
+      0xAC => Instr::I64ExtendI32S
+      0xAD => Instr::I64ExtendI32U
+      0xAE => Instr::I64TruncF32S
+      0xAF => Instr::I64TruncF32U
+      0xB0 => Instr::I64TruncF64S
+      0xB1 => Instr::I64TruncF64U
+      0xB2 => Instr::F32ConvertI32S
+      0xB3 => Instr::F32ConvertI32U
+      0xB4 => Instr::F32ConvertI64S
+      0xB5 => Instr::F32ConvertI64U
+      0xB6 => Instr::F32DemoteF64
+      0xB7 => Instr::F64ConvertI32S
+      0xB8 => Instr::F64ConvertI32U
+      0xB9 => Instr::F64ConvertI64S
+      0xBA => Instr::F64ConvertI64U
+      0xBB => Instr::F64PromoteF32
+      0xBC => Instr::I32ReinterpretF32
+      0xBD => Instr::I64ReinterpretF64
+      0xBE => Instr::F32ReinterpretI32
+      0xBF => Instr::F64ReinterpretI64
+      0xC0 => Instr::I32Extend8S
+      0xC1 => Instr::I32Extend16S
+      0xC2 => Instr::I64Extend8S
+      0xC3 => Instr::I64Extend16S
+      0xC4 => Instr::I64Extend32S
+      0xD0 =>
+      match decode_ref_type(r) {
+        Ok(rt) => Instr::RefNull(rt)
+        Err(e) => return Err(e)
+      }
+      0xD1 => Instr::RefIsNull
+      0xD2 =>
+      match r.read_u32_as_int() {
+        Ok(v) => Instr::RefFunc(v)
+        Err(e) => return Err(e)
+      }
+      0xFC =>
+      match decode_fc_instr(r, off) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      0xFD =>
+      match decode_fd_instr(r, off) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      _ => return Err(WasmError::InvalidOpcode(off, op))
+    }
+    instrs.push(ins)
+  }
+  Ok(instrs)
+}
+
+fn decode_type_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[FuncType], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_types {
+    return Err(WasmError::LimitExceeded("max_types exceeded"))
+  }
+  let out : Array[FuncType] = []
+  let mut i = 0
+  while i < count {
+    let off = r.pos
+    let form = match r.read_byte() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if form != 0x60 {
+      return Err(WasmError::InvalidType(off, "expected 0x60 func type, got " + form.to_string()))
+    }
+    let pc = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if pc > limits.max_params {
+      return Err(WasmError::LimitExceeded("max_params exceeded"))
+    }
+    let params : Array[ValType] = []
+    let mut j = 0
+    while j < pc {
+      match decode_val_type(r) {
+        Ok(vt) => params.push(vt)
+        Err(e) => return Err(e)
+      }
+      j = j + 1
+    }
+    let rc = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if rc > limits.max_results {
+      return Err(WasmError::LimitExceeded("max_results exceeded"))
+    }
+    let results : Array[ValType] = []
+    let mut k = 0
+    while k < rc {
+      match decode_val_type(r) {
+        Ok(vt) => results.push(vt)
+        Err(e) => return Err(e)
+      }
+      k = k + 1
+    }
+    out.push(FuncType::{ params: params, results: results })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_import_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[Import], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_imports {
+    return Err(WasmError::LimitExceeded("max_imports exceeded"))
+  }
+  let out : Array[Import] = []
+  let mut i = 0
+  while i < count {
+    let mod_name = match r.read_name() {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+    let field_name = match r.read_name() {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+    let off = r.pos
+    let kind = match r.read_byte() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let desc = match kind {
+      0x00 =>
+      match r.read_u32_as_int() {
+        Ok(idx) => ImportDesc::Func(idx)
+        Err(e) => return Err(e)
+      }
+      0x01 =>
+      match decode_table_type(r) {
+        Ok(tt) => ImportDesc::Table(tt)
+        Err(e) => return Err(e)
+      }
+      0x02 =>
+      match decode_mem_type(r) {
+        Ok(mt) => ImportDesc::Memory(mt)
+        Err(e) => return Err(e)
+      }
+      0x03 =>
+      match decode_global_type(r) {
+        Ok(gt) => ImportDesc::Global(gt)
+        Err(e) => return Err(e)
+      }
+      _ => return Err(WasmError::InvalidType(off, "unknown import kind " + kind.to_string()))
+    }
+    out.push(Import::{ module_name: mod_name, name: field_name, desc: desc })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_function_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[Int], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_functions {
+    return Err(WasmError::LimitExceeded("max_functions exceeded"))
+  }
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < count {
+    match r.read_u32_as_int() {
+      Ok(v) => out.push(v)
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_table_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[TableType], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_tables {
+    return Err(WasmError::LimitExceeded("max_tables exceeded"))
+  }
+  let out : Array[TableType] = []
+  let mut i = 0
+  while i < count {
+    match decode_table_type(r) {
+      Ok(v) => out.push(v)
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_memory_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[MemType], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_memories {
+    return Err(WasmError::LimitExceeded("max_memories exceeded"))
+  }
+  let out : Array[MemType] = []
+  let mut i = 0
+  while i < count {
+    match decode_mem_type(r) {
+      Ok(v) => out.push(v)
+      Err(e) => return Err(e)
+    }
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_global_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[Global], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_globals {
+    return Err(WasmError::LimitExceeded("max_globals exceeded"))
+  }
+  let out : Array[Global] = []
+  let mut i = 0
+  while i < count {
+    let gt = match decode_global_type(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let init = match decode_expr(r, limits) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    out.push(Global::{ global_type: gt, init: init })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_export_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[Export], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_exports {
+    return Err(WasmError::LimitExceeded("max_exports exceeded"))
+  }
+  let out : Array[Export] = []
+  let mut i = 0
+  while i < count {
+    let name = match r.read_name() {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+    let off = r.pos
+    let k = match r.read_byte() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let kind = match k {
+      0x00 => ExportKind::Func
+      0x01 => ExportKind::Table
+      0x02 => ExportKind::Memory
+      0x03 => ExportKind::Global
+      _ => return Err(WasmError::InvalidType(off, "unknown export kind " + k.to_string()))
+    }
+    let idx = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    out.push(Export::{ name: name, kind: kind, index: idx })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_element_section(
+  r : ByteReader,
+  limits : DecodeLimits,
+) -> Result[Array[ElemSegment], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_elements {
+    return Err(WasmError::LimitExceeded("max_elements exceeded"))
+  }
+  let out : Array[ElemSegment] = []
+  let mut i = 0
+  while i < count {
+    let off = r.pos
+    let flags = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if flags < 0 || flags > 7 {
+      return Err(WasmError::InvalidImmediate(off, "invalid element segment flags " + flags.to_string()))
+    }
+    let is_passive_or_decl = (flags & 1) != 0
+    let has_table_idx = (flags & 2) != 0 && !is_passive_or_decl
+    let is_declarative = (flags & 2) != 0 && is_passive_or_decl
+    let uses_exprs = (flags & 4) != 0
+
+    let mode = if !is_passive_or_decl {
+      let tidx = if has_table_idx {
+        match r.read_u32_as_int() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+      } else {
+        0
+      }
+      let offset_expr = match decode_expr(r, limits) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      ElemMode::Active(tidx, offset_expr)
+    } else if is_declarative {
+      ElemMode::Declarative
+    } else {
+      ElemMode::Passive
+    }
+
+    let elem_type = if flags == 0 || flags == 4 {
+      RefType::FuncRef
+    } else if !uses_exprs {
+      let ek_off = r.pos
+      let ek = match r.read_byte() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if ek != 0x00 {
+        return Err(WasmError::InvalidType(ek_off, "expected elemkind 0x00, got " + ek.to_string()))
+      }
+      RefType::FuncRef
+    } else {
+      match decode_ref_type(r) {
+        Ok(rt) => rt
+        Err(e) => return Err(e)
+      }
+    }
+
+    let item_count = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if item_count > limits.max_functions {
+      return Err(WasmError::LimitExceeded("element item count exceeded"))
+    }
+    let items = if !uses_exprs {
+      let idxs : Array[Int] = []
+      let mut j = 0
+      while j < item_count {
+        match r.read_u32_as_int() {
+          Ok(v) => idxs.push(v)
+          Err(e) => return Err(e)
+        }
+        j = j + 1
+      }
+      ElemItems::FuncIndices(idxs)
+    } else {
+      let exprs : Array[Array[Instr]] = []
+      let mut j = 0
+      while j < item_count {
+        match decode_expr(r, limits) {
+          Ok(ex) => exprs.push(ex)
+          Err(e) => return Err(e)
+        }
+        j = j + 1
+      }
+      ElemItems::Exprs(exprs)
+    }
+    out.push(ElemSegment::{ mode: mode, elem_type: elem_type, items: items, flags: flags })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_code_section(r : ByteReader, limits : DecodeLimits) -> Result[Array[FuncBody], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_functions {
+    return Err(WasmError::LimitExceeded("max_functions exceeded in code section"))
+  }
+  let out : Array[FuncBody] = []
+  let mut i = 0
+  while i < count {
+    let body_size = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let body_start = r.pos
+    if body_size < 0 || body_size > r.end - body_start {
+      return Err(WasmError::UnexpectedEof(body_start))
+    }
+    let body_end = body_start + body_size
+    let br = ByteReader::subrange(r.data, body_start, body_end)
+    let local_group_count = match br.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let locals : Array[LocalGroup] = []
+    let mut total_locals : Int64 = 0L
+    let mut j = 0
+    while j < local_group_count {
+      let lc = match br.read_varuint32() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      total_locals = total_locals + lc
+      if total_locals > limits.max_locals_per_func.to_int64() {
+        return Err(WasmError::LimitExceeded("max_locals_per_func exceeded"))
+      }
+      let vt = match decode_val_type(br) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      locals.push(LocalGroup::{ count: lc.to_int(), val_type: vt })
+      j = j + 1
+    }
+    let body = match decode_expr(br, limits) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if br.pos != body_end {
+      return Err(
+        WasmError::SectionSizeMismatch(
+          br.pos,
+          "function body has trailing bytes: expected " +
+          body_end.to_string() +
+          ", got " +
+          br.pos.to_string(),
+        ),
+      )
+    }
+    r.pos = body_end
+    out.push(FuncBody::{ locals: locals, body: body })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_data_section(
+  r : ByteReader,
+  limits : DecodeLimits,
+) -> Result[Array[DataSegment], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if count > limits.max_data_segments {
+    return Err(WasmError::LimitExceeded("max_data_segments exceeded"))
+  }
+  let out : Array[DataSegment] = []
+  let mut i = 0
+  while i < count {
+    let off = r.pos
+    let mode_tag = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let mode = match mode_tag {
+      0 => {
+        let ex = match decode_expr(r, limits) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        DataMode::Active(0, ex)
+      }
+      1 => DataMode::Passive
+      2 => {
+        let mem_idx = match r.read_u32_as_int() {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        let ex = match decode_expr(r, limits) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        DataMode::Active(mem_idx, ex)
+      }
+      _ => return Err(WasmError::InvalidImmediate(off, "invalid data mode " + mode_tag.to_string()))
+    }
+    let dlen = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let dbytes = match r.read_bytes(dlen) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    out.push(DataSegment::{ mode: mode, data: dbytes })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+///| Streaming section-by-section WebAssembly binary parser.
+pub struct Parser {
+  data : Bytes
+  limits : DecodeLimits
+  mut pos : Int
+  mut header_parsed : Bool
+  mut version : Int
+  mut last_std_section : Int
+  mut section_count : Int
+}
+
+///| Create a streaming `Parser` with default limits.
+pub fn Parser::new(data : Bytes) -> Parser {
+  Parser::with_limits(data, DecodeLimits::default())
+}
+
+///| Create a streaming `Parser` with custom limits.
+pub fn Parser::with_limits(data : Bytes, limits : DecodeLimits) -> Parser {
+  Parser::{
+    data: data,
+    limits: limits,
+    pos: 0,
+    header_parsed: false,
+    version: 0,
+    last_std_section: 0,
+    section_count: 0,
+  }
+}
+
+///| Parse and validate the 8-byte WebAssembly header (`\0asm` + version 1).
+pub fn Parser::parse_header(self : Parser) -> Result[Int, WasmError] {
+  if self.header_parsed {
+    return Ok(self.version)
+  }
+  if self.data.length() < 8 {
+    return Err(WasmError::UnexpectedEof(self.data.length()))
+  }
+  let d = self.data
+  if d[0].to_int() != 0x00 ||
+  d[1].to_int() != 0x61 ||
+  d[2].to_int() != 0x73 ||
+  d[3].to_int() != 0x6D {
+    return Err(WasmError::InvalidMagic(0))
+  }
+  let ver = d[4].to_int() |
+  (d[5].to_int() << 8) |
+  (d[6].to_int() << 16) |
+  (d[7].to_int() << 24)
+  if ver != 1 {
+    return Err(WasmError::UnsupportedVersion(ver))
+  }
+  self.pos = 8
+  self.header_parsed = true
+  self.version = ver
+  Ok(ver)
+}
+
+///| Parse the next section from the binary stream. Returns `Ok(None)` at EOF.
+pub fn Parser::next_section(self : Parser) -> Result[Option[Section], WasmError] {
+  if !self.header_parsed {
+    match self.parse_header() {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  let total = self.data.length()
+  if self.pos >= total {
+    return Ok(None)
+  }
+  if self.section_count >= self.limits.max_sections {
+    return Err(WasmError::LimitExceeded("max_sections exceeded"))
+  }
+  let r = ByteReader::subrange(self.data, self.pos, total)
+  let id_off = r.pos
+  let sec_id = match r.read_byte() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let sec_size = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let sec_start = r.pos
+  if sec_size < 0 || sec_size > total - sec_start {
+    return Err(WasmError::UnexpectedEof(sec_start))
+  }
+  let sec_end = sec_start + sec_size
+  let sr = ByteReader::subrange(self.data, sec_start, sec_end)
+
+  if sec_id != 0 {
+    let rank = section_order_rank(sec_id)
+    if rank < 0 {
+      return Err(WasmError::InvalidSectionId(id_off, sec_id))
+    }
+    if rank == self.last_std_section {
+      return Err(WasmError::DuplicateSection(id_off, sec_id))
+    }
+    if rank < self.last_std_section {
+      return Err(WasmError::InvalidSectionOrder(id_off, sec_id))
+    }
+    self.last_std_section = rank
+  }
+
+  let sec = match sec_id {
+    0 => {
+      let cname = match sr.read_name() {
+        Ok(s) => s
+        Err(e) => return Err(e)
+      }
+      let cdata = sr.data.slice(sr.pos, sec_end)
+      sr.pos = sec_end
+      Section::Custom(CustomSection::{ name: cname, data: cdata, order_after: self.last_std_section })
+    }
+    1 =>
+    match decode_type_section(sr, self.limits) {
+      Ok(v) => Section::Type(v)
+      Err(e) => return Err(e)
+    }
+    2 =>
+    match decode_import_section(sr, self.limits) {
+      Ok(v) => Section::Import(v)
+      Err(e) => return Err(e)
+    }
+    3 =>
+    match decode_function_section(sr, self.limits) {
+      Ok(v) => Section::Function(v)
+      Err(e) => return Err(e)
+    }
+    4 =>
+    match decode_table_section(sr, self.limits) {
+      Ok(v) => Section::Table(v)
+      Err(e) => return Err(e)
+    }
+    5 =>
+    match decode_memory_section(sr, self.limits) {
+      Ok(v) => Section::Memory(v)
+      Err(e) => return Err(e)
+    }
+    6 =>
+    match decode_global_section(sr, self.limits) {
+      Ok(v) => Section::Global(v)
+      Err(e) => return Err(e)
+    }
+    7 =>
+    match decode_export_section(sr, self.limits) {
+      Ok(v) => Section::Export(v)
+      Err(e) => return Err(e)
+    }
+    8 =>
+    match sr.read_u32_as_int() {
+      Ok(v) => Section::Start(v)
+      Err(e) => return Err(e)
+    }
+    9 =>
+    match decode_element_section(sr, self.limits) {
+      Ok(v) => Section::Element(v)
+      Err(e) => return Err(e)
+    }
+    10 =>
+    match decode_code_section(sr, self.limits) {
+      Ok(v) => Section::Code(v)
+      Err(e) => return Err(e)
+    }
+    11 =>
+    match decode_data_section(sr, self.limits) {
+      Ok(v) => Section::Data(v)
+      Err(e) => return Err(e)
+    }
+    12 =>
+    match sr.read_u32_as_int() {
+      Ok(v) => Section::DataCount(v)
+      Err(e) => return Err(e)
+    }
+    _ => return Err(WasmError::InvalidSectionId(id_off, sec_id))
+  }
+
+  if sr.pos != sec_end {
+    return Err(
+      WasmError::SectionSizeMismatch(
+        sr.pos,
+        "section " + sec_id.to_string() + " did not consume all bytes",
+      ),
+    )
+  }
+  self.pos = sec_end
+  self.section_count = self.section_count + 1
+  Ok(Some(sec))
+}
+
+///| Decode a complete WebAssembly binary module using default limits.
+pub fn decode_module(data : Bytes) -> Result[Module, WasmError] {
+  decode_module_with_limits(data, DecodeLimits::default())
+}
+
+///| Decode a complete WebAssembly binary module using custom limits.
+pub fn decode_module_with_limits(data : Bytes, limits : DecodeLimits) -> Result[Module, WasmError] {
+  let p = Parser::with_limits(data, limits)
+  let ver = match p.parse_header() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let mut types : Array[FuncType] = []
+  let mut imports : Array[Import] = []
+  let mut functions : Array[Int] = []
+  let mut tables : Array[TableType] = []
+  let mut memories : Array[MemType] = []
+  let mut globals : Array[Global] = []
+  let mut exports : Array[Export] = []
+  let mut start : Option[Int] = None
+  let mut elements : Array[ElemSegment] = []
+  let mut data_count : Option[Int] = None
+  let mut codes : Array[FuncBody] = []
+  let mut data_segs : Array[DataSegment] = []
+  let custom_sections : Array[CustomSection] = []
+  let section_order : Array[Int] = []
+
+  while true {
+    match p.next_section() {
+      Ok(None) => break
+      Err(e) => return Err(e)
+      Ok(Some(sec)) =>
+      match sec {
+        Section::Custom(cs) => {
+          custom_sections.push(cs)
+          section_order.push(0)
+        }
+        Section::Type(v) => {
+          types = v
+          section_order.push(1)
+        }
+        Section::Import(v) => {
+          imports = v
+          section_order.push(2)
+        }
+        Section::Function(v) => {
+          functions = v
+          section_order.push(3)
+        }
+        Section::Table(v) => {
+          tables = v
+          section_order.push(4)
+        }
+        Section::Memory(v) => {
+          memories = v
+          section_order.push(5)
+        }
+        Section::Global(v) => {
+          globals = v
+          section_order.push(6)
+        }
+        Section::Export(v) => {
+          exports = v
+          section_order.push(7)
+        }
+        Section::Start(v) => {
+          start = Some(v)
+          section_order.push(8)
+        }
+        Section::Element(v) => {
+          elements = v
+          section_order.push(9)
+        }
+        Section::DataCount(v) => {
+          data_count = Some(v)
+          section_order.push(12)
+        }
+        Section::Code(v) => {
+          codes = v
+          section_order.push(10)
+        }
+        Section::Data(v) => {
+          data_segs = v
+          section_order.push(11)
+        }
+      }
+    }
+  }
+
+  Ok(
+    Module::{
+      version: ver,
+      types: types,
+      imports: imports,
+      functions: functions,
+      tables: tables,
+      memories: memories,
+      globals: globals,
+      exports: exports,
+      start: start,
+      elements: elements,
+      data_count: data_count,
+      codes: codes,
+      data: data_segs,
+      custom_sections: custom_sections,
+      section_order: section_order,
+    },
+  )
+}
+
+fn decode_name_map(r : ByteReader) -> Result[Array[NameAssoc], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let out : Array[NameAssoc] = []
+  let mut i = 0
+  while i < count {
+    let idx = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let name = match r.read_name() {
+      Ok(s) => s
+      Err(e) => return Err(e)
+    }
+    out.push(NameAssoc::{ index: idx, name: name })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn decode_indirect_name_map(r : ByteReader) -> Result[Array[IndirectNameAssoc], WasmError] {
+  let count = match r.read_u32_as_int() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let out : Array[IndirectNameAssoc] = []
+  let mut i = 0
+  while i < count {
+    let idx = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let names = match decode_name_map(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    out.push(IndirectNameAssoc::{ index: idx, names: names })
+    i = i + 1
+  }
+  Ok(out)
+}
+
+///| Parse a `name` custom section payload.
+pub fn decode_name_section(data : Bytes) -> Result[NameSection, WasmError] {
+  let r = ByteReader::new(data)
+  let mut module_name : Option[String] = None
+  let mut func_names : Array[NameAssoc] = []
+  let mut local_names : Array[IndirectNameAssoc] = []
+  let mut type_names : Array[NameAssoc] = []
+  let mut table_names : Array[NameAssoc] = []
+  let mut memory_names : Array[NameAssoc] = []
+  let mut global_names : Array[NameAssoc] = []
+  let mut elem_names : Array[NameAssoc] = []
+  let mut data_names : Array[NameAssoc] = []
+
+  while !r.is_eof() {
+    let sub_id = match r.read_byte() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let sub_size = match r.read_u32_as_int() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let sub_start = r.pos
+    if sub_size < 0 || sub_size > r.end - sub_start {
+      return Err(WasmError::UnexpectedEof(sub_start))
+    }
+    let sub_end = sub_start + sub_size
+    let sr = ByteReader::subrange(data, sub_start, sub_end)
+    match sub_id {
+      0 =>
+      match sr.read_name() {
+        Ok(s) => module_name = Some(s)
+        Err(e) => return Err(e)
+      }
+      1 =>
+      match decode_name_map(sr) {
+        Ok(v) => func_names = v
+        Err(e) => return Err(e)
+      }
+      2 =>
+      match decode_indirect_name_map(sr) {
+        Ok(v) => local_names = v
+        Err(e) => return Err(e)
+      }
+      4 =>
+      match decode_name_map(sr) {
+        Ok(v) => type_names = v
+        Err(e) => return Err(e)
+      }
+      5 =>
+      match decode_name_map(sr) {
+        Ok(v) => table_names = v
+        Err(e) => return Err(e)
+      }
+      6 =>
+      match decode_name_map(sr) {
+        Ok(v) => memory_names = v
+        Err(e) => return Err(e)
+      }
+      7 =>
+      match decode_name_map(sr) {
+        Ok(v) => global_names = v
+        Err(e) => return Err(e)
+      }
+      8 =>
+      match decode_name_map(sr) {
+        Ok(v) => elem_names = v
+        Err(e) => return Err(e)
+      }
+      9 =>
+      match decode_name_map(sr) {
+        Ok(v) => data_names = v
+        Err(e) => return Err(e)
+      }
+      _ => ()
+    }
+    r.pos = sub_end
+  }
+
+  Ok(
+    NameSection::{
+      module_name: module_name,
+      func_names: func_names,
+      local_names: local_names,
+      type_names: type_names,
+      table_names: table_names,
+      memory_names: memory_names,
+      global_names: global_names,
+      elem_names: elem_names,
+      data_names: data_names,
+    },
+  )
+}
