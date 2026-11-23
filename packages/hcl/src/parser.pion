@@ -1,0 +1,2096 @@
+///| Recursive-descent HCL2 parser producing a flat arena-indexed AST with
+///| explicit `HclLimits` depth protection, duplicate attribute rejection,
+///| indented heredoc dedenting, and JSON-syntax equivalence (`parse_json`).
+
+import "json5"
+
+struct Parser {
+  tokens : Array[Token]
+  mut pos : Int
+  nodes : Array[ExprNode]
+  limits : HclLimits
+  mut depth : Int
+}
+
+fn Parser::new(tokens : Array[Token], limits : HclLimits) -> Parser {
+  Parser::{ tokens: tokens, pos: 0, nodes: [], limits: limits, depth: 0 }
+}
+
+fn Parser::peek(self : Parser) -> Token {
+  if self.pos < self.tokens.length() {
+    self.tokens[self.pos]
+  } else {
+    self.tokens[self.tokens.length() - 1]
+  }
+}
+
+fn Parser::peek_at(self : Parser, delta : Int) -> Token {
+  let idx = self.pos + delta
+  if idx >= 0 && idx < self.tokens.length() {
+    self.tokens[idx]
+  } else {
+    self.tokens[self.tokens.length() - 1]
+  }
+}
+
+fn Parser::advance(self : Parser) -> Token {
+  let tok = self.peek()
+  if self.pos + 1 < self.tokens.length() {
+    self.pos = self.pos + 1
+  }
+  tok
+}
+
+fn Parser::skip_newlines(self : Parser) -> Unit {
+  while true {
+    match self.peek().kind {
+      TokKind::Newline => {
+        let _ = self.advance()
+      }
+      _ => break
+    }
+  }
+}
+
+fn Parser::push_node(self : Parser, node : ExprNode) -> Int {
+  let id = self.nodes.length()
+  self.nodes.push(node)
+  id
+}
+
+fn Parser::enter(self : Parser, span : Span) -> Result[Unit, HclError] {
+  self.depth = self.depth + 1
+  if self.depth > self.limits.max_depth {
+    return Err(
+      HclError::new(
+        HclErrorKind::LimitExceeded,
+        "maximum nesting depth exceeded (" + self.limits.max_depth.to_string() + ")",
+        span,
+      ),
+    )
+  }
+  Ok(())
+}
+
+fn Parser::leave(self : Parser) -> Unit {
+  if self.depth > 0 {
+    self.depth = self.depth - 1
+  }
+}
+
+fn parse_number_double(raw : String, span : Span) -> Result[Double, HclError] {
+  // Fast integer path for common decimal integers
+  let n = raw.length()
+  let mut is_plain_int = n > 0 && n <= 15
+  let mut i = 0
+  let mut acc : Int64 = 0L
+  if is_plain_int {
+    while i < n {
+      let b = raw.code_unit_at(i)
+      if b < 48 || b > 57 {
+        is_plain_int = false
+        break
+      }
+      acc = acc * 10L + (b - 48).to_int64()
+      i = i + 1
+    }
+  }
+  if is_plain_int {
+    return Ok(acc.to_double())
+  }
+  match json5::parse_with_options(raw, json5::ParseOptions::strict_json()) {
+    Ok(json5::Json5Value::Number(d)) => Ok(d)
+    _ => Err(HclError::new(HclErrorKind::SyntaxError, "invalid number literal: " + raw, span))
+  }
+}
+
+///| Parse an HCL2 body until `RBrace` (if `stop_at_rbrace`) or `Eof`.
+fn Parser::parse_body(self : Parser, stop_at_rbrace : Bool) -> Result[Body, HclError] {
+  let start = self.peek().span.start
+  match self.enter(self.peek().span) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let attributes : Array[Attribute] = []
+  let blocks : Array[Block] = []
+  let attr_names : Array[String] = []
+
+  while true {
+    self.skip_newlines()
+    let tok = self.peek()
+    match tok.kind {
+      TokKind::Eof => {
+        if stop_at_rbrace {
+          self.leave()
+          return Err(
+            HclError::new(
+              HclErrorKind::SyntaxError,
+              "unterminated block (expected `}`)",
+              tok.span,
+            ),
+          )
+        }
+        break
+      }
+      TokKind::RBrace => {
+        if stop_at_rbrace {
+          break
+        }
+        self.leave()
+        return Err(
+          HclError::new(
+            HclErrorKind::SyntaxError,
+            "unexpected `}` at top level",
+            tok.span,
+          ),
+        )
+      }
+      TokKind::Ident(name) => {
+        let name_tok = self.advance()
+        match self.peek().kind {
+          TokKind::Equal => {
+            // Check duplicate attribute in this body
+            let mut k = 0
+            while k < attr_names.length() {
+              if attr_names[k] == name {
+                self.leave()
+                return Err(
+                  HclError::new(
+                    HclErrorKind::DuplicateAttribute,
+                    "duplicate attribute `" + name + "`",
+                    name_tok.span,
+                  ),
+                )
+              }
+              k = k + 1
+            }
+            attr_names.push(name)
+            let _ = self.advance() // consume '='
+            let expr_id = match self.parse_expr() {
+              Ok(id) => id
+              Err(e) => {
+                self.leave()
+                return Err(e)
+              }
+            }
+            let end_pos = self.peek().span.start
+            // Expect newline, RBrace (in one-line block), or Eof
+            match self.peek().kind {
+              TokKind::Newline => {
+                let _ = self.advance()
+              }
+              TokKind::Eof => ()
+              TokKind::RBrace => {
+                if !stop_at_rbrace {
+                  self.leave()
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected newline after attribute",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+              _ => {
+                self.leave()
+                return Err(
+                  HclError::new(
+                    HclErrorKind::SyntaxError,
+                    "expected newline after attribute expression",
+                    self.peek().span,
+                  ),
+                )
+              }
+            }
+            attributes.push(
+              Attribute::{
+                name: name,
+                expr: expr_id,
+                name_span: name_tok.span,
+                span: Span::new(name_tok.span.start, end_pos),
+              },
+            )
+          }
+          _ => {
+            // Block: type label* { body }
+            let labels : Array[String] = []
+            while true {
+              match self.peek().kind {
+                TokKind::LBrace => break
+                TokKind::Ident(lbl) => {
+                  let _ = self.advance()
+                  labels.push(lbl)
+                }
+                TokKind::OQuote => {
+                  let lbl_s = match self.parse_simple_string_label() {
+                    Ok(s) => s
+                    Err(e) => {
+                      self.leave()
+                      return Err(e)
+                    }
+                  }
+                  labels.push(lbl_s)
+                }
+                _ => {
+                  self.leave()
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected block label or `{` after block type `" + name + "`",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+            }
+            let _ = self.advance() // consume '{'
+            let block_body = match self.parse_body(true) {
+              Ok(b) => b
+              Err(e) => {
+                self.leave()
+                return Err(e)
+              }
+            }
+            let close_tok = self.advance() // consume '}'
+            // Expect newline, Eof, or RBrace after block
+            match self.peek().kind {
+              TokKind::Newline => {
+                let _ = self.advance()
+              }
+              TokKind::Eof => ()
+              TokKind::RBrace => ()
+              _ => {
+                self.leave()
+                return Err(
+                  HclError::new(
+                    HclErrorKind::SyntaxError,
+                    "expected newline after block closing `}`",
+                    self.peek().span,
+                  ),
+                )
+              }
+            }
+            blocks.push(
+              Block::{
+                block_type: name,
+                labels: labels,
+                body: block_body,
+                type_span: name_tok.span,
+                span: Span::new(name_tok.span.start, close_tok.span.end),
+              },
+            )
+          }
+        }
+      }
+      _ => {
+        self.leave()
+        return Err(
+          HclError::new(
+            HclErrorKind::SyntaxError,
+            "expected attribute name or block type",
+            tok.span,
+          ),
+        )
+      }
+    }
+  }
+  self.leave()
+  Ok(Body::{ attributes: attributes, blocks: blocks, span: Span::new(start, self.peek().span.end) })
+}
+
+fn Parser::parse_simple_string_label(self : Parser) -> Result[String, HclError] {
+  let open = self.advance() // OQuote
+  let sb = StringBuilder::new()
+  while true {
+    let tok = self.peek()
+    match tok.kind {
+      TokKind::CQuote => {
+        let _ = self.advance()
+        return Ok(sb.to_string())
+      }
+      TokKind::QuotedLit(s) => {
+        let _ = self.advance()
+        sb.write_string(s)
+      }
+      _ =>
+      return Err(
+        HclError::new(
+          HclErrorKind::SyntaxError,
+          "block labels cannot contain template interpolations",
+          open.span,
+        ),
+      )
+    }
+  }
+  Ok("")
+}
+
+// Expression precedence (lowest to highest):
+// 1. Conditional: cond ? true_val : false_val
+// 2. Logical OR: ||
+// 3. Logical AND: &&
+// 4. Equality: == !=
+// 5. Relational: < <= > >=
+// 6. Additive: + -
+// 7. Multiplicative: * / %
+// 8. Unary: - !
+// 9. Postfix: .attr, [idx], [*], .*
+// 10. Primary: literals, templates, ident, func call, (expr), [...], {...}, for
+
+fn Parser::parse_expr(self : Parser) -> Result[Int, HclError] {
+  match self.enter(self.peek().span) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let res = self.parse_conditional()
+  self.leave()
+  res
+}
+
+fn Parser::parse_conditional(self : Parser) -> Result[Int, HclError] {
+  let cond = match self.parse_or() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  match self.peek().kind {
+    TokKind::Question => {
+      let q_span = self.advance().span
+      self.skip_newlines()
+      let true_expr = match self.parse_expr() {
+        Ok(id) => id
+        Err(e) => return Err(e)
+      }
+      self.skip_newlines()
+      match self.peek().kind {
+        TokKind::Colon => {
+          let _ = self.advance()
+        }
+        _ =>
+        return Err(
+          HclError::new(
+            HclErrorKind::SyntaxError,
+            "expected `:` in conditional expression",
+            self.peek().span,
+          ),
+        )
+      }
+      self.skip_newlines()
+      let false_expr = match self.parse_expr() {
+        Ok(id) => id
+        Err(e) => return Err(e)
+      }
+      Ok(self.push_node(ExprNode::Conditional(cond, true_expr, false_expr, q_span)))
+    }
+    _ => Ok(cond)
+  }
+}
+
+fn Parser::parse_or(self : Parser) -> Result[Int, HclError] {
+  let mut left = match self.parse_and() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  while true {
+    match self.peek().kind {
+      TokKind::OrOr => {
+        let op_span = self.advance().span
+        let right = match self.parse_and() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        left = self.push_node(ExprNode::Binary(BinOp::Or, left, right, op_span))
+      }
+      _ => break
+    }
+  }
+  Ok(left)
+}
+
+fn Parser::parse_and(self : Parser) -> Result[Int, HclError] {
+  let mut left = match self.parse_equality() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  while true {
+    match self.peek().kind {
+      TokKind::AndAnd => {
+        let op_span = self.advance().span
+        let right = match self.parse_equality() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        left = self.push_node(ExprNode::Binary(BinOp::And, left, right, op_span))
+      }
+      _ => break
+    }
+  }
+  Ok(left)
+}
+
+fn Parser::parse_equality(self : Parser) -> Result[Int, HclError] {
+  let mut left = match self.parse_relational() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  while true {
+    let op_opt = match self.peek().kind {
+      TokKind::EqEq => Some(BinOp::Eq)
+      TokKind::BangEq => Some(BinOp::Ne)
+      _ => None
+    }
+    match op_opt {
+      Some(op) => {
+        let op_span = self.advance().span
+        let right = match self.parse_relational() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        left = self.push_node(ExprNode::Binary(op, left, right, op_span))
+      }
+      None => break
+    }
+  }
+  Ok(left)
+}
+
+fn Parser::parse_relational(self : Parser) -> Result[Int, HclError] {
+  let mut left = match self.parse_additive() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  while true {
+    let op_opt = match self.peek().kind {
+      TokKind::Lt => Some(BinOp::Lt)
+      TokKind::LtEq => Some(BinOp::Le)
+      TokKind::Gt => Some(BinOp::Gt)
+      TokKind::GtEq => Some(BinOp::Ge)
+      _ => None
+    }
+    match op_opt {
+      Some(op) => {
+        let op_span = self.advance().span
+        let right = match self.parse_additive() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        left = self.push_node(ExprNode::Binary(op, left, right, op_span))
+      }
+      None => break
+    }
+  }
+  Ok(left)
+}
+
+fn Parser::parse_additive(self : Parser) -> Result[Int, HclError] {
+  let mut left = match self.parse_multiplicative() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  while true {
+    let op_opt = match self.peek().kind {
+      TokKind::Plus => Some(BinOp::Add)
+      TokKind::Minus => Some(BinOp::Sub)
+      _ => None
+    }
+    match op_opt {
+      Some(op) => {
+        let op_span = self.advance().span
+        let right = match self.parse_multiplicative() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        left = self.push_node(ExprNode::Binary(op, left, right, op_span))
+      }
+      None => break
+    }
+  }
+  Ok(left)
+}
+
+fn Parser::parse_multiplicative(self : Parser) -> Result[Int, HclError] {
+  let mut left = match self.parse_unary() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  while true {
+    let op_opt = match self.peek().kind {
+      TokKind::Star => Some(BinOp::Mul)
+      TokKind::Slash => Some(BinOp::Div)
+      TokKind::Percent => Some(BinOp::Mod)
+      _ => None
+    }
+    match op_opt {
+      Some(op) => {
+        let op_span = self.advance().span
+        let right = match self.parse_unary() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        left = self.push_node(ExprNode::Binary(op, left, right, op_span))
+      }
+      None => break
+    }
+  }
+  Ok(left)
+}
+
+fn Parser::parse_unary(self : Parser) -> Result[Int, HclError] {
+  match self.peek().kind {
+    TokKind::Minus => {
+      let span = self.advance().span
+      match self.enter(span) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let inner = match self.parse_unary() {
+        Ok(id) => id
+        Err(e) => {
+          self.leave()
+          return Err(e)
+        }
+      }
+      self.leave()
+      Ok(self.push_node(ExprNode::Unary(UnaryOp::Neg, inner, span)))
+    }
+    TokKind::Bang => {
+      let span = self.advance().span
+      match self.enter(span) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      let inner = match self.parse_unary() {
+        Ok(id) => id
+        Err(e) => {
+          self.leave()
+          return Err(e)
+        }
+      }
+      self.leave()
+      Ok(self.push_node(ExprNode::Unary(UnaryOp::Not, inner, span)))
+    }
+    _ => self.parse_postfix()
+  }
+}
+
+fn Parser::parse_postfix(self : Parser) -> Result[Int, HclError] {
+  let base = match self.parse_primary() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  let steps : Array[TraversalStep] = []
+  let start = self.peek().span.start
+  while true {
+    match self.peek().kind {
+      TokKind::Dot => {
+        let dot_span = self.advance().span
+        match self.peek().kind {
+          TokKind::Ident(attr) => {
+            let t = self.advance()
+            steps.push(TraversalStep::GetAttr(attr, t.span))
+          }
+          TokKind::NumberLit(num) => {
+            // Legacy numeric index traversal `a.0`
+            let t = self.advance()
+            let idx_val = match parse_number_double(num, t.span) {
+              Ok(d) => d
+              Err(e) => return Err(e)
+            }
+            let idx_node = self.push_node(ExprNode::LitNumber(idx_val, num, t.span))
+            steps.push(TraversalStep::Index(idx_node, t.span))
+          }
+          TokKind::Star => {
+            // Legacy attr-only splat `.*`
+            let s_tok = self.advance()
+            let sub : Array[TraversalStep] = []
+            while true {
+              match self.peek().kind {
+                TokKind::Dot => {
+                  let _ = self.advance()
+                  match self.peek().kind {
+                    TokKind::Ident(a) => {
+                      let at = self.advance()
+                      sub.push(TraversalStep::GetAttr(a, at.span))
+                    }
+                    TokKind::NumberLit(num) => {
+                      let nt = self.advance()
+                      let iv = match parse_number_double(num, nt.span) {
+                        Ok(d) => d
+                        Err(e) => return Err(e)
+                      }
+                      let idx_n = self.push_node(ExprNode::LitNumber(iv, num, nt.span))
+                      sub.push(TraversalStep::Index(idx_n, nt.span))
+                    }
+                    _ =>
+                    return Err(
+                      HclError::new(
+                        HclErrorKind::SyntaxError,
+                        "expected attribute name after `.` in splat",
+                        self.peek().span,
+                      ),
+                    )
+                  }
+                }
+                _ => break
+              }
+            }
+            steps.push(TraversalStep::AttrSplat(sub, Span::new(dot_span.start, s_tok.span.end)))
+          }
+          _ =>
+          return Err(
+            HclError::new(
+              HclErrorKind::SyntaxError,
+              "expected attribute name, index, or `*` after `.`",
+              self.peek().span,
+            ),
+          )
+        }
+      }
+      TokKind::LBracket => {
+        // Check for full splat `[*]`
+        let is_full_splat = match (self.peek_at(1).kind, self.peek_at(2).kind) {
+          (TokKind::Star, TokKind::RBracket) => true
+          _ => false
+        }
+        if is_full_splat {
+          let lb = self.advance()
+          let _ = self.advance() // *
+          let rb = self.advance() // ]
+          let sub : Array[TraversalStep] = []
+          while true {
+            match self.peek().kind {
+              TokKind::Dot => {
+                let _ = self.advance()
+                match self.peek().kind {
+                  TokKind::Ident(a) => {
+                    let at = self.advance()
+                    sub.push(TraversalStep::GetAttr(a, at.span))
+                  }
+                  TokKind::NumberLit(num) => {
+                    let nt = self.advance()
+                    let iv = match parse_number_double(num, nt.span) {
+                      Ok(d) => d
+                      Err(e) => return Err(e)
+                    }
+                    let idx_n = self.push_node(ExprNode::LitNumber(iv, num, nt.span))
+                    sub.push(TraversalStep::Index(idx_n, nt.span))
+                  }
+                  _ =>
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected attribute name after `.` in splat",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+              TokKind::LBracket => {
+                let is_nested_splat = match (self.peek_at(1).kind, self.peek_at(2).kind) {
+                  (TokKind::Star, TokKind::RBracket) => true
+                  _ => false
+                }
+                if is_nested_splat {
+                  break
+                }
+                let idx_lb = self.advance()
+                self.skip_newlines()
+                let idx_expr = match self.parse_expr() {
+                  Ok(id) => id
+                  Err(e) => return Err(e)
+                }
+                self.skip_newlines()
+                match self.peek().kind {
+                  TokKind::RBracket => {
+                    let idx_rb = self.advance()
+                    sub.push(TraversalStep::Index(idx_expr, Span::new(idx_lb.span.start, idx_rb.span.end)))
+                  }
+                  _ =>
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected `]` after index expression",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+              _ => break
+            }
+          }
+          steps.push(TraversalStep::FullSplat(sub, Span::new(lb.span.start, rb.span.end)))
+        } else {
+          let lb = self.advance()
+          self.skip_newlines()
+          let idx_expr = match self.parse_expr() {
+            Ok(id) => id
+            Err(e) => return Err(e)
+          }
+          self.skip_newlines()
+          match self.peek().kind {
+            TokKind::RBracket => {
+              let rb = self.advance()
+              steps.push(TraversalStep::Index(idx_expr, Span::new(lb.span.start, rb.span.end)))
+            }
+            _ =>
+            return Err(
+              HclError::new(
+                HclErrorKind::SyntaxError,
+                "expected `]` after index expression",
+                self.peek().span,
+              ),
+            )
+          }
+        }
+      }
+      _ => break
+    }
+  }
+  if steps.length() == 0 {
+    Ok(base)
+  } else {
+    Ok(self.push_node(ExprNode::Traversal(base, steps, Span::new(start, self.peek().span.end))))
+  }
+}
+
+fn Parser::parse_primary(self : Parser) -> Result[Int, HclError] {
+  let tok = self.peek()
+  match tok.kind {
+    TokKind::NumberLit(raw) => {
+      let t = self.advance()
+      let d = match parse_number_double(raw, t.span) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      Ok(self.push_node(ExprNode::LitNumber(d, raw, t.span)))
+    }
+    TokKind::Ident(name) => {
+      let t = self.advance()
+      if name == "true" {
+        return Ok(self.push_node(ExprNode::LitBool(true, t.span)))
+      }
+      if name == "false" {
+        return Ok(self.push_node(ExprNode::LitBool(false, t.span)))
+      }
+      if name == "null" {
+        return Ok(self.push_node(ExprNode::LitNull(t.span)))
+      }
+      // Check for function call `name(...)`
+      match self.peek().kind {
+        TokKind::LParen => self.parse_func_call(name, t.span)
+        _ => Ok(self.push_node(ExprNode::ScopeVar(name, t.span)))
+      }
+    }
+    TokKind::OQuote => self.parse_quoted_template()
+    TokKind::OHeredoc(marker, indented) => self.parse_heredoc_template(marker, indented)
+    TokKind::LParen => {
+      let lp = self.advance()
+      self.skip_newlines()
+      let inner = match self.parse_expr() {
+        Ok(id) => id
+        Err(e) => return Err(e)
+      }
+      self.skip_newlines()
+      match self.peek().kind {
+        TokKind::RParen => {
+          let rp = self.advance()
+          Ok(self.push_node(ExprNode::Parentheses(inner, Span::new(lp.span.start, rp.span.end))))
+        }
+        _ =>
+        Err(
+          HclError::new(
+            HclErrorKind::SyntaxError,
+            "expected closing `)`",
+            self.peek().span,
+          ),
+        )
+      }
+    }
+    TokKind::LBracket => self.parse_tuple_or_for_tuple()
+    TokKind::LBrace => self.parse_object_or_for_object()
+    _ =>
+    Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "unexpected token `" + tok.raw + "` in expression",
+        tok.span,
+      ),
+    )
+  }
+}
+
+fn Parser::parse_func_call(self : Parser, name : String, name_span : Span) -> Result[Int, HclError] {
+  let _ = self.advance() // '('
+  let args : Array[Int] = []
+  let mut expand_final = false
+  self.skip_newlines()
+  match self.peek().kind {
+    TokKind::RParen => {
+      let rp = self.advance()
+      return Ok(self.push_node(ExprNode::FuncCall(name, args, false, Span::new(name_span.start, rp.span.end))))
+    }
+    _ => ()
+  }
+  while true {
+    self.skip_newlines()
+    let arg = match self.parse_expr() {
+      Ok(id) => id
+      Err(e) => return Err(e)
+    }
+    args.push(arg)
+    self.skip_newlines()
+    match self.peek().kind {
+      TokKind::Ellipsis => {
+        let _ = self.advance()
+        expand_final = true
+        self.skip_newlines()
+      }
+      _ => ()
+    }
+    match self.peek().kind {
+      TokKind::Comma => {
+        let _ = self.advance()
+        self.skip_newlines()
+        match self.peek().kind {
+          TokKind::RParen => {
+            let rp = self.advance()
+            return Ok(
+              self.push_node(
+                ExprNode::FuncCall(name, args, expand_final, Span::new(name_span.start, rp.span.end)),
+              ),
+            )
+          }
+          _ => {
+            if expand_final {
+              return Err(
+                HclError::new(
+                  HclErrorKind::SyntaxError,
+                  "`...` expansion is only allowed on the final function argument",
+                  self.peek().span,
+                ),
+              )
+            }
+          }
+        }
+      }
+      TokKind::RParen => {
+        let rp = self.advance()
+        return Ok(
+          self.push_node(
+            ExprNode::FuncCall(name, args, expand_final, Span::new(name_span.start, rp.span.end)),
+          ),
+        )
+      }
+      _ =>
+      return Err(
+        HclError::new(
+          HclErrorKind::SyntaxError,
+          "expected `,` or `)` in function call arguments",
+          self.peek().span,
+        ),
+      )
+    }
+  }
+  Err(HclError::new(HclErrorKind::SyntaxError, "unterminated function call", name_span))
+}
+
+fn Parser::parse_tuple_or_for_tuple(self : Parser) -> Result[Int, HclError] {
+  let lb = self.advance() // '['
+  self.skip_newlines()
+  // Check for `[for ...]`
+  let is_for = match self.peek().kind {
+    TokKind::Ident(s) => s == "for"
+    _ => false
+  }
+  if is_for {
+    return self.parse_for_tuple(lb.span)
+  }
+  let items : Array[Int] = []
+  while true {
+    self.skip_newlines()
+    match self.peek().kind {
+      TokKind::RBracket => {
+        let rb = self.advance()
+        return Ok(self.push_node(ExprNode::TupleCons(items, Span::new(lb.span.start, rb.span.end))))
+      }
+      _ => ()
+    }
+    let item = match self.parse_expr() {
+      Ok(id) => id
+      Err(e) => return Err(e)
+    }
+    items.push(item)
+    self.skip_newlines()
+    match self.peek().kind {
+      TokKind::Comma => {
+        let _ = self.advance()
+      }
+      TokKind::RBracket => ()
+      _ =>
+      return Err(
+        HclError::new(
+          HclErrorKind::SyntaxError,
+          "expected `,` or `]` in tuple literal",
+          self.peek().span,
+        ),
+      )
+    }
+  }
+  Err(HclError::new(HclErrorKind::SyntaxError, "unterminated tuple literal", lb.span))
+}
+
+fn Parser::parse_for_intro(self : Parser) -> Result[(Option[String], String, Int), HclError] {
+  let _ = self.advance() // 'for'
+  self.skip_newlines()
+  let first = match self.peek().kind {
+    TokKind::Ident(s) => {
+      let _ = self.advance()
+      s
+    }
+    _ =>
+    return Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "expected loop variable name after `for`",
+        self.peek().span,
+      ),
+    )
+  }
+  self.skip_newlines()
+  let mut key_var : Option[String] = None
+  let mut val_var = first
+  match self.peek().kind {
+    TokKind::Comma => {
+      let _ = self.advance()
+      self.skip_newlines()
+      match self.peek().kind {
+        TokKind::Ident(s2) => {
+          let _ = self.advance()
+          key_var = Some(first)
+          val_var = s2
+        }
+        _ =>
+        return Err(
+          HclError::new(
+            HclErrorKind::SyntaxError,
+            "expected value variable name after `,` in `for`",
+            self.peek().span,
+          ),
+        )
+      }
+    }
+    _ => ()
+  }
+  self.skip_newlines()
+  match self.peek().kind {
+    TokKind::Ident(kw) => {
+      if kw != "in" {
+        return Err(
+          HclError::new(HclErrorKind::SyntaxError, "expected `in` in `for` expression", self.peek().span),
+        )
+      }
+      let _ = self.advance()
+    }
+    _ =>
+    return Err(
+      HclError::new(HclErrorKind::SyntaxError, "expected `in` in `for` expression", self.peek().span),
+    )
+  }
+  self.skip_newlines()
+  let coll = match self.parse_expr() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  Ok((key_var, val_var, coll))
+}
+
+fn Parser::parse_for_tuple(self : Parser, start_span : Span) -> Result[Int, HclError] {
+  let (key_var, val_var, coll) = match self.parse_for_intro() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  self.skip_newlines()
+  match self.peek().kind {
+    TokKind::Colon => {
+      let _ = self.advance()
+    }
+    _ =>
+    return Err(
+      HclError::new(HclErrorKind::SyntaxError, "expected `:` in `for` expression", self.peek().span),
+    )
+  }
+  self.skip_newlines()
+  let val_expr = match self.parse_expr() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  self.skip_newlines()
+  let mut cond_expr : Option[Int] = None
+  match self.peek().kind {
+    TokKind::Ident(kw) => {
+      if kw == "if" {
+        let _ = self.advance()
+        self.skip_newlines()
+        let c = match self.parse_expr() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        cond_expr = Some(c)
+        self.skip_newlines()
+      }
+    }
+    _ => ()
+  }
+  match self.peek().kind {
+    TokKind::RBracket => {
+      let rb = self.advance()
+      Ok(
+        self.push_node(
+          ExprNode::ForTuple(
+            key_var,
+            val_var,
+            coll,
+            val_expr,
+            cond_expr,
+            Span::new(start_span.start, rb.span.end),
+          ),
+        ),
+      )
+    }
+    _ =>
+    Err(
+      HclError::new(HclErrorKind::SyntaxError, "expected `]` closing `for` expression", self.peek().span),
+    )
+  }
+}
+
+fn Parser::parse_object_or_for_object(self : Parser) -> Result[Int, HclError] {
+  let lb = self.advance() // '{'
+  self.skip_newlines()
+  // Check for `{for ...}` (not `{ for = 1 }`!)
+  let is_for = match self.peek().kind {
+    TokKind::Ident(s) => {
+      if s == "for" {
+        match self.peek_at(1).kind {
+          TokKind::Equal => false
+          TokKind::Colon => false
+          _ => true
+        }
+      } else {
+        false
+      }
+    }
+    _ => false
+  }
+  if is_for {
+    return self.parse_for_object(lb.span)
+  }
+  let items : Array[ObjectItem] = []
+  while true {
+    self.skip_newlines()
+    match self.peek().kind {
+      TokKind::RBrace => {
+        let rb = self.advance()
+        return Ok(self.push_node(ExprNode::ObjectCons(items, Span::new(lb.span.start, rb.span.end))))
+      }
+      _ => ()
+    }
+    let item_start = self.peek().span.start
+    // Object key: bare identifier is treated as literal string key unless parenthesized `(expr)`
+    let mut force_eval_key = false
+    let key_expr = match self.peek().kind {
+      TokKind::Ident(k) => {
+        let is_bare_key = match self.peek_at(1).kind {
+          TokKind::Equal => true
+          TokKind::Colon => true
+          _ => false
+        }
+        if is_bare_key {
+          let kt = self.advance()
+          self.push_node(ExprNode::LitString(k, kt.span))
+        } else {
+          force_eval_key = true
+          match self.parse_expr() {
+            Ok(id) => id
+            Err(e) => return Err(e)
+          }
+        }
+      }
+      TokKind::LParen => {
+        force_eval_key = true
+        match self.parse_expr() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+      }
+      _ => {
+        force_eval_key = true
+        match self.parse_expr() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+      }
+    }
+    match self.peek().kind {
+      TokKind::Equal => {
+        let _ = self.advance()
+      }
+      TokKind::Colon => {
+        let _ = self.advance()
+      }
+      _ =>
+      return Err(
+        HclError::new(
+          HclErrorKind::SyntaxError,
+          "expected `=` or `:` after object key",
+          self.peek().span,
+        ),
+      )
+    }
+    self.skip_newlines()
+    let val_expr = match self.parse_expr() {
+      Ok(id) => id
+      Err(e) => return Err(e)
+    }
+    let item_end = self.peek().span.start
+    items.push(
+      ObjectItem::{
+        key_expr: key_expr,
+        val_expr: val_expr,
+        force_eval_key: force_eval_key,
+        span: Span::new(item_start, item_end),
+      },
+    )
+    match self.peek().kind {
+      TokKind::Comma => {
+        let _ = self.advance()
+      }
+      TokKind::Newline => {
+        let _ = self.advance()
+      }
+      TokKind::RBrace => ()
+      _ =>
+      return Err(
+        HclError::new(
+          HclErrorKind::SyntaxError,
+          "expected `,`, newline, or `}` after object item",
+          self.peek().span,
+        ),
+      )
+    }
+  }
+  Err(HclError::new(HclErrorKind::SyntaxError, "unterminated object literal", lb.span))
+}
+
+fn Parser::parse_for_object(self : Parser, start_span : Span) -> Result[Int, HclError] {
+  let (key_var, val_var, coll) = match self.parse_for_intro() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  self.skip_newlines()
+  match self.peek().kind {
+    TokKind::Colon => {
+      let _ = self.advance()
+    }
+    _ =>
+    return Err(
+      HclError::new(HclErrorKind::SyntaxError, "expected `:` in object `for` expression", self.peek().span),
+    )
+  }
+  self.skip_newlines()
+  let key_expr = match self.parse_expr() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  self.skip_newlines()
+  match self.peek().kind {
+    TokKind::FatArrow => {
+      let _ = self.advance()
+    }
+    _ =>
+    return Err(
+      HclError::new(HclErrorKind::SyntaxError, "expected `=>` in object `for` expression", self.peek().span),
+    )
+  }
+  self.skip_newlines()
+  let val_expr = match self.parse_expr() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  let mut group = false
+  match self.peek().kind {
+    TokKind::Ellipsis => {
+      let _ = self.advance()
+      group = true
+    }
+    _ => ()
+  }
+  self.skip_newlines()
+  let mut cond_expr : Option[Int] = None
+  match self.peek().kind {
+    TokKind::Ident(kw) => {
+      if kw == "if" {
+        let _ = self.advance()
+        self.skip_newlines()
+        let c = match self.parse_expr() {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        cond_expr = Some(c)
+        self.skip_newlines()
+      }
+    }
+    _ => ()
+  }
+  match self.peek().kind {
+    TokKind::RBrace => {
+      let rb = self.advance()
+      Ok(
+        self.push_node(
+          ExprNode::ForObject(
+            key_var,
+            val_var,
+            coll,
+            key_expr,
+            val_expr,
+            group,
+            cond_expr,
+            Span::new(start_span.start, rb.span.end),
+          ),
+        ),
+      )
+    }
+    _ =>
+    Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "expected `}` closing object `for` expression",
+        self.peek().span,
+      ),
+    )
+  }
+}
+
+// Template parsing (`"..."`, `<<EOF`, `<<-EOF`, and standalone templates)
+
+fn Parser::parse_quoted_template(self : Parser) -> Result[Int, HclError] {
+  let open = self.advance() // OQuote
+  let parts = match self.parse_template_parts(true, false, "") {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  match self.peek().kind {
+    TokKind::CQuote => {
+      let close = self.advance()
+      // Optimization: plain string literal without any interpolations/directives
+      if parts.length() == 0 {
+        return Ok(self.push_node(ExprNode::LitString("", Span::new(open.span.start, close.span.end))))
+      }
+      if parts.length() == 1 {
+        match parts[0] {
+          TemplatePart::Literal(s, _) =>
+          return Ok(self.push_node(ExprNode::LitString(s, Span::new(open.span.start, close.span.end))))
+          _ => ()
+        }
+      }
+      Ok(self.push_node(ExprNode::Template(parts, true, Span::new(open.span.start, close.span.end))))
+    }
+    _ =>
+    Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "expected closing `\"` for template string",
+        self.peek().span,
+      ),
+    )
+  }
+}
+
+fn Parser::parse_heredoc_template(self : Parser, marker : String, indented : Bool) -> Result[Int, HclError] {
+  let open = self.advance() // OHeredoc
+  let raw_parts = match self.parse_template_parts(false, true, marker) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  match self.peek().kind {
+    TokKind::CHeredoc(_) => {
+      let close = self.advance()
+      let parts = if indented { dedent_heredoc_parts(raw_parts) } else { raw_parts }
+      if parts.length() == 0 {
+        return Ok(self.push_node(ExprNode::LitString("", Span::new(open.span.start, close.span.end))))
+      }
+      if parts.length() == 1 {
+        match parts[0] {
+          TemplatePart::Literal(s, _) =>
+          return Ok(self.push_node(ExprNode::LitString(s, Span::new(open.span.start, close.span.end))))
+          _ => ()
+        }
+      }
+      Ok(self.push_node(ExprNode::Template(parts, false, Span::new(open.span.start, close.span.end))))
+    }
+    _ =>
+    Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "unterminated heredoc `" + marker + "`",
+        self.peek().span,
+      ),
+    )
+  }
+}
+
+///| Strip minimum common leading whitespace from non-empty lines in an indented heredoc (`<<-EOF`).
+fn dedent_heredoc_parts(parts : Array[TemplatePart]) -> Array[TemplatePart] {
+  // Pass 1: find minimum leading whitespace (spaces/tabs) on non-empty lines across top-level literals
+  let mut min_indent = -1
+  let mut at_line_start = true
+  let mut i = 0
+  while i < parts.length() {
+    match parts[i] {
+      TemplatePart::Literal(s, _) => {
+        let n = s.length()
+        let mut j = 0
+        while j < n {
+          if at_line_start {
+            let mut ws = 0
+            while j + ws < n && (s.code_unit_at(j + ws) == 32 || s.code_unit_at(j + ws) == 9) {
+              ws = ws + 1
+            }
+            if j + ws < n && s.code_unit_at(j + ws) == 10 {
+              // Empty/whitespace-only line: ignore for min_indent calculation
+              j = j + ws + 1
+              at_line_start = true
+              continue
+            }
+            if j + ws < n || i + 1 < parts.length() {
+              if min_indent < 0 || ws < min_indent {
+                min_indent = ws
+              }
+            }
+            j = j + ws
+            at_line_start = false
+          } else {
+            if s.code_unit_at(j) == 10 {
+              at_line_start = true
+            }
+            j = j + 1
+          }
+        }
+      }
+      _ => {
+        if at_line_start {
+          min_indent = 0
+          at_line_start = false
+        }
+      }
+    }
+    i = i + 1
+  }
+  if min_indent <= 0 {
+    return parts
+  }
+  // Pass 2: strip up to min_indent leading spaces/tabs from each line start
+  let out : Array[TemplatePart] = []
+  at_line_start = true
+  i = 0
+  while i < parts.length() {
+    match parts[i] {
+      TemplatePart::Literal(s, span) => {
+        let sb = StringBuilder::new()
+        let n = s.length()
+        let mut j = 0
+        while j < n {
+          if at_line_start {
+            let mut skipped = 0
+            while j < n && skipped < min_indent && (s.code_unit_at(j) == 32 || s.code_unit_at(j) == 9) {
+              j = j + 1
+              skipped = skipped + 1
+            }
+            at_line_start = false
+          }
+          if j < n {
+            let c = s.code_unit_at(j)
+            sb.write_byte(c.to_byte())
+            if c == 10 {
+              at_line_start = true
+            }
+            j = j + 1
+          }
+        }
+        out.push(TemplatePart::Literal(sb.to_string(), span))
+      }
+      other => {
+        at_line_start = false
+        out.push(other)
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn Parser::is_template_control_kw(self : Parser, kw1 : String, kw2 : String) -> Bool {
+  match self.peek().kind {
+    TokKind::TemplateControl(_) => {
+      match self.peek_at(1).kind {
+        TokKind::Ident(s) => s == kw1 || (kw2.length() > 0 && s == kw2)
+        _ => false
+      }
+    }
+    _ => false
+  }
+}
+
+fn Parser::parse_template_parts(
+  self : Parser,
+  stop_cquote : Bool,
+  stop_cheredoc : Bool,
+  stop_kw : String,
+) -> Result[Array[TemplatePart], HclError] {
+  match self.enter(self.peek().span) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let parts : Array[TemplatePart] = []
+  while true {
+    let tok = self.peek()
+    match tok.kind {
+      TokKind::Eof => break
+      TokKind::CQuote => {
+        if stop_cquote {
+          break
+        }
+        self.leave()
+        return Err(HclError::new(HclErrorKind::SyntaxError, "unexpected quote in template", tok.span))
+      }
+      TokKind::CHeredoc(_) => {
+        if stop_cheredoc {
+          break
+        }
+        self.leave()
+        return Err(HclError::new(HclErrorKind::SyntaxError, "unexpected heredoc end", tok.span))
+      }
+      TokKind::QuotedLit(s) => {
+        let t = self.advance()
+        parts.push(TemplatePart::Literal(s, t.span))
+      }
+      TokKind::StringLit(s) => {
+        let t = self.advance()
+        parts.push(TemplatePart::Literal(s, t.span))
+      }
+      TokKind::TemplateInterp(strip_left) => {
+        let open = self.advance()
+        self.skip_newlines()
+        let expr_id = match self.parse_expr() {
+          Ok(id) => id
+          Err(e) => {
+            self.leave()
+            return Err(e)
+          }
+        }
+        self.skip_newlines()
+        match self.peek().kind {
+          TokKind::TemplateSeqEnd(strip_right) => {
+            let close = self.advance()
+            parts.push(
+              TemplatePart::Interp(
+                expr_id,
+                strip_left,
+                strip_right,
+                Span::new(open.span.start, close.span.end),
+              ),
+            )
+          }
+          _ => {
+            self.leave()
+            return Err(
+              HclError::new(
+                HclErrorKind::SyntaxError,
+                "expected `}` closing template interpolation",
+                self.peek().span,
+              ),
+            )
+          }
+        }
+      }
+      TokKind::TemplateControl(strip_left) => {
+        // Check if this control directive closes an enclosing if/for
+        if stop_kw == "endif" && self.is_template_control_kw("else", "endif") {
+          break
+        }
+        if stop_kw == "endif_only" && self.is_template_control_kw("endif", "") {
+          break
+        }
+        if stop_kw == "endfor" && self.is_template_control_kw("endfor", "") {
+          break
+        }
+        let open = self.advance() // %{
+        let kw_tok = self.peek()
+        match kw_tok.kind {
+          TokKind::Ident(kw) => {
+            if kw == "if" {
+              let _ = self.advance()
+              let cond = match self.parse_expr() {
+                Ok(id) => id
+                Err(e) => {
+                  self.leave()
+                  return Err(e)
+                }
+              }
+              let open_strip_right = match self.peek().kind {
+                TokKind::TemplateSeqEnd(sr) => {
+                  let _ = self.advance()
+                  sr
+                }
+                _ => {
+                  self.leave()
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected `}` after `%{if ...`",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+              let true_parts = match self.parse_template_parts(stop_cquote, stop_cheredoc, "endif") {
+                Ok(p) => p
+                Err(e) => {
+                  self.leave()
+                  return Err(e)
+                }
+              }
+              let mut false_parts : Array[TemplatePart] = []
+              if self.is_template_control_kw("else", "") {
+                let _ = self.advance() // %{
+                let _ = self.advance() // else
+                match self.peek().kind {
+                  TokKind::TemplateSeqEnd(_) => {
+                    let _ = self.advance()
+                  }
+                  _ => {
+                    self.leave()
+                    return Err(
+                      HclError::new(
+                        HclErrorKind::SyntaxError,
+                        "expected `}` after `%{else`",
+                        self.peek().span,
+                      ),
+                    )
+                  }
+                }
+                false_parts = match self.parse_template_parts(stop_cquote, stop_cheredoc, "endif_only") {
+                  Ok(p) => p
+                  Err(e) => {
+                    self.leave()
+                    return Err(e)
+                  }
+                }
+              }
+              if !self.is_template_control_kw("endif", "") {
+                self.leave()
+                return Err(
+                  HclError::new(
+                    HclErrorKind::SyntaxError,
+                    "expected `%{endif}` closing `%{if}`",
+                    self.peek().span,
+                  ),
+                )
+              }
+              let end_strip_left = match self.advance().kind {
+                TokKind::TemplateControl(sl) => sl
+                _ => false
+              }
+              let _ = self.advance() // endif
+              let (end_strip_right, close_end) = match self.peek().kind {
+                TokKind::TemplateSeqEnd(sr) => {
+                  let ct = self.advance()
+                  (sr, ct.span.end)
+                }
+                _ => {
+                  self.leave()
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected `}` after `%{endif`",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+              parts.push(
+                TemplatePart::If(
+                  cond,
+                  true_parts,
+                  false_parts,
+                  strip_left,
+                  open_strip_right,
+                  end_strip_left,
+                  end_strip_right,
+                  Span::new(open.span.start, close_end),
+                ),
+              )
+            } else if kw == "for" {
+              let (kvar, vvar, coll) = match self.parse_for_intro() {
+                Ok(v) => v
+                Err(e) => {
+                  self.leave()
+                  return Err(e)
+                }
+              }
+              let open_strip_right = match self.peek().kind {
+                TokKind::TemplateSeqEnd(sr) => {
+                  let _ = self.advance()
+                  sr
+                }
+                _ => {
+                  self.leave()
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected `}` after `%{for ...`",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+              let body_parts = match self.parse_template_parts(stop_cquote, stop_cheredoc, "endfor") {
+                Ok(p) => p
+                Err(e) => {
+                  self.leave()
+                  return Err(e)
+                }
+              }
+              if !self.is_template_control_kw("endfor", "") {
+                self.leave()
+                return Err(
+                  HclError::new(
+                    HclErrorKind::SyntaxError,
+                    "expected `%{endfor}` closing `%{for}`",
+                    self.peek().span,
+                  ),
+                )
+              }
+              let end_strip_left = match self.advance().kind {
+                TokKind::TemplateControl(sl) => sl
+                _ => false
+              }
+              let _ = self.advance() // endfor
+              let (end_strip_right, close_end) = match self.peek().kind {
+                TokKind::TemplateSeqEnd(sr) => {
+                  let ct = self.advance()
+                  (sr, ct.span.end)
+                }
+                _ => {
+                  self.leave()
+                  return Err(
+                    HclError::new(
+                      HclErrorKind::SyntaxError,
+                      "expected `}` after `%{endfor`",
+                      self.peek().span,
+                    ),
+                  )
+                }
+              }
+              parts.push(
+                TemplatePart::For(
+                  kvar,
+                  vvar,
+                  coll,
+                  body_parts,
+                  strip_left,
+                  open_strip_right,
+                  end_strip_left,
+                  end_strip_right,
+                  Span::new(open.span.start, close_end),
+                ),
+              )
+            } else {
+              self.leave()
+              return Err(
+                HclError::new(
+                  HclErrorKind::SyntaxError,
+                  "unexpected template directive `" + kw + "`",
+                  kw_tok.span,
+                ),
+              )
+            }
+          }
+          _ => {
+            self.leave()
+            return Err(
+              HclError::new(
+                HclErrorKind::SyntaxError,
+                "expected template directive keyword (`if`, `for`, `else`, `endif`, `endfor`)",
+                kw_tok.span,
+              ),
+            )
+          }
+        }
+      }
+      _ => {
+        self.leave()
+        return Err(
+          HclError::new(
+            HclErrorKind::SyntaxError,
+            "unexpected token in template",
+            tok.span,
+          ),
+        )
+      }
+    }
+  }
+  self.leave()
+  Ok(parts)
+}
+
+///| Parse an HCL2 configuration file into an AST `File`.
+pub fn parse_file_impl(src : String, limits : HclLimits) -> Result[File, HclError] {
+  let tokens = match lex_hcl(src, false, limits.max_depth) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let p = Parser::new(tokens, limits)
+  let body = match p.parse_body(false) {
+    Ok(b) => b
+    Err(e) => return Err(e)
+  }
+  Ok(File::{ body: body, nodes: p.nodes })
+}
+
+///| Parse a standalone HCL2 expression into an `ExprFile`.
+pub fn parse_expr_impl(src : String, limits : HclLimits) -> Result[ExprFile, HclError] {
+  let tokens = match lex_hcl(src, false, limits.max_depth) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let p = Parser::new(tokens, limits)
+  p.skip_newlines()
+  let root = match p.parse_expr() {
+    Ok(id) => id
+    Err(e) => return Err(e)
+  }
+  p.skip_newlines()
+  match p.peek().kind {
+    TokKind::Eof => Ok(ExprFile::{ root: root, nodes: p.nodes })
+    _ =>
+    Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "unexpected trailing token `" + p.peek().raw + "` after expression",
+        p.peek().span,
+      ),
+    )
+  }
+}
+
+///| Parse a standalone unquoted HCL2 template into an `ExprFile`.
+pub fn parse_template_impl(src : String, limits : HclLimits) -> Result[ExprFile, HclError] {
+  let tokens = match lex_template(src, limits.max_depth) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let p = Parser::new(tokens, limits)
+  let parts = match p.parse_template_parts(false, false, "") {
+    Ok(ps) => ps
+    Err(e) => return Err(e)
+  }
+  let root = if parts.length() == 0 {
+    p.push_node(ExprNode::LitString("", Span::zero()))
+  } else if parts.length() == 1 {
+    match parts[0] {
+      TemplatePart::Literal(s, sp) => p.push_node(ExprNode::LitString(s, sp))
+      _ => p.push_node(ExprNode::Template(parts, true, Span::zero()))
+    }
+  } else {
+    p.push_node(ExprNode::Template(parts, true, Span::zero()))
+  }
+  Ok(ExprFile::{ root: root, nodes: p.nodes })
+}
+
+fn string_has_template_seq(s : String) -> Bool {
+  let n = s.length()
+  let mut i = 0
+  while i + 1 < n {
+    let b = s.code_unit_at(i)
+    let b1 = s.code_unit_at(i + 1)
+    if (b == 36 || b == 37) && (b1 == 123 || b1 == b) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn convert_json_value_to_expr(
+  v : json5::Json5Value,
+  nodes : Array[ExprNode],
+  limits : HclLimits,
+  depth : Int,
+) -> Result[Int, HclError] {
+  if depth > limits.max_depth {
+    return Err(
+      HclError::new(HclErrorKind::LimitExceeded, "maximum JSON nesting depth exceeded", Span::zero()),
+    )
+  }
+  match v {
+    json5::Json5Value::Null => {
+      let id = nodes.length()
+      nodes.push(ExprNode::LitNull(Span::zero()))
+      Ok(id)
+    }
+    json5::Json5Value::Bool(b) => {
+      let id = nodes.length()
+      nodes.push(ExprNode::LitBool(b, Span::zero()))
+      Ok(id)
+    }
+    json5::Json5Value::Number(d) => {
+      let id = nodes.length()
+      nodes.push(ExprNode::LitNumber(d, "", Span::zero()))
+      Ok(id)
+    }
+    json5::Json5Value::Str(s) => {
+      if string_has_template_seq(s) {
+        let tmpl = match parse_template_impl(s, limits) {
+          Ok(ef) => ef
+          Err(e) => return Err(e)
+        }
+        // Remap template sub-arena into main `nodes` arena
+        let base = nodes.length()
+        let mut i = 0
+        while i < tmpl.nodes.length() {
+          nodes.push(remap_expr_node(tmpl.nodes[i], base))
+          i = i + 1
+        }
+        Ok(base + tmpl.root)
+      } else {
+        let id = nodes.length()
+        nodes.push(ExprNode::LitString(s, Span::zero()))
+        Ok(id)
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let ids : Array[Int] = []
+      let mut i = 0
+      while i < items.length() {
+        let cid = match convert_json_value_to_expr(items[i], nodes, limits, depth + 1) {
+          Ok(x) => x
+          Err(e) => return Err(e)
+        }
+        ids.push(cid)
+        i = i + 1
+      }
+      let id = nodes.length()
+      nodes.push(ExprNode::TupleCons(ids, Span::zero()))
+      Ok(id)
+    }
+    json5::Json5Value::Object(entries) => {
+      let obj_items : Array[ObjectItem] = []
+      let mut i = 0
+      while i < entries.length() {
+        let (k, ev_item) = entries[i]
+        let kid = nodes.length()
+        nodes.push(ExprNode::LitString(k, Span::zero()))
+        let vid = match convert_json_value_to_expr(ev_item, nodes, limits, depth + 1) {
+          Ok(x) => x
+          Err(e) => return Err(e)
+        }
+        obj_items.push(
+          ObjectItem::{
+            key_expr: kid,
+            val_expr: vid,
+            force_eval_key: false,
+            span: Span::zero(),
+          },
+        )
+        i = i + 1
+      }
+      let id = nodes.length()
+      nodes.push(ExprNode::ObjectCons(obj_items, Span::zero()))
+      Ok(id)
+    }
+  }
+}
+
+fn remap_traversal_steps(steps : Array[TraversalStep], offset : Int) -> Array[TraversalStep] {
+  let out : Array[TraversalStep] = []
+  let mut i = 0
+  while i < steps.length() {
+    let s = match steps[i] {
+      TraversalStep::GetAttr(a, sp) => TraversalStep::GetAttr(a, sp)
+      TraversalStep::Index(e, sp) => TraversalStep::Index(e + offset, sp)
+      TraversalStep::AttrSplat(sub, sp) => TraversalStep::AttrSplat(remap_traversal_steps(sub, offset), sp)
+      TraversalStep::FullSplat(sub, sp) => TraversalStep::FullSplat(remap_traversal_steps(sub, offset), sp)
+    }
+    out.push(s)
+    i = i + 1
+  }
+  out
+}
+
+fn remap_template_parts(parts : Array[TemplatePart], offset : Int) -> Array[TemplatePart] {
+  let out : Array[TemplatePart] = []
+  let mut i = 0
+  while i < parts.length() {
+    let p = match parts[i] {
+      TemplatePart::Literal(s, sp) => TemplatePart::Literal(s, sp)
+      TemplatePart::Interp(e, sl, sr, sp) => TemplatePart::Interp(e + offset, sl, sr, sp)
+      TemplatePart::If(c, tp, fp, sl, osr, esl, esr, sp) =>
+      TemplatePart::If(
+        c + offset,
+        remap_template_parts(tp, offset),
+        remap_template_parts(fp, offset),
+        sl,
+        osr,
+        esl,
+        esr,
+        sp,
+      )
+      TemplatePart::For(kv, vv, col, bp, sl, osr, esl, esr, sp) =>
+      TemplatePart::For(
+        kv,
+        vv,
+        col + offset,
+        remap_template_parts(bp, offset),
+        sl,
+        osr,
+        esl,
+        esr,
+        sp,
+      )
+    }
+    out.push(p)
+    i = i + 1
+  }
+  out
+}
+
+fn remap_expr_node(node : ExprNode, offset : Int) -> ExprNode {
+  if offset == 0 {
+    return node
+  }
+  match node {
+    ExprNode::LitNull(sp) => ExprNode::LitNull(sp)
+    ExprNode::LitBool(b, sp) => ExprNode::LitBool(b, sp)
+    ExprNode::LitNumber(d, r, sp) => ExprNode::LitNumber(d, r, sp)
+    ExprNode::LitString(s, sp) => ExprNode::LitString(s, sp)
+    ExprNode::Template(ps, unwrap, sp) => ExprNode::Template(remap_template_parts(ps, offset), unwrap, sp)
+    ExprNode::ScopeVar(n, sp) => ExprNode::ScopeVar(n, sp)
+    ExprNode::Parentheses(e, sp) => ExprNode::Parentheses(e + offset, sp)
+    ExprNode::Unary(op, e, sp) => ExprNode::Unary(op, e + offset, sp)
+    ExprNode::Binary(op, l, r, sp) => ExprNode::Binary(op, l + offset, r + offset, sp)
+    ExprNode::Conditional(c, t, f, sp) => ExprNode::Conditional(c + offset, t + offset, f + offset, sp)
+    ExprNode::TupleCons(xs, sp) => {
+      let out : Array[Int] = []
+      let mut i = 0
+      while i < xs.length() {
+        out.push(xs[i] + offset)
+        i = i + 1
+      }
+      ExprNode::TupleCons(out, sp)
+    }
+    ExprNode::ObjectCons(items, sp) => {
+      let out : Array[ObjectItem] = []
+      let mut i = 0
+      while i < items.length() {
+        let it = items[i]
+        out.push(
+          ObjectItem::{
+            key_expr: it.key_expr + offset,
+            val_expr: it.val_expr + offset,
+            force_eval_key: it.force_eval_key,
+            span: it.span,
+          },
+        )
+        i = i + 1
+      }
+      ExprNode::ObjectCons(out, sp)
+    }
+    ExprNode::FuncCall(n, args, exp, sp) => {
+      let out : Array[Int] = []
+      let mut i = 0
+      while i < args.length() {
+        out.push(args[i] + offset)
+        i = i + 1
+      }
+      ExprNode::FuncCall(n, out, exp, sp)
+    }
+    ExprNode::Traversal(base, steps, sp) =>
+    ExprNode::Traversal(base + offset, remap_traversal_steps(steps, offset), sp)
+    ExprNode::ForTuple(kv, vv, col, ve, ce, sp) => {
+      let ce2 = match ce {
+        Some(c) => Some(c + offset)
+        None => None
+      }
+      ExprNode::ForTuple(kv, vv, col + offset, ve + offset, ce2, sp)
+    }
+    ExprNode::ForObject(kv, vv, col, ke, ve, grp, ce, sp) => {
+      let ce2 = match ce {
+        Some(c) => Some(c + offset)
+        None => None
+      }
+      ExprNode::ForObject(kv, vv, col + offset, ke + offset, ve + offset, grp, ce2, sp)
+    }
+  }
+}
+
+///| Parse an HCL2 JSON-syntax configuration file (`.tf.json`) into an AST `File`.
+pub fn parse_json_file_impl(src : String, limits : HclLimits) -> Result[File, HclError] {
+  let opts = json5::ParseOptions::{
+    max_depth: limits.max_depth,
+    max_nodes: 1000000,
+    duplicate_keys: json5::DuplicateKeyPolicy::LastWins,
+    allow_json5: false,
+    allow_comments: false,
+    allow_trailing_commas: false,
+    reject_overflow: true,
+  }
+  let root = match json5::parse_with_options(src, opts) {
+    Ok(v) => v
+    Err(e) =>
+    return Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "JSON syntax error: " + e.message,
+        Span::new(Pos::new(e.line, e.col, e.offset), Pos::new(e.line, e.col, e.offset)),
+      ),
+    )
+  }
+  match root {
+    json5::Json5Value::Object(entries) => {
+      let nodes : Array[ExprNode] = []
+      let attributes : Array[Attribute] = []
+      let mut i = 0
+      while i < entries.length() {
+        let (k, v) = entries[i]
+        // Skip HCL JSON comment properties ("//")
+        if k == "//" {
+          i = i + 1
+          continue
+        }
+        let eid = match convert_json_value_to_expr(v, nodes, limits, 1) {
+          Ok(id) => id
+          Err(e) => return Err(e)
+        }
+        attributes.push(
+          Attribute::{
+            name: k,
+            expr: eid,
+            name_span: Span::zero(),
+            span: Span::zero(),
+          },
+        )
+        i = i + 1
+      }
+      Ok(File::{ body: Body::{ attributes: attributes, blocks: [], span: Span::zero() }, nodes: nodes })
+    }
+    _ =>
+    Err(
+      HclError::new(
+        HclErrorKind::SyntaxError,
+        "HCL JSON configuration root must be a JSON object",
+        Span::zero(),
+      ),
+    )
+  }
+}
