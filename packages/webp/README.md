@@ -37,3 +37,17 @@ let img_limited = webp::decode_with_limits(bytes, webp::DecodeLimits::default())
 sh scripts/verify.sh packages/webp
 sh packages/webp/bench/run_bench.sh
 ```
+
+## Benchmarks
+
+Head-to-head against Go `golang.org/x/image/webp` `v0.48.0` (go1.27.3), measured at the Wave 20 release on Darwin arm64 with `sh packages/webp/bench/run_bench.sh` (`scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved). Each workload decodes a deterministic 512×512 WebP 30 times to RGBA8888 (30 MiB of RGBA; MB/s is RGBA output throughput). Both sides print the same 1,048,576 B of RGBA and the stdout SHA-256 matched in every round.
+
+| Workload | Pion Median (ms) | Pion Min / Max (ms) | Go Median (ms) | Pion MB/s | Go MB/s | Pion Peak RSS | Go Peak RSS | Pion vs Go | RGBA8888 SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| VP8L Lossless | **130.652** | 128.435 / 132.096 | 154.463 | 240.77 | 203.66 | **4.47 MiB** | 11.95 MiB | **1.18x** | `d17d1dff27faae74…` |
+| VP8 Lossy | 147.946 | 138.070 / 168.802 | **143.284** | 212.63 | 219.54 | **4.39 MiB** | 12.89 MiB | 0.97x | `290259f8f8ad61a0…` |
+| VP8X + ALPH (VP8L alpha + VP8 lossy) | **179.968** | 175.499 / 185.194 | 192.009 | 174.79 | 163.83 | **4.80 MiB** | 11.97 MiB | **1.07x** | `19475dec78b0d4ff…` |
+
+Honest notes: VP8L lossless and VP8X+ALPH lead Go; VP8 lossy is roughly at parity and trailed Go slightly in this run (0.97x; the audit's own bench section measured 1.00x on the same machine minutes earlier, with load around 6). Peak RSS is 2.5–2.9× lower than Go on all three.
+
+Red-team audit (`sh packages/webp/audit/run_audit.sh`, `audit/` untouched): **exit 0, `AUDIT PASS`**. 1 P0 + 5 P2 findings fixed. 20 / 20 red-team and control cases pass in all 4 modes (native / wasm32 × debug / release), 11 / 11 package unit tests, 5 / 5 libwebp-adjudicated vectors, 622-file differential corpus identical to x/image/webp in all 4 modes (601 identical, 21 rejected by both), 10,000 byte-level mutants with 0 crashes and native == wasm32 on all of them, 12 / 12 DoS bombs within time and RSS budgets, and 0 `extern "C"` / 0 `World` / 0 module-level mutable state. `wasm_smoke` prints the same 55 B in all 4 modes (SHA-256 `8a00bb493b1061cbc6ec503a8fe400de88fbf6fb5fc39956ca9f54e41bd65eec`).
