@@ -1,0 +1,1768 @@
+///| High-performance pure Pion Brotli (RFC 7932) decoder.
+///| Features:
+///| - Local-register 64-bit bit buffer with 4-byte fast refill & dual fast/safe paths
+///| - 2-level canonical prefix-code LUT (8-bit primary + dynamic subtables) inlined in hot loops
+///| - Specialized single-tree literal fast path (up to 3 literals per refill)
+///| - Module-level cached RFC 7932 static dictionary (122,784 B) & flat affix tables
+///| - Packed 32xUInt64 IMTF (8x faster than byte-by-byte shift, defeats IMTF CPU amplification)
+///| - Per-meta-block pre-allocation with 1.5x Int64-safe growth & zero-copy final return
+///| - Strict `DecodeLimits` enforcement clamped to runtime container max (2,147,483,631 B)
+
+///| Runtime maximum `Bytes` container length (2^31 - 17).
+let max_container_bytes : Int = 2147483631
+
+///|
+let root_bits : Int = 8
+
+///|
+let root_size : Int = 256
+
+///|
+let root_mask : UInt64 = 255UL
+
+///|
+fn build_bit_masks() -> FixedArray[UInt64] {
+  let a : FixedArray[UInt64] = FixedArray::make(33, 0UL)
+  let mut k = 0
+  while k <= 32 {
+    a[k] = (1UL << k) - 1UL
+    k = k + 1
+  }
+  a
+}
+
+///|
+let bit_masks : FixedArray[UInt64] = build_bit_masks()
+
+///|
+fn build_rev8() -> FixedArray[Int] {
+  let a : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut i = 0
+  while i < 256 {
+    let mut x = i
+    let mut r = 0
+    let mut b = 0
+    while b < 8 {
+      r = (r << 1) | (x & 1)
+      x = x >> 1
+      b = b + 1
+    }
+    a[i] = r
+    i = i + 1
+  }
+  a
+}
+
+///|
+let rev8 : FixedArray[Int] = build_rev8()
+
+///|
+fn bit_reverse(code : Int, len : Int) -> Int {
+  let r = (rev8[code & 255] << 8) | rev8[(code >> 8) & 255]
+  r >> (16 - len)
+}
+
+///|
+fn make_fixed_int(src : Array[Int]) -> FixedArray[Int] {
+  let n = src.length()
+  let a : FixedArray[Int] = FixedArray::make(n, 0)
+  let mut i = 0
+  while i < n {
+    a[i] = src[i]
+    i = i + 1
+  }
+  a
+}
+
+///|
+let length_order : FixedArray[Int] = make_fixed_int([
+  1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+])
+
+///|
+let length_prefix_len : FixedArray[Int] = make_fixed_int([
+  2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4,
+])
+
+///|
+let length_prefix_value : FixedArray[Int] = make_fixed_int([
+  0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5,
+])
+
+///|
+let block_len_base : FixedArray[Int] = make_fixed_int([
+  1, 5, 9, 13, 17, 25, 33, 41, 49, 65, 81, 97, 113, 145, 177, 209, 241, 305, 369,
+  497, 753, 1265, 2289, 4337, 8433, 16625,
+])
+
+///|
+let block_len_bits : FixedArray[Int] = make_fixed_int([
+  2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13,
+  24,
+])
+
+///|
+let insert_base : FixedArray[Int] = make_fixed_int([
+  0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090,
+  2114, 6210, 22594,
+])
+
+///|
+let insert_bits : FixedArray[Int] = make_fixed_int([
+  0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24,
+])
+
+///|
+let copy_base : FixedArray[Int] = make_fixed_int([
+  2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326,
+  582, 1094, 2118,
+])
+
+///|
+let copy_bits : FixedArray[Int] = make_fixed_int([
+  0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24,
+])
+
+///|
+let cell_insert : FixedArray[Int] = make_fixed_int([
+  0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16,
+])
+
+///|
+let cell_copy : FixedArray[Int] = make_fixed_int([
+  0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16,
+])
+
+///|
+let dict_bits : FixedArray[Int] = make_fixed_int([
+  0, 0, 0, 0, 10, 10, 11, 11, 10, 10, 10, 10, 10, 9, 9, 8, 7, 7, 8, 7, 7, 6, 6, 5,
+  5,
+])
+
+///|
+fn build_dict_offsets() -> FixedArray[Int] {
+  let a : FixedArray[Int] = FixedArray::make(25, 0)
+  let mut off = 0
+  let mut l = 4
+  while l <= 24 {
+    a[l] = off
+    off = off + (l << dict_bits[l])
+    l = l + 1
+  }
+  a
+}
+
+///|
+let dict_offsets : FixedArray[Int] = build_dict_offsets()
+
+///| 64-bit LSB-first bitstream reader with exact EOF tracking.
+struct BitReader {
+  data : Bytes
+  len : Int
+  mut pos : Int
+  mut buf : UInt64
+  mut cnt : Int
+}
+
+///|
+fn BitReader::new(data : Bytes) -> BitReader {
+  BitReader::{ data: data, len: data.length(), pos: 0, buf: 0UL, cnt: 0 }
+}
+
+///| Refill `buf` with up to 64 bits from `data`.
+fn BitReader::fill(self : BitReader) -> Unit {
+  if self.cnt <= 32 && self.pos + 4 <= self.len {
+    let b0 = self.data[self.pos].to_int().to_int64().to_uint64()
+    let b1 = self.data[self.pos + 1].to_int().to_int64().to_uint64()
+    let b2 = self.data[self.pos + 2].to_int().to_int64().to_uint64()
+    let b3 = self.data[self.pos + 3].to_int().to_int64().to_uint64()
+    let word = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    self.buf = self.buf | (word << self.cnt)
+    self.pos = self.pos + 4
+    self.cnt = self.cnt + 32
+  }
+  while self.cnt <= 56 && self.pos < self.len {
+    self.buf = self.buf | (self.data[self.pos].to_int().to_int64().to_uint64() << self.cnt)
+    self.pos = self.pos + 1
+    self.cnt = self.cnt + 8
+  }
+}
+
+///| Read `k` bits (`0 <= k <= 32`) LSB-first.
+fn BitReader::take(self : BitReader, k : Int) -> Result[Int, BrotliError] {
+  if k == 0 {
+    return Ok(0)
+  }
+  if self.cnt < k {
+    self.fill()
+    if self.cnt < k {
+      return Err(BrotliError::UnexpectedEof("bitstream ended unexpectedly"))
+    }
+  }
+  let v = (self.buf & bit_masks[k]).to_int()
+  self.buf = self.buf >> k
+  self.cnt = self.cnt - k
+  Ok(v)
+}
+
+///| Align to the next byte boundary, verifying all skipped fill bits are zero (RFC 7932 §9.2).
+fn BitReader::align_zero(self : BitReader) -> Result[Unit, BrotliError] {
+  let drop = self.cnt & 7
+  if drop > 0 {
+    if (self.buf & bit_masks[drop]) != 0UL {
+      return Err(BrotliError::InvalidTrailingBits("non-zero padding bits"))
+    }
+    self.buf = self.buf >> drop
+    self.cnt = self.cnt - drop
+  }
+  Ok(())
+}
+
+///| Flush buffered whole bytes back to `pos` after byte alignment so bulk byte copies can run.
+fn BitReader::rewind_aligned(self : BitReader) -> Unit {
+  let whole = self.cnt >> 3
+  self.pos = self.pos - whole
+  self.buf = 0UL
+  self.cnt = 0
+}
+
+///| Verify clean stream termination: zero trailing bits and zero trailing bytes.
+fn BitReader::finish_stream(self : BitReader) -> Result[Unit, BrotliError] {
+  let _ = self.align_zero()?
+  let remaining = (self.len - self.pos) + (self.cnt >> 3)
+  if remaining > 0 {
+    return Err(BrotliError::TrailingData(remaining))
+  }
+  Ok(())
+}
+
+///| 2-level canonical Huffman table (8-bit primary + dynamic subtables for lengths 9..15).
+///| Entry encoding:
+///| - `entry > 0`: direct hit, `bits = entry >> 16`, `sym = entry & 0xFFFF`
+///| - `entry < 0`: subtable pointer, `enc = -entry`, `sub_off = enc & 0xFFFFF`, `sub_bits = enc >> 20`
+///| - `entry == 0`: invalid code
+struct PrefixCode {
+  table : FixedArray[Int]
+  single : Int
+}
+
+///|
+let empty_table : FixedArray[Int] = FixedArray::make(0, 0)
+
+///| Build a 2-level LUT from symbol code lengths (`lens[sym] in 0..15`).
+fn PrefixCode::from_lens(
+  lens : FixedArray[Int],
+  alpha_size : Int,
+) -> Result[PrefixCode, BrotliError] {
+  let counts : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut used = 0
+  let mut last_sym = 0
+  let mut max_len = 0
+  let mut i = 0
+  while i < alpha_size {
+    let l = lens[i]
+    if l < 0 || l > 15 {
+      return Err(BrotliError::InvalidPrefixCode("code length out of range"))
+    }
+    if l > 0 {
+      counts[l] = counts[l] + 1
+      used = used + 1
+      last_sym = i
+      if l > max_len {
+        max_len = l
+      }
+    }
+    i = i + 1
+  }
+  if used == 0 {
+    return Err(BrotliError::InvalidPrefixCode("empty prefix code"))
+  }
+  if used == 1 {
+    return Ok(PrefixCode::{ table: empty_table, single: last_sym })
+  }
+
+  let next_code : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut code = 0
+  let mut l = 1
+  while l <= 15 {
+    code = (code + counts[l - 1]) << 1
+    next_code[l] = code
+    l = l + 1
+  }
+  if code + counts[15] != 32768 {
+    return Err(BrotliError::InvalidPrefixCode("incomplete or oversubscribed prefix code"))
+  }
+
+  if max_len <= root_bits {
+    let table : FixedArray[Int] = FixedArray::make(root_size, 0)
+    i = 0
+    while i < alpha_size {
+      let cl = lens[i]
+      if cl > 0 {
+        let c = next_code[cl]
+        next_code[cl] = c + 1
+        let rev = bit_reverse(c, cl)
+        let entry = (cl << 16) | i
+        let step = 1 << cl
+        let mut idx = rev
+        while idx < root_size {
+          table[idx] = entry
+          idx = idx + step
+        }
+      }
+      i = i + 1
+    }
+    return Ok(PrefixCode::{ table: table, single: -1 })
+  }
+
+  let sym_codes : FixedArray[Int] = FixedArray::make(alpha_size, 0)
+  let sub_max_len : FixedArray[Int] = FixedArray::make(root_size, 0)
+  i = 0
+  while i < alpha_size {
+    let cl = lens[i]
+    if cl > 0 {
+      let c = next_code[cl]
+      next_code[cl] = c + 1
+      sym_codes[i] = c
+      if cl > root_bits {
+        let p = bit_reverse(c >> (cl - root_bits), root_bits)
+        if cl > sub_max_len[p] {
+          sub_max_len[p] = cl
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  let sub_offsets : FixedArray[Int] = FixedArray::make(root_size, 0)
+  let mut total_size = root_size
+  let mut p = 0
+  while p < root_size {
+    let ml = sub_max_len[p]
+    if ml > root_bits {
+      sub_offsets[p] = total_size
+      total_size = total_size + (1 << (ml - root_bits))
+    }
+    p = p + 1
+  }
+
+  let table : FixedArray[Int] = FixedArray::make(total_size, 0)
+  p = 0
+  while p < root_size {
+    let ml = sub_max_len[p]
+    if ml > root_bits {
+      let sub_bits = ml - root_bits
+      table[p] = -(sub_offsets[p] | (sub_bits << 20))
+    }
+    p = p + 1
+  }
+
+  i = 0
+  while i < alpha_size {
+    let cl = lens[i]
+    if cl > 0 {
+      let c = sym_codes[i]
+      if cl <= root_bits {
+        let rev = bit_reverse(c, cl)
+        let entry = (cl << 16) | i
+        let step = 1 << cl
+        let mut idx = rev
+        while idx < root_size {
+          table[idx] = entry
+          idx = idx + step
+        }
+      } else {
+        let rev_full = bit_reverse(c, cl)
+        let pref = rev_full & 255
+        let sub_bits = sub_max_len[pref] - root_bits
+        let sub_size = 1 << sub_bits
+        let sub_off = sub_offsets[pref]
+        let extra = cl - root_bits
+        let entry = (extra << 16) | i
+        let step = 1 << extra
+        let mut idx = rev_full >> root_bits
+        while idx < sub_size {
+          table[sub_off + idx] = entry
+          idx = idx + step
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  Ok(PrefixCode::{ table: table, single: -1 })
+}
+
+///| Decode one symbol from `b` using this 2-level LUT.
+fn PrefixCode::read(self : PrefixCode, b : BitReader) -> Result[Int, BrotliError] {
+  if self.single >= 0 {
+    return Ok(self.single)
+  }
+  if b.cnt < 15 {
+    b.fill()
+  }
+  let entry = self.table[(b.buf & root_mask).to_int()]
+  if entry > 0 {
+    let bits = entry >> 16
+    if b.cnt < bits {
+      return Err(BrotliError::UnexpectedEof("truncated prefix code symbol"))
+    }
+    b.buf = b.buf >> bits
+    b.cnt = b.cnt - bits
+    return Ok(entry & 65535)
+  }
+  if entry < 0 {
+    if b.cnt < root_bits {
+      return Err(BrotliError::UnexpectedEof("truncated prefix code prefix"))
+    }
+    let enc = -entry
+    let sub_off = enc & 1048575
+    let sub_bits = enc >> 20
+    let sub_idx = ((b.buf >> root_bits) & bit_masks[sub_bits]).to_int()
+    let sub_entry = self.table[sub_off + sub_idx]
+    if sub_entry <= 0 {
+      return Err(BrotliError::InvalidPrefixCode("invalid secondary table entry"))
+    }
+    let total = root_bits + (sub_entry >> 16)
+    if b.cnt < total {
+      return Err(BrotliError::UnexpectedEof("truncated prefix code subsymbol"))
+    }
+    b.buf = b.buf >> total
+    b.cnt = b.cnt - total
+    return Ok(sub_entry & 65535)
+  }
+  Err(BrotliError::InvalidPrefixCode("invalid prefix code entry"))
+}
+
+///| Read a Brotli prefix code (simple or complex, RFC 7932 §3.4-3.5).
+fn read_code(b : BitReader, size : Int) -> Result[PrefixCode, BrotliError] {
+  let lens : FixedArray[Int] = FixedArray::make(size, 0)
+  let hskip = b.take(2)?
+  if hskip == 1 {
+    let mut bits = 0
+    while (1 << bits) < size {
+      bits = bits + 1
+    }
+    let nsym = b.take(2)? + 1
+    let syms : FixedArray[Int] = FixedArray::make(4, 0)
+    let mut i = 0
+    while i < nsym {
+      let sv = b.take(bits)?
+      if sv >= size {
+        return Err(BrotliError::InvalidPrefixCode("simple prefix symbol out of range"))
+      }
+      let mut j = 0
+      while j < i {
+        if syms[j] == sv {
+          return Err(BrotliError::InvalidPrefixCode("duplicate symbol in simple prefix code"))
+        }
+        j = j + 1
+      }
+      syms[i] = sv
+      i = i + 1
+    }
+    if nsym == 1 {
+      return Ok(PrefixCode::{ table: empty_table, single: syms[0] })
+    } else if nsym == 2 {
+      lens[syms[0]] = 1
+      lens[syms[1]] = 1
+    } else if nsym == 3 {
+      lens[syms[0]] = 1
+      lens[syms[1]] = 2
+      lens[syms[2]] = 2
+    } else {
+      let tree_select = b.take(1)?
+      if tree_select == 0 {
+        lens[syms[0]] = 2
+        lens[syms[1]] = 2
+        lens[syms[2]] = 2
+        lens[syms[3]] = 2
+      } else {
+        lens[syms[0]] = 1
+        lens[syms[1]] = 2
+        lens[syms[2]] = 3
+        lens[syms[3]] = 3
+      }
+    }
+    return PrefixCode::from_lens(lens, size)
+  }
+
+  let cl : FixedArray[Int] = FixedArray::make(18, 0)
+  let mut space = 32
+  let mut nonzero = 0
+  let mut i = hskip
+  while i < 18 {
+    if b.cnt < 4 {
+      b.fill()
+    }
+    let v = (b.buf & 15UL).to_int()
+    let plen = length_prefix_len[v]
+    if b.cnt < plen {
+      return Err(BrotliError::UnexpectedEof("truncated code-length code"))
+    }
+    b.buf = b.buf >> plen
+    b.cnt = b.cnt - plen
+    let l = length_prefix_value[v]
+    cl[length_order[i]] = l
+    if l != 0 {
+      space = space - (32 >> l)
+      nonzero = nonzero + 1
+      if space <= 0 {
+        break
+      }
+    }
+    i = i + 1
+  }
+  if nonzero == 0 || (nonzero != 1 && space != 0) {
+    return Err(BrotliError::InvalidPrefixCode("invalid code-length prefix code"))
+  }
+  let clc = PrefixCode::from_lens(cl, 18)?
+  i = 0
+  let mut prev = 8
+  let mut repeat = 0
+  let mut repeat_len = 0
+  let mut room = 32768
+  while i < size && room > 0 {
+    let sym = clc.read(b)?
+    if sym < 16 {
+      repeat = 0
+      lens[i] = sym
+      i = i + 1
+      if sym != 0 {
+        prev = sym
+        room = room - (32768 >> sym)
+      }
+    } else {
+      let extra = if sym == 16 { 2 } else { 3 }
+      let new_len = if sym == 16 { prev } else { 0 }
+      if repeat_len != new_len {
+        repeat = 0
+        repeat_len = new_len
+      }
+      let old = repeat
+      if repeat > 0 {
+        repeat = (repeat - 2) << extra
+      }
+      let exv = b.take(extra)?
+      repeat = repeat + exv + 3
+      let delta = repeat - old
+      if delta <= 0 || delta > size - i {
+        return Err(BrotliError::InvalidPrefixCode("code-length repeat past alphabet"))
+      }
+      let mut k = 0
+      while k < delta {
+        lens[i] = new_len
+        i = i + 1
+        k = k + 1
+      }
+      if new_len != 0 {
+        room = room - delta * (32768 >> new_len)
+      }
+    }
+  }
+  if room != 0 {
+    return Err(BrotliError::InvalidPrefixCode("incomplete complex prefix code"))
+  }
+  PrefixCode::from_lens(lens, size)
+}
+
+///| Read variable-length 8-bit integer (RFC 7932 §9.2 `NBLTYPES` / `NTREES`).
+fn read_var8(b : BitReader) -> Result[Int, BrotliError] {
+  if b.take(1)? == 0 {
+    return Ok(0)
+  }
+  let n = b.take(3)?
+  if n == 0 {
+    Ok(1)
+  } else {
+    let ex = b.take(n)?
+    Ok((1 << n) + ex)
+  }
+}
+
+///| Growable output buffer with strict `max_bytes` guard and Int64-safe 1.5x growth.
+struct OutBuf {
+  mut buf : Bytes
+  mut n : Int
+  max_bytes : Int
+}
+
+///|
+fn OutBuf::new(max_bytes : Int) -> OutBuf {
+  OutBuf::{ buf: Bytes::new(0), n: 0, max_bytes: max_bytes }
+}
+
+///| Grow `self.buf` to hold at least `self.n + add` bytes, rejecting if `> max_bytes`.
+fn OutBuf::ensure_additional(
+  self : OutBuf,
+  add : Int,
+) -> Result[Unit, BrotliError] {
+  if add < 0 || add > self.max_bytes - self.n {
+    return Err(BrotliError::OutputLimitExceeded(self.max_bytes))
+  }
+  let needed64 = self.n.to_int64() + add.to_int64()
+  let cur_cap64 = self.buf.length().to_int64()
+  if needed64 <= cur_cap64 {
+    return Ok(())
+  }
+  let max64 = self.max_bytes.to_int64()
+  if self.n == 0 {
+    let cap = needed64.to_int()
+    self.buf = Bytes::new(cap)
+    return Ok(())
+  }
+  // 1.5x geometric growth in Int64 clamped to max_bytes to curb peak RSS on large streams
+  let mut new_cap64 = cur_cap64
+  if new_cap64 < 256L {
+    new_cap64 = 256L
+  }
+  while new_cap64 < needed64 {
+    let grown = new_cap64 + (new_cap64 >> 1)
+    if grown >= max64 || grown <= new_cap64 {
+      new_cap64 = max64
+      break
+    }
+    new_cap64 = grown
+  }
+  if new_cap64 < needed64 {
+    new_cap64 = needed64
+  }
+  if new_cap64 > max64 {
+    new_cap64 = max64
+  }
+  let new_cap = new_cap64.to_int()
+  if new_cap <= 33554432 {
+    let pad = Bytes::new(new_cap - self.n)
+    if self.n == self.buf.length() {
+      self.buf = self.buf.concat(pad)
+    } else {
+      self.buf = self.buf.slice(0, self.n).concat(pad)
+    }
+    return Ok(())
+  }
+  let old = self.buf
+  let next = Bytes::new(new_cap)
+  let mut i = 0
+  let lim8 = self.n - 8
+  while i <= lim8 {
+    next[i] = old[i]
+    next[i + 1] = old[i + 1]
+    next[i + 2] = old[i + 2]
+    next[i + 3] = old[i + 3]
+    next[i + 4] = old[i + 4]
+    next[i + 5] = old[i + 5]
+    next[i + 6] = old[i + 6]
+    next[i + 7] = old[i + 7]
+    i = i + 8
+  }
+  while i < self.n {
+    next[i] = old[i]
+    i = i + 1
+  }
+  self.buf = next
+  Ok(())
+}
+
+///| Block-type state machine (literal / insert-and-copy / distance).
+struct Blocks {
+  count : Int
+  types : Option[PrefixCode]
+  lens : Option[PrefixCode]
+  mut kind : Int
+  mut left : Int
+  mut last : Int
+  mut second : Int
+}
+
+///|
+fn read_block_len(b : BitReader, c : PrefixCode) -> Result[Int, BrotliError] {
+  let s = c.read(b)?
+  let ex = b.take(block_len_bits[s])?
+  Ok(block_len_base[s] + ex)
+}
+
+///|
+fn read_blocks(b : BitReader) -> Result[Blocks, BrotliError] {
+  let count = read_var8(b)? + 1
+  if count < 2 {
+    return Ok(Blocks::{
+      count: count,
+      types: None,
+      lens: None,
+      kind: 0,
+      left: 1 << 28,
+      last: 0,
+      second: 1,
+    })
+  }
+  let types = read_code(b, count + 2)?
+  let lens = read_code(b, 26)?
+  let left = read_block_len(b, lens)?
+  Ok(Blocks::{
+    count: count,
+    types: Some(types),
+    lens: Some(lens),
+    kind: 0,
+    left: left,
+    last: 0,
+    second: 1,
+  })
+}
+
+///|
+fn Blocks::next(self : Blocks, b : BitReader) -> Result[Unit, BrotliError] {
+  if self.left > 0 {
+    return Ok(())
+  }
+  match self.types {
+    Some(types) => {
+      match self.lens {
+        Some(lens) => {
+          let s = types.read(b)?
+          let mut t = if s == 0 {
+            self.second
+          } else if s == 1 {
+            self.last + 1
+          } else {
+            s - 2
+          }
+          if t >= self.count {
+            t = t - self.count
+          }
+          self.second = self.last
+          self.last = t
+          self.kind = t
+          self.left = read_block_len(b, lens)?
+          Ok(())
+        }
+        None => Ok(())
+      }
+    }
+    None => Ok(())
+  }
+}
+
+///| Precomputed initial packed MTF table: 32 UInt64 words holding bytes 0..255 in little-endian order.
+fn build_init_mtf_words() -> FixedArray[UInt64] {
+  let w : FixedArray[UInt64] = FixedArray::make(32, 0UL)
+  let mut wi = 0
+  while wi < 32 {
+    let base = wi * 8
+    let mut word = 0UL
+    let mut bi = 0
+    while bi < 8 {
+      word = word | ((base + bi).to_int64().to_uint64() << (bi * 8))
+      bi = bi + 1
+    }
+    w[wi] = word
+    wi = wi + 1
+  }
+  w
+}
+
+///|
+let init_mtf_words : FixedArray[UInt64] = build_init_mtf_words()
+
+///| Packed-word Inverse Move-To-Front transform (8 bytes shifted per UInt64 op).
+fn inverse_mtf_inplace(map : FixedArray[Int], size : Int) -> Unit {
+  let w : FixedArray[UInt64] = FixedArray::make(32, 0UL)
+  let mut wi0 = 0
+  while wi0 < 32 {
+    w[wi0] = init_mtf_words[wi0]
+    wi0 = wi0 + 1
+  }
+  let all_ones = 18446744073709551615UL
+  let mut j = 0
+  while j < size {
+    let idx = map[j]
+    if idx == 0 {
+      map[j] = (w[0] & 255UL).to_int()
+      j = j + 1
+      continue
+    }
+    let wi = idx >> 3
+    let bi = (idx & 7) << 3
+    let v_u64 = (w[wi] >> bi) & 255UL
+    map[j] = v_u64.to_int()
+    let keep_mask = if bi == 56 { 0UL } else { all_ones << (bi + 8) }
+    let low_mask = (1UL << bi) - 1UL
+    if wi == 0 {
+      w[0] = (w[0] & keep_mask) | ((w[0] & low_mask) << 8) | v_u64
+    } else {
+      w[wi] = (w[wi] & keep_mask) | ((w[wi] & low_mask) << 8) | (w[wi - 1] >> 56)
+      let mut k = wi - 1
+      while k > 0 {
+        w[k] = (w[k] << 8) | (w[k - 1] >> 56)
+        k = k - 1
+      }
+      w[0] = (w[0] << 8) | v_u64
+    }
+    j = j + 1
+  }
+}
+
+///| Read a context map (RFC 7932 §7.3).
+fn read_context_map(
+  b : BitReader,
+  size : Int,
+  trees : Int,
+) -> Result[FixedArray[Int], BrotliError] {
+  let map : FixedArray[Int] = FixedArray::make(size, 0)
+  if trees < 2 {
+    return Ok(map)
+  }
+  let has_rle = b.take(1)?
+  let rle = if has_rle == 1 { b.take(4)? + 1 } else { 0 }
+  let c = read_code(b, trees + rle)?
+  let mut i = 0
+  if c.single >= 0 {
+    let s = c.single
+    if s == 0 {
+      i = size
+    } else if s <= rle {
+      while i < size {
+        let run = (1 << s) + b.take(s)?
+        if run > size - i {
+          return Err(BrotliError::InvalidContextMap("context map RLE run exceeds size"))
+        }
+        i = i + run
+      }
+    } else {
+      let tree_id = s - rle
+      if tree_id >= trees {
+        return Err(BrotliError::InvalidContextMap("context map tree id out of range"))
+      }
+      while i < size {
+        map[i] = tree_id
+        i = i + 1
+      }
+    }
+  } else {
+    while i < size {
+      let s = c.read(b)?
+      if s == 0 {
+        i = i + 1
+      } else if s <= rle {
+        let run = (1 << s) + b.take(s)?
+        if run > size - i {
+          return Err(BrotliError::InvalidContextMap("context map RLE run exceeds size"))
+        }
+        i = i + run
+      } else {
+        let tree_id = s - rle
+        if tree_id >= trees {
+          return Err(BrotliError::InvalidContextMap("context map tree id out of range"))
+        }
+        map[i] = tree_id
+        i = i + 1
+      }
+    }
+  }
+  if b.take(1)? == 1 {
+    inverse_mtf_inplace(map, size)
+  }
+  Ok(map)
+}
+
+///| RFC 7932 §8 UTF-8 uppercase transform applied in-place on `buf[base + at .. base + n]`.
+fn upper_inplace(buf : Bytes, base : Int, at : Int, n : Int) -> Int {
+  let c = buf[base + at].to_int()
+  if c < 192 {
+    if c >= 97 && c <= 122 {
+      buf[base + at] = (c ^ 32).to_byte()
+    }
+    1
+  } else if c < 224 {
+    if at + 1 < n {
+      buf[base + at + 1] = (buf[base + at + 1].to_int() ^ 32).to_byte()
+    }
+    2
+  } else {
+    if at + 2 < n {
+      buf[base + at + 2] = (buf[base + at + 2].to_int() ^ 5).to_byte()
+    }
+    3
+  }
+}
+
+///| Write a transformed static dictionary word directly into pre-allocated `buf[pos..]`.
+///| Returns `written >= 0`, `-1` for invalid transform id, or `-2` if `written > left`.
+fn write_dict_word_fast(
+  buf : Bytes,
+  pos0 : Int,
+  len : Int,
+  word : Int,
+  left : Int,
+) -> Int {
+  let nbits = dict_bits[len]
+  let idx = word & ((1 << nbits) - 1)
+  let t = word >> nbits
+  if t < 0 || t >= flat_tr.kinds.length() {
+    return -1
+  }
+  let start = dict_offsets[len] + idx * len
+  let kind = flat_tr.kinds[t]
+  let mut from = 0
+  let mut n = len
+  if kind >= 1 && kind <= 9 {
+    n = if kind > n { 0 } else { n - kind }
+  } else if kind >= 12 {
+    from = if kind - 11 > n { n } else { kind - 11 }
+  }
+  let wn = n - from
+  let poff = flat_tr.pref_off[t]
+  let plen = flat_tr.pref_len[t]
+  let soff = flat_tr.suff_off[t]
+  let slen = flat_tr.suff_len[t]
+  let written = plen + wn + slen
+  if written > left {
+    return -2
+  }
+  let blob = flat_tr.blob
+  let dict = static_dict
+  let mut pos = pos0
+  let mut i = 0
+  while i < plen {
+    buf[pos] = blob[poff + i]
+    pos = pos + 1
+    i = i + 1
+  }
+  let word_base = pos
+  let mut di = start + from
+  let dend = start + n
+  let dlim8 = dend - 8
+  while di <= dlim8 {
+    buf[pos] = dict[di]
+    buf[pos + 1] = dict[di + 1]
+    buf[pos + 2] = dict[di + 2]
+    buf[pos + 3] = dict[di + 3]
+    buf[pos + 4] = dict[di + 4]
+    buf[pos + 5] = dict[di + 5]
+    buf[pos + 6] = dict[di + 6]
+    buf[pos + 7] = dict[di + 7]
+    di = di + 8
+    pos = pos + 8
+  }
+  while di < dend {
+    buf[pos] = dict[di]
+    di = di + 1
+    pos = pos + 1
+  }
+  if kind == 10 && wn > 0 {
+    let _ = upper_inplace(buf, word_base, 0, wn)
+  } else if kind == 11 {
+    let mut ui = 0
+    while ui < wn {
+      ui = ui + upper_inplace(buf, word_base, ui, wn)
+    }
+  }
+  i = 0
+  while i < slen {
+    buf[pos] = blob[soff + i]
+    pos = pos + 1
+    i = i + 1
+  }
+  written
+}
+
+///| Decode a complete Brotli (RFC 7932) stream with default resource limits.
+pub fn decode(data : Bytes) -> Result[Bytes, BrotliError] {
+  decode_with_limits(data, DecodeLimits::default())
+}
+
+///| Decode a complete Brotli (RFC 7932) stream with explicit resource limits.
+pub fn decode_with_limits(
+  data : Bytes,
+  limits : DecodeLimits,
+) -> Result[Bytes, BrotliError] {
+  if limits.max_output_bytes < 0 {
+    return Err(BrotliError::OutputLimitExceeded(limits.max_output_bytes))
+  }
+  if limits.max_window_bits < 10 || limits.max_window_bits > 24 {
+    return Err(BrotliError::InvalidWindowBits(limits.max_window_bits))
+  }
+  if data.length() == 0 {
+    return Err(BrotliError::UnexpectedEof("empty brotli input"))
+  }
+
+  let eff_max_output = if limits.max_output_bytes > max_container_bytes {
+    max_container_bytes
+  } else {
+    limits.max_output_bytes
+  }
+
+  let b = BitReader::new(data)
+  let wbits = if b.take(1)? == 0 {
+    16
+  } else {
+    let nv = b.take(3)?
+    if nv != 0 {
+      17 + nv
+    } else {
+      let mv = b.take(3)?
+      if mv == 1 {
+        return Err(BrotliError::InvalidWindowBits(25))
+      }
+      if mv == 0 {
+        17
+      } else {
+        8 + mv
+      }
+    }
+  }
+  if wbits > limits.max_window_bits {
+    return Err(BrotliError::WindowLimitExceeded(wbits))
+  }
+  let window = (1 << wbits) - 16
+  let out = OutBuf::new(eff_max_output)
+
+  let dist : FixedArray[Int] = FixedArray::make(4, 0)
+  dist[0] = 16
+  dist[1] = 15
+  dist[2] = 11
+  dist[3] = 4
+  let mut di = 3
+  let lut = static_context_lut
+  let in_len = data.length()
+
+  let mut last = false
+  while !last {
+    last = b.take(1)? == 1
+    if last && b.take(1)? == 1 {
+      break
+    }
+    let nb_raw = b.take(2)?
+    let nibbles = if nb_raw == 3 { 0 } else { nb_raw + 4 }
+    if nibbles == 0 {
+      if b.take(1)? != 0 {
+        return Err(BrotliError::InvalidMetaBlock("reserved metadata bit must be 0"))
+      }
+      let skip_bytes = b.take(2)?
+      let skip = if skip_bytes == 0 {
+        0
+      } else {
+        let skip_raw = b.take(skip_bytes * 8)?
+        if skip_bytes > 1 && (skip_raw >> ((skip_bytes - 1) * 8)) == 0 {
+          return Err(BrotliError::InvalidMetaBlock("non-canonical MSKIPLEN"))
+        }
+        skip_raw + 1
+      }
+      let _ = b.align_zero()?
+      b.rewind_aligned()
+      if skip > b.len - b.pos {
+        return Err(BrotliError::UnexpectedEof("metadata block truncated"))
+      }
+      b.pos = b.pos + skip
+      continue
+    }
+
+    let mlen_raw = b.take(nibbles * 4)?
+    if nibbles > 4 && (mlen_raw >> ((nibbles - 1) * 4)) == 0 {
+      return Err(BrotliError::InvalidMetaBlock("non-canonical MLEN"))
+    }
+    let mut left = mlen_raw + 1
+
+    if !last && b.take(1)? == 1 {
+      let _ = b.align_zero()?
+      b.rewind_aligned()
+      if left > b.len - b.pos {
+        return Err(BrotliError::UnexpectedEof("uncompressed meta-block truncated"))
+      }
+      let _ = out.ensure_additional(left)?
+      let dst_buf = out.buf
+      let mut dst_pos = out.n
+      let mut src_pos = b.pos
+      let src_end = src_pos + left
+      let lim8 = src_end - 8
+      while src_pos <= lim8 {
+        dst_buf[dst_pos] = data[src_pos]
+        dst_buf[dst_pos + 1] = data[src_pos + 1]
+        dst_buf[dst_pos + 2] = data[src_pos + 2]
+        dst_buf[dst_pos + 3] = data[src_pos + 3]
+        dst_buf[dst_pos + 4] = data[src_pos + 4]
+        dst_buf[dst_pos + 5] = data[src_pos + 5]
+        dst_buf[dst_pos + 6] = data[src_pos + 6]
+        dst_buf[dst_pos + 7] = data[src_pos + 7]
+        src_pos = src_pos + 8
+        dst_pos = dst_pos + 8
+      }
+      while src_pos < src_end {
+        dst_buf[dst_pos] = data[src_pos]
+        src_pos = src_pos + 1
+        dst_pos = dst_pos + 1
+      }
+      b.pos = src_end
+      out.n = dst_pos
+      continue
+    }
+
+    // Reject bombs before parsing Huffman tables or allocating output space
+    if left > eff_max_output - out.n {
+      return Err(BrotliError::OutputLimitExceeded(eff_max_output))
+    }
+
+    let lit = read_blocks(b)?
+    let cmd = read_blocks(b)?
+    let dst = read_blocks(b)?
+    let postfix = b.take(2)?
+    let direct = b.take(4)? << postfix
+    let modes : FixedArray[Int] = FixedArray::make(lit.count, 0)
+    let mut i = 0
+    while i < lit.count {
+      modes[i] = b.take(2)?
+      i = i + 1
+    }
+    let lit_trees = read_var8(b)? + 1
+    let lit_map = read_context_map(b, 64 * lit.count, lit_trees)?
+    let dst_trees = read_var8(b)? + 1
+    let dst_map = read_context_map(b, 4 * dst.count, dst_trees)?
+
+    let lit_tables : FixedArray[FixedArray[Int]] = FixedArray::make(lit_trees, empty_table)
+    let lit_singles : FixedArray[Int] = FixedArray::make(lit_trees, -1)
+    i = 0
+    while i < lit_trees {
+      let pc = read_code(b, 256)?
+      lit_tables[i] = pc.table
+      lit_singles[i] = pc.single
+      i = i + 1
+    }
+    let cmd_tables : FixedArray[FixedArray[Int]] = FixedArray::make(cmd.count, empty_table)
+    let cmd_singles : FixedArray[Int] = FixedArray::make(cmd.count, -1)
+    i = 0
+    while i < cmd.count {
+      let pc = read_code(b, 704)?
+      cmd_tables[i] = pc.table
+      cmd_singles[i] = pc.single
+      i = i + 1
+    }
+    let dst_tables : FixedArray[FixedArray[Int]] = FixedArray::make(dst_trees, empty_table)
+    let dst_singles : FixedArray[Int] = FixedArray::make(dst_trees, -1)
+    let dst_alpha = 16 + direct + (48 << postfix)
+    i = 0
+    while i < dst_trees {
+      let pc = read_code(b, dst_alpha)?
+      dst_tables[i] = pc.table
+      dst_singles[i] = pc.single
+      i = i + 1
+    }
+
+    // Pre-allocate once for the entire meta-block so the inner loop has zero growth checks
+    let _ = out.ensure_additional(left)?
+    let buf = out.buf
+    let mut pos = out.n
+
+    // Track last 2 output bytes in registers
+    let mut prev1 = if pos >= 1 { buf[pos - 1].to_int() } else { 0 }
+    let mut prev2 = if pos >= 2 { buf[pos - 2].to_int() } else { 0 }
+
+    // Hoist bit-reader state into local registers for the entire meta-block hot loop
+    let mut bitbuf = b.buf
+    let mut bitcnt = b.cnt
+    let mut in_pos = b.pos
+    let fast_in_lim = in_len - 8
+    let single_lit_tree = lit_trees == 1
+    let lit0_tbl = lit_tables[0]
+    let lit0_single = lit_singles[0]
+    let postfix_mask = (1 << postfix) - 1
+
+    while left > 0 {
+      if cmd.left == 0 {
+        b.buf = bitbuf
+        b.cnt = bitcnt
+        b.pos = in_pos
+        let _ = cmd.next(b)?
+        bitbuf = b.buf
+        bitcnt = b.cnt
+        in_pos = b.pos
+      }
+      cmd.left = cmd.left - 1
+
+      // Decode insert-and-copy command symbol inline
+      let ck = cmd.kind
+      let mut sym = cmd_singles[ck]
+      if sym < 0 {
+        if bitcnt < 15 {
+          if bitcnt <= 32 && in_pos + 4 <= in_len {
+            let w = data[in_pos].to_int().to_int64().to_uint64() |
+            (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+            (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+            (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+            bitbuf = bitbuf | (w << bitcnt)
+            in_pos = in_pos + 4
+            bitcnt = bitcnt + 32
+          } else {
+            while bitcnt <= 56 && in_pos < in_len {
+              bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+              in_pos = in_pos + 1
+              bitcnt = bitcnt + 8
+            }
+          }
+        }
+        let ctbl = cmd_tables[ck]
+        let ent = ctbl[(bitbuf & root_mask).to_int()]
+        if ent > 0 {
+          let nb = ent >> 16
+          if bitcnt < nb {
+            return Err(BrotliError::UnexpectedEof("truncated command symbol"))
+          }
+          bitbuf = bitbuf >> nb
+          bitcnt = bitcnt - nb
+          sym = ent & 65535
+        } else if ent < 0 {
+          if bitcnt < root_bits {
+            return Err(BrotliError::UnexpectedEof("truncated command prefix"))
+          }
+          let enc = -ent
+          let sub_ent = ctbl[(enc & 1048575) + ((bitbuf >> root_bits) & bit_masks[enc >> 20]).to_int()]
+          if sub_ent <= 0 {
+            return Err(BrotliError::InvalidPrefixCode("invalid command subtable entry"))
+          }
+          let total = root_bits + (sub_ent >> 16)
+          if bitcnt < total {
+            return Err(BrotliError::UnexpectedEof("truncated command subsymbol"))
+          }
+          bitbuf = bitbuf >> total
+          bitcnt = bitcnt - total
+          sym = sub_ent & 65535
+        } else {
+          return Err(BrotliError::InvalidPrefixCode("invalid command prefix entry"))
+        }
+      }
+
+      let cell = sym >> 6
+      let ic = cell_insert[cell] + ((sym >> 3) & 7)
+      let cc = cell_copy[cell] + (sym & 7)
+      let ib = insert_bits[ic]
+      let mut insert = insert_base[ic]
+      if ib > 0 {
+        if bitcnt < ib {
+          if bitcnt <= 32 && in_pos + 4 <= in_len {
+            let w = data[in_pos].to_int().to_int64().to_uint64() |
+            (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+            (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+            (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+            bitbuf = bitbuf | (w << bitcnt)
+            in_pos = in_pos + 4
+            bitcnt = bitcnt + 32
+          } else {
+            while bitcnt <= 56 && in_pos < in_len {
+              bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+              in_pos = in_pos + 1
+              bitcnt = bitcnt + 8
+            }
+          }
+          if bitcnt < ib {
+            return Err(BrotliError::UnexpectedEof("truncated insert extra bits"))
+          }
+        }
+        insert = insert + (bitbuf & bit_masks[ib]).to_int()
+        bitbuf = bitbuf >> ib
+        bitcnt = bitcnt - ib
+      }
+
+      let cb = copy_bits[cc]
+      let mut copy = copy_base[cc]
+      if cb > 0 {
+        if bitcnt < cb {
+          if bitcnt <= 32 && in_pos + 4 <= in_len {
+            let w = data[in_pos].to_int().to_int64().to_uint64() |
+            (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+            (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+            (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+            bitbuf = bitbuf | (w << bitcnt)
+            in_pos = in_pos + 4
+            bitcnt = bitcnt + 32
+          } else {
+            while bitcnt <= 56 && in_pos < in_len {
+              bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+              in_pos = in_pos + 1
+              bitcnt = bitcnt + 8
+            }
+          }
+          if bitcnt < cb {
+            return Err(BrotliError::UnexpectedEof("truncated copy extra bits"))
+          }
+        }
+        copy = copy + (bitbuf & bit_masks[cb]).to_int()
+        bitbuf = bitbuf >> cb
+        bitcnt = bitcnt - cb
+      }
+
+      if insert > 0 {
+        if insert > left {
+          return Err(BrotliError::InvalidMetaBlock("insert exceeds meta-block length"))
+        }
+        let mut rem = insert
+        while rem > 0 {
+          if lit.left == 0 {
+            b.buf = bitbuf
+            b.cnt = bitcnt
+            b.pos = in_pos
+            let _ = lit.next(b)?
+            bitbuf = b.buf
+            bitcnt = b.cnt
+            in_pos = b.pos
+          }
+          let chunk = if lit.left < rem { lit.left } else { rem }
+          lit.left = lit.left - chunk
+          if single_lit_tree {
+            if lit0_single >= 0 {
+              // Single constant literal fill
+              let fb = lit0_single.to_byte()
+              let end_p = pos + chunk
+              let lim8 = end_p - 8
+              while pos <= lim8 {
+                buf[pos] = fb
+                buf[pos + 1] = fb
+                buf[pos + 2] = fb
+                buf[pos + 3] = fb
+                buf[pos + 4] = fb
+                buf[pos + 5] = fb
+                buf[pos + 6] = fb
+                buf[pos + 7] = fb
+                pos = pos + 8
+              }
+              while pos < end_p {
+                buf[pos] = fb
+                pos = pos + 1
+              }
+              if chunk >= 2 {
+                prev2 = lit0_single
+                prev1 = lit0_single
+              } else {
+                prev2 = prev1
+                prev1 = lit0_single
+              }
+            } else {
+              // Ultra-fast single-tree literal loop (no context LUT, up to 3 literals per refill)
+              let mut ci = 0
+              while ci < chunk {
+                if bitcnt < 24 && in_pos <= fast_in_lim {
+                  let w = data[in_pos].to_int().to_int64().to_uint64() |
+                  (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+                  (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+                  (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+                  bitbuf = bitbuf | (w << bitcnt)
+                  in_pos = in_pos + 4
+                  bitcnt = bitcnt + 32
+                  // Fast path: bitcnt >= 32, decode up to 3 primary-table literals with zero EOF checks
+                  let e1 = lit0_tbl[(bitbuf & root_mask).to_int()]
+                  if e1 > 0 {
+                    let nb1 = e1 >> 16
+                    bitbuf = bitbuf >> nb1
+                    bitcnt = bitcnt - nb1
+                    buf[pos] = (e1 & 65535).to_byte()
+                    pos = pos + 1
+                    ci = ci + 1
+                    if ci < chunk {
+                      let e2 = lit0_tbl[(bitbuf & root_mask).to_int()]
+                      if e2 > 0 {
+                        let nb2 = e2 >> 16
+                        bitbuf = bitbuf >> nb2
+                        bitcnt = bitcnt - nb2
+                        buf[pos] = (e2 & 65535).to_byte()
+                        pos = pos + 1
+                        ci = ci + 1
+                        if ci < chunk {
+                          let e3 = lit0_tbl[(bitbuf & root_mask).to_int()]
+                          if e3 > 0 {
+                            let nb3 = e3 >> 16
+                            bitbuf = bitbuf >> nb3
+                            bitcnt = bitcnt - nb3
+                            buf[pos] = (e3 & 65535).to_byte()
+                            pos = pos + 1
+                            ci = ci + 1
+                          }
+                        }
+                      }
+                    }
+                    continue
+                  }
+                }
+                if bitcnt < 15 {
+                  if bitcnt <= 32 && in_pos + 4 <= in_len {
+                    let w = data[in_pos].to_int().to_int64().to_uint64() |
+                    (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+                    (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+                    (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+                    bitbuf = bitbuf | (w << bitcnt)
+                    in_pos = in_pos + 4
+                    bitcnt = bitcnt + 32
+                  } else {
+                    while bitcnt <= 56 && in_pos < in_len {
+                      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+                      in_pos = in_pos + 1
+                      bitcnt = bitcnt + 8
+                    }
+                  }
+                }
+                let ent = lit0_tbl[(bitbuf & root_mask).to_int()]
+                if ent > 0 {
+                  let nb = ent >> 16
+                  if bitcnt < nb {
+                    return Err(BrotliError::UnexpectedEof("truncated literal symbol"))
+                  }
+                  bitbuf = bitbuf >> nb
+                  bitcnt = bitcnt - nb
+                  buf[pos] = (ent & 65535).to_byte()
+                  pos = pos + 1
+                  ci = ci + 1
+                } else if ent < 0 {
+                  if bitcnt < root_bits {
+                    return Err(BrotliError::UnexpectedEof("truncated literal prefix"))
+                  }
+                  let enc = -ent
+                  let sub_ent = lit0_tbl[(enc & 1048575) + ((bitbuf >> root_bits) & bit_masks[enc >> 20]).to_int()]
+                  if sub_ent <= 0 {
+                    return Err(BrotliError::InvalidPrefixCode("invalid literal subtable entry"))
+                  }
+                  let total = root_bits + (sub_ent >> 16)
+                  if bitcnt < total {
+                    return Err(BrotliError::UnexpectedEof("truncated literal subsymbol"))
+                  }
+                  bitbuf = bitbuf >> total
+                  bitcnt = bitcnt - total
+                  buf[pos] = (sub_ent & 65535).to_byte()
+                  pos = pos + 1
+                  ci = ci + 1
+                } else {
+                  return Err(BrotliError::InvalidPrefixCode("invalid literal prefix entry"))
+                }
+              }
+              if pos >= 2 {
+                prev1 = buf[pos - 1].to_int()
+                prev2 = buf[pos - 2].to_int()
+              } else if pos == 1 {
+                prev1 = buf[0].to_int()
+                prev2 = 0
+              }
+            }
+          } else {
+            // Context-modeled multi-tree literal loop with inlined LUT & local bitbuf
+            let mode_base = modes[lit.kind] * 512
+            let map_base = lit.kind * 64
+            let mut ci = 0
+            while ci < chunk {
+              let ctx = lut[mode_base + prev1].to_int() |
+              lut[mode_base + 256 + prev2].to_int()
+              let tree = lit_map[map_base + ctx]
+              let mut lb = lit_singles[tree]
+              if lb < 0 {
+                if bitcnt < 15 {
+                  if bitcnt <= 32 && in_pos + 4 <= in_len {
+                    let w = data[in_pos].to_int().to_int64().to_uint64() |
+                    (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+                    (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+                    (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+                    bitbuf = bitbuf | (w << bitcnt)
+                    in_pos = in_pos + 4
+                    bitcnt = bitcnt + 32
+                  } else {
+                    while bitcnt <= 56 && in_pos < in_len {
+                      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+                      in_pos = in_pos + 1
+                      bitcnt = bitcnt + 8
+                    }
+                  }
+                }
+                let ltbl = lit_tables[tree]
+                let ent = ltbl[(bitbuf & root_mask).to_int()]
+                if ent > 0 {
+                  let nb = ent >> 16
+                  if bitcnt < nb {
+                    return Err(BrotliError::UnexpectedEof("truncated literal symbol"))
+                  }
+                  bitbuf = bitbuf >> nb
+                  bitcnt = bitcnt - nb
+                  lb = ent & 65535
+                } else if ent < 0 {
+                  if bitcnt < root_bits {
+                    return Err(BrotliError::UnexpectedEof("truncated literal prefix"))
+                  }
+                  let enc = -ent
+                  let sub_ent = ltbl[(enc & 1048575) + ((bitbuf >> root_bits) & bit_masks[enc >> 20]).to_int()]
+                  if sub_ent <= 0 {
+                    return Err(BrotliError::InvalidPrefixCode("invalid literal subtable entry"))
+                  }
+                  let total = root_bits + (sub_ent >> 16)
+                  if bitcnt < total {
+                    return Err(BrotliError::UnexpectedEof("truncated literal subsymbol"))
+                  }
+                  bitbuf = bitbuf >> total
+                  bitcnt = bitcnt - total
+                  lb = sub_ent & 65535
+                } else {
+                  return Err(BrotliError::InvalidPrefixCode("invalid literal prefix entry"))
+                }
+              }
+              buf[pos] = lb.to_byte()
+              pos = pos + 1
+              prev2 = prev1
+              prev1 = lb
+              ci = ci + 1
+            }
+          }
+          rem = rem - chunk
+        }
+        left = left - insert
+        if left == 0 {
+          break
+        }
+      }
+
+      // Decode distance symbol inline when cell >= 2
+      let mut code = 0
+      if cell >= 2 {
+        if dst.left == 0 {
+          b.buf = bitbuf
+          b.cnt = bitcnt
+          b.pos = in_pos
+          let _ = dst.next(b)?
+          bitbuf = b.buf
+          bitcnt = b.cnt
+          in_pos = b.pos
+        }
+        dst.left = dst.left - 1
+        let cidx = if copy > 4 { 3 } else { copy - 2 }
+        let dtree = dst_map[dst.kind * 4 + cidx]
+        code = dst_singles[dtree]
+        if code < 0 {
+          if bitcnt < 15 {
+            if bitcnt <= 32 && in_pos + 4 <= in_len {
+              let w = data[in_pos].to_int().to_int64().to_uint64() |
+              (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+              (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+              (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+              bitbuf = bitbuf | (w << bitcnt)
+              in_pos = in_pos + 4
+              bitcnt = bitcnt + 32
+            } else {
+              while bitcnt <= 56 && in_pos < in_len {
+                bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+                in_pos = in_pos + 1
+                bitcnt = bitcnt + 8
+              }
+            }
+          }
+          let dtbl = dst_tables[dtree]
+          let ent = dtbl[(bitbuf & root_mask).to_int()]
+          if ent > 0 {
+            let nb = ent >> 16
+            if bitcnt < nb {
+              return Err(BrotliError::UnexpectedEof("truncated distance symbol"))
+            }
+            bitbuf = bitbuf >> nb
+            bitcnt = bitcnt - nb
+            code = ent & 65535
+          } else if ent < 0 {
+            if bitcnt < root_bits {
+              return Err(BrotliError::UnexpectedEof("truncated distance prefix"))
+            }
+            let enc = -ent
+            let sub_ent = dtbl[(enc & 1048575) + ((bitbuf >> root_bits) & bit_masks[enc >> 20]).to_int()]
+            if sub_ent <= 0 {
+              return Err(BrotliError::InvalidPrefixCode("invalid distance subtable entry"))
+            }
+            let total = root_bits + (sub_ent >> 16)
+            if bitcnt < total {
+              return Err(BrotliError::UnexpectedEof("truncated distance subsymbol"))
+            }
+            bitbuf = bitbuf >> total
+            bitcnt = bitcnt - total
+            code = sub_ent & 65535
+          } else {
+            return Err(BrotliError::InvalidPrefixCode("invalid distance prefix entry"))
+          }
+        }
+      }
+
+      let d = if code < 16 {
+        if code == 0 {
+          dist[di]
+        } else if code == 1 {
+          dist[(di + 3) & 3]
+        } else if code == 2 {
+          dist[(di + 2) & 3]
+        } else if code == 3 {
+          dist[(di + 1) & 3]
+        } else {
+          let base = if code < 10 { dist[di] } else { dist[(di + 3) & 3] }
+          let k = ((code - (if code < 10 { 4 } else { 10 })) >> 1) + 1
+          if (code & 1) == 0 {
+            base - k
+          } else {
+            base + k
+          }
+        }
+      } else if code < 16 + direct {
+        code - 15
+      } else {
+        let x = code - direct - 16
+        let nbits = 1 + (x >> (postfix + 1))
+        let h = x >> postfix
+        let low = x & postfix_mask
+        let off = ((2 + (h & 1)) << nbits) - 4
+        if bitcnt < nbits {
+          if bitcnt <= 32 && in_pos + 4 <= in_len {
+            let w = data[in_pos].to_int().to_int64().to_uint64() |
+            (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+            (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+            (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+            bitbuf = bitbuf | (w << bitcnt)
+            in_pos = in_pos + 4
+            bitcnt = bitcnt + 32
+          } else {
+            while bitcnt <= 56 && in_pos < in_len {
+              bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+              in_pos = in_pos + 1
+              bitcnt = bitcnt + 8
+            }
+          }
+          if bitcnt < nbits {
+            return Err(BrotliError::UnexpectedEof("truncated distance extra bits"))
+          }
+        }
+        let ex = (bitbuf & bit_masks[nbits]).to_int()
+        bitbuf = bitbuf >> nbits
+        bitcnt = bitcnt - nbits
+        ((off + ex) << postfix) + low + direct + 1
+      }
+
+      if d <= 0 {
+        return Err(BrotliError::InvalidDistance("non-positive distance"))
+      }
+
+      let reach = if pos < window { pos } else { window }
+      if d > reach {
+        if copy < 4 || copy > 24 {
+          return Err(BrotliError::InvalidDictionaryRef("dictionary word length out of 4..24"))
+        }
+        let written = write_dict_word_fast(buf, pos, copy, d - reach - 1, left)
+        if written < 0 {
+          if written == -1 {
+            return Err(BrotliError::InvalidDictionaryRef("transform id out of range"))
+          }
+          return Err(BrotliError::InvalidMetaBlock("dictionary word exceeds meta-block length"))
+        }
+        pos = pos + written
+        left = left - written
+        if pos >= 2 {
+          prev1 = buf[pos - 1].to_int()
+          prev2 = buf[pos - 2].to_int()
+        } else if pos == 1 {
+          prev1 = buf[0].to_int()
+          prev2 = 0
+        }
+      } else {
+        if code != 0 {
+          di = (di + 1) & 3
+          dist[di] = d
+        }
+        if copy > left {
+          return Err(BrotliError::InvalidMetaBlock("copy exceeds meta-block length"))
+        }
+        let dst_end = pos + copy
+        if d == 1 {
+          let fill_b = buf[pos - 1]
+          let lim16 = dst_end - 16
+          while pos <= lim16 {
+            buf[pos] = fill_b
+            buf[pos + 1] = fill_b
+            buf[pos + 2] = fill_b
+            buf[pos + 3] = fill_b
+            buf[pos + 4] = fill_b
+            buf[pos + 5] = fill_b
+            buf[pos + 6] = fill_b
+            buf[pos + 7] = fill_b
+            buf[pos + 8] = fill_b
+            buf[pos + 9] = fill_b
+            buf[pos + 10] = fill_b
+            buf[pos + 11] = fill_b
+            buf[pos + 12] = fill_b
+            buf[pos + 13] = fill_b
+            buf[pos + 14] = fill_b
+            buf[pos + 15] = fill_b
+            pos = pos + 16
+          }
+          while pos < dst_end {
+            buf[pos] = fill_b
+            pos = pos + 1
+          }
+        } else if d >= 8 {
+          let mut src_pos = pos - d
+          let lim8 = dst_end - 8
+          while pos <= lim8 {
+            buf[pos] = buf[src_pos]
+            buf[pos + 1] = buf[src_pos + 1]
+            buf[pos + 2] = buf[src_pos + 2]
+            buf[pos + 3] = buf[src_pos + 3]
+            buf[pos + 4] = buf[src_pos + 4]
+            buf[pos + 5] = buf[src_pos + 5]
+            buf[pos + 6] = buf[src_pos + 6]
+            buf[pos + 7] = buf[src_pos + 7]
+            src_pos = src_pos + 8
+            pos = pos + 8
+          }
+          while pos < dst_end {
+            buf[pos] = buf[src_pos]
+            src_pos = src_pos + 1
+            pos = pos + 1
+          }
+        } else {
+          // Short overlapping copy (d in 2..7): pattern doubling to >= 8 then 8-byte unrolled copy
+          let mut cur_d = d
+          while cur_d < 8 && pos + cur_d <= dst_end {
+            let mut s = pos - cur_d
+            let mut k = 0
+            while k < cur_d {
+              buf[pos] = buf[s]
+              pos = pos + 1
+              s = s + 1
+              k = k + 1
+            }
+            cur_d = cur_d * 2
+          }
+          let mut src_pos = pos - cur_d
+          let lim8 = dst_end - 8
+          while pos <= lim8 {
+            buf[pos] = buf[src_pos]
+            buf[pos + 1] = buf[src_pos + 1]
+            buf[pos + 2] = buf[src_pos + 2]
+            buf[pos + 3] = buf[src_pos + 3]
+            buf[pos + 4] = buf[src_pos + 4]
+            buf[pos + 5] = buf[src_pos + 5]
+            buf[pos + 6] = buf[src_pos + 6]
+            buf[pos + 7] = buf[src_pos + 7]
+            src_pos = src_pos + 8
+            pos = pos + 8
+          }
+          while pos < dst_end {
+            buf[pos] = buf[src_pos]
+            src_pos = src_pos + 1
+            pos = pos + 1
+          }
+        }
+        left = left - copy
+        if pos >= 2 {
+          prev1 = buf[pos - 1].to_int()
+          prev2 = buf[pos - 2].to_int()
+        } else if pos == 1 {
+          prev1 = buf[0].to_int()
+          prev2 = 0
+        }
+      }
+    }
+
+    // Sync local registers back to BitReader & OutBuf
+    b.buf = bitbuf
+    b.cnt = bitcnt
+    b.pos = in_pos
+    out.n = pos
+  }
+
+  let _ = b.finish_stream()?
+  if out.n == out.buf.length() {
+    return Ok(out.buf)
+  }
+  Ok(out.buf.slice(0, out.n))
+}
