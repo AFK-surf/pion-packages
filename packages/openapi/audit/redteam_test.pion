@@ -1,0 +1,936 @@
+///| Red-team prosecution tests for `packages/openapi` @ ad06774 (feat/pkg-openapi).
+///|
+///| Every test asserts what OpenAPI 3.0.3 / 3.1.0 (+ JSON Schema 2020-12, RFC 3986, RFC 9110) requires and,
+///| where it has one, what Go `github.com/getkin/kin-openapi v0.131.0` does on the very same input
+///| (see `diff/` + `run_audit.sh diff` for the live differential).
+///| A FAILING test here is evidence against Pion, not a broken test. `control_*` tests must PASS.
+///|
+///| Naming: `p0_*` resource exhaustion / crash under default `OpenApiLimits`,
+///|         `p1_*` validation bypass (fail-open) or false rejection of valid real-world input,
+///|         `p2_*` spec divergences / capability gaps.
+///|
+///| Specs are written with `'` for `"` (see `j`).
+
+import "openapi"
+import "json5"
+import "jsonschema"
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+///| Replace every `'` with `"` so JSON specs stay readable.
+fn j(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    sb.write_byte((if b == 39 { 34 } else { b }).to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn doc_of(src : String, ctx : String) -> Option[openapi::OpenApiDoc] {
+  match openapi::parse(j(src)) {
+    Ok(d) => Some(d)
+    Err(e) => {
+      debug_assert(false, ctx + ": unexpected parse error: " + e.message)
+      None
+    }
+  }
+}
+
+///|
+fn validator_of(src : String, ctx : String) -> Option[openapi::Validator] {
+  match doc_of(src, ctx) {
+    None => None
+    Some(d) => {
+      match openapi::Validator::from_doc(d) {
+        Ok(v) => Some(v)
+        Err(e) => {
+          debug_assert(false, ctx + ": Validator::from_doc failed: " + e.message)
+          None
+        }
+      }
+    }
+  }
+}
+
+///| One-operation 3.0.3 spec: `paths` JSON object text (with `'`) plus optional components text.
+fn spec(paths : String, components : String) -> String {
+  "{'openapi':'3.0.3','info':{'title':'t','version':'1'},'paths':" + paths +
+  (if components.length() > 0 { ",'components':" + components } else { "" }) + "}"
+}
+
+///|
+fn spec31(paths : String, components : String) -> String {
+  "{'openapi':'3.1.0','info':{'title':'t','version':'1'},'paths':" + paths +
+  (if components.length() > 0 { ",'components':" + components } else { "" }) + "}"
+}
+
+///|
+fn rq(
+  m : openapi::HttpMethod,
+  path : String,
+  query : Array[(String, String)],
+  headers : Array[(String, String)],
+  ct : Option[String],
+  body : Option[String],
+) -> openapi::HttpRequest {
+  openapi::HttpRequest::{
+    method: m,
+    path: path,
+    query: query,
+    headers: headers,
+    cookies: [],
+    content_type: ct,
+    body: body,
+  }
+}
+
+///|
+fn post_json(path : String, body : String) -> openapi::HttpRequest {
+  rq(openapi::HttpMethod::Post, path, [], [], Some("application/json"), Some(j(body)))
+}
+
+///|
+fn get_q(path : String, query : Array[(String, String)]) -> openapi::HttpRequest {
+  rq(openapi::HttpMethod::Get, path, query, [], None, None)
+}
+
+///|
+fn n_req_errs(v : openapi::Validator, r : openapi::HttpRequest) -> Int {
+  v.validate_request(r).length()
+}
+
+///|
+fn first_err(v : openapi::Validator, r : openapi::HttpRequest) -> String {
+  let es = v.validate_request(r)
+  if es.length() == 0 {
+    "(no error)"
+  } else {
+    es[0].location + ": " + es[0].message
+  }
+}
+
+///|
+fn n_resp_errs(v : openapi::Validator, m : openapi::HttpMethod, path : String, st : Int, body : String) -> Int {
+  let r = openapi::HttpResponse::{
+    status: st,
+    headers: [],
+    content_type: Some("application/json"),
+    body: Some(j(body)),
+  }
+  v.validate_response(m, path, r).length()
+}
+
+///|
+fn route_of(doc : openapi::OpenApiDoc, m : openapi::HttpMethod, path : String) -> String {
+  match doc.build_router().find(m, path) {
+    Ok(rm) => {
+      let sb = StringBuilder::new()
+      match rm.operation.operation_id {
+        Some(id) => sb.write_string(id)
+        None => sb.write_string("?")
+      }
+      let mut i = 0
+      while i < rm.path_params.length() {
+        let (k, v) = rm.path_params[i]
+        sb.write_string("," + k + "=" + v)
+        i = i + 1
+      }
+      sb.to_string()
+    }
+    Err(openapi::RouteError::NotFound(_)) => "404"
+    Err(openapi::RouteError::MethodNotAllowed(_, _)) => "405"
+  }
+}
+
+///|
+fn count_nodes(v : json5::Json5Value) -> Int {
+  match v {
+    json5::Json5Value::Object(es) => {
+      let mut n = 1
+      let mut i = 0
+      while i < es.length() {
+        let (_, sv) = es[i]
+        n = n + count_nodes(sv)
+        i = i + 1
+      }
+      n
+    }
+    json5::Json5Value::Array(items) => {
+      let mut n = 1
+      let mut i = 0
+      while i < items.length() {
+        n = n + count_nodes(items[i])
+        i = i + 1
+      }
+      n
+    }
+    _ => 1
+  }
+}
+
+///| Collect every `$ref` string in a JSON tree.
+fn collect_refs(v : json5::Json5Value, out : Array[String]) -> Unit {
+  match v {
+    json5::Json5Value::Object(es) => {
+      let mut i = 0
+      while i < es.length() {
+        let (k, sv) = es[i]
+        match (k, sv) {
+          ("$ref", json5::Json5Value::Str(r)) => out.push(r)
+          _ => collect_refs(sv, out)
+        }
+        i = i + 1
+      }
+    }
+    json5::Json5Value::Array(items) => {
+      let mut i = 0
+      while i < items.length() {
+        collect_refs(items[i], out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///| Number of entries with key `k` in an object.
+fn key_count(v : json5::Json5Value, k : String) -> Int {
+  match v {
+    json5::Json5Value::Object(es) => {
+      let mut n = 0
+      let mut i = 0
+      while i < es.length() {
+        let (kk, _) = es[i]
+        if kk == k {
+          n = n + 1
+        }
+        i = i + 1
+      }
+      n
+    }
+    _ => 0
+  }
+}
+
+///|
+fn props_of(tool : openapi::ToolSchema) -> json5::Json5Value {
+  match json5::get(tool.input_schema, "properties") {
+    Some(p) => p
+    None => json5::Json5Value::Null
+  }
+}
+
+///| Fan-out bomb: `A0` has `k` properties each `$ref` to `A1`, which has `m` plain properties.
+fn fanout_spec(k : Int, m : Int, ops : Int) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"t\",\"version\":\"1\"},\"paths\":{")
+  let mut o = 0
+  while o < ops {
+    if o > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("\"/b" + o.to_string() + "\":{\"post\":{\"operationId\":\"op" + o.to_string())
+    sb.write_string("\",\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/A0\"}}}},")
+    sb.write_string("\"responses\":{\"200\":{\"description\":\"ok\"}}}}")
+    o = o + 1
+  }
+  sb.write_string("},\"components\":{\"schemas\":{\"A0\":{\"type\":\"object\",\"properties\":{")
+  let mut i = 0
+  while i < k {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("\"p" + i.to_string() + "\":{\"$ref\":\"#/components/schemas/A1\"}")
+    i = i + 1
+  }
+  sb.write_string("}},\"A1\":{\"type\":\"object\",\"properties\":{")
+  i = 0
+  while i < m {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("\"q" + i.to_string() + "\":{\"type\":\"string\"}")
+    i = i + 1
+  }
+  sb.write_string("}}}}}")
+  sb.to_string()
+}
+
+///| Balanced DAG of depth `d` and branching `b` (no cycles): `N_i` has `b` properties -> `N_{i+1}`.
+fn dag_spec(d : Int, b : Int) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"t\",\"version\":\"1\"},\"paths\":{\"/o\":{\"post\":{\"operationId\":\"op0\",")
+  sb.write_string("\"requestBody\":{\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/N0\"}}}},")
+  sb.write_string("\"responses\":{\"200\":{\"description\":\"ok\"}}}}},\"components\":{\"schemas\":{")
+  let mut i = 0
+  while i < d {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("\"N" + i.to_string() + "\":{\"type\":\"object\",\"properties\":{")
+    let mut k = 0
+    while k < b {
+      if k > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string("\"f" + k.to_string() + "\":{\"$ref\":\"#/components/schemas/N" + (i + 1).to_string() + "\"}")
+      k = k + 1
+    }
+    sb.write_string("}}")
+    i = i + 1
+  }
+  sb.write_string(",\"N" + d.to_string() + "\":{\"type\":\"string\"}}}}")
+  sb.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// P0: resource exhaustion under default OpenApiLimits
+// ---------------------------------------------------------------------------
+
+///| `max_ref_expansions` (4096) counts `$ref` hops, not output size: 2000 refs to a 60-property schema
+///| (a ~90 KB spec, 4k parsed nodes) expands to 240k+ nodes per schema copy — above `max_nodes` (200k).
+///| At 4000x200 a 179 KB spec costs 1.1 GB RSS natively; 30 operations x (2000x50) trap wasm32 (4 GiB).
+///| kin-openapi keeps `$ref` as shared pointers (24 MB).
+test "p0_from_doc_fanout_expansion_exceeds_max_nodes" {
+  let src = fanout_spec(2000, 60, 1)
+  let doc = match openapi::parse(src) {
+    Ok(d) => d
+    Err(e) => {
+      debug_assert(false, "parse: " + e.message)
+      return
+    }
+  }
+  match openapi::Validator::from_doc(doc) {
+    Err(e) => debug_assert(e.is_kind(openapi::OpenApiErrorKind::LimitExceeded), "unexpected error " + e.message)
+    Ok(v) => {
+      let mut total = 0
+      let mut i = 0
+      while i < v.route_validators.length() {
+        let rv = v.route_validators[i]
+        let mut k = 0
+        while k < rv.body_schemas.length() {
+          let (_, e) = rv.body_schemas[k]
+          match e {
+            Some(en) => total = total + count_nodes(en.raw_schema)
+            None => ()
+          }
+          k = k + 1
+        }
+        i = i + 1
+      }
+      debug_assert(
+        total <= doc.limits.max_nodes,
+        "from_doc materialized " + total.to_string() + " schema nodes from a " + src.length().to_string() +
+        "-byte spec (max_nodes=" + doc.limits.max_nodes.to_string() + "); no limit tripped",
+      )
+    }
+  }
+}
+
+///| Same amplification through `export_tool` / `export_all_tools` (MCP export of an untrusted spec).
+test "p0_export_tool_fanout_expansion_exceeds_max_nodes" {
+  let src = fanout_spec(2000, 60, 1)
+  let doc = match openapi::parse(src) {
+    Ok(d) => d
+    Err(e) => {
+      debug_assert(false, "parse: " + e.message)
+      return
+    }
+  }
+  match doc.export_tool("op0") {
+    Err(e) => debug_assert(e.is_kind(openapi::OpenApiErrorKind::LimitExceeded), "unexpected error " + e.message)
+    Ok(t) => {
+      let n = count_nodes(t.input_schema)
+      debug_assert(
+        n <= doc.limits.max_nodes,
+        "export_tool produced " + n.to_string() + " nodes from a " + src.length().to_string() +
+        "-byte spec (max_nodes=" + doc.limits.max_nodes.to_string() + ")",
+      )
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P1: validation bypass / false rejection
+// ---------------------------------------------------------------------------
+
+///| OAS 3.0.3 4.7.24 `readOnly`: "If the property is marked as readOnly being true and is in the required list,
+///| the required will take effect on the response only." kin-openapi: accepted.
+test "p1_readonly_required_property_rejected_in_request" {
+  let v = match validator_of(
+    spec(
+      "{'/pets':{'post':{'operationId':'c','requestBody':{'required':true,'content':{'application/json':{'schema':{'$ref':'#/components/schemas/Pet'}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "{'schemas':{'Pet':{'type':'object','required':['id','name'],'properties':{'id':{'type':'integer','readOnly':true},'name':{'type':'string'}}}}}",
+    ),
+    "ro",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  let r = post_json("/pets", "{'name':'rex'}")
+  debug_assert(n_req_errs(v, r) == 0, "request omitting a readOnly required property was rejected: " + first_err(v, r))
+}
+
+///| Mirror: `writeOnly` + required applies to requests only. kin-openapi: accepted.
+test "p1_writeonly_required_property_rejected_in_response" {
+  let v = match validator_of(
+    spec(
+      "{'/u':{'get':{'operationId':'g','responses':{'200':{'description':'ok','content':{'application/json':{'schema':{'type':'object','required':['password'],'properties':{'password':{'type':'string','writeOnly':true},'name':{'type':'string'}}}}}}}}}}",
+      "",
+    ),
+    "wo",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  let n = n_resp_errs(v, openapi::HttpMethod::Get, "/u", 200, "{'name':'a'}")
+  debug_assert(n == 0, "response omitting a writeOnly required property was rejected")
+}
+
+///| `application/x-www-form-urlencoded` / `text/plain` bodies with a schema are accepted without any
+///| validation (fail-open). kin-openapi decodes and validates both.
+test "p1_non_json_request_bodies_are_never_validated" {
+  let v = match validator_of(
+    spec(
+      "{'/c':{'post':{'operationId':'c','requestBody':{'required':true,'content':{'application/x-www-form-urlencoded':{'schema':{'type':'object','required':['a'],'properties':{'a':{'type':'integer'}}}},'text/plain':{'schema':{'type':'string','maxLength':3}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "form",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  let f = rq(openapi::HttpMethod::Post, "/c", [], [], Some("application/x-www-form-urlencoded"), Some("a=not-an-int"))
+  let t = rq(openapi::HttpMethod::Post, "/c", [], [], Some("text/plain"), Some("way too long"))
+  debug_assert(n_req_errs(v, f) > 0, "form body a=not-an-int accepted although a is integer")
+  debug_assert(n_req_errs(v, t) > 0, "text/plain body longer than maxLength accepted")
+}
+
+///| Parameters described with `content` (OAS 3.0.3 4.7.12.1, mutually exclusive with `schema`) are
+///| decoded to `schema: None` and never validated. kin-openapi rejects `{"b":1}`.
+test "p1_parameter_content_schema_is_ignored" {
+  let v = match validator_of(
+    spec(
+      "{'/x':{'get':{'operationId':'x','parameters':[{'name':'q','in':'query','required':true,'content':{'application/json':{'schema':{'type':'object','required':['a']}}}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "content-param",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, get_q("/x", [("q", j("{'b':1}"))])) > 0, "content-described query param never validated")
+}
+
+///| `style: deepObject` (`?filter[a]=x`) is never looked up: an invalid member passes; `form` objects
+///| (`?o=a,1`) are never decoded: a valid one is rejected. kin-openapi: deepObject ok|err, form ok|err.
+test "p1_object_parameters_deepobject_bypass_and_form_false_reject" {
+  let v = match validator_of(
+    spec(
+      "{'/x':{'get':{'operationId':'x','parameters':[{'name':'filter','in':'query','style':'deepObject','explode':true,'schema':{'type':'object','properties':{'a':{'type':'integer'}}}},{'name':'o','in':'query','style':'form','explode':false,'schema':{'type':'object','properties':{'a':{'type':'integer'}}}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "objparams",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, get_q("/x", [("filter[a]", "not-int")])) > 0, "deepObject filter[a]=not-int accepted")
+  let good = get_q("/x", [("o", "a,1")])
+  debug_assert(n_req_errs(v, good) == 0, "form object o=a,1 rejected: " + first_err(v, good))
+}
+
+///| A dangling parameter `$ref` is silently decoded as an unnamed optional *query* parameter, so
+///| `Validator::from_doc` succeeds and the intended (required) parameter is never enforced.
+///| kin-openapi refuses to load the document.
+test "p1_dangling_parameter_ref_silently_dropped_by_validator" {
+  let src = spec(
+    "{'/x':{'get':{'operationId':'x','parameters':[{'$ref':'#/components/parameters/ApiKey'}],'responses':{'200':{'description':'ok'}}}}}",
+    "{'parameters':{'ApiKEY':{'name':'X-Api-Key','in':'header','required':true,'schema':{'type':'string'}}}}",
+  )
+  let doc = match doc_of(src, "dangling") {
+    Some(d) => d
+    None => return
+  }
+  match openapi::Validator::from_doc(doc) {
+    Err(_) => ()
+    Ok(v) => {
+      let r = get_q("/x", [])
+      debug_assert(
+        n_req_errs(v, r) > 0,
+        "Validator built over an unresolvable parameter $ref and accepts every request (param decoded as name='' in=query)",
+      )
+    }
+  }
+}
+
+///| `example` / `default` / `enum` / `const` values are literal data, but the dereferencer walks into them:
+///| an example object carrying a `"$ref"` key makes `Validator::from_doc` (and `validate()`) fail.
+///| kin-openapi: loads, validates and accepts the request.
+test "p1_ref_key_inside_example_breaks_from_doc" {
+  let src = spec(
+    "{'/c':{'post':{'operationId':'c','requestBody':{'content':{'application/json':{'schema':{'type':'object','example':{'$ref':'#/not/a/pointer'}}}}},'responses':{'200':{'description':'ok'}}}}}",
+    "",
+  )
+  let doc = match doc_of(src, "example-ref") {
+    Some(d) => d
+    None => return
+  }
+  match openapi::Validator::from_doc(doc) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "from_doc rejected a valid spec because of a literal example value: " + e.message)
+  }
+}
+
+///| Same walk rewrites literal data with the 3.0 `nullable` normalizer: an `enum` member
+///| `{"nullable":true,"type":"string"}` becomes `{"type":["string","null"]}` and the exact value no longer matches.
+test "p1_nullable_normalizer_rewrites_enum_literals" {
+  let v = match validator_of(
+    spec(
+      "{'/c':{'post':{'operationId':'c','requestBody':{'content':{'application/json':{'schema':{'enum':[{'nullable':true,'type':'string'}]}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "enum-literal",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  let r = post_json("/c", "{'nullable':true,'type':'string'}")
+  debug_assert(n_req_errs(v, r) == 0, "value equal to the only enum member rejected: " + first_err(v, r))
+}
+
+///| OpenAPI 3.1 / JSON Schema 2020-12: `$ref` is an applicator, its siblings apply *in addition*
+///| (8.2.3.1). Pion merges siblings over the target, so `{"$ref": A, "required": ["b"]}` drops A's
+///| `required: ["a"]` (fail-open). kin-openapi (3.0 semantics) still enforces A.
+test "p1_openapi31_ref_siblings_override_instead_of_and" {
+  let v = match validator_of(
+    spec31(
+      "{'/c':{'post':{'operationId':'c','requestBody':{'content':{'application/json':{'schema':{'$ref':'#/components/schemas/A','required':['b']}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "{'schemas':{'A':{'type':'object','required':['a']}}}",
+    ),
+    "31-siblings",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, post_json("/c", "{'b':1}")) > 0, "body missing A.required 'a' accepted")
+}
+
+///| Two recursive schemas whose names sanitize to the same `$defs` key (`a.b`, `a_b`) share one hoisted
+///| definition: every `a_b` subtree is validated against `a.b` (fail-open). kin-openapi rejects `{"i":"str"}`.
+test "p1_hoisted_defs_name_collision_validates_wrong_schema" {
+  let v = match validator_of(
+    spec(
+      "{'/a':{'post':{'operationId':'a','requestBody':{'content':{'application/json':{'schema':{'type':'object','properties':{'x':{'$ref':'#/components/schemas/a.b'},'y':{'$ref':'#/components/schemas/a_b'}}}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "{'schemas':{'a.b':{'type':'object','properties':{'s':{'type':'string'},'n':{'$ref':'#/components/schemas/a.b'}}},'a_b':{'type':'object','properties':{'i':{'type':'integer'},'n':{'$ref':'#/components/schemas/a_b'}}}}}",
+    ),
+    "defs-collision",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, post_json("/a", "{'y':{'i':1,'n':{'i':'str'}}}")) > 0, "nested a_b.i='str' accepted")
+}
+
+///| OAS 3.0.3 4.7.9: "The path is appended to the URL from the Server Object". Pion's router ignores
+///| `servers` entirely: `servers: [{url: /api}]` + `/users` matches `/users` and 404s `/api/users`.
+///| kin-openapi (gorillamux) routes `/api/users` and 404s `/users`.
+test "p1_router_ignores_server_base_path" {
+  let doc = match doc_of(
+    "{'openapi':'3.0.3','info':{'title':'t','version':'1'},'servers':[{'url':'/api'}],'paths':{'/users':{'get':{'operationId':'list','responses':{'200':{'description':'ok'}}}}}}",
+    "servers",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  debug_assert(route_of(doc, openapi::HttpMethod::Get, "/api/users") == "list", "/api/users not routed")
+  debug_assert(route_of(doc, openapi::HttpMethod::Get, "/users") == "404", "/users routed despite servers: /api")
+}
+
+///| Empty segments and trailing slashes are dropped before matching: `/users/`, `//users`, `/users//42`
+///| and `/users/42//` all match. A proxy/backend that treats them as distinct paths is then validated
+///| against the wrong operation. kin-openapi: all 404.
+test "p1_router_collapses_empty_segments_and_trailing_slash" {
+  let doc = match doc_of(
+    spec(
+      "{'/users':{'get':{'operationId':'list','responses':{'200':{'description':'ok'}}}},'/users/{id}':{'get':{'operationId':'get','parameters':[{'name':'id','in':'path','required':true,'schema':{'type':'string'}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "slashes",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  let probes = ["/users/", "//users", "/users//42", "/users/42/"]
+  let mut i = 0
+  while i < probes.length() {
+    let r = route_of(doc, openapi::HttpMethod::Get, probes[i])
+    debug_assert(r == "404", probes[i] + " routed to " + r)
+    i = i + 1
+  }
+}
+
+///| `max_ref_expansions` counts every inlined occurrence, so an ordinary acyclic schema graph
+///| (depth 6, 5 `$ref` fields per level = 5^6 occurrences — the shape of any API with expandable
+///| sub-resources) makes `Validator::from_doc` and `export_tool` fail. kin-openapi: loads fine.
+test "p1_ordinary_acyclic_schema_graph_rejected_by_expansion_budget" {
+  let doc = match openapi::parse(dag_spec(6, 5)) {
+    Ok(d) => d
+    Err(e) => {
+      debug_assert(false, "parse: " + e.message)
+      return
+    }
+  }
+  match openapi::Validator::from_doc(doc) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "from_doc rejected a 7-schema acyclic spec: " + e.message)
+  }
+}
+
+///| Two parameters with the same `name` in different locations (legal: uniqueness is per (name, in)),
+///| or a parameter named `body` next to a JSON request body, produce duplicate `properties` keys in the
+///| exported tool schema — the JSON is ambiguous and one constraint silently wins.
+test "p1_export_tool_duplicate_property_keys" {
+  let doc = match doc_of(
+    spec(
+      "{'/u/{id}':{'post':{'operationId':'upd','parameters':[{'name':'id','in':'path','required':true,'schema':{'type':'integer'}},{'name':'id','in':'query','schema':{'type':'string'}},{'name':'body','in':'header','schema':{'type':'string'}}],'requestBody':{'required':true,'content':{'application/json':{'schema':{'type':'object'}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "export-dups",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  match doc.export_tool("upd") {
+    Err(e) => debug_assert(false, "export failed: " + e.message)
+    Ok(t) => {
+      let p = props_of(t)
+      debug_assert(key_count(p, "id") <= 1, "exported properties contain 'id' " + key_count(p, "id").to_string() + " times")
+      debug_assert(key_count(p, "body") <= 1, "exported properties contain 'body' " + key_count(p, "body").to_string() + " times")
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P2: divergences / capability gaps
+// ---------------------------------------------------------------------------
+
+///| OAS 3.0.3 `allowEmptyValue: true` lets `?s=` through; Pion still applies `minLength: 1`. kin: ok.
+test "p2_allow_empty_value_ignored" {
+  let v = match validator_of(
+    spec(
+      "{'/x':{'get':{'operationId':'x','parameters':[{'name':'s','in':'query','allowEmptyValue':true,'schema':{'type':'string','minLength':1}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "aev",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  let r = get_q("/x", [("s", "")])
+  debug_assert(n_req_errs(v, r) == 0, "?s= rejected despite allowEmptyValue: " + first_err(v, r))
+}
+
+///| Path `style: label` (`/x/.5`) and `style: matrix` (`/x/;id=5`) are not decoded. kin: both ok.
+test "p2_label_and_matrix_path_styles_unsupported" {
+  let v = match validator_of(
+    spec(
+      "{'/l/{id}':{'get':{'operationId':'l','parameters':[{'name':'id','in':'path','required':true,'style':'label','schema':{'type':'integer'}}],'responses':{'200':{'description':'ok'}}}},'/m/{id}':{'get':{'operationId':'m','parameters':[{'name':'id','in':'path','required':true,'style':'matrix','schema':{'type':'integer'}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "label",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, get_q("/l/.5", [])) == 0, "label /l/.5 rejected")
+  debug_assert(n_req_errs(v, get_q("/m/;id=5", [])) == 0, "matrix /m/;id=5 rejected")
+}
+
+///| Integer/number parameters are parsed with the JSON number grammar *including surrounding
+///| whitespace*: `?n= 5` and `?n=5%20` pass as integers. kin-openapi (strconv) rejects both.
+test "p2_numeric_parameter_accepts_surrounding_whitespace" {
+  let v = match validator_of(
+    spec(
+      "{'/x':{'get':{'operationId':'x','parameters':[{'name':'n','in':'query','schema':{'type':'integer'}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "ws",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, get_q("/x", [("n", " 5")])) > 0, "' 5' accepted as integer")
+  debug_assert(n_req_errs(v, get_q("/x", [("n", "5 ")])) > 0, "'5 ' accepted as integer")
+}
+
+///| An unknown `in` value (`body`, `Header`, `formData`) is silently decoded as `query`, and `validate()`
+///| reports nothing. kin-openapi `doc.Validate`: error.
+test "p2_unknown_parameter_location_silently_becomes_query" {
+  let doc = match doc_of(
+    spec(
+      "{'/x':{'get':{'operationId':'x','parameters':[{'name':'q','in':'body','schema':{'type':'string'}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "bad-in",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  debug_assert(doc.validate().length() > 0, "validate() accepts parameter with in: body")
+}
+
+///| `validate()` never looks inside Schema Objects: `type: "strin"` and `pattern: "(["` pass static
+///| validation (they only surface later, from `Validator::from_doc`). kin-openapi `doc.Validate`: error.
+test "p2_validate_does_not_check_schema_objects" {
+  let doc = match doc_of(
+    spec(
+      "{'/a':{'get':{'operationId':'a','parameters':[{'name':'q','in':'query','schema':{'type':'string','pattern':'(['}}],'responses':{'200':{'description':'ok','content':{'application/json':{'schema':{'type':'strin'}}}}}}}}",
+      "",
+    ),
+    "schema-check",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  debug_assert(doc.validate().length() > 0, "validate() reports no issue for type 'strin' / pattern '(['")
+}
+
+///| 3.0 `nullable: true` + `enum` without `null`: kin-openapi (and the 3.0.3 wording "adds null to the
+///| allowed values") accept `null`; Pion's `type: [T, "null"]` rewrite keeps the enum and rejects it.
+test "p2_nullable_enum_rejects_null" {
+  let v = match validator_of(
+    spec(
+      "{'/c':{'post':{'operationId':'c','requestBody':{'content':{'application/json':{'schema':{'type':'object','properties':{'e':{'type':'string','enum':['a','b'],'nullable':true}}}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "nullable-enum",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, post_json("/c", "{'e':null}")) == 0, "null rejected for nullable enum")
+}
+
+///| HTTP methods are case-sensitive (RFC 9110 9.1); `HttpMethod::parse("get")` maps to GET, so a raw
+///| `get` request line is routed. gorillamux: 405.
+test "p2_lowercase_http_method_is_routed" {
+  debug_assert(openapi::HttpMethod::parse("get") is None, "HttpMethod::parse accepts lowercase 'get'")
+}
+
+///| `readOnly` properties sent in a request / `writeOnly` returned in a response are accepted.
+///| OAS: "SHOULD NOT be sent"; kin-openapi rejects both by default.
+test "p2_readonly_in_request_and_writeonly_in_response_accepted" {
+  let v = match validator_of(
+    spec(
+      "{'/p':{'post':{'operationId':'p','requestBody':{'content':{'application/json':{'schema':{'$ref':'#/components/schemas/P'}}}},'responses':{'200':{'description':'ok','content':{'application/json':{'schema':{'$ref':'#/components/schemas/P'}}}}}}}}",
+      "{'schemas':{'P':{'type':'object','properties':{'id':{'type':'integer','readOnly':true},'pw':{'type':'string','writeOnly':true}}}}}",
+    ),
+    "ro-wo",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, post_json("/p", "{'id':1}")) > 0, "readOnly id accepted in request")
+  debug_assert(n_resp_errs(v, openapi::HttpMethod::Post, "/p", 200, "{'pw':'x'}") > 0, "writeOnly pw accepted in response")
+}
+
+///| MCP / OpenAI tool names must match `^[a-zA-Z0-9_-]{1,64}$`; `operationId` is exported verbatim.
+test "p2_export_tool_name_not_sanitized" {
+  let doc = match doc_of(
+    spec("{'/a':{'get':{'operationId':'list users/v2 (beta)','responses':{'200':{'description':'ok'}}}}}", ""),
+    "tool-name",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  match doc.export_tool("list users/v2 (beta)") {
+    Err(e) => debug_assert(false, "export failed: " + e.message)
+    Ok(t) => {
+      let mut ok = t.name.length() >= 1 && t.name.length() <= 64
+      let mut i = 0
+      while i < t.name.length() {
+        let b = t.name.code_unit_at(i)
+        if !((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 45) {
+          ok = false
+        }
+        i = i + 1
+      }
+      debug_assert(ok, "tool name '" + t.name + "' violates ^[a-zA-Z0-9_-]{1,64}$")
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// controls: must PASS (defences that hold)
+// ---------------------------------------------------------------------------
+
+///| 2^18 DAG bomb is cut by the expansion budget; 2^25 by max_depth — no OOM.
+test "control_dag_bomb_rejected" {
+  let sb = StringBuilder::new()
+  sb.write_string("{'openapi':'3.0.3','info':{'title':'t','version':'1'},'paths':{'/b':{'post':{'operationId':'op0','requestBody':{'content':{'application/json':{'schema':{'$ref':'#/components/schemas/A0'}}}},'responses':{'200':{'description':'ok'}}}}},'components':{'schemas':{")
+  let mut i = 0
+  while i < 18 {
+    let nx = "#/components/schemas/A" + (i + 1).to_string()
+    sb.write_string("'A" + i.to_string() + "':{'type':'object','properties':{'x':{'$ref':'" + nx + "'},'y':{'$ref':'" + nx + "'}}},")
+    i = i + 1
+  }
+  sb.write_string("'A18':{'type':'string'}}}}")
+  let doc = match doc_of(sb.to_string(), "dag") {
+    Some(d) => d
+    None => return
+  }
+  match openapi::Validator::from_doc(doc) {
+    Ok(_) => debug_assert(false, "2^18 bomb accepted")
+    Err(e) => debug_assert(e.is_kind(openapi::OpenApiErrorKind::LimitExceeded), "wrong error " + e.message)
+  }
+  match doc.export_tool("op0") {
+    Ok(_) => debug_assert(false, "2^18 bomb exported")
+    Err(e) => debug_assert(e.is_kind(openapi::OpenApiErrorKind::LimitExceeded), "wrong error " + e.message)
+  }
+}
+
+///| Mutually recursive schemas export with local `$defs`, no dangling `$ref`, and compile as JSON Schema.
+test "control_recursive_export_self_contained" {
+  let doc = match doc_of(
+    spec(
+      "{'/b':{'post':{'operationId':'op0','requestBody':{'content':{'application/json':{'schema':{'$ref':'#/components/schemas/N'}}}},'responses':{'200':{'description':'ok'}}}}}",
+      "{'schemas':{'N':{'type':'object','properties':{'a':{'$ref':'#/components/schemas/N'},'b':{'$ref':'#/components/schemas/M'}}},'M':{'type':'object','properties':{'n':{'$ref':'#/components/schemas/N'},'m':{'$ref':'#/components/schemas/M'}}}}}",
+    ),
+    "rec",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  match doc.export_tool("op0") {
+    Err(e) => debug_assert(false, "export failed: " + e.message)
+    Ok(t) => {
+      let refs : Array[String] = []
+      collect_refs(t.input_schema, refs)
+      let mut i = 0
+      while i < refs.length() {
+        let r = refs[i]
+        let ok = r.length() > 8 && r.slice(0, 8) == "#/$defs/" &&
+        (match json5::get(t.input_schema, "$defs") {
+          Some(d) => json5::get(d, r.slice(8, r.length())) is Some(_)
+          None => false
+        })
+        debug_assert(ok, "dangling exported $ref " + r)
+        i = i + 1
+      }
+      match jsonschema::compile(t.input_schema) {
+        Ok(c) => {
+          let inst = match json5::parse(j("{'body':{'a':{'b':{'n':{}}}}}")) {
+            Ok(x) => x
+            Err(_) => json5::Json5Value::Null
+          }
+          debug_assert(c.is_valid(inst), "recursive instance rejected")
+        }
+        Err(e) => debug_assert(false, "exported schema does not compile: " + e.message)
+      }
+    }
+  }
+}
+
+///| Static beats template, percent-encoded UTF-8 decodes, `%2F` stays in one segment, 405 vs 404.
+test "control_router_priority_and_decoding" {
+  let doc = match doc_of(
+    spec(
+      "{'/users/me':{'get':{'operationId':'me','responses':{'200':{'description':'ok'}}}},'/users/{id}':{'get':{'operationId':'get','parameters':[{'name':'id','in':'path','required':true,'schema':{'type':'string'}}],'responses':{'200':{'description':'ok'}}}}}",
+      "",
+    ),
+    "router",
+  ) {
+    Some(d) => d
+    None => return
+  }
+  debug_assert(route_of(doc, openapi::HttpMethod::Get, "/users/me") == "me", "static priority")
+  debug_assert(route_of(doc, openapi::HttpMethod::Get, "/users/%E4%B8%AD") == "get,id=中", "utf-8 decode")
+  debug_assert(route_of(doc, openapi::HttpMethod::Get, "/users/a%2Fb") == "get,id=a/b", "%2F")
+  debug_assert(route_of(doc, openapi::HttpMethod::Post, "/users/1") == "405", "405")
+  debug_assert(route_of(doc, openapi::HttpMethod::Get, "/nope") == "404", "404")
+}
+
+///| Header names case-insensitive; responses exact > NXX > default; 3.0 boolean exclusiveMinimum.
+test "control_runtime_basics" {
+  let v = match validator_of(
+    spec(
+      "{'/r':{'post':{'operationId':'r','parameters':[{'name':'X-Rate','in':'header','required':true,'schema':{'type':'integer','maximum':10}}],'requestBody':{'content':{'application/json':{'schema':{'type':'number','minimum':0,'exclusiveMinimum':true}}}},'responses':{'201':{'description':'c','content':{'application/json':{'schema':{'type':'integer'}}}},'2XX':{'description':'x','content':{'application/json':{'schema':{'type':'string'}}}},'default':{'description':'d','content':{'application/json':{'schema':{'type':'boolean'}}}}}}}}",
+      "",
+    ),
+    "runtime",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  let ok = rq(openapi::HttpMethod::Post, "/r", [], [("x-rate", "5")], Some("application/json; charset=utf-8"), Some("1"))
+  debug_assert(n_req_errs(v, ok) == 0, "valid request rejected: " + first_err(v, ok))
+  let zero = rq(openapi::HttpMethod::Post, "/r", [], [("X-RATE", "5")], Some("application/json"), Some("0"))
+  debug_assert(n_req_errs(v, zero) > 0, "exclusiveMinimum: 0 accepted")
+  debug_assert(n_resp_errs(v, openapi::HttpMethod::Post, "/r", 201, "1") == 0, "201 exact")
+  debug_assert(n_resp_errs(v, openapi::HttpMethod::Post, "/r", 202, "'s'") == 0, "2XX")
+  debug_assert(n_resp_errs(v, openapi::HttpMethod::Post, "/r", 500, "true") == 0, "default")
+  debug_assert(n_resp_errs(v, openapi::HttpMethod::Post, "/r", 201, "'s'") > 0, "201 mismatch")
+}
+
+///| YAML alias bomb and 100k-deep JSON are refused with errors, not crashes.
+test "control_parser_bombs_refused" {
+  let lol = StringBuilder::new()
+  lol.write_string("openapi: 3.0.3\ninfo: {title: d, version: '1'}\npaths: {}\nl0: &l0 [a,a,a,a,a,a,a,a,a,a]\n")
+  let mut i = 1
+  while i < 9 {
+    lol.write_string("l" + i.to_string() + ": &l" + i.to_string() + " [")
+    let mut k = 0
+    while k < 10 {
+      if k > 0 {
+        lol.write_string(",")
+      }
+      lol.write_string("*l" + (i - 1).to_string())
+      k = k + 1
+    }
+    lol.write_string("]\n")
+    i = i + 1
+  }
+  debug_assert(openapi::parse(lol.to_string()) is Err(_), "YAML billion laughs accepted")
+  let deep = StringBuilder::new()
+  deep.write_string("{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"d\",\"version\":\"1\"},\"paths\":{},\"x\":")
+  i = 0
+  while i < 100000 {
+    deep.write_string("[")
+    i = i + 1
+  }
+  i = 0
+  while i < 100000 {
+    deep.write_string("]")
+    i = i + 1
+  }
+  deep.write_string("}")
+  match openapi::parse(deep.to_string()) {
+    Ok(_) => debug_assert(false, "100k-deep JSON accepted")
+    Err(e) => debug_assert(e.is_kind(openapi::OpenApiErrorKind::LimitExceeded), "wrong kind " + e.message)
+  }
+}
+
+///| Path-level parameters inherit and operation-level (name, in) overrides; RFC 6901 escapes resolve.
+test "control_param_override_and_pointer_escapes" {
+  let v = match validator_of(
+    spec(
+      "{'/x/{id}':{'parameters':[{'name':'id','in':'path','required':true,'schema':{'type':'integer'}},{'name':'v','in':'query','required':true,'schema':{'type':'integer'}}],'get':{'operationId':'x','parameters':[{'name':'v','in':'query','schema':{'type':'string'}}],'responses':{'200':{'description':'ok','content':{'application/json':{'schema':{'$ref':'#/components/schemas/a~1b%20c'}}}}}}}}",
+      "{'schemas':{'a/b c':{'type':'integer'}}}",
+    ),
+    "override",
+  ) {
+    Some(v) => v
+    None => return
+  }
+  debug_assert(n_req_errs(v, get_q("/x/1", [])) == 0, "inherited required v not overridden")
+  debug_assert(n_req_errs(v, get_q("/x/z", [])) > 0, "path id=z accepted")
+  debug_assert(n_resp_errs(v, openapi::HttpMethod::Get, "/x/1", 200, "'s'") > 0, "a~1b%20c not resolved")
+}
