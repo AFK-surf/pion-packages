@@ -152,8 +152,11 @@ Each item is re-evaluated from `README.md` at run time (`docs` section):
   only gid < 512 and kerns only gid < 256, and covers no `name`, `vmtx`, UVS, named instance or `avar` output;
   the "0 deviations" claim is therefore much narrower than stated (this audit found P1-1 / P1-2 / P2-2 there);
 * 8 package tests; none of ttf-parser 0.25.1's own test vectors (`tests/tables/{cmap,glyf,hmtx,maxp}.rs`) were
-  ported (AGENTS.md 1.1); `BENCHMARKS.md` has no `opentype` section (AGENTS.md 1.3);
+  ported (AGENTS.md 1.1);
 * the "Mac Roman fallback" advertised under `cmap` is P1-2.
+* information only (printed as `INFO`, not gated): the root `BENCHMARKS.md` has no `opentype` section yet
+  (AGENTS.md 1.3). Package fix branches may not touch repository root files; that section is appended when the
+  release is merged into `main`.
 The benchmark ratios themselves reproduce (0.61-0.65x / 0.73-0.76x measured in three runs vs 0.59x / 0.71x
 documented, same stdout SHA-256), and the wasm32 sizes are within 0.1 % (76,211 / 76,618 B measured vs
 76,279 / 76,686 B, most likely embedded source paths).
