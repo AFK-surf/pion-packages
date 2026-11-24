@@ -156,10 +156,10 @@ All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `w
 
 | Mode | Binary Size (`Linux x86_64` / `wasm32`) | Stdout SHA-256 (`271 B`) |
 | --- | ---: | --- |
-| Native Debug | `140,656 B` | `f8311f93f4000564...` |
-| Native Release | `238,960 B` | `f8311f93f4000564...` |
-| Wasm32 Debug | `74,994 B` | `f8311f93f4000564...` |
-| Wasm32 Release | `72,929 B` | `f8311f93f4000564...` |
+| Native Debug | `154,744 B` | `f8311f93f4000564...` |
+| Native Release | `261,496 B` | `f8311f93f4000564...` |
+| Wasm32 Debug | `92,288 B` | `f8311f93f4000564...` |
+| Wasm32 Release | `92,015 B` | `f8311f93f4000564...` |
 
 ## Head-to-Head Benchmarks
 
@@ -171,8 +171,8 @@ Includes `Sec-CH-UA`, `Permissions-Policy`, `Priority`, `Cache-Status`, `Accept-
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_sfv`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 261.333 | 253.480 | 290.452 | 27.19 | 2,177.78 | **1.91 MiB** | 0.39x |
-| `rust_sfv` (`0.16.1 --release`) | **100.936** | 97.697 | 131.769 | **70.39** | **841.13** | 2.20 MiB | 1.00x (baseline) |
+| `pion` (`--release`) | **73.620** | 69.908 | 89.881 | **96.51** | **613.50** | **2.09 MiB** | 1.03x |
+| `rust_sfv` (`0.16.1 --release`) | 76.044 | **68.881** | **81.949** | 93.43 | 633.70 | **2.09 MiB** | 1.00x (baseline) |
 
 _Stdout SHA-256 verified identical across all rounds: `02d5fdad1e5bb9ddbb8dd72577d8ae8f8ce158884a7db93a1805b2c83207c5a6`._
 
@@ -182,15 +182,15 @@ Heavy mix of nested dictionaries, inner lists, Base64 byte sequences, multi-byte
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_sfv`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`) | 225.533 | 187.066 | 309.942 | 31.73 | 3,523.95 | **1.90 MiB** | 0.44x |
-| `rust_sfv` (`0.16.1 --release`) | **98.583** | 95.282 | 121.112 | **72.59** | **1,540.35** | 2.20 MiB | 1.00x (baseline) |
+| `pion` (`--release`) | 99.589 | 87.863 | **111.735** | 71.86 | 1,556.08 | **2.07 MiB** | 0.91x |
+| `rust_sfv` (`0.16.1 --release`) | **90.799** | **82.730** | 119.072 | **78.81** | **1,418.73** | 2.15 MiB | 1.00x (baseline) |
 
 _Stdout SHA-256 verified identical across all rounds: `3debee67da84f79a28a8d51b9cbe60f1244b60f54b8d4c76aebb64d085bd2972`._
 
 ### Honest Performance Notes
 
-- **Throughput**: `pion` runs at `0.39x` (Corpus 1) and `0.44x` (Corpus 2) of Rust `sfv 0.16.1` (`27.19–31.73 MB/s` vs `70.39–72.59 MB/s`), largely because Pion's `StringBuilder` / UTF-8 slicing allocates owned `String` buffers per token/key whereas Rust `sfv` benefits from LLVM-optimized `Vec`/`IndexMap` and zero-copy byte slices during parsing.
-- **Peak RSS**: `pion` uses slightly less peak resident memory on both corpora (`1.90–1.91 MiB` vs `2.20 MiB`).
+- **Throughput**: On Corpus 1 (real-world browser headers), `pion` matches/edges past Rust `sfv 0.16.1` at **`1.03x`** (`96.51 MB/s` vs `93.43 MB/s`, `613.50 ns/op` vs `633.70 ns/op`), driven by zero-copy `code_unit_at`/`slice` parsing, 64-bit bitmask character classification, error-path-only ASCII scanning, and direct `StringBuilder` integer/decimal/string formatting. On Corpus 2 (deeply nested structures, Base64, and percent-encoded display strings), `pion` runs at **`0.91x`** (`71.86 MB/s` vs `78.81 MB/s`), with the remaining ~9% gap attributable to per-node heap allocation and RC overhead for AST structs/enums (`Item`, `BareItem`, `ListEntry`, `Param`, empty `Array[Param]`) compared to Rust's flat by-value `Vec`/`IndexMap` layout.
+- **Peak RSS**: `pion` matches or uses slightly less peak resident memory on both corpora (`2.07–2.09 MiB` vs `2.09–2.15 MiB`).
 
 ## Third-Party Test Vector Attribution
 
