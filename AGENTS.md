@@ -42,6 +42,7 @@
   pionc add <name> --registry https://github.com/AFK-surf/pion-packages.git
   ```
   正常解析、写入 `pion.lock` 并通过 `pionc check`。
+- 发版集成（新增 / 升级 `index/<name>.toml`）时同一提交内必须执行 `python3 scripts/gen_catalog.py` 重新生成根目录 `catalog.json`（新包请同时在脚本 `PACKAGE_META` 中补齐 `category` / `summary` / `keywords`），并以 `python3 scripts/gen_catalog.py --check` 确认一致。
 
 ### 1.5 零 worktree 污染
 - 遵循 Pion 全局内容寻址缓存（`$PION_CACHE_DIR`，默认 `~/.cache/pion/cas`），严禁在仓库树内生成或提交 `target/`、`_build/`、临时二进制或基准缓存文件。
@@ -55,10 +56,12 @@ AGENTS.md               # 本文件（生态移植与验收铁律）
 CLAUDE.md               # @AGENTS.md
 README.md               # 项目说明、使用方式与包清单
 BENCHMARKS.md           # 跨语言头对头基准总榜
+catalog.json            # 机器可读包目录（由 scripts/gen_catalog.py 生成，勿手改）
 index/<name>.toml       # Git-Index Registry 条目（遵循 pion SPEC.md §6）
 packages/<name>/        # 独立 Pion 包（含 pion.toml, src/, *_test.pion, bench/）
 scripts/verify.sh       # 统一快检脚本（fmt / check / test / git status）
 scripts/bench_compare.py# 零依赖 Python 3 头对头基准与 SHA-256 校验框架
+scripts/gen_catalog.py  # 零依赖 Python 3 catalog.json 生成 / 校验与 skill 速查表输出
 ```
 
 ## 3. 常用验证命令
@@ -67,4 +70,5 @@ scripts/bench_compare.py# 零依赖 Python 3 头对头基准与 SHA-256 校验�
 sh scripts/verify.sh                     # 全仓快检（fmt / check / test / clean worktree）
 sh scripts/verify.sh packages/<name>     # 单包快检
 python3 scripts/bench_compare.py --help  # 查看头对头基准框架参数
+python3 scripts/gen_catalog.py           # 重新生成 catalog.json（--check 校验一致，--skill-md 输出分组速查表）
 ```
