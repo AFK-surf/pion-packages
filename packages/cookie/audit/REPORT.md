@@ -50,6 +50,28 @@ without a direct security consequence, robustness, performance or documentation.
 Trigger tiers (security-audit convention): ① default configuration, no special input; ② specific but legitimate
 configuration / timing; ③ attacker-controlled input across a trust boundary.
 
+## Re-audit 2: `origin/feat/pkg-cookie-fix` @ `e4dbe752`
+
+`e4dbe752` adds, on top of `eaeb5880`: `import_text` rejects a non-host-only cookie on a public suffix and
+`matching_cookies` no longer sends one (P2-5 closed); `packages/cookie/scripts/gen_psl_index.py` regenerates
+`src/psl_index.pion` byte for byte (`--check` passes; P2-11 closed); UTS #46 folding extended to basic Greek / Cyrillic
+upper case and fullwidth ASCII, other U+FF00..U+FFEF forms refused; README notes `with_domain` without a leading dot.
+`audit/` is byte-identical to `422a9e70`; with it, `STRICT=1` reports `RESULT: clean`.
+
+Residual found by this review, gate extended (P2-8 stays OPEN): the fold is still a hand-written subset, so 10 of the
+412 non-ASCII characters used by PSL rules have upper-case forms it leaves alone (Ā Č Ŋ Š Қ Ա Հ Յ Გ Ე) and decomposed
+(NFD) input is not composed (114 rules contain a precomposed character). Neither is mapped nor refused, which makes a
+non-canonical spelling of a public suffix pass the jar's PSL check: `Domain=ČÁHCESUOLO.NO` from
+`https://x.ČÁHCESUOLO.NO/` is **stored** (the canonical `čáhcesuolo.no` is rejected), and
+`registrable_domain("x.ČÁHCESUOLO.NO")` = `Čáhcesuolo.no`, `registrable_domain("x.c\u030Ca\u0301hcesuolo.no")` =
+`čáhcesuolo.no` (both are public suffixes), `x.𝐞xample.com` → `𝐞xample.com`. Trigger tier ③ and only for hosts that
+reach the jar un-canonicalised (a WHATWG URL parser would have produced Punycode), hence P2. Two ways that pass the
+extended case and the model (which accepts mapping or refusing per input):
+(a) generate the full mapping into a literal with `gen_psl_index.py`-style tooling from Python's `unicodedata`
+(NFKC + lower case for every BMP / SMP code point that changes, plus canonical composition pairs), or
+(b) fail closed: generate the set of code points that are not stable under NFKC + lower case, plus the combining marks
+that take part in canonical composition, and return None when the input contains one the fold does not handle.
+
 ## Re-audit of `origin/feat/pkg-cookie-fix` @ `eaeb5880` (E-cookie-Fix-1)
 
 Every changed file was reviewed (`parse.pion`, `date.pion`, `jar.pion`, `psl.pion`, new `psl_index.pion`, README) and

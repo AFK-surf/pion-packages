@@ -26,7 +26,7 @@ import spec_ref  # noqa: E402
 MODE_FLAGS = {
     "parse": ["samesite_keep", "path_keep", "format_nameless_raw", "format_nameless_always", "format_nameless_err"],
     "date": [],
-    "psl": ["ip_trailing", "no_uts46", "psl_reject_noncanonical", "psl_reject_long"],
+    "psl": ["ip_trailing", "no_uts46", "uts46_subset", "psl_reject_noncanonical", "psl_reject_long"],
     "match": ["url_backslash", "url_reject_backslash"],
     "jar": ["nameless_prefix", "secure_alone", "hostonly_identity", "xsite_set", "url_backslash", "samesite_keep",
             "lax_nonhttp", "path_keep", "domain_multidot", "url_reject_backslash"],

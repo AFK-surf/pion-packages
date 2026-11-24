@@ -35,6 +35,7 @@ FLAG_IDS = {
     "format_nameless_raw": "P2-4",
     "ip_trailing": "P2-8",
     "no_uts46": "P2-8",
+    "uts46_subset": "P2-8",
     # accepted alternatives (fail-closed choices a fix may make; not findings)
     "url_reject_backslash": "OK",
     "psl_reject_noncanonical": "OK",
@@ -383,15 +384,46 @@ def is_ip_literal(s):
     return True
 
 
+def _fold_subset(ch):
+    """The fold of feat/pkg-cookie-fix @ e4dbe752 (ASCII, Latin-1, basic Greek / Cyrillic upper case, fullwidth ASCII);
+    None = refused (other U+FF00..U+FFEF forms)."""
+    cp = ord(ch)
+    if 65 <= cp <= 90 or 192 <= cp <= 214 or 216 <= cp <= 222 or 913 <= cp <= 929 or 931 <= cp <= 939 or 1040 <= cp <= 1071:
+        return chr(cp + 32)
+    if 1024 <= cp <= 1039:
+        return chr(cp + 80)
+    if cp in (12290, 65294, 65377):
+        return "."
+    if 65313 <= cp <= 65338:
+        return chr(cp - 65313 + 97)
+    if 65345 <= cp <= 65370:
+        return chr(cp - 65345 + 97)
+    if 65296 <= cp <= 65305:
+        return chr(cp - 65296 + 48)
+    if cp == 65293:
+        return "-"
+    if 65280 <= cp <= 65519:
+        return None
+    return ch
+
+
 def _labels(b, flags):
     """-> (display labels, ascii labels) or None (the package's input contract)."""
     try:
         s = b.decode("utf-8")
     except UnicodeDecodeError:
         return None
+    if "uts46_subset" in flags:
+        out = []
+        for ch in s:
+            f = _fold_subset(ch)
+            if f is None:
+                return None
+            out.append(f)
+        s = "".join(out)
     if "psl_reject_noncanonical" in flags:
-        if any(ch in s for ch in "\u3002\uff0e\uff61") or \
-                any(not ch.isascii() and unicodedata.normalize("NFKC", ch).lower() != ch for ch in s):
+        s_al = "".join(ch.lower() if ch.isascii() else ch for ch in s)
+        if any(ch in s for ch in "\u3002\uff0e\uff61") or unicodedata.normalize("NFKC", s_al).lower() != s_al:
             return None
     if "no_uts46" not in flags:
         s = s.replace("。", ".").replace("．", ".").replace("｡", ".")
@@ -410,7 +442,7 @@ def _labels(b, flags):
     for lab in s.split("."):
         if not lab:
             return None
-        if "no_uts46" in flags:
+        if "no_uts46" in flags or "uts46_subset" in flags:
             lab = "".join(ch.lower() if ch.isascii() else ch for ch in lab)
         else:
             lab = unicodedata.normalize("NFKC", lab).lower()  # UTS #46 mapping for the corpus' inputs
