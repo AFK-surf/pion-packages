@@ -4,7 +4,7 @@ Pure Pion, zero-external-dependency implementation of the **Unicode 16.0.0 Line 
 
 - Zero external dependencies (`[dependencies]` empty), zero `extern "C"`, zero `World` dependency, zero `Double`/`Float`, zero `FixedArray`, zero module-level mutable globals/containers, and full Wasm32 compatibility.
 - Strict **O(n)** single-pass streaming scanner with bounded O(1) lookahead cache — resistant to 100,000+ adversarial `SP`/`CM`/`ZWJ`/`QU`/`NU`/`OP`/`CL`/`RI`/`AK+VI` runs without backtracking or stack overflow.
-- Compact 3-level pure-ASCII immutable `String` lookup table (`42,100 B` in `src/tables.pion`) with O(1) lookup across all 1,114,112 Unicode code points (`U+0000..U+10FFFF`), including an inline ASCII fast path.
+- Compact 3-level pure-ASCII immutable `String` lookup table + `47×64` DFA pair-action table packed into a single `table_blob` (`45,326 B` in `src/tables.pion`) with O(1) lookup across all 1,114,112 Unicode code points (`U+0000..U+10FFFF`), including inline ASCII word/digit and CJK fast paths.
 
 ## Features
 
@@ -96,7 +96,7 @@ sh packages/unicode_linebreak/bench/run_bench.sh
 
 - Stdout: `unicode_linebreak_wasm_smoke: OK samples=12 opps=52 mandatory=16 fnv64=13553705255585179840`
 - Stdout SHA-256: `5b5e94c5c1af8a9ab13fbab1c9c6c7997effa36c1ccd27381ff4963681518b70`
-- Wasm32 binary size: `81,346 B` (debug & `--release`)
+- Wasm32 binary size: `94,646 B` (debug & `--release`)
 
 ### Differential Oracle & Head-to-Head Benchmarks vs Rust `icu_segmenter 2.4.0`
 
@@ -108,8 +108,8 @@ Measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_icu_segmenter`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_linebreak` (`--release`) | 442.040 | 351.747 | 509.872 | 18.96 | 2,210,200.10 | 2.29 MiB | 0.16x |
-| `rust_icu_segmenter` (`2.4.0 --release`, LTO) | 70.997 | 47.411 | 104.817 | 118.08 | 354,985.04 | 2.16 MiB | 1.00x (baseline) |
+| `pion_linebreak` (`--release`) | 53.230 | 51.745 | 61.350 | 157.49 | 266,149.08 | 2.30 MiB | 0.87x |
+| `rust_icu_segmenter` (`2.4.0 --release`, LTO) | 46.286 | 44.003 | 61.164 | 181.12 | 231,431.80 | 2.12 MiB | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `4f3e0ed13a6f354869c8eef2e97ac96a6d28ae32f3edf72b4d8efbd8e3fec21d`
 
@@ -117,7 +117,7 @@ Measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_icu_segmenter`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_linebreak` (`--release`) | 424.892 | 401.579 | 444.064 | 20.52 | 2,124,461.67 | 2.30 MiB | 0.14x |
-| `rust_icu_segmenter` (`2.4.0 --release`, LTO) | 60.809 | 53.429 | 71.270 | 143.40 | 304,044.74 | 2.10 MiB | 1.00x (baseline) |
+| `pion_linebreak` (`--release`) | 65.854 | 60.288 | 81.442 | 132.41 | 329,267.85 | 2.30 MiB | 0.89x |
+| `rust_icu_segmenter` (`2.4.0 --release`, LTO) | 58.761 | 53.997 | 78.228 | 148.40 | 293,805.64 | 2.14 MiB | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `15c9425ff0699122e752b8361caabefe61c54c5231ee7211ec7ce2ef9eaf665e`
