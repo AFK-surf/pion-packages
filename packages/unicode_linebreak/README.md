@@ -22,7 +22,8 @@ Pure Pion, zero-external-dependency implementation of the **Unicode 16.0.0 Line 
 2. **Public API**:
    - `line_breaks(s : String) -> Array[BreakOpportunity]` (empty string returns `[]`; non-empty string always ends with `(s.length(), BreakKind::Mandatory)`)
    - `line_breaks_with_limits(s : String, limits : LineBreakLimits) -> Result[Array[BreakOpportunity], LineBreakError]` (negative limits immediately return `Err(LineBreakError::LimitExceeded)`; `0` is enforced strictly)
-   - `next_break_opportunity(s : String, byte_offset : Int) -> Option[BreakOpportunity]` (safe on negative, mid-UTF-8, and out-of-bounds offsets; never panics or loops)
+   - `line_break_iter(s : String) -> LineBreakIter` + `LineBreakIter::next(self) -> Option[BreakOpportunity]` (resumable streaming iterator yielding the exact same sequence as `line_breaks(s)` in strict worst-case **O(n)** time and **O(1)** auxiliary memory for any input, including pure non-anchor punctuation streams)
+   - `next_break_opportunity(s : String, byte_offset : Int) -> Option[BreakOpportunity]` (safe on negative, mid-UTF-8, and out-of-bounds offsets; never panics or loops. Single-call complexity is **O(distance to nearest backward state-reset anchor)** — covering all 31 context-independent resolved classes and ill-formed UTF-8 bytes, giving amortized O(1) per call / O(n) total over all natural-language text and ill-formed byte streams; for pure non-anchor punctuation streams such as repeated `"- "` or `"\" "`, or maximum streaming throughput, use `line_breaks(s)` or `LineBreakIter`)
    - `line_break_class(cp : Int) -> LineBreakClass` (raw UAX #14 `Line_Break` property lookup)
 3. **Safe UTF-8 Handling**:
    - Invalid UTF-8 byte sequences are decoded to `U+FFFD` per the Unicode maximal subpart rule and always advance at least 1 byte.
@@ -43,6 +44,9 @@ let limited = unicode_linebreak::line_breaks_with_limits(
 let first = unicode_linebreak::next_break_opportunity("中文 a", 0)
 // Some(BreakOpportunity::{ byte_offset: 3, kind: BreakKind::Allowed })
 
+let iter = unicode_linebreak::line_break_iter("a-b c")
+// iter.next() streams BreakOpportunity values in strict worst-case O(n)
+
 let cls = unicode_linebreak::line_break_class(0x4E00)
 // LineBreakClass::ID
 ```
@@ -52,7 +56,7 @@ let cls = unicode_linebreak::line_break_class(0x4E00)
 Verified directly with `pionc check --json` across `scope`/`spawn` boundaries:
 
 - **`Send` types** (safe to capture directly in `spawn`): `LineBreakClass`, `BreakKind`, `BreakOpportunity`, `LineBreakError`, `LineBreakLimits`, and `String`.
-- **Non-`Send` types**: `Array[BreakOpportunity]` (the return value of `line_breaks` / `line_breaks_with_limits`, rejected by `pionc` with `E_NOT_SEND`). Do **not** attempt to wrap `Array[BreakOpportunity]` in `Mutex::new(...)` (`Mutex[T]` requires `T: Send`). Instead, pass the immutable `String` input and `LineBreakLimits` across `spawn` and compute `line_breaks` inside the task, or pass individual `BreakOpportunity` values across threads.
+- **Non-`Send` types**: `Array[BreakOpportunity]` (returned by `line_breaks` / `line_breaks_with_limits`) and `LineBreakIter` (mutable streaming cursor), both rejected by `pionc` with `E_NOT_SEND`. Do **not** attempt to wrap either in `Mutex::new(...)` (`Mutex[T]` requires `T: Send`). Instead, pass the immutable `String` input and `LineBreakLimits` across `spawn` and construct `line_breaks(s)` or `line_break_iter(s)` inside the task, or pass individual `BreakOpportunity` values across threads.
 
 ## Unicode Data & License Attribution
 
@@ -79,8 +83,8 @@ sh packages/unicode_linebreak/bench/run_bench.sh
 
 ### Unit, Red → Green & Adversarial Suite
 
-- Red → Green verified: `1/15` passed on stub build (`14/15` failed as expected), **`19/19` passed** after full implementation and red-team hardening.
-- Covers mandatory vs allowed breaks (`CR+LF`/`CR`/`LF`/`NL`/`BK`), CJK kinsoku, `ZW`/`SP`/`GL`/`WJ`/`CM`, Emoji ZWJ & skin-tone modifiers (`EB × EM`, `ExtPict(Cn) × EM`), RI flag pairs, LB10 remaining `CM`/`ZWJ` East_Asian_Width clearing, LB15a/b/c/d, LB19/19a, LB20a/21a (including `[BA - $EastAsian]` exclusion), LB25, LB28a Brahmic syllables, unassigned Supplemental Arrows-C `U+1F80C..U+1F8FF` (`XX`), invalid UTF-8 safety, `next_break_opportunity` O(n) backward-anchor iteration and negative/mid-UTF-8/bounds handling, `LineBreakLimits` negative/zero/exact bounds, and 100,000-character O(n) DoS stress runs.
+- Red → Green verified: `1/15` passed on stub build (`14/15` failed as expected), **`21/21` passed** after full implementation and red-team hardening.
+- Covers mandatory vs allowed breaks (`CR+LF`/`CR`/`LF`/`NL`/`BK`), CJK kinsoku, `ZW`/`SP`/`GL`/`WJ`/`CM`, Emoji ZWJ & skin-tone modifiers (`EB × EM`, `ExtPict(Cn) × EM`), RI flag pairs, LB10 remaining `CM`/`ZWJ` East_Asian_Width clearing, LB15a/b/c/d, LB19/19a, LB20a/21a (including `[BA - $EastAsian]` exclusion), LB25, LB28a Brahmic syllables, unassigned Supplemental Arrows-C `U+1F80C..U+1F8FF` (`XX`), invalid UTF-8 safety, `next_break_opportunity` O(n) backward-anchor iteration across ASCII, Korean (`H2`/`H3`), Hebrew (`HL`), Kana (`CJ→NS`), ill-formed `0xFF`/`0x80` runs, and negative/mid-UTF-8/bounds handling, `LineBreakIter` strict worst-case O(n) streaming on pure non-anchor punctuation streams, `LineBreakLimits` negative/zero/exact bounds, and 100,000-character O(n) DoS stress runs.
 
 ### Official Unicode 16.0.0 `LineBreakTest.txt` Conformance
 
@@ -92,7 +96,7 @@ sh packages/unicode_linebreak/bench/run_bench.sh
 
 - Stdout: `unicode_linebreak_wasm_smoke: OK samples=12 opps=52 mandatory=16 fnv64=13553705255585179840`
 - Stdout SHA-256: `5b5e94c5c1af8a9ab13fbab1c9c6c7997effa36c1ccd27381ff4963681518b70`
-- Wasm32 binary size: `81,146 B` (debug & `--release`)
+- Wasm32 binary size: `81,346 B` (debug & `--release`)
 
 ### Differential Oracle & Head-to-Head Benchmarks vs Rust `icu_segmenter 2.4.0`
 
