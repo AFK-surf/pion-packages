@@ -61,6 +61,8 @@ PACKAGE_META = {
             ["cel", "expression", "policy", "type-check", "evaluator", "rules", "表达式"]),
     "cli": ("core-utils", "Declarative clap-style CLI args and subcommand parser with env fallback, help and completions",
             ["cli", "args", "argv", "flags", "subcommand", "clap", "completion", "命令行"]),
+    "cookie": ("web-net", "RFC 6265bis HTTP cookie parser/jar, CHIPS partitioned cookies & embedded Mozilla Public Suffix List",
+               ["cookie", "http", "rfc6265", "samesite", "chips", "psl", "public-suffix", "cookie-jar", "浏览器"]),
     "crdt": ("core-utils", "Yjs/YATA CRDT engine (YText, YArray, YMap) with Yjs Update v1 wire compatibility",
              ["crdt", "yjs", "yata", "collaboration", "sync", "ytext", "ymap", "协同编辑"]),
     "cron": ("core-utils", "Cron expression parser and calendar scheduler with Quartz L/W/# extensions and macros",
