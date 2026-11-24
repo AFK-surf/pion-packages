@@ -4,8 +4,8 @@ Audited commit: `origin/feat/pkg-opentype @ 8f9e048` (pure Pion OpenType / TrueT
 Auditor: RT-opentype (independent, adversarial; nothing outside `packages/opentype/audit/` was changed).
 
 **Result (8f9e048): 0 P0 · 2 P1 · 11 P2.** Re-review of the fix branch `feat/pkg-opentype-fix @ e88e6f09`:
-see the "Re-review" section at the end (**not signed off**: P2-9 only partly
-fixed, new P2-12). No crash, wasm trap, hang, out-of-bounds read or nondeterminism was found
+see the "Re-review" section at the end. **SIGNED OFF: `feat/pkg-opentype-fix @ 69560174`**
+(all 2 P1 + 12 P2 closed, `STRICT=1` EXIT=0). No crash, wasm trap, hang, out-of-bounds read or nondeterminism was found
 on any input: every synthesized edge case, 553 system font faces, 20,000 mutated font files plus in-memory
 mutation of real fonts, and 16 DoS bombs ran cleanly and byte-identically in all four build modes.
 The two P1s are silent wrong answers on real-world font structures (lost kerning pairs, wrong glyphs from a
@@ -260,3 +260,25 @@ as in HarfBuzz and skrifa.
 Gate update (this commit): `dos` now also runs the three size-amplification bombs above (< 1 MiB, budgets
 100 ms); on e88e6f09 `STRICT=1` exits 1 with `OPEN: P2-9` and `OPEN: P2-12`, on 8f9e048 the same bombs report
 P2-9 (P2-12 does not exist there). **Not signed off** until both are closed; everything else is verified.
+
+## Final review and sign-off: `feat/pkg-opentype-fix @ 69560174`
+
+* `git diff 6f96b41..69560174 -- packages/opentype/audit/` is empty; `e88e6f09..69560174` touches only
+  `src/cmap.pion` and the README wasm32 sizes.
+* `cmap_parse_subtables` is now one O(n) pass that keeps at most one subtable per class (Unicode full
+  repertoire, Unicode BMP format 4, other Unicode formats, Windows Symbol) and at most one format 14 subtable
+  (preferring 0/5): no de-duplication loop, at most 4 subtables (+ the Symbol U+F0xx retry) per lookup.
+  Priority order is unchanged; a second subtable of the same class is no longer a fallback (HarfBuzz and skrifa
+  use a single subtable too, and 553 system faces show 0 unexplained divergences).
+* Independent `STRICT=1 sh packages/opentype/audit/run_audit.sh` at 6f96b41's gate: **EXIT=0, AUDIT PASS (0 P0),
+  0 OPEN**: 16/16 cases in all 4 modes, 33/33 package tests, 152 synthesized fonts and 553 system faces with
+  0 unexplained divergences (1,986,378 code points, 667,765 outlines, 57,736 kern pairs, 5,759 UVS,
+  252 variation coordinates), 20,000 + 1,600 fuzz inputs clean and 4-mode identical, all 19 bombs within budget
+  (`cmap_distinct_records` 0 ms, `uvs_distinct_records` 0-1 ms, `cmap_records_parse` 0-3 ms; were
+  0.4-5.7 s / 0.75 s on e88e6f09), wasm_smoke hash = README, bench ratios reproduced, 5/5 injected bugs caught,
+  all README / process checks pass (root `BENCHMARKS.md` section: INFO, added at release merge).
+
+**SIGN-OFF (RT-opentype): `packages/opentype` at `feat/pkg-opentype-fix @ 69560174838e18adc10e4079bee8af49fc316ba5`
+is approved for release as `opentype-v0.1.0`.** Findings P1-1, P1-2 and P2-1 .. P2-12 are closed; no P0 was
+ever found. Release integration still has to add the root `BENCHMARKS.md` section, `index/opentype.toml` and
+`catalog.json` (AGENTS.md 1.3 / 1.4); those are outside this package audit.
