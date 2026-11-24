@@ -43,10 +43,21 @@ M = [
     ("linebreak.pion", "(prev == cls_EB || prev_ep_cn) && cur == cls_EM", "prev == cls_EB && cur == cls_EM",
      "LB30b: [ExtPict & Cn] x EM dropped"),
     ("linebreak.pion", "after_zw_sp = cur == cls_ZW", "after_zw_sp = false", "LB8: ZW SP* no longer forces a break"),
-    ("linebreak.pion", "after_hl_hy_ba = prev == cls_HL && (cur == cls_HY || cur == cls_BA)", "after_hl_hy_ba = false",
+    ("linebreak.pion", "after_hl_hy_ba = prev == cls_HL &&", "after_hl_hy_ba = false && prev == cls_HL &&",
      "LB21a: HL (HY | BA) x dropped"),
     ("tables.pion", "let flag_qu_pi : Int = 2", "let flag_qu_pi : Int = 64", "tables: QU_Pi flag never set"),
     ("utf8.pion", "b1 >= 0xA0 && b1 <= 0xBF", "(b1 & 0xC0) == 0x80", "UTF-8: E0 overlong forms accepted"),
+    # regressions of the 585254a fixes
+    ("linebreak.pion", "(cur == cls_HY || (cur == cls_BA && !cur_ea))", "(cur == cls_HY || cur == cls_BA)",
+     "P2-2 regression: LB21a [BA - $EastAsian] exclusion dropped"),
+    ("linebreak.pion", "let cur_ea = if is_lb10 { false } else { (cur_flags & flag_ea) != 0 }",
+     "let cur_ea = (cur_flags & flag_ea) != 0", "P2-3 regression: LB10 keeps the mark's East_Asian_Width"),
+    ("linebreak.pion", "  if res_cls == cls_NU {\n    return true\n  }", "  if res_cls == cls_NU || res_cls == cls_SP {\n    return true\n  }",
+     "P1-1 anchor: SP accepted as a state-reset anchor (loses OP SP* / ZW SP* / B2 SP* state)"),
+    ("linebreak.pion", "  if res_cls == cls_NU {\n    return true\n  }", "  if res_cls == cls_NU || res_cls == cls_RI {\n    return true\n  }",
+     "P1-1 anchor: RI accepted as an anchor (loses LB30a parity)"),
+    ("linebreak.pion", "let anchor = find_backward_anchor(s, target, n)", "let anchor = find_backward_anchor(s, target + 1, n)",
+     "P1-1 anchor: search starts one byte past the target"),
 ]
 
 

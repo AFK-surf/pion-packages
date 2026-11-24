@@ -1,7 +1,52 @@
 # Red-team audit: `packages/unicode_linebreak` v0.1.0 (RT-unicode-linebreak)
 
-> **NOT SIGNED OFF**: 1 P1 and 4 P2 findings are open (below). `STRICT=1 sh packages/unicode_linebreak/audit/run_audit.sh`
-> exits 1 until they are fixed; the default mode exits 0 (no P0).
+> **NOT SIGNED OFF** (re-audit 1 of `585254aa`, next section): P2-1..P2-4 are closed, P1-1 is only partly fixed.
+> `STRICT=1 sh packages/unicode_linebreak/audit/run_audit.sh` exits 1 until P1-1 is closed. The first audit of
+> `c79ed32` follows.
+
+## Re-audit 1 (`origin/feat/pkg-unicode-linebreak` @ `585254aa04e8bdabdba7918fb565f618edf30f58`) — **NOT SIGNED OFF**
+
+The audit branch is rebased onto `585254aa` (fast-forward, `audit/**` only). Re-run on Linux x86_64:
+
+- **Closed:** P2-1 (all 1,114,112 code points now match the independent loader, 0 mismatches; U+1F80C.. are XX),
+  P2-2 (`redteam_p2_2` passes; LB21a now `cur == cls_BA && !cur_ea`), P2-3 (`redteam_p2_3` passes; LB10 clears
+  every flag of a remaining CM / ZWJ, also at sot), P2-4 (`gen_tables.py --check` OK, output byte-identical to
+  the committed 42,100 B file). README now says 19/19 unit tests (measured 19/19), wasm32 81,146 B (measured)
+  and lists the ICU 2.4.0 deviations this audit measured (INFO-3 closed).
+- **Still conforming everywhere:** 16,672/16,672 official vectors with kinds; model and ICU: 0 unexplained over
+  72,217 inputs incl. the new 1,000-input `long` corpus (40-200 code points, ill-formed bytes) and 32 new
+  backward-anchor seams (ZWJ before the anchor, truncated / ill-formed / `EF`-prefixed bytes, 4+ continuation
+  bytes, CR LF across the anchor, AL / ID / NU anchors with CM, fullwidth EA=W digits, U+25CC, ExtPict&Cn, U+FFFD,
+  OP SP*, Pi SP*, RI parity, NU chains, PR OP, HL HY, HY AL, B2, CL NS, EB EM, AK VI, Korean, BK / NL / LF CM);
+  `next_break_opportunity` == `line_breaks` at every byte offset of every input (0 inconsistencies):
+  the anchor search is *correct*.
+- **P1-1 partly fixed:** `find_backward_anchor` only accepts AL / ID / NU / BK / CR / LF / NL, walks back to byte 0
+  when there is none, and gives up (byte 0) at any ill-formed byte or > 3 continuation bytes. Iterating
+  `next_break_opportunity` is now linear for Latin and CJK text but still quadratic for whole scripts
+  (median of 3 self-timed runs, native `--release`, 4n bytes):
+
+  | bomb | n -> 4n | 4n time |
+  | --- | --- | ---: |
+  | d25 `"a "` | 3.9x (fixed) | 2.6 ms |
+  | d30 `"一"` | 2.9x (fixed) | 5.6 ms |
+  | d26 Korean `"가각 "` (H2 / H3) | 22.1x | **33.5 s** (56 KB) |
+  | d27 Hebrew `"אב "` (HL) | 15.2x | **14.3 s** (40 KB) |
+  | d29 small kana `"ぁ "` (CJ -> NS) | 16.3x | **6.7 s** (32 KB) |
+  | d28 ill-formed `"\xff "` | 14.5x | **6.4 s** (16 KB) |
+  | d32 `"- "` (HY SP) | 13.6x | **5.6 s** (16 KB) |
+  | d31 mixed news text x 160 | 17.0x | 0.30 s (13 KB) |
+
+  `line_breaks` on the same inputs takes 0.3-9 ms.
+- **Fix direction (handed to the package author):** after processing c, the state machine's state depends on the
+  context before c only for CM / ZWJ (LB9), SP (keeps the `after_*` flags), QU (`qu_after_non_ea`, LB15a), HY / BA
+  incl. U+2010 (LB20a / LB21a), VI (LB28a), SY / IS / CL / CP (`nu_state`) and RI (parity); every other class is an
+  exact reset anchor. Non-continuation bytes are always decoder boundaries, so ill-formed input needs no fallback
+  to byte 0. Text made only of the 12 non-anchor classes (`"- "`, RI SP, VI SP, U+2010 SP: bombs d32-d35) needs a
+  resumable iterator, or the per-call cost has to be documented.
+- **Gate changes in this re-audit:** inject mutant 18 retargeted to the new LB21a line, 5 new regression mutants
+  (LB21a EA exclusion, LB10 EA, SP / RI accepted as anchors, anchor search past the target) and red-team cases
+  that pass on the audited build are part of the gate: 25/25 caught. 11 new iteration bombs (d26-d35, 3 rounds
+  each, no re-measure when 5x over the absolute budget). DoS gate: 4n/n < 8.
 
 - **Audited commit:** `origin/feat/pkg-unicode-linebreak` @ `c79ed32e76553ba53b6e58b08904c01ff4207613`
 - **Scope:** Unicode 16.0.0 UAX #14 (revision 53) rules LB1-LB31 incl. Mandatory / Allowed kinds, the

@@ -35,7 +35,7 @@ PY="python3 -I -B"
 CMP="$PY $AUDIT_DIR/diff/compare.py"
 RD="$PY $AUDIT_DIR/diff/readme.py $README"
 MODES="native_dbg native_rel wasm_dbg wasm_rel"
-CORPORA="lbtest named pairs fastpath fuzz"
+CORPORA="lbtest named pairs fastpath fuzz long"
 mkdir -p "$BIN"
 export PYTHONDONTWRITEBYTECODE=1
 RC=0
@@ -100,7 +100,7 @@ build() {
   cp "$AUDIT_OUT/rust-target/release/unicode_linebreak_audit_oracle" "$BIN/oracle"
   ver=$(sed -n '/^name = "icu_segmenter"$/{n;p;}' "$AUDIT_DIR/diff/rust/Cargo.lock")
   rm -rf "$C" && set -- $($PY "$AUDIT_DIR/diff/gen.py" "$U" "$C" "$FUZZ_N")
-  echo "  corpora: LineBreakTest $1, named $2, pairs $3, fuzz $4, fastpath $5 ($6 Unicode 16.0.0 property combinations), icuprobe $7 (ICU behaviour only)"
+  echo "  corpora: LineBreakTest $1, named $2, pairs $3, fuzz $4, fastpath $5 ($6 Unicode 16.0.0 property combinations), icuprobe $7 (ICU behaviour only), long $8"
   $PY "$AUDIT_DIR/diff/ucd.py" "$U" verify || fail "vendored Unicode 16.0.0 data (SHA-256 / derived-file cross-check)"
   $PY "$AUDIT_DIR/diff/model.py" "$U" selftest || fail "reference model self-test"
   echo "  $(pionc --version) | node $(node --version) | $(cargo --version) | icu_segmenter $ver | python $(python3 -c 'import sys;print(sys.version.split()[0])')"
@@ -271,14 +271,14 @@ conformance() {
   claim=$($RD lbtest)
   got=$($CMP lbtest "$U" "$C/lbtest.cases" "$AUDIT_OUT/pion_lbtest.txt" | sed -n 's/.*txt: \([0-9]*\/[0-9]*\) vectors.*/\1/p')
   echo "  README.md: $claim"; [ "$got" = "$claim" ] || open_finding "P2-5: $(title P2-5)"
-  for g in named pairs fastpath fuzz; do
+  for g in named pairs fastpath fuzz long; do
     $CMP invariants "$C/$g.cases" "$AUDIT_OUT/pion_$g.txt" | sed "s/^  /  [$g] /" || fail "$g: output invariants"
   done
 }
 
 api() {
   echo "==> api: next_break_opportunity at every byte offset (incl. mid-UTF-8, -1, len, len+1, INT_MIN/MAX) == line_breaks; LineBreakLimits sweep"
-  for g in lbtest named fastpath fuzz; do
+  for g in lbtest named fastpath fuzz long; do
     for m in native_rel wasm_rel; do
       # shellcheck disable=SC2046
       $(runner $m) api "$C/$g.cases" > "$AUDIT_OUT/api_${g}_$m.txt" 2>&1 || fail "api $g: $m exited non-zero"
@@ -317,7 +317,7 @@ oracles() {
 }
 
 dos() {
-  echo "==> dos: 25 bombs at n and 4n, self-timed median of 7 runs in process (native --release, wasm32 --release)"
+  echo "==> dos: 35 bombs at n and 4n, self-timed median of 7 runs in process (native --release, wasm32 --release)"
   out=$($PY "$AUDIT_DIR/diff/dos.py" "$BIN/ulb_audit_rel" "node $WASM_RT $BIN/ulb_audit_rel.wasm")
   r=$?
   printf '%s\n' "$out" | grep -v '^OPENIDS' | cut -c1-200
@@ -378,7 +378,7 @@ PY
 
 inject() {
   echo "==> inject: realistic bugs injected into a copy of packages/unicode_linebreak/src; the gate must catch each"
-  echo "     (gate = control cases + official LineBreakTest positions / kinds + next_break_opportunity / limits sweep)"
+  echo "     (gate = control cases + passing red-team cases + official LineBreakTest positions / kinds + next_break_opportunity / limits sweep)"
   I="$AUDIT_OUT/inject" && rm -rf "$I" && mkdir -p "$I"
   $PY "$AUDIT_DIR/diff/inject.py" "$PKG_DIR" "$I" > "$I/list.txt"
   caught=0
@@ -397,13 +397,16 @@ inject() {
     fi
     hit=""
     for c in $("$I/m$n.bin" list); do
-      case "$c" in control_*) ;; *) continue ;; esac
+      # control cases, and red-team cases that pass on the audited (unmutated) build
+      case "$c" in control_*) ;; redteam_*) grep -q "^PASS $c\$" "$AUDIT_OUT/cases_native_rel.txt" 2> /dev/null || continue ;; *) continue ;; esac
       "$I/m$n.bin" case "$c" 2>&1 | grep -q '^PASS ' || hit="$hit $c"
     done
     "$I/m$n.bin" dump "$C/lbtest.cases" > "$I/lb$n.txt" 2>&1
     $CMP lbtest "$U" "$C/lbtest.cases" "$I/lb$n.txt" > "$I/lb$n.log" 2>&1 || hit="$hit LineBreakTest"
-    "$I/m$n.bin" api "$C/named.cases" > "$I/api$n.txt" 2>&1
-    [ "$(grep -vc '^ok$' "$I/api$n.txt")" = 0 ] || hit="$hit api"
+    for g in named lbtest; do
+      "$I/m$n.bin" api "$C/$g.cases" > "$I/api$n.txt" 2>&1
+      [ "$(grep -vc '^ok$' "$I/api$n.txt")" = 0 ] || { hit="$hit api:$g"; break; }
+    done
     if [ -n "$hit" ]; then
       caught=$((caught + 1))
       echo "  [$n] caught by$hit: $desc" | cut -c1-220

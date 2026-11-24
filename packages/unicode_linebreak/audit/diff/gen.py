@@ -11,6 +11,8 @@
                 same pair with SP, CM, ZWJ, SP SP in between
   fastpath.cases  the inlined ASCII AL x AL path against everything: "ab" + c + "cd" and "ab" + c + d + "cd"
                 for every ASCII c, d, and "ab" + r + "cd", "ab" + r + "\u0301cd", r + "ab" for every representative r
+  long.cases    longer random strings (40-200 code points, a quarter with an ill-formed byte) so that
+                next_break_opportunity's backward anchor search walks over real distances
   icuprobe.cases  short probes that isolate the contexts in which Rust icu_segmenter 2.4.0 departs from
                 16.0.0 (dotted-circle / Brahmic prefixes, NU (SY | IS) PO / PR chains) followed by every
                 representative: they give compare.py ICU's own behaviour per context (never used for Pion verdicts)
@@ -102,6 +104,18 @@ NAMED = [
     ("bad_surrogate", b"a\xed\xa0\x80b"), ("bad_f5", b"a\xf5\x80\x80\x80b"), ("bad_ff", b"\xff\xfe a"),
     ("bad_above_max", b"\xf4\x90\x80\x80a"), ("bad_cont_run", b"\x80\x80\x80\x80"), ("bad_mixed", b"\xe4\xb8\xad\x80\xe6"),
     ("bad_cm_after", b"\x80\xcc\x81 a"), ("bad_crlf", b"\r\x80\n"), ("bad_nul", b"\x00\x00"),
+    # next_break_opportunity backward anchors (AL / ID / NU / BK / CR / LF / NL reset the state machine)
+    ("anc_zwj", "a\u200db c d"), ("anc_zwj2", "\u4e00\u200d\u4e00 \u4e00"), ("anc_trunc", b"\xe4\xb8a b c"),
+    ("anc_trunc4", b"\xf0\x9f\x98 1 2 3"), ("anc_crlf", "a\r\nb c\r\nd"), ("anc_cr_only", "a\rb\rc d"),
+    ("anc_cm", "a\u0301 b\u0301 c"), ("anc_nu_cm", "1\u0301 2\u0301,3 4"), ("anc_id_cm", "\u4e00\u0301 \u4e00\u0301 x"),
+    ("anc_fw_digit", "\uff11 \uff12\u0301 \uff13%"), ("anc_fw_digit_qu", "\uff11\u201c\uff12\u201d\uff13"),
+    ("anc_25cc", "\u25cc\u25cc \u1b05\u25cc\u1b44 a"), ("anc_ep_cn", "\U0001F777\U0001F3FB \U0001F777 a"),
+    ("anc_fffd", "\ufffd a \ufffd b"), ("anc_ef_bad", b"\xef\xbf a \xef b"), ("anc_cont_run", b"a\x80\x80\x80\x80 b c"),
+    ("anc_op_sp", "a( \u4e00  b"), ("anc_qu_pi_sp", "a \u00ab  b \u00bb c"), ("anc_ri", "a\U0001F1E6\U0001F1E6\U0001F1E6 b"),
+    ("anc_nu_chain", "a 1,234.56%) b 7/8$"), ("anc_pr_op", "x $(12) y %(.5) z"), ("anc_hl_hy", "\u05d0-a \u05d0\u3000b"),
+    ("anc_hy_al", " -a -b \u2010c"), ("anc_b2", "a\u2014 \u2014b"), ("anc_cl_ns", "a) \u3005b"), ("anc_eb_em", "a\U0001F466\U0001F3FB b"),
+    ("anc_ak_vi", "a\u1b05\u1bf2\u1b05 b"), ("anc_korean", "\uac00\uac01 \uac00 a \uac01"), ("anc_bk", "a\x0bb\x0c c\u2028d"),
+    ("anc_nl", "a\u0085b c"), ("anc_lf_cm", "a\n\u0301b"), ("anc_lb10_ea", "a \u3099\u201c\u4e00 b"),
     ("big_mixed", "Hello, world! 中文排版「引号」 $(1,234.56) 🇺🇸🇯🇵 👩‍💻 א-ב ᬅ᭄ á\r\n"),
     ("empty", ""),
 ]
@@ -198,7 +212,17 @@ def main(argv):
             rows.append(("p%s_%X" % (y.encode().hex(), x), "0" + y + chr(x)))
             rows.append(("q%s_%X" % (y.encode().hex(), x), y + chr(x) + "0"))
     n6 = write(os.path.join(outdir, "icuprobe.cases"), rows)
-    print(n1, n2, n3, n4, n5, len(R), n6)
+    rows = []
+    for i in range(max(200, fuzz_n // 20)):
+        ln = rnd.choice([40, 60, 90, 140, 200])
+        cps = [rnd.choice(hot) if rnd.random() < 0.85 else rnd.choice(flat) for _ in range(ln)]
+        data = "".join(chr(c) for c in cps).encode("utf-8")
+        if i % 4 == 3:
+            pos = rnd.randrange(len(data) + 1)
+            data = data[:pos] + bytes([rnd.choice([0x80, 0xBF, 0xE4, 0xEF, 0xF0, 0xFF])]) + data[pos:]
+        rows.append(("G%d" % i, data))
+    n7 = write(os.path.join(outdir, "long.cases"), rows)
+    print(n1, n2, n3, n4, n5, len(R), n6, n7)
     return 0
 
 

@@ -46,6 +46,18 @@ B = [
      2000000, None),
     ("d24", "next_break_opportunity(s, len-1), \"a \" x 125k", "a ", 125000, lambda r: 1, "nbo_last", 2000000, None),
     ("d25", "iterate next_break_opportunity, \"a \" x 2k", "a ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    # backward-anchor fix (585254a): texts whose code points are never anchors (AL / ID / NU / hard breaks)
+    ("d26", "iterate nbo, Korean \"\uac00\uac01 \" x 2k", "\uac00\uac01 ", 2000, lambda r: 2 * r, "nbo_iter", 200000, "P1-1"),
+    ("d27", "iterate nbo, Hebrew \"\u05d0\u05d1 \" x 2k", "\u05d0\u05d1 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d28", "iterate nbo, ill-formed \"\\xff \" x 2k", b"\xff ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d29", "iterate nbo, kana NS \"\u3041 \" x 2k", "\u3041 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d30", "iterate nbo, CJK \"\u4e00\" x 4k (ID anchors)", "\u4e00", 4000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d32", "iterate nbo, \"- \" x 2k (HY SP only)", "- ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d33", "iterate nbo, RI SP x 2k (RI SP only)", "\U0001F1E6 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d34", "iterate nbo, VI SP x 2k (VI SP only)", "\u1b44 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d35", "iterate nbo, U+2010 SP x 2k (BA SP only)", "\u2010 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d31", "iterate nbo, mixed news text x 40", "Hello, world! \u4e2d\u6587\u6392\u7248\u300c\u5f15\u53f7\u300d $(1,234.56) "
+     "\U0001F1FA\U0001F1F8 \U0001F469\u200d\U0001F4BB \u05d0-\u05d1 a\u0301\r\n", 40, None, "nbo_iter", 200000, "P1-1"),
 ]
 
 
@@ -54,7 +66,7 @@ def enc(u):
 
 
 def run(cmd, unit, reps, op):
-    args = cmd + ["bomb", enc(unit).hex(), str(reps), str(ROUNDS), op]
+    args = cmd + ["bomb", enc(unit).hex(), str(reps), str(3 if op == "nbo_iter" else ROUNDS), op]
     try:
         r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
     except subprocess.TimeoutExpired:
@@ -91,6 +103,8 @@ def main(argv):
                 if best is None or ratio_f < best[0]:
                     best = (ratio_f, a, b)
                 if ratio_f < RATIO_MAX and not (rname == "native" and b[0] > budget):
+                    break
+                if b[0] > 5 * budget:  # far over the absolute budget: re-measuring cannot change the verdict
                     break
             if not a or not b:
                 print("  %-4s %-48s %-7s CRASH %s" % (bid, desc[:48], rname, err or err2))
