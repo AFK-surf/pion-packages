@@ -18,12 +18,12 @@ Pure Pion **WHATWG Encoding Standard** character set decoding & encoding library
   - `EUC-JP` (JIS0208 2-byte, `0x8E` half-width Katakana, `0x8F` JIS0212 3-byte),
   - `Big5` (Big5/HKSCS BMP + Plane 2 astral + 4 double-codepoint pointers `1133`, `1135`, `1164`, `1166`),
   - `EUC-KR` (KS X 1001 + CP949/UHC extensions),
-  - `ISO-2022-JP` (complete 7-state escape machine).
+  - `ISO-2022-JP` (complete 7-state escape machine & WHATWG §12.2.2 encoder).
 - **Streaming `Decoder` & Encoders**:
-  - `Decoder::new(enc)` / `Decoder::with_options(enc, DecodeOptions::new(fatal, ignore_bom))` / `decode_chunk(bytes, last)` — 1-byte-at-a-time streaming is 100% identical to whole-buffer decoding.
-  - `encode_utf8`, `encode_utf16le`, `encode_utf16be`, strict `encode(enc, s) -> Result[Bytes, EncodeError]`, and WHATWG HTML `encode_html(enc, s) -> (Bytes, Bool)` (numeric character reference `&#...;` fallback).
-- **Compact Immutable Tables**:
-  - All 40 encodings' index tables are stored in ~187 KB of read-only printable ASCII (4+6+6 bit-packed `u16`s), requiring zero startup initialization and keeping the release Wasm32 smoke binary at **297 KB**.
+  - `Decoder::new(enc)` / `Decoder::with_options(enc, DecodeOptions::new(fatal, ignore_bom))` / `decode_chunk(bytes, last)` — 1-byte-at-a-time streaming is 100% identical to whole-buffer decoding, `had_errors()` persists across `last = true` until reset/next stream, and fatal `DecodeError` reports non-negative absolute stream byte offsets.
+  - `encode_utf8`, `encode_utf16le`, `encode_utf16be`, strict `encode(enc, s) -> Result[Bytes, EncodeError]`, and WHATWG HTML `encode_html(enc, s) -> (Bytes, Bool)` (numeric character reference `&#...;` fallback; ill-formed UTF-8 `String` inputs are decoded with WHATWG maximal-subpart `U+FFFD` replacement).
+- **Compact Immutable Tables & O(log N) CJK Encoders**:
+  - All 40 encodings' decode tables and code-point-sorted CJK reverse lookup tables (`gb2312_hanzi`, `jis0208_kanji`, `big5_bmp`, `big5_astral`, `ksx1001_hanja`) are stored in immutable read-only printable ASCII (`String`, 4+6+6 bit-packed `u16`s) with zero startup allocation, zero mutable module globals, O(log N) binary-search encoding, and a **496 KiB** release Wasm32 smoke binary.
 
 ## Usage
 
@@ -53,29 +53,39 @@ match dec.decode_chunk(chunk2, true) {
 ```sh
 sh scripts/verify.sh packages/encoding
 sh packages/encoding/bench/run_bench.sh
+sh packages/encoding/tests/diff_oracle.sh
+STRICT=1 sh packages/encoding/audit/run_audit.sh
 ```
 
-- **Differential Testing vs Rust `encoding_rs v0.8.44`**: **0 divergences** across:
-  - All 29 single-byte encodings × `0x00..0xFF` (7,424 cases),
-  - All `0x81..0xFE × 0x00..0xFF` 2-byte combinations for `GBK`, `gb18030`, `Big5`, `EUC-KR` (32,256 each),
-  - `gb18030` 4-byte BMP/astral ranges and malformed/EOF recovery,
-  - All `Shift_JIS` 1-byte & 2-byte sequences (15,616 cases),
-  - All `EUC-JP` JIS0208, `0x8E`, and JIS0212 3-byte sequences (33,417 cases),
-  - `ISO-2022-JP`, `UTF-8`, `UTF-16LE`, `UTF-16BE` malformed/BOM/surrogate cases (whole-buffer & 1-byte streaming),
-  - All 10 encoders (`UTF-8`, `windows-1252`, `KOI8-R`, `GBK`, `gb18030`, `Shift_JIS`, `EUC-JP`, `Big5`, `EUC-KR`, `ISO-2022-JP`) with HTML NCR fallback.
+- **Differential Testing vs Rust `encoding_rs v0.8.44` (`packages/encoding/audit/run_audit.sh`)**: **0 divergences** across all **1,921,335** corpus cases in all 4 modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`):
+  - **7,766** label resolution cases (all 228 WHATWG labels, whitespace & case-folding edge cases),
+  - **1,348,129** decode cases (all 29 single-byte encodings, exhaustive 2-byte DBCS, 3-byte EUC-JP/gb18030, 4-byte gb18030 + GB18030-2022, ISO-2022-JP state machine, UTF-8/UTF-16LE/BE, BOM sniffing & streaming across 7 chunkings),
+  - **565,440** encode cases across all 40 encodings (strict + WHATWG HTML NCR fallback, including ISO-2022-JP Roman/JIS0208 transitions).
+- **Unit Test Suite**: **36** package unit tests (`packages/encoding/src/encoding_test.pion`) covering WHATWG, `encoding_rs`, WPT encoding vectors, and all red-team regressions.
 - **4-Mode Verification (`wasm_smoke`)**:
-  - `native debug` (358 KB), `native --release` (423 KB), `wasm32 debug` (296 KB), `wasm32 --release` (297 KB) all compile cleanly and produce identical output:
-  - `encoding_wasm_smoke: OK checks=5 fnv64=10389566807909293613`
-  - SHA-256: `1bc026dd014a95b5b6eece2c90c52117bd4531cf741802b343c78d7da60fd225`
+  - `native debug` (**553 KiB**), `native --release` (**633 KiB**), `wasm32 debug` (**495 KiB**), `wasm32 --release` (**496 KiB**) all compile cleanly and produce identical output (including genuine 1-byte streaming decode):
+  - `encoding_wasm_smoke: OK checks=13 fnv64=5273225285721917244`
+  - SHA-256: `0d48911ddc9b1d317b8d4ff6d2d2a2ab0868f1a67d231dec65589e56001ce4df`
 
 ### Head-to-Head Benchmark vs Mozilla Rust `encoding_rs` (v0.8.44, `--release`)
 
-Measured on `Darwin arm64` (`sh packages/encoding/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, 100 iterations of ~1 MiB realistic HTML per scenario, stdout SHA-256 verified identical across all rounds):
+Measured on `Darwin arm64` (`sh packages/encoding/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, stdout SHA-256 verified identical across all implementations and rounds):
 
-| Workload (~104.8 MB total) | `pion_encoding` Median (ms) | `pion_encoding` Throughput | `rust_encoding_rs` Median (ms) | `rust_encoding_rs` Throughput | Speedup | Peak RSS (Pion / Rust) |
+#### Decoding (100 iterations of ~1 MiB realistic HTML, ~104.8 MB total)
+
+| Workload | `pion_encoding` Median (ms) | `pion_encoding` Throughput | `rust_encoding_rs` Median (ms) | `rust_encoding_rs` Throughput | Speedup | Peak RSS (Pion / Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Mixed ASCII + UTF-8 HTML | 55.994 | 1,871.79 MB/s | 18.513 | 5,661.38 MB/s | 0.33x | **7.05 MiB** / 9.08 MiB |
-| Mixed Chinese GB18030 HTML | 291.471 | 359.61 MB/s | 73.164 | 1,432.61 MB/s | 0.25x | 14.08 MiB / 9.14 MiB |
-| Mixed Japanese Shift_JIS HTML | 268.739 | 390.08 MB/s | 99.784 | 1,050.57 MB/s | 0.37x | 15.48 MiB / 9.11 MiB |
+| Decode UTF-8 HTML | 51.129 | 2,049.92 MB/s | 15.382 | 6,813.94 MB/s | 0.30x | **5.19 MiB** / 9.16 MiB |
+| Decode GB18030 HTML | 253.776 | 413.02 MB/s | 64.002 | 1,637.69 MB/s | 0.25x | 19.89 MiB / 9.20 MiB |
+| Decode Shift_JIS HTML | 230.574 | 454.65 MB/s | 89.807 | 1,167.29 MB/s | 0.39x | 11.44 MiB / 9.17 MiB |
 
-Note: `rust_encoding_rs` uses hand-tuned ARM64 NEON SIMD (`simdutf8` & 16-byte SIMD ASCII lanes), whereas `pion_encoding` is 100% portable scalar Pion with zero `extern "C"` and zero SIMD intrinsics.
+#### Encoding (20 iterations of ~1 MiB realistic UTF-8 HTML, ~21.0 MB total, HTML NCR fallback)
+
+| Workload | `pion_encoding` Median (ms) | `pion_encoding` Throughput | `rust_encoding_rs` Median (ms) | `rust_encoding_rs` Throughput | Speedup | Peak RSS (Pion / Rust) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Encode Big5 HTML | 367.171 | 57.09 MB/s | 399.272 | 52.50 MB/s | **1.09x** | 6.84 MiB / 5.17 MiB |
+| Encode GB18030 HTML | 367.981 | 56.99 MB/s | 365.866 | 57.32 MB/s | 0.99x | **10.55 MiB** / 11.22 MiB |
+| Encode Shift_JIS HTML | 206.633 | 101.45 MB/s | 116.219 | 180.37 MB/s | 0.56x | 11.86 MiB / 6.19 MiB |
+| Encode EUC-KR HTML | 317.515 | 66.03 MB/s | 62.092 | 337.65 MB/s | 0.20x | 11.02 MiB / 5.16 MiB |
+
+Note: `rust_encoding_rs` uses hand-tuned ARM64 NEON SIMD (`simdutf8` & 16-byte SIMD ASCII lanes) for decoding and default-feature linear/direct tables for encoding, whereas `pion_encoding` is 100% portable scalar Pion with zero `extern "C"`, zero SIMD intrinsics, and O(log N) binary-search CJK encoder tables.
