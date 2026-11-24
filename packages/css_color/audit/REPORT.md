@@ -81,6 +81,7 @@
     - `ORACLE-chrome-powerless` (82): polar mixes or relative colors of near-achromatic inputs, where Chrome keeps float32 noise hues that the ED makes powerless;
     - `ORACLE-chrome-a98` (52): Chrome's a98-rgb path is off by up to 0.0064. `color(from red a98-rgb r g b)` gives `g = −0.0064` in Chrome, while the exact answer is 0 because red is an a98 primary; css_color matches `spec_ref` to 1e-15.
   - `ORACLE-ill-conditioned` (9): angles of 1e300rad/grad, where the double rounding of the unit conversion exceeds 360°.
+  - `ORACLE-chrome-color-mix-arity` (0 on the baseline): well-formed single-colour and N > 2 `color-mix()`, which the CSS Color 5 ED grammar (`[ <color> && <percentage>? ]#`) and the pinned WPT vectors accept. WPT also gives their computed values, e.g. `color-mix(in srgb, red, green, blue)` → `color(srgb 0.333333 0.16732 0.333333)`. Chrome 159 rejects them; it still implements exactly two colors.
   - `ORACLE-wpt-rec2020` (2 WPT vectors): the 2025 ED and WPT moved rec2020 to BT.1886 gamma 2.4. Chrome 159, `color 0.3.3`, `spec_ref.py` and css_color keep the BT.2020 piecewise OETF, so this is an oracle disagreement, not a finding. It is explained by the last fix-model stage. `ORACLE-chrome-rec2020-pre-ED` (0 on the baseline) covers the opposite choice against the Chrome golden.
 - **Rust `color =0.3.3`** (`diff/oracle`, locked): a parse + convert oracle in f32. It parses neither `color-mix()`, relative colors nor `calc()`, and lacks the 7 `grey` aliases.
 - **`diff/spec_ref.py`**: a float64 port of the ED sample code. Matrices are derived from the primaries and white points with rational arithmetic, and match the ED's printed values. It also contains the ED gamut-mapping algorithm and the WCAG formula.
@@ -246,3 +247,15 @@ The ED clamps only a negative saturation. css_color also clamps S to ≤ 100%. F
 | `diff/spec_ref.py` | float64 ED reference (conversions, gamut mapping, WCAG) |
 | `diff/compare.py`, `diff/gamut.py`, `diff/dos.py`, `diff/readme.py` | comparators and budgets, README claim parser |
 | `diff/fixmodel.py` | the 8 candidate fixes used for attribution; a starting point for the fix branch |
+
+## Re-audit of the fix branch `feat/pkg-css-color-fix` @ `576f406`
+
+- I read the whole `576f406` diff (`src/{format,math,mix,parser,space,types}.pion`, `wpt_test.pion`, README) and found no new P0, P1 or P2.
+- Run on the merged tree (fix sources + this `audit/`): `STRICT=1 sh packages/css_color/audit/run_audit.sh` → `AUDIT PASS (0 P0)`, 0 `OPEN`, exit 0.
+  - WPT: 11 405 pass, 247 out of scope, 2 `ORACLE-wpt-rec2020`, 0 unexplained.
+  - Chrome golden: 0 unexplained. The 5 accepted single-colour / N-ary `color-mix()` inputs are `ORACLE-chrome-color-mix-arity`, confirmed against the WPT expectations above.
+  - The 5 injected bugs are all caught.
+- Behaviour differences that remain, all non-blocking and spec-permitted:
+  1. Infinite results are kept as such. `rgb(from red calc(r / 0) g b)` stores +∞ (`to_css` → `color(srgb calc(infinity) 0 0)`), and a literal `1e400` becomes ∞. Chrome clamps these two to float max (`1.33444e+36` / `3.40282e+38`), but Chrome itself keeps `oklch(0.5 calc(infinity) 30)` and gives `oklab(calc(NaN) …)` for `color-mix(in oklab, lab(50 1e400 0), blue)`. No trap, `to_rgba8` stays within 0..255, and `to_css` re-parses.
+  2. Modern `hsl()` no longer clamps L, which follows the ED text. Chrome 159 clamps L, and no WPT vector covers it.
+  3. `src/wpt_test.pion` ports 8 selected WPT-derived tests rather than all 11 654 vectors. The full pinned suite runs in `audit/`.

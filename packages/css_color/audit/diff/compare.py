@@ -251,6 +251,10 @@ def classify_accept(s, pion_ok, pion_line=""):
     if not pion_ok and pion_line == "ERR NonFiniteValue":
         return "P2-5"
     if pion_ok:  # pion accepts, the reference rejects
+        if _ed_mix_arity(l):
+            # CSS Color 5 ED grammar `[ <color> && <percentage>? ]#` (1..N colors); WPT expects these valid and
+            # computes them; Chrome 159 still implements only exactly two colors
+            return "ORACLE-chrome-color-mix-arity"
         if re.search(r"#[0-9a-f]+[g-z_]", l):
             return "P2-3"
         if "calc(" in l:
@@ -272,6 +276,57 @@ def classify_accept(s, pion_ok, pion_line=""):
     if re.search(r"from#", l):
         return "P2-3"
     return None
+
+
+def _split_top(body):
+    """Split at top-level commas; None when parentheses do not balance."""
+    items, depth, cur = [], 0, ""
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        if ch == "," and depth == 0:
+            items.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if depth != 0:
+        return None
+    items.append(cur)
+    return items
+
+
+_ONE_COLOR = re.compile(r"^\s*(-?\d*\.?\d+%\s+)?(#[0-9a-f]+|[a-z][a-z-]*|[a-z-]+\(.*\))(\s+-?\d*\.?\d+%)?\s*$", re.S)
+
+
+def _ed_mix_arity(l):
+    """True only for a well-formed single-colour or N-ary (N > 2) color-mix(): method, then 1 or >= 3 items that
+    are each one color (a single ident / hash / function token) with at most one percentage."""
+    for m in re.finditer(r"color-mix\(", l):
+        depth, end = 0, None
+        for j in range(m.end(), len(l)):
+            if l[j] == "(":
+                depth += 1
+            elif l[j] == ")":
+                if depth == 0:
+                    end = j
+                    break
+                depth -= 1
+        if end is None:
+            continue
+        items = _split_top(l[m.end():end])
+        if not items:
+            continue
+        if re.match(r"^\s*in\s", items[0]):
+            items = items[1:]
+        if len(items) == 2 or not items:
+            continue
+        if all(_ONE_COLOR.match(x) and not re.search(r"\)\s+[a-z#]", x) for x in items):
+            return True
+    return False
 
 
 def _mix_arity(l):
