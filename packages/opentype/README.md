@@ -64,7 +64,7 @@ All 33 unit, ported `ttf-parser` regression, and adversarial security test cases
 
 - Stdout: `opentype_wasm_smoke: OK glyphs=3 cmds=4 fnv64=3240767612368691165`
 - Stdout SHA-256: `c6ff6601c00f35604a1d44c21c8301f64a0ac68b62ac33594ae0ec0b168e2cda`
-- Wasm32 binary size: `79,746 B` (debug) / `80,160 B` (`--release`)
+- Wasm32 binary size: `71,499 B` (debug) / `71,725 B` (`--release`)
 
 ### Differential Oracle vs Rust `ttf-parser 0.25.1` (`--release`)
 
@@ -94,11 +94,11 @@ Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 
 
 - Verified stdout SHA-256: `844d1e676bcb6b0bf0569fb430e6ab7f76fc845c5350445de896495bc37f5b7c`
 
-#### Synthesized Variable Font (`synthetic_512.ttf`, 22.8 KiB, 200 iterations)
+#### Synthesized Variable Font (`synthetic_512.ttf`, 22.8 KiB, 200 iterations, `Linux x86_64`)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Peak RSS | µs/op | Speedup (vs `rust_ttf_parser`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_opentype` (`--release`) | 9.818 | 9.585 | 10.280 | 2.00 MiB | 49.09 | 0.70x |
-| `rust_ttf_parser` (`0.25.1 --release`, LTO) | 6.867 | 6.262 | 8.692 | 1.98 MiB | 34.34 | 1.00x (baseline) |
+| `pion_opentype` (`--release`) | 4.466 | 4.098 | 4.741 | 10.90 MiB | 22.33 | 0.67x |
+| `rust_ttf_parser` (`0.25.1 --release`, LTO) | 2.988 | 2.772 | 3.342 | 11.29 MiB | 14.94 | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `743e55b9beb82d9cda6edd244071c1bfac6f1f34b38520bbd4ad4aae3928f3f7`
