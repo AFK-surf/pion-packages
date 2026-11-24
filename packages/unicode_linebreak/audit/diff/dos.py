@@ -1,0 +1,145 @@
+"""DoS / complexity probes for packages/unicode_linebreak (stdlib only).
+
+Each bomb is a repeated unit built *inside* the audit binary (`unicode_linebreak_audit bomb <hex> <reps> <rounds>
+<op>`), which times only the library call with clock_monotonic_us and reports the median of `rounds` runs, so
+process start-up, file I/O and single-run jitter of a shared, loaded machine do not enter the ratio. Every bomb
+runs at n and 4n bytes; the 4n/n median ratio must stay < 8 (linear: 4, quadratic: 16; 8 is their geometric midpoint); a pair over the
+limit is re-measured up to twice and the lowest ratio kept (load on a shared machine only inflates ratios). The big size also gets
+an absolute budget and must not crash (no recursion: 1,000,000-unit runs).
+
+  dos.py <bin> [<wasm runner prefix>]   -> table; `OPENIDS <ids>` for overruns explained by open findings;
+                                           exit 1 on a crash, a result that differs between n-scaled runs and
+                                           the expected opportunity count, or an unexplained overrun
+"""
+import subprocess
+import sys
+
+ROUNDS = 7
+RATIO_MAX = 8.0  # geometric midpoint of linear (4x) and quadratic (16x) growth for a 4x input
+
+# (id, description, unit, reps at n, expected opportunities at reps r (lambda), op, budget us at 4n, finding)
+B = [
+    ("d01", "SP x 250k", " ", 250000, lambda r: 1, "breaks", 2000000, None),
+    ("d02", "a + CM x 250k", "́", 250000, None, "breaks", 2000000, None),
+    ("d03", "ZWJ x 250k", "‍", 250000, lambda r: 1, "breaks", 2000000, None),
+    ("d04", "QU (\") x 250k", '"', 250000, lambda r: 1, "breaks", 2000000, None),
+    ("d05", "QU_Pf x 250k (LB15b lookahead)", "»", 125000, None, "breaks", 2000000, None),
+    ("d06", "OP SP* (\"( \" x 125k)", "( ", 125000, None, "breaks", 2000000, None),
+    ("d07", "CL CP SP* (\")) \" x 80k)", ")) ", 80000, None, "breaks", 2000000, None),
+    ("d08", "NU IS NU chain (\"1.\" x 125k)", "1.", 125000, lambda r: 1, "breaks", 2000000, None),
+    ("d09", "NU SY NU chain (\"1/\" x 125k)", "1/", 125000, lambda r: 1, "breaks", 2000000, None),
+    ("d10", "PR OP NU (\"$(1\" x 80k)", "$(1", 80000, None, "breaks", 2000000, None),
+    ("d11", "PR OP IS CM* NU (LB25 double lookahead)", "$(." + "́" * 30 + "1", 4000, None, "breaks", 2000000, None),
+    ("d12", "RI x 125k", "\U0001F1E6", 62500, None, "breaks", 2000000, None),
+    ("d13", "AK VI AK (Balinese)", "ᬅ᭄", 62500, None, "breaks", 2000000, None),
+    ("d14", "HY AL (\" -a\" x 80k)", " -a", 80000, None, "breaks", 2000000, None),
+    ("d15", "QU_Pi SP* (\"« \" x 80k)", "« ", 80000, None, "breaks", 2000000, None),
+    ("d16", "Pf + CM run per unit (LB15b lookahead over CM)", "»" + "́" * 50, 2500, None, "breaks", 2000000, None),
+    ("d17", "CJK QU CJK (LB19a lookahead)", "一“", 62500, None, "breaks", 2000000, None),
+    ("d18", "AK AK + CM run (LB28a VF lookahead)", "ᬅ" + "᬴" * 40, 3000, None, "breaks", 2000000, None),
+    ("d19", "SP IS + CM run (LB15c lookahead)", " ." + "́" * 40, 3000, None, "breaks", 2000000, None),
+    ("d20", "ill-formed bytes 0xFF x 250k", b"\xff", 250000, None, "breaks", 2000000, None),
+    ("d21", "truncated 4-byte lead x 250k", b"\xf0\x9f\x98", 80000, None, "breaks", 2000000, None),
+    ("d22", "mixed news text", "Hello, world! 中文排版「引号」 $(1,234.56) 🇺🇸 👩‍💻 א-ב á\r\n", 4000, None,
+     "breaks", 2000000, None),
+    ("d23", "line_breaks_with_limits default, \"a \" x 125k", "a ", 125000, lambda r: r, "limits",
+     2000000, None),
+    ("d24", "next_break_opportunity(s, len-1), \"a \" x 125k", "a ", 125000, lambda r: 1, "nbo_last", 2000000, None),
+    ("d25", "iterate next_break_opportunity, \"a \" x 8k", "a ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    # backward-anchor fix (585254a): texts whose code points are never anchors (AL / ID / NU / hard breaks)
+    ("d26", "iterate nbo, Korean \"\uac00\uac01 \" x 8k", "\uac00\uac01 ", 8000, lambda r: 2 * r, "nbo_iter", 200000, "P1-1"),
+    ("d27", "iterate nbo, Hebrew \"\u05d0\u05d1 \" x 8k", "\u05d0\u05d1 ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d28", "iterate nbo, ill-formed \"\\xff \" x 8k", b"\xff ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d29", "iterate nbo, kana NS \"\u3041 \" x 8k", "\u3041 ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d30", "iterate nbo, CJK \"\u4e00\" x 16k (ID anchors)", "\u4e00", 16000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d32", "iterate nbo, \"- \" x 2k (HY SP only)", "- ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    ("d33", "iterate nbo, RI SP x 2k (RI SP only)", "\U0001F1E6 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    ("d34", "iterate nbo, VI SP x 2k (VI SP only)", "\u1b44 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    ("d35", "iterate nbo, U+2010 SP x 2k (BA SP only)", "\u2010 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    # LineBreakIter (b84c35e): the documented O(n) way to iterate, including texts without any reset anchor
+    ("d36", "LineBreakIter, \"- \" x 125k (HY SP only)", "- ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d37", "LineBreakIter, RI SP x 125k", "\U0001F1E6 ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d38", "LineBreakIter, VI SP x 125k", "\u1b44 ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d39", "LineBreakIter, U+2010 SP x 125k", "\u2010 ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d40", "LineBreakIter, Korean x 80k", "\uac00\uac01 ", 80000, lambda r: 2 * r, "iter", 2000000, None),
+    ("d41", "LineBreakIter, a + CM x 250k", "\u0301", 250000, None, "iter", 2000000, None),
+    ("d31", "iterate nbo, mixed news text x 400", "Hello, world! \u4e2d\u6587\u6392\u7248\u300c\u5f15\u53f7\u300d $(1,234.56) "
+     "\U0001F1FA\U0001F1F8 \U0001F469\u200d\U0001F4BB \u05d0-\u05d1 a\u0301\r\n", 400, None, "nbo_iter", 200000, "P1-1"),
+]
+
+
+def enc(u):
+    return u if isinstance(u, bytes) else u.encode("utf-8")
+
+
+def run(cmd, unit, reps, op):
+    args = cmd + ["bomb", enc(unit).hex(), str(reps), str(3 if op == "nbo_iter" else ROUNDS), op]
+    try:
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+    except subprocess.TimeoutExpired:
+        return None, "TIMEOUT"
+    if r.returncode != 0:
+        return None, "exit %d %s" % (r.returncode, r.stderr.decode(errors="replace")[:160])
+    p = r.stdout.decode().split()
+    if len(p) != 5:
+        return None, "bad output %r" % r.stdout[:120]
+    return [int(x) for x in p[:4]] + [p[4]], None
+
+
+def main(argv):
+    runners = [("native", argv[0].split())]
+    if len(argv) > 1:
+        runners.append(("wasm32", argv[1].split()))
+    rc = 0
+    opened = set()
+    print("  %-4s %-48s %-7s %10s %10s %7s %12s" % ("id", "bomb", "runner", "n us", "4n us", "ratio", "4n bytes"))
+    for bid, desc, unit, reps, expect, op, budget, finding in B:
+        for rname, cmd in runners:
+            if rname == "wasm32" and op == "nbo_iter":
+                reps_n = reps // 2
+            else:
+                reps_n = reps
+            best = None
+            for attempt in range(3):  # noise on a shared machine only ever inflates a ratio: keep the best
+                a, err = run(cmd, unit, reps_n, op)
+                b, err2 = run(cmd, unit, reps_n * 4, op) if a else (None, None)
+                if not a or not b:
+                    break
+                # tiny timings are dominated by clock granularity: compare with a 200 us floor
+                ratio_f = max(b[0], 200) / max(a[0], 200)
+                if best is None or ratio_f < best[0]:
+                    best = (ratio_f, a, b)
+                if ratio_f < RATIO_MAX and not (rname == "native" and b[0] > budget):
+                    break
+                if b[0] > 5 * budget:  # far over the absolute budget: re-measuring cannot change the verdict
+                    break
+            if not a or not b:
+                print("  %-4s %-48s %-7s CRASH %s" % (bid, desc[:48], rname, err or err2))
+                rc = 1
+                continue
+            ratio_f, a, b = best
+            ratio = b[0] / max(a[0], 1)
+            over = ratio_f >= RATIO_MAX or (rname == "native" and b[0] > budget)
+            if expect is not None and (a[3] != expect(reps_n) or b[3] != expect(reps_n * 4)):
+                print("  %s: opportunity count %d / %d, want %d / %d" % (bid, a[3], b[3], expect(reps_n), expect(reps_n * 4)))
+                rc = 1
+            tag = ""
+            if over:
+                if finding == "DOC":
+                    tag = "  OVER (documented: O(distance to nearest anchor) per call, README points to LineBreakIter)"
+                elif finding:
+                    opened.add(finding)
+                    tag = "  OVER (%s)" % finding
+                else:
+                    tag = "  OVER (unexplained)"
+                    rc = 1
+            elif finding and finding != "DOC":
+                tag = "  (%s no longer reproduces)" % finding
+            print("  %-4s %-48s %-7s %10d %10d %7.2f %12d%s" % (bid, desc[:48], rname, a[0], b[0], ratio, b[2], tag))
+    if opened:
+        print("OPENIDS " + " ".join(sorted(opened)))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
