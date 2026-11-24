@@ -112,6 +112,8 @@ PACKAGE_META = {
             ["hcl", "hcl2", "terraform", "config", "hashicorp", "cty", "配置"]),
     "highlight": ("markup-docs", "Incremental line-state syntax highlighter for 24 languages with HTML output",
                   ["highlight", "syntax", "code", "tokenizer", "shiki", "html", "语法高亮"]),
+    "hls": ("media-graphics", "RFC 8216 / 8216bis LL-HLS (.m3u8) Master/Media playlist parser, validator, ABR selector and serializer",
+            ["hls", "m3u8", "ll-hls", "rfc8216", "streaming", "playlist", "abr", "video", "流媒体"]),
     "html": ("markup-docs", "WHATWG HTML5 parser, CSS selector queries, XSS sanitizer and srcset/picture selection",
              ["html", "html5", "dom", "selector", "sanitize", "xss", "parser", "网页解析"]),
     "http1": ("web-net", "Sans-IO HTTP/1.1 request/response parser and encoder with chunked coding and smuggling guards",
