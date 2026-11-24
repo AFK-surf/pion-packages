@@ -244,6 +244,8 @@ PACKAGE_META = {
              ["yaml", "yml", "config", "parser", "emitter", "anchors", "配置"]),
     "zip": ("compression-archive", "ZIP read/write (store/deflate) with ZIP64, data descriptors and SFX offsets",
             ["zip", "archive", "zip64", "deflate", "unzip", "compression", "压缩包"]),
+    "zstd": ("compression-archive", "RFC 8878 Zstandard decompressor, compressor and xxHash64 with strict Zip Bomb DoS limits",
+             ["zstd", "zstandard", "rfc8878", "compression", "decompress", "fse", "huffman", "xxhash64", "压缩"]),
 }
 
 STOPWORDS = {
