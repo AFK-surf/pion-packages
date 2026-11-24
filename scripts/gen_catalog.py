@@ -156,6 +156,8 @@ PACKAGE_META = {
                 ["msgpack", "messagepack", "binary", "serialization", "timestamp", "序列化"]),
     "openapi": ("core-utils", "OpenAPI 3.0/3.1 JSON+YAML loader, $ref resolution, validation and request routing",
                 ["openapi", "swagger", "api", "ref", "schema", "routing", "接口文档"]),
+    "opentype": ("media-graphics", "OpenType/TrueType (SFNT + TTC) binary font parser: cmap, hmtx/vmtx, kern, fvar/avar & glyf outlines",
+                 ["opentype", "truetype", "font", "sfnt", "ttc", "cmap", "glyf", "fvar", "variable-font", "字体"]),
     "pdf": ("markup-docs", "PDF 1.4 document builder and structural validator with fonts, vector drawing and images",
             ["pdf", "document", "export", "vector", "font", "flate", "文档生成"]),
     "promql": ("query-lang", "Prometheus PromQL parser, formatter and in-memory instant/range evaluator",
