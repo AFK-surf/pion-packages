@@ -231,3 +231,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 - **Copyright**: Copyright (C) 1996-2021 Julian R Seward; Copyright (C) 2019-2020 Federico Mena Quintero; Copyright (C) 2021 Micah Snyder; Copyright (C) 2024-2025 Trifecta Tech Foundation and contributors
 - **License**: `bzip2-1.0.6` (full license text and copyright notice in [`packages/bzip2/NOTICE`](packages/bzip2/NOTICE)); Pion port additions are licensed under MIT (full text in `LICENSE`), so `packages/bzip2` is licensed under `MIT AND bzip2-1.0.6`.
 - **Modification Notice**: Altered version — rewritten and ported to pure Pion as a standalone stream compressor and decompressor.
+
+### Unicode 16.0.0 data files (`packages/idna/src/tables_uts46.pion`, `packages/idna/src/tables_uts39.pion`, `packages/idna/audit/ucd/`)
+- **Upstream**: Unicode Consortium — Unicode Character Database, UTS #46 IDNA and UTS #39 Security data, version 16.0.0 (<https://www.unicode.org/Public/16.0.0/ucd/>, <https://www.unicode.org/Public/idna/16.0.0/>, <https://www.unicode.org/Public/security/16.0.0/>)
+- **Files**: `IdnaMappingTable.txt`, `UnicodeData.txt`, `CompositionExclusions.txt`, `DerivedNormalizationProps.txt`, `DerivedBidiClass.txt`, `DerivedJoiningType.txt`, `Scripts.txt`, `DerivedCoreProperties.txt`, `BidiBrackets.txt`, `BidiMirroring.txt`, `IdentifierStatus.txt`, `confusables.txt`; the embedded lookup tables are generated from them by `packages/idna/tools/gen_tables.py`, and the red-team audit keeps unmodified gzip copies (plus the `IdnaTestV2.txt` test vectors) with SHA-256 pins in `packages/idna/audit/ucd/LICENSE`
+- **Copyright**: Copyright © 1991-2026 Unicode, Inc.
+- **License**: Unicode License v3 (SPDX: `Unicode-3.0`), full text in [`packages/idna/audit/ucd/LICENSE`](packages/idna/audit/ucd/LICENSE)
