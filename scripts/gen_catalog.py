@@ -166,6 +166,8 @@ PACKAGE_META = {
                  ["opentype", "truetype", "font", "sfnt", "ttc", "cmap", "glyf", "fvar", "variable-font", "字体"]),
     "pdf": ("markup-docs", "PDF 1.4 document builder and structural validator with fonts, vector drawing and images",
             ["pdf", "document", "export", "vector", "font", "flate", "文档生成"]),
+    "preflate": ("compression-archive", "Bit-exact RFC 1951 DEFLATE stream analyzer and reconstructor with compact PF corrections and bomb limits",
+                 ["preflate", "deflate", "zlib", "rfc1951", "recompress", "bit-exact", "compression", "重压缩"]),
     "promql": ("query-lang", "Prometheus PromQL parser, formatter and in-memory instant/range evaluator",
                ["promql", "prometheus", "metrics", "query", "timeseries", "监控"]),
     "protobuf": ("data-formats", "Protocol Buffers wire codec, .proto schema parser and dynamic messages with JSON mapping",

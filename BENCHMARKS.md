@@ -373,6 +373,9 @@
 | `lepton` | Baseline 512×512 RGB JPEG (`SOF0`, 50,288 B) 解码 ×10（Linux x86_64） | 502,880 B | 216.703 ms (2.32 MB/s) | **155.921 ms** (`rust_lepton_jpeg`) | 0.72x | **4.30 MiB** | 8.13 MiB |
 | `bzip2` | L6 压缩：结构化 JSON 日志语料（768 KiB × 3，Linux x86_64） | 2,359,296 B | 656.495 ms (3.59 MB/s) | **269.012 ms** (`rust_bzip2` `0.6.1`) | 0.41x | 15.34 MiB | **7.77 MiB** |
 | `bzip2` | L6 解压：结构化 JSON 日志语料（768 KiB × 10，Linux x86_64） | 7,864,320 B | 267.268 ms (29.42 MB/s) | **182.432 ms** (`rust_bzip2` `0.6.1`) | 0.68x | 8.79 MiB | **6.46 MiB** |
+| `preflate` | RFC 1951 `analyze` + `reencode` 往返（zlib L1，Linux x86_64，× 3） | 2,892,498 B 明文（186,902 B DEFLATE） | 90.985 ms (31.79 MB/s) | **46.661 ms** (`rust_preflate_rs`) | 0.51x | **7.04 MiB** | 7.56 MiB |
+| `preflate` | RFC 1951 `analyze` + `reencode` 往返（zlib L6，Linux x86_64，× 3） | 2,892,498 B 明文（151,737 B DEFLATE） | 164.980 ms (17.53 MB/s) | **82.277 ms** (`rust_preflate_rs`) | 0.50x | **6.96 MiB** | 7.59 MiB |
+| `preflate` | RFC 1951 `analyze` + `reencode` 往返（zlib L9，Linux x86_64，× 3） | 2,892,498 B 明文（136,769 B DEFLATE） | 468.736 ms (6.17 MB/s) | **112.447 ms** (`rust_preflate_rs`) | 0.24x | **6.87 MiB** | 7.38 MiB |
 
 ## 各包明细
 
@@ -2964,3 +2967,36 @@ stdout 98 B，SHA-256 `07e5114911044ec15c475eca5f1bf25c341775bb97a9827a93c381a2c
 stdout 94 B，SHA-256 `ccde469114e3ca2cddabfae68d2ee9c68bdea42889495e9d4119e3960495cff2`（两端全部轮次一致）。
 
 如实说明：两项均落后 Rust——L6 压缩 **0.41x**（主要在 BWT 块排序内循环，Peak RSS 15.34 vs 7.77 MiB），L6 解压 **0.68x**（Peak RSS 8.79 vs 6.46 MiB）。12 / 12 单测通过；`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）stdout SHA-256 `3e8ba80c873e78ff09aa9f9cdc8c6dde0b9aeb3ecc48890e141b6594a6594de4` 逐字节一致。
+
+### preflate
+
+参考实现：Rust [`preflate-rs`](https://crates.io/crates/preflate-rs) `0.7.6`（`--release`，记作 `rust_preflate_rs`）。环境：Linux x86_64（AMD Ryzen 7 PRO 8845HS），`pionc 0.1.0 --release`。负载：由 `sh packages/preflate/bench/run_bench.sh` 确定性生成 `964,166 B`（~942 KiB）合成重复结构化 JSON/日志明文语料，经 Python `zlib`（`wbits=-15`）压缩为 L1 / L6 / L9 原始 DEFLATE 流；每轮执行 `3` 次完整 `analyze` + `reencode` 往返（共处理 `2,892,498 B` 明文），并将重建的原始 DEFLATE 流写至 stdout，由 `scripts/bench_compare.py`（`--warmup 1 --rounds 5`，严格交替）强制校验与原始 DEFLATE 流 SHA-256 逐字节一致。
+
+#### zlib L1（186,902 B DEFLATE，× 3 = 2,892,498 B 明文）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Corrections | Speedup (vs `rust_preflate_rs`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion`（`--release`） | 90.985 | 87.427 | 100.869 | 31.79 | **7.04 MiB** | 57 B (0.03%) | 0.51x |
+| `rust_preflate_rs`（`0.7.6 --release`） | **46.661** | 46.158 | 47.482 | 61.99 | 7.56 MiB | **28 B** (0.01%) | 1.00x (baseline) |
+
+stdout `186,902 B`，SHA-256 `751431aadfa8321968d213859d618ed38f5c3a45b1fc97b5ae668770d5254a18`（与原始 DEFLATE 及两端全部轮次逐字节一致）。
+
+#### zlib L6（151,737 B DEFLATE，× 3 = 2,892,498 B 明文）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Corrections | Speedup (vs `rust_preflate_rs`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion`（`--release`） | 164.980 | 159.876 | 176.674 | 17.53 | **6.96 MiB** | **46 B** (0.03%) | 0.50x |
+| `rust_preflate_rs`（`0.7.6 --release`） | **82.277** | 80.235 | 101.630 | 35.16 | 7.59 MiB | 7,166 B (4.72%) | 1.00x (baseline) |
+
+stdout `151,737 B`，SHA-256 `d2c58f601a6a2bdbd1f893c5de3a42f1f17f587069d11f0f5780b6d5321025eb`（与原始 DEFLATE 及两端全部轮次逐字节一致）。
+
+#### zlib L9（136,769 B DEFLATE，× 3 = 2,892,498 B 明文）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Corrections | Speedup (vs `rust_preflate_rs`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion`（`--release`） | 468.736 | 447.986 | 566.958 | 6.17 | **6.87 MiB** | **46 B** (0.03%) | 0.24x |
+| `rust_preflate_rs`（`0.7.6 --release`） | **112.447** | 108.326 | 157.295 | 25.72 | 7.38 MiB | 8,744 B (6.39%) | 1.00x (baseline) |
+
+stdout `136,769 B`，SHA-256 `8ca8b1c8a544151b6295829abddef3f9deef3af7a9d361096e9766ff46af4d20`（与原始 DEFLATE 及两端全部轮次逐字节一致）。
+
+如实说明：吞吐方面三档均落后 Rust `preflate-rs 0.7.6`（L1 **0.51x**、L6 **0.50x**、L9 **0.24x**），主要差距在于纯 Pion 标量哈希链查找在深链（L6 / L9）上的循环开销；峰值 RSS 三档均略低于 Rust（**6.87–7.04 MiB** vs 7.38–7.59 MiB）；修正流紧凑度方面，在该合成重复 JSON 日志语料上 L6 / L9 仅 **46 B**（0.03%），分别比 `preflate-rs` 的 7,166 B / 8,744 B 小 **155.8×** 与 **190.1×**（L1 为 57 B vs 28 B；真实异构语料下的压缩比会随上游压缩器家族与熵分布变化）。`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）stdout `318 B`，SHA-256 `d8af29f4fc481ddc1bc36529945e7df6d1c5ec86e80c724da7933ddc3244753f` 逐字节一致。
