@@ -11,7 +11,33 @@ STRICT=1 sh packages/hls/audit/run_audit.sh   # exit 1 while anything is OPEN
 sh packages/hls/audit/run_audit.sh <section>  # build static unit cases determinism oracles dos smoke bench inject
 ```
 
-## Re-audit of `feat/pkg-hls-fix @ 58a5430b` (2026-11-24): NOT SIGNED OFF
+## SIGN-OFF: `feat/pkg-hls-fix @ 5a090a583b098e6f826634232cbfaf20fcacdcbb` (2026-11-24)
+
+**Signed off: 0 P0, 0 P1, 0 P2 open.** `5a090a58` changes nothing under `audit/` (`git diff 3b5575e7..5a090a58 --
+packages/hls/audit/` empty) and nothing outside `packages/hls/`. Its diff (`src/parser.pion`, `src/types.pion`,
+`src/utils.pion`, README.md, `hls_security_test.pion`) was read line by line; the four items left open by the
+re-audit below are closed:
+
+| id | fix in 5a090a58 | verified with |
+| --- | --- | --- |
+| P2-6 | unknown tags before the first segment stay in `custom_tags` and are written before the first segment; tags after the last segment go to the new `trailing_custom_tags` (written last); `MediaSegment.keys_before_map : Int` records how many keys precede the MAP | `redteam_p2_6`; extra probes: `CUE-OUT a b CUE-IN c` keeps both positions, `KEY k1, MAP, KEY k2` → `k1, MAP, k2`, `MAP i1, KEY k1, seg, KEY k2, MAP i2, KEY NONE, seg` written in source order |
+| P2-11 | `prev_part_uri` / `prev_part_br_end` reset at every Parent Segment boundary | `redteam_p2_11`: the first part of a new segment with `BYTERANGE="100"` is rejected (`InvalidByteRange`) |
+| P2-12 | README.md line 3: `!Send` AST types "can be handed to a `spawn` closure only by ownership transfer (`move`), or serialized with `format_playlist` and sent as a `String`" | `static` probe: the 5 `Send` types are `Send`, the 5 listed `!Send` types are `!Send`, `move` into `spawn` compiles for each (and runs, native + wasm32); no `Mutex` claim left |
+| P2-14 | `validate_define_value`: IMPORT / QUERYPARAM values longer than `max_line_bytes` or containing `"`, CR/LF/NUL, ASCII or C1 controls are rejected | `redteam_p2_14`; probes with `x\n#EXT-X-ENDLIST` and `k",IV=0x1` → `InvalidVariable` |
+
+Independent run of `STRICT=1 sh packages/hls/audit/run_audit.sh` on `5a090a58` (separate worktree):
+**`no open findings`, `EXIT=0`** — static red lines clean; packages/hls tests 13/13; audit tests 28/28; red-team +
+control cases 28/28 in all 4 modes; 4,280 corpus inputs + API sweep + 14 bombs + wasm_smoke byte-identical in all
+4 modes (wasm_smoke SHA-256 `ccb40399…` = README.md); reference model 0 unexplained divergences (named 236/260
+identical, fuzz 3,678/4,020); 18/18 DoS bombs within budget on native and wasm32 `--release` (P0-1 / P1-3 bombs now
+`LimitExceeded` in ≤ 0.07 s, ≤ 79 MiB); bench 1.39x / 209 MB/s (README 1.35x), second corpus 0.89x (README 0.84x,
+documented); 5/5 injected bugs caught. `sh scripts/verify.sh packages/hls`: PASS, worktree clean.
+
+Notes (not findings): the wasm32 sizes in README.md (237,697 / 235,971 B) predate 5a090a58; measured here
+239,479 / 237,749 B (+0.75 %, inside the 1 % path-dependence tolerance) — refresh them at release. The m3u8-rs
+oracle remains informational.
+
+## Re-audit of `feat/pkg-hls-fix @ 58a5430b` (2026-11-24): not signed off (superseded by the sign-off above)
 
 `58a5430b` changes nothing under `audit/` and nothing outside `packages/hls/` (verified). The full diff
 (`d4f3d1e2..58a5430b`, +1,589 / −362 in `src/`, README, tests, bench, wasm_smoke) was read line by line and the
