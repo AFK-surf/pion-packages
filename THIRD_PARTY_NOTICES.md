@@ -237,3 +237,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 - **Files**: `IdnaMappingTable.txt`, `UnicodeData.txt`, `CompositionExclusions.txt`, `DerivedNormalizationProps.txt`, `DerivedBidiClass.txt`, `DerivedJoiningType.txt`, `Scripts.txt`, `DerivedCoreProperties.txt`, `BidiBrackets.txt`, `BidiMirroring.txt`, `IdentifierStatus.txt`, `confusables.txt`; the embedded lookup tables are generated from them by `packages/idna/tools/gen_tables.py`, and the red-team audit keeps unmodified gzip copies (plus the `IdnaTestV2.txt` test vectors) with SHA-256 pins in `packages/idna/audit/ucd/LICENSE`
 - **Copyright**: Copyright © 1991-2026 Unicode, Inc.
 - **License**: Unicode License v3 (SPDX: `Unicode-3.0`), full text in [`packages/idna/audit/ucd/LICENSE`](packages/idna/audit/ucd/LICENSE)
+
+### httpwg/structured-field-tests (`packages/structured_fields/bench/gen_data.py`, `packages/structured_fields/audit/sft/`)
+- **Upstream**: `httpwg/structured-field-tests` (<https://github.com/httpwg/structured-field-tests>) @ `4a4782f8234512af133f6f57c4ca998578b57110`
+- **Usage**: the 251 core conformance vectors embedded in `packages/structured_fields/bench/gen_data.py`, and unmodified gzip copies of all 20 parsing files plus the `serialisation-tests/` files kept by the red-team audit in `packages/structured_fields/audit/sft/` (test data only; nothing is compiled into the package)
+- **Copyright**: Copyright (c) 2018- IETF Trust and the persons identified as authors of the code. All rights reserved.
+- **License**: BSD 3-Clause License (SPDX: `BSD-3-Clause`), full text in [`packages/structured_fields/audit/sft/LICENSE.md`](packages/structured_fields/audit/sft/LICENSE.md)
