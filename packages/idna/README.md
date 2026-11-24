@@ -1,0 +1,107 @@
+# `idna` (v0.1.0)
+
+Pure Pion, zero-external-dependency **UTS #46 / IDNA2008 (RFC 5891 / 5892 / 5893) / RFC 3492 Punycode** domain engine with **UTS #39 Unicode Security Mechanisms** and browser Omnibox anti-spoofing (`display_domain`).
+
+- Zero external dependencies (`[dependencies]` empty), zero `extern "C"`, zero `World` dependency, zero mutable module-level globals, integer-only deterministic arithmetic, and full Wasm32 compatibility.
+
+## Features
+
+1. **RFC 3492 Punycode (`punycode_encode`, `punycode_decode` & `*_with_limits`)**
+   - Full standalone Punycode encoder/decoder with 64-bit overflow guards against `0x7FFFFFFF`, surrogate (`U+D800..U+DFFF`) and out-of-range (`> U+10FFFF`) rejection, truncated variable-length integer detection, and configurable `IdnaLimits` DoS bounds.
+2. **Configurable Unicode 16.0.0 UTS #46 + IDNA2008 (`to_ascii`, `to_unicode`, `label_to_ascii`, `label_to_unicode`)**
+   - Full `IdnaOptions` matrix with presets: `uts46_strict()`, `uts46_url()`, `uts46_non_transitional()`, `uts46_transitional()`:
+     - `use_std3_ascii_rules`: enforce LDH (`a-z`, `0-9`, `-`) ASCII restrictions.
+     - `check_hyphens`: reject leading/trailing `-` and `--` at positions 3–4 of non-`xn--` labels.
+     - `check_bidi`: full RFC 5893 Bidi Rules 1–6 across domain labels.
+     - `check_joiners`: full RFC 5892 ContextJ rules for `U+200C` (ZWNJ) and `U+200D` (ZWJ).
+     - `check_contexto`: full RFC 5892 ContextO rules (`U+00B7` Middle Dot, `U+0375` Greek Keraia, `U+05F3`/`U+05F4` Hebrew Geresh/Gershayim, `U+30FB` Katakana Middle Dot, Arabic-Indic vs Extended Arabic-Indic digit mixing).
+     - `verify_dns_length`: label length `1..=63`, total length `<= 253` (allowing a single trailing root dot).
+     - `transitional_processing`: distinguish `ß` / `ς` / ZWNJ / ZWJ transitional vs non-transitional handling.
+     - `ignore_invalid_punycode` and `deny_dot_in_label` (blocks Punycode-decoded `.`, `U+3002`, `U+FF0E`, `U+FF61` injection).
+   - `to_unicode` conforms to UTS #46 §4.2, always returning best-effort Unicode output alongside `is_valid`, `first_error`, and `error_count`.
+3. **UTS #39 Confusables & Browser Omnibox Anti-Spoofing**
+   - `skeleton(input)` (`bidiSkeleton(LTR, input)` = `NFD(prototype_map(remove_default_ignorable(NFD(uba_ltr_reorder_l1_l4(input)))))` per UTS #39 16.0 §4 with full UAX #9 P1, X1–X10 incl. isolates (`LRI`/`RLI`/`FSI`/`PDI`, BD9/BD13), W1–W7, N0 paired brackets, N1–N2, I1–I2, L1–L4 mirroring using Unicode 16.0.0 `confusables.txt` / `BidiBrackets.txt` / `BidiMirroring.txt` and O(n) canonical ordering) and `are_confusable(a, b)`.
+   - `detect_scripts(label)` and `is_mixed_script(label)` over all 170 Unicode 16.0.0 scripts.
+   - `display_domain(domain, policy)` / `display_domain_default(domain)`: returns `DisplayDecision` (`display`, `ascii`, `is_punycode_fallback`, `reasons`) blocking mixed-script spoofs (`pаypal.com`, `gοοgle.com`), whole-script confusables including Cyrillic diacritic variants outside native TLDs (`аррӏе.com`, `соӧр.com`, `ѕсһӧн.de`, with native IDN/ccTLD awareness so `тест.рф`/`тест.bg`/`работа.ua`/`αθήνα.gr`/`αγορά.gr` stay readable), single-script Restricted Latin homoglyphs (`gooɡle.com`, `ɑpple.com`, `faceboᴏk.com`, while preserving `Identifier_Status = Allowed` letters `æ`, `œ`, `ı`), Chrome `kDangerousPattern` CJK slash/dash spoofs (`google.comノevil.com`, `pay一pal.com`, `amaーzon.com`, while preserving `ポケモン123.jp`, `ラーメン-ya.com`, `コーヒー1.jp`), combining overlays (`U+0335..U+0338`), invisible/default-ignorable characters, and mixed decimal numbering systems while allowing legitimate multilingual domains (`中文.com`, `日本語.jp`, `한국어.kr`, `münchen.de`, `café.fr`, `www.ร้าน.ไทย`, `привет.рф`, and Latin + CJK/Kana/Hangul per UTS #39 Highly Restrictive). For invalid IDNs (`to_ascii` failure), `display` returns a bounded printable-ASCII percent-escaped fallback (never raw attacker-controlled non-ASCII or Bidi override text).
+4. **Strict DoS Guardrails (`IdnaLimits`)**
+   - Enforces `max_input_bytes`, `max_labels`, `max_label_codepoints`, and `max_punycode_input`. Any negative limit immediately returns `IdnaErrorKind::LimitExceeded`; `0` is enforced strictly.
+
+## Usage
+
+```pion
+import "idna"
+
+match idna::to_ascii_default("münchen.de") {
+  Ok(ascii) => () // "xn--mnchen-3ya.de"
+  Err(_) => ()
+}
+
+let uni = idna::to_unicode_default("xn--mnchen-3ya.de")
+// uni.is_valid == true, uni.output == "münchen.de"
+
+let spoof = idna::display_domain_default("p\u{0430}ypal.com")
+// spoof.is_punycode_fallback == true, spoof.display == "xn--pypal-4ve.com"
+```
+
+## Concurrency & `Send` Guarantees
+
+Verified directly with `pionc check` across `scope`/`spawn` boundaries:
+
+- **`Send` types** (safe to capture directly in `spawn`): `IdnaOptions`, `IdnaLimits`, `DisplayPolicy`, `IdnaErrorKind`, `IdnaError`, `UnicodeResult`, `Script`, `SpoofReason`, and all `String` outputs.
+- **Non-`Send` types**: `DisplayDecision` (contains `reasons : Array[SpoofReason]`). When crossing a `spawn` boundary, pass its `String` fields (`decision.display`, `decision.ascii`) or transfer ownership explicitly.
+
+## Unicode Data & License Attribution
+
+Embedded lookup tables (`src/tables_uts46.pion`, `src/tables_uts39.pion`) are deterministically generated by `tools/gen_tables.py` from official **Unicode 16.0.0** data files (`IdnaMappingTable.txt`, `UnicodeData.txt`, `CompositionExclusions.txt`, `DerivedNormalizationProps.txt`, `DerivedBidiClass.txt`, `DerivedJoiningType.txt`, `Scripts.txt`, `DerivedCoreProperties.txt`, `confusables.txt`, `BidiBrackets.txt`, `BidiMirroring.txt`, `IdentifierStatus.txt`), licensed under the **Unicode License v3 (`Unicode-3.0`)** by Unicode, Inc.
+
+```sh
+python3 packages/idna/tools/gen_tables.py /path/to/unicode-16.0.0 packages/idna/src
+```
+
+## Verification
+
+```sh
+sh scripts/verify.sh packages/idna
+sh packages/idna/bench/run_bench.sh
+```
+
+### Unit & Adversarial Security Suite
+
+All **31/31** tests in `src/idna_test.pion` pass (Red → Green verified: 0/29 pass on stub build, 31/31 pass after audit hardening), covering RFC 3492 Punycode vectors, overflow/surrogate guards, UTS #46 option combinations, IDNA2008 Bidi/ContextJ/ContextO, UTS #39 `skeleton`/`are_confusable`/`display_domain`, and `IdnaLimits` negative/zero/DoS bounds.
+
+### 4-Mode Verification (`wasm_smoke`)
+
+`packages/idna/wasm_smoke` builds and runs cleanly across `native debug`, `native --release`, `wasm32 debug`, and `wasm32 --release` with byte-identical stdout:
+
+- Stdout: `idna_wasm_smoke: OK domains=17 valid_strict=15 fnv64=1255427531955746724`
+- Stdout SHA-256: `abcaee375464c848e62ca12d5a25f0a20700ee933db9285c2d37339f145e2df4`
+- Wasm32 binary size: `232,814 B` (debug) / `234,953 B` (`--release`)
+
+### Differential Oracle vs Rust `idna 1.1.0` & Official `IdnaTestV2`
+
+- **258-case full-option differential corpus (`bench/run_bench.sh`)**: **258/258 PASS (0 deviations)** across `url` and `strict_hyphens` (`to_ascii` output + `to_unicode` validity & valid output) against locked Rust `idna 1.1.0`.
+- **Official Unicode 16.0.0 `IdnaTestV2.txt` (6,387 valid-UTF-8 vectors)**:
+  - Spec valid vectors: **546/546 (100.00%)** exact match.
+  - Exact agreement with Rust `idna 1.1.0`: **6,378/6,387 (99.86%)**. Of the 9 differences, 7 are Unicode 16.0.0 `[V7]` unassigned code points (e.g., `U+32931`, `U+3E8AC`) that `packages/idna` strictly rejects per Unicode 16.0.0 `IdnaTestV2.txt` whereas Rust `idna 1.1.0` (ICU4X 2.4 data) accepts them, and 2 (`IdnaTestV2` lines 312 & 415) are UTS #46 §4.1 `[V4]` decoded labels starting with `xn--` under `CheckHyphens = false` that `packages/idna` rejects per UTS #46 16.0.0 whereas Rust `idna 1.1.0` accepts them.
+
+### Head-to-Head Steady-State Benchmarks vs Rust `idna 1.1.0`
+
+Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, byte-identical stdout SHA-256 verified across all rounds; workload = 200 domains × 200 iterations × (`to_ascii` + `to_unicode`) = 80,000 operations):
+
+#### Corpus 1: Multilingual IDN (100% IDN / Punycode / NFD / Fullwidth)
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_idna`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_idna` (`--release`) | 50.816 | 49.587 | 52.380 | 12.77 | 635.19 | 2.47 MiB | 0.46x |
+| `rust_idna` (`1.1.0 --release`, LTO) | 23.317 | 21.175 | 23.866 | 27.83 | 291.46 | 2.17 MiB | 1.00x (baseline) |
+
+- Verified stdout SHA-256: `2c0f91c034c05db0125d616d557f0925e75817cb9684987aaf23452853673d1b`
+
+#### Corpus 2: Real-World Browser Traffic (70% ASCII / 30% IDN & Punycode)
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_idna`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_idna` (`--release`) | 21.854 | 20.572 | 21.970 | 33.04 | 273.18 | 2.45 MiB | 0.71x |
+| `rust_idna` (`1.1.0 --release`, LTO) | 15.600 | 15.052 | 16.225 | 46.28 | 195.00 | 2.09 MiB | 1.00x (baseline) |
+
+- Verified stdout SHA-256: `fe08124d195da1027bb2c0a777a7085590492f2f1343a6502de21720e6127528`
