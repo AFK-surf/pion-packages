@@ -80,6 +80,8 @@ PACKAGE_META = {
                   ["css", "color", "oklch", "oklab", "display-p3", "color-mix", "gamut", "wcag", "srgb", "色彩"]),
     "csv": ("data-formats", "Streaming RFC 4180 CSV reader/writer with flexible dialects and DoS limits",
             ["csv", "tsv", "rfc4180", "table", "delimiter", "streaming", "表格"]),
+    "dash": ("media-graphics", "ISO/IEC 23009-1 MPEG-DASH (.mpd) manifest parser, BaseURL/SegmentTemplate expander, ABR selector & serializer",
+             ["dash", "mpd", "mpeg-dash", "streaming", "manifest", "abr", "video", "segment-template", "流媒体"]),
     "decimal": ("core-utils", "128-bit exact decimal arithmetic with 7 rounding modes, rust_decimal compatible serialization",
                 ["decimal", "money", "fixed-point", "rounding", "arithmetic", "rust_decimal", "金额"]),
     "diff": ("core-utils", "Myers/Histogram line diff, unified patch create/parse/apply and three-way merge",
