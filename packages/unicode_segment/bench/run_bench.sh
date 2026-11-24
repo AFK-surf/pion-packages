@@ -1,6 +1,6 @@
 #!/bin/sh
 # Differential oracle & fair head-to-head benchmark runner for packages/unicode_segment:
-# Pion Native (`packages/unicode_segment`, --release) vs Rust `unicode-segmentation 1.13.3` (--release).
+# Pion Native (`packages/unicode_segment`, --release) vs Rust `unicode-segmentation 1.12.0` (--release).
 # All build artifacts and temporary outputs live in /tmp/pion-unicode-segment-bench.
 set -eu
 
@@ -31,7 +31,7 @@ CARGO_TARGET_DIR="$OUT_DIR/rust-target" cargo build --release $LOCK_FLAG \
 cp "$OUT_DIR/rust-target/release/unicode_segment_rust_bench" "$BIN_DIR/rust_segment"
 
 echo ""
-echo "=== Differential Oracle: Pion unicode_segment vs Rust unicode-segmentation 1.13.3 ==="
+echo "=== Differential Oracle: Pion unicode_segment vs Rust unicode-segmentation 1.12.0 ==="
 "$BIN_DIR/pion_segment" diff "$DATA_DIR/diff_corpus.txt" > "$OUT_DIR/pion.diff"
 "$BIN_DIR/rust_segment" diff "$DATA_DIR/diff_corpus.txt" > "$OUT_DIR/rust.diff"
 TOTAL_DIFF=$(wc -l < "$DATA_DIR/diff_corpus.txt" | tr -d ' ')

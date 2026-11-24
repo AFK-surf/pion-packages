@@ -8,7 +8,7 @@ Pure Pion, zero-external-dependency **Unicode 16.0.0 UAX #29** text segmentation
 
 1. **Extended Grapheme Cluster Segmentation (UAX #29 §3.1.1, GB1–GB999)**
    - Full Unicode 16.0.0 rule coverage: `CR × LF` (GB3), `Control`/`CR`/`LF` (GB4/GB5), Hangul Jamo `L`/`V`/`LV`/`LVT`/`T` (GB6–GB8), `Extend`/`ZWJ`/`SpacingMark`/`Prepend` (GB9/GB9a/GB9b), **GB9c Indic Conjunct Break** (`InCB=Consonant`/`Linker`/`Extend`), **GB11 Emoji ZWJ** (`Extended_Pictographic Extend* ZWJ × Extended_Pictographic`), and **GB12/GB13 Regional Indicator** flag pairs.
-   - Zero-copy UTF-8 byte-span APIs (`grapheme_indices`, `grapheme_count`) plus string slices (`graphemes`) and editor cursor navigation (`is_grapheme_boundary`, `next_grapheme_boundary`, `prev_grapheme_boundary`) that never split multi-byte UTF-8 sequences, surrogate-free emoji sequences, flags, or Indic conjuncts.
+   - Zero-copy UTF-8 byte-span APIs (`grapheme_indices`, `grapheme_count`) plus string slices (`graphemes`) and editor cursor navigation (`is_grapheme_boundary`, `next_grapheme_boundary`, `prev_grapheme_boundary`) that never split multi-byte UTF-8 sequences, emoji sequences, flags, or Indic conjuncts. Cursor lookback is O(1) on ordinary text (including Latin, CJK, Hangul syllables, Devanagari, and standalone emoji) and only scans further across genuinely stateful runs (such as long Regional Indicator `RI` runs or `Extend`/`ZWJ`/GB9c chains, matching Rust `GraphemeCursor`).
 2. **Word Boundary Segmentation (UAX #29 §4.1, WB1–WB999)**
    - Full Unicode 16.0.0 rule coverage including `CR × LF`, `Newline`/`CR`/`LF`, `ZWJ × Extended_Pictographic` (WB3c), `WSegSpace × WSegSpace` (WB3d), `Extend`/`Format`/`ZWJ` absorption (WB4), `ALetter`, `Hebrew_Letter` (`Single_Quote`/`Double_Quote` WB7a–WB7c), `MidLetter`/`MidNumLet`/`MidNum`, `Numeric`, `Katakana`, `ExtendNumLet`, and `Regional_Indicator` pairs.
    - Provides `word_bounds`, `words`, `unicode_word_bounds`, and `unicode_words` (filtering out pure whitespace and punctuation to retain segments containing Unicode `Alphabetic` or `General_Category=Nd/Nl/No` characters, matching Rust `unicode-segmentation::unicode_words`).
@@ -16,9 +16,9 @@ Pure Pion, zero-external-dependency **Unicode 16.0.0 UAX #29** text segmentation
    - Full Unicode 16.0.0 rule coverage with a strictly **O(n)** single-pass DFA and monotonic memoized SB8 lookahead (immune to O(n²) `ATerm`/`Close`/`Sp` backtracking bombs).
    - Provides `sentence_bounds` and `sentences`.
 4. **DoS Guardrails (`SegmentLimits`) & Strict O(n) Guarantees**
-   - Every segmentation entrypoint has a `*_with_limits(s, limits)` variant enforcing `max_input_bytes` and `max_segments`.
-   - Negative limits immediately return `Err(SegmentError::LimitExceeded)` (even on empty strings); `0` is enforced strictly (accepting only empty input); segment limits abort early without unbounded allocation.
-   - All 3 engines run in strictly O(n) linear time even on adversarial 100,000-character `Extend`, `ZWJ`, `Regional_Indicator`, and `ATerm`/`Close`/`Sp` chains.
+   - Every full-string segmentation entrypoint (`grapheme_*`, `word_*`, `unicode_word*`, `sentence_*`) has a `*_with_limits(s, limits)` variant enforcing `max_input_bytes` and `max_segments`.
+   - Negative limits immediately return `Err(SegmentError::LimitExceeded)` (even on empty strings); `0` is enforced strictly (any input with `length > max_input_bytes` fails, and `max_segments = 0` rejects whenever a segment would be emitted while permitting inputs that yield 0 segments, such as empty strings or punctuation-only input passed to `unicode_words_with_limits`); segment limits abort early without unbounded allocation.
+   - All 3 full-string engines run in strictly O(n) linear time even on adversarial 100,000-character `Extend`, `ZWJ`, `Regional_Indicator`, and `ATerm`/`Close`/`Sp` chains.
 
 ## Usage
 
@@ -92,7 +92,7 @@ sh packages/unicode_segment/bench/run_bench.sh
 ### Unit & Adversarial Stress Suite (Red → Green)
 
 - **Red stage**: `0/12` passed on stub build (`pionc check --json` passed, `pionc test --json` failed all 12 tests).
-- **Green stage**: **12/12** tests in `src/segment_test.pion` pass, covering GB1–GB999 (incl. GB9c Indic Conjunct Break, GB11 Emoji ZWJ, GB12/13 Regional Indicators), cursor navigation & mid-UTF-8-byte safety, WB1–WB999 + `unicode_words`, SB1–SB11 + SB998, invalid/truncated UTF-8 handling, negative/zero/exact `SegmentLimits`, and 100,000-character O(n) DoS stress tests.
+- **Green stage**: **13/13** tests in `src/segment_test.pion` pass, covering GB1–GB999 (incl. GB9c Indic Conjunct Break, GB11 Emoji ZWJ, GB12/13 Regional Indicators), cursor navigation & mid-UTF-8-byte safety, linear-time Korean prose & pure Hangul cursor walks, WB1–WB999 + `unicode_words`, SB1–SB11 + SB998, invalid/truncated UTF-8 handling, negative/zero/exact `SegmentLimits`, and 100,000-character O(n) DoS stress tests.
 
 ### Official Unicode 16.0.0 UCD Test Suites (100% Pass)
 
@@ -113,17 +113,17 @@ All three normative Unicode 16.0.0 UAX #29 test files pass with **0 failures**:
 - Stdout SHA-256 (all 4 modes): `89e7ea936b3cbdde07b4a38e5ded9546787d5f30c3aab9d7d2055c3676d1ccbb`
 - Wasm32 binary size: `84,973 B` (debug) / `84,948 B` (`--release`)
 
-### Differential Oracle & Head-to-Head Benchmarks vs Rust `unicode-segmentation 1.13.3`
+### Differential Oracle & Head-to-Head Benchmarks vs Rust `unicode-segmentation 1.12.0`
 
-- **Differential oracle (`bench/run_bench.sh`)**: **20/20** multilingual/edge-case test lines matched **byte-for-byte (0 deviations)** across `grapheme_indices`, `word_bounds`, `unicode_word_bounds`, and `sentence_bounds` against locked Rust `unicode-segmentation 1.13.3` (Unicode 16.0.0 aligned).
+- **Differential oracle (`bench/run_bench.sh`)**: **20/20** multilingual/edge-case test lines matched **byte-for-byte (0 deviations)** across `grapheme_indices`, `word_bounds`, `unicode_word_bounds`, and `sentence_bounds` against pinned Rust `unicode-segmentation =1.12.0` (the Unicode 16.0.0 release).
 - **Head-to-head steady-state benchmarks**: measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, byte-identical stdout SHA-256 verified across all rounds; each iteration runs Grapheme + Word + Unicode Words + Sentence segmentation over the full corpus):
 
 #### Corpus 1: Multilingual Web/Social (ZH/JA/KO/EN/DE/EL/RU/AR/HE/Devanagari GB9c/Emoji ZWJ/Flags, 5.45 MB total)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_segment`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `pion_segment` (`--release`) | 76.656 | 75.324 | 112.789 | 71.13 | 0.53x |
-| `rust_segment` (`1.13.3 --release`, LTO) | 40.761 | 40.241 | 62.067 | 133.78 | 1.00x (baseline) |
+| `pion_segment` (`--release`) | 81.680 | 75.547 | 129.691 | 66.76 | 0.51x |
+| `rust_segment` (`1.12.0 --release`, LTO) | 41.823 | 39.710 | 58.587 | 130.38 | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `ec165b39282eeeee184088d9eb7422bb069d4f01fada5acd2dcd3d0008a9e9a8`
 
@@ -131,7 +131,7 @@ All three normative Unicode 16.0.0 UAX #29 test files pass with **0 failures**:
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_segment`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `pion_segment` (`--release`) | 197.524 | 124.529 | 202.310 | 24.95 | 0.40x |
-| `rust_segment` (`1.13.3 --release`, LTO) | 78.618 | 76.664 | 80.468 | 62.68 | 1.00x (baseline) |
+| `pion_segment` (`--release`) | 143.558 | 110.670 | 201.887 | 34.33 | 0.45x |
+| `rust_segment` (`1.12.0 --release`, LTO) | 65.265 | 60.670 | 81.522 | 75.51 | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `b5b966a2fa1a51a41723176d7a5f833609c13df3ccf66be50e45151e20c01472`
