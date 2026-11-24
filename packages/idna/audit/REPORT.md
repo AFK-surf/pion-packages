@@ -1,0 +1,248 @@
+# Red-team audit: `packages/idna` v0.1.0 (RT-idna)
+
+- **Audited commit:** `origin/feat/pkg-idna` @ `b046fc868892e248a9b256b6b83698a6114451d3`
+- **Scope:** RFC 3492 Punycode, UTS #46 16.0.0 / IDNA2008 (RFC 5891 / 5892 / 5893), UTS #39 16.0.0
+  (`skeleton`, `are_confusable`, scripts, `display_domain`), `IdnaLimits`, `Send` claims, determinism across
+  native / wasm32 × debug / release, README claims and benchmarks.
+- **Method:** independent red-team package (`audit/`, public API only), an independent Python reference model
+  written from the specifications and the official Unicode 16.0.0 data (`diff/model.py`, stdlib only, no
+  `unicodedata`), Rust `idna =1.1.0` (`diff/rust`, `--locked`), the full official `IdnaTestV2.txt` (6,389 lines,
+  all three columns), 3,000 seeded fuzz domains + 414 hand-written adversarial inputs, 20 DoS bombs with time and
+  RSS budgets, 7 injected bugs.
+- **Re-run:** `sh packages/idna/audit/run_audit.sh` (~90 s on an M-series Mac). Exit status 1 only for P0
+  conditions; with `STRICT=1` every open finding below also fails the run. Every README number is parsed from
+  `README.md` at run time (`diff/readme.py`); every red-team case uses only the public API and accepts any
+  reasonable fix, so the gate can be run unmodified on a fix branch.
+
+## Summary
+
+| Severity | Count | Findings |
+| --- | ---: | --- |
+| P0 (crash / wrong core output without explanation / nondeterminism) | **0** | — |
+| P1 (security-relevant wrong behaviour) | **6** | P1-1 … P1-6 |
+| P2 (spec deviation / limited impact / documentation) | **10** | P2-1 … P2-10 |
+| INFO (documented or out-of-branch, not failing) | 9 | INFO-1 … INFO-9 |
+
+What holds up well (all gated, see "Verification" below):
+
+- No crash, trap, hang or OOM on any input (IdnaTestV2, 3,414 adversarial/fuzz inputs, IdnaLimits sweep,
+  20 bombs incl. 1 MB inputs) in any of the 4 modes; all 4 modes are byte-identical everywhere.
+- RFC 3492: overflow, truncation, surrogate, > U+10FFFF and invalid-digit handling are correct; 40,000
+  random strings round-trip identically to CPython's `punycode` codec in the model self-test.
+- UTS #46 core: **0 unexplained divergences** from the independent model and from Rust `idna 1.1.0` over
+  9,803 inputs × 6 option profiles; the IdnaTestV2 failures are exactly the findings / documented deviations below.
+- `src/tables_uts46.pion` and `src/tables_uts39.pion` are regenerated **byte-identically** by
+  `tools/gen_tables.py` from the official Unicode 16.0.0 files (`IdnaMappingTable`, `UnicodeData`,
+  `CompositionExclusions`, `DerivedBidiClass`, `DerivedJoiningType`, `Scripts`, `DerivedCoreProperties`,
+  `confusables`), so the Unicode 16.0.0 / `Unicode-3.0` claim is true.
+- All 8 README `Send` types are `Send`; `DisplayDecision` is `!Send` and both README ways across `spawn`
+  (`String` fields, `move`) compile; 8 threads × 2,000 rounds give results identical to one thread.
+
+## Findings
+
+### P1-1 — NFC quick-check gap: 19 code points skip normalisation; `to_ascii` emits a second, non-NFC A-label
+
+`cp_may_need_nfc` (`src/nfc.pion:22`) decides whether the mapped domain is normalised at all (both the
+non-ASCII fast path of `to_ascii` and `uts46_process`, `src/uts46.pion:351`). It returns `true` for
+`ccc != 0`, Hangul jamo and the ranges `U+09BE..U+1B35` / `U+11127..U+113FF`, but misses every other
+`NFC_Quick_Check=Maybe` character that UTS #46 allows. Derived from `DerivedNormalizationProps.txt` 16.0.0:
+`U+114B0 U+114BA U+114BD` (Tirhuta), `U+115AF` (Siddham), `U+11930` (Dives Akuru), `U+1611E..U+16129`
+(Gurung Khema, new in 16.0), `U+16D67 U+16D68` (Kirat Rai, new in 16.0).
+
+```
+to_ascii("𑒏𑒻.com")  = xn--gy1dycd.com   (KA + E + AI-length, not normalised)
+to_ascii("𑒏𑒻.com")    = xn--gy1d2c.com    (the NFC form; Rust idna 1.1.0 returns this for both)
+to_unicode("xn--gy1dycd.com").is_valid = false  (PunycodeNotNfc: the package rejects its own output)
+```
+
+Impact: two A-labels for one name (registry / cookie / HSTS / allow-list keys disagree with every other
+implementation), `to_unicode` output that is not NFC, and a value the package itself refuses to read back.
+Fix: return `true` for every `NFC_QC != Yes` code point (generate the set in `tools/gen_tables.py`), or always
+normalise when a non-ASCII code point ≥ U+0300 is present. Gate: `redteam_p1_1_nfc_quick_check_gap`, and the
+model / Rust oracles attribute 697 + 208 divergences to it.
+
+### P1-2 — `display_domain` returns the raw, attacker-controlled input as `display` for invalid IDNs
+
+`src/uts39.pion:198`: when `to_ascii` fails, the decision is `{display: domain, ascii: "", is_punycode_fallback:
+true, reasons: [InvalidIdna]}`. The field an Omnibox renders therefore contains exactly what the policy
+rejected: `evil<U+202E>moc.elgoog.com` (renders as `evilcom.google.com`), `paypal.com<U+2044>login.evil.com`,
+disallowed look-alikes, unpaired invalid bytes. `is_punycode_fallback = true` while `display` is not Punycode.
+Fix: for invalid input return an ASCII-safe `display` (e.g. `""`, the percent-encoded input, or Punycode of
+the mapped labels) and document it. Gate: `redteam_p1_2_display_raw_invalid` (any ASCII-only display passes).
+
+### P1-3 — single-script Latin homoglyphs are displayed as Unicode
+
+`display_domain_default("gooɡle.com")` (U+0261), `"ɑpple.com"` (U+0251), `"ɡithub.com"`, `"faceboᴏk.com"`
+(U+1D0F), `"pɑypal.com"` → `is_punycode_fallback = false`, `display` = the spoof. The label is one script
+(Latin), so neither the mixed-script nor the whole-script test (which requires `!has_latin`) can fire. Browsers
+block these (Chrome: skeleton match against top domains plus a list of dangerous Latin letters). The task's
+"纯拉丁内含拉丁扩展/倒置字符" class is fully open. Fix: fall back when a label contains non-ASCII Latin letters
+and its UTS #39 skeleton is pure ASCII (a Latin label that is confusable with an ASCII label is a spoof by
+construction; `münchen`, `café`, `bücher` keep non-ASCII skeletons and stay readable — `control_display`
+pins that). Gate: `redteam_p1_3_latin_homoglyph`.
+
+### P1-4 — CJK characters that look like `/` or `-` next to Latin are displayed
+
+`allow_mixed_latin_cjk` lets Latin + Han/Kana through without Chrome's dangerous-pattern rule, so
+`google.comノevil.com` (U+30CE reads as a path separator), `paypal.com丿x.evil.com` (U+4E3F),
+`pay一pal.com` (U+4E00 reads as `pay-pal.com`) and `amaーzon.com` (U+30FC) are displayed as Unicode.
+Fix: fall back when ノ ソ ゾ ン 丶 乀 乁 丿 一 ー sit next to non-CJK characters (Chrome `kDangerousPattern`).
+Gate: `redteam_p1_4_cjk_slash_dash`; legitimate `ノート.jp`, `abc中文.com` must stay readable (`control_display`).
+
+### P1-5 — `skeleton` / `are_confusable` miss UTS #39 16.0's Default_Ignorable removal
+
+UTS #39 16.0 §4: `internalSkeleton(X)` = NFD → **remove `Default_Ignorable_Code_Point`** → prototypes → NFD.
+`src/uts39.pion:5` implements the pre-15 formula the README documents, so
+`are_confusable("paypal", "pay<U+200B>pal")` (also U+00AD, U+034F, U+2060, U+FE0F) is `false`. The function
+is the package's public confusable primitive (usernames, labels compared outside `display_domain`; inside
+`display_domain` most ignorables are already removed by UTS #46 mapping or flagged as invisible). Fix: drop
+Default_Ignorable code points after the first NFD (the table already exists: `unicode_is_default_ignorable`).
+Gate: `redteam_p1_5_skeleton_default_ignorable`; the model attributes 2,459 skeleton divergences to it.
+
+### P1-6 — `skeleton` / `are_confusable`: unbounded input and quadratic canonical ordering
+
+Neither function takes limits, and `nfd_normalize` orders each run of non-starters with an insertion sort
+(`src/nfc.pion:106`). Alternating `U+0301` (ccc 230) / `U+0316` (ccc 220) is the worst case (machine load average ~10;
+the times double at load ~28):
+
+| bomb | input | native `--release` | wasm32 `--release` |
+| --- | --- | ---: | ---: |
+| b18 `skeleton` | `a` + 50,000 × (U+0301 U+0316), 200 KB | 10.3 s | 11.5 s |
+| b19 `are_confusable` | `a` + 30,000 × pair, 120 KB (×2 skeletons) | 9.7 s | 8.1 s |
+
+1 MB of such input is minutes of CPU on one call. Fix: bound the input (`IdnaLimits`-style parameter or a
+`max_input_bytes` constant) and use an O(n log n) / counting sort for runs (ccc has 256 values), or the
+Stream-Safe Text Format (UAX #15 §13: insert CGJ after 30 non-starters). Gate: `redteam_p1_6_skeleton_quadratic`
+(time ratio for 2× input must be < 3) and `diff/dos.py` b18 / b19 budgets.
+
+### P2-1 — UTS #46 V4 missing: a decoded label may start with `xn--` when CheckHyphens is false
+
+UTS #46 16.0 §4.1 V4: "If not CheckHyphens, the label must not begin with `xn--`". With `uts46_url()`
+(CheckHyphens = false) `to_ascii("xn--xn--mnchen-eeb.com")` is `Ok` and `to_unicode` valid
+(`xn--münchen.com`, double-encoded label). IdnaTestV2 lines 312 / 415 carry `[V2, V4]`; with V2 ignored
+(CheckHyphens = false) V4 must still fail. Rust `idna 1.1.0` has the same gap. Gate:
+`redteam_p2_1_v4_xn_prefix`; 12 model divergences.
+
+### P2-2 — `ignore_invalid_punycode` suppresses more than the decode failure
+
+UTS #46 16.0 §4 step 4.1: a non-ASCII `xn--` label is *always* an error; IgnoreInvalidPunycode only waives the
+Punycode conversion failure, and the label then still goes through "empty or ASCII-only → error" and V2/V4.
+`src/uts46.pion:387/411` skip both the non-ASCII error and all validation:
+`to_ascii("xn--münchen.com", url + ignore)` = `Ok("xn--xn--mnchen-eeb.com")` (a *new* A-label), and
+`to_ascii("xn--9.com", …)` = `Ok`. Gate: `redteam_p2_2_ignore_invalid_punycode`; 364 model divergences
+(profile `I` only).
+
+### P2-3 — ContextO KATAKANA MIDDLE DOT ignores Han characters below U+3040
+
+RFC 5892 A.9 accepts U+30FB if the label has any Hiragana / Katakana / Han character.
+`src/uts46.pion:111` only looks at `cp >= 0x3040`, so `々・.jp` (U+3005), `〇・.jp` (U+3007) and
+`人々・〇.jp` are rejected by `uts46_strict()` (and therefore by `display_domain_default`). Gate:
+`redteam_p2_3_contexto_katakana_han`.
+
+### P2-4 — transitional processing of U+1E9E ẞ
+
+U+1E9E is *mapped* to U+00DF, which is a *deviation*. IdnaTestV2 lines 229–230 require
+`toAsciiT("FAẞ.de") = "fass.de"`. The fast path of `to_ascii` (`src/uts46.pion:857`) emits
+`xn--fa-hia.de` (the non-transitional result) and the full path reports `DisallowedCodePoint`
+(`faẞ́.de`). The only such mapping in 16.0 is U+1E9E (checked by the model). Gate:
+`redteam_p2_4_transitional_sharp_s`; the only IdnaTestV2 failure that is a defect.
+
+### P2-5 — whole-script confusables with diacritics are displayed
+
+The whole-script test needs a pure-ASCII skeleton, so a Cyrillic label that renders as a Latin word with a
+diacritic passes: `соӧр.com`, `ѕсһӧн.de` (U+04E7 → `o` + U+0308). Fix: compare the skeleton with its
+diacritic-stripped form, or use Chrome's per-script "Latin look-alike letters" sets. Gate:
+`redteam_p2_5_whole_script_diacritic`.
+
+### P2-6 — combining overlays are displayed
+
+U+0335..U+0338 (blocked by Chrome) pass: `google.com̸evil.com`, `paypa̵l.com`. Gate:
+`redteam_p2_6_combining_overlay`.
+
+### P2-7 — `skeleton` is not `bidiSkeleton(LTR, X)`
+
+UTS #39 16.0 defines `skeleton(X) = bidiSkeleton(LTR, X)`: reorder for display with the UBA, then
+`internalSkeleton`. RTL text is mapped in logical order: `skeleton("סו")` = `ol`, the 16.0 skeleton (displayed
+`וס`) is `lo`. The repository's `unicode_bidi` package provides the reordering. Gate:
+`redteam_p2_7_bidi_skeleton`.
+
+### P2-8 — numbering systems are merged runs of Nd code points
+
+`tools/gen_tables.py:245` merges consecutive Nd code points into one "system", so the two Unicode 16 systems
+in U+116D0..U+116E3 (Myanmar Pao / Eastern Pwo Karen digits) count as one: `𑛑𑛛.com` is not flagged
+`MixedNumberingSystems`. Use `code point − digit value` (the zero) as the system key. Gate:
+`redteam_p2_8_numbering_merge`.
+
+### P2-9 — NFC runs over the whole domain before per-label limits
+
+`uts46_process` maps and NFC-normalises the full input before splitting and checking `max_label_codepoints`.
+With a caller-raised `max_input_bytes` (other limits default), one label of N combining marks costs O(N²)
+before `LimitExceeded`: `a` + 20,000 mark pairs (80 KB) takes 1.65 s native / 1.87 s wasm32 (b17) although the
+label limit is 1,000. Default limits (4,096 bytes) keep it in the low milliseconds, hence P2. Fix: enforce the
+per-label code point limit while mapping (before normalisation), or fix the sort (P1-6). Gate:
+`redteam_p2_9_limits_after_nfc`, bomb b17.
+
+### P2-10 — README claims that are not reproduced
+
+- "UTS #39 **Moderately** Restrictive": Moderately Restrictive allows Latin + any Recommended script except
+  Cyrillic / Greek; `script_set_is_allowed` only allows the Highly Restrictive CJK combinations, e.g.
+  `shopไทย.com` is `MixedScript`. Either allow those combinations or say Highly Restrictive (the safer choice).
+- "Official Unicode 16.0.0 IdnaTestV2 … Spec valid vectors: **546/546 (100.00%)**": with all three columns
+  (toUnicode, toAsciiN, toAsciiT) it is 544/546 (P2-4).
+- `skeleton` is documented as `NFD(prototype_map(NFD(input)))`, which is not the 16.0 definition (P1-5, P2-7).
+
+Reproduced: 29/29 unit tests, `wasm_smoke` stdout and SHA-256 in 4 modes, wasm32 sizes (path-dependent,
+within 0.01 %), 258/258 differential cases, 6,380/6,387 Rust agreement with all 7 differences being code
+points unassigned in Unicode 16.0, benchmark SHA-256s, speedups (0.46x / 0.69x measured vs 0.44x / 0.68x).
+
+## INFO (documented behaviour or outside this branch; never failing)
+
+- **INFO-1** `to_unicode` best-effort output of an *invalid* label that decodes to ASCII only keeps the raw
+  A-label (`xn--ascii-`), where the model / IdnaTestV2 show the decoded text; validity is right.
+- **INFO-2** 31 module-level `FixedArray` tables: immutable bindings built by pure functions; the runtime
+  freezes module-level heap constants (`pion_rc_immortalize`, SPEC.md), and the concurrency probe confirms
+  race-free reads. No `let mut`, no module-level `Array` / `Map`.
+- **INFO-3** Rust `idna 1.1.0` (ICU4X 2.4 data) accepts code points unassigned in Unicode 16.0 (Unicode 17,
+  e.g. CJK Ext. J U+32931); Pion rejects them as 16.0 `[V7]`. This is the README's "7 differences".
+- **INFO-4** `IdnaLimits` (documented) reject inputs Rust accepts (labels > 1,000 code points etc.).
+- **INFO-6** `verify_dns_length` accepts one trailing root dot (documented in README; = Rust
+  `VerifyAllowRootDot`); IdnaTestV2 expects `A4_2` for those 163 checks.
+- **INFO-7** IdnaTestV2's `X4_2` (empty label in toUnicode, 50 checks) has no UTS #46 16.0 processing step;
+  Pion and Rust both report these as valid.
+- **INFO-8** a second benchmark corpus (`diff/altbench.py`: 63-byte labels, NFD-dense, A-label heavy, Bidi) runs
+  at ~0.34x of Rust, below both README corpora (0.44x / 0.68x). Not a README claim; worth adding to the table.
+- **INFO-9** root `THIRD_PARTY_NOTICES.md` does not list `packages/idna`'s Unicode data (root file: release
+  integration, not this feature branch).
+- `uts46_url()` is UTS #46 with UseSTD3ASCIIRules = false: NUL, space, `/`, `@` … are valid ASCII per
+  UTS #46 16.0 (as in Rust with `AsciiDenyList::EMPTY`); a URL parser must still apply the WHATWG forbidden
+  domain code points.
+
+## Verification (what `run_audit.sh` runs)
+
+| Section | What | Result on `b046fc8` |
+| --- | --- | --- |
+| static | MIT, 0 deps, 0 `extern "C"`, 0 `World`, 0 imports, 0 module-level `let mut` / Array / Map, 0 `Double`/`Float`, no internal names; Unicode 16.0.0 data regenerates the tables byte-identically; `pionc check` spawn probe for all 9 public value types; 8-thread run | pass |
+| unit | `pionc fmt/check/test` of the package (29/29 = README) and the audit package (17 controls pass, 15 red-team open) | pass |
+| cases | 32 cases × 4 modes, one process each, PASS/FAIL identical across modes | 17 controls pass |
+| determinism | 9,803 inputs × 16 entry points (to_ascii/to_unicode × 6 profiles, label API, skeleton, scripts, display, punycode encode/decode), IdnaLimits sweep (432 lines), 17 in-budget bombs: 4 modes byte-identical | pass |
+| oracles | Python model: 186,257 checks, 0 unexplained; Rust idna 1.1.0: 39,212 checks, 0 unexplained | pass |
+| idnatest | IdnaTestV2 16.0.0, 19,161 checks: 18,946 pass, 2 = P2-4, 213 = INFO-6/7 | pass |
+| dos | 20 bombs × (native, wasm32) in fresh processes, time + RSS budgets; max RSS 81 MiB (wasm32) | b17 (P2-9), b18/b19 (P1-6) over budget |
+| smoke | `wasm_smoke` 4 modes vs README stdout / SHA-256 / sizes | pass |
+| bench | `bench/run_bench.sh` re-run, SHA-256 and speedups vs README; second corpus; display / skeleton ns/op | pass (INFO-8) |
+| inject | 7 realistic bugs (Punycode threshold, Bidi rule 4, CheckHyphens 3-4, ContextJ virama, whole-script, DNS 63, V1 NFC) | 7/7 caught |
+
+Model self-test: NFC/NFD agree with CPython `unicodedata` (13.0) on 20,000 random strings of characters it
+knows; RFC 3492 agrees with CPython's `punycode` codec on 20,000 random strings.
+
+## Files
+
+- `run_audit.sh` — the gate (`diff/model.py nfcqc` re-derives the NFC_QC set of P1-1 from the data); `REPORT.md` — this file
+- `pion.toml`, `src/main.pion` (CLI: `dump`, `bomb`, `time`, `api`, `list`, `case`), `src/dump.pion`,
+  `src/cases.pion`, `redteam_test.pion`, `control_test.pion` — red-team package (`pionc test` runs both)
+- `probe/` — 8-thread concurrency probe
+- `diff/model.py`, `diff/ucd.py` — independent reference model; `diff/gen.py` — corpora; `diff/compare.py` —
+  classifier; `diff/idnatest.py` — IdnaTestV2 runner; `diff/dos.py` — bombs; `diff/inject.py` — mutants;
+  `diff/readme.py` — README claim parser; `diff/altbench.py` — second benchmark corpus;
+  `diff/rust/` — Rust `idna =1.1.0` oracle (Cargo.lock from `bench/rust_bench`)
+- `ucd/*.txt.gz` — Unicode 16.0.0 data (see `ucd/LICENSE`)
