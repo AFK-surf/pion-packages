@@ -18,14 +18,21 @@ SECTIONS=${SECTIONS:-"tests fuzz yrs malformed size bench"}
 SEEDS=${SEEDS:-60}
 ROUNDS=${ROUNDS:-5}
 YJS_VERSION=13.6.33
+YOCTO_REV=$(awk -F'"' '/^[[:space:]]*y-octo[[:space:]]*=/{for(i=1;i<=NF;i++) if($i ~ /rev[[:space:]]*=/) {print $(i+1); exit}}' "$AUDIT_DIR/rust/Cargo.toml")
+if [ -z "$YOCTO_REV" ]; then
+  echo "failed to parse y-octo rev from $AUDIT_DIR/rust/Cargo.toml" >&2
+  exit 1
+fi
 export PATH="$HOME/.pion/bin:$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="$AUDIT_CACHE/target"
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
 export YJS_MODULE="$AUDIT_CACHE/node_modules/yjs"
 BIN="$AUDIT_CACHE/bin"
 HARNESS="$BIN/harness"
 PBENCH="$BIN/pion_bench"
 YRS_INTERP="$CARGO_TARGET_DIR/release/yrs_interp"
 YRS_BENCH="$CARGO_TARGET_DIR/release/yrs_bench"
+YOCTO_BENCH="$CARGO_TARGET_DIR/release/y_octo_bench"
 TRACE="$AUDIT_CACHE/traces/automerge-paper.ops"
 TRACE_UPD="$AUDIT_CACHE/traces/automerge-paper.update.hex"
 mkdir -p "$AUDIT_CACHE/bin" "$AUDIT_CACHE/traces" "$AUDIT_OUT/fuzz"
@@ -41,7 +48,26 @@ fi
 say "yjs $(node -p "require('$YJS_MODULE/package.json').version")"
 pionc build --release -o "$HARNESS" "$AUDIT_DIR/harness" || exit 1
 pionc build --release -o "$PBENCH" "$AUDIT_DIR/bench/pion_bench" || exit 1
-(cd "$AUDIT_DIR/rust" && cargo build --release --locked --bins 2>&1 | tail -1) || exit 1
+(cd "$AUDIT_DIR/rust" && cargo build --release --locked --bins >"$AUDIT_OUT/cargo-rust.log" 2>&1) || { tail -30 "$AUDIT_OUT/cargo-rust.log"; exit 1; }
+tail -1 "$AUDIT_OUT/cargo-rust.log"
+YOCTO_DIR="$AUDIT_CACHE/y-octo"
+YOCTO_SRC="${YOCTO_REPO:-https://github.com/y-crdt/y-octo.git}"
+if [ ! -d "$YOCTO_DIR/.git" ]; then
+  git clone --filter=blob:none "$YOCTO_SRC" "$YOCTO_DIR" >"$AUDIT_OUT/y-octo-git.log" 2>&1 || { tail -20 "$AUDIT_OUT/y-octo-git.log"; say "git clone y-octo failed"; exit 1; }
+fi
+if [ "$(git -C "$YOCTO_DIR" rev-parse HEAD 2>/dev/null)" != "$YOCTO_REV" ]; then
+  git -C "$YOCTO_DIR" fetch --depth=1 "$YOCTO_SRC" "$YOCTO_REV" >"$AUDIT_OUT/y-octo-git.log" 2>&1 \
+    || git -C "$YOCTO_DIR" fetch "$YOCTO_SRC" >"$AUDIT_OUT/y-octo-git.log" 2>&1 \
+    || { tail -20 "$AUDIT_OUT/y-octo-git.log"; say "git fetch y-octo failed"; exit 1; }
+  git -C "$YOCTO_DIR" checkout --detach "$YOCTO_REV" >"$AUDIT_OUT/y-octo-git.log" 2>&1 \
+    || { tail -20 "$AUDIT_OUT/y-octo-git.log"; say "git checkout y-octo $YOCTO_REV failed"; exit 1; }
+fi
+cp "$AUDIT_DIR/rust/y-octo-wasm.Cargo.lock" "$YOCTO_DIR/Cargo.lock" || { say "missing $AUDIT_DIR/rust/y-octo-wasm.Cargo.lock"; exit 1; }
+(cd "$YOCTO_DIR" && CARGO_TARGET_DIR="$AUDIT_CACHE/target-yocto-wasm" cargo build -p y-octo-wasm --target wasm32-unknown-unknown --release --locked >"$AUDIT_OUT/cargo-yocto-wasm.log" 2>&1) || { tail -30 "$AUDIT_OUT/cargo-yocto-wasm.log"; exit 1; }
+tail -1 "$AUDIT_OUT/cargo-yocto-wasm.log"
+export YOCTO_WASM="$AUDIT_CACHE/target-yocto-wasm/wasm32-unknown-unknown/release/y_octo_wasm.wasm"
+export YOCTO_WASM_JS="$YOCTO_DIR/y-octo-wasm/js/index.mjs"
+say "y-octo rev $(git -C "$YOCTO_DIR" rev-parse --short HEAD)"
 if [ ! -f "$TRACE" ]; then
   curl -sSfL -o "$AUDIT_CACHE/traces/automerge-paper.json.gz" \
     https://raw.githubusercontent.com/josephg/editing-traces/master/sequential_traces/automerge-paper.json.gz || exit 1
@@ -126,21 +152,34 @@ open(sys.argv[2], 'w').write('\n'.join(lines) + '\n')
 EOF
   p=$("$HARNESS" "$AUDIT_OUT/trace_script.txt" | awk '/^U /{print length($3)/2}')
   r=$("$YRS_INTERP" "$AUDIT_OUT/trace_script.txt" | awk '/^U /{print length($3)/2}')
+  [ -n "$p" ] || { say "harness size failed"; exit 1; }
+  [ -n "$r" ] || { say "yrs_interp size failed"; exit 1; }
+  yo=$("$YOCTO_BENCH" size 0 1 "$TRACE") || { say "y_octo_bench size failed"; exit 1; }
+  yw=$(node "$AUDIT_DIR/bench/yocto_wasm_bench.mjs" size 0 1 "$TRACE") || { say "yocto_wasm_bench size failed"; exit 1; }
   y=$(($(wc -c <"$TRACE_UPD") / 2))
-  say "   encodeStateAsUpdate bytes: node_yjs=$y rust_yrs=$r pion=$p"
+  say "   encodeStateAsUpdate bytes: node_yjs=$y rust_yrs=$r rust_y_octo=$yo node_y_octo_wasm=$yw pion=$p"
 fi
 
 # ---------------------------------------------------------------------------------------------
 if has bench; then
   say ""
-  say "== [6] head-to-head benchmarks: Pion vs Node yjs vs Rust yrs (--release), warmup 1, rounds $ROUNDS"
+  say "== [6] head-to-head benchmarks: Pion vs Node yjs vs Rust yrs vs Rust y-octo vs Node y-octo-wasm (--release), warmup 1, rounds $ROUNDS"
   bench() {
     name=$1
     shift
-    python3 "$ROOT_DIR/scripts/bench_compare.py" --title "$name" --warmup 1 --rounds "$ROUNDS" \
-      --impl "pion=$PBENCH $*" --impl "node_yjs=node $AUDIT_DIR/bench/node_bench.mjs $*" \
-      --impl "rust_yrs=$YRS_BENCH $*" --baseline rust_yrs \
-      --md-out "$AUDIT_OUT/bench-$name.md" --json-out "$AUDIT_OUT/bench-$name.json" >"$AUDIT_OUT/bench-$name.log" 2>&1
+    rm -f "$AUDIT_OUT/bench-$name.md" "$AUDIT_OUT/bench-$name.json"
+    if ! python3 "$ROOT_DIR/scripts/bench_compare.py" --title "$name" --warmup 1 --rounds "$ROUNDS" \
+      --impl "pion=$PBENCH $*" \
+      --impl "node_yjs=node $AUDIT_DIR/bench/node_bench.mjs $*" \
+      --impl "rust_yrs=$YRS_BENCH $*" \
+      --impl "rust_y_octo=$YOCTO_BENCH $*" \
+      --impl "node_y_octo_wasm=node $AUDIT_DIR/bench/yocto_wasm_bench.mjs $*" \
+      --baseline rust_yrs \
+      --md-out "$AUDIT_OUT/bench-$name.md" --json-out "$AUDIT_OUT/bench-$name.json" >"$AUDIT_OUT/bench-$name.log" 2>&1; then
+      tail -30 "$AUDIT_OUT/bench-$name.log"
+      say "bench $name failed"
+      exit 1
+    fi
     say ""
     say "### $name ($*)"
     grep -E '^\||SHA-256|mismatch' "$AUDIT_OUT/bench-$name.md" | tee -a "$SUMMARY" >/dev/null
