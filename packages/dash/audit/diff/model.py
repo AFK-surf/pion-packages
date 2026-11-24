@@ -98,22 +98,87 @@ def utf8(cp):
     return chr(cp).encode("utf-8", "surrogatepass")
 
 
+XML_NS = b"http://www.w3.org/XML/1998/namespace"
+XMLNS_NS = b"http://www.w3.org/2000/xmlns/"
+CENC_NS = b"urn:mpeg:cenc:2013"
+MSPR_NS = b"urn:microsoft:playready"
+
+
+def split_q(n):
+    return (n.split(b":", 1)[0], n.split(b":", 1)[1]) if b":" in n else (b"", n)
+
+
 class Elem:
-    __slots__ = ("name", "local", "attrs", "text", "children")
+    """Element with Namespaces in XML 1.0 resolution (bind_ns). `ns` is None for an undeclared prefix."""
+    __slots__ = ("name", "prefix", "local", "ns", "attrs", "ans", "text", "children", "dash")
 
     def __init__(self, name, attrs, text, children):
         self.name = name
-        self.local = name.split(b":", 1)[1] if b":" in name else name
+        self.prefix, self.local = split_q(name)
+        self.ns = b""
         self.attrs = attrs
+        self.ans = []
         self.text = text
         self.children = children
+        self.dash = b""
 
-    def get(self, local):  # design: lookup by local name, first match (namespaces are not resolved)
-        for (n, v) in self.attrs:
-            ln = n.split(b":", 1)[1] if b":" in n else n
-            if ln == local:
+    def isd(self, local):
+        """A DASH element: same expanded name as `local` in the MPD namespace (design: the namespace of the root
+        <MPD>, whatever it is). Elements with an undeclared prefix (not namespace-well-formed) are foreign."""
+        return self.local == local and self.ns is not None and self.ns == self.dash and (self.prefix == b"" or self.dash != b"")
+
+    def is_cenc(self, local):
+        # design: cenc namespace, or the conventional 'cenc' prefix, or an unqualified element without namespace
+        return self.local == local and (self.ns == CENC_NS or self.prefix == b"cenc" or (self.ns == b"" and self.prefix == b""))
+
+    def is_mspr(self, local):
+        return self.local == local and (self.ns == MSPR_NS or self.prefix == b"mspr")
+
+    def get(self, local):
+        """DASH attributes are unqualified; design: an attribute qualified with the MPD namespace counts too."""
+        for (n, v), ns in zip(self.attrs, self.ans):
+            pr, ln = split_q(n)
+            if ln == local and (pr == b"" or (self.dash != b"" and ns == self.dash)):
                 return v
         return None
+
+    def get_cenc(self, local):
+        for (n, v), ns in zip(self.attrs, self.ans):
+            pr, ln = split_q(n)
+            if ln == local and (ns == CENC_NS or pr == b"" or pr == b"cenc"):
+                return v
+        return None
+
+
+def bind_ns(el, scope, dash=None):
+    """Namespaces in XML 1.0: resolve element / attribute prefixes; duplicate expanded attribute names are errors."""
+    sc = dict(scope)
+    for (n, v) in el.attrs:
+        if n == b"xmlns":
+            sc[b""] = v
+        elif n.startswith(b"xmlns:"):
+            sc[n[6:]] = v
+    el.ns = sc.get(el.prefix, b"" if el.prefix == b"" else None)
+    if dash is None:
+        dash = el.ns if el.ns is not None else b""
+    el.dash = dash
+    seen = set()
+    el.ans = []
+    for (n, v) in el.attrs:
+        pr, ln = split_q(n)
+        if n == b"xmlns" or pr == b"xmlns":
+            ns = XMLNS_NS
+        elif pr == b"":
+            ns = b""
+        else:
+            ns = sc.get(pr)
+        if ns and ns != XMLNS_NS:
+            if (ns, ln) in seen:
+                raise Err("InvalidXml", "duplicate expanded attribute name")
+            seen.add((ns, ln))
+        el.ans.append(ns)
+    for c in el.children:
+        bind_ns(c, sc, dash)
 
 
 class Xml:
@@ -737,14 +802,15 @@ def content_protection(el):
     sc = el.get(b"schemeIdUri")
     if sc is None:
         raise Err("InvalidMpd", "schemeIdUri")
-    pssh = [trim(c.text) for c in el.children if c.local == b"pssh"]
-    return (sc, el.get(b"value"), el.get(b"default_KID"), pssh)
+    pssh = [trim(c.text) for c in el.children if c.is_cenc(b"pssh")]
+    pro = [trim(c.text) for c in el.children if c.is_mspr(b"pro")]
+    return (sc, el.get(b"value"), el.get_cenc(b"default_KID"), pssh, pro)
 
 
 def init_child(el):
     src = rng = None
     for c in el.children:
-        if c.local == b"Initialization":
+        if c.isd(b"Initialization"):
             src, rng = c.get(b"sourceURL"), c.get(b"range")
     return src, rng
 
@@ -761,7 +827,7 @@ def seg_list(el, fl):
     src, rng = init_child(el)
     urls = []
     for c in el.children:
-        if c.local == b"SegmentURL":
+        if c.isd(b"SegmentURL"):
             if len(urls) >= LIM["max_segments"]:
                 raise Err("LimitExceeded", "SegmentURL")
             urls.append((c.get(b"media"), c.get(b"mediaRange"), c.get(b"index"), c.get(b"indexRange")))
@@ -775,10 +841,10 @@ def seg_list(el, fl):
 def seg_template(el, fl):
     tl = []
     for c in el.children:
-        if c.local != b"SegmentTimeline":
+        if not c.isd(b"SegmentTimeline"):
             continue
         for s in c.children:
-            if s.local != b"S":
+            if not s.isd(b"S"):
                 continue
             if len(tl) >= LIM["max_timeline_entries"]:
                 raise Err("LimitExceeded", "S")
@@ -802,11 +868,11 @@ def seg_template(el, fl):
 def seg_children(el, fl):
     sb = sl = st = None
     for c in el.children:  # design: the last element of each kind wins
-        if c.local == b"SegmentBase":
+        if c.isd(b"SegmentBase"):
             sb = seg_base(c, fl)
-        elif c.local == b"SegmentList":
+        elif c.isd(b"SegmentList"):
             sl = seg_list(c, fl)
-        elif c.local == b"SegmentTemplate":
+        elif c.isd(b"SegmentTemplate"):
             st = seg_template(c, fl)
     return sb, sl, st
 
@@ -825,9 +891,9 @@ def representation(el, fl):
              frame_rate=opt(el, b"frameRate", lambda v: rational(v, fl)),
              sap=opt(el, b"startWithSAP", lambda v: nonneg(v, fl)), sar=el.get(b"sar"), codecs=el.get(b"codecs"),
              mime=el.get(b"mimeType"), asr=el.get(b"audioSamplingRate"))
-    r["bu"] = [trim(c.text) for c in el.children if c.local == b"BaseURL"]
-    r["cp"] = [content_protection(c) for c in el.children if c.local == b"ContentProtection"]
-    r["ach"] = [descriptor(c) for c in el.children if c.local == b"AudioChannelConfiguration"]
+    r["bu"] = [trim(c.text) for c in el.children if c.isd(b"BaseURL")]
+    r["cp"] = [content_protection(c) for c in el.children if c.isd(b"ContentProtection")]
+    r["ach"] = [descriptor(c) for c in el.children if c.isd(b"AudioChannelConfiguration")]
     r["sb"], r["sl"], r["st"] = seg_children(el, fl)
     return r
 
@@ -847,13 +913,13 @@ def adaptation_set(el, fl, tot):
     m = {b"Role": "role", b"Accessibility": "acc", b"AudioChannelConfiguration": "ach", b"SupplementalProperty": "supp",
          b"EssentialProperty": "ess"}
     for c in el.children:
-        if c.local == b"BaseURL":
+        if c.isd(b"BaseURL"):
             a["bu"].append(trim(c.text))
-        elif c.local in m:
+        elif c.local in m and c.isd(c.local):
             a[m[c.local]].append(descriptor(c))
-        elif c.local == b"ContentProtection":
+        elif c.isd(b"ContentProtection"):
             a["cp"].append(content_protection(c))
-        elif c.local == b"Representation":
+        elif c.isd(b"Representation"):
             if tot["rep"] >= LIM["max_representations"]:
                 raise Err("LimitExceeded", "reps")
             tot["rep"] += 1
@@ -865,10 +931,10 @@ def adaptation_set(el, fl, tot):
 def period(el, fl, tot):
     p = dict(id=el.get(b"id"), start=opt(el, b"start", lambda v: duration_us(v, fl)),
              dur=opt(el, b"duration", lambda v: duration_us(v, fl)), bss=opt(el, b"bitstreamSwitching", boolean))
-    p["bu"] = [trim(c.text) for c in el.children if c.local == b"BaseURL"]
+    p["bu"] = [trim(c.text) for c in el.children if c.isd(b"BaseURL")]
     p["as"] = []
     for c in el.children:
-        if c.local == b"AdaptationSet":
+        if c.isd(b"AdaptationSet"):
             if tot["as"] >= LIM["max_adaptation_sets"]:
                 raise Err("LimitExceeded", "as")
             tot["as"] += 1
@@ -880,6 +946,7 @@ def period(el, fl, tot):
 def mpd(root, fl):
     if root.local != b"MPD":
         raise Err("InvalidMpd", "root")
+    bind_ns(root, {b"xml": XML_NS})
     t = root.get(b"type")
     if t is not None and t not in (b"static", b"dynamic"):
         raise Err("InvalidMpd", "type")
@@ -896,13 +963,13 @@ def mpd(root, fl):
     m["bu"], m["loc"], m["utc"], m["periods"] = [], [], [], []
     tot = {"as": 0, "rep": 0}
     for c in root.children:
-        if c.local == b"BaseURL":
+        if c.isd(b"BaseURL"):
             m["bu"].append(trim(c.text))
-        elif c.local == b"Location":
+        elif c.isd(b"Location"):
             m["loc"].append(trim(c.text))
-        elif c.local == b"UTCTiming":
+        elif c.isd(b"UTCTiming"):
             m["utc"].append(descriptor(c))
-        elif c.local == b"Period":
+        elif c.isd(b"Period"):
             if len(m["periods"]) >= LIM["max_periods"]:
                 raise Err("LimitExceeded", "periods")
             m["periods"].append(period(c, fl, tot))
@@ -1458,10 +1525,12 @@ def w_desc(o, tag, ds):
 
 
 def w_cp(o, cps):
-    for (s, v, k, ps) in cps:
+    for (s, v, k, ps, pro) in cps:
         o.append("CP|%s|%s|%s|%d\n" % (qs(s), os_(v), os_(k), len(ps)))
         for x in ps:
             o.append("PSSH|%s\n" % qs(x))
+        for x in pro:
+            o.append("PRO|%s\n" % qs(x))
 
 
 def dump_structure(m):
@@ -1539,9 +1608,9 @@ def text_has_cr(m):
     for p in m["periods"]:
         texts += p["bu"]
         for a in p["as"]:
-            texts += a["bu"] + [x for cp in a["cp"] for x in cp[3]]
+            texts += a["bu"] + [x for cp in a["cp"] for x in cp[3] + cp[4]]
             for r in a["reps"]:
-                texts += r["bu"] + [x for cp in r["cp"] for x in cp[3]]
+                texts += r["bu"] + [x for cp in r["cp"] for x in cp[3] + cp[4]]
     return any(b"\r" in t for t in texts)
 
 

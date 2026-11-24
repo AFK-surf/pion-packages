@@ -1,13 +1,104 @@
 # Red-team audit: `packages/dash` v0.1.0 (ISO/IEC 23009-1 MPEG-DASH)
 
-Audited commit: `65e82e3` (`origin/feat/pkg-dash`). Auditor: independent red team (`RT-dash`).
-Nothing under `packages/dash/src`, the package tests, the package `README.md` or any repository-root file was
-changed; everything lives in `packages/dash/audit/`.
+Auditor: independent red team (`RT-dash`). Nothing under `packages/dash/src`, the package tests, the package
+`README.md` or any repository-root file is changed by the audit; everything lives in `packages/dash/audit/`.
 
 ```sh
 sh packages/dash/audit/run_audit.sh            # exit 1 while any P0 reproduces
 STRICT=1 sh packages/dash/audit/run_audit.sh   # exit 1 while any finding is open
 ```
+
+## Re-audit of `b9cd082` (`origin/feat/pkg-dash-fix`, "resolve all 15 red-team audit findings")
+
+**Verdict: NOT SIGNED.** All 15 original findings are closed, but the fix leaves one CPU amplification of the
+P0-1 class open (P1-6) and introduces a new one (P1-5). `STRICT=1 sh packages/dash/audit/run_audit.sh`:
+`EXIT=1`, 2 OPEN (P1-5, P1-6), 0 P0.
+
+| Status | Findings |
+| --- | --- |
+| Closed (red-team case passes in 4 modes, model / dos gates agree) | P0-1, P1-1, P1-2, P1-3, P1-4, P2-1 ... P2-10 |
+| **Open, new** | **P1-5** (introduced by the P2-9 fix), **P1-6** (CPU part of P0-1 not covered by the output budget) |
+
+Review of the full diff `cc29e80..b9cd082` (9 files, +2,240 / -960), file by file:
+
+- `xml_lexer.pion`: strict UTF-8 + `Char` pre-validation of the whole input (overlong, surrogates, > U+10FFFF,
+  U+FFFE / U+FFFF), global end-of-line handling, XML 1.0 5th-edition `Name` tables, `XMLDecl` only at offset 0 /
+  after the BOM with `VersionNum`, `EncodingDecl` (UTF-8 only), `SDDecl`, reserved `xml` PI targets, `]]>` in
+  character data, lower-case `&#x` only, references of any length, attribute-value normalisation, an explicit
+  heap stack instead of recursion (P1-4: 20,000 levels with `max_xml_depth = 1,000,000` now 0.02 s), Namespaces
+  in XML resolution with duplicate expanded-attribute detection. Correct; see P1-5 for the lookup cost.
+- `mpd.pion`: every element / attribute lookup is now namespace-qualified against the namespace of the root
+  `<MPD>`; `S@r < -1` rejected; `width` / `height` accept 0; `mspr:pro` collected. Correct.
+- `time.pion`: `+` on unsigned integers, no-zone date-times, `24:00:00` (only with zero minutes / seconds /
+  fraction), offsets up to `+-14:00`, `.` only in durations, `T` / `Z` upper case, unsigned rationals. Correct.
+- `resolve.pion`: RFC 3986 5.2 resolver (`split_uri_ref`, O(n) `remove_dot_segments`, rootless chains keep
+  leading `..`), `max_output_bytes` (64 MiB) checked before each segment and bounded template expansion, checked
+  segment numbers (an `Int64::MAX` last segment is now accepted), PTO in the `r="-1"` Period end, exact fractional
+  ticks, Period@start inference. Correct, except P1-6.
+- `format.pion`: values are validated (UTF-8 / `Char`, positive / non-negative integers, durations, rationals,
+  date-time strings, `S@d`, `S@r`) and CR is written as `&#13;`; `mspr:pro` written with its namespace. Correct.
+- `abr.pion`: every codec of a comma-separated `@codecs` list is matched. Correct.
+- `types.pion` / `README.md`: `max_output_bytes`, `ContentProtection.pro`; the per-type `Send` list in README.md
+  equals the `pionc check` probe (10 `Send`, 8 `!Send`, `move` into `spawn` works).
+
+Audit-side changes in this commit (the fix did not touch `audit/`, as required):
+
+- `diff/model.py` now resolves namespaces (Namespaces in XML 1.0) and models the P2-9 behaviour: DASH elements
+  are those in the namespace of the root `<MPD>`; elements with an undeclared prefix are foreign; DASH attributes
+  are unqualified (or qualified with the MPD namespace); `pssh` / `default_KID` in the cenc namespace or with the
+  conventional `cenc` prefix; `pro` in the PlayReady namespace or with the `mspr` prefix; duplicate expanded
+  attribute names are errors. It also dumps `PRO|` records; `compare.py` allows `mspr:pro` in `format_mpd` output.
+  Both points reported by the fixer were audit-side gaps, not package bugs.
+- 16 new named cases (namespaces, PlayReady PRO, `24:00` at a year end); random DRM now includes `mspr:pro`.
+- 3 new bombs: `b31` / `b32` (P1-6), `b33` (P1-5).
+
+Re-audit run (Darwin arm64, `pionc` Wave H-1 `1e609a5`):
+
+| Gate | Result |
+| --- | --- |
+| static | all 0; `Send` probe 10 / 8 = README.md |
+| unit | package 26/26 (README.md: 26); audit 26 pass, 0 open, 0 control failing |
+| cases | 27/27 in each of the 4 modes |
+| determinism | named 216, fuzz 2,000, API 387, `format_mpd` output, 26 bombs: 4 modes byte-identical |
+| model | named 216/216 and fuzz 2,000/2,000 conforming, API 387/387 conforming: 0 unexplained |
+| XML layer vs pyexpat | 2,193 agree, 2 known expat leniencies, 0 disagree |
+| `format_mpd` output | 742/742 accepted documents well-formed, DASH element names only |
+| dash-mpd-core | 725 both accept with identical shared fields; every other difference is dash-mpd-core leniency |
+| dos | 30 bombs in budget (P0-1 `b27` / `b28` / `b29` now 0.02-0.13 s, <= 183 MB; P1-4 `b30` 0.02 s); `b31` / `b32` / `b33` > 20 s (P1-5, P1-6) |
+| smoke | 4 x `2ce81a01...` = README.md; wasm32 213 / 206 KiB = README.md |
+| bench | 1.33x / 133.7 MB/s, SHA-256 `a3b2d125...` identical; alt corpus 1.34x (was 1.59x-1.67x before the fix) |
+| inject | 5/5 |
+
+### P1-5 (new, introduced by the P2-9 fix) namespace prefix lookup is linear in the number of in-scope bindings
+
+`xp_ns_lookup` (`src/xml_lexer.pion`) scans `ns_prefixes` backwards for every prefixed element and attribute.
+Within default limits a document can keep 62 levels x 255 `xmlns:` bindings = 15,810 bindings in scope and then
+use 1.5 M prefixed (unbound) attribute names: `b33` (15 MB) takes 65 s native `--release` (> 20 s budget in both
+native and wasm32); before the fix the same input parsed in 0.03 s. Fix direction: a map from prefix to its
+binding stack (O(1) lookup), or count `xmlns` declarations against a small budget.
+
+### P1-6 (residual of P0-1) `resolve_url` re-scans the whole BaseURL for every segment
+
+The output budget bounds bytes written, but `resolve_url(base, rel)` calls `split_uri_ref(base)` (a scan plus
+slices of the base) before it looks at `rel`, also when `rel` is absolute, so a long BaseURL costs O(|BaseURL|)
+per segment while each segment URL stays short: 1 MB BaseURL + `media="http://c/$Number$"` + 99,999 timeline
+segments (`b31`, 1 MB) takes 49 s native; the same with 99,999 absolute `SegmentURL@media` (`b32`, 4 MB) 48 s.
+Fix direction: split / normalise the base once per track (`pre_normalize_base_url` already exists) and resolve
+each segment against the parsed base, returning absolute references without touching the base.
+
+### INFO added by the re-audit
+
+- I-9 Undeclared prefixes are accepted (not namespace-well-formed): elements with them are ignored, `cenc:` /
+  `mspr:` are recognised by prefix even when undeclared or bound to another URI, the root namespace is not checked
+  against `urn:mpeg:dash:schema:mpd:2011`. Lenient and harmless for real manifests.
+- I-10 `README.md` does not list `max_output_bytes` among the `DashLimits` fields; the budget is per
+  `resolve_segments` call (per track), not per MPD.
+- I-11 `format_mpd` writes text values verbatim, so constructed `BaseURL` / `pssh` / `pro` values with leading or
+  trailing whitespace come back trimmed (values from `parse` are already trimmed).
+
+---
+
+# Original audit of `65e82e3` (`origin/feat/pkg-dash`)
 
 ## Summary
 

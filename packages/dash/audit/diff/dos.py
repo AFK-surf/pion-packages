@@ -80,6 +80,19 @@ def bombs():
     a("b29_dotdot_cpu", "P0-1: 1 MB BaseURL of '../' x 99,999 segments (resolve_url per segment)",
       doc(rep_tpl('<SegmentTemplate media="s$Number$"><SegmentTimeline><S d="1" r="99998"/></SegmentTimeline></SegmentTemplate>'),
           base="<BaseURL>" + "x/../" * 200000 + "</BaseURL>"), "P0-1")
+    # P1-6: per-segment work proportional to |BaseURL| that the output budget does not see (absolute media URLs)
+    a("b31_abs_media_cpu", "P1-6: 1 MB BaseURL, absolute media template, 99,999 segments",
+      doc(rep_tpl('<SegmentTemplate media="http://c/$Number$"><SegmentTimeline><S d="1" r="99998"/></SegmentTimeline></SegmentTemplate>'),
+          base="<BaseURL>http://h/" + "a" * 1000000 + "/</BaseURL>"), "P1-6")
+    a("b32_abs_list_cpu", "P1-6: 1 MB BaseURL, 99,999 absolute SegmentURL@media",
+      doc(rep_tpl('<SegmentList duration="1">' + '<SegmentURL media="http://c/s"/>' * 99999 + "</SegmentList>"),
+          base="<BaseURL>http://h/" + "a" * 1000000 + "/</BaseURL>"), "P1-6")
+    # P1-5: namespace prefix lookup is a linear scan over every in-scope binding
+    decl = " ".join('xmlns:p%d="urn:x:%d"' % (i, i) for i in range(255))
+    leaf = "<a " + " ".join('q:a%d=""' % i for i in range(250)) + "/>"
+    a("b33_ns_lookup_cpu", "P1-5: 62 levels x 255 xmlns bindings, 6,000 elements x 250 prefixed attributes (15 MB)",
+      "<MPD>" + "".join("<n%d %s>" % (l, decl) for l in range(62)) + leaf * (15000000 // len(leaf)) +
+      "".join("</n%d>" % l for l in reversed(range(62))) + "</MPD>", "P1-5")
     # P1-4: raised max_xml_depth
     a("b30_depth_limit_raised", "P1-4: 20,000 nested elements with max_xml_depth=1,000,000",
       "<MPD>" + "<a>" * 20000 + "</a>" * 20000 + "</MPD>", "P1-4", 1000000)

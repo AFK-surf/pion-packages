@@ -192,6 +192,24 @@ def named():
     a(("rep_empty_id", st('', '<AdaptationSet><Representation id="" bandwidth="1"/></AdaptationSet>')))
     a(("rep_no_bw", st('', '<AdaptationSet><Representation id="v"/></AdaptationSet>')))
     a(("ns_foreign_period", '<MPD %s xmlns:x="urn:x" type="static"><x:Period><AdaptationSet/></x:Period></MPD>' % NS))
+    # --- namespaces (Namespaces in XML 1.0) and PlayReady PRO
+    R1 = '<Representation id="v" bandwidth="1"/>'
+    a(("ns_foreign_attr", '<MPD %s xmlns:x="urn:x" type="static"><Period><AdaptationSet><Representation x:id="evil" id="v" bandwidth="1"/></AdaptationSet></Period></MPD>' % NS))
+    a(("ns_custom_prefix", '<m:MPD xmlns:m="urn:mpeg:dash:schema:mpd:2011" type="static"><m:Period id="p"><m:AdaptationSet><m:Representation id="v" bandwidth="1"/></m:AdaptationSet></m:Period></m:MPD>'))
+    a(("ns_mixed_default", '<MPD %s type="static"><Period xmlns="urn:other"><AdaptationSet/></Period><Period id="real"/></MPD>' % NS))
+    a(("ns_undeclare_default", '<MPD %s type="static"><Period><AdaptationSet xmlns="">%s</AdaptationSet></Period></MPD>' % (NS, R1)))
+    a(("ns_unbound_prefix_elem", '<MPD %s type="static"><y:Period/><Period id="ok"/></MPD>' % NS))
+    a(("ns_no_default_ns", '<MPD type="static"><Period id="p"><x:AdaptationSet xmlns:x="urn:x"/><AdaptationSet>%s</AdaptationSet></Period></MPD>' % R1))
+    a(("ns_dup_expanded_attr", '<MPD %s xmlns:a="urn:q" xmlns:b="urn:q" a:k="1" b:k="2"/>' % NS))
+    a(("ns_dup_unbound_attr", '<MPD %s a:k="1" b:k="2"/>' % NS))
+    a(("ns_dash_qualified_attr", '<MPD %s xmlns:d="urn:mpeg:dash:schema:mpd:2011" type="static"><Period d:id="qualified"/></MPD>' % NS))
+    a(("ns_xml_lang", st('', '<AdaptationSet xml:lang="fr" lang="en"/>')))
+    a(("ns_cenc_wrong_uri", '<MPD %s xmlns:cenc="urn:not-cenc" type="static"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:x" cenc:default_KID="k"><cenc:pssh>P</cenc:pssh></ContentProtection></AdaptationSet></Period></MPD>' % NS))
+    a(("ns_cenc_other_prefix", '<MPD %s xmlns:c="urn:mpeg:cenc:2013" type="static"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:x" c:default_KID="k"><c:pssh>P</c:pssh></ContentProtection></AdaptationSet></Period></MPD>' % NS))
+    a(("ns_cenc_undeclared", '<MPD %s type="static"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:x" cenc:default_KID="k"><cenc:pssh>P</cenc:pssh><pssh>Q</pssh></ContentProtection></AdaptationSet></Period></MPD>' % NS))
+    a(("mspr_pro_declared", '<MPD %s xmlns:mspr="urn:microsoft:playready" type="static"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95"><mspr:pro> UFJP </mspr:pro><mspr:pro>Q</mspr:pro><cenc:pssh>S</cenc:pssh></ContentProtection>%s</AdaptationSet></Period></MPD>' % (NS, R1)))
+    a(("mspr_pro_other_prefix", '<MPD %s xmlns:pr="urn:microsoft:playready" type="static"><Period><AdaptationSet><ContentProtection schemeIdUri="urn:x"><pr:pro>A</pr:pro></ContentProtection></AdaptationSet></Period></MPD>' % NS))
+    a(("dt_24_year_end", mpd('type="dynamic" availabilityStartTime="2024-12-31T24:00:00Z"', '<Period start="PT0S"/>')))
     a(("unknown_elements", mpd('type="static"', '<ProgramInformation><Title>t</Title></ProgramInformation><EventStream schemeIdUri="x"><Event/></EventStream>'
                                 '<Period><Foo><AdaptationSet/></Foo><AdaptationSet><Label>l</Label><Representation id="v" bandwidth="1"><SubRepresentation level="0"/></Representation></AdaptationSet></Period>')))
     return c
@@ -273,7 +291,8 @@ def rand_doc(R):
     def cp():
         return ch('<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" cenc:default_KID="%08x-0000-4000-8000-000000000000"/>' % R.randint(0, 1 << 31),
                   '<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"><cenc:pssh>AAAA%dBB==</cenc:pssh></ContentProtection>' % R.randint(0, 99),
-                  '<ContentProtection schemeIdUri="urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95" value="MSPR 2.0"><cenc:pssh> P%d </cenc:pssh><cenc:pssh>Q</cenc:pssh></ContentProtection>' % R.randint(0, 9))
+                  '<ContentProtection schemeIdUri="urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95" value="MSPR 2.0"><cenc:pssh> P%d </cenc:pssh><cenc:pssh>Q</cenc:pssh></ContentProtection>' % R.randint(0, 9),
+                  '<ContentProtection schemeIdUri="urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95" value="MSPR 2.0"><mspr:pro xmlns:mspr="urn:microsoft:playready">PRO%d=</mspr:pro></ContentProtection>' % R.randint(0, 9))
 
     codecs = ["avc1.4d401f", "avc1.640028", "av01.0.08M.08", "hvc1.1.6.L93.B0", "hev1.2.4.L120", "mp4a.40.2", "ec-3", "vp09.00.10.08",
               "mp4a.40.2,avc1.64001f", "avc1.4d401e, mp4a.40.5", "AVC1.42E01E", "avc10", "opus"]

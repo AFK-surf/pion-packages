@@ -396,7 +396,7 @@ def rust_reject_class(msg):
 # --------------------------------------------------------------- format_mpd output checks
 
 ALLOWED = {"MPD", "BaseURL", "Location", "UTCTiming", "Period", "AdaptationSet", "Representation", "Role", "ContentProtection",
-           "cenc:pssh", "Accessibility", "AudioChannelConfiguration", "SupplementalProperty", "EssentialProperty", "SegmentBase",
+           "cenc:pssh", "mspr:pro", "Accessibility", "AudioChannelConfiguration", "SupplementalProperty", "EssentialProperty", "SegmentBase",
            "SegmentList", "SegmentURL", "SegmentTemplate", "SegmentTimeline", "S", "Initialization"}
 
 
