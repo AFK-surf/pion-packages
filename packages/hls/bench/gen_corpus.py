@@ -69,7 +69,7 @@ def make_media_case(idx: int, seg_count: int, llhls: bool = False) -> str:
     if not llhls:
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD" if idx % 2 == 0 else "#EXT-X-PLAYLIST-TYPE:EVENT")
     else:
-        lines.append("#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=24.0,PART-HOLD-BACK=1.002,CAN-BLOCK-RELOAD=YES")
+        lines.append(f"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL={6 * td}.0,PART-HOLD-BACK=1.002,CAN-BLOCK-RELOAD=YES")
         lines.append("#EXT-X-PART-INF:PART-TARGET=0.334")
         if idx % 2 == 0:
             lines.append(f"#EXT-X-SKIP:SKIPPED-SEGMENTS={idx % 8}")
