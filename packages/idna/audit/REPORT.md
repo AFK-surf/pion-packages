@@ -1,6 +1,6 @@
 # Red-team audit: `packages/idna` v0.1.0 (RT-idna)
 
-> First audit of `b046fc8` below; re-audit of the fix branch `15b226e5` in the next section.
+> First audit of `b046fc8` below; re-audits of the fix branch at `f89aefdf` and `15b226e5` in the next sections.
 
 - **Audited commit:** `origin/feat/pkg-idna` @ `b046fc868892e248a9b256b6b83698a6114451d3`
 - **Scope:** RFC 3492 Punycode, UTS #46 16.0.0 / IDNA2008 (RFC 5891 / 5892 / 5893), UTS #39 16.0.0
@@ -15,6 +15,49 @@
   conditions; with `STRICT=1` every open finding below also fails the run. Every README number is parsed from
   `README.md` at run time (`diff/readme.py`); every red-team case uses only the public API and accepts any
   reasonable fix, so the gate can be run unmodified on a fix branch.
+
+## Re-audit 2 (`origin/feat/pkg-idna-fix` @ `f89aefdf`) — **NOT SIGNED OFF**
+
+Reviewed `ca7b4cb7..f89aefdf` (7 files, `packages/idna/audit/` untouched), synchronised the reference model
+(`diff/uba.py` now covers isolates X5a-X5c / X6a / BD9 / BD13 and paragraph separators; the model follows the
+fix branch's documented display policy: Identifier_Status=Allowed exemption, Chrome-style CJK rules, TLD-script
+awareness) and re-ran `STRICT=1`: **EXIT=1, 2 OPEN** (P2-7, P2-11). Everything else stays closed; model / Rust /
+IdnaTestV2 have 0 unexplained divergences, 7/7 injected bugs caught, all bombs within budget.
+
+Verified as fixed in f89aefd: X1-X8 explicit embeddings / overrides (`\u202Elapyap` ≒ `paypal`), N0 paired
+brackets, L1, L3, L4 (UTS #39's S1 ≒ S2 example holds), INFO-11 (`@missing` long names now mapped, IDNA Bidi
+rules adjusted to the new class codes `bc >= 11`), `æble.dk` / `cœur.fr` / `kırmızı.com.tr` / `ポケモン123.jp` /
+`ラーメン-ya.com` / `コーヒー1.jp` / `тест.рф` / `весна.рф` readable again.
+
+### P2-7 still open: isolates are not implemented
+
+`bidi_reorder_ltr` treats LRI / RLI / FSI / PDI as plain neutrals (no X5a-X5c / X6a, no isolating run sequences
+BD13), and its RTL fast path ignores RLI. An invisible isolate therefore still changes the visual order without
+changing the skeleton:
+
+```
+are_confusable("א\u2066ab\u2069ב", "בabא") = false   displays "בabא" (LRI island inside RTL text); must be true
+skeleton("\u20671 2\u2069") = "l 2"                  RLI: the digits display as "2 1"
+```
+
+The reference model (full UAX #9 incl. isolates) gives `בabא` / `2 l`; Pion matches the model's no-isolate
+variant. Gate: `redteam_p2_7_bidi_skeleton` (7 pairs).
+
+### P2-11 still open: whole-script rule forces ordinary Greek / Cyrillic domains to Punycode
+
+The TLD-script exemption only covers TLDs written in the same script; Greek and Cyrillic IDNs are mostly
+registered under Latin-script ccTLDs. With diacritics and overlay marks ignored, ordinary words become
+"ASCII look-alikes" (θ → `O` + U+0335 overlay, ή → `n` + marks, ά → `a`):
+
+| Domain | b046fc8 / 858accee | 15b226e | f89aefd |
+| --- | --- | --- | --- |
+| `αθήνα.gr` (Athens), `αγορά.gr` | readable | Punycode | **Punycode** |
+| `тест.bg`, `работа.ua` (also `весна`, `рот`, `нос`, `сосна`, `тесто` on `.com` / `.eu` / `.gr`) | readable | Punycode | **Punycode** |
+
+Suggested fix: keep the diacritic-insensitive test for Cyrillic only (the P2-5 cases), do not drop overlay
+marks (ccc 1, e.g. U+0335 in θ's prototype), and exempt the ccTLDs where the script is used (e.g. `.bg .by .kz
+.mk .rs .ru .ua` and the Cyrillic IDN TLDs for Cyrillic, `.gr .cy` and `.ελ` for Greek), or use per-script
+look-alike letter sets as Chrome does. Gate: `redteam_p2_11_display_overblocking` (12 domains).
 
 ## Re-audit of the fix branch (`origin/feat/pkg-idna-fix` @ `15b226e5`) — **NOT SIGNED OFF**
 

@@ -141,7 +141,13 @@ def named():
                   "b\u00fccher.de", "example.com", "EXAMPLE.COM", "\uff25\uff38\uff21\uff2d\uff30\uff2c\uff25\u3002\uff23\uff2f\uff2d",
                   "\u0939\u093f\u0928\u094d\u0926\u0940.\u092d\u093e\u0930\u0924", "\u0b87\u0ba8\u0bcd\u0ba4\u0bbf\u0baf\u0bbe",
                   "\u10e1\u10d0\u10e5\u10d0\u10e0\u10d7\u10d5\u10d4\u10da\u10dd.ge", "\u0570\u0561\u0575.am",
-                  "\u1797\u17b6\u179f\u17b6.kh", "\u3042\u3044\u3046\u4e00\u4e8c.jp", "\u5317\u4eac\u5927\u5b66.cn"])
+                  "\u1797\u17b6\u179f\u17b6.kh", "\u3042\u3044\u3046\u4e00\u4e8c.jp", "\u5317\u4eac\u5927\u5b66.cn",
+                  "\u00e6ble.dk", "c\u0153ur.fr", "k\u0131rm\u0131z\u0131.com.tr", "\u30dd\u30b1\u30e2\u30f3123.jp",
+                  "\u30b3\u30fc\u30d2\u30fc1.jp", "\u0442\u0435\u0441\u0442.\u0440\u0444", "\u03b1\u03b8\u03ae\u03bd\u03b1.gr",
+                  "\u03b1\u03b3\u03bf\u03c1\u03ac.gr", "\u0442\u0435\u0441\u0442.bg", "\u0440\u0430\u0431\u043e\u0442\u0430.ua"])
+    # UAX #9 isolates (outside the reference UBA's scope: INFO-10 / INFO-12)
+    add("bidi_iso", ["\u20671 2\u2069", "a\u2067b\u2069c", "\u2067lapyap\u2069", "\u05d0\u2066ab\u2069\u05d1",
+                     "\u2068\u05d0 1\u2069"])
     return cases
 
 

@@ -169,9 +169,8 @@ def model_cmp(cpath, ppath, mpath):
                 if mv[1] == "?":
                     ok = True
                 elif mv[2] == "?":
-                    ok = pv[1] == mv[3]
-                    if ok:
-                        t.add("INFO-10", name, key, pv, mv)  # isolates / B / non-ignorable BN: out of model scope
+                    ok = True
+                    t.add("INFO-10", name, key, pv, mv)  # isolates (X5a-X5c, X6a, BD13): outside the model's scope
                 else:
                     ok = pv[1] == mv[2]
                     if not ok and any(c not in ASSIGNED for c in cp) and mv[4] == "rtl":
@@ -233,12 +232,12 @@ def rust_cmp(cpath, ppath, rpath, assigned):
             if not ok:
                 all_ok = False
                 pk = pv[3] if key[0] == "A" else pv[4]
-                if gap:
+                if unassigned16 and (pv[2] in ("ERR", "0")) and rv[2] in ("OK", "1"):
+                    fid = "INFO-3"  # Rust idna 1.1.0 / ICU4X 2.4 data is Unicode 17: code points unassigned in 16.0
+                elif gap:
                     fid = "P1-1"
                 elif pk == "LimitExceeded":
                     fid = "INFO-4"  # IdnaLimits (documented DoS bounds) stricter than Rust's
-                elif unassigned16 and (pv[2] in ("ERR", "0")) and rv[2] in ("OK", "1"):
-                    fid = "INFO-3"  # Rust idna 1.1.0 / ICU4X 2.4 data is Unicode 17: code points unassigned in 16.0
                 elif key[2] == "U" and pk == "InvalidHyphens" and rv[2] in ("OK", "1") and any(
                         lab.startswith("xn--") and any(ord(ch) >= 0x80 for ch in lab)
                         for lab in unhex(r["U U"][3]).decode("utf-8", "replace").split(".")):

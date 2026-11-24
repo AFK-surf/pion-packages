@@ -478,7 +478,10 @@ def display(cps):
     if u[1] == a:
         return ("0", set(), a, a)
     reasons = set()
-    for lab in u[1].split("."):
+    labels = u[1].split(".")
+    tld = next((x for x in reversed(labels) if x), "")
+    tld_ids = scripts([ord(c) for c in tld])
+    for lab in labels:
         lc = [ord(c) for c in lab]
         if not lc:
             continue
@@ -490,16 +493,23 @@ def display(cps):
         ids = scripts(lc)
         if not _script_set_ok(ids):
             reasons.add("MixedScript")
+        # Chrome kDangerousPattern: slash look-alikes with no CJK neighbour; ー not after kana
         for k, c in enumerate(lc):
-            if c in CJK_SLASH and ((k > 0 and not _cjk_context(lc[k - 1])) or
-                                   (k + 1 < len(lc) and not _cjk_context(lc[k + 1]))):
+            if c in CJK_SLASH and c != 0x30FC and len(lc) > 1 and \
+                    not (k > 0 and _cjk_context(lc[k - 1])) and not (k + 1 < len(lc) and _cjk_context(lc[k + 1])):
+                reasons.add("MixedScript")
+            if c == 0x30FC and not (k > 0 and D.script.get(lc[k - 1], 0) in (6, 7)):
                 reasons.add("MixedScript")
         sk = skeleton_bidi(lc) or skeleton_bidi(lc, False)
         if any(c >= 0x80 for c in lc) and 2 not in ids and len(ids) == 1:
-            base = [c for c in sk if not D.is_mark(c)]
-            if base and all(c < 0x80 or c in SMALL_CAPS for c in base):
-                reasons.add("WholeScriptConfusable")
-        if any(c >= 0x80 for c in lc) and 2 in ids and len(ids) == 1:
+            if ids[0] in tld_ids:
+                if sk and all(c < 0x80 for c in sk):
+                    reasons.add("WholeScriptConfusable")
+            else:
+                base = [c for c in sk if not D.is_mark(c)]
+                if base and all(c < 0x80 or c in SMALL_CAPS for c in base):
+                    reasons.add("WholeScriptConfusable")
+        if any(c >= 0x80 and c not in D.id_allowed for c in lc) and 2 in ids and len(ids) == 1:
             if sk and all(c < 0x80 for c in sk):
                 reasons.add("WholeScriptConfusable")
     if reasons:

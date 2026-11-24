@@ -65,10 +65,10 @@ title() {
     P2-4) echo "transitional_processing: ẞ (mapped to the deviation ß) gives xn--fa-hia / DisallowedCodePoint, IdnaTestV2 wants fass" ;;
     P2-5) echo "whole-script confusable test needs a pure-ASCII skeleton: Cyrillic соӧр / ѕсһӧн displayed" ;;
     P2-6) echo "combining overlays U+0335..U+0338 displayed (google.com̸evil.com)" ;;
-    P2-7) echo "skeleton is not bidiSkeleton(LTR, X): no X1-X8 / N0 / L1 reordering, no L3 / L4 (UTS #39's own S1~S2 example fails)" ;;
+    P2-7) echo "skeleton is not bidiSkeleton(LTR, X): isolates (X5a-X5c / X6a / BD13) still missing on f89aefd" ;;
     P2-8) echo "numbering systems from merged Nd runs: U+116D0..116E3 (two systems) counted as one" ;;
     P2-9) echo "NFC of the whole domain runs before per-label limits: raised max_input_bytes -> quadratic before LimitExceeded" ;;
-    P2-11) echo "regression in 15b226e: legitimate domains forced to Punycode (æble.dk, cœur.fr, kırmızı, ポケモン123.jp, тест.рф)" ;;
+    P2-11) echo "legitimate domains forced to Punycode (15b226e regression; f89aefd still: αθήνα.gr, αγορά.gr, тест.bg, работа.ua)" ;;
     P2-10) echo "README.md claims not reproduced (Moderately Restrictive, IdnaTestV2 546/546, Send list, sizes, ...)" ;;
     *) echo "(see REPORT.md)" ;;
   esac
