@@ -8,6 +8,40 @@ sh packages/dash/audit/run_audit.sh            # exit 1 while any P0 reproduces
 STRICT=1 sh packages/dash/audit/run_audit.sh   # exit 1 while any finding is open
 ```
 
+## SIGN-OFF: `c320b86` (`origin/feat/pkg-dash-fix`)
+
+**`packages/dash` v0.1.0 at `c320b86` is signed off by the independent red team (`RT-dash`), 2026-11-24.**
+
+- Reviewed `a799893..c320b86` (P2-11, `src/resolve.pion` +7 / -2, `src/dash_test.pion` +11): `emptied_tail`
+  adds the RFC 3986 rule C `/` when a reference segment of its own is cancelled and nothing of the base directory
+  remains (`prefix_end == 0`, base not rootless). Checked by hand against 5.2.4 for `a/../b`, `a/..`, `../a/../b`,
+  `../b`, `a//..`, `x/..` and the directory case `urn:a/b`; the reference model agrees on all 225 named cases.
+- All 18 findings of this audit are closed: P0-1, P1-1 ... P1-6, P2-1 ... P2-11 (P2-12 never opened: README.md
+  claims reproduce).
+- Independent run on `c320b86` with the audit tree of this commit, Darwin arm64, `pionc` Wave H-1 `1e609a5`:
+  **`STRICT=1 sh packages/dash/audit/run_audit.sh` -> `EXIT=0`, 0 P0, 0 OPEN.**
+
+| Gate | Result on `c320b86` |
+| --- | --- |
+| static | all grep gates 0; `Send` probe 10 `Send` / 8 `!Send` = README.md per-type list |
+| unit | package 26/26 (README.md: 26); audit `pionc test` 27 pass, 0 open, 0 control failing |
+| cases | 28/28 (15 red-team + 13 control) in each of native debug / release, wasm32 debug / release |
+| determinism | named 225, fuzz 2,000, API 387, `format_mpd` output, 26 bombs: 4 modes byte-identical |
+| reference model | named 225/225, fuzz 2,000/2,000, API 387/387 conforming; 0 explained, 0 unexplained |
+| XML layer vs pyexpat | 2,208 agree, 2 known expat leniencies (`VersionNum`), 0 disagree |
+| `format_mpd` output | 719/719 accepted documents well-formed (pyexpat), DASH element names only |
+| dash-mpd-core =0.1.0 | every accept-set / field difference classified as dash-mpd-core leniency, 0 unexplained |
+| dos | 36/36 bombs within 20 s / 1 GiB on native and wasm32 (slowest `b33` ns-lookup 15 MB) |
+| smoke | 4 x `2ce81a01...` = README.md; wasm32 220 / 214 KiB = README.md |
+| bench | 1.39x / 129.3 MB/s, stdout SHA-256 `a3b2d125...` identical (README.md 1.31x / 131.13 MB/s); alt corpus 1.96x |
+| inject | 5/5 injected bugs caught by control cases |
+
+Not blocking, left as INFO for the release integration and later versions: I-1 ... I-11 below (first BaseURL
+only, `$SubNumber$`, ABR preference order, design choices of the model, negative-value padding, bench parity is a
+summary, dash-mpd-core leniency, repository-root `README.md` / `BENCHMARKS.md` / `catalog.json` not updated on the
+feature branch, undeclared prefixes accepted, `max_output_bytes` missing from the README.md `DashLimits` list,
+constructed text values with surrounding whitespace come back trimmed).
+
 ## Re-audit 3 of `57ecbbd` (`origin/feat/pkg-dash-fix`, P1-6 relative `../` variant)
 
 **Verdict: NOT SIGNED (one P2 left).** P1-6 is closed: `resolve_relative_path_parsed` splits the normalised base
