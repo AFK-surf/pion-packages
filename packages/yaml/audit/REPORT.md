@@ -2,7 +2,7 @@
 
 Prosecution brief against the Pion YAML 1.2 package. It is compared with **Rust `yaml-rust2 0.10.4`** and
 **Go `gopkg.in/yaml.v3 v3.0.1`**, all run on the same bytes and the same machine
-(`Darwin arm64`, Apple M-series, `tokyo-mac-studio-0`, 2026-11-23).
+(`Darwin arm64`, Apple M-series, Apple M5 Max (Darwin arm64), 2026-11-23).
 
 Nothing under `packages/yaml/src/**`, the existing tests or the repository root was modified. Everything
 lives in `packages/yaml/audit/`.

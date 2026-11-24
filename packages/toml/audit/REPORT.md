@@ -12,7 +12,7 @@ References used for every claim:
 | Go `BurntSushi/toml` | v1.6.0 | the toml-test authors' own implementation |
 | `toml-lang/toml-test` | **v2.2.0** (latest tag) | official compliance suite, run with its own harness (decoder **and** encoder) |
 
-Machine: `tokyo-mac-studio-0`, Apple M5 Max (18 cores, arm64 Darwin), pionc 0.1.0, cargo 1.100, go 1.27.3.
+Machine: Apple M5 Max (18 cores, Darwin arm64), pionc 0.1.0, cargo 1.100, go 1.27.3.
 The machine was shared with other jobs (load average 30-45). All benchmarks are interleaved
 `scripts/bench_compare.py` runs (warmup 1, 5 rounds, stdout SHA-256 identical across implementations);
 numbers are from the final clean `run_audit.sh` run, with the earlier exploratory run in brackets

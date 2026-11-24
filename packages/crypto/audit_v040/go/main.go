@@ -1,7 +1,7 @@
 // Red-team Go oracle for packages/crypto v0.4.0 (RT-crypto-v040): PBKDF2-HMAC-SHA256/512 + scrypt.
 //
 // References: golang.org/x/crypto/pbkdf2 and golang.org/x/crypto/scrypt v0.58.0 (byte values),
-// Go stdlib crypto/aes + crypto/cipher (the .mlogin.enc v1 AES-256-GCM envelope). The Node.js
+// Go stdlib crypto/aes + crypto/cipher (the scrypt + AES-256-GCM envelope). The Node.js
 // oracle (../node/oracle.mjs) recomputes every valid row with crypto.pbkdf2Sync / crypto.scryptSync
 // and checks the maxmem boundary rows against OpenSSL's EVP_PBE_scrypt memory rule.
 //
@@ -14,7 +14,7 @@
 //
 //	P256 / P512 pass salt iters dkLen
 //	SC   pass salt N r p dkLen maxmem      (maxmem "D" = scrypt() with its 256 MiB default)
-//	ML   pass salt16 N iv12 pt             (.mlogin.enc v1: scrypt(N, 8, 1, 32) + AES-256-GCM, empty AAD;
+//	ML   pass salt16 N iv12 pt             (scrypt + AES-256-GCM envelope: scrypt(N, 8, 1, 32) + AES-256-GCM, empty AAD;
 //	                                        maxmem 64 MiB for N <= 32768, scrypt() default above)
 //
 // Expected line: label \t result, result = lowercase hex | ERR:<CryptoError kind> | alternatives
@@ -213,7 +213,7 @@ func emitS(label string, pass, salt []byte, n, r, p, dk int64, maxmem string) {
 		goScrypt(pass, salt, n, r, p, dk, mm))
 }
 
-func mlogin(pass, salt []byte, n int64, iv, pt []byte) string {
+func sealEnvV1(pass, salt []byte, n int64, iv, pt []byte) string {
 	mm := defaultMaxMem
 	if n <= 32768 {
 		mm = 64 << 20
@@ -314,16 +314,16 @@ func gen(corpusPath, expectPath string) {
 			emitS(fmt.Sprintf("sc/%smaxmem/N%d_r%d_p%d_m%d", heavy, c[0], c[1], c[2], mm), []byte("pw"), []byte("NaCl"), c[0], c[1], c[2], 32, itoa(mm))
 		}
 	}
-	// .mlogin.enc v1 default write params under 64 MiB, and N=65536 must be refused under 64 MiB
-	emitS("sc/heavy/mlogin64/N32768", []byte("monoid-login-passphrase-2026!"), mustHex("0123456789abcdeffedcba9876543210"), 32768, 8, 1, 32, "67108864")
-	emitS("sc/mlogin64/N65536", []byte("monoid-login-passphrase-2026!"), mustHex("0123456789abcdeffedcba9876543210"), 65536, 8, 1, 32, "67108864")
-	emitS("sc/mlogin64/N131072", []byte("monoid-login-passphrase-2026!"), mustHex("0123456789abcdeffedcba9876543210"), 131072, 8, 1, 32, "67108864")
+	// scrypt + AES-256-GCM envelope default write params under 64 MiB, and N=65536 must be refused under 64 MiB
+	emitS("sc/heavy/env64/N32768", []byte("pion-kdf-test-passphrase-2026!"), mustHex("0123456789abcdeffedcba9876543210"), 32768, 8, 1, 32, "67108864")
+	emitS("sc/env64/N65536", []byte("pion-kdf-test-passphrase-2026!"), mustHex("0123456789abcdeffedcba9876543210"), 65536, 8, 1, 32, "67108864")
+	emitS("sc/env64/N131072", []byte("pion-kdf-test-passphrase-2026!"), mustHex("0123456789abcdeffedcba9876543210"), 131072, 8, 1, 32, "67108864")
 	// RFC 7914 §2: N < 2^(16 r)  (OpenSSL / Node.js refuse, Go x/crypto accepts)
 	for _, c := range [][2]int64{{32768, 1}, {65536, 1}, {131072, 1}, {65536, 2}} {
 		emitS(fmt.Sprintf("sc/nbound/N%d_r%d", c[0], c[1]), []byte("pw"), []byte("salt"), c[0], c[1], 1, 32, "D")
 	}
 
-	// .mlogin.enc v1 envelopes, N = 1024 .. 131072 (Node.js cross-checks every byte)
+	// scrypt + AES-256-GCM envelopes, N = 1024 .. 131072 (Node.js cross-checks every byte)
 	for i, n := range []int64{1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072} {
 		for j := 0; j < 2; j++ {
 			pass := pw(5+17*i+j, i+j)
@@ -334,7 +334,7 @@ func gen(corpusPath, expectPath string) {
 			if n >= 16384 {
 				label = fmt.Sprintf("ml/heavy/N%d_%d", n, j)
 			}
-			emit(label, "ML", []string{h(pass), h(salt), itoa(n), h(iv), h(pt)}, mlogin(pass, salt, n, iv, pt))
+			emit(label, "ML", []string{h(pass), h(salt), itoa(n), h(iv), h(pt)}, sealEnvV1(pass, salt, n, iv, pt))
 		}
 	}
 	// hostile scrypt parameters (each must be a clean Err, never panic / OOM / trap)
@@ -439,7 +439,7 @@ func bench(mode string, n int) int {
 		fmt.Printf("pbkdf2_sha256=%s\n", hex.EncodeToString(pbkdf2.Key(pass, salt, n, 32, sha256.New)))
 		return 0
 	case "scrypt":
-		pass := []byte("monoid-login-passphrase-2026!")
+		pass := []byte("pion-kdf-test-passphrase-2026!")
 		salt := mustHex("0123456789abcdeffedcba9876543210")
 		hh := sha256.New()
 		for i := 0; i < n; i++ {

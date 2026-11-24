@@ -30,7 +30,7 @@ wgsl::find_entry_point(compiled.reflection, "vs_main")
 
 ## Verification
 
-Measured at release (Wave 21, `tokyo-mac-studio-0`, Apple M5 Max, Darwin arm64, `pionc 0.1.0` self-hosted, warm `PION_CACHE_DIR`):
+Measured at release (Wave 21, Apple M5 Max (Darwin arm64), `pionc 0.1.0` self-hosted, warm `PION_CACHE_DIR`):
 
 - **Unit & compliance tests**: `sh scripts/verify.sh packages/wgsl` (20/20 passing).
 - **4-mode Wasm32 + Native determinism** (`packages/wgsl/wasm_smoke`): `native_dbg`, `native_rel`, `wasm_dbg` and `wasm_rel` each print `5,312 B` of byte-identical stdout (`sha256: e6cfe5f0fefe1503c736e7a303b5cf6e436b95d55e603f71bfacfe7a38ff9455`).

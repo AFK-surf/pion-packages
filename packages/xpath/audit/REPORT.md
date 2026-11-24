@@ -11,7 +11,7 @@ Nothing outside `packages/xpath/audit/` was changed (`src/`, `*_test.pion`, `ben
 | libxml2 (system, `XML_PARSE_NOCDATA`) | 2.9.13 | second differential oracle, extra bench baseline |
 | Python model of XPath §3.5/§4.2/§4.4 | `diff/gen_corpus.py` (`xp_number`, `xp_string`, `xp_round`, `math.fmod`) | ground truth for 2,700 number-fuzz queries |
 
-Machine: `tokyo-mac-studio-0`, Apple Silicon arm64 Darwin, `pionc 0.1.0` (`AFK-surf/pion@66d2b4b`),
+Machine: Apple M5 Max (Darwin arm64), Apple Silicon arm64 Darwin, `pionc 0.1.0` (`AFK-surf/pion@66d2b4b`),
 node 24.22 (wasm32 runtime), shared machine. Benchmarks are interleaved `scripts/bench_compare.py`
 runs (warmup 1, 5 rounds, stdout SHA-256 identical across implementations).
 

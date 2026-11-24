@@ -2,7 +2,7 @@
 
 Target: `origin/feat/pkg-wgsl` @ `f1bb2c4` (pure Pion WGSL lexer / parser / validator / reflection, MSL 2.x and GLSL ES 3.00 / 450 backends, `v0.1.0`): `src/{types,lexer,parser,validate,msl,glsl,lib}.pion`, `bench/`, `wasm_smoke/`.
 Judges: Rust `naga =24.0.0` (`diff/naga`, same version the package bench pins) for WGSL validity; Apple `xcrun -sdk macosx metal -std=macos-metal2.4` (metalfe-32023.921.6) for MSL; `glslangValidator` 16.6.0 for GLSL; and the **local Metal GPU** (Apple M5 Max, `gpu/gpurun.swift`) for runtime semantics, where every compute case runs twice, once from packages/wgsl's MSL and once from naga's MSL with the same slot map, against the result the WGSL spec requires.
-Machine: Darwin arm64 (tokyo-mac-studio-0), `pionc 0.1.0`, node v24.22.2, cargo 1.100.0.
+Machine: Apple M5 Max (Darwin arm64), `pionc 0.1.0`, node v24.22.2, cargo 1.100.0.
 
 Reproduce: `sh packages/wgsl/audit/run_audit.sh` (about 25 s hot, first run adds the cargo build and the glslang download; sections `build portability selftest unit judge gpu dos fuzz bench`, e.g. `run_audit.sh gpu` after one `build`). Artifacts go to `$AUDIT_OUT` (default `/private/tmp/pion-wgsl-audit`); nothing is written inside the repository. **The script exits non-zero while any finding below is open.** A fix is complete when `run_audit.sh` prints `AUDIT RESULT: PASS` with `audit/` byte-for-byte unchanged.
 

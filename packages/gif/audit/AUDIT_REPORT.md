@@ -2,7 +2,7 @@
 
 Target: `origin/feat/pkg-gif` @ `2599585` (pure Pion GIF87a/GIF89a decoder, `v0.1.0`): `src/{types,lzw,decoder}.pion`, `bench/`, `wasm_smoke/`.
 Reference: Go `image/gif` + `compress/lzw` (go1.27.3) with a browser-semantics compositor (`diff/go/main.go`), plus an independent Pion reference compositor (`src/build.pion::rt_ref_composite`) for cases Go rejects (clipping, out-of-range indices).
-Machine: Darwin arm64 (tokyo-mac-studio-0), `pionc 0.1.0`, node v24.22.2.
+Machine: Apple M5 Max (Darwin arm64), `pionc 0.1.0`, node v24.22.2.
 
 Reproduce: `sh packages/gif/audit/run_audit.sh` (about 6 min; sections `build selftest unit diff fuzz dos wasm_dos portability bench`, e.g. `run_audit.sh dos` after one `build`). Artifacts go to `$AUDIT_OUT` (default `/private/tmp/pion-gif-audit`); nothing is written inside the repository. **The script exits non-zero while any finding below is open.** A fix is complete when `run_audit.sh` prints `AUDIT PASS` with `audit/` byte-for-byte unchanged.
 

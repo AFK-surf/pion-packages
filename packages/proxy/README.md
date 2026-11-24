@@ -1,6 +1,6 @@
 # `proxy` — Pure-Pion Zero-Dependency Sans-IO Proxy Protocol & URL Redaction Library
 
-Pure-Pion, zero-dependency, `World`-free, `Send`-clean (zero module-level mutable state) implementation of **RFC 1928 / RFC 1929 (SOCKS5)**, **RFC 9110 / RFC 9112 (HTTP `CONNECT` & Plaintext HTTP Forward Proxy)**, and **Proxy URL Parsing with Mandatory Credential Redaction & `NO_PROXY` Matching** — designed for both Native and `wasm32` targets (including desktop local `127.0.0.1` proxy bridges such as `AFK-surf/monoid-login`).
+Pure-Pion, zero-dependency, `World`-free, `Send`-clean (zero module-level mutable state) implementation of **RFC 1928 / RFC 1929 (SOCKS5)**, **RFC 9110 / RFC 9112 (HTTP `CONNECT` & Plaintext HTTP Forward Proxy)**, and **Proxy URL Parsing with Mandatory Credential Redaction & `NO_PROXY` Matching** — designed for both Native and `wasm32` targets (including desktop local `127.0.0.1` proxy bridges).
 
 ## Capabilities & Security Guarantees
 
@@ -91,7 +91,7 @@ SHA-256: `96dfab9a281eb5f28ff90fb48fce58432871efa657702e23f02b67803167b7bb`
 
 ### W2: SOCKS5 Full Bidirectional Handshake (`UserPass` + `ATYP=0x03`, `500,000` rounds)
 
-SHA-256: `bd5d0f40fb590fb8256a99a89e1416f98ce0358b6eb65c6a4acaed42b61f51d7`
+SHA-256: `043478854b0465b542b83ad885a551d7dd5f70d5e476d1fec0873c3177677406`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_ref`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -100,7 +100,7 @@ SHA-256: `bd5d0f40fb590fb8256a99a89e1416f98ce0358b6eb65c6a4acaed42b61f51d7`
 
 ### W3: HTTP `CONNECT` + Plaintext Forward-Proxy Header Sanitization (`100,000` requests)
 
-SHA-256: `88bc1dee6f226e2b2f0f26caa4449beee6cec65b48a2d12b920e94d6fbc0c800`
+SHA-256: `97be02e5339025ac08b10c28d61c1e0682b6c61f56535a43991fcbc8c8fd049a`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_net_http`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

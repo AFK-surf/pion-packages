@@ -86,7 +86,7 @@ Every check below is reproducible with `sh packages/flate/audit/run_audit.sh all
 
 ## Multi-Shape Benchmarks
 
-Measured via `sh packages/flate/audit/run_audit.sh bench` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification where compress modes re-decompress and print output length + CRC-32 so a broken encoder cannot win) on `Darwin arm64` (`tokyo-mac-studio-0`) against **Rust `flate2 1.1.11` (`rust_backend` / `miniz_oxide`, `--release`)** and **Go `go1.27.3` `compress/gzip` + `hash/{crc32,adler32}`**.
+Measured via `sh packages/flate/audit/run_audit.sh bench` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification where compress modes re-decompress and print output length + CRC-32 so a broken encoder cannot win) on Apple M5 Max (`Darwin arm64`) against **Rust `flate2 1.1.11` (`rust_backend` / `miniz_oxide`, `--release`)** and **Go `go1.27.3` `compress/gzip` + `hash/{crc32,adler32}`**.
 
 ### 1. Throughput Across 6 Real & Pathological Corpora (MB/s)
 

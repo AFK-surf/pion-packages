@@ -344,7 +344,7 @@ func benchPbkdf2Sha256() int {
 }
 
 func benchScrypt() int {
-	pass := []byte("monoid-login-passphrase-2026!")
+	pass := []byte("pion-kdf-test-passphrase-2026!")
 	salt, err := hex.DecodeString("0123456789abcdeffedcba9876543210")
 	if err != nil {
 		return 1

@@ -16,7 +16,7 @@ CASES = [
         "resp_time": T0,
         "lookup_time": T0 + 120,
         "status": 200,
-        "req_h": [("accept-encoding", "gzip, deflate, br"), ("user-agent", "Farview/1.0")],
+        "req_h": [("accept-encoding", "gzip, deflate, br"), ("user-agent", "PionBrowser/1.0")],
         "resp_h": [
             ("date", "Tue, 14 Nov 2023 22:13:20 GMT"),
             ("cache-control", "public, max-age=31536000, immutable"),

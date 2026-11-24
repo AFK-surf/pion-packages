@@ -3,7 +3,7 @@
 Branch `audit/redteam-template`, forked from `origin/feat/pkg-template` @ `e7d8411`. Only
 `packages/template/audit/**` is added; the package source is untouched.
 
-Machine: Darwin arm64 (tokyo-mac-studio-0), `pionc 0.1.0`, rustc stable, node (wasm32 runner
+Machine: Apple M5 Max (Darwin arm64), `pionc 0.1.0`, rustc stable, node (wasm32 runner
 `~/.pion/share/pion/pion_wasm_rt.mjs`). Reference: `minijinja = "=3.1.0"` with features
 `builtins json preserve_order urlencode loop_controls fuel` (`audit/diff/rust`).
 

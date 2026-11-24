@@ -245,13 +245,13 @@ fn enc_width(imp: &str, data: &[u8], ec: char) -> Result<usize, ()> {
 fn cmd_bench(mode: &str, imp: &str, arg: usize) {
     let s = |x: &str| x.as_bytes().to_vec();
     let (inputs, ecs, rounds): (Vec<Vec<u8>>, &str, usize) = match mode {
-        "w1" | "w3" => (
+        "w1" => (
             vec![
-                s("https://still.fail/o/01m3hng540559hjg7h4rcww0te/chat"),
+                s("https://example.com/o/01examp1e2a3b4c5d6e7f8g9h0/chat"),
                 s("otpauth://totp/acme:alice@example.com?secret=jbswy3dpehpk3pxp&issuer=acme"),
                 s("https://github.com/afk-surf/pion-packages/tree/main/packages/qrcode"),
-                s("otpauth://totp/stillfail:bob@example.org?secret=mfrggzdfmztwq2lk&digits=6"),
-                s("https://console.still.fail/device/activate?token=k9x4m2p7q1w8"),
+                s("otpauth://totp/example:bob@example.org?secret=mfrggzdfmztwq2lk&digits=6"),
+                s("https://console.example.com/device/activate?token=a1b2c3d4e5f6"),
             ],
             "MQQMM",
             2000,
@@ -306,7 +306,7 @@ fn main() {
         Some("cw") => cmd_cw(&a[2]),
         Some("bench") => cmd_bench(&a[2], &a[3], a.get(4).map(|x| x.parse().unwrap()).unwrap_or(0)),
         _ => {
-            eprintln!("usage: oracle_rust enc|dec <tsv> | bench <w1|w2|w3|real|dp> <qrcode014|qrcodegen|fast_qr> [n]");
+            eprintln!("usage: oracle_rust enc|dec <tsv> | bench <w1|w2|real|dp> <qrcode014|qrcodegen|fast_qr> [n]");
             std::process::exit(2)
         }
     }

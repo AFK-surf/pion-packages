@@ -2,7 +2,7 @@
 
 - **Target**: `AFK-surf/pion-packages` `origin/main` `7a40e8f`, `packages/texmath` (`src/**` and the existing tests are unchanged).
 - **Reference**: npm `katex@latest` = **0.19.1** (the same version the README names), Node v24.22.2.
-- **Host**: `tokyo-mac-studio-0`, Apple M5 Max, Darwin arm64, `pionc 0.1.0 (arm64_apple, self-hosted)`.
+- **Host**: Apple M5 Max (Darwin arm64), `pionc 0.1.0 (arm64_apple, self-hosted)`.
 - **Scope**: everything below comes from running both implementations on the same input. No claim rests on reading code alone. Where code is quoted, it only explains a behaviour that was already measured.
 
 ## How to reproduce
@@ -176,7 +176,7 @@ Reference: KaTeX's own `__renderToHTMLTree` root height and depth (KaTeX's imple
 | `\overset{!}{=}` (display) | 1.153 / 0.000 | 1.053 / **−0.133** | **negative depth** (invalid box) |
 | `\underset{n}{\to}` | 0.367 / 0.700 | 0.367 / 0.368 | −0.33 |
 
-The existing `layout_test.pion` checks only loose invariants ("width in (0.5, 0.7)", "sqrt bounds exceed radicand"). None of these errors trips it. A native Invar/mbui renderer using this IR would draw visibly misplaced accents, too-small delimiters and clipped radicals.
+The existing `layout_test.pion` checks only loose invariants ("width in (0.5, 0.7)", "sqrt bounds exceed radicand"). None of these errors trips it. A native GPU UI renderer using this IR would draw visibly misplaced accents, too-small delimiters and clipped radicals.
 
 ### P2-2 wasm32 (the browser target) is slower than KaTeX and uses 9x the memory
 Same 500-formula corpus ×20 as the README, same Node, `bench_compare.py --warmup 1 --rounds 5`, SHA-256 identical:

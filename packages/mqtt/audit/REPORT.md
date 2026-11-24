@@ -2,7 +2,7 @@
 
 - 审计对象：`origin/feat/pkg-mqtt` `c850403e0763d72ca904ff82110d8d9256192e26` 的 `packages/mqtt/src/**`（只读，本分支只新增 `packages/mqtt/audit/**`）
 - 对照：OASIS MQTT 3.1.1 / 5.0 规范；Go `github.com/eclipse/paho.golang/packets v0.23.0`（只支持 5.0）；Rust `rumqttc 0.25.1`（`mqttbytes::v4` 与 `v5`）
-- 工具链：`pionc 0.1.0`（`AFK-surf/pion@79d1fbd`，arm64_apple）、go 1.27.3、cargo 1.100.0；Darwin arm64（tokyo-mac-studio-0）
+- 工具链：`pionc 0.1.0`（`AFK-surf/pion@79d1fbd`，arm64_apple）、go 1.27.3、cargo 1.100.0；Apple M5 Max (Darwin arm64)
 - 复现：`sh packages/mqtt/audit/run_audit.sh`（产物和缓存都放在 `/tmp/rt-mqtt-*`，跑完工作区仍干净）
 
 ## 0. 结论

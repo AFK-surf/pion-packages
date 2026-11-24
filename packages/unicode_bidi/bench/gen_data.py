@@ -8,7 +8,7 @@ def gen_pure_ltr(path: str, count: int) -> None:
         "The quick brown fox jumps over the lazy dog 0123456789 (standard ASCII text).",
         "HTTP/1.1 200 OK; Content-Type: text/html; charset=utf-8; X-Request-Id: req-9876543210",
         "fn compute_layout(width: f64, height: f64) -> Result[Rect, Error] { Ok(Rect::new(0, 0, width, height)) }",
-        "中文与英文混合排版测试 2026-11-23 Farview Browser Engine pure Pion layout pipeline.",
+        "中文与英文混合排版测试 2026-11-23 Pion Browser Engine pure Pion layout pipeline.",
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.",
     ]
     with open(path, "w", encoding="utf-8") as f:

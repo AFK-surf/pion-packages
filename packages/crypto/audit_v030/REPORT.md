@@ -4,7 +4,7 @@
 | --- | --- |
 | Target | `origin/feat/crypto-v030` @ `fc168c0` (`src/aes_gcm.pion`, the v0.3.0 additions to `src/p256.pion`, the new benchmarks and README claims) |
 | Reference | Go 1.27.3 stdlib: `crypto/aes` + `cipher.NewGCMWithNonceSize`, `crypto/ecdh.P256()`, `crypto/elliptic.UnmarshalCompressed`; NIST SP 800-38D; SEC 1 v2 §2.3.3–2.3.4; Wycheproof attack classes |
-| Toolchain | `pionc` 0.1.0 (`AFK-surf/pion@66d2b4b`), node + `pion_wasm_rt.mjs`, `darwin/arm64` (`tokyo-mac-studio-0`, Apple M5 Max) |
+| Toolchain | `pionc` 0.1.0 (`AFK-surf/pion@66d2b4b`), node + `pion_wasm_rt.mjs`, `darwin/arm64` (Apple M5 Max (Darwin arm64)) |
 | Reproduce | `sh packages/crypto/audit_v030/run_audit.sh` (≈2–4 min; artefacts in `/private/tmp/rt-crypto-v030-*`, the worktree stays clean) |
 | Changes | Only `packages/crypto/audit_v030/**`; nothing else in the repository was touched |
 
@@ -23,7 +23,7 @@ passes, the SSA constant-time gate passes, and 10 / 10 re-created bug classes ar
 (so the clean result is not an artefact of weak tests). `run_audit.sh` exits 1 only because of P2-1; a
 fix branch that raises the benchmark iteration counts reruns it unchanged to `exit 0`.
 
-Gate summary (`run_audit.sh all` on `tokyo-mac-studio-0` at load average ≈ 30; timings vary with load, the verdicts did not across 3 runs):
+Gate summary (`run_audit.sh all` on Apple M5 Max (Darwin arm64) at load average ≈ 30; timings vary with load, the verdicts did not across 3 runs):
 
 ```
 GATE tests: PASS      84/84 (8 audit controls + the package's 76)

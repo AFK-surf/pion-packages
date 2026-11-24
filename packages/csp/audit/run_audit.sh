@@ -15,7 +15,6 @@
 #
 # Needs pionc ($HOME/.pion/bin), node (wasm32 runtime + reference), cargo (bench), python3.
 # Every build artefact goes to $AUDIT_OUT (default /private/tmp/rt_csp_work), never into git.
-# Do NOT use `sample`/`lldb` on tokyo-mac-studio-0 (no Developer Mode: they hang).
 set -eu
 
 AUDIT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

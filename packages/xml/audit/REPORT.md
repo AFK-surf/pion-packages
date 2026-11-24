@@ -10,7 +10,7 @@ Nothing outside `packages/xml/audit/` was changed.
 | W3C XML Conformance Test Suite | `xmlts20130923` | 1,662 XML 1.0 5th-ed. + Namespaces 1.0 cases (`ENTITIES="none"`, UTF-8 only) |
 | roxmltree's own `tests/files` | 0.21.2 | 92 upstream oracle documents |
 
-Machine: `tokyo-mac-studio-0`, Apple M5 Max (18 cores, arm64 Darwin), pionc 0.1.0, cargo 1.100, node 24.22.
+Machine: Apple M5 Max (18 cores, Darwin arm64), pionc 0.1.0, cargo 1.100, node 24.22.
 The machine was shared (load average 12-16). Benchmarks are interleaved `scripts/bench_compare.py`
 runs (warmup 1, 5 rounds, stdout SHA-256 identical across implementations). Conclusions rely only on
 gaps far larger than run-to-run spread.

@@ -5,7 +5,7 @@
 - Go [`google.golang.org/protobuf`](https://pkg.go.dev/google.golang.org/protobuf) **v1.36.6**：`protowire`、`dynamicpb`、`protojson`。`.proto` 编译用 [`bufbuild/protocompile`](https://github.com/bufbuild/protocompile) **v0.14.1**，它的检查规则与 protoc 一致。
 - Rust [`prost`](https://crates.io/crates/prost) **=0.13.5**（`--release`）。prost 没有动态反射，所以只参与线格式三方对拍。
 
-环境：`tokyo-mac-studio-0`（Darwin arm64，`pionc 0.1.0` @ `AFK-surf/pion@8d110a3`，node 跑 wasm32），2026-11-23。整机同时有其他负载，时间请看同一轮交替运行得出的**倍率**，绝对值仅作参考。
+环境：Apple M5 Max (Darwin arm64，`pionc 0.1.0` @ `AFK-surf/pion@8d110a3`，node 跑 wasm32），2026-11-23。整机同时有其他负载，时间请看同一轮交替运行得出的**倍率**，绝对值仅作参考。
 
 ## 一键复现
 
