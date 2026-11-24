@@ -84,6 +84,8 @@ PACKAGE_META = {
                ["effect", "fiber", "concurrency", "scheduler", "async", "runtime", "simulation", "并发"]),
     "email": ("web-net", "RFC 5322 email headers, MIME tree build/extract, DKIM sign/verify and mbox",
               ["email", "rfc5322", "mime", "dkim", "mbox", "smtp", "mail", "邮件"]),
+    "encoding": ("data-formats", "WHATWG Encoding Standard codec (all 40 encodings: UTF-8/16, GB18030, Shift_JIS, Big5, EUC-KR, streaming)",
+                 ["encoding", "charset", "whatwg", "textdecoder", "utf16", "gb18030", "shift-jis", "big5", "euc-kr", "字符编码"]),
     "exif": ("media-graphics", "TIFF/EXIF 2.32 metadata and orientation parser for JPEG, WebP, PNG and raw TIFF",
              ["exif", "tiff", "jpeg", "metadata", "orientation", "gps", "photo", "照片元数据"]),
     "flate": ("compression-archive", "DEFLATE, zlib and gzip compress/decompress with CRC-32/Adler-32 and zip-bomb limits",
