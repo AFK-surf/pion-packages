@@ -220,3 +220,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 - **Upstream**: `hyph-utf8` / `ushyphmax.tex`
 - **Copyright**: Copyright (C) 1990, 2004, 2005 Gerard D.C. Kuiken
 - **License**: Permissive license with attribution preserved in file header (`packages/hyphenation/src/en_us_data.pion`).
+
+### Mozilla Public Suffix List (`packages/cookie/src/psl_data.pion`, `packages/cookie/audit/psl/`)
+- **Upstream**: `publicsuffix/list` @ `763a4c200052` (`public_suffix_list.dat`; audit vectors `tests/test_psl.txt` @ `6ca11f5`, pinned with sha256 in `packages/cookie/audit/psl/PINNED`)
+- **Copyright**: Mozilla Foundation and Public Suffix List contributors
+- **License**: Mozilla Public License 2.0 (MPL-2.0), https://mozilla.org/MPL/2.0/; MPL-2.0 headers are kept in each file, and the embedded rule table holds the same 10,472 rules re-sorted for O(log N) lookup
