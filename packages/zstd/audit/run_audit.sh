@@ -110,12 +110,15 @@ static() {
   echo "  Double / Float: $n"; [ "$n" = 0 ] || fail "floating point in src"
   n=$(printf '%s\n' "$SRC" | grep -cE '\bpanic\(|\babort\(|\.unwrap\(\)')
   echo "  panic / abort / unwrap in src: $n"; [ "$n" = 0 ] || fail "panic path in src"
-  n=$(cat "$README" "$PKG_DIR"/src/*.pion "$PKG_DIR"/*.pion "$PKG_DIR"/bench/*.sh "$PKG_DIR"/bench/*.py "$PKG_DIR"/bench/*/src/* "$PKG_DIR"/wasm_smoke/src/* |
-    grep -ciE 'tokyo|pvg-office|afk-ap|gt1|gt2|office-host|mac-studio|stillfail|/Users/|/home/')
-  echo "  internal machine names / paths in README, src, tests, bench, wasm_smoke: $n"; [ "$n" = 0 ] || fail "internal names"
-  # (the two scan commands themselves are excluded: they have to spell the patterns)
+  # host names: this machine's short and full name, plus any extra regex in $AUDIT_FORBIDDEN_NAMES (nothing is
+  # hard-coded, so the public repository never spells an internal host); personal paths: /Users/ and /home/
+  pat='/Users/|/home/'
+  for h in "$(hostname -s 2> /dev/null)" "$(hostname 2> /dev/null)"; do [ -n "$h" ] && pat="$pat|$h"; done
+  [ -n "${AUDIT_FORBIDDEN_NAMES:-}" ] && pat="$pat|$AUDIT_FORBIDDEN_NAMES"
+  n=$(cat "$README" "$PKG_DIR"/src/*.pion "$PKG_DIR"/*.pion "$PKG_DIR"/bench/*.sh "$PKG_DIR"/bench/*.py "$PKG_DIR"/bench/*/src/* "$PKG_DIR"/wasm_smoke/src/* | grep -ciE "$pat")
+  echo "  host names (this machine, \$AUDIT_FORBIDDEN_NAMES) / personal paths in README, src, tests, bench, wasm_smoke: $n"; [ "$n" = 0 ] || fail "internal names"
   n=$(cat "$AUDIT_DIR"/REPORT.md "$AUDIT_DIR"/run_audit.sh "$AUDIT_DIR"/diff/*.py "$AUDIT_DIR"/src/*.pion "$AUDIT_DIR"/*.pion "$AUDIT_DIR"/diff/rust/src/* |
-    grep -v "grep -ciE" | grep -ciE 'tokyo|pvg-office|afk-ap-pool|office-host|mac-studio|/Users/|/home/')
+    grep -v -e 'pat=' -e 'personal paths' | grep -ciE "$pat")
   echo "  internal machine names / paths in audit/: $n"; [ "$n" = 0 ] || fail "internal names in audit/"
   grep -q '"zstd"' "$ROOT_DIR/catalog.json" 2> /dev/null ||
     info "root catalog.json / README.md / BENCHMARKS.md / index/ do not list zstd yet (release integration, not this branch)"

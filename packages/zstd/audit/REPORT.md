@@ -279,6 +279,11 @@ end, the box had just rebooted), `pionc 0.1.0` (amd64_sysv), node v24.22.1, zstd
 ==> summary    P0 conditions: none   OPEN: 0   STRICT=1   EXIT=0
 ```
 
+Follow-up (same day): the host-name scan of the `static` gate no longer spells any host name in this public
+repository; it checks this machine's own `hostname -s` / `hostname`, personal home-directory paths and an optional
+`$AUDIT_FORBIDDEN_NAMES` regex. `STRICT=1 sh packages/zstd/audit/run_audit.sh static` on the committed tree →
+`EXIT=0`; the other gates are unchanged.
+
 Default mode differs from `STRICT=1` only in how OPEN findings count; with 0 OPEN and no P0 condition it exits 0
 as well (its `static` section was re-run separately on the same tree: `EXIT=0`). `scripts/verify.sh` ran with
 `--allow-dirty` because the run directory is a synced copy without git metadata; in this git checkout the audit
