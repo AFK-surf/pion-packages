@@ -9,7 +9,51 @@ sh packages/structured_fields/audit/run_audit.sh            # exit 1 while any P
 STRICT=1 sh packages/structured_fields/audit/run_audit.sh   # exit 1 while any P0 / P1 / P2 finding is open
 ```
 
-## Verdict: NOT SIGNED (2 open P2, 0 P0, 0 P1)
+## SIGN-OFF: `aae61ca` (`origin/feat/pkg-structured-fields-fix`)
+
+**`packages/structured_fields` v0.1.0 at `aae61ca` is signed off by the independent red team (`RT-sfv`),
+2026-11-24.**
+
+- **Diff reviewed:** `4b6fb16..aae61ca`, every line. It touches only `README.md`, `src/parser.pion`,
+  `src/serializer.pion` and `structured_fields_test.pion`. `audit/` is unchanged, byte for byte.
+  - **P2-1, closed.** The two trailing-HTAB checks at the end of `parse_list_with_limits` and
+    `parse_dictionary_with_limits` are removed. Item parsing is unchanged, so `"1\t"` and `"\t1"` still fail, as
+    do leading HTABs on every type.
+  - **P2-2, closed.** `write_params` and `serialize_dictionary_with_limits` now return
+    `SfvError::InvalidKey("duplicate ... key")` for a repeated key. Up to 8 keys are compared pairwise; above that a
+    `Map` is used, so the check is O(n). `write_params` also covers item parameters, inner-list parameters and
+    parameters on inner-list items, because all of them go through `write_params`. A new key can only make
+    serialization fail, never produce different output, and the duplicate check runs before any byte is written.
+  - **README.md** now states the corrected whitespace rule and the duplicate-key rejection. It also covers I-2
+    (callers must validate origins) and I-3 (an empty List / Dictionary means leaving the header out). The
+    `wasm_smoke` sizes were updated and reproduce exactly.
+  - **Package tests.** Three old `expect_*_fail(".. \t")` assertions now assert the RFC behaviour. The two new
+    regression tests cover both fixes: small and large (> 8) dictionaries and parameter lists, inner lists, and an
+    Item with a trailing HTAB. No other assertion was removed or weakened.
+- **Closed findings:** P2-1 and P2-2, the only ones this audit opened. INFO items I-2 and I-3 are now documented in
+  README.md. I-1 (root files, release integration), I-4, I-5, I-6 and I-7 remain INFO and do not block.
+- **Independent re-run** on `aae61ca` with the audit tree of this commit. Machine: Linux x86_64, `pvg`-class shared
+  box (load 12–16 / 16). Toolchain: `pionc 0.1.0` (abi `pionc-v0.19`), node v24.22.1, cargo 1.100.0, Rust `sfv
+  =0.16.1` (`--locked`), Python 3.13.5.
+  **`STRICT=1 sh packages/structured_fields/audit/run_audit.sh` → `EXIT=0`, 0 P0, 0 OPEN.**
+  `sh packages/structured_fields/audit/run_audit.sh` → `EXIT=0`.
+  `sh scripts/verify.sh packages/structured_fields` passes `fmt --check`, `check` and `test` (30/30), with the
+  clean-worktree check run in a git checkout.
+
+| Gate | Result on `aae61ca` |
+| --- | --- |
+| static | all checks 0; `Send` probe: 4 `Send` / 7 `!Send`, the same as the README.md table |
+| unit | package 30/30 (README.md: 30); audit `pionc test`: 14/14 (12 control + 2 red-team, which now pass) |
+| cases | 14/14 in native debug / release and wasm32 debug / release |
+| official | all 20 files of httpwg/structured-field-tests @ `4a4782f`: Pion 1,607/1,607 parsing + 553/553 serialisation |
+| determinism | 30,151 inputs and vectors (official, named, fuzz, helpers, official serialisation, serializer ASTs): the 4 modes are byte-identical |
+| oracles | Pion = independent model on 24,857 / 24,857 parse inputs and 5,254 / 5,254 serializer ASTs: 0 explained, 0 unexplained. Pion = Rust `sfv` on every parse input. The only serializer differences are `sfv`'s own: duplicate collapsing (6) and f64 rounding (9) |
+| dos | 30/30 bombs within budget, native = wasm32. 1 M distinct dictionary keys: 0.99 s / 367 MiB native, 1.75 s wasm32. 4 M duplicate keys: 0.94 s native, 2.55 s wasm32. 4× input → 3.98× / 4.15× time (linear) |
+| smoke | 4 × `f8311f93...` (271 B) = README.md; sizes 140,656 / 238,960 / 74,994 / 72,929 B = README.md |
+| bench | stdout SHA-256 `02d5fdad...` / `3debee67...` reproduce. Ratios 0.29x / 0.33x on a box at load 16, where both medians were 2–4× the idle values. Earlier, less-loaded runs gave 0.30–0.38x / 0.44–0.52x; README.md says 0.39x / 0.44x. Peak RSS: pion 1.96–1.97 MiB, rust_sfv 2.18–2.20 MiB |
+| inject | 15/15 injected bugs caught by control tests |
+
+## Original audit of `fc9180d`: NOT SIGNED (2 open P2, 0 P0, 0 P1). Both were fixed in `aae61ca`, see above
 
 Independent run on `fc9180d` + this audit tree, Linux x86_64 (`pvg`-class shared box, load ~10/16), `pionc 0.1.0`
 (abi `pionc-v0.19`), node v24.22.1, cargo 1.100.0, Python 3.13.5:
@@ -20,8 +64,8 @@ signs once both are fixed (or P2-2 is documented and changed to reject or collap
 
 | ID | Sev | Status | Summary |
 | --- | --- | --- | --- |
-| P2-1 | P2 | OPEN | List / Dictionary fields that end in HTAB are rejected; RFC 9651 §4.2.1 / §4.2.2 accept them |
-| P2-2 | P2 | OPEN | Serializer emits hand-built duplicate Dictionary / Parameter keys; `get_*` (first wins) and every parser (last wins) then disagree |
+| P2-1 | P2 | CLOSED in `aae61ca` | List / Dictionary fields that end in HTAB are rejected; RFC 9651 §4.2.1 / §4.2.2 accept them |
+| P2-2 | P2 | CLOSED in `aae61ca` | Serializer emits hand-built duplicate Dictionary / Parameter keys; `get_*` (first wins) and every parser (last wins) then disagree |
 
 Everything else the brief asked for was checked and holds; see the gate table and the dimension sections below.
 
