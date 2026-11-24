@@ -132,6 +132,8 @@ PACKAGE_META = {
              ["ical", "icalendar", "ics", "rrule", "calendar", "event", "timezone", "日历"]),
     "icc": ("media-graphics", "ICC v2/v4 color profile parser, JPEG/WebP profile extraction and ICC to sRGB transforms",
             ["icc", "color-profile", "srgb", "color-management", "jpeg", "gamma", "色彩管理"]),
+    "idna": ("web-net", "Unicode 16.0 UTS #46 / IDNA2008 / Punycode & UTS #39 confusable / omnibox anti-spoofing",
+             ["idna", "uts46", "punycode", "uts39", "confusable", "spoofing", "bidi", "domain", "unicode", "国际化域名"]),
     "jq": ("query-lang", "jq 1.7 / gojq JSON query and transformation language engine",
            ["jq", "json", "query", "filter", "transform", "gojq", "查询"]),
     "json": ("data-formats", "Strict RFC 8259 JSON parser with lossless numbers, JSON Pointer and RFC 8785 canonical output",
