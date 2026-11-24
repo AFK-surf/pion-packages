@@ -214,6 +214,8 @@ PACKAGE_META = {
              ["toml", "config", "parser", "serializer", "cargo", "配置"]),
     "unicode_bidi": ("markup-docs", "Unicode 16 UAX #9 bidirectional algorithm: levels, reordering and mirroring",
                      ["bidi", "uax9", "rtl", "arabic", "hebrew", "unicode", "双向文本"]),
+    "unicode_segment": ("markup-docs", "Unicode 16.0 UAX #29 extended grapheme, word and sentence segmentation with O(n) cursors",
+                        ["unicode", "uax29", "grapheme", "word-break", "sentence-break", "emoji", "cursor", "segmentation", "分词"]),
     "url": ("web-net", "WHATWG URL parser with IDNA/Punycode, IPv4/IPv6, percent-encoding, query params and data: URIs",
             ["url", "uri", "whatwg", "idna", "punycode", "querystring", "percent-encoding", "网址"]),
     "uuid": ("crypto-auth", "RFC 9562 UUID v1-v8 and ULID generation/parsing as zero-allocation 128-bit values",
