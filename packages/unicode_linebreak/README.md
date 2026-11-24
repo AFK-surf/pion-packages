@@ -4,7 +4,7 @@ Pure Pion, zero-external-dependency implementation of the **Unicode 16.0.0 Line 
 
 - Zero external dependencies (`[dependencies]` empty), zero `extern "C"`, zero `World` dependency, zero `Double`/`Float`, zero `FixedArray`, zero module-level mutable globals/containers, and full Wasm32 compatibility.
 - Strict **O(n)** single-pass streaming scanner with bounded O(1) lookahead cache — resistant to 100,000+ adversarial `SP`/`CM`/`ZWJ`/`QU`/`NU`/`OP`/`CL`/`RI`/`AK+VI` runs without backtracking or stack overflow.
-- Compact 3-level pure-ASCII immutable `String` lookup table (`42.8 KB`) with O(1) lookup across all 1,114,112 Unicode code points (`U+0000..U+10FFFF`), including an inline ASCII fast path.
+- Compact 3-level pure-ASCII immutable `String` lookup table (`42,100 B` in `src/tables.pion`) with O(1) lookup across all 1,114,112 Unicode code points (`U+0000..U+10FFFF`), including an inline ASCII fast path.
 
 ## Features
 
@@ -79,8 +79,8 @@ sh packages/unicode_linebreak/bench/run_bench.sh
 
 ### Unit, Red → Green & Adversarial Suite
 
-- Red → Green verified: `1/15` passed on stub build (`14/15` failed as expected), **`15/15` passed** after full implementation.
-- Covers mandatory vs allowed breaks (`CR+LF`/`CR`/`LF`/`NL`/`BK`), CJK kinsoku, `ZW`/`SP`/`GL`/`WJ`/`CM`, Emoji ZWJ & skin-tone modifiers (`EB × EM`, `ExtPict(Cn) × EM`), RI flag pairs, LB15a/b/c/d, LB19/19a, LB20a/21a, LB25, LB28a Brahmic syllables, invalid UTF-8 safety, `next_break_opportunity` negative/mid-UTF-8/bounds, `LineBreakLimits` negative/zero/exact bounds, and 100,000-character O(n) DoS stress runs.
+- Red → Green verified: `1/15` passed on stub build (`14/15` failed as expected), **`19/19` passed** after full implementation and red-team hardening.
+- Covers mandatory vs allowed breaks (`CR+LF`/`CR`/`LF`/`NL`/`BK`), CJK kinsoku, `ZW`/`SP`/`GL`/`WJ`/`CM`, Emoji ZWJ & skin-tone modifiers (`EB × EM`, `ExtPict(Cn) × EM`), RI flag pairs, LB10 remaining `CM`/`ZWJ` East_Asian_Width clearing, LB15a/b/c/d, LB19/19a, LB20a/21a (including `[BA - $EastAsian]` exclusion), LB25, LB28a Brahmic syllables, unassigned Supplemental Arrows-C `U+1F80C..U+1F8FF` (`XX`), invalid UTF-8 safety, `next_break_opportunity` O(n) backward-anchor iteration and negative/mid-UTF-8/bounds handling, `LineBreakLimits` negative/zero/exact bounds, and 100,000-character O(n) DoS stress runs.
 
 ### Official Unicode 16.0.0 `LineBreakTest.txt` Conformance
 
@@ -92,13 +92,13 @@ sh packages/unicode_linebreak/bench/run_bench.sh
 
 - Stdout: `unicode_linebreak_wasm_smoke: OK samples=12 opps=52 mandatory=16 fnv64=13553705255585179840`
 - Stdout SHA-256: `5b5e94c5c1af8a9ab13fbab1c9c6c7997effa36c1ccd27381ff4963681518b70`
-- Wasm32 binary size: `79,508 B` (debug & `--release`)
+- Wasm32 binary size: `81,146 B` (debug & `--release`)
 
 ### Differential Oracle & Head-to-Head Benchmarks vs Rust `icu_segmenter 2.4.0`
 
 Measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, byte-identical stdout SHA-256 verified across all rounds, locked `Cargo.lock` with `icu_segmenter 2.4.0 --release` LTO):
 
-- **Differential oracle (`bench/run_bench.sh`)**: **`123/123` PASS (0 deviations)** byte-for-byte against `icu_segmenter 2.4.0`. (Rules added/revised in Unicode 15.1/16.0 where `icu_segmenter 2.4.0` diverges — LB15c `SP ÷ IS NU`, LB19a CJK-surrounded quotes, LB20a word-initial hyphen, LB21a `HL HY ÷ HL`, and LB25 non-numeric `SY × NU` / `$(` / `)$` — are exhaustively verified by the 16,672/16,672 official Unicode 16.0.0 `LineBreakTest.txt` suite.)
+- **Differential oracle (`bench/run_bench.sh`)**: **`123/123` PASS (0 deviations)** byte-for-byte against `icu_segmenter 2.4.0`. Known `icu_segmenter 2.4.0` divergences from Unicode 16.0.0 UAX #14 — Unicode 15.1 `Line_Break` data (`FE20..FE2F`, `2E56..2E5C`, `FE10`/`FE13`/`FE14`, `1B50..`), pre-15.1 LB19/LB19a, pre-16.0 LB21a (`HL HY ÷ HL` and `[BA - $EastAsian]`), LB15c `SP ÷ IS NU`, LB20a word-initial hyphen, LB25 (`NU (SY|IS)* × (PO|PR)`, `(PR|PO) × OP IS? NU`, no `SY × NU`), a `U+25CC` pair bug (breaking after two dotted circles even before `SP`/`LF`/`CR`/`BK`), and implementation-defined `SA` dictionary/LSTM handling — are exhaustively verified against Unicode 16.0.0 by the 16,672/16,672 official `LineBreakTest.txt` suite.
 
 #### Corpus 1: Multilingual Web/News Layout (41,916 B × 200 iters = 8.38 MB)
 

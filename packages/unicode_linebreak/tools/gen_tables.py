@@ -60,16 +60,18 @@ def encode_2(v: int) -> str:
 
 
 def load_ucd(ucd_dir: str):
-    # 1. LineBreak.txt with @missing and unassigned block defaults per LineBreak-16.0.0.txt
+    # 1. LineBreak.txt with @missing and unassigned block defaults per
+    # Unicode 16.0.0 DerivedLineBreak.txt (Note: U+1F800..U+1F8FF defaults to XX, not ID).
     lb = ["XX"] * 0x110000
     for lo, hi in [
         (0x3400, 0x4DBF),
         (0x4E00, 0x9FFF),
         (0xF900, 0xFAFF),
+        (0x1F000, 0x1F7FF),
+        (0x1F900, 0x1FAFF),
+        (0x1FC00, 0x1FFFD),
         (0x20000, 0x2FFFD),
         (0x30000, 0x3FFFD),
-        (0x1F000, 0x1FAFF),
-        (0x1FC00, 0x1FFFD),
     ]:
         for cp in range(lo, hi + 1):
             lb[cp] = "ID"
@@ -170,7 +172,7 @@ def chunk_string(name: str, data: str, width: int = 100) -> str:
     parts = [data[i : i + width] for i in range(0, len(data), width)]
     for idx, part in enumerate(parts):
         suffix = " +" if idx + 1 < len(parts) else ""
-        lines.append(f'  "{part}"{suffix}')
+        lines.append(f'"{part}"{suffix}')
     return "\n".join(lines)
 
 
