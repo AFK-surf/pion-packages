@@ -52,10 +52,17 @@ B = [
     ("d28", "iterate nbo, ill-formed \"\\xff \" x 2k", b"\xff ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
     ("d29", "iterate nbo, kana NS \"\u3041 \" x 2k", "\u3041 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
     ("d30", "iterate nbo, CJK \"\u4e00\" x 4k (ID anchors)", "\u4e00", 4000, lambda r: r, "nbo_iter", 200000, "P1-1"),
-    ("d32", "iterate nbo, \"- \" x 2k (HY SP only)", "- ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
-    ("d33", "iterate nbo, RI SP x 2k (RI SP only)", "\U0001F1E6 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
-    ("d34", "iterate nbo, VI SP x 2k (VI SP only)", "\u1b44 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
-    ("d35", "iterate nbo, U+2010 SP x 2k (BA SP only)", "\u2010 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d32", "iterate nbo, \"- \" x 2k (HY SP only)", "- ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    ("d33", "iterate nbo, RI SP x 2k (RI SP only)", "\U0001F1E6 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    ("d34", "iterate nbo, VI SP x 2k (VI SP only)", "\u1b44 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    ("d35", "iterate nbo, U+2010 SP x 2k (BA SP only)", "\u2010 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
+    # LineBreakIter (b84c35e): the documented O(n) way to iterate, including texts without any reset anchor
+    ("d36", "LineBreakIter, \"- \" x 125k (HY SP only)", "- ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d37", "LineBreakIter, RI SP x 125k", "\U0001F1E6 ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d38", "LineBreakIter, VI SP x 125k", "\u1b44 ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d39", "LineBreakIter, U+2010 SP x 125k", "\u2010 ", 125000, lambda r: r, "iter", 2000000, None),
+    ("d40", "LineBreakIter, Korean x 80k", "\uac00\uac01 ", 80000, lambda r: 2 * r, "iter", 2000000, None),
+    ("d41", "LineBreakIter, a + CM x 250k", "\u0301", 250000, None, "iter", 2000000, None),
     ("d31", "iterate nbo, mixed news text x 40", "Hello, world! \u4e2d\u6587\u6392\u7248\u300c\u5f15\u53f7\u300d $(1,234.56) "
      "\U0001F1FA\U0001F1F8 \U0001F469\u200d\U0001F4BB \u05d0-\u05d1 a\u0301\r\n", 40, None, "nbo_iter", 200000, "P1-1"),
 ]
@@ -118,13 +125,15 @@ def main(argv):
                 rc = 1
             tag = ""
             if over:
-                if finding:
+                if finding == "DOC":
+                    tag = "  OVER (documented: O(distance to nearest anchor) per call, README points to LineBreakIter)"
+                elif finding:
                     opened.add(finding)
                     tag = "  OVER (%s)" % finding
                 else:
                     tag = "  OVER (unexplained)"
                     rc = 1
-            elif finding:
+            elif finding and finding != "DOC":
                 tag = "  (%s no longer reproduces)" % finding
             print("  %-4s %-48s %-7s %10d %10d %7.2f %12d%s" % (bid, desc[:48], rname, a[0], b[0], ratio, b[2], tag))
     if opened:

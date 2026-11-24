@@ -178,7 +178,7 @@ static() {
   }
   c_send=" $($RD send_types) "
   c_not=" $($RD notsend_types) "
-  for t in LineBreakClass BreakKind BreakOpportunity LineBreakError LineBreakLimits String "Array[BreakOpportunity]"; do
+  for t in LineBreakClass BreakKind BreakOpportunity LineBreakError LineBreakLimits LineBreakIter String "Array[BreakOpportunity]"; do
     case "$t" in String) ty=String ;; "Array[BreakOpportunity]") ty="Array[unicode_linebreak::BreakOpportunity]" ;; *) ty="unicode_linebreak::$t" ;; esac
     r=$(probe "$ty")
     extra=""
@@ -187,7 +187,7 @@ static() {
     printf '    %-26s %s%s\n' "$t" "$([ "$r" = ok ] && echo Send || echo "!Send ($r)")" "$extra"
   done
   for t in $c_send $c_not; do
-    case " LineBreakClass BreakKind BreakOpportunity LineBreakError LineBreakLimits Array[BreakOpportunity] " in
+    case " LineBreakClass BreakKind BreakOpportunity LineBreakError LineBreakLimits LineBreakIter Array[BreakOpportunity] " in
       *" $t "*) ;; *) open_finding "P2-5: $(title P2-5)"; echo "    README.md lists unknown type $t" ;; esac
   done
 }
@@ -277,7 +277,7 @@ conformance() {
 }
 
 api() {
-  echo "==> api: next_break_opportunity at every byte offset (incl. mid-UTF-8, -1, len, len+1, INT_MIN/MAX) == line_breaks; LineBreakLimits sweep"
+  echo "==> api: next_break_opportunity at every byte offset (incl. mid-UTF-8, -1, len, len+1, INT_MIN/MAX) and LineBreakIter == line_breaks; LineBreakLimits sweep"
   for g in lbtest named fastpath fuzz long; do
     for m in native_rel wasm_rel; do
       # shellcheck disable=SC2046
@@ -317,7 +317,7 @@ oracles() {
 }
 
 dos() {
-  echo "==> dos: 35 bombs at n and 4n, self-timed median of 7 runs in process (native --release, wasm32 --release)"
+  echo "==> dos: 41 bombs at n and 4n, self-timed median of 7 runs in process (native --release, wasm32 --release)"
   out=$($PY "$AUDIT_DIR/diff/dos.py" "$BIN/ulb_audit_rel" "node $WASM_RT $BIN/ulb_audit_rel.wasm")
   r=$?
   printf '%s\n' "$out" | grep -v '^OPENIDS' | cut -c1-200

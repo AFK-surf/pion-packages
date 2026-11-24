@@ -37,7 +37,8 @@ def claims(t):
         c["send_types"] = " ".join(x for x in re.findall(r"`([A-Za-z\[\]]+)`", m.group(1)) if x != "String")
     m = re.search(r"\*\*Non-`Send` types\*\*:(.*)", t)
     if m:
-        c["notsend_types"] = " ".join(re.findall(r"`(Array\[[A-Za-z]+\])`", m.group(1))[:1])
+        c["notsend_types"] = " ".join(t for t in re.findall(r"`([A-Za-z]+(?:\[[A-Za-z]+\])?)`", m.group(1).split(". ")[0])
+                                      if t not in ("E_NOT_SEND", "pionc", "line_breaks", "line_breaks_with_limits"))
     grab("table_kb", r"lookup table \(`([0-9.]+) KB`\)")
     return c
 
