@@ -84,7 +84,7 @@ Red-team audit (`packages/diff/audit`, v0.2.0): 5/5 P0 red-team tests pass and t
 
 ## v0.2.0 Head-to-Head Benchmark (Pion Native vs Rust `imara-diff v0.2.0 --release`)
 
-Measured after red-team remediation on `tokyo-mac-studio-0` (Apple M5 Max) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, stdout SHA-256 byte-for-byte identical).
+Measured after red-team remediation on Apple M5 Max (Darwin arm64) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, stdout SHA-256 byte-for-byte identical).
 
 ### Standard workloads (`sh packages/diff/bench/run_bench.sh`)
 

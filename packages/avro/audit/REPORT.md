@@ -1,7 +1,7 @@
 # 红队审计报告：Pion `packages/avro` v0.1.0 @ `79be97f`（`feat/pkg-avro`）
 
 对照基准：Apache Avro **1.11.1** 规范（Java 参考实现的行为作为规范歧义处的裁决）、Go [`github.com/hamba/avro/v2`](https://github.com/hamba/avro) **v2.28.0**（与 `bench/go` 相同，`go.sum` 锁定、`-mod=readonly`）。
-环境：`tokyo-mac-studio-0`（Darwin arm64，`pionc 0.1.0` / `AFK-surf/pion@66d2b4b`，Go 1.27.3，Node 24），2026-11-24。整机同时有其他负载，计时以同一轮的**倍率**为准。
+环境：Apple M5 Max (Darwin arm64，`pionc 0.1.0` / `AFK-surf/pion@66d2b4b`，Go 1.27.3，Node 24），2026-11-24。整机同时有其他负载，计时以同一轮的**倍率**为准。
 
 ## 一键复现
 

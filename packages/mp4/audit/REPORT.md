@@ -1,7 +1,7 @@
 # RT-mp4 red-team audit: `packages/mp4` v0.1.0
 
 - **Target**: `origin/feat/pkg-mp4` @ `a0084452d9fc56b55b6d7ec7f786c993ece87e32` (`src/types.pion` 235 lines, `src/mp4.pion` 2240 lines, read in full).
-- **Toolchain**: `pionc 0.1.0 (arm64_apple, self-hosted)`, Node v24.22.2 (wasm32 runner), FFmpeg/ffprobe 9.0.2, Python 3.9.6, Darwin arm64 (`tokyo-mac-studio-0`).
+- **Toolchain**: `pionc 0.1.0 (arm64_apple, self-hosted)`, Node v24.22.2 (wasm32 runner), FFmpeg/ffprobe 9.0.2, Python 3.9.6, Apple M5 Max (Darwin arm64).
 - **Reproduce**: `sh packages/mp4/audit/run_audit.sh all` (sections: `build corpus unit compare seek fuzz dos prof`). Every artifact goes to `/private/tmp/pion-mp4-audit`; `git status --ignored` stays clean.
 - **Files**: `redteam_test.pion` (13 `redteam_*` + 9 `control_*`), `src/main.pion` (dump / batch / seek / prof harness), `vectors.py` (crafted inputs; it also generates the hex block in the test), `corpus.py` + `bmff.py` (FFmpeg corpus and BMFF rewrites), `difftest.py` (ffprobe diff, fuzz, DoS), `perf.py` (patched-copy timing experiments).
 

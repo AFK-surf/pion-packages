@@ -1,0 +1,222 @@
+# Third-Party Notices
+
+This repository (`AFK-surf/pion-packages`) is licensed under the MIT License (see `LICENSE`),
+except where third-party data tables, test suites, or ported algorithms are noted below.
+For all MIT-licensed upstream components listed below, the full MIT License text is provided
+in the root [`LICENSE`](LICENSE) file. For Apache-2.0 components, the full Apache License 2.0
+text is provided in [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
+
+---
+
+## Important Notice: CC BY-SA 4.0 Test Data (Markdown Specification Examples)
+
+> **CC BY-SA 4.0** — The following **test-only** files contain specification examples adapted from
+> the CommonMark 0.31.2 Specification (© John MacFarlane) and the GitHub Flavored Markdown (GFM)
+> Specification (© GitHub, Inc.), licensed under the Creative Commons Attribution-ShareAlike 4.0
+> International License (<https://creativecommons.org/licenses/by-sa/4.0/>):
+>
+> - `packages/markdown/spec_part1_test.pion`
+> - `packages/markdown/spec_part2_test.pion`
+> - `packages/markdown/spec_part3_test.pion`
+> - `packages/markdown/spec_part4_test.pion`
+> - `packages/markdown/gfm_test.pion` (`gfm_table_*`, `gfm_strikethrough_*`, `gfm_tasklist_*`, and
+>   `gfm_autolink_*` tests: © GitHub, Inc., CC BY-SA 4.0; `smart_punct_test_*` 16 tests: original
+>   test data from `commonmark/cmark` `test/smart_punct.txt`, Copyright (c) 2014, John MacFarlane,
+>   BSD-2-Clause, transcribed via `pulldown-cmark/pulldown-cmark` `tests/suite/smart_punct.rs`,
+>   © Google Inc., MIT)
+>
+> These files are **test data only** and are **not compiled into library artifacts**; they do not
+> affect the MIT license of the `markdown` library code (`packages/markdown/src/`).
+
+---
+
+## Third-Party Components, Data Tables, and Test Suites
+
+### Brotli (`packages/brotli/src/tables.pion`)
+- **Upstream**: `google/brotli` (<https://github.com/google/brotli>)
+- **Copyright**: Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors
+- **License**: MIT (full text in `LICENSE`)
+
+### pulldown-cmark (`packages/markdown/src/entities.pion`, `packages/markdown/gfm_test.pion` `smart_punct_test_*`, and parser/entity references)
+- **Upstream**: `pulldown-cmark/pulldown-cmark` (<https://github.com/pulldown-cmark/pulldown-cmark>)
+- **Copyright**: Copyright 2015 Google Inc. / pulldown-cmark contributors
+- **License**: MIT (full text in `LICENSE`)
+
+### commonmark/cmark (`packages/markdown/gfm_test.pion` `smart_punct_test_*` test data)
+- **Upstream**: `commonmark/cmark` (`test/smart_punct.txt`, <https://github.com/commonmark/cmark>)
+- **Copyright**: Copyright (c) 2014, John MacFarlane
+- **License**: BSD-2-Clause:
+
+```text
+Copyright (c) 2014, John MacFarlane
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+    * Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials provided
+      with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### KaTeX (`packages/texmath/`)
+- **Files**:
+  - `packages/texmath/src/symbols.pion`
+  - `packages/texmath/src/metrics_data.pion`
+  - `packages/texmath/src/parser.pion`
+  - `packages/texmath/src/lexer.pion`
+  - `packages/texmath/src/macros.pion`
+  - `packages/texmath/src/mathml.pion`
+  - `packages/texmath/src/layout.pion`
+  - `packages/texmath/audit/corpus_katex_screenshotter.txt`
+- **Upstream**: `KaTeX/KaTeX` (<https://github.com/KaTeX/KaTeX>)
+- **Copyright**: Copyright (c) 2013-2020 Khan Academy and other contributors
+- **License**: MIT (full text in `LICENSE`)
+
+### imara-diff (`packages/diff/`)
+- **Upstream**: `pascalkuthe/imara-diff` (<https://github.com/pascalkuthe/imara-diff>)
+- **Copyright**: Copyright Pascal Kuthe
+- **License**: Apache-2.0 (full text in `LICENSES/Apache-2.0.txt`)
+- **Modification Notice**: Modified and ported from Rust to Pion.
+
+### BurntSushi Crates (`packages/glob/`, `packages/time/`, `packages/csv/`)
+- **Upstream**: `BurntSushi/ripgrep` (`globset`), `BurntSushi/jiff`, `BurntSushi/rust-csv`
+- **Copyright**: Copyright Andrew Gallant (BurntSushi) and contributors
+- **License**: MIT OR Unlicense (MIT full text in `LICENSE`)
+
+### dtolnay/semver & petgraph (`packages/semver/`, `packages/graph/`)
+- **Upstream**: `dtolnay/semver` (<https://github.com/dtolnay/semver>), `petgraph/petgraph` (<https://github.com/petgraph/petgraph>)
+- **Copyright**: Copyright David Tolnay (`semver`); Copyright petgraph contributors (`petgraph`)
+- **License**: MIT OR Apache-2.0 (MIT full text in `LICENSE`; Apache-2.0 full text in `LICENSES/Apache-2.0.txt`)
+
+### MIT Upstream Test Suites & Reference Implementations
+The following packages incorporate or adapt test vectors and/or algorithms from MIT-licensed upstream projects (full MIT License text in `LICENSE`):
+- `packages/decimal/`: `paupino/rust-decimal` — Copyright (c) 2016 Paul Mason (MIT)
+- `packages/crdt/`:
+  - `yjs/yjs` (`v13.6.33`) — Copyright (c) 2023 Kevin Jahns `<kevin.jahns@protonmail.com>` and Chair of Computer Science 5 (Databases & Information Systems), RWTH Aachen University, Germany (MIT)
+  - `dmonad/lib0` (`v0.2.99`) — Copyright (c) 2019 Kevin Jahns `<kevin.jahns@protonmail.com>`. (MIT)
+- `packages/highlight/`: `PrismJS/prism` — Copyright (c) 2012 Lea Verou (MIT)
+- `packages/graphql/`: `graphql/graphql-js` (Copyright (c) GraphQL Contributors) / `apollographql/apollo-rs` (`apollo-parser`, Copyright 2021 Apollo Graph, Inc.) (MIT)
+- `packages/cbor/`: `fxamacker/cbor` — Copyright (c) 2019-present Faye Amacker (MIT), and RFC 8949 test vectors
+- `packages/json5/`: `json5/json5-tests` — Copyright (c) 2012-2016 Aseem Kishore, and [others](https://github.com/json5/json5/contributors). (MIT)
+- `packages/toml/`: `toml-lang/toml-test` — Copyright (c) 2018 TOML authors (MIT)
+- `packages/yaml/`: `yaml/yaml-test-suite` — Copyright (c) 2016-2020 Ingy döt Net (MIT)
+- `packages/msgpack/`: `kawanet/msgpack-test-suite` — Copyright (c) 2017-2018 Yusuke Kawasaki (MIT)
+- `packages/jsonschema/`: `json-schema-org/JSON-Schema-Test-Suite` — Copyright (c) 2012 Julian Berman (MIT)
+
+### Unicode Character Database (UCD 13.0.0 / 16.0.0)
+- **Files**:
+  - `packages/json5/src/unicode_id.pion` (UCD 13.0.0)
+  - `packages/regex/src/unicode*.pion` (UCD 16.0.0)
+  - `packages/unicode_bidi/src/tables.pion` (UCD 16.0.0)
+  - `packages/url/src/idna_tables.pion` (UCD 16.0.0)
+  - `packages/url/audit/data/IdnaTestV2.txt` (UCD 16.0.0)
+  - `packages/hyphenation/src/unicode.pion` (UCD 16.0.0)
+- **Upstream**: Unicode Consortium — Unicode Character Database (<https://www.unicode.org/Public/>)
+- **Copyright**: Copyright © Unicode, Inc.
+- **License**: Unicode-3.0 (full text in `packages/url/audit/data/LICENSE.unicode`)
+
+### WHATWG Specifications & Embedded Tables (`packages/encoding/src/tables.pion`, `packages/html/src/entities_table.pion`, `packages/webvtt/src/entities_table.pion`)
+- **Upstream**:
+  - WHATWG Encoding Standard indices (<https://encoding.spec.whatwg.org/>), aligned with Mozilla `encoding_rs`
+  - WHATWG HTML Living Standard named character references (<https://html.spec.whatwg.org/entities.json>)
+- **Copyright**: Copyright © WHATWG (Apple, Google, Mozilla, Microsoft)
+- **License**: WHATWG Living Standards are licensed under CC BY 4.0 (<https://creativecommons.org/licenses/by/4.0/>); portions embedded as source code and data tables are explicitly licensed under the **3-Clause BSD License** per the WHATWG IPR Policy:
+
+```text
+Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### Web Platform Tests — WebVTT (`packages/webvtt/`)
+- **Upstream**: `web-platform-tests/wpt` (`webvtt/`)
+- **Copyright**: Copyright © web-platform-tests contributors
+- **License**: BSD-3-Clause (see `packages/webvtt/audit/wpt/LICENSE.md`)
+
+### Web Platform Tests — URL (`packages/url/audit/data/urltestdata.json`, `packages/url/audit/data/setters_tests.json`, `packages/url/wpt_*_test.pion`)
+- **Upstream**: `web-platform-tests/wpt` (`url/`)
+- **Copyright**: Copyright © web-platform-tests contributors
+- **License**: BSD-3-Clause (see `packages/url/audit/data/LICENSE.wpt`)
+
+### Go `archive/tar/testdata` (`packages/tar/src/testdata_test.pion`)
+- **Upstream**: The Go Programming Language (`src/archive/tar/testdata`, `go1.27.3`)
+- **Copyright**: Copyright 2009 The Go Authors.
+- **License**: BSD-3-Clause:
+
+```text
+Copyright 2009 The Go Authors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google LLC nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### JSONPath Compliance Test Suite (`packages/jsonpath/audit/cts/`)
+- **Upstream**: `jsonpath-compliance-test-suite/jsonpath-compliance-test-suite`
+- **License**: BSD-2-Clause (see `packages/jsonpath/audit/cts/LICENSE`)
+
+### `hyph-en-us` Hyphenation Patterns (`packages/hyphenation/src/en_us_data.pion`)
+- **Upstream**: `hyph-utf8` / `ushyphmax.tex`
+- **Copyright**: Copyright (C) 1990, 2004, 2005 Gerard D.C. Kuiken
+- **License**: Permissive license with attribution preserved in file header (`packages/hyphenation/src/en_us_data.pion`).

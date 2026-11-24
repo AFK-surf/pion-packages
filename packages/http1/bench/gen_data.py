@@ -14,7 +14,7 @@ def gen_requests(out_path: str, count: int = 50000) -> int:
         "/v2/webhooks/stripe/events?attempt=1",
         "/healthz",
     ]
-    hosts = ["api.still.fail", "cdn.example.com", "edge-tokyo-01.internal"]
+    hosts = ["api.example.com", "cdn.example.com", "edge-01.example.internal"]
     uas = [
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36",
         "pion-http/0.1.0 (arm64_apple)",

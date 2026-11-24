@@ -15,7 +15,7 @@ Pure-Pion implementation of the **Unicode Bidirectional Algorithm (UAX #9, Unico
   - **I1–I2**: implicit level resolution (clamped to `0..=126` invariant)
   - **L1–L4**: trailing whitespace/separator reset, O(line) local-buffer `reorder_line` / `reorder_line_with_mirroring`, UTF-8 boundary byte-copy RTL reversal, and RTL glyph mirroring
 - Compact 1-byte `Bytes` internal working buffers and reusable `BidiScratch` across paragraphs.
-- Explicit `Limits` / `Result[BidiInfo, BidiError]` API (`new_with_limits`) plus total `BidiInfo::new` and Farview-compatible `bidi_line_levels` / `bidi_visual_order` helpers.
+- Explicit `Limits` / `Result[BidiInfo, BidiError]` API (`new_with_limits`) plus total `BidiInfo::new` and convenience `bidi_line_levels` / `bidi_visual_order` helpers.
 - Verified on Unicode 16.0.0 `BidiCharacterTest` (`91,707/91,707`) and `BidiTest` (`770,241/770,241`), red-team audit (`18/18`), and Native + Wasm32 (`debug` / `--release`).
 
 ## Head-to-Head Benchmarks (`Darwin arm64`, Pion Native `--release` vs Rust `unicode-bidi 0.3.18 --release`)

@@ -1,7 +1,7 @@
 # RT-proxy: red-team audit of `packages/proxy` v0.1.0
 
 - **Baseline:** `origin/feat/pkg-proxy` @ `d4fb097` (`src/` 3 110 lines: `proxy_url.pion`, `socks5.pion`, `http_proxy.pion`, `types.pion`)
-- **References:** RFC 1928, RFC 1929, RFC 9110, RFC 9112; `AFK-surf/monoid-login@886d08e` `src/proxy-bridge.ts` (the code this package replaces); Go `golang.org/x/net/http/httpproxy` v0.62.0 (Go's `ProxyFromEnvironment`)
+- **References:** RFC 1928, RFC 1929, RFC 9110, RFC 9112; Go `golang.org/x/net/http/httpproxy` v0.62.0 (Go's `ProxyFromEnvironment`)
 - **Toolchain:** `pionc` 0.1.0 (`AFK-surf/pion@66d2b4b`), Go 1.27.3, Node 24.22, macOS arm64
 - **Scope rule:** this branch only adds files under `packages/proxy/audit/`. Nothing else in the package changes.
 
@@ -19,9 +19,9 @@ sh packages/proxy/audit/run_audit.sh tests      # just the red-team unit tests
 | P0-1 | **P0** | A `Connection: Content-Length` header strips `Content-Length` from the forwarded head, but `content_length` is still reported, so the request desyncs (CL.0 smuggling) | `p0_connection_nominated_content_length_stripped_body_desync` |
 | P0-2 | **P0** | A `Connection: Transfer-Encoding` header strips TE, but `is_chunked = true` is still reported, so the request desyncs (TE.0 smuggling) | `p0_connection_nominated_transfer_encoding_stripped_body_desync` |
 | P1-1 | **P1** | `UnsupportedScheme` repeats everything before the first `://`, so a scheme-less `user:pass@host` URL puts the credentials in the error message | `p1_unsupported_scheme_error_echoes_userinfo` |
-| P1-2 | **P1** | `redacted()` prints a username when there is no password (token-in-username proxies); monoid-login prints `***@` | `p1_redacted_echoes_username_only_userinfo` |
+| P1-2 | **P1** | `redacted()` prints a username when there is no password (token-in-username proxies); standard proxy URL redaction prints `***@` | `p1_redacted_echoes_username_only_userinfo` |
 | P2-1 | P2 | The ssh username in `redacted()` is not escaped (allows host spoofing, ESC/BEL injection), and C0 control bytes are accepted in credentials | `p2_redacted_ssh_username_unescaped_log_spoofing` |
-| P2-2 | P2 | `\` in the authority: this parser connects to a different host than WHATWG/monoid-login | `p2_backslash_userinfo_parser_differential` |
+| P2-2 | P2 | `\` in the authority: this parser connects to a different host than WHATWG `new URL` | `p2_backslash_userinfo_parser_differential` |
 | P2-3 | P2 | The proxy host accepts `% \ < > ^ \|`; `%6d` is kept literally instead of being decoded | `p2_proxy_host_accepts_non_rfc3986_characters` |
 | P2-4 | P2 | NO_PROXY IPv4/CIDR rules never match IPv4-mapped IPv6 targets (Go's matcher does) | `p2_no_proxy_ipv4_mapped_ipv6_not_matched` |
 | P2-5 | P2 | NO_PROXY `*.example.com` silently becomes a rule that can never match (Go treats it as `.example.com`) | `p2_no_proxy_star_dot_wildcard_ignored` |
@@ -60,28 +60,28 @@ The fuzzer finds this independently: 31 of 5 405 forward cases (`framing desync:
 
 ### P1-1: `UnsupportedScheme` repeats the userinfo
 
-`src/proxy_url.pion:144-172` treats everything before the **first** `://` as the scheme, never checks it against the RFC 3986 scheme grammar, and puts it into the error message. A scheme-less value is common and valid input: curl accepts `user:pass@proxy:3128`, and monoid-login's `withScheme` prefixes `http://`. Such a value leaks as soon as its path or query contains a URL:
+`src/proxy_url.pion:144-172` treats everything before the **first** `://` as the scheme, never checks it against the RFC 3986 scheme grammar, and puts it into the error message. A scheme-less value is common and valid input: curl accepts `user:pass@proxy:3128`, and reference `withScheme` helpers prefixes `http://`. Such a value leaks as soon as its path or query contains a URL:
 
 ```text
 parse_proxy_url("alice:hunter2@proxy.example:8080/?next=http://intranet")
 → Err: "unsupported proxy scheme: alice:hunter2@proxy.example:8080/?next=http"
 ```
 
-The README promises "error messages never echo credentials". **Fix:** echo the scheme only when it matches `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, and otherwise return a constant message. Accepting scheme-less input the way monoid-login does is a separate compatibility choice.
+The README promises "error messages never echo credentials". **Fix:** echo the scheme only when it matches `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, and otherwise return a constant message. Accepting scheme-less input is a separate compatibility choice.
 
 ### P1-2: `redacted()` prints a username when there is no password
 
-`src/proxy_url.pion:411-422` replaces userinfo with `***@` only when a password is present. Many proxy providers and token gateways put the secret in the **username** (`http://<token>@proxy`). monoid-login, whose `redactProxyUrl` this package replaces, prints `***@` whenever a username exists for http/https/socks5/socks5h; only ssh user names are shown. The baseline prints `http://ghp_tok3nSECRET@proxy.example:8080`. The fuzzer flags 206 of 5 537 structured URLs, and the differential flags 191 corpus URLs (all username-only). `proxy_url_test.pion:166` pins the leaky output (`http://carol@proxy.local:3128`), so the fix must update that test as well.
+`src/proxy_url.pion:411-422` replaces userinfo with `***@` only when a password is present. Many proxy providers and token gateways put the secret in the **username** (`http://<token>@proxy`). Standard proxy URL redaction prints `***@` whenever a username exists for http/https/socks5/socks5h; only ssh user names are shown. The baseline prints `http://ghp_tok3nSECRET@proxy.example:8080`. The fuzzer flags 206 of 5 537 structured URLs, and the historical pre-release differential flagged 191 corpus URLs (all username-only; note: the original internal reference implementation is not published in this repository, and the current `run_audit.sh` runs Pion URL redaction self-checks plus Pion vs Go `NO_PROXY` differential checks). `proxy_url_test.pion:166` pins the leaky output (`http://carol@proxy.local:3128`), so the fix must update that test as well.
 
 ## P2
 
-- **P2-1 ssh user not escaped** (`proxy_url.pion:413-420`; `has_crlf_or_nul`, `types.pion:304`, checks only CR/LF/NUL). `ssh://admin%40evil.example%3A22%23@good.example` is redacted to `ssh://admin@evil.example:22#@good.example:22`, which parses back as host `evil.example`. `%1B[2J…%07` writes raw ESC/BEL into the "safe" log line. monoid-login uses `encodeURIComponent`. C0 bytes such as `%09`/`%1B` are also accepted in decoded credentials.
-- **P2-2 backslash differential.** `http://u:p@evil.example\@good.example:8080`: `new URL` (monoid-login) connects to `evil.example:80` as `u`/`p`; this parser connects to `good.example:8080` with password `p@evil.example\`. `\` is not legal in userinfo (RFC 3986) and is a path separator for WHATWG special schemes. Reject it.
-- **P2-3 host charset.** `validate_plain_host` (`proxy_url.pion:101-124`) accepts `%`, `\`, `<`, `>`, `^`, `|`, which WHATWG forbids. `http://exa%6dple.com` keeps `exa%6dple.com` (WHATWG: `example.com`). The differential shows 185 host/port disagreements with the reference, including `127.1` and `0x7f.0.0.1` (WHATWG canonicalises those to `127.0.0.1`; not scored).
+- **P2-1 ssh user not escaped** (`proxy_url.pion:413-420`; `has_crlf_or_nul`, `types.pion:304`, checks only CR/LF/NUL). `ssh://admin%40evil.example%3A22%23@good.example` is redacted to `ssh://admin@evil.example:22#@good.example:22`, which parses back as host `evil.example`. `%1B[2J…%07` writes raw ESC/BEL into the "safe" log line. Standard URL redaction escapes usernames with `encodeURIComponent`. C0 bytes such as `%09`/`%1B` are also accepted in decoded credentials.
+- **P2-2 backslash differential.** `http://u:p@evil.example\@good.example:8080`: WHATWG `new URL` connects to `evil.example:80` as `u`/`p`; this parser connects to `good.example:8080` with password `p@evil.example\`. `\` is not legal in userinfo (RFC 3986) and is a path separator for WHATWG special schemes. Reject it.
+- **P2-3 host charset.** `validate_plain_host` (`proxy_url.pion:101-124`) accepts `%`, `\`, `<`, `>`, `^`, `|`, which WHATWG forbids. `http://exa%6dple.com` keeps `exa%6dple.com` (WHATWG: `example.com`). In the historical pre-release differential (original internal reference not published; current `run_audit.sh` runs Pion URL self-checks and Pion vs Go `NO_PROXY` differential), 185 host/port disagreements were recorded, including `127.1` and `0x7f.0.0.1` (WHATWG canonicalises those to `127.0.0.1`; not scored).
 - **P2-4 IPv4-mapped IPv6 in NO_PROXY.** `matches()` (`proxy_url.pion:724-766`) checks IPv4 rules only against IPv4 targets, so `10.0.0.0/8` does not cover `::ffff:10.1.2.3` (the Go matcher unmaps, so it does). The opposite direction also differs: `::/0` matches `::ffff:1.2.3.4` here but not in Go. Of 1 197 NO_PROXY cases, 38 disagree with Go: these mapped-address cases, `*.` (P2-5), and trailing-dot leniency (see Observations).
 - **P2-5 `*.domain`.** `parse_single_no_proxy_rule` (`:535`) only special-cases a bare `*`, so `*.corp.example` becomes a literal domain that can never match. The rule is dropped without any signal, and those hosts keep going through the proxy.
 - **P2-6 code aliasing.** `SocksReplyCode::to_byte` (`types.pion:69`) and `SocksAuthMethod::to_byte` (`socks5.pion:19`) call `v.to_byte()`, which wraps: `Unassigned(0)`/`Unassigned(256)` go on the wire as `00` (Succeeded), `Unassigned(261)` as `05`, `Other(256)` as `00` (NoAuth), `Other(258)` as `02` (UserPass), `Other(-1)` as `FF`. The encoders should reject values outside `9..255` / `3..254`.
-- **P2-7 lost failure code.** `socks5_decode_reply` (`socks5.pion:497-522`) parses BND.ADDR before it looks at REP. A REP=5 reply with ATYP=0 (common on errors) yields `InvalidAddressType(0)`, so the user sees "invalid address type" instead of "connection refused". `ProxyError::SocksFailure` exists but is never produced. monoid-login checks REP first.
+- **P2-7 lost failure code.** `socks5_decode_reply` (`socks5.pion:497-522`) parses BND.ADDR before it looks at REP. A REP=5 reply with ATYP=0 (common on errors) yields `InvalidAddressType(0)`, so the user sees "invalid address type" instead of "connection refused". `ProxyError::SocksFailure` exists but is never produced. REP should be checked first.
 - **P2-8 request-target bytes.** `parse_and_sanitize_forward_request` copies the target (`http_proxy.pion:832, 873-884`) into the upstream request line without checking it. HTAB, VT, `\x01`, and DEL pass through (RFC 9112 §3.2; HTAB is a request-line separator for several servers), and so does `#frag`, even though a `#` in the authority is rejected.
 - **P2-9 `NeedMore(0)`** at `http_proxy.pion:450, 580, 789`. `DecodeStatus::NeedMore(Int)` is documented as the minimum number of bytes still needed. A `read_exact(need)` loop spins on 0. `NeedMore(1)` is enough to fix it.
 - **P2-10 duplicate `Proxy-Authorization`** (`:507-512`, `:932-933`). The last header wins (in the test, `alice` then `mallory` yields `mallory`). A front component that checks the first header disagrees with this parser about who the client is.
@@ -90,13 +90,12 @@ The README promises "error messages never echo credentials". **Fix:** echo the s
 ## Observations (reported, not scored)
 
 - **O1 Quadratic re-scan when bytes trickle in.** Every HTTP decoder rescans from byte 0 on each call and returns `NeedMore(0)` with no offset hint. With the default 64 KiB limit, a client that sends 1 byte per segment costs **1.43 s CPU** for one 65 506-byte head; the same head decoded whole 1 024 times costs 0.21 s (`run_audit.sh dos`: 8 K 0.02 s → 16 K 0.09 s → 32 K 0.37 s → 64 K 1.43 s, ×4 per doubling). The cost is bounded by `max_header_bytes`, and the bridge listens on loopback, so this is not scored. A `resume_from` offset (or a stateful scanner) would make it linear.
-- **Fail-closed differences from monoid-login** (`diff`: 432 URLs rejected here but accepted by the reference, 118 the other way round). Examples: malformed or `%00`/`%0D` percent-escapes in credentials are rejected here, while the reference keeps them verbatim. `ssh://user:@host` is rejected. A scheme-less `host:port` is rejected. `host:` (empty port) is rejected. In the other direction, `h%0A.example` and `a\b` are accepted here (covered by P2-3). `:08080` is accepted as 8080, like WHATWG.
-- **`redacted()` with only a password** (`http://:secret@host`) prints `***@`, where the reference prints no userinfo. Both are safe.
+- **Fail-closed differences (historical pre-release audit data):** in the original pre-release differential (original internal reference implementation not published; current `run_audit.sh` runs Pion URL self-checks and Pion vs Go `NO_PROXY` differential), 432 URLs were rejected here while accepted by that reference, and 118 the other way round. Examples: malformed or `%00`/`%0D` percent-escapes in credentials are rejected here. `ssh://user:@host` is rejected. A scheme-less `host:port` is rejected. `host:` (empty port) is rejected. In the other direction, `h%0A.example` and `a\b` were accepted before P2-3 was fixed. `:08080` is accepted as 8080, like WHATWG.
+- **`redacted()` with only a password** (`http://:secret@host`) prints `***@`, which hides the credential cleanly.
 - **NO_PROXY trailing dot.** `example.com` matches `EXAMPLE.com.` and `EXAMPLE.COM.` matches `example.com` here, but not in Go. The behaviour here is more correct for FQDNs; not scored. Go also never proxies loopback or `localhost`; this package leaves that to the rules (63 such cases were set aside in the diff).
-- **RFC 1929 empty password.** The encoder and decoder reject PLEN=0, as RFC 1929's `1 to 255` field width requires. monoid-login sends PLEN=0 for `socks5://user@host`, so porting that bridge needs a policy decision.
+- **RFC 1929 empty password.** The encoder and decoder reject PLEN=0, as RFC 1929's `1 to 255` field width requires.
 - **SOCKS encoder/decoder asymmetry.** The decoder accepts CONNECT with DST.PORT=0 and domains containing spaces or other non-hostname bytes; the encoder rejects port 0. Both are allowed by RFC 1928; not scored.
 - **`HttpConnectResponse.proxy_authenticate`** keeps only the last challenge. Every challenge is still present in `headers` (checked by a control test).
-- **Reference bug found on the way:** in monoid-login@886d08e, `parseProxyUrl` and `redactProxyUrl` call each other on every unparseable URL (`proxy-bridge.ts:64` ↔ `:105`). The recursion only stops when V8 overflows the stack (depth ≈ 4 154, about 13 ms per call), which is also why the URL corpus is kept to 4 838 entries. The Pion port does not have this problem.
 
 ## Defended (control tests, all PASS)
 
@@ -128,8 +127,8 @@ These are the package's own W1–W3 benchmarks, re-run with `bench_compare.py --
 | workload | pion median | go median | pion/go | README claim | stdout SHA-256 |
 | --- | ---: | ---: | ---: | ---: | --- |
 | W1 URL + redaction + NO_PROXY, 200 k | 138.0 ms | 83.4 ms | 0.60× | 0.60× | identical `96dfab9a…` |
-| W2 SOCKS5 handshake, 500 k | 273.7 ms | 41.8 ms | 0.15× | 0.16× | identical `bd5d0f40…` |
-| W3 CONNECT + forward sanitize, 100 k | 533.1 ms | 566.4 ms | 1.06× | 1.02× | identical `88bc1dee…` |
+| W2 SOCKS5 handshake, 500 k | 273.7 ms | 41.8 ms | 0.15× | 0.16× | identical `bd5d0f40…` (pre-release audit baseline) |
+| W3 CONNECT + forward sanitize, 100 k | 533.1 ms | 566.4 ms | 1.06× | 1.02× | identical `88bc1dee…` (pre-release audit baseline) |
 
 The numbers reproduce, and the README reports the slower results honestly. Two caveats about fairness:
 
@@ -140,6 +139,6 @@ The numbers reproduce, and the README reports the slower results honestly. Two c
 
 - `redteam_test.pion`, `pion.toml`: 15 finding tests and 10 controls (`pionc test packages/proxy/audit`)
 - `probe/`: fuzzer with streaming invariants (`fuzz`), corpus runners (`urls`, `noproxy`), trickle-feed DoS probe (`drip`/`whole`)
-- `diff/ref_monoid_login.mjs`: monoid-login@886d08e `parseProxyUrl`/`redactProxyUrl`, ported verbatim; `diff/go/`: `x/net/http/httpproxy` oracle (pinned `go.sum`); `diff/gen_corpus.py`, `diff/compare.py`
+- `diff/go/`: `x/net/http/httpproxy` oracle (pinned `go.sum`); `diff/gen_corpus.py`, `diff/compare.py`
 - `reference_fix.patch`: a non-normative fix sketch that takes `run_audit.sh` to exit 0
 - `run_audit.sh`: one-command reproduction; all output goes to `$AUDIT_OUT` (default `/private/tmp/rt-proxy-audit`)

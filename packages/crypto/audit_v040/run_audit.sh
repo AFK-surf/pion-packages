@@ -6,7 +6,7 @@
 #
 # Gates (exit 1 if any fails; a fix branch reruns this unchanged):
 #   tests    control_* red-team unit tests (exact CryptoError kinds, RFC 7914 §11 KATs, HMAC key-fold
-#            boundaries, N < 2^(16 r), max_mem exact boundaries, a Node.js .mlogin.enc v1 envelope)
+#            boundaries, N < 2^(16 r), max_mem exact boundaries, a Node.js scrypt + AES-256-GCM envelope)
 #   diff     1,103-row Go golang.org/x/crypto corpus, cross-checked byte for byte by Node.js
 #            crypto.pbkdf2Sync / scryptSync / aes-256-gcm, then byte-identical in native_dbg /
 #            native_rel / wasm_dbg / wasm_rel (+ 4-mode stdout SHA-256 equal, 0 traps)

@@ -8,8 +8,8 @@
 # branch closes every finding (no byte of audit/ needs to change). diff / dos / bench are
 # reported, not scored (bench only fails on a stdout SHA-256 mismatch).
 #
-# Needs: pionc ($HOME/.pion/bin, AFK-surf/pion@66d2b4b), node (wasm32 runtime + monoid-login
-# reference), go 1.27 (golang.org/x/net v0.62.0 from the module cache or network), python3.
+# Needs: pionc ($HOME/.pion/bin, AFK-surf/pion@66d2b4b), node (wasm32 runtime),
+# go 1.27 (golang.org/x/net v0.62.0 from the module cache or network), python3.
 # Every artefact goes to $AUDIT_OUT (default /private/tmp/rt-proxy-audit), never into the worktree.
 set -eu
 
@@ -105,15 +105,14 @@ run_fuzz() {
 }
 
 run_diff() {
-  step "differential: proxy URLs vs monoid-login@886d08e (node), NO_PROXY vs golang.org/x/net/http/httpproxy v0.62.0"
+  step "differential: proxy URL redaction audit, NO_PROXY vs golang.org/x/net/http/httpproxy v0.62.0"
   python3 -I "$AUDIT_DIR/diff/gen_corpus.py" "$DATA/corpus"
   "$BIN/probe_native_rel" urls "$DATA/corpus/urls.hex" > "$DATA/urls_pion.out"
   node "$WASM_RT" "$BIN/probe_wasm_rel.wasm" urls "$DATA/corpus/urls.hex" > "$DATA/urls_pion_wasm.out"
   cmp -s "$DATA/urls_pion.out" "$DATA/urls_pion_wasm.out" && echo "urls: native == wasm32" || { echo "urls: native != wasm32"; FAIL=1; }
-  node "$AUDIT_DIR/diff/ref_monoid_login.mjs" "$DATA/corpus/urls.hex" > "$DATA/urls_ref.out"
   "$BIN/probe_native_rel" noproxy "$DATA/corpus/noproxy.tsv" > "$DATA/np_pion.out"
   "$BIN/noproxy_go" "$DATA/corpus/noproxy.tsv" > "$DATA/np_go.out"
-  python3 -I "$AUDIT_DIR/diff/compare.py" "$DATA/corpus" "$DATA/urls_pion.out" "$DATA/urls_ref.out" \
+  python3 -I "$AUDIT_DIR/diff/compare.py" "$DATA/corpus" "$DATA/urls_pion.out" \
     "$DATA/np_pion.out" "$DATA/np_go.out" --show 4
 }
 

@@ -1,7 +1,7 @@
 # 红队审计报告：Pion `packages/msgpack` @ `ef53ce0`（`feat/pkg-msgpack`）
 
 对照实现：Rust [`rmpv`](https://github.com/3Hren/msgpack-rust) **=1.3.1**（`--release`，与 `bench/rust` 相同）、Go [`vmihailenco/msgpack/v5`](https://github.com/vmihailenco/msgpack) **v5.4.1**（与 `bench/go` 相同）、MessagePack 规范（含 Timestamp ext `-1`）。
-环境：`tokyo-mac-studio-0`（Darwin arm64，`pionc 0.1.0` = `AFK-surf/pion@bee7628`，node v24.22.2），2026-11-23。整机同时有其他负载，时间数字以同一轮交替运行的**倍率**为准。
+环境：Apple M5 Max (Darwin arm64，`pionc 0.1.0` = `AFK-surf/pion@bee7628`，node v24.22.2），2026-11-23。整机同时有其他负载，时间数字以同一轮交替运行的**倍率**为准。
 
 ## 一键复现
 

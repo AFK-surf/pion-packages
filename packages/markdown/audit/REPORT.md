@@ -2,7 +2,7 @@
 
 Target: `origin/feat/opt-markdown` @ `d082835` ("zero-Event streaming HTML…"). The oracle is the real
 crate pinned to `=0.13.1` (`audit/rust_ref/Cargo.lock`), built with `--release`. Machine: Darwin arm64
-(tokyo-mac-studio-0), `pionc 0.1.0 (arm64_apple, self-hosted)`, `cargo 1.100.0`.
+(Apple M5 Max (Darwin arm64)), `pionc 0.1.0 (arm64_apple, self-hosted)`, `cargo 1.100.0`.
 
 Nothing under `packages/markdown/src/**`, the existing tests, or the repo root was changed. Everything in
 this audit lives under `packages/markdown/audit/`.

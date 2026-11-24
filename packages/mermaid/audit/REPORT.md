@@ -3,7 +3,7 @@
 Target `AFK-surf/pion-packages@7a40e8f`, branch `audit/redteam-mermaid`. References are
 **mermaid 12.3.0** (parsed through `mermaid.mermaidAPI.getDiagramFromText` under `linkedom`, the
 same entry point as `bench/bench_node_parse.mjs`) and **@dagrejs/dagre 3.1.3**. Toolchain:
-`pionc 0.1.0`, Node 24, Darwin arm64 (`tokyo-mac-studio-0`).
+`pionc 0.1.0`, Node 24, Apple M5 Max (Darwin arm64).
 
 Everything below is reproduced by one command, and no file outside `packages/mermaid/audit/` is
 touched:

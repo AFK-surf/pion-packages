@@ -84,7 +84,7 @@ The core ZIP security invariants and MS-DOS timestamp bitfield codec in `package
 
 ## Head-to-Head Benchmarks
 
-Measured on `Darwin arm64` (`tokyo-mac-studio-0`) via `sh packages/zip/bench/run_bench.sh` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) comparing:
+Measured on Apple M5 Max (`Darwin arm64`) via `sh packages/zip/bench/run_bench.sh` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) comparing:
 - **`pion`**: `packages/zip` (`pionc 0.1.0 --release`)
 - **`go_zip`**: Go `go1.27.3` stdlib `archive/zip`
 - **`rust_zip`**: Rust `1.100.0` `zip =2.2.3` (`--release --locked`, `default-features = false, features = ["deflate"]`, locked via `packages/zip/bench/rust/Cargo.lock`: `flate2 1.1.11`, `miniz_oxide 0.9.1`, `crc32fast 1.5.5`)

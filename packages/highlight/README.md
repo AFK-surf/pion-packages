@@ -1,6 +1,6 @@
 # `highlight`
 
-Pure Pion zero-allocation, line-state incremental syntax highlighting engine (24 languages including Java, Kotlin, Swift, C#, PHP, Ruby, Dockerfile, and Markdown), designed to replace JavaScript `shiki` / `prismjs` across `still.fail`, `board`, and `invar/code_field`.
+Pure Pion zero-allocation, line-state incremental syntax highlighting engine (24 languages including Java, Kotlin, Swift, C#, PHP, Ruby, Dockerfile, and Markdown), designed to replace JavaScript `shiki` / `prismjs` for native and WebAssembly editors and code viewers.
 
 Zero regex backtracking, zero JavaScript, zero C glue, zero `World` dependency, `Send`-safe immutable value types, and dual-target verified on **Native (`arm64_apple`)** and **WebAssembly (`wasm32`)**.
 

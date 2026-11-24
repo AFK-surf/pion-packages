@@ -1,6 +1,6 @@
 # `encoding` (v0.1.0)
 
-Pure Pion **WHATWG Encoding Standard** character set decoding & encoding library — 100% pure Pion, zero external dependencies, zero `extern "C"`, zero `World` dependency, and zero mutable module globals. Designed to power Farview's HTML charset sniffing and Web `TextDecoder` / `TextEncoder` APIs, as well as the broader Pion ecosystem (`email`, `html`, `csv`, legacy CJK text).
+Pure Pion **WHATWG Encoding Standard** character set decoding & encoding library — 100% pure Pion, zero external dependencies, zero `extern "C"`, zero `World` dependency, and zero mutable module globals. Designed to power HTML charset sniffing and Web `TextDecoder` / `TextEncoder` APIs, as well as the broader Pion ecosystem (`email`, `html`, `csv`, legacy CJK text).
 
 ## Coverage (All 40 WHATWG Encodings)
 

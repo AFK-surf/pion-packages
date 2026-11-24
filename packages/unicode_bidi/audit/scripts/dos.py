@@ -34,7 +34,7 @@ CASES = [
     ("paragraphs_rtl_x5k_l1only", "l1", lambda n: (R + "\n") * (n // 10), True),
     ("paragraphs_ltr_x5k_l1only", "l1", lambda n: (A + "\n") * (n // 10), True),
     ("crlf_ws_lines_3k", "lines", lambda n: (R + " \t" + LRI + "\r\n") * (n // 16), True),
-    ("farview_single_line_rtl", "farview", lambda n: (R + " ab (1) ") * (n // 8), False),
+    ("line_levels_single_line_rtl", "line_levels", lambda n: (R + " ab (1) ") * (n // 8), False),
     ("vis_levels_0_125_50k", "vis", lambda n: ",".join(str(i % 126) for i in range(n)), False),
     ("vis_huge_int_level", "vis", lambda n: "0," + str(n * 20), False),
     # Memory amplification at the documented default limit (16 MiB): size fixed, see the rss column.

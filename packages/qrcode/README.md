@@ -27,7 +27,7 @@ Pure Pion, zero-dependency, `World`-free, Native + Wasm32 dual-target **ISO/IEC 
 import "qrcode"
 
 pub fn example() -> Result[String, qrcode::QrError] {
-  let qr = match qrcode::encode("https://still.fail", qrcode::EcLevel::M) {
+  let qr = match qrcode::encode("https://example.com", qrcode::EcLevel::M) {
     Result::Ok(q) => q
     Result::Err(e) => return Result::Err(e)
   }
@@ -36,7 +36,7 @@ pub fn example() -> Result[String, qrcode::QrError] {
     Result::Ok(d) => d
     Result::Err(e) => return Result::Err(e)
   }
-  let _ = decoded.text // "https://still.fail"
+  let _ = decoded.text // "https://example.com"
   Result::Ok(svg)
 }
 ```
@@ -60,7 +60,7 @@ pionc run --target wasm32 packages/qrcode/wasm_smoke
 pionc run --target wasm32 --release packages/qrcode/wasm_smoke
 ```
 
-- Verified stdout SHA-256 across all 4 modes: `e19b626d6e7669a7487f8f6ce5d2a7b4fc26a780bc7ae46e27608e15d6f6095c`
+- Verified stdout SHA-256 across all 4 modes: `942df35238cee14406e00bdf7b407e750dd2466bb2de007336bb65a5523aaf47`
 
 ## Formal Verification (Lean 4)
 
@@ -89,7 +89,7 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved)
 | `rust_qrcodegen` (`qrcodegen 1.8.0`) | 1171.980 | 1160.355 | 2165.364 | 2.42 MiB | 4.59x |
 | `rust_fast_qr` (`fast_qr 0.14.0`) | **511.794** | 500.976 | 895.892 | 2.17 MiB | **10.52x** |
 
-- Stdout SHA-256: `a58f60af0df01ae748d6ce495ed1c66abf1f26096bb871c245a434b9ab151869`
+- Stdout SHA-256 (4-impl `audit/oracle` W1): `a58f60af0df01ae748d6ce495ed1c66abf1f26096bb871c245a434b9ab151869` (2-impl `bench/pion_bench` vs `bench/rust`: W1 `ef441039060c80753eba6ab8bab357edeb0846715b50a43334064df2c9872357`, W3 `ff4e46713732b6ef461cf923589d62b48b3b466787ea5378624b05efe8d1c48d`)
 
 ### W2: Large Multi-Version Binary Encode (300 ops, v10–v40 + RS Interleaving)
 

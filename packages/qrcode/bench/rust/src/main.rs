@@ -69,11 +69,11 @@ fn render_compact_svg(qr: &QrCode) -> String {
 
 fn bench_w1() {
     let inputs: [&[u8]; 5] = [
-        b"https://still.fail/o/01m3hng540559hjg7h4rcww0te/chat",
+        b"https://example.com/o/01examp1e2a3b4c5d6e7f8g9h0/chat",
         b"otpauth://totp/acme:alice@example.com?secret=jbswy3dpehpk3pxp&issuer=acme",
         b"https://github.com/afk-surf/pion-packages/tree/main/packages/qrcode",
-        b"otpauth://totp/stillfail:bob@example.org?secret=mfrggzdfmztwq2lk&digits=6",
-        b"https://console.still.fail/device/activate?token=k9x4m2p7q1w8",
+        b"otpauth://totp/example:bob@example.org?secret=mfrggzdfmztwq2lk&digits=6",
+        b"https://console.example.com/device/activate?token=a1b2c3d4e5f6",
     ];
     let ecs = [EcLevel::M, EcLevel::Q, EcLevel::Q, EcLevel::M, EcLevel::M];
 
@@ -121,10 +121,10 @@ fn bench_w2() {
 
 fn bench_w3() {
     let inputs: [&[u8]; 5] = [
-        b"https://console.still.fail/device/activate?token=k9x4m2p7q1w8",
-        b"https://share.still.fail/doc/q4-roadmap?view=compact&theme=dark",
-        b"https://still.fail/o/01m3hng540559hjg7h4rcww0te/chat",
-        b"otpauth://totp/stillfail:bob@example.org?secret=mfrggzdfmztwq2lk&digits=6",
+        b"https://console.example.com/device/activate?token=a1b2c3d4e5f6",
+        b"https://share.example.com/doc/roadmap?view=compact&theme=dark",
+        b"https://example.com/o/01examp1e2a3b4c5d6e7f8g9h0/chat",
+        b"otpauth://totp/example:bob@example.org?secret=mfrggzdfmztwq2lk&digits=6",
         b"otpauth://totp/acme:alice@example.com?secret=jbswy3dpehpk3pxp&issuer=acme",
     ];
     let ecs = [EcLevel::M, EcLevel::M, EcLevel::M, EcLevel::M, EcLevel::Q];

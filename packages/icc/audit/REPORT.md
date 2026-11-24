@@ -13,7 +13,7 @@
     - `wasm_smoke` output that differs between the 4 modes;
     - shipped bench output that is not byte-identical.
   - The fixes must make the `redteam_*` cases pass **without editing `audit/`**.
-- **Toolchain**: pionc 0.1.0 (arm64_apple, self-hosted), node v24.22.2 (`pion_wasm_rt.mjs`), cargo 1.100.0 with `qcms =0.3.0` and `moxcms =0.9.2` (locked `Cargo.lock`), python3 stdlib, macOS arm64 (`tokyo-mac-studio-0`, Apple M5 Max, load about 6–8).
+- **Toolchain**: pionc 0.1.0 (arm64_apple, self-hosted), node v24.22.2 (`pion_wasm_rt.mjs`), cargo 1.100.0 with `qcms =0.3.0` and `moxcms =0.9.2` (locked `Cargo.lock`), python3 stdlib, macOS arm64 (Apple M5 Max (Darwin arm64), load about 6–8).
 - **Proprietary profiles**: the 11 matrix/TRC and GRAY profiles in `/System/Library/ColorSync/Profiles` are read in place when present, and never copied into the tree (the `portability` gate checks that 0 `.icc`/`.icm` files are in git). Every other profile is synthesised by `diff/gen.py`.
 
 ## Verdict

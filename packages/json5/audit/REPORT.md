@@ -1,7 +1,7 @@
 # Red-team audit: `packages/json5` @ `b9f6a1f` (`feat/pkg-json5`)
 
 This is the case against the pure Pion JSON5 v2.0 / JSONC / RFC 6901 / RFC 6902 package. Each finding was run on the
-same bytes, on the same machine (`tokyo-mac-studio-0`, Apple M5 Max, macOS 27.0.1, 2026-11-23), against:
+same bytes, on the same machine (Apple M5 Max (Darwin arm64), macOS 27.0.1, 2026-11-23), against:
 
 | reference | role |
 |---|---|

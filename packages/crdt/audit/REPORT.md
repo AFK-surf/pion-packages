@@ -2,7 +2,7 @@
 
 - 审计对象：`AFK-surf/pion-packages` `origin/main` `7a40e8f`，`packages/crdt/src/**`（未改动任何源码与原有测试）。
 - 参照实现：Node.js `yjs@13.6.33`（`lib0` 随附，`node v24.22.2`）；Rust `yrs =0.28.2`（`cargo build --release`，`lto=thin`，`OffsetKind::Utf16`，与 JS 索引一致）。`y-octo =0.3.0` 已锁进 `rust/Cargo.lock`，本轮未单独出数。
-- 机器：`Darwin arm64`（tokyo-mac-studio-0）。**跑 bench 时同机还有别的会话在跑审计，load average ≈ 42**，绝对毫秒数有噪声；三个实现严格交替轮转，倍率可比。
+- 机器：`Darwin arm64`（Apple M5 Max (Darwin arm64)）。**跑 bench 时同机还有别的会话在跑审计，load average ≈ 42**，绝对毫秒数有噪声；三个实现严格交替轮转，倍率可比。
 - 一键复现：`sh packages/crdt/audit/run_audit.sh`（`SECTIONS="tests fuzz yrs malformed size bench"`、`SEEDS`、`ROUNDS` 可调；产物只写 `~/.cache/pion-crdt-audit` 与 `$AUDIT_OUT`）。
 
 ## 0. 总览

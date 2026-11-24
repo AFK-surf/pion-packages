@@ -7,7 +7,7 @@ References:
 - `github.com/emersion/go-msgauth v0.7.0` (pinned by `oracle/go/go.sum`). It is an independent RFC 6376/8463 DKIM implementation built on Go `crypto/ed25519` and `crypto/rsa`, and it signs and verifies the DKIM fixtures.
 - The RFC 8463 Appendix A test message, verbatim.
 
-Machine: Darwin arm64 (tokyo-mac-studio-0), `pionc 0.1.0`, node v24.22.2, go1.27.3, cargo 1.100.0.
+Machine: Apple M5 Max (Darwin arm64), `pionc 0.1.0`, node v24.22.2, go1.27.3, cargo 1.100.0.
 
 Reproduce: `sh packages/email/audit/run_audit.sh`. It takes about 10 s and writes all artifacts to a fresh `$AUDIT_OUT` under `/private/tmp`. Nothing is written inside the repository.
 

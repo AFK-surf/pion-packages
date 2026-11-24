@@ -1,6 +1,6 @@
 # Red-team audit: `packages/highlight` vs prismjs / shiki
 
-Target: `AFK-surf/pion-packages` `origin/main` `7a40e8f`, `packages/highlight` (untouched). Machine: Darwin arm64 (tokyo-mac-studio-0), `pionc 0.1.0`, Node v24.22.2, reference engines **prismjs 1.30.0** and **shiki 3.23.0** (TextMate grammars, the same ones VS Code uses). Rust `syntect` / tree-sitter were not run: this machine has no `cargo`.
+Target: `AFK-surf/pion-packages` `origin/main` `7a40e8f`, `packages/highlight` (untouched). Machine: Apple M5 Max (Darwin arm64), `pionc 0.1.0`, Node v24.22.2, reference engines **prismjs 1.30.0** and **shiki 3.23.0** (TextMate grammars, the same ones VS Code uses). Rust `syntect` / tree-sitter were not run: this machine has no `cargo`.
 
 ## Reproduce
 

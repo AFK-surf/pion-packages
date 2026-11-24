@@ -2,7 +2,7 @@
 
 Target: `origin/feat/pkg-brotli` @ `71bb340` (pure Pion RFC 7932 decoder, `v0.1.0`).
 References: Google C `libbrotlidec`/`libbrotlienc` **1.2.1** (Homebrew; the oracle) and Rust `brotli-decompressor 4.0.3` (the decoder inside `brotli 7.0.0`; second opinion).
-Machine: Darwin arm64 (tokyo-mac-studio-0), `pionc 0.1.0`, node v24.22.2, cargo 1.100.0.
+Machine: Apple M5 Max (Darwin arm64), `pionc 0.1.0`, node v24.22.2, cargo 1.100.0.
 Reproduce everything with `sh packages/brotli/audit/run_audit.sh all` (about 3 min). Artifacts go to `$AUDIT_OUT`, which defaults to `/private/tmp/pion-brotli-audit`. Nothing is written inside the repository.
 
 ## Verdict

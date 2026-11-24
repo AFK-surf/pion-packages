@@ -2,7 +2,7 @@
 
 Target: `origin/feat/pkg-woff2` @ `66ac41c` (`packages/woff2` `v0.1.0`, pure Pion WOFF 2.0 / WOFF 1.0 → SFNT decoder).
 References: Rust `wuff =0.2.10` (`audit/diff/rust`, same canonical output line as the Pion harness), fontTools `4.60.2` (independent WOFF2/WOFF1 *encoder* for the real-font corpus and semantic glyph comparison against the original fonts), and the W3C WOFF 2.0 / WOFF 1.0 texts.
-Machine: Darwin arm64 (tokyo-mac-studio-0), `pionc 0.1.0 (arm64_apple, self-hosted)`.
+Machine: Apple M5 Max (Darwin arm64), `pionc 0.1.0 (arm64_apple, self-hosted)`.
 Everything below can be reproduced with `sh packages/woff2/audit/run_audit.sh all`. Artifacts (binaries, Cargo target, Python venv, corpora, JSON reports) go to `$AUDIT_OUT`, default `/private/tmp/pion-woff2-audit`. Nothing is written inside the repository.
 
 ## Verdict

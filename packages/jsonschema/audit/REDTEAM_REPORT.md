@@ -5,7 +5,7 @@
   Pion), Node `ajv@8.17.1` (`ajv/dist/2020` + `ajv` draft-07, `strict:false, allErrors:true`, `ajv-formats@3.0.1` when
   formats are asserted), official **JSON-Schema-Test-Suite @ `83e866b`** (2025-02-19, the suite generation contemporary
   with jsonschema 0.29.1; `refRemote.json` excluded because it needs an HTTP remote server).
-- **Toolchain**: `pionc 0.1.0` (`AFK-surf/pion@c375cee`), cargo 1.100.0, node v24.22.2, Darwin arm64 (tokyo-mac-studio-0).
+- **Toolchain**: `pionc 0.1.0` (`AFK-surf/pion@c375cee`), cargo 1.100.0, node v24.22.2, Apple M5 Max (Darwin arm64).
 - **Reproduce everything**: `sh packages/jsonschema/audit/run_audit.sh` (sections: `build unit suite redteam modes deep dos bench`).
   All artifacts land in `/private/tmp/rt-jsonschema`; the worktree stays clean.
 

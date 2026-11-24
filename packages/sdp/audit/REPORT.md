@@ -7,7 +7,7 @@
 - **Oracles** (`--release`, exact pins): webrtc-rs [`sdp` =0.9.0](https://crates.io/crates/sdp)
   and Mozilla/Firefox [`webrtc-sdp` =0.3.17](https://crates.io/crates/webrtc-sdp).
 - **Toolchain**: `pionc 0.1.0 (arm64_apple, self-hosted)`, cargo 1.100.0, node v24.22.2, macOS
-  arm64 (`tokyo-mac-studio-0`).
+  arm64 (Apple M5 Max (Darwin arm64)).
 - **Reproduce**: `sh packages/sdp/audit/run_audit.sh all` (about 30 s; everything is written to
   `/private/tmp/pion-sdp-audit`, and `git status --porcelain --ignored` stays empty).
 

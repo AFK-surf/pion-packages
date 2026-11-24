@@ -2,7 +2,7 @@
 
 Target: `origin/feat/pkg-flate` @ `ad6f6b9` (pure Pion RFC 1951 / 1950 / 1952, CRC-32, Adler-32).
 References: Rust `flate2 1.1.11` with the `rust_backend` (`miniz_oxide`), Go `go1.27.3` `compress/{flate,zlib,gzip}`, and CPython `zlib`.
-Machine: Darwin arm64 (tokyo-mac-studio-0). Every result below can be reproduced with `sh packages/flate/audit/run_audit.sh all`. All artifacts are written to `$AUDIT_OUT`, which defaults to `/private/tmp/pion-flate-audit`. That is the real path of `/tmp`, so wasm32 runs see the same paths as native runs.
+Machine: Apple M5 Max (Darwin arm64). Every result below can be reproduced with `sh packages/flate/audit/run_audit.sh all`. All artifacts are written to `$AUDIT_OUT`, which defaults to `/private/tmp/pion-flate-audit`. That is the real path of `/tmp`, so wasm32 runs see the same paths as native runs.
 
 ## Verdict
 

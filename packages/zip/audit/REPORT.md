@@ -2,7 +2,7 @@
 
 - **Target**: `AFK-surf/pion-packages` `feat/pkg-zip` @ `2598d1c` (`packages/zip/src/{reader,writer,types,path}.pion`, `bench/`).
 - **References**: Go `go1.27.3` `archive/zip`, Rust `1.100.0` `zip =2.2.3` (`default-features = false, features = ["deflate"]`, locked via `diff/rust/Cargo.lock`), CPython `3.9.6` `zipfile`.
-- **Toolchain**: `pionc 0.1.0 (arm64_apple, self-hosted)`, `node v24.22.2` (`pion_wasm_rt.mjs`), Darwin arm64 (`tokyo-mac-studio-0`, shared machine, load 20–35 during timing runs — timings are given as ratios against a same-run control).
+- **Toolchain**: `pionc 0.1.0 (arm64_apple, self-hosted)`, `node v24.22.2` (`pion_wasm_rt.mjs`), Darwin arm64 (Apple M5 Max (Darwin arm64), shared machine, load 20–35 during timing runs — timings are given as ratios against a same-run control).
 - **Reproduce**: `sh packages/zip/audit/run_audit.sh` (sections: `build unit writer vectors paths fuzz modes dos prof`). All artifacts land in `/private/tmp/pion-zip-audit`; the worktree stays clean (`git status --porcelain --ignored` is checked at the end).
 
 | File | Purpose |

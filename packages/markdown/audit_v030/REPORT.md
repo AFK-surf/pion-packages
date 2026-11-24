@@ -53,7 +53,7 @@ HTML 也一样：解析器给出 `HtmlInline("<script>")`、`Text("alert(1)")`�
 | `hi <script>alert(1)</script> there` | `hi alert(1) there` |
 | `a <style>p{x:y}</style> b` | `a p{x:y} b` |
 
-影响：monoid、group、board 的会话列表、通知和搜索摘要会显示 JS/CSS 源码。纯文本本身不是 HTML，不直接构成
+影响：下游应用的会话列表、通知和搜索摘要会显示 JS/CSS 源码。纯文本本身不是 HTML，不直接构成
 XSS；但调用方若把预览拼进 HTML 而不转义，泄漏出来的 `<`、`>` 正文会变成注入面。修复方向：遇到 `script`、
 `style`（建议再加 `textarea`、`title`、`template`、`noscript`）时跳到对应闭合标签，行内情况要跨
 `HtmlInline` 节点带上这个状态。

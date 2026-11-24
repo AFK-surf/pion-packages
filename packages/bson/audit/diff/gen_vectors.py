@@ -120,7 +120,7 @@ for t in (0x14, 0x15, 0x20, 0x7E, 0x80, 0xFE, 0x00):
 
 # DateTime boundaries
 for ms in [0, 1, -1, 999, -999, 1000, -1000, 253402300799999, 253402300800000, -62135596800000,
-           -62135596800001, -62167219200000, 2**63 - 1, -2**63, 2**53, -2**53, 1356351330501, 951782400000,
+           -62135596800001, -62167219200000, 2**63 - 1, -2**63, 2**53, -2**53, 1752914535321, 951782400000,
            951868800000, 4107542400000, 32503680000000]:
     B("datetime", doc(el(0x09, b"a", struct.pack("<q", ms))))
 
@@ -196,12 +196,12 @@ for k in range(n_fuzz):
 J = lambda cat, s: add(cat, "J", s)
 wrap = lambda v: '{"a":' + v + '}'
 
-for v in ['{"$oid":"56e1fc72e0c917e9c4714161","x":1}', '{"$numberInt":"1","x":1}', '{"x":1,"$numberInt":"1"}',
+for v in ['{"$oid":"65a00102030405060708090a","x":1}', '{"$numberInt":"1","x":1}', '{"x":1,"$numberInt":"1"}',
           '{"$numberLong":"1","x":1}', '{"$numberDouble":"1.0","x":1}', '{"$numberDecimal":"1","x":1}',
           '{"$date":{"$numberLong":"1"},"x":1}', '{"$date":"1970-01-01T00:00:00Z","x":1}',
-          '{"$binary":{"base64":"AA==","subType":"00"},"x":1}', '{"$uuid":"73ffd264-44b3-4c69-90e8-e7d1dfc035d4","x":1}',
+          '{"$binary":{"base64":"AA==","subType":"00"},"x":1}', '{"$uuid":"12345678-9abc-4def-8123-456789abcdef","x":1}',
           '{"$regularExpression":{"pattern":"a","options":""},"x":1}', '{"$timestamp":{"t":1,"i":1},"x":1}',
-          '{"$symbol":"s","x":1}', '{"$dbPointer":{"$ref":"a","$id":{"$oid":"56e1fc72e0c917e9c4714161"}},"x":1}',
+          '{"$symbol":"s","x":1}', '{"$dbPointer":{"$ref":"a","$id":{"$oid":"65a00102030405060708090a"}},"x":1}',
           '{"$undefined":true,"x":1}', '{"$minKey":1,"x":1}', '{"$maxKey":1,"x":1}', '{"$code":"c","x":1}',
           '{"$code":"c","$scope":{},"x":1}', '{"$numberInt":"1","$numberLong":"1"}']:
     J("ej_wrapper_extra_field", wrap(v))
@@ -220,8 +220,8 @@ for s in ["1", "1.", ".5", "-.5", "1e5", "1E+5", "+1.0", "-0", "-0.0", "0.0", "I
 for s in ["1", "-0", "0E+6111", "1E+6145", "1E+6144", "1E-6177", "NaN", "-NaN", "sNaN", "-sNaN", "Inf", "-Inf",
           "Infinity", "+Infinity", ".1", "1.", " 1", "1 ", "1e", "1E-", "١", ""]:
     J("ej_number_decimal", wrap(json.dumps({"$numberDecimal": s})))
-for s in ["56e1fc72e0c917e9c4714161", "56E1FC72E0C917E9C4714161", "56e1fc72e0c917e9c471416", "56e1fc72e0c917e9c47141611",
-          "zze1fc72e0c917e9c4714161", "", "56e1fc72e0c917e9c471416é"]:
+for s in ["65a00102030405060708090a", "65A00102030405060708090A", "65a00102030405060708090", "65a00102030405060708090a1",
+          "zza00102030405060708090a", "", "65a00102030405060708090é"]:
     J("ej_oid", wrap(json.dumps({"$oid": s})))
 J("ej_oid", wrap('{"$oid":1}'))
 for s in ["1970-01-01T00:00:00Z", "1970-01-01T00:00:00.000Z", "1970-01-01T00:00:00.1Z", "1970-01-01T00:00:00.1234Z",
@@ -232,7 +232,7 @@ for s in ["1970-01-01T00:00:00Z", "1970-01-01T00:00:00.000Z", "1970-01-01T00:00:
           "1970-01-01T00:00:00", "1970-1-01T00:00:00Z", "1970-01-01T00:00:00.Z", "1970-01-01T00:00:00+24:00",
           "1970-01-01T00:00:00-00:30", "1970-01-01T00:00:00+05:30:00", "١970-01-01T00:00:00Z", ""]:
     J("ej_date_iso", wrap(json.dumps({"$date": s})))
-for v in ['{"$date":0}', '{"$date":1356351330501}', '{"$date":-1}', '{"$date":1.5}', '{"$date":{"$numberInt":"5"}}',
+for v in ['{"$date":0}', '{"$date":1752914535321}', '{"$date":-1}', '{"$date":1.5}', '{"$date":{"$numberInt":"5"}}',
           '{"$date":{"$numberLong":"9223372036854775807"}}', '{"$date":{"$numberLong":"9223372036854775808"}}',
           '{"$date":{"$numberLong":"1","x":1}}', '{"$date":null}', '{"$date":true}', '{"$date":{"$numberDouble":"1"}}']:
     J("ej_date_other", wrap(v))
@@ -248,9 +248,9 @@ for v in ['{"$binary":{"base64":"AA==","subType":"0"}}', '{"$binary":{"base64":"
           '{"$binary":{"base64":"AAAA","subType":"04"}}',
           '{"$binary":{"base64":"AA==","subType":"09"}}', '{"$binary":{"base64":"","subType":"09"}}']:
     J("ej_binary", wrap(v))
-for s in ["73ffd264-44b3-4c69-90e8-e7d1dfc035d4", "73FFD264-44B3-4C69-90E8-E7D1DFC035D4", "73ffd26444b34c6990e8e7d1dfc035d4",
-          "73ffd264-44b3-4c69-90e8-e7d1dfc035d", "{73ffd264-44b3-4c69-90e8-e7d1dfc035d4}", "73ffd264-44b34c69-90e8-e7d1dfc035d4-",
-          "73ffd264_44b3_4c69_90e8_e7d1dfc035d4", "g3ffd264-44b3-4c69-90e8-e7d1dfc035d4", ""]:
+for s in ["12345678-9abc-4def-8123-456789abcdef", "12345678-9ABC-4DEF-8123-456789ABCDEF", "123456789abc4def8123456789abcdef",
+          "12345678-9abc-4def-8123-456789abcde", "{12345678-9abc-4def-8123-456789abcdef}", "12345678-9abc4def-8123-456789abcdef-",
+          "12345678_9abc_4def_8123_456789abcdef", "g2345678-9abc-4def-8123-456789abcdef", ""]:
     J("ej_uuid", wrap(json.dumps({"$uuid": s})))
 for v in ['{"$regularExpression":{"pattern":"a","options":"mix"}}', '{"$regularExpression":{"pattern":"a","options":"z"}}',
           '{"$regularExpression":{"pattern":"a","options":"ii"}}', '{"$regularExpression":{"pattern":"a\\u0000b","options":""}}',
@@ -264,12 +264,12 @@ for v in ['{"$timestamp":{"t":1,"i":2}}', '{"$timestamp":{"i":2,"t":1}}', '{"$ti
           '{"$timestamp":{"t":1,"t":2}}']:
     J("ej_timestamp", wrap(v))
 for v in ['{"$code":"x","$scope":{"a":1}}', '{"$scope":{"a":1},"$code":"x"}', '{"$code":"x","$scope":1}',
-          '{"$code":1}', '{"$scope":{}}', '{"$code":"x","$scope":{"$numberInt":"1"}}', '{"$code":"x","$scope":{"$oid":"56e1fc72e0c917e9c4714161"}}',
+          '{"$code":1}', '{"$scope":{}}', '{"$code":"x","$scope":{"$numberInt":"1"}}', '{"$code":"x","$scope":{"$oid":"65a00102030405060708090a"}}',
           '{"$symbol":1}', '{"$undefined":false}', '{"$undefined":1}', '{"$minKey":2}', '{"$minKey":{"$numberInt":"1"}}',
-          '{"$maxKey":"1"}', '{"$maxKey":1.0}', '{"$dbPointer":{"$ref":"a","$id":"56e1fc72e0c917e9c4714161"}}',
-          '{"$dbPointer":{"$ref":1,"$id":{"$oid":"56e1fc72e0c917e9c4714161"}}}',
-          '{"$dbPointer":{"$id":{"$oid":"56e1fc72e0c917e9c4714161"},"$ref":"a"}}',
-          '{"$ref":"c","$id":{"$oid":"56e1fc72e0c917e9c4714161"}}', '{"$ref":"c","$id":1,"$db":"d"}', '{"$foo":1}',
+          '{"$maxKey":"1"}', '{"$maxKey":1.0}', '{"$dbPointer":{"$ref":"a","$id":"65a00102030405060708090a"}}',
+          '{"$dbPointer":{"$ref":1,"$id":{"$oid":"65a00102030405060708090a"}}}',
+          '{"$dbPointer":{"$id":{"$oid":"65a00102030405060708090a"},"$ref":"a"}}',
+          '{"$ref":"c","$id":{"$oid":"65a00102030405060708090a"}}', '{"$ref":"c","$id":1,"$db":"d"}', '{"$foo":1}',
           '{"$numberint":"1"}', '{"$NumberInt":"1"}']:
     J("ej_misc_wrappers", wrap(v))
 # plain JSON numbers (relaxed typing)
@@ -283,7 +283,7 @@ for s in ['"a\\u0000b"', '"\\ud83d\\ude00"', '"\\ud83d"', '"\\ude00"', '"\\ud83d
           '"a\tb"', '"\\u000"', '"\\U0041"', '" "', '"é"']:
     J("ej_string", '{"s":' + s + '}')
     J("ej_key", '{' + s + ':1}')
-for s in ['{"a":1,"a":2}', '{"a":1,"b":2,"a":3}', '{"$oid":"56e1fc72e0c917e9c4714161"}', '[1]', '1', '"x"', '{}', '{} ',
+for s in ['{"a":1,"a":2}', '{"a":1,"b":2,"a":3}', '{"$oid":"65a00102030405060708090a"}', '[1]', '1', '"x"', '{}', '{} ',
           ' {}', '{}{}', '{"a":1,}', '{"a":[1,]}', '{,}', '{"a" 1}', '{"a":tru}', '{"a":nulll}', "{'a':1}", '{"a":1}\u0000',
           '﻿{}', '{"a":[]}', '{"a":[[]]}', '{"a":{"b":{}}}']:
     J("ej_structure", s)

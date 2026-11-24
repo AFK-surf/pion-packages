@@ -16,17 +16,17 @@
 
 **0 P0 · 1 P1 · 3 P2.** The cryptographic core is correct: every one of the 1,103 Go-generated
 vectors (all HMAC key-folding and `salt || INT(i)` padding boundaries, `dkLen` 1–256, the full
-`N × r × p` matrix up to `N = 32768, r = 16, p = 4`, the max_mem boundaries and 16 `.mlogin.enc` v1
+`N × r × p` matrix up to `N = 32768, r = 16, p = 4`, the max_mem boundaries and 16 scrypt + AES-256-GCM envelope
 envelopes for `N = 1024 … 131072`) is byte-identical to Go **and** to Node.js, in all four build modes
 (`native_dbg` / `native_rel` / `wasm_dbg` / `wasm_rel`, identical stdout SHA-256, 0 traps). All 17
 re-created bug classes (Salsa20/6, Integerify offset, BlockMix shuffle, HMAC fold at 64/128, INT(i)
-endianness, padding off-by-one, ...) are detected. The `.mlogin.enc` v1 path (N=32768, r=8, p=1,
+endianness, padding off-by-one, ...) are detected. The scrypt + AES-256-GCM envelope path (N=32768, r=8, p=1,
 64 MiB) is safe and interoperable.
 
 The findings are all at the **integer / allocation edges** of the public API: a 2 GiB `dk_len`
 returns an all-zero "key" (P1-1) or aborts the process (P2-1); a caller-raised `max_mem` traps on
 wasm32 (P2-2); and the RFC 7914 `N < 2^(16 r)` rule is not enforced (P2-3). None is reachable through
-the `.mlogin.enc` parameters; all are reachable by any caller that forwards untrusted KDF parameters
+the scrypt + AES-256-GCM envelope parameters; all are reachable by any caller that forwards untrusted KDF parameters
 (e.g. parameters read from an encrypted file header).
 
 | ID | Sev | Finding | Where | Gate |
@@ -65,7 +65,7 @@ The `probes` gate accepts any `Err` or an `OKBIG` whose last 32 bytes equal Go's
 `go_oracle tail` value.
 
 Severity rationale: fail-open wrong output from a public KDF entry point with an RFC-legal parameter;
-not P0 because no realistic caller (including `.mlogin.enc`, `dk_len = 32`) asks for a 2 GiB key.
+not P0 because no realistic caller (including scrypt + AES-256-GCM envelope, `dk_len = 32`) asks for a 2 GiB key.
 
 ### P2-1 — `dk_len` near `Int::MAX` aborts the process
 
@@ -89,7 +89,7 @@ a 2 GiB `Bytes` works), so with a ceiling the caller raised above ~1 GiB:
 | N=2²⁰, r=16 (V = 2 GiB) | `f819704b…` (= Go) | trap |
 | N=2²⁴, r=2 (V = 4 GiB) | computes (4 GiB RSS) | trap |
 
-The default `scrypt` (256 MiB) and the `.mlogin.enc` ceilings (64 / 256 MiB) are not affected.
+The default `scrypt` (256 MiB) and the scrypt + AES-256-GCM envelope ceilings (64 / 256 MiB) are not affected.
 **Fix**: a target-independent hard ceiling on the V table (`128 · r · N < 2³⁰`, i.e. `N · r < 2²³`,
 → `MemoryLimitExceeded`) regardless of `max_mem_bytes`, documented in the README. The gate accepts
 `ERR:MemoryLimitExceeded` or Go's bytes, but requires all four modes to agree. The wasm32 allocation
@@ -102,7 +102,7 @@ RFC 7914 §2: N "must be larger than 1, a power of 2, and less than 2^(128 · r 
 Node.js `scryptSync`) refuses `N ≥ 2^(16 r)`; Go x/crypto does not check it. `scrypt.pion:311` checks
 only `N > 1` and power of two, so `scrypt(pw, salt, 65536, 1, 1, 32)` returns `c2caa7d8…` where Node.js
 throws `ERR_CRYPTO_INVALID_SCRYPT_PARAMS`. With `r ≥ 2` the bound exceeds `Int` (only `r = 1`,
-`N ≥ 65536` is affected), and `.mlogin.enc` uses `r = 8`, so the impact is limited to a key a
+`N ≥ 65536` is affected), and scrypt + AES-256-GCM envelope uses `r = 8`, so the impact is limited to a key a
 Pion writer could produce that the Node.js side can never re-derive. **Fix**: `if r < 2 && n >= 65536
 { return Err(InvalidParam) }` (general form: `16 * r < 31 && n >= 1 << (16 * r)`).
 Gated by `control_scrypt_n_below_2_pow_16r` and the `sc/nbound/` corpus rows (Node.js refuses both).
@@ -154,11 +154,11 @@ stdout SHA-256. Families:
 - **scrypt** `N ∈ {2, 4, 8, 16, 64, 1024, 16384, 32768} × r ∈ {1, 2, 4, 8, 16} × p ∈ {1, 2, 3, 4}`
   (160 rows), password/salt boundaries (144), dkLen sweep (15), exact `128 r (N + p + 2)` max_mem
   boundaries and one byte below for 9 parameter sets (Node.js `maxmem` agrees on every one), the
-  64 MiB `.mlogin.enc` rule (N=32768 passes, 65536 / 131072 refused, as in Node), 37 hostile
+  64 MiB scrypt + AES-256-GCM envelope rule (N=32768 passes, 65536 / 131072 refused, as in Node), 37 hostile
   parameter rows (`N = 0, −1, 1, 3, 6, 15, 1023, 2³⁰, Int::MIN, Int::MAX`, `r, p = 0, −1, Int::MAX`,
   `r · p = 2³², 2³⁰`, `128 r (N + p + 2)` beyond 64 bits, `dk_len = 0, −1, Int::MIN`,
   `max_mem = 0, −1, Int64::MIN`): all clean `Err` of the documented kind, 0 panics, no allocation.
-- **`.mlogin.enc` v1** (16 rows): `scrypt(N, 8, 1, 32)` for `N = 1024 … 131072` (64 MiB ceiling up
+- **scrypt + AES-256-GCM envelope** (16 rows): `scrypt(N, 8, 1, 32)` for `N = 1024 … 131072` (64 MiB ceiling up
   to 32768, default above) + AES-256-GCM (12-byte IV, empty AAD), ciphertext ‖ tag identical to
   Node.js, and each envelope re-opens in Pion.
 
@@ -167,7 +167,7 @@ stdout SHA-256. Families:
 9 tests: exact error kinds for every hostile PBKDF2/scrypt parameter (iterations checked before
 `dk_len`), RFC 7914 §11 PBKDF2-SHA256 KATs (c = 1 and 80,000), HMAC key-fold property at 63–66 /
 127–130 bytes (`PBKDF2(P) == PBKDF2(H(P))` iff `|P| >` block), `T_1 ‖ T_2` prefix property for
-`dk_len` 1–256, exact max_mem boundaries, a Node.js-produced `.mlogin.enc` envelope from a UTF-8
+`dk_len` 1–256, exact max_mem boundaries, a Node.js-produced scrypt + AES-256-GCM envelope from a UTF-8
 passphrase with an embedded NUL (Pion derives the same key, opens it and re-seals identical bytes),
 call-to-call independence of the ROMix scratch buffers, and the P2-3 rule. 8/9 pass on `8775804`
 (`control_scrypt_n_below_2_pow_16r` fails), plus the package's own 82 tests.
@@ -194,7 +194,7 @@ New `ct_ssa_check_v040.py` on the release QBE SSA: `salsa20_8_xor`, `blockmix_sa
 `sha256_compress_w`, `sha512_compress_w` branch-free and table-free; the PBKDF2 / scrypt entry points
 branch only on public lengths and parameters. INFO: ROMix's `V[Integerify(X) mod N]` is a
 password-dependent memory access by design (RFC 7914 scrypt is not cache-timing constant time, same as
-Go, OpenSSL and libsodium); acceptable for `.mlogin.enc`'s offline-file threat model.
+Go, OpenSSL and libsodium); acceptable for scrypt + AES-256-GCM envelope's offline-file threat model.
 
 ### Mutation sensitivity (`mutants` gate)
 

@@ -1,12 +1,12 @@
 # `pdf` — Pure Pion ISO 32000-1 PDF 1.4 Generator & Structural Validator
 
-A pure Pion, zero-`World`, zero-`extern "C"` PDF 1.4 document builder and structural validator, upgraded from Farview's `pdf_export` engine and backed by `packages/flate` for RFC 1950 `/FlateDecode`.
+A pure Pion, zero-`World`, zero-`extern "C"` PDF 1.4 document builder and structural validator, backed by `packages/flate` for RFC 1950 `/FlateDecode`.
 
 ## Features
 
 - **Compression Filters (`src/filter.pion`)**:
   - `/FlateDecode` (RFC 1950 zlib via `flate::zlib_compress` / `flate::zlib_decompress_with_limit`).
-  - `/RunLengthDecode` (ISO 32000-1 §7.4.5 PackBits `rle_encode` / `rle_decode`, single pre-allocated output buffer, preserving full Farview compatibility).
+  - `/RunLengthDecode` (ISO 32000-1 §7.4.5 PackBits `rle_encode` / `rle_decode`, single pre-allocated output buffer).
   - Uncompressed streams (`Compression::Uncompressed`).
 - **General-Purpose PDF 1.4 Builder (`src/doc.pion`, `src/content.pion`)**:
   - Multi-page documents (`PdfDoc`, `Page`, `ContentStream`) with `PageSize::a4()` / `PageSize::letter()` / custom pt dimensions enforced within ISO 32000-1 / PDF 1.4 Annex C `[3.0, 14400.0]` pt; `add_page` freezes an immutable snapshot of each page.
@@ -14,7 +14,7 @@ A pure Pion, zero-`World`, zero-`extern "C"` PDF 1.4 document builder and struct
   - Exact 10-digit byte-offset `xref` table, `/Root`, `/Size`, `startxref`, and `%%EOF` emitted via an overflow-safe budgeted `ByteBuf` with zero-allocation ASCII integer/fixed-point formatters (no scientific notation, exact integer parts up to `1e14`, up to 12 fractional digits for small-scale transforms).
   - **Text**: All 14 PDF Standard Type 1 fonts (`Helvetica`, `Helvetica-Bold`, `Times-Roman`, `Courier`, `Symbol`, `ZapfDingbats`, etc.) emitted on demand; Latin text fonts transcode UTF-8 to `/WinAnsiEncoding` (cp1252).
   - **2D Vector Graphics**: `save`/`restore` (with `q`/`Q` balance & underflow checking), `concat_matrix` (singular-matrix guard), `set_fill_rgb`/`set_stroke_rgb`/`set_fill_gray`/`set_stroke_gray`, `set_line_width`/`set_line_cap`/`set_line_join`/`set_miter_limit`/`set_dash` (operand-range validated), `move_to`/`line_to`/`cubic_to`/`rect`/`close_path`, `fill`/`fill_even_odd`/`stroke`/`close_and_stroke`/`fill_and_stroke`/`clip`/`clip_even_odd`.
-  - **Images**: `add_rgb_image`, `add_rgba_image` (`AlphaMode::BlendWhite` division-free white-paper compositing or `AlphaMode::SoftMask` `/SMask` `DeviceGray` transparency), `add_jpeg_image` (zero-recompression `/DCTDecode` passthrough with full SOF0–SOF15 dimension/component validation and Adobe APP14 CMYK `/Decode [1 0 1 0 1 0 1 0]` inversion), per-document `ImageId` ownership tags, O(1) resource deduplication, plus Farview-compatible `encode_pdf_pages` / `encode_pdf_pages_with_compression`.
+  - **Images**: `add_rgb_image`, `add_rgba_image` (`AlphaMode::BlendWhite` division-free white-paper compositing or `AlphaMode::SoftMask` `/SMask` `DeviceGray` transparency), `add_jpeg_image` (zero-recompression `/DCTDecode` passthrough with full SOF0–SOF15 dimension/component validation and Adobe APP14 CMYK `/Decode [1 0 1 0 1 0 1 0]` inversion), per-document `ImageId` ownership tags, O(1) resource deduplication, plus convenience `encode_pdf_pages` / `encode_pdf_pages_with_compression`.
 - **Resource Limits (`Limits`)**:
   - Explicit `Result[T, PdfError]` error handling with early enforcement of `max_pages`, `max_objects`, `max_stream_bytes`, `max_document_bytes`, and `max_image_pixels` (strict `<= 0` means 0 allowed, never unlimited), plus per-`ContentStream` byte budget.
 - **Structural Validator (`src/validate.pion`)**:

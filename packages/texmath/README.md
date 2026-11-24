@@ -14,7 +14,7 @@ Zero JavaScript, zero C glue, zero `World` dependency, `Send`-safe value types, 
 3. **TeX Box Metrics Layout IR (`src/layout.pion`, `src/metrics_data.pion`)**
    - Real CM/KaTeX font metrics across 12 font tables (`Main-Regular`, `Math-Italic`, `Main-Bold`, `Size1..4-Regular`, `AMS-Regular`, `Caligraphic-Regular`, `Fraktur-Regular`, `SansSerif-Regular`, `Typewriter-Regular`) plus TeXbook `sigmasAndXis`.
    - Implements TeXbook Rules 11 (roots with Size1–Size4 surd depths), 12 (accents), 13 (large operators & display limits), 15 (fractions), 18 (scripts with character-box & script-style drop rules), 19 (axis-centered delimiters), and p. 170 inter-atom spacing with binary-operator cancellation. Verified against KaTeX `__renderToHTMLTree` across 60 formulas (0 / 60 mismatches within 0.005em).
-   - Emits positioned `LayoutBox` trees (`Glyph`, `HBox`, `VBox`, `Rule`, `Kern`, `Delim`, `Radical`, `ColorBox`, `ShiftBox`) with `(x, y, width, height, depth, font_style, scale)` ready for native Invar/mbui rendering.
+   - Emits positioned `LayoutBox` trees (`Glyph`, `HBox`, `VBox`, `Rule`, `Kern`, `Delim`, `Radical`, `ColorBox`, `ShiftBox`) with `(x, y, width, height, depth, font_style, scale)` ready for native GPU UI rendering.
 4. **KaTeX-Compatible MathML Serializer (`src/mathml.pion`)**
    - Byte-for-byte compatible with `katex.renderToString(tex, { output: "mathml", displayMode })` across 55 unit vectors, 100/100 red-team differential cases, 500 benchmark formulas (SHA-256 verified), and 108/127 (85.0%, 0 valid rejections) of KaTeX v0.19.1's own screenshotter corpus.
 
@@ -42,7 +42,7 @@ pub fn box_metrics(b : LayoutBox) -> Metrics
 
 ### v0.2.0 Head-to-Head (after red-team remediation)
 
-Measured on `tokyo-mac-studio-0` (Apple M5 Max) with `bench/corpus.txt` × 20, `scripts/bench_compare.py` strictly interleaved, stdout SHA-256 identical across implementations:
+Measured on Apple M5 Max (Darwin arm64) with `bench/corpus.txt` × 20, `scripts/bench_compare.py` strictly interleaved, stdout SHA-256 identical across implementations:
 
 | Target | `pion-texmath` Median | `pion-texmath` Peak RSS | `node-katex` Median | `node-katex` Peak RSS | Speedup (vs `node-katex`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -53,7 +53,7 @@ Lagging item: Wasm32 is still 0.78x of Node.js KaTeX. Re-measured on `AFK-surf/p
 
 ### v0.1.0 Head-to-Head (historical, before red-team remediation)
 
-`tokyo-mac-studio-0`, Apple M5 Max, `Darwin arm64`, 500 diverse formulas × 20 = 10,000 ops, `--warmup 1 --rounds 5`:
+Apple M5 Max (`Darwin arm64`), 500 diverse formulas × 20 = 10,000 ops, `--warmup 1 --rounds 5`:
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `node-katex`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

@@ -8,7 +8,7 @@ Nothing outside `packages/csv/audit/` was changed.
 | Rust `csv` | **1.4.0** (resolves `csv-core` **0.1.13**, pinned in `tools/rust_ref/Cargo.lock`) | every behaviour claim (reader + writer), benchmarks |
 | Go `encoding/csv` | go 1.27.3 stdlib | benchmarks |
 
-Machine: `tokyo-mac-studio-0`, Apple M5 Max (18 cores, arm64 Darwin), pionc 0.1.0, cargo 1.100, go 1.27.3,
+Machine: Apple M5 Max (18 cores, Darwin arm64), pionc 0.1.0, cargo 1.100, go 1.27.3,
 node 24.22. The machine is shared (load average 14-17 during the runs). Benchmarks are interleaved
 `scripts/bench_compare.py` runs (warmup 1, 5 rounds, stdout SHA-256 identical across all implementations);
 conclusions only rely on gaps far larger than the run-to-run spread (~5-10 %).

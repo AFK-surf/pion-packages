@@ -2,7 +2,7 @@
 
 - 被审对象：`origin/feat/opt-diff` @ `281f5c1`（`perf(diff): optimize interner, histogram, myers, and unified formatting`），只读，未改 `src/**`、原有测试或仓库根文件。
 - 参照实现：crates.io `imara-diff = "=0.2.0"`（`harness/rust_oracle`，`--release`，`lto = true`，`codegen-units = 1`）。所有“期望值”都由这个真实 Rust 程序在同一输入上打印出来，没有手写期望。
-- 机器：`tokyo-mac-studio-0`，Darwin arm64（Apple M5 Max，18 核），跟 README 基准同一平台。**跑基准时机器负载 39–48**（别的会话在用），所以下面的倍率是严格交替测出来的相对值，绝对毫秒数有噪声。
+- 机器：Apple M5 Max (Darwin arm64)，Darwin arm64（Apple M5 Max，18 核），跟 README 基准同一平台。**跑基准时机器负载 39–48**（别的会话在用），所以下面的倍率是严格交替测出来的相对值，绝对毫秒数有噪声。
 
 ## 一键复现
 

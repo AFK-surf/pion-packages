@@ -236,7 +236,7 @@ func benchSocks5() int {
 	domains := [4]string{
 		"api.github.com",
 		"registry.npmjs.org",
-		"auth.monoid.computer",
+		"auth.example.com",
 		"station-us.internal",
 	}
 	ports := [4]uint16{443, 443, 8443, 2222}
@@ -379,7 +379,7 @@ func benchHTTP() int {
 		cBuf.WriteString(auth)
 		cBuf.WriteString("\r\nProxy-Authorization: Basic ")
 		cBuf.WriteString(b64)
-		cBuf.WriteString("\r\nUser-Agent: monoid-login/1.0\r\n\r\n")
+		cBuf.WriteString("\r\nUser-Agent: pion-proxy/1.0\r\n\r\n")
 		cBytes := cBuf.Bytes()
 
 		creq, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(cBytes)))

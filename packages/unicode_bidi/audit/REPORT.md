@@ -27,7 +27,7 @@ of table / API defects (P2).
 | 4 | P2 | 3,970 scalars have a Bidi_Class different from UCD 16.0.0 (noncharacters/default-ignorables L→BN; unassigned Arabic-default ranges R→AL) | `tables.py`, `p2_bidi_class_*`, `p2_noncharacter_prefix_*` |
 | 5 | P2 | `default_level = Level::new(126)` yields `Level`s 127/128 (invariant 0..=126 broken; Rust panics) | `p2_default_level_126_*` |
 | 6 | P2 | `BidiInfo::new` swallows `InputTooLong` → empty `levels` for non-empty text | `p2_new_silently_drops_levels_*` |
-| 7 | P2 | `bidi_line_levels` (Farview) applies paragraph 0's level in L1 to every paragraph | `p2_bidi_line_levels_*` |
+| 7 | P2 | `bidi_line_levels` helper applies paragraph 0's level in L1 to every paragraph | `p2_bidi_line_levels_*` |
 | 8 | P2 | Line ranges inside a UTF-8 sequence are accepted and the RTL path emits U+FFFD per stray byte (output longer than the range) | `p2_reorder_line_mid_char_*` |
 | 9 | P2 | `bidi_visual_order(Array[Int])` loops `max-min` times on unvalidated ints (`[0, 2e9]` → 2.2 s, `[-2e9, 1]` → 2.9 s) | manual probe below |
 | 10 | P2 | Process: upstream conformance suites not ported; package missing from `index/`, README and BENCHMARKS.md | — |
@@ -141,7 +141,7 @@ paragraphs_rtl_x5k              1.386    3.246   2.3     5.4 |    0.027    0.054
 paragraphs_rtl_x5k_l1only       0.403    4.646  11.5     5.4 |    0.016    0.037     - | ok
 paragraphs_ltr_x5k_l1only       0.535    2.371   4.4     4.5 |    0.010    0.027     - | ok
 crlf_ws_lines_3k                1.326    5.554   4.2     7.3 |    0.032    0.137   4.3 | ok
-farview_single_line_rtl         0.023    0.042   1.8     9.8 |      n/a      n/a     - | ok
+line_levels_single_line_rtl         0.023    0.042   1.8     9.8 |      n/a      n/a     - | ok
 vis_levels_0_125_50k            0.014    0.025     -     5.0 |      n/a      n/a     - | ok
 max_input_16mib_mixed           1.651        -     -  1044.4 |    0.445        -     - | ok   (rust_rss=133.0 MB)
 
@@ -229,7 +229,7 @@ snap or reject non-boundary ranges (`InvalidLineRange` already exists in `BidiEr
 echo "0,2000000000" > vis.txt;  pion_probe one vis.txt vis 1   -> real 2.20 s (2 elements)
 echo "-2000000000,1" > vis2.txt; pion_probe one vis2.txt vis 1 -> real 2.91 s
 ```
-O((max−min)·n) for arbitrary `Array[Int]` from Farview. Fix: clamp to 0..=126 or iterate only over
+O((max−min)·n) for arbitrary `Array[Int]` from callers. Fix: clamp to 0..=126 or iterate only over
 distinct levels.
 
 ### P2-10 Process gaps (AGENTS.md §1.1/§1.3/§1.4)

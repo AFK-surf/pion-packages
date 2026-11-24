@@ -1,7 +1,7 @@
 # 红队审计报告：Pion `packages/decimal` @ `9128ea9`（`feat/pkg-decimal`）
 
 对照实现：Rust [`rust_decimal`](https://github.com/paupino/rust-decimal) **=1.37.2**（`features = ["maths"]`，`--release`，与 `bench/rust` 同版本）。
-环境：`tokyo-mac-studio-0`（Darwin arm64，`pionc 0.1.0`，`rustc 1.100.0`，node 运行 wasm32），2026-11-23。整机同时有其他负载，时间以同一轮交替运行的**倍率**为准。
+环境：Apple M5 Max (Darwin arm64，`pionc 0.1.0`，`rustc 1.100.0`，node 运行 wasm32），2026-11-23。整机同时有其他负载，时间以同一轮交替运行的**倍率**为准。
 
 ## 一键复现
 

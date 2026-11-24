@@ -4,8 +4,8 @@
 //
 // - every row whose expected result is hex is recomputed with crypto.pbkdf2Sync / crypto.scryptSync
 //   (OpenSSL EVP_PBE_scrypt) and, for ML rows, aes-256-gcm with a 12-byte IV and empty AAD
-//   (.mlogin.enc v1: ct || 16-byte tag): bytes must be identical to golang.org/x/crypto;
-// - the max_mem boundary rows (sc/.../maxmem/), the 64 MiB .mlogin.enc rows (sc/mlogin64/) and
+//   (scrypt + AES-256-GCM envelope: ct || 16-byte tag): bytes must be identical to golang.org/x/crypto;
+// - the max_mem boundary rows (sc/.../maxmem/), the 64 MiB scrypt + AES-256-GCM envelope rows (sc/env64/) and
 //   the RFC 7914 §2 N < 2^(16 r) rows (sc/nbound/) that the Go corpus expects as errors must be
 //   refused by Node too (same 128 r (N + p + 2) memory rule and N bound as OpenSSL).
 // Exit 0 = Go and Node agree on every checked row.
@@ -34,7 +34,7 @@ for (let i = 0; i < corpus.length; i++) {
     continue;
   }
   const isHex = /^[0-9a-f]*$/.test(want);
-  const mustRefuse = !isHex && /^sc\/(heavy\/)?(maxmem|mlogin64|nbound)\//.test(label);
+  const mustRefuse = !isHex && /^sc\/(heavy\/)?(maxmem|env64|nbound)\//.test(label);
   if (!isHex && !mustRefuse) continue;
   let got;
   try {

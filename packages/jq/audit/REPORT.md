@@ -2,7 +2,7 @@
 
 - **Target**: `origin/feat/pkg-jq` @ `35ff1bb` (`packages/jq/src/*`, 7.4 kLoC Pion), toolchain `pionc` @ `AFK-surf/pion@79d1fbd`.
 - **References**: Go `github.com/itchyny/gojq v0.12.17` (used as a library, `audit/diff/go`) and the system `jq 1.7.1` as the tie-breaker.
-- **Machine**: Darwin arm64 (tokyo-mac-studio-0), node v24.22.2 for wasm32.
+- **Machine**: Apple M5 Max (Darwin arm64), node v24.22.2 for wasm32.
 - **Scope rule**: this audit adds files under `packages/jq/audit/` only. `sh scripts/verify.sh packages/jq` still passes 38/38 (`jq`), 376/376 total, worktree clean.
 
 ## How to reproduce
