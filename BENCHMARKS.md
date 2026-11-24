@@ -368,6 +368,9 @@
 | `opentype` | 同上，合成 512 字形可变字体 `synthetic_512.ttf`（× 200） | 4,559,200 B | 12.215 ms (61.08 µs/op) | **9.698 ms** (`rust_ttf_parser`) | 0.79x | 2.00 MiB | 2.00 MiB |
 | `hls` | 主语料：70 个 Master / Media / LL-HLS 播放列表解析（× 50，3,500 次） | 21,627,600 B | **97.242 ms** (222.41 MB/s) | 134.893 ms (`rust_m3u8_rs`) | **1.39x** | 4.03 MiB | **3.52 MiB** |
 | `hls` | `altbench` 现实语料：60 个长 URL / 逐分片 PDT / 密钥轮换 / 显式字节范围播放列表（× 5，300 次） | 42,287,085 B | 126.932 ms (333.15 MB/s) | **115.993 ms** (`rust_m3u8_rs`) | 0.91x | 27.44 MiB | **13.77 MiB** |
+| `lepton` | Baseline 512×512 RGB JPEG (`SOF0`, 50,288 B) 往返 ×10（Linux x86_64） | 502,880 B | 446.070 ms (1.13 MB/s) | **212.924 ms** (`rust_lepton_jpeg`) | 0.48x | **4.89 MiB** | 8.71 MiB |
+| `lepton` | Progressive 512×512 Luma JPEG (`SOF2`, 44,142 B) 往返 ×10（Linux x86_64） | 441,420 B | 385.331 ms (1.15 MB/s) | **262.010 ms** (`rust_lepton_jpeg`) | 0.68x | **4.58 MiB** | 8.26 MiB |
+| `lepton` | Baseline 512×512 RGB JPEG (`SOF0`, 50,288 B) 解码 ×10（Linux x86_64） | 502,880 B | 216.703 ms (2.32 MB/s) | **155.921 ms** (`rust_lepton_jpeg`) | 0.72x | **4.30 MiB** | 8.13 MiB |
 
 ## 各包明细
 
@@ -2902,3 +2905,36 @@ SHA-256 `5435f14cac58923a0ea773283d88c4212c0bd043e4e3d5f1150582c4e6a482e4`（两
 如实说明：主语料领先 **1.39x**，峰值 RSS 略高（4.03 vs 3.52 MiB）；现实语料落后（**0.91x**），峰值 RSS 约为 Rust 的 2 倍（27.44 vs 13.77 MiB），原因是本包执行完整 RFC 8216bis 严格校验、ISO 8601 日期校验并保留逐分片元数据，而 `m3u8-rs` 不做这些校验。包 README 记录的上一次测量为主语料 1.35x、现实语料 0.84x，与本次同机复测方向一致。
 
 红队（独立 Opus，多轮复审后 `SIGN-OFF`）：13 / 13 单测；1 P0 + 6 P1 + 14 P2 共 21 项全部修复。`STRICT=1 sh packages/hls/audit/run_audit.sh` `no open findings`、exit 0：红队 + 对照用例 28 / 28 × 4 模；4,280 个输入（260 命名 + 4,020 种子与变异）对独立 RFC 8216bis 参考模型 0 条未解释偏差；命名、变异、API 与 DoS 输出 4 模逐字节一致；18 个 DoS 炸弹在 native 与 Wasm32 `--release` 上全部在预算内；5 / 5 注入缺陷被捕获。`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）stdout SHA-256 `ccb403999c3dd751365666e2813bb49a01ea55e6fd3bfe0c34a52f4ebb4fb933`（与包 README 一致），Wasm32 debug / `--release` 实测 239,459 / 237,733 B。
+
+### lepton
+
+参考实现：Rust [`lepton_jpeg`](https://crates.io/crates/lepton_jpeg) `0.5.8`（`--release`，`DEFAULT_THREAD_POOL` 多线程，记作 `rust_lepton_jpeg`）。环境：Linux `x86_64`（Debian 6.12.118-1，Intel Xeon Platinum 8581C），`pionc 0.1.0`（`--release`），`rustc 1.96.0`。由 `sh packages/lepton/bench/run_bench.sh`（`scripts/bench_compare.py`，`--warmup 1 --rounds 5` 严格交替）生成确定性 512×512 基线 RGB（`SOF0`，50,288 B）与渐进式灰度（`SOF2`，44,142 B）JPEG；每轮向 stdout 输出还原后的完整 JPEG 字节流并与原图 SHA-256 逐字节比对一致。
+
+#### Baseline 512×512 RGB JPEG (`SOF0`, 50,288 B) 往返 ×10（502,880 B）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_lepton_jpeg`) | Compressed Size |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_lepton`（`--release`，单线程） | 446.070 | 294.785 | 664.138 | 1.13 | **4.89 MiB** | 0.48x | 37,509 B (−25.41%) |
+| `rust_lepton_jpeg`（`0.5.8 --release`，多线程） | **212.924** | 170.263 | 281.221 | **2.36** | 8.71 MiB | 1.00x (baseline) | **36,349 B (−27.72%)** |
+
+stdout 50,288 B，SHA-256 `7e9035d180b1c0be324c85c16b4048a7500c10b2c65d71e11ac903945216689d`（两端全部轮次与原图逐字节一致）。
+
+#### Progressive 512×512 Luma JPEG (`SOF2`, 44,142 B) 往返 ×10（441,420 B）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_lepton_jpeg`) | Compressed Size |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_lepton`（`--release`，单线程） | 385.331 | 331.269 | 859.268 | 1.15 | **4.58 MiB** | 0.68x | 33,267 B (−24.64%) |
+| `rust_lepton_jpeg`（`0.5.8 --release`，多线程） | **262.010** | 172.908 | 319.787 | **1.68** | 8.26 MiB | 1.00x (baseline) | **32,551 B (−26.26%)** |
+
+stdout 44,142 B，SHA-256 `ae6a32d2b290b90721081c6723ac8e17660aaaf467d279735d59fe5e2b11839d`（两端全部轮次与原图逐字节一致）。
+
+#### Baseline 512×512 RGB JPEG (`SOF0`, 50,288 B) 解码 ×10（502,880 B）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_lepton_jpeg`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_lepton`（`--release`，单线程） | 216.703 | 176.899 | 329.129 | 2.32 | **4.30 MiB** | 0.72x |
+| `rust_lepton_jpeg`（`0.5.8 --release`，多线程） | **155.921** | 121.523 | 251.847 | **3.23** | 8.13 MiB | 1.00x (baseline) |
+
+stdout 50,288 B，SHA-256 `7e9035d180b1c0be324c85c16b4048a7500c10b2c65d71e11ac903945216689d`（两端全部轮次与原图逐字节一致）。
+
+如实说明：单线程纯 Pion `lepton` 在三项吞吐上均落后多线程 Rust `lepton_jpeg`（`0.48x`–`0.72x`），压缩率相差 1.6–2.3 个百分点（基线 −25.41% vs −27.72%，渐进 −24.64% vs −26.26%）；由于 `rust_lepton_jpeg` 使用 `DEFAULT_THREAD_POOL`（多线程），其峰值 RSS 与多核加速比会随线程数与共享 Linux VM 负载波动（Pion 峰值 RSS 约低 1.3–1.9×，本次实测 4.30–4.89 MiB vs 8.13–8.71 MiB）。`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）输出 `lepton_wasm_smoke: OK checks=4 base=151 prog=1201 fnv64=979157046982172007`，SHA-256 `311e4623416b52a481bfadd5dcf1d1e37a4dd03df06ac336fc2fde7e0bbe60c0` 全部一致。
