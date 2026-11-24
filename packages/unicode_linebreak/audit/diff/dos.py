@@ -45,13 +45,13 @@ B = [
     ("d23", "line_breaks_with_limits default, \"a \" x 125k", "a ", 125000, lambda r: r, "limits",
      2000000, None),
     ("d24", "next_break_opportunity(s, len-1), \"a \" x 125k", "a ", 125000, lambda r: 1, "nbo_last", 2000000, None),
-    ("d25", "iterate next_break_opportunity, \"a \" x 2k", "a ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d25", "iterate next_break_opportunity, \"a \" x 8k", "a ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
     # backward-anchor fix (585254a): texts whose code points are never anchors (AL / ID / NU / hard breaks)
-    ("d26", "iterate nbo, Korean \"\uac00\uac01 \" x 2k", "\uac00\uac01 ", 2000, lambda r: 2 * r, "nbo_iter", 200000, "P1-1"),
-    ("d27", "iterate nbo, Hebrew \"\u05d0\u05d1 \" x 2k", "\u05d0\u05d1 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
-    ("d28", "iterate nbo, ill-formed \"\\xff \" x 2k", b"\xff ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
-    ("d29", "iterate nbo, kana NS \"\u3041 \" x 2k", "\u3041 ", 2000, lambda r: r, "nbo_iter", 200000, "P1-1"),
-    ("d30", "iterate nbo, CJK \"\u4e00\" x 4k (ID anchors)", "\u4e00", 4000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d26", "iterate nbo, Korean \"\uac00\uac01 \" x 8k", "\uac00\uac01 ", 8000, lambda r: 2 * r, "nbo_iter", 200000, "P1-1"),
+    ("d27", "iterate nbo, Hebrew \"\u05d0\u05d1 \" x 8k", "\u05d0\u05d1 ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d28", "iterate nbo, ill-formed \"\\xff \" x 8k", b"\xff ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d29", "iterate nbo, kana NS \"\u3041 \" x 8k", "\u3041 ", 8000, lambda r: r, "nbo_iter", 200000, "P1-1"),
+    ("d30", "iterate nbo, CJK \"\u4e00\" x 16k (ID anchors)", "\u4e00", 16000, lambda r: r, "nbo_iter", 200000, "P1-1"),
     ("d32", "iterate nbo, \"- \" x 2k (HY SP only)", "- ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
     ("d33", "iterate nbo, RI SP x 2k (RI SP only)", "\U0001F1E6 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
     ("d34", "iterate nbo, VI SP x 2k (VI SP only)", "\u1b44 ", 2000, lambda r: r, "nbo_iter", 200000, "DOC"),
@@ -63,8 +63,8 @@ B = [
     ("d39", "LineBreakIter, U+2010 SP x 125k", "\u2010 ", 125000, lambda r: r, "iter", 2000000, None),
     ("d40", "LineBreakIter, Korean x 80k", "\uac00\uac01 ", 80000, lambda r: 2 * r, "iter", 2000000, None),
     ("d41", "LineBreakIter, a + CM x 250k", "\u0301", 250000, None, "iter", 2000000, None),
-    ("d31", "iterate nbo, mixed news text x 40", "Hello, world! \u4e2d\u6587\u6392\u7248\u300c\u5f15\u53f7\u300d $(1,234.56) "
-     "\U0001F1FA\U0001F1F8 \U0001F469\u200d\U0001F4BB \u05d0-\u05d1 a\u0301\r\n", 40, None, "nbo_iter", 200000, "P1-1"),
+    ("d31", "iterate nbo, mixed news text x 400", "Hello, world! \u4e2d\u6587\u6392\u7248\u300c\u5f15\u53f7\u300d $(1,234.56) "
+     "\U0001F1FA\U0001F1F8 \U0001F469\u200d\U0001F4BB \u05d0-\u05d1 a\u0301\r\n", 400, None, "nbo_iter", 200000, "P1-1"),
 ]
 
 
