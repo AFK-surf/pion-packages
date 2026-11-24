@@ -125,6 +125,8 @@ def named_cases():
         "wb_format_start": S(0xAD, 0x61, 0xAD, 0x62),
         "wb_newline_extend": "a\n" + S(0x0301) + "b",
         "wb_email_url": "mail me: a.b@c.de or https://x.y/z?q=1&r=2#f",
+        # Rust unicode-segmentation 1.12 / 1.13 keep these in one word; WB6 / WB12 break before the punctuation
+        "wb_mid_zwj_ep_rust_defect": "a:" + S(0x200D, 0x231A) + " 1," + S(0x200D, 0x1F468) + " " + S(0x05D0) + "'" + S(0x200D, 0x2764),
         "wb_alnum_filter": "+-*/ ¼ ½ ² ³ Ⅷ ⅷ ① " + S(0x16EE) + " " + S(0x0BF2) + " ___ ... ' \" ",
         # Sentences
         "sb_abbrev": "Dr. Smith paid $3.14! Next? U.S.A. is big. e.g. this. Mr. Jones.",

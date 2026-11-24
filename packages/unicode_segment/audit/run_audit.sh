@@ -65,6 +65,7 @@ title() {
     INFO-3) echo "Rust unicode-segmentation 1.13.3 uses Unicode 17.0.0: differences on code points whose properties changed 16 -> 17 are version drift, not defects (1.12.0 = Unicode 16.0.0 agrees on every input)" ;;
     INFO-4) echo "cursor walk over a long Regional_Indicator run is quadratic: RI parity needs the whole run (Rust's GraphemeCursor rescans too)" ;;
     INFO-5) echo "benchmark speedups differ from README.md by more than 25 % on this machine (load-dependent, see bench log)" ;;
+    INFO-9) echo "Rust unicode-segmentation (1.12.0 and 1.13.3) keeps 'AHLetter|Numeric|Hebrew_Letter Mid* ZWJ ExtPict' in one word; Pion matches the independent UAX #29 reference (diff/wbref.py) and WB6 / WB12" ;;
     INFO-6) echo "wasm32 binary size differs from README.md by more than 2 % (the binary embeds absolute source paths)" ;;
     *) echo "(see REPORT.md)" ;;
   esac
@@ -96,7 +97,7 @@ build() {
   build4 "$AUDIT_DIR" "$BIN/aud" || fail "build audit CLI (4 modes)"
   cargo_build "$AUDIT_DIR/diff/rust" useg_oracle "$BIN/rust13" || fail "cargo build oracle 1.13.3"
   cargo_build "$AUDIT_DIR/diff/rust12" useg_oracle12 "$BIN/rust12" || fail "cargo build oracle 1.12.0"
-  rm -rf "$C" && set -- $($PY "$AUDIT_DIR/diff/gen.py" "$C" "$FUZZ_N")
+  rm -rf "$C" "$AUDIT_OUT"/pion_*.txt "$AUDIT_OUT"/rust1*_*.txt && set -- $($PY "$AUDIT_DIR/diff/gen.py" "$C" "$FUZZ_N")
   echo "  corpus: $1 official UAX #29 vectors, $2 named adversarial, $3 fuzz ($4 with ill-formed UTF-8)"
   mkdir -p "$AUDIT_OUT/ucd16"
   for f in "$AUDIT_DIR"/ucd/16.0.0/*.gz; do gunzip -c "$f" > "$AUDIT_OUT/ucd16/$(basename "$f" .gz)"; done
@@ -223,6 +224,7 @@ conformance() {
     $(runner $m) dump "$C/ucd.cases" > "$AUDIT_OUT/pion_ucd_$m.txt" 2> "$AUDIT_OUT/pion_ucd_$m.err" || fail "ucd dump: $m exited non-zero"
   done
   $CMP ucd "$C/ucd.expect" "$AUDIT_OUT/pion_ucd_native_rel.txt" || fail "official UAX #29 16.0.0 vector failure"
+  $PY "$AUDIT_DIR/diff/wbref.py" selftest || fail "independent word-boundary reference does not reproduce WordBreakTest"
   cp "$AUDIT_OUT/pion_ucd_native_rel.txt" "$AUDIT_OUT/pion_ucd.txt"
   for g in G W S; do
     want=$($RD "$(echo $g | tr GWS gws)b")
@@ -244,6 +246,9 @@ oracles() {
     printf '%s\n' "$out" | cut -c1-260
     [ $r = 0 ] || fail "unexplained difference from Rust 1.13.3 ($g)"
     case "$out" in *" 0 Unicode 16->17 drift"*) ;; *) info "INFO-3: $(title INFO-3)" ;; esac
+    for o in "$AUDIT_OUT/rust12_$g.txt"; do
+      $CMP rust "$C/$g.cases" "$AUDIT_OUT/pion_$g.txt" "$o" | grep -q ' 0 Rust word-boundary defect' || info "INFO-9: $(title INFO-9)"
+    done
   done
   $CMP inv "$AUDIT_OUT/pion_ucd.txt" "$AUDIT_OUT/pion_named.txt" "$AUDIT_OUT/pion_fuzz.txt" || fail "in-process invariant violated"
   v13=$(sed -n 's/^V //p' "$AUDIT_OUT/rust13_named.txt" | head -1)

@@ -4,10 +4,14 @@
     compare.py rust  <cases> <pion_dump> <rust_dump>          Pion vs a Rust unicode-segmentation oracle
     compare.py inv   <pion_dump>...                           Pion in-process invariants (`I ok`)
 
-Exit status 1 on any unexplained difference. A Pion/Rust difference is explained only when the oracle reports
-Unicode 17.0.0 (unicode-segmentation 1.13.x) and the input contains a code point whose segmentation-relevant
-properties changed between Unicode 16.0.0 and 17.0.0 (diff/ucd.py drift_set): that is Unicode-version drift,
-reported as INFO. Against the Unicode 16.0.0 oracle (1.12.0) nothing is explained.
+Exit status 1 on any unexplained difference. A Pion/Rust difference is explained only
+  (a) when the oracle reports Unicode 17.0.0 (unicode-segmentation 1.13.x) and the input contains a code point whose
+      segmentation-relevant properties changed between Unicode 16.0.0 and 17.0.0 (diff/ucd.py drift_set):
+      Unicode-version drift, INFO-3; or
+  (b) when only word_bounds / unicode_word_bounds differ and Pion's W and U lines are exactly what the independent
+      UAX #29 16.0.0 word-boundary reference (diff/wbref.py, 1,826/1,826 on WordBreakTest) computes: a Rust
+      defect (INFO-9, `AHLetter|Numeric Mid* ZWJ ExtPict`).
+Everything else is unexplained.
 """
 
 import os
@@ -88,6 +92,7 @@ def cmd_rust(cases, pion, rust):
     ver = next(iter(r.values())).get("V", "?") if r else "?"
     drift = None
     explained = 0
+    rust_bug = []
     unexplained = []
     fields = 0
     for name, b in c.items():
@@ -99,6 +104,12 @@ def cmd_rust(cases, pion, rust):
         fields += 4
         if not diffs:
             continue
+        if set(diffs) <= {"W", "U"}:
+            import wbref
+            wl, ul = wbref.dump_lines(b, scalars)
+            if pp.get("W") == wl and pp.get("U") == ul:
+                rust_bug.append(name)
+                continue
         if ver.startswith("17."):
             if drift is None:
                 import ucd
@@ -111,8 +122,11 @@ def cmd_rust(cases, pion, rust):
             name, ",".join(diffs), b.hex(), " | ".join("%s %s" % (t, pp.get(t)) for t in diffs),
             " | ".join("%s %s" % (t, rr.get(t)) for t in diffs)))
     print("  vs Rust unicode-segmentation (Unicode %s): %d inputs x 4 APIs (G/W/U/S) = %d comparisons, "
-          "%d identical inputs, %d Unicode 16->17 drift (INFO), %d unexplained"
-          % (ver, len(c), fields, len(c) - explained - len(unexplained), explained, len(unexplained)))
+          "%d identical inputs, %d Unicode 16->17 drift (INFO), %d Rust word-boundary defect (INFO-9), %d unexplained"
+          % (ver, len(c), fields, len(c) - explained - len(rust_bug) - len(unexplained), explained, len(rust_bug),
+             len(unexplained)))
+    for n in rust_bug[:3]:
+        print("    RUSTBUG %s: %s" % (n, " ".join("%04X" % x for x in scalars(c[n]))[:120]))
     for u in unexplained[:15]:
         print("    DIFF " + u)
     return not unexplained
