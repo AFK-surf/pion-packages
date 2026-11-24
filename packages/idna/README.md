@@ -75,7 +75,7 @@ All **31/31** tests in `src/idna_test.pion` pass (Red → Green verified: 0/29 p
 
 - Stdout: `idna_wasm_smoke: OK domains=17 valid_strict=15 fnv64=1255427531955746724`
 - Stdout SHA-256: `abcaee375464c848e62ca12d5a25f0a20700ee933db9285c2d37339f145e2df4`
-- Wasm32 binary size: `232,814 B` (debug) / `234,953 B` (`--release`)
+- Wasm32 binary size: `262,582 B` (debug) / `264,711 B` (`--release`)
 
 ### Differential Oracle vs Rust `idna 1.1.0` & Official `IdnaTestV2`
 
@@ -86,14 +86,14 @@ All **31/31** tests in `src/idna_test.pion` pass (Red → Green verified: 0/29 p
 
 ### Head-to-Head Steady-State Benchmarks vs Rust `idna 1.1.0`
 
-Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, byte-identical stdout SHA-256 verified across all rounds; workload = 200 domains × 200 iterations × (`to_ascii` + `to_unicode`) = 80,000 operations):
+Measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, byte-identical stdout SHA-256 verified across all rounds; workload = 200 domains × 200 iterations × (`to_ascii` + `to_unicode`) = 80,000 operations):
 
 #### Corpus 1: Multilingual IDN (100% IDN / Punycode / NFD / Fullwidth)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_idna`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_idna` (`--release`) | 50.816 | 49.587 | 52.380 | 12.77 | 635.19 | 2.47 MiB | 0.46x |
-| `rust_idna` (`1.1.0 --release`, LTO) | 23.317 | 21.175 | 23.866 | 27.83 | 291.46 | 2.17 MiB | 1.00x (baseline) |
+| `pion_idna` (`--release`) | 15.795 | 15.599 | 16.412 | 41.09 | 197.44 | N/A | 1.04x |
+| `rust_idna` (`1.1.0 --release`, LTO) | 16.471 | 16.281 | 16.863 | 39.40 | 205.89 | N/A | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `2c0f91c034c05db0125d616d557f0925e75817cb9684987aaf23452853673d1b`
 
@@ -101,7 +101,7 @@ Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_idna`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_idna` (`--release`) | 21.854 | 20.572 | 21.970 | 33.04 | 273.18 | 2.45 MiB | 0.71x |
-| `rust_idna` (`1.1.0 --release`, LTO) | 15.600 | 15.052 | 16.225 | 46.28 | 195.00 | 2.09 MiB | 1.00x (baseline) |
+| `pion_idna` (`--release`) | 6.996 | 6.692 | 7.192 | 103.21 | 87.45 | N/A | 1.05x |
+| `rust_idna` (`1.1.0 --release`, LTO) | 7.342 | 7.314 | 7.991 | 98.34 | 91.77 | N/A | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `fe08124d195da1027bb2c0a777a7085590492f2f1343a6502de21720e6127528`
