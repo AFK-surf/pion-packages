@@ -1,0 +1,1046 @@
+///| Complete RFC 8878 Zstandard frame & block decompressor.
+///| Supports multi-frame streams, Skippable Frames, Raw/RLE/Compressed blocks,
+///| 1-stream & 4-stream Huffman literals (FSE & Direct weights, Treeless reuse),
+///| Predefined/RLE/FSE/Repeat sequence modes, Repeat Offsets 1/2/3 (including LL==0),
+///| xxHash64 content checksum verification, and strict `ZstdLimits` DoS protection.
+
+let zstd_magic : UInt = 0xFD2FB528U
+let skippable_magic_low : UInt = 0x184D2A50U
+let skippable_magic_high : UInt = 0x184D2A5FU
+let max_block_size_limit : Int = 131072
+
+///|
+fn read_u32_le(data : Bytes, pos : Int) -> UInt {
+  let b0 = data[pos].to_int().to_uint()
+  let b1 = data[pos + 1].to_int().to_uint()
+  let b2 = data[pos + 2].to_int().to_uint()
+  let b3 = data[pos + 3].to_int().to_uint()
+  b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+///|
+fn read_u16_le(data : Bytes, pos : Int) -> Int {
+  data[pos].to_int() | (data[pos + 1].to_int() << 8)
+}
+
+///| Growable output buffer enforcing `max_output` before any allocation.
+struct OutBuf {
+  mut buf : Bytes
+  mut len : Int
+  max_output : Int
+}
+
+///|
+fn OutBuf::new(initial_cap : Int, max_output : Int) -> OutBuf {
+  let cap = if initial_cap < 0 {
+    0
+  } else if initial_cap > max_output {
+    max_output
+  } else {
+    initial_cap
+  }
+  OutBuf::{ buf: Bytes::new(cap), len: 0, max_output: max_output }
+}
+
+///| Ensure room for `extra` additional bytes, rejecting before allocation if over `max_output`.
+fn OutBuf::ensure(self : OutBuf, extra : Int) -> Result[Unit, ZstdError] {
+  if extra < 0 {
+    return Err(ZstdError::LimitExceeded("negative output write"))
+  }
+  let needed = self.len.to_int64() + extra.to_int64()
+  if needed > self.max_output.to_int64() {
+    return Err(
+      ZstdError::LimitExceeded("decompressed output exceeded max_output_bytes"),
+    )
+  }
+  let needed_i = needed.to_int()
+  if needed_i <= self.buf.length() {
+    return Ok(())
+  }
+  let mut new_cap : Int64 = if self.buf.length() < 1024 {
+    1024L
+  } else {
+    self.buf.length().to_int64()
+  }
+  while new_cap < needed {
+    new_cap = new_cap + (new_cap >> 1) + 1024L
+  }
+  let cap_limit = self.max_output.to_int64()
+  if new_cap > cap_limit {
+    new_cap = cap_limit
+  }
+  let nb = Bytes::new(new_cap.to_int())
+  let mut i = 0
+  let cur = self.len
+  while i < cur {
+    nb[i] = self.buf[i]
+    i = i + 1
+  }
+  self.buf = nb
+  Ok(())
+}
+
+///|
+fn OutBuf::write_slice(
+  self : OutBuf,
+  src : Bytes,
+  start : Int,
+  count : Int,
+) -> Result[Unit, ZstdError] {
+  if count == 0 {
+    return Ok(())
+  }
+  match self.ensure(count) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let dst = self.buf
+  let mut dp = self.len
+  let mut sp = start
+  let end = start + count
+  while sp + 4 <= end {
+    dst[dp] = src[sp]
+    dst[dp + 1] = src[sp + 1]
+    dst[dp + 2] = src[sp + 2]
+    dst[dp + 3] = src[sp + 3]
+    dp = dp + 4
+    sp = sp + 4
+  }
+  while sp < end {
+    dst[dp] = src[sp]
+    dp = dp + 1
+    sp = sp + 1
+  }
+  self.len = dp
+  Ok(())
+}
+
+///|
+fn OutBuf::write_repeat(
+  self : OutBuf,
+  byte_val : Byte,
+  count : Int,
+) -> Result[Unit, ZstdError] {
+  if count == 0 {
+    return Ok(())
+  }
+  match self.ensure(count) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let dst = self.buf
+  let mut dp = self.len
+  let end = dp + count
+  while dp + 4 <= end {
+    dst[dp] = byte_val
+    dst[dp + 1] = byte_val
+    dst[dp + 2] = byte_val
+    dst[dp + 3] = byte_val
+    dp = dp + 4
+  }
+  while dp < end {
+    dst[dp] = byte_val
+    dp = dp + 1
+  }
+  self.len = dp
+  Ok(())
+}
+
+///| Per-frame persistent decoder state (tables and repeat offsets).
+struct FrameState {
+  mut rep1 : Int
+  mut rep2 : Int
+  mut rep3 : Int
+  mut prev_huff : Option[HuffTable]
+  mut prev_ll : Option[FseTable]
+  mut prev_of : Option[FseTable]
+  mut prev_ml : Option[FseTable]
+}
+
+///|
+fn FrameState::new() -> FrameState {
+  FrameState::{
+    rep1: 1,
+    rep2: 4,
+    rep3: 8,
+    prev_huff: None,
+    prev_ll: None,
+    prev_of: None,
+    prev_ml: None,
+  }
+}
+
+///| Decode a single `Compressed_Block` at `data[block_start..block_end]`.
+fn decode_compressed_block(
+  data : Bytes,
+  block_start : Int,
+  block_end : Int,
+  block_max : Int,
+  window_size : Int64,
+  frame_start_out : Int,
+  state : FrameState,
+  out : OutBuf,
+  ll_base : FixedArray[Int],
+  ll_bits : FixedArray[Int],
+  ml_base : FixedArray[Int],
+  ml_bits : FixedArray[Int],
+  predef_ll : FseTable,
+  predef_of : FseTable,
+  predef_ml : FseTable,
+) -> Result[Unit, ZstdError] {
+  if block_start >= block_end {
+    return Err(ZstdError::UnexpectedEof("empty compressed block"))
+  }
+  let block_out_start = out.len
+
+  // ---- 1. Literals_Section (RFC 8878 §3.1.1.3.1) ----
+  let mut pos = block_start
+  let b0 = data[pos].to_int()
+  let lit_type = b0 & 3
+  let size_fmt = (b0 >> 2) & 3
+
+  let mut lits = Bytes::new(0)
+  let mut lit_len = 0
+
+  if lit_type == 0 || lit_type == 1 {
+    // Raw_Literals_Block (0) or RLE_Literals_Block (1)
+    let regen_size = if (size_fmt & 1) == 0 {
+      pos = pos + 1
+      b0 >> 3
+    } else if size_fmt == 1 {
+      if pos + 2 > block_end {
+        return Err(ZstdError::UnexpectedEof("truncated 2-byte literals header"))
+      }
+      let v = (b0 | (data[pos + 1].to_int() << 8)) >> 4
+      pos = pos + 2
+      v
+    } else {
+      if pos + 3 > block_end {
+        return Err(ZstdError::UnexpectedEof("truncated 3-byte literals header"))
+      }
+      let v = (b0 | (data[pos + 1].to_int() << 8) |
+        (data[pos + 2].to_int() << 16)) >> 4
+      pos = pos + 3
+      v
+    }
+    if regen_size > block_max {
+      return Err(
+        ZstdError::InvalidLiteralsHeader("literals size exceeds block_max"),
+      )
+    }
+    if lit_type == 0 {
+      if pos + regen_size > block_end {
+        return Err(ZstdError::UnexpectedEof("truncated raw literals"))
+      }
+      lits = data.slice(pos, pos + regen_size)
+      lit_len = regen_size
+      pos = pos + regen_size
+    } else {
+      if pos + 1 > block_end {
+        return Err(ZstdError::UnexpectedEof("truncated RLE literal byte"))
+      }
+      let b = data[pos]
+      pos = pos + 1
+      let buf = Bytes::new(regen_size)
+      let mut i = 0
+      while i < regen_size {
+        buf[i] = b
+        i = i + 1
+      }
+      lits = buf
+      lit_len = regen_size
+    }
+  } else {
+    // Compressed_Literals_Block (2) or Treeless_Literals_Block (3)
+    let mut regen_size = 0
+    let mut comp_size = 0
+    let four_streams = size_fmt != 0
+    if size_fmt == 0 || size_fmt == 1 {
+      if pos + 3 > block_end {
+        return Err(
+          ZstdError::UnexpectedEof("truncated 3-byte compressed literals hdr"),
+        )
+      }
+      let v = b0 | (data[pos + 1].to_int() << 8) |
+      (data[pos + 2].to_int() << 16)
+      regen_size = (v >> 4) & 0x3FF
+      comp_size = (v >> 14) & 0x3FF
+      pos = pos + 3
+    } else if size_fmt == 2 {
+      if pos + 4 > block_end {
+        return Err(
+          ZstdError::UnexpectedEof("truncated 4-byte compressed literals hdr"),
+        )
+      }
+      let v = b0 | (data[pos + 1].to_int() << 8) |
+      (data[pos + 2].to_int() << 16) | (data[pos + 3].to_int() << 24)
+      regen_size = (v >> 4) & 0x3FFF
+      comp_size = (v >> 18) & 0x3FFF
+      pos = pos + 4
+    } else {
+      if pos + 5 > block_end {
+        return Err(
+          ZstdError::UnexpectedEof("truncated 5-byte compressed literals hdr"),
+        )
+      }
+      let v : UInt64 = b0.to_int64().to_uint64() |
+      (data[pos + 1].to_int().to_int64().to_uint64() << 8) |
+      (data[pos + 2].to_int().to_int64().to_uint64() << 16) |
+      (data[pos + 3].to_int().to_int64().to_uint64() << 24) |
+      (data[pos + 4].to_int().to_int64().to_uint64() << 32)
+      regen_size = ((v >> 4) & 0x3FFFFUL).to_int()
+      comp_size = ((v >> 22) & 0x3FFFFUL).to_int()
+      pos = pos + 5
+    }
+    if regen_size > block_max {
+      return Err(
+        ZstdError::InvalidLiteralsHeader(
+          "compressed literals regen_size exceeds block_max",
+        ),
+      )
+    }
+    if pos + comp_size > block_end {
+      return Err(ZstdError::UnexpectedEof("truncated compressed literals data"))
+    }
+    let lit_end = pos + comp_size
+    let huff_tbl = if lit_type == 2 {
+      match huff_read_table(data, pos, lit_end) {
+        Ok((tbl, next_p)) => {
+          state.prev_huff = Some(tbl)
+          pos = next_p
+          tbl
+        }
+        Err(e) => return Err(e)
+      }
+    } else {
+      match state.prev_huff {
+        Some(tbl) => tbl
+        None =>
+        return Err(
+          ZstdError::InvalidLiteralsHeader(
+            "treeless literals without prior Huffman table",
+          ),
+        )
+      }
+    }
+    match
+    huff_decode_literals(huff_tbl, data, pos, lit_end, regen_size, four_streams) {
+      Ok(dec) => {
+        lits = dec
+        lit_len = regen_size
+        pos = lit_end
+      }
+      Err(e) => return Err(e)
+    }
+  }
+
+  // ---- 2. Sequences_Section (RFC 8878 §3.1.1.3.2) ----
+  if pos >= block_end {
+    return Err(ZstdError::UnexpectedEof("missing sequences header"))
+  }
+  let seq_b0 = data[pos].to_int()
+  pos = pos + 1
+  let num_seq = if seq_b0 == 0 {
+    0
+  } else if seq_b0 < 128 {
+    seq_b0
+  } else if seq_b0 < 255 {
+    if pos >= block_end {
+      return Err(ZstdError::UnexpectedEof("truncated 2-byte sequence count"))
+    }
+    let b1 = data[pos].to_int()
+    pos = pos + 1
+    ((seq_b0 - 128) << 8) + b1
+  } else {
+    if pos + 2 > block_end {
+      return Err(ZstdError::UnexpectedEof("truncated 3-byte sequence count"))
+    }
+    let b1 = data[pos].to_int()
+    let b2 = data[pos + 1].to_int()
+    pos = pos + 2
+    b1 + (b2 << 8) + 0x7F00
+  }
+
+  if num_seq == 0 {
+    if pos != block_end {
+      return Err(
+        ZstdError::InvalidSequences(
+          "trailing bytes in block with 0 sequences",
+        ),
+      )
+    }
+    return out.write_slice(lits, 0, lit_len)
+  }
+
+  if pos >= block_end {
+    return Err(ZstdError::UnexpectedEof("missing symbol compression modes"))
+  }
+  let modes = data[pos].to_int()
+  pos = pos + 1
+  if (modes & 3) != 0 {
+    return Err(
+      ZstdError::InvalidSequences("reserved compression mode bits non-zero"),
+    )
+  }
+  let ll_mode = (modes >> 6) & 3
+  let of_mode = (modes >> 4) & 3
+  let ml_mode = (modes >> 2) & 3
+
+  // Resolve LL table
+  let ll_tbl = if ll_mode == 0 {
+    state.prev_ll = Some(predef_ll)
+    predef_ll
+  } else if ll_mode == 1 {
+    if pos >= block_end {
+      return Err(ZstdError::UnexpectedEof("truncated RLE LL symbol"))
+    }
+    let sym = data[pos].to_int()
+    pos = pos + 1
+    if sym > 35 {
+      return Err(ZstdError::InvalidSequences("RLE LL symbol > 35"))
+    }
+    let t = fse_build_rle_table(sym)
+    state.prev_ll = Some(t)
+    t
+  } else if ll_mode == 2 {
+    match fse_read_distribution(data, pos, block_end, 35, 9) {
+      Ok((t, np)) => {
+        pos = np
+        state.prev_ll = Some(t)
+        t
+      }
+      Err(e) => return Err(e)
+    }
+  } else {
+    match state.prev_ll {
+      Some(t) => t
+      None =>
+      return Err(
+        ZstdError::InvalidSequences("LL Repeat_Mode without prior table"),
+      )
+    }
+  }
+
+  // Resolve OF table
+  let of_tbl = if of_mode == 0 {
+    state.prev_of = Some(predef_of)
+    predef_of
+  } else if of_mode == 1 {
+    if pos >= block_end {
+      return Err(ZstdError::UnexpectedEof("truncated RLE OF symbol"))
+    }
+    let sym = data[pos].to_int()
+    pos = pos + 1
+    if sym > 31 {
+      return Err(ZstdError::InvalidSequences("RLE OF symbol > 31"))
+    }
+    let t = fse_build_rle_table(sym)
+    state.prev_of = Some(t)
+    t
+  } else if of_mode == 2 {
+    match fse_read_distribution(data, pos, block_end, 31, 8) {
+      Ok((t, np)) => {
+        pos = np
+        state.prev_of = Some(t)
+        t
+      }
+      Err(e) => return Err(e)
+    }
+  } else {
+    match state.prev_of {
+      Some(t) => t
+      None =>
+      return Err(
+        ZstdError::InvalidSequences("OF Repeat_Mode without prior table"),
+      )
+    }
+  }
+
+  // Resolve ML table
+  let ml_tbl = if ml_mode == 0 {
+    state.prev_ml = Some(predef_ml)
+    predef_ml
+  } else if ml_mode == 1 {
+    if pos >= block_end {
+      return Err(ZstdError::UnexpectedEof("truncated RLE ML symbol"))
+    }
+    let sym = data[pos].to_int()
+    pos = pos + 1
+    if sym > 52 {
+      return Err(ZstdError::InvalidSequences("RLE ML symbol > 52"))
+    }
+    let t = fse_build_rle_table(sym)
+    state.prev_ml = Some(t)
+    t
+  } else if ml_mode == 2 {
+    match fse_read_distribution(data, pos, block_end, 52, 9) {
+      Ok((t, np)) => {
+        pos = np
+        state.prev_ml = Some(t)
+        t
+      }
+      Err(e) => return Err(e)
+    }
+  } else {
+    match state.prev_ml {
+      Some(t) => t
+      None =>
+      return Err(
+        ZstdError::InvalidSequences("ML Repeat_Mode without prior table"),
+      )
+    }
+  }
+
+  // ---- 3. Execute Sequences (RFC 8878 §3.1.1.4) ----
+  let br = match BackBitReader::init(data, pos, block_end) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+
+  let mut st_ll = match br.read_bits(ll_tbl.accuracy_log) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let mut st_of = match br.read_bits(of_tbl.accuracy_log) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let mut st_ml = match br.read_bits(ml_tbl.accuracy_log) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+
+  let mut lit_pos = 0
+  let mut rep1 = state.rep1
+  let mut rep2 = state.rep2
+  let mut rep3 = state.rep3
+  let mut seq_i = 0
+
+  while seq_i < num_seq {
+    let of_code = of_tbl.sym[st_of]
+    let ml_code = ml_tbl.sym[st_ml]
+    let ll_code = ll_tbl.sym[st_ll]
+
+    if of_code > 31 || ml_code > 52 || ll_code > 35 {
+      return Err(ZstdError::InvalidSequences("decoded sequence code out of range"))
+    }
+
+    // Read extra bits: OF, then ML, then LL
+    let of_extra = match br.read_bits(of_code) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let of_val : Int64 = (1L << of_code) + of_extra.to_int64()
+
+    let ml_nb = ml_bits[ml_code]
+    let ml_extra = match br.read_bits(ml_nb) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let match_len = ml_base[ml_code] + ml_extra
+
+    let ll_nb = ll_bits[ll_code]
+    let ll_extra = match br.read_bits(ll_nb) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let lit_count = ll_base[ll_code] + ll_extra
+
+    // Update FSE states if not the last sequence: LL, then ML, then OF
+    if seq_i + 1 < num_seq {
+      let b_ll = match br.read_bits(ll_tbl.nb_bits[st_ll]) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      st_ll = ll_tbl.baseline[st_ll] + b_ll
+
+      let b_ml = match br.read_bits(ml_tbl.nb_bits[st_ml]) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      st_ml = ml_tbl.baseline[st_ml] + b_ml
+
+      let b_of = match br.read_bits(of_tbl.nb_bits[st_of]) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      st_of = of_tbl.baseline[st_of] + b_of
+    }
+
+    // Resolve actual offset using repeat offsets
+    let offset : Int = if of_val > 3L {
+      let off64 = of_val - 3L
+      if off64 > window_size || off64 > max_container_bytes.to_int64() {
+        return Err(ZstdError::InvalidOffset("offset exceeds window_size"))
+      }
+      let off = off64.to_int()
+      rep3 = rep2
+      rep2 = rep1
+      rep1 = off
+      off
+    } else {
+      let ov = of_val.to_int()
+      if lit_count == 0 {
+        if ov == 1 {
+          let off = rep2
+          rep2 = rep1
+          rep1 = off
+          off
+        } else if ov == 2 {
+          let off = rep3
+          rep3 = rep2
+          rep2 = rep1
+          rep1 = off
+          off
+        } else {
+          let off = rep1 - 1
+          if off <= 0 {
+            return Err(ZstdError::InvalidOffset("rep1 - 1 <= 0"))
+          }
+          rep3 = rep2
+          rep2 = rep1
+          rep1 = off
+          off
+        }
+      } else if ov == 1 {
+        rep1
+      } else if ov == 2 {
+        let off = rep2
+        rep2 = rep1
+        rep1 = off
+        off
+      } else {
+        let off = rep3
+        rep3 = rep2
+        rep2 = rep1
+        rep1 = off
+        off
+      }
+    }
+
+    // Copy literals
+    if lit_pos + lit_count > lit_len {
+      return Err(ZstdError::InvalidSequences("sequence literal length overrun"))
+    }
+    let block_produced = (out.len - block_out_start).to_int64() +
+    lit_count.to_int64() + match_len.to_int64()
+    if block_produced > block_max.to_int64() {
+      return Err(
+        ZstdError::InvalidSequences("block decompressed size exceeds block_max"),
+      )
+    }
+
+    if lit_count > 0 {
+      match out.write_slice(lits, lit_pos, lit_count) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      lit_pos = lit_pos + lit_count
+    }
+
+    // Validate and copy match
+    let frame_written = out.len - frame_start_out
+    if offset <= 0 || offset > frame_written || offset.to_int64() > window_size {
+      return Err(
+        ZstdError::InvalidOffset("match offset out of frame/window bounds"),
+      )
+    }
+    match out.ensure(match_len) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    let dst = out.buf
+    let mut dp = out.len
+    let end_dp = dp + match_len
+    if offset == 1 {
+      let b = dst[dp - 1]
+      while dp + 4 <= end_dp {
+        dst[dp] = b
+        dst[dp + 1] = b
+        dst[dp + 2] = b
+        dst[dp + 3] = b
+        dp = dp + 4
+      }
+      while dp < end_dp {
+        dst[dp] = b
+        dp = dp + 1
+      }
+    } else if offset >= match_len {
+      let mut sp = dp - offset
+      while dp + 4 <= end_dp {
+        dst[dp] = dst[sp]
+        dst[dp + 1] = dst[sp + 1]
+        dst[dp + 2] = dst[sp + 2]
+        dst[dp + 3] = dst[sp + 3]
+        dp = dp + 4
+        sp = sp + 4
+      }
+      while dp < end_dp {
+        dst[dp] = dst[sp]
+        dp = dp + 1
+        sp = sp + 1
+      }
+    } else {
+      let mut sp = dp - offset
+      while dp < end_dp {
+        dst[dp] = dst[sp]
+        dp = dp + 1
+        sp = sp + 1
+      }
+    }
+    out.len = end_dp
+
+    seq_i = seq_i + 1
+  }
+
+  // Verify sequence bitstream cleanly exhausted
+  if br.bits_avail != 0 || br.byte_pos != pos {
+    return Err(
+      ZstdError::InvalidBitstream("sequence bitstream did not exhaust cleanly"),
+    )
+  }
+
+  // Append remaining trailing literals
+  let rem_lits = lit_len - lit_pos
+  if rem_lits > 0 {
+    let block_produced = (out.len - block_out_start).to_int64() +
+    rem_lits.to_int64()
+    if block_produced > block_max.to_int64() {
+      return Err(
+        ZstdError::InvalidSequences(
+          "trailing literals exceed block_max",
+        ),
+      )
+    }
+    match out.write_slice(lits, lit_pos, rem_lits) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+
+  state.rep1 = rep1
+  state.rep2 = rep2
+  state.rep3 = rep3
+  Ok(())
+}
+
+///| Decompress a Zstandard stream enforcing `limits`.
+pub fn decompress_with_limits(
+  data : Bytes,
+  limits : ZstdLimits,
+) -> Result[Bytes, ZstdError] {
+  if limits.max_input_bytes < 0 ||
+  limits.max_output_bytes < 0 ||
+  limits.max_window_bytes < 0 ||
+  limits.max_frames < 0 {
+    return Err(ZstdError::LimitExceeded("negative limit in ZstdLimits"))
+  }
+  let input_len = data.length()
+  if input_len > limits.max_input_bytes {
+    return Err(ZstdError::LimitExceeded("input exceeds max_input_bytes"))
+  }
+  if input_len == 0 {
+    return Err(ZstdError::UnexpectedEof("empty zstd input"))
+  }
+
+  let eff_max_out = if limits.max_output_bytes > max_container_bytes {
+    max_container_bytes
+  } else {
+    limits.max_output_bytes
+  }
+
+  // Build local immutable lookup tables (zero module-level mutable state)
+  let ll_base = build_ll_base()
+  let ll_bits = build_ll_bits()
+  let ml_base = build_ml_base()
+  let ml_bits = build_ml_bits()
+  let predef_ll = match fse_build_table(build_predef_ll_norm(), 35, 6) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let predef_of = match fse_build_table(build_predef_of_norm(), 28, 5) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+  let predef_ml = match fse_build_table(build_predef_ml_norm(), 52, 6) {
+    Ok(t) => t
+    Err(e) => return Err(e)
+  }
+
+  let out = OutBuf::new(0, eff_max_out)
+  let mut pos = 0
+  let mut frame_count = 0
+
+  while pos < input_len {
+    frame_count = frame_count + 1
+    if frame_count > limits.max_frames {
+      return Err(ZstdError::LimitExceeded("frame count exceeded max_frames"))
+    }
+    if pos + 4 > input_len {
+      return Err(ZstdError::UnexpectedEof("truncated frame magic"))
+    }
+    let magic = read_u32_le(data, pos)
+    pos = pos + 4
+
+    // Skippable Frame (RFC 8878 §3.1.2)
+    if magic >= skippable_magic_low && magic <= skippable_magic_high {
+      if pos + 4 > input_len {
+        return Err(ZstdError::UnexpectedEof("truncated skippable frame size"))
+      }
+      let skip_len = read_u32_le(data, pos).to_int64()
+      pos = pos + 4
+      if pos.to_int64() + skip_len > input_len.to_int64() {
+        return Err(
+          ZstdError::UnexpectedEof("truncated skippable frame payload"),
+        )
+      }
+      pos = (pos.to_int64() + skip_len).to_int()
+      continue
+    }
+
+    if magic != zstd_magic {
+      return Err(ZstdError::InvalidMagic(magic))
+    }
+
+    // ---- Frame Header (RFC 8878 §3.1.1.1) ----
+    if pos >= input_len {
+      return Err(ZstdError::UnexpectedEof("missing frame header descriptor"))
+    }
+    let fhd = data[pos].to_int()
+    pos = pos + 1
+
+    // Reserved bit (bit 3) MUST be 0
+    if (fhd & 0x08) != 0 {
+      return Err(
+        ZstdError::InvalidFrameHeader("Frame_Header_Descriptor reserved bit set"),
+      )
+    }
+    let fcs_flag = (fhd >> 6) & 3
+    let single_segment = ((fhd >> 5) & 1) == 1
+    let has_checksum = ((fhd >> 2) & 1) == 1
+    let did_flag = fhd & 3
+
+    // Window Descriptor (present iff !single_segment)
+    let mut window_size : Int64 = 0L
+    if !single_segment {
+      if pos >= input_len {
+        return Err(ZstdError::UnexpectedEof("missing window descriptor"))
+      }
+      let wd = data[pos].to_int()
+      pos = pos + 1
+      let exponent = wd >> 3
+      let mantissa = wd & 7
+      let window_log = 10 + exponent
+      if window_log > 41 {
+        return Err(ZstdError::LimitExceeded("window_size exceeds max_window_bytes"))
+      }
+      let window_base : Int64 = 1L << window_log
+      let window_add : Int64 = (window_base >> 3) * mantissa.to_int64()
+      window_size = window_base + window_add
+      if window_size > limits.max_window_bytes.to_int64() {
+        return Err(
+          ZstdError::LimitExceeded("window_size exceeds max_window_bytes"),
+        )
+      }
+    }
+
+    // Dictionary ID
+    let did_size = if did_flag == 0 { 0 } else { 1 << (did_flag - 1) }
+    if did_size > 0 {
+      if pos + did_size > input_len {
+        return Err(ZstdError::UnexpectedEof("truncated dictionary id"))
+      }
+      let dict_id : UInt = if did_size == 1 {
+        data[pos].to_int().to_uint()
+      } else if did_size == 2 {
+        read_u16_le(data, pos).to_uint()
+      } else {
+        read_u32_le(data, pos)
+      }
+      pos = pos + did_size
+      if dict_id != 0U {
+        return Err(ZstdError::UnsupportedDictionary(dict_id))
+      }
+    }
+
+    // Frame Content Size
+    let mut has_fcs = false
+    let mut fcs : UInt64 = 0UL
+    if fcs_flag == 0 {
+      if single_segment {
+        if pos >= input_len {
+          return Err(ZstdError::UnexpectedEof("truncated 1-byte FCS"))
+        }
+        has_fcs = true
+        fcs = data[pos].to_int().to_int64().to_uint64()
+        pos = pos + 1
+      }
+    } else if fcs_flag == 1 {
+      if pos + 2 > input_len {
+        return Err(ZstdError::UnexpectedEof("truncated 2-byte FCS"))
+      }
+      has_fcs = true
+      fcs = (read_u16_le(data, pos) + 256).to_int64().to_uint64()
+      pos = pos + 2
+    } else if fcs_flag == 2 {
+      if pos + 4 > input_len {
+        return Err(ZstdError::UnexpectedEof("truncated 4-byte FCS"))
+      }
+      has_fcs = true
+      fcs = read_u32_le(data, pos).to_int64().to_uint64()
+      pos = pos + 4
+    } else {
+      if pos + 8 > input_len {
+        return Err(ZstdError::UnexpectedEof("truncated 8-byte FCS"))
+      }
+      has_fcs = true
+      fcs = read_u64_le(data, pos)
+      pos = pos + 8
+    }
+
+    // Enforce output & window limits BEFORE any allocation!
+    if has_fcs {
+      let rem_out = (eff_max_out - out.len).to_int64().to_uint64()
+      if fcs > rem_out {
+        return Err(
+          ZstdError::LimitExceeded(
+            "Frame_Content_Size exceeds remaining max_output_bytes",
+          ),
+        )
+      }
+      if single_segment {
+        if fcs > limits.max_window_bytes.to_int64().to_uint64() {
+          return Err(
+            ZstdError::LimitExceeded(
+              "single-segment FCS exceeds max_window_bytes",
+            ),
+          )
+        }
+        window_size = fcs.to_int64()
+      }
+      // Bounded pre-allocation (cap at 4 MiB so truncated headers cannot trigger huge alloc)
+      let pre = if fcs > 4194304UL { 4194304 } else { fcs.to_int() }
+      if pre > 0 {
+        match out.ensure(pre) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+    }
+
+    let block_max = if window_size < max_block_size_limit.to_int64() {
+      window_size.to_int()
+    } else {
+      max_block_size_limit
+    }
+
+    // ---- Blocks Loop (RFC 8878 §3.1.1.2) ----
+    let frame_start_out = out.len
+    let state = FrameState::new()
+    let mut last_block = false
+
+    while !last_block {
+      if pos + 3 > input_len {
+        return Err(ZstdError::UnexpectedEof("truncated block header"))
+      }
+      let bh = data[pos].to_int() | (data[pos + 1].to_int() << 8) |
+      (data[pos + 2].to_int() << 16)
+      pos = pos + 3
+      last_block = (bh & 1) == 1
+      let block_type = (bh >> 1) & 3
+      let block_size = bh >> 3
+
+      if block_type == 3 {
+        return Err(ZstdError::InvalidBlockHeader("reserved block type 3"))
+      }
+      if block_size > block_max {
+        return Err(
+          ZstdError::InvalidBlockHeader("block size exceeds block_max"),
+        )
+      }
+
+      if block_type == 0 {
+        // Raw_Block
+        if pos + block_size > input_len {
+          return Err(ZstdError::UnexpectedEof("truncated raw block"))
+        }
+        match out.write_slice(data, pos, block_size) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        pos = pos + block_size
+      } else if block_type == 1 {
+        // RLE_Block
+        if pos >= input_len {
+          return Err(ZstdError::UnexpectedEof("truncated RLE block byte"))
+        }
+        let b = data[pos]
+        pos = pos + 1
+        match out.write_repeat(b, block_size) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      } else {
+        // Compressed_Block
+        if pos + block_size > input_len {
+          return Err(ZstdError::UnexpectedEof("truncated compressed block"))
+        }
+        match
+        decode_compressed_block(
+          data,
+          pos,
+          pos + block_size,
+          block_max,
+          window_size,
+          frame_start_out,
+          state,
+          out,
+          ll_base,
+          ll_bits,
+          ml_base,
+          ml_bits,
+          predef_ll,
+          predef_of,
+          predef_ml,
+        ) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        pos = pos + block_size
+      }
+    }
+
+    let frame_written = out.len - frame_start_out
+    if has_fcs && frame_written.to_int64().to_uint64() != fcs {
+      return Err(
+        ZstdError::ContentSizeMismatch(
+          "decoded frame size does not match Frame_Content_Size",
+        ),
+      )
+    }
+
+    // Content Checksum (RFC 8878 §3.1.1: low 32 bits of xxHash64(seed=0))
+    if has_checksum {
+      if pos + 4 > input_len {
+        return Err(ZstdError::UnexpectedEof("truncated content checksum"))
+      }
+      let expected_chk = read_u32_le(data, pos)
+      pos = pos + 4
+      let actual_chk = (xxhash64_slice(
+        out.buf,
+        frame_start_out,
+        frame_written,
+        0UL,
+      ) & 0xFFFFFFFFUL).to_int().to_uint()
+      if actual_chk != expected_chk {
+        return Err(ZstdError::ChecksumMismatch("xxHash64 content checksum mismatch"))
+      }
+    }
+  }
+
+  if out.len == out.buf.length() {
+    Ok(out.buf)
+  } else {
+    Ok(out.buf.slice(0, out.len))
+  }
+}

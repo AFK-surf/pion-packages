@@ -1,0 +1,616 @@
+///| RFC 8878 §4.2 Huffman table decoding (FSE-compressed and Direct 4-bit weights),
+///| 1-stream and 4-stream backward bitstream literal decoding, and Huffman literal encoding.
+
+///| Flat canonical Huffman decode table (size = `1 << max_bits`, `max_bits <= 11`).
+struct HuffTable {
+  sym : FixedArray[Int]
+  nb_bits : FixedArray[Int]
+  max_bits : Int
+}
+
+///| Fill `span` consecutive entries in a canonical Huffman decode table.
+fn fill_huff_span(
+  table_sym : FixedArray[Int],
+  table_nb : FixedArray[Int],
+  idx : Int,
+  span : Int,
+  sym : Int,
+  nb : Int,
+) -> Unit {
+  let mut k = 0
+  while k < span {
+    table_sym[idx + k] = sym
+    table_nb[idx + k] = nb
+    k = k + 1
+  }
+}
+
+///| Fill all symbols of weight `w` into the canonical Huffman decode table and return new `idx`.
+fn fill_huff_weight(
+  all_w : FixedArray[Int],
+  total_syms : Int,
+  w : Int,
+  nb : Int,
+  span : Int,
+  table_sym : FixedArray[Int],
+  table_nb : FixedArray[Int],
+  start_idx : Int,
+  total : Int,
+) -> Result[Int, ZstdError] {
+  let mut idx = start_idx
+  let mut s = 0
+  while s < total_syms {
+    if all_w[s] == w {
+      if idx + span > total {
+        return Err(ZstdError::InvalidHuffmanTable("table overflow"))
+      }
+      fill_huff_span(table_sym, table_nb, idx, span, s, nb)
+      idx = idx + span
+    }
+    s = s + 1
+  }
+  Ok(idx)
+}
+
+///| Assign canonical Huffman encode codes for weight `w` and return new `idx`.
+fn assign_huff_codes_weight(
+  weights : FixedArray[Int],
+  max_sym : Int,
+  w : Int,
+  nb : Int,
+  span : Int,
+  code_val : FixedArray[Int],
+  code_len : FixedArray[Int],
+  start_idx : Int,
+) -> Int {
+  let mut idx = start_idx
+  let mut s = 0
+  while s <= max_sym {
+    if weights[s] == w {
+      code_val[s] = idx >> (w - 1)
+      code_len[s] = nb
+      idx = idx + span
+    }
+    s = s + 1
+  }
+  idx
+}
+
+///| Build a canonical Huffman decode table from symbol weights `weights[0..num_weights]`.
+///| Automatically reconstructs the implicit last symbol's weight per RFC 8878 §4.2.1.
+fn huff_build_table_from_weights(
+  weights : FixedArray[Int],
+  num_weights : Int,
+) -> Result[HuffTable, ZstdError] {
+  if num_weights <= 0 || num_weights > 255 {
+    return Err(ZstdError::InvalidHuffmanTable("invalid weight count"))
+  }
+  let mut weight_sum = 0
+  let mut i = 0
+  while i < num_weights {
+    let w = weights[i]
+    if w < 0 || w > 11 {
+      return Err(ZstdError::InvalidHuffmanTable("weight out of range 0..11"))
+    }
+    if w > 0 {
+      weight_sum = weight_sum + (1 << (w - 1))
+    }
+    i = i + 1
+  }
+  if weight_sum <= 0 {
+    return Err(ZstdError::InvalidHuffmanTable("zero weight sum"))
+  }
+
+  let max_bits = high_bit(weight_sum) + 1
+  if max_bits < 1 || max_bits > 11 {
+    return Err(ZstdError::InvalidHuffmanTable("max_bits out of range 1..11"))
+  }
+  let total = 1 << max_bits
+  let leftover = total - weight_sum
+  if leftover <= 0 || (leftover & (leftover - 1)) != 0 {
+    return Err(ZstdError::InvalidHuffmanTable("leftover is not a power of 2"))
+  }
+  let last_weight = trailing_zeros(leftover) + 1
+  if last_weight > max_bits {
+    return Err(ZstdError::InvalidHuffmanTable("last_weight exceeds max_bits"))
+  }
+
+  let total_syms = num_weights + 1
+  let all_w : FixedArray[Int] = FixedArray::make(total_syms, 0)
+  i = 0
+  while i < num_weights {
+    all_w[i] = weights[i]
+    i = i + 1
+  }
+  all_w[num_weights] = last_weight
+
+  let table_sym : FixedArray[Int] = FixedArray::make(total, 0)
+  let table_nb : FixedArray[Int] = FixedArray::make(total, 0)
+  let mut idx = 0
+  let mut w = 1
+  while w <= max_bits {
+    let nb = max_bits + 1 - w
+    let span = 1 << (w - 1)
+    idx = match
+    fill_huff_weight(
+      all_w, total_syms, w, nb, span, table_sym, table_nb, idx, total,
+    ) {
+      Ok(ni) => ni
+      Err(e) => return Err(e)
+    }
+    w = w + 1
+  }
+  if idx != total {
+    return Err(ZstdError::InvalidHuffmanTable("incomplete Huffman table"))
+  }
+  Ok(HuffTable::{ sym: table_sym, nb_bits: table_nb, max_bits: max_bits })
+}
+
+///| Parse RFC 8878 §4.2.1 Huffman Tree Description at `data[start..end]`.
+///| Returns `(HuffTable, next_byte_pos)`.
+fn huff_read_table(
+  data : Bytes,
+  start : Int,
+  end : Int,
+) -> Result[(HuffTable, Int), ZstdError] {
+  if start >= end {
+    return Err(ZstdError::UnexpectedEof("empty Huffman header"))
+  }
+  let hdr = data[start].to_int()
+  let weights : FixedArray[Int] = FixedArray::make(256, 0)
+  if hdr >= 128 {
+    // Direct 4-bit representation
+    let num_weights = hdr - 127
+    let num_bytes = (num_weights + 1) >> 1
+    if start + 1 + num_bytes > end {
+      return Err(ZstdError::UnexpectedEof("truncated direct Huffman weights"))
+    }
+    let mut i = 0
+    let mut p = start + 1
+    while i < num_weights {
+      let b = data[p].to_int()
+      p = p + 1
+      weights[i] = (b >> 4) & 15
+      i = i + 1
+      if i < num_weights {
+        weights[i] = b & 15
+        i = i + 1
+      }
+    }
+    match huff_build_table_from_weights(weights, num_weights) {
+      Ok(tbl) => Ok((tbl, start + 1 + num_bytes))
+      Err(e) => Err(e)
+    }
+  } else {
+    // FSE-compressed weights
+    let comp_size = hdr
+    let comp_start = start + 1
+    let comp_end = comp_start + comp_size
+    if comp_size == 0 || comp_end > end {
+      return Err(ZstdError::UnexpectedEof("truncated FSE Huffman weights"))
+    }
+    let (fse_tbl, stream_start) = match
+    fse_read_distribution(data, comp_start, comp_end, 12, 6) {
+      Ok(r) => r
+      Err(e) => return Err(e)
+    }
+    if stream_start >= comp_end {
+      return Err(ZstdError::InvalidHuffmanTable("empty FSE weights bitstream"))
+    }
+    let br = match BackBitReader::init(data, stream_start, comp_end) {
+      Ok(r) => r
+      Err(e) => return Err(e)
+    }
+    let alog = fse_tbl.accuracy_log
+    let mut state1 = match br.read_bits(alog) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let mut state2 = match br.read_bits(alog) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let mut count = 0
+    while true {
+      if count >= 255 {
+        return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
+      }
+      weights[count] = fse_tbl.sym[state1]
+      count = count + 1
+      let nb1 = fse_tbl.nb_bits[state1]
+      if br.remaining_bits() < nb1 {
+        if count >= 255 {
+          return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
+        }
+        weights[count] = fse_tbl.sym[state2]
+        count = count + 1
+        break
+      }
+      let bits1 = match br.read_bits(nb1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      state1 = fse_tbl.baseline[state1] + bits1
+
+      if count >= 255 {
+        return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
+      }
+      weights[count] = fse_tbl.sym[state2]
+      count = count + 1
+      let nb2 = fse_tbl.nb_bits[state2]
+      if br.remaining_bits() < nb2 {
+        if count >= 255 {
+          return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
+        }
+        weights[count] = fse_tbl.sym[state1]
+        count = count + 1
+        break
+      }
+      let bits2 = match br.read_bits(nb2) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      state2 = fse_tbl.baseline[state2] + bits2
+    }
+    match huff_build_table_from_weights(weights, count) {
+      Ok(tbl) => Ok((tbl, comp_end))
+      Err(e) => Err(e)
+    }
+  }
+}
+
+///| Decode a single Huffman backward bitstream `data[start..end]` of `out_len` symbols
+///| into `dst[dst_pos .. dst_pos + out_len]`.
+fn huff_decode_stream(
+  tbl : HuffTable,
+  data : Bytes,
+  start : Int,
+  end : Int,
+  dst : Bytes,
+  dst_pos : Int,
+  out_len : Int,
+) -> Result[Unit, ZstdError] {
+  let br = match BackBitReader::init(data, start, end) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  let max_bits = tbl.max_bits
+  let mask = (1UL << max_bits) - 1UL
+  let sym_tbl = tbl.sym
+  let nb_tbl = tbl.nb_bits
+  let mut p = dst_pos
+  let limit = dst_pos + out_len
+
+  // Fast loop while at least 4 symbols can be decoded without touching byte_pos boundary
+  while p < limit {
+    if br.bits_avail < max_bits {
+      br.refill()
+    }
+    let idx = if br.bits_avail >= max_bits {
+      ((br.bit_buf >> (br.bits_avail - max_bits)) & mask).to_int()
+    } else {
+      ((br.bit_buf << (max_bits - br.bits_avail)) & mask).to_int()
+    }
+    let nb = nb_tbl[idx]
+    if nb > br.bits_avail {
+      return Err(ZstdError::InvalidBitstream("Huffman stream underflow"))
+    }
+    br.bits_avail = br.bits_avail - nb
+    dst[p] = sym_tbl[idx].to_byte()
+    p = p + 1
+  }
+
+  if br.bits_avail != 0 || br.byte_pos != start {
+    return Err(
+      ZstdError::InvalidBitstream("Huffman stream did not exhaust cleanly"),
+    )
+  }
+  Ok(())
+}
+
+///| Decode a 1-stream or 4-stream Huffman literals payload into a newly allocated `Bytes`.
+fn huff_decode_literals(
+  tbl : HuffTable,
+  data : Bytes,
+  start : Int,
+  end : Int,
+  regen_size : Int,
+  four_streams : Bool,
+) -> Result[Bytes, ZstdError] {
+  let out = Bytes::new(regen_size)
+  if !four_streams {
+    match huff_decode_stream(tbl, data, start, end, out, 0, regen_size) {
+      Ok(_) => Ok(out)
+      Err(e) => Err(e)
+    }
+  } else {
+    if end - start < 6 {
+      return Err(
+        ZstdError::UnexpectedEof("truncated 4-stream Huffman jump table"),
+      )
+    }
+    let s1 = data[start].to_int() | (data[start + 1].to_int() << 8)
+    let s2 = data[start + 2].to_int() | (data[start + 3].to_int() << 8)
+    let s3 = data[start + 4].to_int() | (data[start + 5].to_int() << 8)
+    let p1 = start + 6
+    let p2 = p1 + s1
+    let p3 = p2 + s2
+    let p4 = p3 + s3
+    if p4 > end {
+      return Err(
+        ZstdError::InvalidLiteralsHeader("4-stream Huffman jump table overflow"),
+      )
+    }
+    let seg = (regen_size + 3) >> 2
+    let rem = regen_size - seg * 3
+    if rem < 0 {
+      return Err(
+        ZstdError::InvalidLiteralsHeader("4-stream regen_size too small"),
+      )
+    }
+    match huff_decode_stream(tbl, data, p1, p2, out, 0, seg) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    match huff_decode_stream(tbl, data, p2, p3, out, seg, seg) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    match huff_decode_stream(tbl, data, p3, p4, out, seg * 2, seg) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    match huff_decode_stream(tbl, data, p4, end, out, seg * 3, rem) {
+      Ok(_) => Ok(out)
+      Err(e) => Err(e)
+    }
+  }
+}
+
+///| Encode literals with a Direct-weight Huffman table (1-stream or 4-stream) if it saves space.
+///| Returns `Some((header_and_payload, is_four_streams))` or `None` if raw is better.
+fn huff_try_encode_literals(
+  lits : Bytes,
+  len : Int,
+) -> Option[(Bytes, Bool)] {
+  if len < 48 {
+    return None
+  }
+  // Count byte frequencies
+  let freq : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut max_sym = 0
+  let mut unique = 0
+  let mut i = 0
+  while i < len {
+    let b = lits[i].to_int()
+    if freq[b] == 0 {
+      unique = unique + 1
+      if b > max_sym {
+        max_sym = b
+      }
+    }
+    freq[b] = freq[b] + 1
+    i = i + 1
+  }
+  // Direct 4-bit weights supports up to 128 weights (max_sym <= 128)
+  if unique < 2 || max_sym > 128 {
+    return None
+  }
+
+  // Build length-limited Huffman code lengths (max_bits <= 11) via simple Kraft-normalized weights.
+  // Compute bit lengths from log2(len / freq[s]), then adjust to exact Kraft sum == 1 << max_bits.
+  let max_bits = 11
+  let target = 1 << max_bits
+  let weights : FixedArray[Int] = FixedArray::make(max_sym + 1, 0)
+  let mut kraft = 0
+  let mut s = 0
+  while s <= max_sym {
+    let f = freq[s]
+    if f > 0 {
+      // Initial weight estimate: w = max_bits + 1 - ceil(log2(len / f))
+      let mut ratio = (len + f - 1) / f
+      if ratio < 1 {
+        ratio = 1
+      }
+      let mut bl = high_bit(ratio)
+      if (1 << bl) < ratio {
+        bl = bl + 1
+      }
+      if bl < 1 {
+        bl = 1
+      }
+      if bl > max_bits {
+        bl = max_bits
+      }
+      let w = max_bits + 1 - bl
+      weights[s] = w
+      kraft = kraft + (1 << (w - 1))
+    }
+    s = s + 1
+  }
+
+  // Reduce kraft if > target by decrementing lowest-frequency symbols with w > 1
+  let mut iter_guard = 0
+  while kraft > target && iter_guard < 2048 {
+    iter_guard = iter_guard + 1
+    let mut best_s = -1
+    let mut best_f = 2147483647
+    s = 0
+    while s <= max_sym {
+      if weights[s] > 1 && freq[s] < best_f {
+        best_f = freq[s]
+        best_s = s
+      }
+      s = s + 1
+    }
+    if best_s < 0 {
+      return None
+    }
+    let old_w = weights[best_s]
+    weights[best_s] = old_w - 1
+    kraft = kraft - (1 << (old_w - 2))
+  }
+
+  // Increase kraft if < target by incrementing highest-frequency symbols that fit
+  iter_guard = 0
+  while kraft < target && iter_guard < 2048 {
+    iter_guard = iter_guard + 1
+    let rem = target - kraft
+    let mut best_s = -1
+    let mut best_f = -1
+    s = 0
+    while s <= max_sym {
+      let w = weights[s]
+      if w > 0 && w < max_bits {
+        let delta = 1 << (w - 1)
+        if delta <= rem && freq[s] > best_f {
+          best_f = freq[s]
+          best_s = s
+        }
+      }
+      s = s + 1
+    }
+    if best_s < 0 {
+      return None
+    }
+    let old_w = weights[best_s]
+    weights[best_s] = old_w + 1
+    kraft = kraft + (1 << (old_w - 1))
+  }
+  if kraft != target {
+    return None
+  }
+
+  // Normalize weights down if all non-zero weights are > 1 (tightens max_bits)
+  let mut min_w = max_bits
+  s = 0
+  while s <= max_sym {
+    if weights[s] > 0 && weights[s] < min_w {
+      min_w = weights[s]
+    }
+    s = s + 1
+  }
+  let shift = min_w - 1
+  let eff_max_bits = max_bits - shift
+  if shift > 0 {
+    s = 0
+    while s <= max_sym {
+      if weights[s] > 0 {
+        weights[s] = weights[s] - shift
+      }
+      s = s + 1
+    }
+  }
+
+  // Assign canonical Huffman codes matching RFC 8878 §4.2.2
+  let code_val : FixedArray[Int] = FixedArray::make(max_sym + 1, 0)
+  let code_len : FixedArray[Int] = FixedArray::make(max_sym + 1, 0)
+  let mut idx = 0
+  let mut w = 1
+  while w <= eff_max_bits {
+    let nb = eff_max_bits + 1 - w
+    let span = 1 << (w - 1)
+    idx = assign_huff_codes_weight(
+      weights, max_sym, w, nb, span, code_val, code_len, idx,
+    )
+    w = w + 1
+  }
+
+  // Direct 4-bit weight header: num_weights = max_sym (last symbol max_sym is implicit)
+  let num_weights = max_sym
+  let hdr_bytes = 1 + ((num_weights + 1) >> 1)
+  let four_streams = len >= 1024
+
+  let encode_seg = fn(seg_start : Int, seg_len : Int) -> Bytes {
+    let bw = BitWriter::new(seg_len)
+    let mut k = seg_start + seg_len - 1
+    while k >= seg_start {
+      let b = lits[k].to_int()
+      bw.write_bits(code_val[b], code_len[b])
+      k = k - 1
+    }
+    bw.finish_with_sentinel()
+  }
+
+  if !four_streams {
+    let stream = encode_seg(0, len)
+    let total_comp = hdr_bytes + stream.length()
+    if total_comp + 4 >= len {
+      return None
+    }
+    let out = Bytes::new(total_comp)
+    out[0] = (127 + num_weights).to_byte()
+    let mut p = 1
+    let mut wi = 0
+    while wi < num_weights {
+      let hi = weights[wi] & 15
+      let lo = if wi + 1 < num_weights { weights[wi + 1] & 15 } else { 0 }
+      out[p] = ((hi << 4) | lo).to_byte()
+      p = p + 1
+      wi = wi + 2
+    }
+    let mut j = 0
+    while j < stream.length() {
+      out[p + j] = stream[j]
+      j = j + 1
+    }
+    Some((out, false))
+  } else {
+    let seg = (len + 3) >> 2
+    let rem = len - seg * 3
+    let st1 = encode_seg(0, seg)
+    let st2 = encode_seg(seg, seg)
+    let st3 = encode_seg(seg * 2, seg)
+    let st4 = encode_seg(seg * 3, rem)
+    if st1.length() > 65535 || st2.length() > 65535 || st3.length() > 65535 {
+      return None
+    }
+    let total_comp = hdr_bytes + 6 + st1.length() + st2.length() + st3.length() +
+    st4.length()
+    if total_comp + 6 >= len {
+      return None
+    }
+    let out = Bytes::new(total_comp)
+    out[0] = (127 + num_weights).to_byte()
+    let mut p = 1
+    let mut wi = 0
+    while wi < num_weights {
+      let hi = weights[wi] & 15
+      let lo = if wi + 1 < num_weights { weights[wi + 1] & 15 } else { 0 }
+      out[p] = ((hi << 4) | lo).to_byte()
+      p = p + 1
+      wi = wi + 2
+    }
+    out[p] = (st1.length() & 255).to_byte()
+    out[p + 1] = ((st1.length() >> 8) & 255).to_byte()
+    out[p + 2] = (st2.length() & 255).to_byte()
+    out[p + 3] = ((st2.length() >> 8) & 255).to_byte()
+    out[p + 4] = (st3.length() & 255).to_byte()
+    out[p + 5] = ((st3.length() >> 8) & 255).to_byte()
+    p = p + 6
+    let mut j = 0
+    while j < st1.length() {
+      out[p + j] = st1[j]
+      j = j + 1
+    }
+    p = p + st1.length()
+    j = 0
+    while j < st2.length() {
+      out[p + j] = st2[j]
+      j = j + 1
+    }
+    p = p + st2.length()
+    j = 0
+    while j < st3.length() {
+      out[p + j] = st3[j]
+      j = j + 1
+    }
+    p = p + st3.length()
+    j = 0
+    while j < st4.length() {
+      out[p + j] = st4[j]
+      j = j + 1
+    }
+    Some((out, true))
+  }
+}
