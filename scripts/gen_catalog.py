@@ -144,6 +144,8 @@ PACKAGE_META = {
             ["jwt", "jws", "jwk", "hs256", "hmac", "token", "auth", "鉴权"]),
     "kdl": ("data-formats", "KDL v2.0 (and v1 compat) document parser and canonical/compact serializer",
             ["kdl", "config", "document", "parser", "serializer", "配置"]),
+    "lepton": ("media-graphics", "Lossless JPEG recompression for 8-bit sequential (SOF0/SOF1) and progressive (SOF2) with exact restoration",
+               ["lepton", "jpeg", "lossless", "recompression", "range-coding", "progressive", "image", "无损压缩"]),
     "lua": ("query-lang", "Lua 5.4 bytecode compiler and sandboxed register VM with GC and resource limits",
             ["lua", "script", "vm", "interpreter", "sandbox", "bytecode", "脚本"]),
     "markdown": ("markup-docs", "CommonMark + GFM Markdown parser and HTML renderer with AST and plain-text preview",
