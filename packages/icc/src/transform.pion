@@ -1,0 +1,688 @@
+///| High-speed ICC -> sRGB color transform engine.
+///| Uses precomputed Q14 256-entry input linearization LUTs, Q14 3x3 integer matrix multiply,
+///| and an immutable 8193-entry linear -> sRGB output LUT (zero floating-point ops in the pixel hot loop,
+///| zero per-pixel allocations, zero mutable module globals).
+
+///| Precomputed immutable ICC -> sRGB transform.
+pub struct Transform {
+  pub is_identity : Bool
+  pub is_gray : Bool
+  same_lut : Bool
+  lut_r : FixedArray[Int]
+  lut_g : FixedArray[Int]
+  lut_b : FixedArray[Int]
+  gray_lut : FixedArray[Byte]
+  m00 : Int
+  m01 : Int
+  m02 : Int
+  m10 : Int
+  m11 : Int
+  m12 : Int
+  m20 : Int
+  m21 : Int
+  m22 : Int
+}
+
+fn tone_curve_equals(a : ToneCurve, b : ToneCurve) -> Bool {
+  match (a, b) {
+    (ToneCurve::Identity, ToneCurve::Identity) => true
+    (ToneCurve::Gamma(ga), ToneCurve::Gamma(gb)) => ga == gb
+    (
+      ToneCurve::Parametric(ta, ga, aa, ba, ca, da, ea, fa),
+      ToneCurve::Parametric(tb, gb, ab, bb, cb, db, eb, fb),
+    ) =>
+    ta == tb &&
+    ga == gb &&
+    aa == ab &&
+    ba == bb &&
+    ca == cb &&
+    da == db &&
+    ea == eb &&
+    fa == fb
+    (ToneCurve::Table(ea), ToneCurve::Table(eb)) => {
+      let n = ea.length()
+      if n != eb.length() {
+        return false
+      }
+      if n > 0 && (ea[0] != eb[0] || ea[n - 1] != eb[n - 1]) {
+        return false
+      }
+      let mut i = 1
+      while i < n - 1 {
+        if ea[i] != eb[i] {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+fn is_exact_srgb_para3(curve : ToneCurve) -> Bool {
+  match curve {
+    ToneCurve::Parametric(3, g, a, b, c, d, _, _) =>
+    f64_abs(g - 2.4) < 0.001 &&
+    f64_abs(a - 0.947867298578) < 0.0005 &&
+    f64_abs(b - 0.052132701422) < 0.0005 &&
+    f64_abs(c - 0.077399380805) < 0.0005 &&
+    f64_abs(d - 0.04045) < 0.001
+    _ => false
+  }
+}
+
+fn build_input_lut_q14(curve : ToneCurve) -> FixedArray[Int] {
+  if is_exact_srgb_para3(curve) {
+    return build_srgb_eotf_q14()
+  }
+  let lut : FixedArray[Int] = FixedArray::make(256, 0)
+  match curve {
+    ToneCurve::Identity => {
+      let mut i = 0
+      while i < 256 {
+        lut[i] = (i * 16384 + 127) / 255
+        i = i + 1
+      }
+    }
+    ToneCurve::Table(entries) => {
+      let n = entries.length()
+      if n == 0 {
+        let mut i = 0
+        while i < 256 {
+          lut[i] = (i * 16384 + 127) / 255
+          i = i + 1
+        }
+      } else if n == 1 {
+        let mut q = ((entries[0].to_int64() * 16384L + 32767L) / 65535L).to_int()
+        if q < 0 {
+          q = 0
+        } else if q > 16384 {
+          q = 16384
+        }
+        let mut i = 0
+        while i < 256 {
+          lut[i] = q
+          i = i + 1
+        }
+      } else {
+        let nm1 = n - 1
+        let mut i = 0
+        while i < 256 {
+          let scaled = i * nm1
+          let lo = scaled / 255
+          let rem = scaled - lo * 255
+          let q = if lo >= nm1 {
+            ((entries[nm1].to_int64() * 16384L + 32767L) / 65535L).to_int()
+          } else if rem == 0 {
+            ((entries[lo].to_int64() * 16384L + 32767L) / 65535L).to_int()
+          } else {
+            let e0 = entries[lo].to_int64()
+            let e1 = entries[lo + 1].to_int64()
+            let interp = e0 * (255 - rem).to_int64() + e1 * rem.to_int64()
+            ((interp * 16384L + 8355712L) / 16711425L).to_int()
+          }
+          lut[i] = if q < 0 { 0 } else if q > 16384 { 16384 } else { q }
+          i = i + 1
+        }
+      }
+    }
+    ToneCurve::Gamma(g) => {
+      if g <= 0.0 || !f64_is_finite(g) {
+        let mut i = 0
+        while i < 256 {
+          lut[i] = (i * 16384 + 127) / 255
+          i = i + 1
+        }
+      } else {
+        lut[0] = 0
+        lut[255] = 16384
+        let inv255 = 1.0 / 255.0
+        let mut i = 1
+        while i < 255 {
+          let lin = f64_clamp01(f64_pow_unit_fast(i.to_double() * inv255, g))
+          let q = round_to_int(lin * 16384.0)
+          lut[i] = if q < 0 { 0 } else if q > 16384 { 16384 } else { q }
+          i = i + 1
+        }
+      }
+    }
+    ToneCurve::Parametric(3, g, a, b, c, d, _, _) => {
+      let inv255 = 1.0 / 255.0
+      let mut i = 0
+      while i < 256 {
+        let v = i.to_double() * inv255
+        let y = if v >= d {
+          let base = a * v + b
+          if base > 0.0 {
+            if base <= 1.0 && f64_is_finite(g) {
+              f64_pow_unit_fast(base, g)
+            } else {
+              f64_pow(base, g)
+            }
+          } else {
+            0.0
+          }
+        } else {
+          c * v
+        }
+        let q = round_to_int(f64_clamp01(y) * 16384.0)
+        lut[i] = if q < 0 { 0 } else if q > 16384 { 16384 } else { q }
+        i = i + 1
+      }
+    }
+    _ => {
+      let inv255 = 1.0 / 255.0
+      let mut i = 0
+      while i < 256 {
+        let lin = eval_tone_curve(curve, i.to_double() * inv255)
+        let q = round_to_int(lin * 16384.0)
+        lut[i] = if q < 0 { 0 } else if q > 16384 { 16384 } else { q }
+        i = i + 1
+      }
+    }
+  }
+  lut
+}
+
+fn lut_is_exact_srgb_identity(lut : FixedArray[Int]) -> Bool {
+  let s = srgb_oetf_lo7
+  let mut k = 0
+  while k < 256 {
+    let idx = (lut[k] + 1) >> 1
+    let lo = s.code_unit_at(idx)
+    let enc = if idx >= 1754 { lo | 128 } else { lo }
+    if enc != k {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+fn check_matrix_valid(m : Matrix3x3) -> Result[Unit, IccError] {
+  if !f64_is_finite(m.m00) ||
+  !f64_is_finite(m.m01) ||
+  !f64_is_finite(m.m02) ||
+  !f64_is_finite(m.m10) ||
+  !f64_is_finite(m.m11) ||
+  !f64_is_finite(m.m12) ||
+  !f64_is_finite(m.m20) ||
+  !f64_is_finite(m.m21) ||
+  !f64_is_finite(m.m22) {
+    return Err(IccError::InvalidTag("non-finite primary matrix"))
+  }
+  let r0 = f64_abs(m.m00) + f64_abs(m.m01) + f64_abs(m.m02)
+  let r1 = f64_abs(m.m10) + f64_abs(m.m11) + f64_abs(m.m12)
+  let r2 = f64_abs(m.m20) + f64_abs(m.m21) + f64_abs(m.m22)
+  if r0 > 7.5 || r1 > 7.5 || r2 > 7.5 {
+    return Err(IccError::UnsupportedProfile("color matrix gain exceeds safe range"))
+  }
+  Ok(())
+}
+
+///| Build an ICC -> sRGB transform from a parsed `Profile`.
+pub fn Transform::to_srgb(profile : Profile) -> Result[Transform, IccError] {
+  match profile.pcs {
+    ColorSpace::Xyz => ()
+    _ =>
+    return Err(
+      IccError::UnsupportedProfile(
+        "unsupported PCS '" + profile.pcs.signature() + "' (expected 'XYZ ')",
+      ),
+    )
+  }
+
+  if profile.has_tag("A2B0") || profile.has_tag("A2B1") {
+    return Err(
+      IccError::UnsupportedProfile("CLUT profile (A2B0/A2B1) is not supported"),
+    )
+  }
+
+  match profile.color_space {
+    ColorSpace::Gray => {
+      let ktrc = match profile.gray_trc {
+        Some(c) => c
+        None => return Err(IccError::UnsupportedProfile("GRAY profile missing kTRC tag"))
+      }
+      let gray_lut : FixedArray[Byte] = FixedArray::make(256, b'\x00')
+      let mut all_id = true
+      let mut i = 0
+      while i < 256 {
+        let lin = eval_tone_curve(ktrc, i.to_double() / 255.0)
+        let mut v = round_to_int(srgb_oetf(lin) * 255.0)
+        if v < 0 {
+          v = 0
+        } else if v > 255 {
+          v = 255
+        }
+        if v != i {
+          all_id = false
+        }
+        gray_lut[i] = v.to_byte()
+        i = i + 1
+      }
+      let empty_i : FixedArray[Int] = FixedArray::make(1, 0)
+      Ok(
+        Transform::{
+          is_identity: all_id,
+          is_gray: true,
+          same_lut: true,
+          lut_r: empty_i,
+          lut_g: empty_i,
+          lut_b: empty_i,
+          gray_lut: gray_lut,
+          m00: 16384,
+          m01: 0,
+          m02: 0,
+          m10: 0,
+          m11: 16384,
+          m12: 0,
+          m20: 0,
+          m21: 0,
+          m22: 16384,
+        },
+      )
+    }
+    ColorSpace::Rgb => {
+      let src_m = match profile.matrix() {
+        Some(m) => m
+        None =>
+        return Err(
+          IccError::UnsupportedProfile("RGB profile missing rXYZ/gXYZ/bXYZ tags"),
+        )
+      }
+      let (rt, gt, bt) = match (profile.red_trc, profile.green_trc, profile.blue_trc) {
+        (Some(r), Some(g), Some(b)) => (r, g, b)
+        _ =>
+        return Err(
+          IccError::UnsupportedProfile("RGB profile missing rTRC/gTRC/bTRC tags"),
+        )
+      }
+      // ICC rXYZ/gXYZ/bXYZ are already adapted to PCS D50; convert D50 XYZ -> D65 linear sRGB.
+      let m = mat3_mul(xyz_d50_to_srgb_linear(), src_m)
+      match check_matrix_valid(m) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+
+      // Tight matrix identity guard: 0.00015 * 12.92 * 255 = 0.49 LSB max
+      let eps = 0.00015
+      let mat_near_id = f64_abs(m.m00 - 1.0) <= eps &&
+      f64_abs(m.m01) <= eps &&
+      f64_abs(m.m02) <= eps &&
+      f64_abs(m.m10) <= eps &&
+      f64_abs(m.m11 - 1.0) <= eps &&
+      f64_abs(m.m12) <= eps &&
+      f64_abs(m.m20) <= eps &&
+      f64_abs(m.m21) <= eps &&
+      f64_abs(m.m22 - 1.0) <= eps
+
+      // Fast O(1) path for exact sRGB para3 + identity matrix
+      if mat_near_id &&
+      is_exact_srgb_para3(rt) &&
+      is_exact_srgb_para3(gt) &&
+      is_exact_srgb_para3(bt) {
+        let empty_i : FixedArray[Int] = FixedArray::make(1, 0)
+        let empty_b : FixedArray[Byte] = FixedArray::make(1, b'\x00')
+        return Ok(
+          Transform::{
+            is_identity: true,
+            is_gray: false,
+            same_lut: true,
+            lut_r: empty_i,
+            lut_g: empty_i,
+            lut_b: empty_i,
+            gray_lut: empty_b,
+            m00: 16384,
+            m01: 0,
+            m02: 0,
+            m10: 0,
+            m11: 16384,
+            m12: 0,
+            m20: 0,
+            m21: 0,
+            m22: 16384,
+          },
+        )
+      }
+
+      let g_eq_r = tone_curve_equals(gt, rt)
+      let b_eq_r = tone_curve_equals(bt, rt)
+      let lut_r = build_input_lut_q14(rt)
+      let lut_g = if g_eq_r { lut_r } else { build_input_lut_q14(gt) }
+      let lut_b = if b_eq_r {
+        lut_r
+      } else if tone_curve_equals(bt, gt) {
+        lut_g
+      } else {
+        build_input_lut_q14(bt)
+      }
+
+      // Integer LUT identity check (0 transcendental ops)
+      if mat_near_id {
+        let r_id = lut_is_exact_srgb_identity(lut_r)
+        let g_id = if !r_id { false } else if g_eq_r { true } else { lut_is_exact_srgb_identity(lut_g) }
+        let b_id = if !g_id { false } else if b_eq_r { true } else { lut_is_exact_srgb_identity(lut_b) }
+        if b_id {
+          let empty_i : FixedArray[Int] = FixedArray::make(1, 0)
+          let empty_b : FixedArray[Byte] = FixedArray::make(1, b'\x00')
+          return Ok(
+            Transform::{
+              is_identity: true,
+              is_gray: false,
+              same_lut: true,
+              lut_r: empty_i,
+              lut_g: empty_i,
+              lut_b: empty_i,
+              gray_lut: empty_b,
+              m00: 16384,
+              m01: 0,
+              m02: 0,
+              m10: 0,
+              m11: 16384,
+              m12: 0,
+              m20: 0,
+              m21: 0,
+              m22: 16384,
+            },
+          )
+        }
+      }
+
+      let empty_b : FixedArray[Byte] = FixedArray::make(1, b'\x00')
+      Ok(
+        Transform::{
+          is_identity: false,
+          is_gray: false,
+          same_lut: g_eq_r && b_eq_r,
+          lut_r: lut_r,
+          lut_g: lut_g,
+          lut_b: lut_b,
+          gray_lut: empty_b,
+          m00: round_to_int(m.m00 * 16384.0),
+          m01: round_to_int(m.m01 * 16384.0),
+          m02: round_to_int(m.m02 * 16384.0),
+          m10: round_to_int(m.m10 * 16384.0),
+          m11: round_to_int(m.m11 * 16384.0),
+          m12: round_to_int(m.m12 * 16384.0),
+          m20: round_to_int(m.m20 * 16384.0),
+          m21: round_to_int(m.m21 * 16384.0),
+          m22: round_to_int(m.m22 * 16384.0),
+        },
+      )
+    }
+    _ =>
+    Err(
+      IccError::UnsupportedProfile(
+        "unsupported color space '" + profile.color_space.signature() + "'",
+      ),
+    )
+  }
+}
+
+///| Return whether this transform is an exact O(1) identity no-op.
+pub fn Transform::is_identity(self : Transform) -> Bool {
+  self.is_identity
+}
+
+///| Transform a single 8-bit grayscale value to sRGB luminance.
+pub fn Transform::transform_gray_pixel(self : Transform, v : Byte) -> Byte {
+  if self.is_identity {
+    return v
+  }
+  if self.is_gray {
+    return self.gray_lut[v.to_int()]
+  }
+  let (r, _, _) = self.transform_rgb_pixel(v, v, v)
+  r
+}
+
+///| Transform a single 8-bit RGB pixel to sRGB.
+pub fn Transform::transform_rgb_pixel(
+  self : Transform,
+  r : Byte,
+  g : Byte,
+  b : Byte,
+) -> (Byte, Byte, Byte) {
+  if self.is_identity {
+    return (r, g, b)
+  }
+  if self.is_gray {
+    let gl = self.gray_lut
+    return (gl[r.to_int()], gl[g.to_int()], gl[b.to_int()])
+  }
+  let lr = self.lut_r[r.to_int()]
+  let lg = self.lut_g[g.to_int()]
+  let lb = self.lut_b[b.to_int()]
+  let mut ri = (self.m00 * lr + self.m01 * lg + self.m02 * lb + 16384) >> 15
+  let mut gi = (self.m10 * lr + self.m11 * lg + self.m12 * lb + 16384) >> 15
+  let mut bi = (self.m20 * lr + self.m21 * lg + self.m22 * lb + 16384) >> 15
+  if ri < 0 {
+    ri = 0
+  } else if ri > 8192 {
+    ri = 8192
+  }
+  if gi < 0 {
+    gi = 0
+  } else if gi > 8192 {
+    gi = 8192
+  }
+  if bi < 0 {
+    bi = 0
+  } else if bi > 8192 {
+    bi = 8192
+  }
+  (srgb_oetf_at(ri), srgb_oetf_at(gi), srgb_oetf_at(bi))
+}
+
+///| Transform packed 8-bit RGB pixels in place. Buffer length must be a multiple of 3.
+pub fn Transform::transform_rgb_in_place(
+  self : Transform,
+  buf : Array[Byte],
+) -> Result[Unit, IccError] {
+  let n = buf.length()
+  if n % 3 != 0 {
+    return Err(
+      IccError::InvalidBuffer(
+        "RGB buffer length " + n.to_string() + " is not a multiple of 3",
+      ),
+    )
+  }
+  if self.is_identity || n == 0 {
+    return Ok(())
+  }
+  if self.is_gray {
+    let gl = self.gray_lut
+    let mut i = 0
+    while i < n {
+      buf[i] = gl[buf[i].to_int()]
+      buf[i + 1] = gl[buf[i + 1].to_int()]
+      buf[i + 2] = gl[buf[i + 2].to_int()]
+      i = i + 3
+    }
+    return Ok(())
+  }
+  let lut_r = self.lut_r
+  let lut_g = self.lut_g
+  let lut_b = self.lut_b
+  let out_s = srgb_oetf_lo7
+  let m00 = self.m00
+  let m01 = self.m01
+  let m02 = self.m02
+  let m10 = self.m10
+  let m11 = self.m11
+  let m12 = self.m12
+  let m20 = self.m20
+  let m21 = self.m21
+  let m22 = self.m22
+  let mut i = 0
+  while i < n {
+    let lr = lut_r[buf[i].to_int()]
+    let lg = lut_g[buf[i + 1].to_int()]
+    let lb = lut_b[buf[i + 2].to_int()]
+    let mut ri = (m00 * lr + m01 * lg + m02 * lb + 16384) >> 15
+    let mut gi = (m10 * lr + m11 * lg + m12 * lb + 16384) >> 15
+    let mut bi = (m20 * lr + m21 * lg + m22 * lb + 16384) >> 15
+    if ri < 0 {
+      ri = 0
+    } else if ri > 8192 {
+      ri = 8192
+    }
+    if gi < 0 {
+      gi = 0
+    } else if gi > 8192 {
+      gi = 8192
+    }
+    if bi < 0 {
+      bi = 0
+    } else if bi > 8192 {
+      bi = 8192
+    }
+    let ro = out_s.code_unit_at(ri)
+    let go = out_s.code_unit_at(gi)
+    let bo = out_s.code_unit_at(bi)
+    buf[i] = (if ri >= 1754 { ro | 128 } else { ro }).to_byte()
+    buf[i + 1] = (if gi >= 1754 { go | 128 } else { go }).to_byte()
+    buf[i + 2] = (if bi >= 1754 { bo | 128 } else { bo }).to_byte()
+    i = i + 3
+  }
+  Ok(())
+}
+
+///| Transform packed 8-bit RGBA pixels in place, preserving Alpha bytes untouched.
+///| Buffer length must be a multiple of 4.
+pub fn Transform::transform_rgba_in_place(
+  self : Transform,
+  buf : Array[Byte],
+) -> Result[Unit, IccError] {
+  let n = buf.length()
+  if (n & 3) != 0 {
+    return Err(
+      IccError::InvalidBuffer(
+        "RGBA buffer length " + n.to_string() + " is not a multiple of 4",
+      ),
+    )
+  }
+  if self.is_identity || n == 0 {
+    return Ok(())
+  }
+  if self.is_gray {
+    let gl = self.gray_lut
+    let mut i = 0
+    while i < n {
+      buf[i] = gl[buf[i].to_int()]
+      buf[i + 1] = gl[buf[i + 1].to_int()]
+      buf[i + 2] = gl[buf[i + 2].to_int()]
+      i = i + 4
+    }
+    return Ok(())
+  }
+  let m00 = self.m00
+  let m01 = self.m01
+  let m02 = self.m02
+  let m10 = self.m10
+  let m11 = self.m11
+  let m12 = self.m12
+  let m20 = self.m20
+  let m21 = self.m21
+  let m22 = self.m22
+  if n >= 2048 {
+    let out = decode_srgb_oetf_8193()
+    if self.same_lut {
+      let lut = self.lut_r
+      let mut i = 0
+      let n8 = n - (n & 7)
+      while i < n8 {
+        let lr0 = lut[buf[i].to_int()]
+        let lg0 = lut[buf[i + 1].to_int()]
+        let lb0 = lut[buf[i + 2].to_int()]
+        let lr1 = lut[buf[i + 4].to_int()]
+        let lg1 = lut[buf[i + 5].to_int()]
+        let lb1 = lut[buf[i + 6].to_int()]
+
+        let mut r0 = (m00 * lr0 + m01 * lg0 + m02 * lb0 + 16384) >> 15
+        let mut g0 = (m10 * lr0 + m11 * lg0 + m12 * lb0 + 16384) >> 15
+        let mut b0 = (m20 * lr0 + m21 * lg0 + m22 * lb0 + 16384) >> 15
+        let mut r1 = (m00 * lr1 + m01 * lg1 + m02 * lb1 + 16384) >> 15
+        let mut g1 = (m10 * lr1 + m11 * lg1 + m12 * lb1 + 16384) >> 15
+        let mut b1 = (m20 * lr1 + m21 * lg1 + m22 * lb1 + 16384) >> 15
+
+        if r0 < 0 { r0 = 0 } else if r0 > 8192 { r0 = 8192 }
+        if g0 < 0 { g0 = 0 } else if g0 > 8192 { g0 = 8192 }
+        if b0 < 0 { b0 = 0 } else if b0 > 8192 { b0 = 8192 }
+        if r1 < 0 { r1 = 0 } else if r1 > 8192 { r1 = 8192 }
+        if g1 < 0 { g1 = 0 } else if g1 > 8192 { g1 = 8192 }
+        if b1 < 0 { b1 = 0 } else if b1 > 8192 { b1 = 8192 }
+
+        buf[i] = out[r0]
+        buf[i + 1] = out[g0]
+        buf[i + 2] = out[b0]
+        buf[i + 4] = out[r1]
+        buf[i + 5] = out[g1]
+        buf[i + 6] = out[b1]
+        i = i + 8
+      }
+      while i < n {
+        let lr = lut[buf[i].to_int()]
+        let lg = lut[buf[i + 1].to_int()]
+        let lb = lut[buf[i + 2].to_int()]
+        let mut ri = (m00 * lr + m01 * lg + m02 * lb + 16384) >> 15
+        let mut gi = (m10 * lr + m11 * lg + m12 * lb + 16384) >> 15
+        let mut bi = (m20 * lr + m21 * lg + m22 * lb + 16384) >> 15
+        if ri < 0 { ri = 0 } else if ri > 8192 { ri = 8192 }
+        if gi < 0 { gi = 0 } else if gi > 8192 { gi = 8192 }
+        if bi < 0 { bi = 0 } else if bi > 8192 { bi = 8192 }
+        buf[i] = out[ri]
+        buf[i + 1] = out[gi]
+        buf[i + 2] = out[bi]
+        i = i + 4
+      }
+      return Ok(())
+    }
+    let lut_r = self.lut_r
+    let lut_g = self.lut_g
+    let lut_b = self.lut_b
+    let mut i = 0
+    while i < n {
+      let lr = lut_r[buf[i].to_int()]
+      let lg = lut_g[buf[i + 1].to_int()]
+      let lb = lut_b[buf[i + 2].to_int()]
+      let mut ri = (m00 * lr + m01 * lg + m02 * lb + 16384) >> 15
+      let mut gi = (m10 * lr + m11 * lg + m12 * lb + 16384) >> 15
+      let mut bi = (m20 * lr + m21 * lg + m22 * lb + 16384) >> 15
+      if ri < 0 { ri = 0 } else if ri > 8192 { ri = 8192 }
+      if gi < 0 { gi = 0 } else if gi > 8192 { gi = 8192 }
+      if bi < 0 { bi = 0 } else if bi > 8192 { bi = 8192 }
+      buf[i] = out[ri]
+      buf[i + 1] = out[gi]
+      buf[i + 2] = out[bi]
+      i = i + 4
+    }
+    return Ok(())
+  }
+  let out_s = srgb_oetf_lo7
+  let lut_r = self.lut_r
+  let lut_g = self.lut_g
+  let lut_b = self.lut_b
+  let mut i = 0
+  while i < n {
+    let lr = lut_r[buf[i].to_int()]
+    let lg = lut_g[buf[i + 1].to_int()]
+    let lb = lut_b[buf[i + 2].to_int()]
+    let mut ri = (m00 * lr + m01 * lg + m02 * lb + 16384) >> 15
+    let mut gi = (m10 * lr + m11 * lg + m12 * lb + 16384) >> 15
+    let mut bi = (m20 * lr + m21 * lg + m22 * lb + 16384) >> 15
+    if ri < 0 { ri = 0 } else if ri > 8192 { ri = 8192 }
+    if gi < 0 { gi = 0 } else if gi > 8192 { gi = 8192 }
+    if bi < 0 { bi = 0 } else if bi > 8192 { bi = 8192 }
+    let ro = out_s.code_unit_at(ri)
+    let go = out_s.code_unit_at(gi)
+    let bo = out_s.code_unit_at(bi)
+    buf[i] = (if ri >= 1754 { ro | 128 } else { ro }).to_byte()
+    buf[i + 1] = (if gi >= 1754 { go | 128 } else { go }).to_byte()
+    buf[i + 2] = (if bi >= 1754 { bo | 128 } else { bo }).to_byte()
+    i = i + 4
+  }
+  Ok(())
+}
