@@ -199,11 +199,19 @@ EOF
 }
 
 dos() {
-  echo "==> dos: $(wc -l < "$C/bombs.tsv" | tr -d ' ') bombs < 8 KiB, native --release and wasm32 --release (budgets in diff/gen.py, hard limit 60 s)"
-  python3 -I "$AUDIT_DIR/diff/dos.py" "$C/bombs.tsv" "$BIN/oa_rel" node "$WASM_RT" "$BIN/oa_rel.wasm" -- "$ORACLE"
+  echo "==> dos: $(wc -l < "$C/bombs.tsv" | tr -d ' ') bombs (< 8 KiB; 3 size-amplification bombs < 1 MiB), native --release and wasm32 --release (budgets in diff/gen.py, hard limit 60 s)"
+  python3 -I "$AUDIT_DIR/diff/dos.py" "$C/bombs.tsv" "$BIN/oa_rel" node "$WASM_RT" "$BIN/oa_rel.wasm" -- "$ORACLE" > "$AUDIT_OUT/dos.txt"
   r=$?
+  grep -v '^OPEN-FINDING' "$AUDIT_OUT/dos.txt"
   [ $r = 1 ] && fail "DoS: crash / trap / hang / native-wasm divergence on a bomb"
-  [ $r = 3 ] && open_finding "P2-9: cmap lookups re-walk every encoding record per call (8 KiB font: full sweep > budget)"
+  grep '^OPEN-FINDING' "$AUDIT_OUT/dos.txt" | awk '{print $2}' | sort -u > "$AUDIT_OUT/dos_ids.txt"
+  while read -r id; do
+    case "$id" in
+      P2-9) open_finding "P2-9: cmap / UVS lookup cost grows with the number of encoding records ($(grep "^OPEN-FINDING P2-9" "$AUDIT_OUT/dos.txt" | cut -d' ' -f3- | tr '\n' ';' | sed 's/;$//'))" ;;
+      P2-12) open_finding "P2-12: Face::parse is quadratic in the number of cmap encoding records ($(grep "^OPEN-FINDING P2-12" "$AUDIT_OUT/dos.txt" | cut -d' ' -f3- | tr '\n' ';' | sed 's/;$//'))" ;;
+      *) open_finding "$id: DoS budget ($(grep "^OPEN-FINDING $id" "$AUDIT_OUT/dos.txt" | cut -d' ' -f3-))" ;;
+    esac
+  done < "$AUDIT_OUT/dos_ids.txt"
 }
 
 portability() {

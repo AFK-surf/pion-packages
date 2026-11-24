@@ -934,12 +934,13 @@ def bombs(out):
     rows = []
     sq = simple_glyph(SQUARE)
 
-    def add(name, data, budget, note):
-        assert len(data) < 8192, (name, len(data))
+    def add(name, data, budget, note, mode="stress", finding="-", big=False):
+        # big=True: a size-amplification bomb (cost must stay bounded per byte), allowed up to 1 MiB
+        assert len(data) < (1 << 20 if big else 8192), (name, len(data))
         p = os.path.join(out, "bombs", name + ".ttf")
         with open(p, "wb") as f:
             f.write(data)
-        rows.append((name, p, str(budget), note))
+        rows.append((name, p, str(budget), note, mode, finding))
 
     # 1. diamond DAG 2^20 visits (20 levels, 2 refs each)
     gl = [sq]
@@ -997,8 +998,20 @@ def bombs(out):
     best = fmt12([(0x41, 0x41, 1)])
     other = fmt4({0x42: 2})
     recs = [(3, 10, best)] + [(3, 1, other)] * 900
-    add("cmap_many_records", base_font(cmap_t=cmap(recs)), 3000,
+    add("cmap_many_records", base_font(cmap_t=cmap(recs)), 3000, finding="P2-9", note=
         "901 encoding records, 900 aliasing one format 4 subtable: every miss re-walks all of them")
+    # 16-17. distinct candidate subtables: each encoding record points at itself, so its platformID (0 or 14)
+    # reads as a subtable format (0 = byte table, 14 = UVS). Dedup by offset cannot collapse them: per-lookup
+    # cost must not grow with the record count (HarfBuzz / skrifa pick one subtable per face).
+    for pid, nm, n, mode, budget, fid, note in (
+            (0, "cmap_distinct_records", 8000, "cost", 100, "P2-9",
+             "8,000 distinct format 0 candidates (64 KiB): 20,000 glyph_index + 20,000 UVS lookups"),
+            (14, "uvs_distinct_records", 65535, "cost", 100, "P2-9",
+             "65,535 distinct format 14 candidates (513 KiB): 20,000 glyph_index + 20,000 UVS lookups"),
+            (0, "cmap_records_parse", 65535, "parse", 100, "P2-12",
+             "65,535 distinct encoding records (513 KiB): Face::parse alone")):
+        recs = b"".join(u16(pid) + u16(3) + u32(4 + 8 * i) for i in range(n))
+        add(nm, base_font(cmap_t=u16(0) + u16(n) + recs + b"\0" * 300), budget, note, mode=mode, finding=fid, big=True)
     # 12. fmt4 segCountX2 65534 (truncated)
     add("cmap_fmt4_segcount_max", base_font(cmap_t=cmap([(3, 1, fmt4_segments([(0x41, 0x41, 1, 0)], seg_count_x2=0xFFFE))])), 3000,
         "segCountX2 0xFFFE")
@@ -1234,7 +1247,7 @@ def main():
     fz = fuzz(out, fuzz_n)
     s = system_fonts(out)
     macroman(out)
-    print("%d synthesized cases, %d bombs (< 8 KiB), %d fuzz fonts, %d system font faces" % (len(c.rows), len(b), len(fz), len(s)))
+    print("%d synthesized cases, %d bombs, %d fuzz fonts, %d system font faces" % (len(c.rows), len(b), len(fz), len(s)))
 
 
 if __name__ == "__main__":

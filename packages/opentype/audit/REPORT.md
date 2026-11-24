@@ -3,7 +3,9 @@
 Audited commit: `origin/feat/pkg-opentype @ 8f9e048` (pure Pion OpenType / TrueType SFNT + TTC parser).
 Auditor: RT-opentype (independent, adversarial; nothing outside `packages/opentype/audit/` was changed).
 
-**Result: 0 P0 · 2 P1 · 11 P2.** No crash, wasm trap, hang, out-of-bounds read or nondeterminism was found
+**Result (8f9e048): 0 P0 · 2 P1 · 11 P2.** Re-review of the fix branch `feat/pkg-opentype-fix @ e88e6f09`:
+see the "Re-review" section at the end (**not signed off**: P2-9 only partly
+fixed, new P2-12). No crash, wasm trap, hang, out-of-bounds read or nondeterminism was found
 on any input: every synthesized edge case, 553 system font faces, 20,000 mutated font files plus in-memory
 mutation of real fonts, and 16 DoS bombs ran cleanly and byte-identically in all four build modes.
 The two P1s are silent wrong answers on real-world font structures (lost kerning pairs, wrong glyphs from a
@@ -161,6 +163,14 @@ The benchmark ratios themselves reproduce (0.61-0.65x / 0.73-0.76x measured in t
 documented, same stdout SHA-256), and the wasm32 sizes are within 0.1 % (76,211 / 76,618 B measured vs
 76,279 / 76,686 B, most likely embedded source paths).
 
+### P2-12 `Face::parse` is quadratic in the number of `cmap` encoding records (introduced by the P2-9 fix)
+
+Found while re-reviewing `e88e6f09`, not present in 8f9e048 (whose parse is lazy). `cmap_parse_subtables`
+de-duplicates every encoding record against every subtable kept so far (O(n²) over up to 65,535 records) and
+keeps all of them. A 513 KiB font whose 65,535 records each point at themselves (platformID 0 or 14 reads as
+format 0 or 14) makes `Face::parse` take 0.7-1 s native (`bombs/cmap_records_parse`, budget 100 ms; 8f9e048:
+0 ms). Gate: `dos` section. Fix: bound the kept list (see P2-9) so de-duplication is O(n).
+
 ### P2-11 Symbol (3,0) fonts: no U+F000 remap
 
 For a Windows Symbol `cmap` (Wingdings, Webdings and Symbol on this machine) pion maps only U+F020..U+F0FF;
@@ -216,3 +226,37 @@ Each rule is in `diff/compare.py` and is applied only when the other oracle agre
   and per-font queries (kern pairs, UVS, variation coordinates read from each font).
 * `diff/oracle/`: ttf-parser 0.25.1 + skrifa 0.44.0 oracle (`Cargo.lock` committed, built `--locked`).
 * `diff/compare.py`, `diff/dos.py`, `diff/claims.py`: attribution, DoS gate, README claim checks.
+
+## Re-review: `feat/pkg-opentype-fix @ e88e6f09`
+
+Base: `41e8570` (this audit, unchanged: `git diff 41e8570..e88e6f09 -- packages/opentype/audit/` is empty).
+7 files changed, all under `packages/opentype/` (README, `bench/rust_bench`, `src/{cmap,face,glyf,kern_var}`,
+33 tests); no repository root file, no font binary.
+
+Independent run of the 41e8570 gate on e88e6f09: `STRICT=1 sh packages/opentype/audit/run_audit.sh` ->
+**EXIT=0, 0 OPEN** (16/16 cases in 4 modes, 33/33 package tests, 0 unexplained divergences on 152 synthesized
+fonts and 553 system faces, P2-2 43/252 -> 0/252, 20,000 + 1,600 fuzz inputs clean, 5/5 injections caught).
+
+Every changed function was then read line by line, with these extra probes against the fixed code:
+
+| Finding | Verdict on e88e6f09 |
+| --- | --- |
+| P1-1 kern | fixed: the last OpenType subtable is read to the end of the table (HarfBuzz / read-fonts rule) |
+| P1-2 Mac Roman | fixed: (1,0) is no longer a `glyph_index` candidate |
+| P2-1 OOB record | fixed: invalid records are skipped; `head`/`maxp` still required |
+| P2-2 normalization | fixed: 16.16 `fixed_div` / `fixed_mul_div`, skrifa-compatible `avar` mapping, `(v + 2) >> 2`; NaN / ±inf / ±1e300 inputs give the same clamped results in all 4 modes (no wasm trap) |
+| P2-3, P2-4, P2-8, P2-11 | fixed as specified |
+| P2-5 composites | fixed: points are collected per glyph, child transform then point-matching / scaled offset (FreeType's `hypot` scaling), out-of-range point numbers fall back to offset 0; total work stays bounded by `max_glyph_points` x depth |
+| P2-6 rollback, P2-7 copy | fixed |
+| P2-10 docs | fixed (whole-file MB/s column removed, oracle caps stated, 33 tests incl. ported ttf-parser vectors) |
+| **P2-9 lookup cost** | **partly fixed**: aliasing records are de-duplicated, but every *distinct* candidate subtable is still kept and tried on every miss. `bombs/cmap_distinct_records` (64 KiB, 8,000 self-referencing records): 20,000 + 20,000 lookups take 0.40-0.56 s (~21 µs per `glyph_index`, a full code-point sweep ~24 s); `bombs/uvs_distinct_records` (65,535 format 14 candidates, 513 KiB): 5.0-5.5 s (~250 µs per UVS lookup). 8f9e048 takes 1.9-2.1 s / 14-18 s on the same inputs, so this is an improvement, not a regression. Budget 100 ms per 40,000 lookups. |
+| **P2-12 parse cost (new)** | **open**: O(n²) de-duplication in `Face::parse`: 0.69-0.97 s for `bombs/cmap_records_parse` (513 KiB; 8f9e048: 0 ms) |
+
+Suggested fix for both: keep the best subtable plus at most a small constant number of distinct fallbacks
+(e.g. the best per encoding class: Unicode full, Unicode BMP, Symbol), and at most one format 14 subtable (the
+spec allows exactly one). With a bounded list the de-duplication is O(n) and every lookup costs O(1) subtables,
+as in HarfBuzz and skrifa.
+
+Gate update (this commit): `dos` now also runs the three size-amplification bombs above (< 1 MiB, budgets
+100 ms); on e88e6f09 `STRICT=1` exits 1 with `OPEN: P2-9` and `OPEN: P2-12`, on 8f9e048 the same bombs report
+P2-9 (P2-12 does not exist there). **Not signed off** until both are closed; everything else is verified.
