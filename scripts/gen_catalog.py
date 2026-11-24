@@ -72,6 +72,8 @@ PACKAGE_META = {
             ["csp", "content-security-policy", "cors", "origin", "nonce", "preflight", "安全策略"]),
     "css": ("markup-docs", "CSS Syntax 3 tokenizer/parser, Selectors 4 specificity, Media Queries 4 and CSS Color 4",
             ["css", "stylesheet", "selector", "specificity", "media-query", "color", "oklch", "样式"]),
+    "css_color": ("media-graphics", "W3C CSS Color 4 & 5 parser, 15 spaces (oklch/display-p3), color-mix(), relative from & gamut mapping",
+                  ["css", "color", "oklch", "oklab", "display-p3", "color-mix", "gamut", "wcag", "srgb", "色彩"]),
     "csv": ("data-formats", "Streaming RFC 4180 CSV reader/writer with flexible dialects and DoS limits",
             ["csv", "tsv", "rfc4180", "table", "delimiter", "streaming", "表格"]),
     "decimal": ("core-utils", "128-bit exact decimal arithmetic with 7 rounding modes, rust_decimal compatible serialization",
