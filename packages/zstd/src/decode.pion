@@ -146,15 +146,51 @@ fn OutBuf::write_repeat(
   Ok(())
 }
 
-///| Per-frame persistent decoder state (tables and repeat offsets).
+///|
+fn OutBuf::write_fixed_slice(
+  self : OutBuf,
+  src : FixedArray[Byte],
+  start : Int,
+  count : Int,
+) -> Result[Unit, ZstdError] {
+  if count == 0 {
+    return Ok(())
+  }
+  match self.ensure(count) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let dst = self.buf
+  let mut dp = self.len
+  let mut sp = start
+  let end = start + count
+  while sp + 4 <= end {
+    dst[dp] = src[sp]
+    dst[dp + 1] = src[sp + 1]
+    dst[dp + 2] = src[sp + 2]
+    dst[dp + 3] = src[sp + 3]
+    dp = dp + 4
+    sp = sp + 4
+  }
+  while sp < end {
+    dst[dp] = src[sp]
+    dp = dp + 1
+    sp = sp + 1
+  }
+  self.len = dp
+  Ok(())
+}
+
+///| Per-frame persistent decoder state (tables, repeat offsets, reusable literals scratch).
 struct FrameState {
   mut rep1 : Int
   mut rep2 : Int
   mut rep3 : Int
   mut prev_huff : Option[HuffTable]
-  mut prev_ll : Option[FseTable]
+  mut prev_ll : Option[SeqFseTable]
   mut prev_of : Option[FseTable]
-  mut prev_ml : Option[FseTable]
+  mut prev_ml : Option[SeqFseTable]
+  mut lit_scratch : FixedArray[Byte]
 }
 
 ///|
@@ -167,7 +203,393 @@ fn FrameState::new() -> FrameState {
     prev_ll: None,
     prev_of: None,
     prev_ml: None,
+    lit_scratch: FixedArray::make(0, (0).to_byte()),
   }
+}
+
+///| Cold helper for overlapping/RLE matches with `offset < 8`.
+fn copy_match_small_offset(
+  dst : Bytes,
+  init_dp : Int,
+  offset : Int,
+  end_dp : Int,
+) -> Unit {
+  let mut dp = init_dp
+  if offset == 1 {
+    let b = dst[dp - 1]
+    while dp + 4 <= end_dp {
+      dst[dp] = b
+      dst[dp + 1] = b
+      dst[dp + 2] = b
+      dst[dp + 3] = b
+      dp = dp + 4
+    }
+    while dp < end_dp {
+      dst[dp] = b
+      dp = dp + 1
+    }
+  } else if offset >= 4 {
+    let mut sp = dp - offset
+    while dp + 4 <= end_dp {
+      dst[dp] = dst[sp]
+      dst[dp + 1] = dst[sp + 1]
+      dst[dp + 2] = dst[sp + 2]
+      dst[dp + 3] = dst[sp + 3]
+      dp = dp + 4
+      sp = sp + 4
+    }
+    while dp < end_dp {
+      dst[dp] = dst[sp]
+      dp = dp + 1
+      sp = sp + 1
+    }
+  } else if offset == 2 {
+    let b0 = dst[dp - 2]
+    let b1 = dst[dp - 1]
+    while dp + 4 <= end_dp {
+      dst[dp] = b0
+      dst[dp + 1] = b1
+      dst[dp + 2] = b0
+      dst[dp + 3] = b1
+      dp = dp + 4
+    }
+    while dp < end_dp {
+      dst[dp] = dst[dp - 2]
+      dp = dp + 1
+    }
+  } else {
+    let mut sp = dp - offset
+    while dp < end_dp {
+      dst[dp] = dst[sp]
+      dp = dp + 1
+      sp = sp + 1
+    }
+  }
+}
+
+///| Execute `num_seq` Zstandard sequences directly into pre-reserved `dst`.
+///| Returns new `dp >= 0` on success, or negative error code (`-1..-9`) on failure
+///| to keep `Result`/`ZstdError` heap allocations completely out of the hot loop.
+fn decode_sequences_loop(
+  data : Bytes,
+  pos : Int,
+  block_end : Int,
+  num_seq : Int,
+  lits : FixedArray[Byte],
+  lit_len : Int,
+  block_max : Int,
+  block_out_cap : Int,
+  window_size : Int64,
+  frame_start_out : Int,
+  state : FrameState,
+  out : OutBuf,
+  dst : Bytes,
+  block_out_start : Int,
+  ll_tbl : SeqFseTable,
+  of_tbl : FseTable,
+  ml_tbl : SeqFseTable,
+) -> Int {
+  if block_end <= pos || pos < 0 || block_end > data.length() {
+    return -1
+  }
+  let last_byte = data[block_end - 1].to_int()
+  if last_byte == 0 {
+    return -2
+  }
+  let init_hb = high_bit(last_byte)
+  let mut byte_pos = block_end - 1
+  let mut bit_buf : UInt64 = (last_byte & ((1 << init_hb) - 1)).to_int64().to_uint64()
+  let mut bits_avail = init_hb
+  while bits_avail <= 56 && byte_pos > pos {
+    byte_pos = byte_pos - 1
+    bit_buf = (bit_buf << 8) | data[byte_pos].to_int().to_int64().to_uint64()
+    bits_avail = bits_avail + 8
+  }
+
+  let ll_alog = ll_tbl.accuracy_log
+  let of_alog = of_tbl.accuracy_log
+  let ml_alog = ml_tbl.accuracy_log
+  if bits_avail < ll_alog + of_alog + ml_alog {
+    return -3
+  }
+  bits_avail = bits_avail - ll_alog
+  let mut st_ll = ((bit_buf >> bits_avail) & ((1UL << ll_alog) - 1UL)).to_int()
+  bits_avail = bits_avail - of_alog
+  let mut st_of = ((bit_buf >> bits_avail) & ((1UL << of_alog) - 1UL)).to_int()
+  bits_avail = bits_avail - ml_alog
+  let mut st_ml = ((bit_buf >> bits_avail) & ((1UL << ml_alog) - 1UL)).to_int()
+
+  let mut dp = block_out_start
+
+  let ll_entries = ll_tbl.entries
+  let of_entries = of_tbl.entries
+  let ml_entries = ml_tbl.entries
+  let mut lit_pos = 0
+  let mut rep1 = state.rep1
+  let mut rep2 = state.rep2
+  let mut rep3 = state.rep3
+  let mut seq_i = 0
+
+  while seq_i < num_seq {
+    let e_of = of_entries[st_of]
+    let e_ml = ml_entries[st_ml]
+    let e_ll = ll_entries[st_ll]
+    let of_code = e_of & 255
+
+    // Sequential 4-byte fast refill
+    if bits_avail <= 32 && byte_pos >= pos + 4 {
+      byte_pos = byte_pos - 4
+      bit_buf = (bit_buf << 8) |
+      data[byte_pos + 3].to_int().to_int64().to_uint64()
+      bit_buf = (bit_buf << 8) |
+      data[byte_pos + 2].to_int().to_int64().to_uint64()
+      bit_buf = (bit_buf << 8) |
+      data[byte_pos + 1].to_int().to_int64().to_uint64()
+      bit_buf = (bit_buf << 8) | data[byte_pos].to_int().to_int64().to_uint64()
+      bits_avail = bits_avail + 32
+    }
+
+    // Read extra bits: OF, then ML, then LL
+    let of_extra = if of_code == 0 {
+      0
+    } else {
+      if bits_avail < of_code {
+        while bits_avail <= 56 && byte_pos > pos {
+          byte_pos = byte_pos - 1
+          bit_buf = (bit_buf << 8) |
+          data[byte_pos].to_int().to_int64().to_uint64()
+          bits_avail = bits_avail + 8
+        }
+        if bits_avail < of_code {
+          return -3
+        }
+      }
+      bits_avail = bits_avail - of_code
+      ((bit_buf >> bits_avail) & ((1UL << of_code) - 1UL)).to_int()
+    }
+
+    let ml_nb = ((e_ml >> 17) & 31L).to_int()
+    let ll_nb = ((e_ll >> 17) & 31L).to_int()
+    let mut match_len = (e_ml & 0x1FFFFL).to_int()
+    let mut lit_count = (e_ll & 0x1FFFFL).to_int()
+    let extra_ml_ll = ml_nb + ll_nb
+    if extra_ml_ll > 0 {
+      if bits_avail < extra_ml_ll {
+        while bits_avail <= 56 && byte_pos > pos {
+          byte_pos = byte_pos - 1
+          bit_buf = (bit_buf << 8) |
+          data[byte_pos].to_int().to_int64().to_uint64()
+          bits_avail = bits_avail + 8
+        }
+        if bits_avail < extra_ml_ll {
+          return -3
+        }
+      }
+      if ml_nb > 0 {
+        bits_avail = bits_avail - ml_nb
+        match_len = match_len +
+        ((bit_buf >> bits_avail) & ((1UL << ml_nb) - 1UL)).to_int()
+      }
+      if ll_nb > 0 {
+        bits_avail = bits_avail - ll_nb
+        lit_count = lit_count +
+        ((bit_buf >> bits_avail) & ((1UL << ll_nb) - 1UL)).to_int()
+      }
+    }
+
+    // Update FSE states if not the last sequence: LL, then ML, then OF
+    if seq_i + 1 < num_seq {
+      let ll_fse_nb = ((e_ll >> 22) & 15L).to_int()
+      let ml_fse_nb = ((e_ml >> 22) & 15L).to_int()
+      let of_fse_nb = (e_of >> 8) & 255
+      let tot_fse = ll_fse_nb + ml_fse_nb + of_fse_nb
+      if bits_avail < tot_fse {
+        while bits_avail <= 56 && byte_pos > pos {
+          byte_pos = byte_pos - 1
+          bit_buf = (bit_buf << 8) |
+          data[byte_pos].to_int().to_int64().to_uint64()
+          bits_avail = bits_avail + 8
+        }
+        if bits_avail < tot_fse {
+          return -3
+        }
+      }
+      bits_avail = bits_avail - ll_fse_nb
+      st_ll = (e_ll >> 26).to_int() +
+      ((bit_buf >> bits_avail) & ((1UL << ll_fse_nb) - 1UL)).to_int()
+      bits_avail = bits_avail - ml_fse_nb
+      st_ml = (e_ml >> 26).to_int() +
+      ((bit_buf >> bits_avail) & ((1UL << ml_fse_nb) - 1UL)).to_int()
+      bits_avail = bits_avail - of_fse_nb
+      st_of = (e_of >> 16) +
+      ((bit_buf >> bits_avail) & ((1UL << of_fse_nb) - 1UL)).to_int()
+    }
+
+    // Resolve actual offset using repeat offsets (32-bit Int fast path for of_code 2..30)
+    let offset : Int = if of_code >= 2 {
+      let off = if of_code <= 30 {
+        ((1 << of_code) + of_extra) - 3
+      } else {
+        let off64 = ((1L << of_code) + of_extra.to_int64()) - 3L
+        if off64 > window_size || off64 > max_container_bytes.to_int64() {
+          return -4
+        }
+        off64.to_int()
+      }
+      rep3 = rep2
+      rep2 = rep1
+      rep1 = off
+      off
+    } else {
+      let ov = (1 << of_code) + of_extra
+      if lit_count == 0 {
+        if ov == 1 {
+          let off = rep2
+          rep2 = rep1
+          rep1 = off
+          off
+        } else if ov == 2 {
+          let off = rep3
+          rep3 = rep2
+          rep2 = rep1
+          rep1 = off
+          off
+        } else {
+          let off = rep1 - 1
+          if off <= 0 {
+            return -5
+          }
+          rep3 = rep2
+          rep2 = rep1
+          rep1 = off
+          off
+        }
+      } else if ov == 1 {
+        rep1
+      } else if ov == 2 {
+        let off = rep2
+        rep2 = rep1
+        rep1 = off
+        off
+      } else {
+        let off = rep3
+        rep3 = rep2
+        rep2 = rep1
+        rep1 = off
+        off
+      }
+    }
+
+    // Validate literal bounds & block size (overflow-safe)
+    if lit_pos + lit_count > lit_len {
+      return -6
+    }
+    let produced_before = dp - block_out_start
+    if produced_before + lit_count + match_len > block_max {
+      return -7
+    }
+
+    // Copy literals directly into dst
+    if lit_count > 0 {
+      if produced_before + lit_count > block_out_cap {
+        return -8
+      }
+      let mut sp = lit_pos
+      let end_sp = lit_pos + lit_count
+      while sp + 4 <= end_sp {
+        dst[dp] = lits[sp]
+        dst[dp + 1] = lits[sp + 1]
+        dst[dp + 2] = lits[sp + 2]
+        dst[dp + 3] = lits[sp + 3]
+        dp = dp + 4
+        sp = sp + 4
+      }
+      while sp < end_sp {
+        dst[dp] = lits[sp]
+        dp = dp + 1
+        sp = sp + 1
+      }
+      lit_pos = end_sp
+    }
+
+    // Validate and copy match
+    let frame_written = dp - frame_start_out
+    if offset <= 0 || offset > frame_written || offset.to_int64() > window_size {
+      return -4
+    }
+    if (dp - block_out_start) + match_len > block_out_cap {
+      return -8
+    }
+    let end_dp = dp + match_len
+    if offset >= 8 {
+      let mut sp = dp - offset
+      while dp + 8 <= end_dp {
+        dst[dp] = dst[sp]
+        dst[dp + 1] = dst[sp + 1]
+        dst[dp + 2] = dst[sp + 2]
+        dst[dp + 3] = dst[sp + 3]
+        dst[dp + 4] = dst[sp + 4]
+        dst[dp + 5] = dst[sp + 5]
+        dst[dp + 6] = dst[sp + 6]
+        dst[dp + 7] = dst[sp + 7]
+        dp = dp + 8
+        sp = sp + 8
+      }
+      while dp < end_dp {
+        dst[dp] = dst[sp]
+        dp = dp + 1
+        sp = sp + 1
+      }
+    } else {
+      copy_match_small_offset(dst, dp, offset, end_dp)
+      dp = end_dp
+    }
+
+    seq_i = seq_i + 1
+  }
+
+  // Verify sequence bitstream cleanly exhausted
+  let br = BackBitReader::{
+    data: data,
+    start: pos,
+    byte_pos: byte_pos,
+    bit_buf: bit_buf,
+    bits_avail: bits_avail,
+  }
+  if br.bits_avail != 0 || br.byte_pos != pos {
+    return -9
+  }
+
+  // Append remaining trailing literals
+  let rem_lits = lit_len - lit_pos
+  if rem_lits > 0 {
+    let produced_after = (dp - block_out_start) + rem_lits
+    if produced_after > block_max {
+      return -7
+    }
+    if produced_after > block_out_cap {
+      return -8
+    }
+    let mut sp = lit_pos
+    while sp + 4 <= lit_len {
+      dst[dp] = lits[sp]
+      dst[dp + 1] = lits[sp + 1]
+      dst[dp + 2] = lits[sp + 2]
+      dst[dp + 3] = lits[sp + 3]
+      dp = dp + 4
+      sp = sp + 4
+    }
+    while sp < lit_len {
+      dst[dp] = lits[sp]
+      dp = dp + 1
+      sp = sp + 1
+    }
+  }
+
+  state.rep1 = rep1
+  state.rep2 = rep2
+  state.rep3 = rep3
+  dp
 }
 
 ///| Decode a single `Compressed_Block` at `data[block_start..block_end]`.
@@ -184,9 +606,9 @@ fn decode_compressed_block(
   ll_bits : FixedArray[Int],
   ml_base : FixedArray[Int],
   ml_bits : FixedArray[Int],
-  predef_ll : FseTable,
+  predef_ll : SeqFseTable,
   predef_of : FseTable,
-  predef_ml : FseTable,
+  predef_ml : SeqFseTable,
 ) -> Result[Unit, ZstdError] {
   if block_start >= block_end {
     return Err(ZstdError::UnexpectedEof("empty compressed block"))
@@ -199,7 +621,7 @@ fn decode_compressed_block(
   let lit_type = b0 & 3
   let size_fmt = (b0 >> 2) & 3
 
-  let mut lits = Bytes::new(0)
+  let mut raw_lit_base = -1
   let mut lit_len = 0
 
   if lit_type == 0 || lit_type == 1 {
@@ -232,7 +654,7 @@ fn decode_compressed_block(
       if pos + regen_size > block_end {
         return Err(ZstdError::UnexpectedEof("truncated raw literals"))
       }
-      lits = data.slice(pos, pos + regen_size)
+      raw_lit_base = pos
       lit_len = regen_size
       pos = pos + regen_size
     } else {
@@ -241,13 +663,15 @@ fn decode_compressed_block(
       }
       let b = data[pos]
       pos = pos + 1
-      let buf = Bytes::new(regen_size)
+      if state.lit_scratch.length() < regen_size {
+        state.lit_scratch = FixedArray::make(regen_size, (0).to_byte())
+      }
+      let buf = state.lit_scratch
       let mut i = 0
       while i < regen_size {
         buf[i] = b
         i = i + 1
       }
-      lits = buf
       lit_len = regen_size
     }
   } else {
@@ -323,10 +747,20 @@ fn decode_compressed_block(
         )
       }
     }
+    if state.lit_scratch.length() < regen_size {
+      state.lit_scratch = FixedArray::make(regen_size, (0).to_byte())
+    }
     match
-    huff_decode_literals(huff_tbl, data, pos, lit_end, regen_size, four_streams) {
-      Ok(dec) => {
-        lits = dec
+    huff_decode_literals(
+      huff_tbl,
+      data,
+      pos,
+      lit_end,
+      state.lit_scratch,
+      regen_size,
+      four_streams,
+    ) {
+      Ok(_) => {
         lit_len = regen_size
         pos = lit_end
       }
@@ -369,7 +803,11 @@ fn decode_compressed_block(
         ),
       )
     }
-    return out.write_slice(lits, 0, lit_len)
+    if raw_lit_base >= 0 {
+      return out.write_slice(data, raw_lit_base, lit_len)
+    } else {
+      return out.write_fixed_slice(state.lit_scratch, 0, lit_len)
+    }
   }
 
   if pos >= block_end {
@@ -399,13 +837,14 @@ fn decode_compressed_block(
     if sym > 35 {
       return Err(ZstdError::InvalidSequences("RLE LL symbol > 35"))
     }
-    let t = fse_build_rle_table(sym)
+    let t = fse_build_rle_seq_table(sym, ll_base, ll_bits)
     state.prev_ll = Some(t)
     t
   } else if ll_mode == 2 {
     match fse_read_distribution(data, pos, block_end, 35, 9) {
-      Ok((t, np)) => {
+      Ok((raw_t, np)) => {
         pos = np
+        let t = fse_bake_seq_table(raw_t, ll_base, ll_bits)
         state.prev_ll = Some(t)
         t
       }
@@ -469,13 +908,14 @@ fn decode_compressed_block(
     if sym > 52 {
       return Err(ZstdError::InvalidSequences("RLE ML symbol > 52"))
     }
-    let t = fse_build_rle_table(sym)
+    let t = fse_build_rle_seq_table(sym, ml_base, ml_bits)
     state.prev_ml = Some(t)
     t
   } else if ml_mode == 2 {
     match fse_read_distribution(data, pos, block_end, 52, 9) {
-      Ok((t, np)) => {
+      Ok((raw_t, np)) => {
         pos = np
+        let t = fse_bake_seq_table(raw_t, ml_base, ml_bits)
         state.prev_ml = Some(t)
         t
       }
@@ -492,236 +932,68 @@ fn decode_compressed_block(
   }
 
   // ---- 3. Execute Sequences (RFC 8878 §3.1.1.4) ----
-  let br = match BackBitReader::init(data, pos, block_end) {
-    Ok(r) => r
+  if raw_lit_base >= 0 && lit_len > 0 {
+    if state.lit_scratch.length() < lit_len {
+      state.lit_scratch = FixedArray::make(lit_len, (0).to_byte())
+    }
+    let lb = state.lit_scratch
+    let mut k = 0
+    while k < lit_len {
+      lb[k] = data[raw_lit_base + k]
+      k = k + 1
+    }
+  }
+  let rem_out_budget = out.max_output - block_out_start
+  let block_out_cap = if block_max < rem_out_budget {
+    block_max
+  } else {
+    rem_out_budget
+  }
+  match out.ensure(block_out_cap) {
+    Ok(_) => ()
     Err(e) => return Err(e)
   }
-
-  let mut st_ll = match br.read_bits(ll_tbl.accuracy_log) {
-    Ok(v) => v
-    Err(e) => return Err(e)
+  let res_dp = decode_sequences_loop(
+    data,
+    pos,
+    block_end,
+    num_seq,
+    state.lit_scratch,
+    lit_len,
+    block_max,
+    block_out_cap,
+    window_size,
+    frame_start_out,
+    state,
+    out,
+    out.buf,
+    block_out_start,
+    ll_tbl,
+    of_tbl,
+    ml_tbl,
+  )
+  if res_dp >= 0 {
+    out.len = res_dp
+    Ok(())
+  } else if res_dp == -1 {
+    Err(ZstdError::InvalidBitstream("empty backward bitstream"))
+  } else if res_dp == -2 {
+    Err(ZstdError::InvalidBitstream("missing sentinel 1-bit"))
+  } else if res_dp == -3 {
+    Err(ZstdError::InvalidBitstream("backward bitstream underflow"))
+  } else if res_dp == -4 {
+    Err(ZstdError::InvalidOffset("match offset out of frame/window bounds"))
+  } else if res_dp == -5 {
+    Err(ZstdError::InvalidOffset("rep1 - 1 <= 0"))
+  } else if res_dp == -6 {
+    Err(ZstdError::InvalidSequences("sequence literal length overrun"))
+  } else if res_dp == -7 {
+    Err(ZstdError::InvalidSequences("block decompressed size exceeds block_max"))
+  } else if res_dp == -8 {
+    Err(ZstdError::LimitExceeded("decompressed output exceeded max_output_bytes"))
+  } else {
+    Err(ZstdError::InvalidBitstream("sequence bitstream did not exhaust cleanly"))
   }
-  let mut st_of = match br.read_bits(of_tbl.accuracy_log) {
-    Ok(v) => v
-    Err(e) => return Err(e)
-  }
-  let mut st_ml = match br.read_bits(ml_tbl.accuracy_log) {
-    Ok(v) => v
-    Err(e) => return Err(e)
-  }
-
-  let mut lit_pos = 0
-  let mut rep1 = state.rep1
-  let mut rep2 = state.rep2
-  let mut rep3 = state.rep3
-  let mut seq_i = 0
-
-  while seq_i < num_seq {
-    let of_code = of_tbl.sym[st_of]
-    let ml_code = ml_tbl.sym[st_ml]
-    let ll_code = ll_tbl.sym[st_ll]
-
-    if of_code > 31 || ml_code > 52 || ll_code > 35 {
-      return Err(ZstdError::InvalidSequences("decoded sequence code out of range"))
-    }
-
-    // Read extra bits: OF, then ML, then LL
-    let of_extra = match br.read_bits(of_code) {
-      Ok(v) => v
-      Err(e) => return Err(e)
-    }
-    let of_val : Int64 = (1L << of_code) + of_extra.to_int64()
-
-    let ml_nb = ml_bits[ml_code]
-    let ml_extra = match br.read_bits(ml_nb) {
-      Ok(v) => v
-      Err(e) => return Err(e)
-    }
-    let match_len = ml_base[ml_code] + ml_extra
-
-    let ll_nb = ll_bits[ll_code]
-    let ll_extra = match br.read_bits(ll_nb) {
-      Ok(v) => v
-      Err(e) => return Err(e)
-    }
-    let lit_count = ll_base[ll_code] + ll_extra
-
-    // Update FSE states if not the last sequence: LL, then ML, then OF
-    if seq_i + 1 < num_seq {
-      let b_ll = match br.read_bits(ll_tbl.nb_bits[st_ll]) {
-        Ok(v) => v
-        Err(e) => return Err(e)
-      }
-      st_ll = ll_tbl.baseline[st_ll] + b_ll
-
-      let b_ml = match br.read_bits(ml_tbl.nb_bits[st_ml]) {
-        Ok(v) => v
-        Err(e) => return Err(e)
-      }
-      st_ml = ml_tbl.baseline[st_ml] + b_ml
-
-      let b_of = match br.read_bits(of_tbl.nb_bits[st_of]) {
-        Ok(v) => v
-        Err(e) => return Err(e)
-      }
-      st_of = of_tbl.baseline[st_of] + b_of
-    }
-
-    // Resolve actual offset using repeat offsets
-    let offset : Int = if of_val > 3L {
-      let off64 = of_val - 3L
-      if off64 > window_size || off64 > max_container_bytes.to_int64() {
-        return Err(ZstdError::InvalidOffset("offset exceeds window_size"))
-      }
-      let off = off64.to_int()
-      rep3 = rep2
-      rep2 = rep1
-      rep1 = off
-      off
-    } else {
-      let ov = of_val.to_int()
-      if lit_count == 0 {
-        if ov == 1 {
-          let off = rep2
-          rep2 = rep1
-          rep1 = off
-          off
-        } else if ov == 2 {
-          let off = rep3
-          rep3 = rep2
-          rep2 = rep1
-          rep1 = off
-          off
-        } else {
-          let off = rep1 - 1
-          if off <= 0 {
-            return Err(ZstdError::InvalidOffset("rep1 - 1 <= 0"))
-          }
-          rep3 = rep2
-          rep2 = rep1
-          rep1 = off
-          off
-        }
-      } else if ov == 1 {
-        rep1
-      } else if ov == 2 {
-        let off = rep2
-        rep2 = rep1
-        rep1 = off
-        off
-      } else {
-        let off = rep3
-        rep3 = rep2
-        rep2 = rep1
-        rep1 = off
-        off
-      }
-    }
-
-    // Copy literals
-    if lit_pos + lit_count > lit_len {
-      return Err(ZstdError::InvalidSequences("sequence literal length overrun"))
-    }
-    let block_produced = (out.len - block_out_start).to_int64() +
-    lit_count.to_int64() + match_len.to_int64()
-    if block_produced > block_max.to_int64() {
-      return Err(
-        ZstdError::InvalidSequences("block decompressed size exceeds block_max"),
-      )
-    }
-
-    if lit_count > 0 {
-      match out.write_slice(lits, lit_pos, lit_count) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
-      }
-      lit_pos = lit_pos + lit_count
-    }
-
-    // Validate and copy match
-    let frame_written = out.len - frame_start_out
-    if offset <= 0 || offset > frame_written || offset.to_int64() > window_size {
-      return Err(
-        ZstdError::InvalidOffset("match offset out of frame/window bounds"),
-      )
-    }
-    match out.ensure(match_len) {
-      Ok(_) => ()
-      Err(e) => return Err(e)
-    }
-    let dst = out.buf
-    let mut dp = out.len
-    let end_dp = dp + match_len
-    if offset == 1 {
-      let b = dst[dp - 1]
-      while dp + 4 <= end_dp {
-        dst[dp] = b
-        dst[dp + 1] = b
-        dst[dp + 2] = b
-        dst[dp + 3] = b
-        dp = dp + 4
-      }
-      while dp < end_dp {
-        dst[dp] = b
-        dp = dp + 1
-      }
-    } else if offset >= match_len {
-      let mut sp = dp - offset
-      while dp + 4 <= end_dp {
-        dst[dp] = dst[sp]
-        dst[dp + 1] = dst[sp + 1]
-        dst[dp + 2] = dst[sp + 2]
-        dst[dp + 3] = dst[sp + 3]
-        dp = dp + 4
-        sp = sp + 4
-      }
-      while dp < end_dp {
-        dst[dp] = dst[sp]
-        dp = dp + 1
-        sp = sp + 1
-      }
-    } else {
-      let mut sp = dp - offset
-      while dp < end_dp {
-        dst[dp] = dst[sp]
-        dp = dp + 1
-        sp = sp + 1
-      }
-    }
-    out.len = end_dp
-
-    seq_i = seq_i + 1
-  }
-
-  // Verify sequence bitstream cleanly exhausted
-  if br.bits_avail != 0 || br.byte_pos != pos {
-    return Err(
-      ZstdError::InvalidBitstream("sequence bitstream did not exhaust cleanly"),
-    )
-  }
-
-  // Append remaining trailing literals
-  let rem_lits = lit_len - lit_pos
-  if rem_lits > 0 {
-    let block_produced = (out.len - block_out_start).to_int64() +
-    rem_lits.to_int64()
-    if block_produced > block_max.to_int64() {
-      return Err(
-        ZstdError::InvalidSequences(
-          "trailing literals exceed block_max",
-        ),
-      )
-    }
-    match out.write_slice(lits, lit_pos, rem_lits) {
-      Ok(_) => ()
-      Err(e) => return Err(e)
-    }
-  }
-
-  state.rep1 = rep1
-  state.rep2 = rep2
-  state.rep3 = rep3
-  Ok(())
 }
 
 ///| Decompress a Zstandard stream enforcing `limits`.
@@ -755,7 +1027,7 @@ pub fn decompress_with_limits(
   let ml_base = build_ml_base()
   let ml_bits = build_ml_bits()
   let predef_ll = match fse_build_table(build_predef_ll_norm(), 35, 6) {
-    Ok(t) => t
+    Ok(t) => fse_bake_seq_table(t, ll_base, ll_bits)
     Err(e) => return Err(e)
   }
   let predef_of = match fse_build_table(build_predef_of_norm(), 28, 5) {
@@ -763,7 +1035,7 @@ pub fn decompress_with_limits(
     Err(e) => return Err(e)
   }
   let predef_ml = match fse_build_table(build_predef_ml_norm(), 52, 6) {
-    Ok(t) => t
+    Ok(t) => fse_bake_seq_table(t, ml_base, ml_bits)
     Err(e) => return Err(e)
   }
 

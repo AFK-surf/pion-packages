@@ -1,26 +1,23 @@
 ///| RFC 8878 §4.2 Huffman table decoding (FSE-compressed and Direct 4-bit weights),
 ///| 1-stream and 4-stream backward bitstream literal decoding, and Huffman literal encoding.
 
-///| Flat canonical Huffman decode table (size = `1 << max_bits`, `max_bits <= 11`).
+///| Flat canonical Huffman decode table (`entries` has length `1 << max_bits`, `max_bits <= 11`).
+///| Each entry packs `sym | (nb_bits << 8)`.
 struct HuffTable {
-  sym : FixedArray[Int]
-  nb_bits : FixedArray[Int]
+  entries : FixedArray[Int]
   max_bits : Int
 }
 
 ///| Fill `span` consecutive entries in a canonical Huffman decode table.
 fn fill_huff_span(
-  table_sym : FixedArray[Int],
-  table_nb : FixedArray[Int],
+  table_entries : FixedArray[Int],
   idx : Int,
   span : Int,
-  sym : Int,
-  nb : Int,
+  entry : Int,
 ) -> Unit {
   let mut k = 0
   while k < span {
-    table_sym[idx + k] = sym
-    table_nb[idx + k] = nb
+    table_entries[idx + k] = entry
     k = k + 1
   }
 }
@@ -32,19 +29,19 @@ fn fill_huff_weight(
   w : Int,
   nb : Int,
   span : Int,
-  table_sym : FixedArray[Int],
-  table_nb : FixedArray[Int],
+  table_entries : FixedArray[Int],
   start_idx : Int,
   total : Int,
 ) -> Result[Int, ZstdError] {
   let mut idx = start_idx
   let mut s = 0
+  let nb_shifted = nb << 8
   while s < total_syms {
     if all_w[s] == w {
       if idx + span > total {
         return Err(ZstdError::InvalidHuffmanTable("table overflow"))
       }
-      fill_huff_span(table_sym, table_nb, idx, span, s, nb)
+      fill_huff_span(table_entries, idx, span, s | nb_shifted)
       idx = idx + span
     }
     s = s + 1
@@ -124,8 +121,7 @@ fn huff_build_table_from_weights(
   }
   all_w[num_weights] = last_weight
 
-  let table_sym : FixedArray[Int] = FixedArray::make(total, 0)
-  let table_nb : FixedArray[Int] = FixedArray::make(total, 0)
+  let table_entries : FixedArray[Int] = FixedArray::make(total, 0)
   let mut idx = 0
   let mut w = 1
   while w <= max_bits {
@@ -133,7 +129,7 @@ fn huff_build_table_from_weights(
     let span = 1 << (w - 1)
     idx = match
     fill_huff_weight(
-      all_w, total_syms, w, nb, span, table_sym, table_nb, idx, total,
+      all_w, total_syms, w, nb, span, table_entries, idx, total,
     ) {
       Ok(ni) => ni
       Err(e) => return Err(e)
@@ -143,7 +139,7 @@ fn huff_build_table_from_weights(
   if idx != total {
     return Err(ZstdError::InvalidHuffmanTable("incomplete Huffman table"))
   }
-  Ok(HuffTable::{ sym: table_sym, nb_bits: table_nb, max_bits: max_bits })
+  Ok(HuffTable::{ entries: table_entries, max_bits: max_bits })
 }
 
 ///| Parse RFC 8878 §4.2.1 Huffman Tree Description at `data[start..end]`.
@@ -210,14 +206,16 @@ fn huff_read_table(
       Ok(v) => v
       Err(e) => return Err(e)
     }
+    let fse_entries = fse_tbl.entries
     let mut count = 0
     while true {
       if count >= 255 {
         return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
       }
-      weights[count] = fse_tbl.sym[state1]
+      let e1 = fse_entries[state1]
+      weights[count] = e1 & 255
       count = count + 1
-      let nb1 = fse_tbl.nb_bits[state1]
+      let nb1 = (e1 >> 8) & 255
       if br.remaining_bits() < nb1 {
         if count >= 255 {
           return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
@@ -230,19 +228,20 @@ fn huff_read_table(
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      state1 = fse_tbl.baseline[state1] + bits1
+      state1 = (e1 >> 16) + bits1
 
       if count >= 255 {
         return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
       }
-      weights[count] = fse_tbl.sym[state2]
+      let e2 = fse_entries[state2]
+      weights[count] = e2 & 255
       count = count + 1
-      let nb2 = fse_tbl.nb_bits[state2]
+      let nb2 = (e2 >> 8) & 255
       if br.remaining_bits() < nb2 {
         if count >= 255 {
           return Err(ZstdError::InvalidHuffmanTable("more than 255 weights"))
         }
-        weights[count] = fse_tbl.sym[state1]
+        weights[count] = fse_entries[state1] & 255
         count = count + 1
         break
       }
@@ -250,13 +249,76 @@ fn huff_read_table(
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      state2 = fse_tbl.baseline[state2] + bits2
+      state2 = (e2 >> 16) + bits2
     }
     match huff_build_table_from_weights(weights, count) {
       Ok(tbl) => Ok((tbl, comp_end))
       Err(e) => Err(e)
     }
   }
+}
+
+///| Register-frugal 4x unrolled Huffman fast loop (`avail_m = bits_avail - max_bits`).
+///| Writes into `FixedArray[Byte]` (zero COW checks, zero register spills on `e0..e3`).
+fn huff_decode_fast(
+  entries : FixedArray[Int],
+  mask : UInt64,
+  data : Bytes,
+  dst : FixedArray[Byte],
+  init_p : Int,
+  fast_p_limit : Int,
+  init_byte_pos : Int,
+  fast_byte_min : Int,
+  init_bit_buf : UInt64,
+  init_avail_m : Int,
+) -> (Int, Int, UInt64, Int) {
+  let mut p = init_p
+  let mut byte_pos = init_byte_pos
+  let mut bit_buf = init_bit_buf
+  let mut avail_m = init_avail_m
+
+  while p < fast_p_limit && byte_pos >= fast_byte_min {
+    if avail_m < 33 {
+      if avail_m <= 21 {
+        byte_pos = byte_pos - 4
+        bit_buf = (bit_buf << 8) |
+        data[byte_pos + 3].to_int().to_int64().to_uint64()
+        bit_buf = (bit_buf << 8) |
+        data[byte_pos + 2].to_int().to_int64().to_uint64()
+        bit_buf = (bit_buf << 8) |
+        data[byte_pos + 1].to_int().to_int64().to_uint64()
+        bit_buf = (bit_buf << 8) |
+        data[byte_pos].to_int().to_int64().to_uint64()
+        avail_m = avail_m + 32
+      }
+      if avail_m <= 37 {
+        byte_pos = byte_pos - 2
+        bit_buf = (bit_buf << 8) |
+        data[byte_pos + 1].to_int().to_int64().to_uint64()
+        bit_buf = (bit_buf << 8) |
+        data[byte_pos].to_int().to_int64().to_uint64()
+        avail_m = avail_m + 16
+      }
+    }
+    let e0 = entries[((bit_buf >> avail_m) & mask).to_int()]
+    avail_m = avail_m - (e0 >> 8)
+    dst[p] = e0.to_byte()
+
+    let e1 = entries[((bit_buf >> avail_m) & mask).to_int()]
+    avail_m = avail_m - (e1 >> 8)
+    dst[p + 1] = e1.to_byte()
+
+    let e2 = entries[((bit_buf >> avail_m) & mask).to_int()]
+    avail_m = avail_m - (e2 >> 8)
+    dst[p + 2] = e2.to_byte()
+
+    let e3 = entries[((bit_buf >> avail_m) & mask).to_int()]
+    avail_m = avail_m - (e3 >> 8)
+    dst[p + 3] = e3.to_byte()
+
+    p = p + 4
+  }
+  (p, byte_pos, bit_buf, avail_m)
 }
 
 ///| Decode a single Huffman backward bitstream `data[start..end]` of `out_len` symbols
@@ -266,40 +328,86 @@ fn huff_decode_stream(
   data : Bytes,
   start : Int,
   end : Int,
-  dst : Bytes,
+  dst : FixedArray[Byte],
   dst_pos : Int,
   out_len : Int,
 ) -> Result[Unit, ZstdError] {
-  let br = match BackBitReader::init(data, start, end) {
-    Ok(r) => r
-    Err(e) => return Err(e)
+  if end <= start || start < 0 || end > data.length() {
+    return Err(ZstdError::InvalidBitstream("empty backward bitstream"))
   }
+  let last = data[end - 1].to_int()
+  if last == 0 {
+    return Err(ZstdError::InvalidBitstream("missing sentinel 1-bit"))
+  }
+  let hb = high_bit(last)
+  let mut byte_pos = end - 1
+  let mut bit_buf : UInt64 = (last & ((1 << hb) - 1)).to_int64().to_uint64()
+  let mut bits_avail = hb
+  while bits_avail <= 56 && byte_pos > start {
+    byte_pos = byte_pos - 1
+    bit_buf = (bit_buf << 8) | data[byte_pos].to_int().to_int64().to_uint64()
+    bits_avail = bits_avail + 8
+  }
+
   let max_bits = tbl.max_bits
   let mask = (1UL << max_bits) - 1UL
-  let sym_tbl = tbl.sym
-  let nb_tbl = tbl.nb_bits
+  let entries = tbl.entries
   let mut p = dst_pos
   let limit = dst_pos + out_len
+  let fast_p_limit = limit - 3
+  let fast_byte_min = start + 6
 
-  // Fast loop while at least 4 symbols can be decoded without touching byte_pos boundary
+  if p < fast_p_limit && byte_pos >= fast_byte_min {
+    let (np, nbp, nbb, navm) = huff_decode_fast(
+      entries,
+      mask,
+      data,
+      dst,
+      p,
+      fast_p_limit,
+      byte_pos,
+      fast_byte_min,
+      bit_buf,
+      bits_avail - max_bits,
+    )
+    p = np
+    byte_pos = nbp
+    bit_buf = nbb
+    bits_avail = navm + max_bits
+  }
+
+  // Safe tail loop for final bytes or near stream start
   while p < limit {
-    if br.bits_avail < max_bits {
-      br.refill()
+    if bits_avail < max_bits {
+      while bits_avail <= 56 && byte_pos > start {
+        byte_pos = byte_pos - 1
+        bit_buf = (bit_buf << 8) |
+        data[byte_pos].to_int().to_int64().to_uint64()
+        bits_avail = bits_avail + 8
+      }
     }
-    let idx = if br.bits_avail >= max_bits {
-      ((br.bit_buf >> (br.bits_avail - max_bits)) & mask).to_int()
+    let idx = if bits_avail >= max_bits {
+      ((bit_buf >> (bits_avail - max_bits)) & mask).to_int()
     } else {
-      ((br.bit_buf << (max_bits - br.bits_avail)) & mask).to_int()
+      ((bit_buf << (max_bits - bits_avail)) & mask).to_int()
     }
-    let nb = nb_tbl[idx]
-    if nb > br.bits_avail {
+    let e = entries[idx]
+    let nb = e >> 8
+    if nb > bits_avail {
       return Err(ZstdError::InvalidBitstream("Huffman stream underflow"))
     }
-    br.bits_avail = br.bits_avail - nb
-    dst[p] = sym_tbl[idx].to_byte()
+    bits_avail = bits_avail - nb
+    dst[p] = e.to_byte()
     p = p + 1
   }
 
+  let br = BackBitReader::{
+    data: data,
+    start: start,
+    byte_pos: byte_pos,
+    bit_buf: bit_buf,
+    bits_avail: bits_avail,
+  }
   if br.bits_avail != 0 || br.byte_pos != start {
     return Err(
       ZstdError::InvalidBitstream("Huffman stream did not exhaust cleanly"),
@@ -308,21 +416,18 @@ fn huff_decode_stream(
   Ok(())
 }
 
-///| Decode a 1-stream or 4-stream Huffman literals payload into a newly allocated `Bytes`.
+///| Decode a 1-stream or 4-stream Huffman literals payload into caller-provided `out[0..regen_size]`.
 fn huff_decode_literals(
   tbl : HuffTable,
   data : Bytes,
   start : Int,
   end : Int,
+  out : FixedArray[Byte],
   regen_size : Int,
   four_streams : Bool,
-) -> Result[Bytes, ZstdError] {
-  let out = Bytes::new(regen_size)
+) -> Result[Unit, ZstdError] {
   if !four_streams {
-    match huff_decode_stream(tbl, data, start, end, out, 0, regen_size) {
-      Ok(_) => Ok(out)
-      Err(e) => Err(e)
-    }
+    huff_decode_stream(tbl, data, start, end, out, 0, regen_size)
   } else {
     if end - start < 6 {
       return Err(
@@ -360,17 +465,54 @@ fn huff_decode_literals(
       Ok(_) => ()
       Err(e) => return Err(e)
     }
-    match huff_decode_stream(tbl, data, p4, end, out, seg * 3, rem) {
-      Ok(_) => Ok(out)
-      Err(e) => Err(e)
-    }
+    huff_decode_stream(tbl, data, p4, end, out, seg * 3, rem)
   }
+}
+
+///| Encode one Huffman segment `lits[seg_start .. seg_start + seg_len]` in reverse into `buf`.
+///| Returns the number of bytes written.
+fn huff_encode_seg(
+  lits : FixedArray[Byte],
+  seg_start : Int,
+  seg_len : Int,
+  code_tbl : FixedArray[Int],
+  buf : FixedArray[Byte],
+) -> Int {
+  let mut out_len = 0
+  let mut bit_buf : UInt64 = 0UL
+  let mut bit_cnt = 0
+  let mut k = seg_start + seg_len - 1
+  while k >= seg_start {
+    let c = code_tbl[lits[k].to_int()]
+    let nb = c >> 16
+    bit_buf = bit_buf | ((c & 0xFFFF).to_int64().to_uint64() << bit_cnt)
+    bit_cnt = bit_cnt + nb
+    if bit_cnt >= 32 {
+      buf[out_len] = (bit_buf & 255UL).to_int().to_byte()
+      buf[out_len + 1] = ((bit_buf >> 8) & 255UL).to_int().to_byte()
+      buf[out_len + 2] = ((bit_buf >> 16) & 255UL).to_int().to_byte()
+      buf[out_len + 3] = ((bit_buf >> 24) & 255UL).to_int().to_byte()
+      out_len = out_len + 4
+      bit_buf = bit_buf >> 32
+      bit_cnt = bit_cnt - 32
+    }
+    k = k - 1
+  }
+  bit_buf = bit_buf | (1UL << bit_cnt)
+  bit_cnt = bit_cnt + 1
+  while bit_cnt > 0 {
+    buf[out_len] = (bit_buf & 255UL).to_int().to_byte()
+    out_len = out_len + 1
+    bit_buf = bit_buf >> 8
+    bit_cnt = if bit_cnt >= 8 { bit_cnt - 8 } else { 0 }
+  }
+  out_len
 }
 
 ///| Encode literals with a Direct-weight Huffman table (1-stream or 4-stream) if it saves space.
 ///| Returns `Some((header_and_payload, is_four_streams))` or `None` if raw is better.
 fn huff_try_encode_literals(
-  lits : Bytes,
+  lits : FixedArray[Byte],
   len : Int,
 ) -> Option[(Bytes, Bool)] {
   if len < 48 {
@@ -516,25 +658,26 @@ fn huff_try_encode_literals(
     w = w + 1
   }
 
+  // Pack code_val and code_len into a single lookup table: code_val | (code_len << 16)
+  let code_tbl : FixedArray[Int] = FixedArray::make(max_sym + 1, 0)
+  s = 0
+  while s <= max_sym {
+    code_tbl[s] = code_val[s] | (code_len[s] << 16)
+    s = s + 1
+  }
+
   // Direct 4-bit weight header: num_weights = max_sym (last symbol max_sym is implicit)
   let num_weights = max_sym
   let hdr_bytes = 1 + ((num_weights + 1) >> 1)
   let four_streams = len >= 1024
 
-  let encode_seg = fn(seg_start : Int, seg_len : Int) -> Bytes {
-    let bw = BitWriter::new(seg_len)
-    let mut k = seg_start + seg_len - 1
-    while k >= seg_start {
-      let b = lits[k].to_int()
-      bw.write_bits(code_val[b], code_len[b])
-      k = k - 1
-    }
-    bw.finish_with_sentinel()
-  }
-
   if !four_streams {
-    let stream = encode_seg(0, len)
-    let total_comp = hdr_bytes + stream.length()
+    let stream_buf : FixedArray[Byte] = FixedArray::make(
+      len * 2 + 16,
+      (0).to_byte(),
+    )
+    let stream_len = huff_encode_seg(lits, 0, len, code_tbl, stream_buf)
+    let total_comp = hdr_bytes + stream_len
     if total_comp + 4 >= len {
       return None
     }
@@ -550,23 +693,27 @@ fn huff_try_encode_literals(
       wi = wi + 2
     }
     let mut j = 0
-    while j < stream.length() {
-      out[p + j] = stream[j]
+    while j < stream_len {
+      out[p + j] = stream_buf[j]
       j = j + 1
     }
     Some((out, false))
   } else {
     let seg = (len + 3) >> 2
     let rem = len - seg * 3
-    let st1 = encode_seg(0, seg)
-    let st2 = encode_seg(seg, seg)
-    let st3 = encode_seg(seg * 2, seg)
-    let st4 = encode_seg(seg * 3, rem)
-    if st1.length() > 65535 || st2.length() > 65535 || st3.length() > 65535 {
+    let seg_cap = seg * 2 + 16
+    let b1 : FixedArray[Byte] = FixedArray::make(seg_cap, (0).to_byte())
+    let b2 : FixedArray[Byte] = FixedArray::make(seg_cap, (0).to_byte())
+    let b3 : FixedArray[Byte] = FixedArray::make(seg_cap, (0).to_byte())
+    let b4 : FixedArray[Byte] = FixedArray::make(rem * 2 + 16, (0).to_byte())
+    let n1 = huff_encode_seg(lits, 0, seg, code_tbl, b1)
+    let n2 = huff_encode_seg(lits, seg, seg, code_tbl, b2)
+    let n3 = huff_encode_seg(lits, seg * 2, seg, code_tbl, b3)
+    let n4 = huff_encode_seg(lits, seg * 3, rem, code_tbl, b4)
+    if n1 > 65535 || n2 > 65535 || n3 > 65535 {
       return None
     }
-    let total_comp = hdr_bytes + 6 + st1.length() + st2.length() + st3.length() +
-    st4.length()
+    let total_comp = hdr_bytes + 6 + n1 + n2 + n3 + n4
     if total_comp + 6 >= len {
       return None
     }
@@ -581,34 +728,34 @@ fn huff_try_encode_literals(
       p = p + 1
       wi = wi + 2
     }
-    out[p] = (st1.length() & 255).to_byte()
-    out[p + 1] = ((st1.length() >> 8) & 255).to_byte()
-    out[p + 2] = (st2.length() & 255).to_byte()
-    out[p + 3] = ((st2.length() >> 8) & 255).to_byte()
-    out[p + 4] = (st3.length() & 255).to_byte()
-    out[p + 5] = ((st3.length() >> 8) & 255).to_byte()
+    out[p] = (n1 & 255).to_byte()
+    out[p + 1] = ((n1 >> 8) & 255).to_byte()
+    out[p + 2] = (n2 & 255).to_byte()
+    out[p + 3] = ((n2 >> 8) & 255).to_byte()
+    out[p + 4] = (n3 & 255).to_byte()
+    out[p + 5] = ((n3 >> 8) & 255).to_byte()
     p = p + 6
     let mut j = 0
-    while j < st1.length() {
-      out[p + j] = st1[j]
+    while j < n1 {
+      out[p + j] = b1[j]
       j = j + 1
     }
-    p = p + st1.length()
+    p = p + n1
     j = 0
-    while j < st2.length() {
-      out[p + j] = st2[j]
+    while j < n2 {
+      out[p + j] = b2[j]
       j = j + 1
     }
-    p = p + st2.length()
+    p = p + n2
     j = 0
-    while j < st3.length() {
-      out[p + j] = st3[j]
+    while j < n3 {
+      out[p + j] = b3[j]
       j = j + 1
     }
-    p = p + st3.length()
+    p = p + n3
     j = 0
-    while j < st4.length() {
-      out[p + j] = st4[j]
+    while j < n4 {
+      out[p + j] = b4[j]
       j = j + 1
     }
     Some((out, true))
