@@ -32,7 +32,7 @@ README="$PKG_DIR/README.md"
 PY="python3 -I"
 CMP="$PY $AUDIT_DIR/diff/compare.py"
 CASE_GROUPS="named hex syntax none mix relative numeric fuzz wpt"
-FIX_IDS="P1-1 P2-8 P1-2 P2-7 P2-11 P2-12 P2-9 P2-2"
+FIX_IDS="P1-1 P2-8 P1-2 P2-7 P2-11 P2-12 P2-9 P2-2 ORACLE-wpt-rec2020"
 CHROME_BIN=${CHROME_BIN:-$HOME/Library/Caches/ms-playwright/chromium_headless_shell-1255/chrome-headless-shell-mac-arm64/chrome-headless-shell}
 mkdir -p "$BIN"
 export PYTHONDONTWRITEBYTECODE=1
@@ -95,12 +95,10 @@ with open(sys.argv[2], "w") as f:
     for line in open(sys.argv[1], encoding="utf-8"):
         f.write("srgb\t" + enc(unesc(line.rstrip("\n").split("\t")[2])) + "\n")
 PY
-  rm -rf "$AUDIT_OUT/fixmodel" && $PY "$AUDIT_DIR/diff/fixmodel.py" "$PKG_DIR" "$AUDIT_OUT/fixmodel" > /dev/null || fail "fixmodel"
-  k=1
-  for id in $FIX_IDS; do
-    pionc build --release -o "$BIN/fix$k" "$AUDIT_OUT/fixmodel/stage$k/css_color/audit" > "$AUDIT_OUT/fixbuild$k.log" 2>&1 || fail "fix model stage $k ($id) does not build"
-    k=$((k + 1))
-  done
+  # fix model (attribution only): on an already-fixed tree a patch whose snippet is gone is skipped, and a stage
+  # that no longer builds is replaced by the previous stage; neither is a P0
+  rm -rf "$AUDIT_OUT/fixmodel" && $PY "$AUDIT_DIR/diff/fixmodel.py" "$PKG_DIR" "$AUDIT_OUT/fixmodel" --build "$BIN" "$BIN/css_color_audit_rel" > "$AUDIT_OUT/fixmodel.txt" || fail "fixmodel"
+  echo "  fix model stages (patches applied / build): $(awk '{printf "%s %s%s  ", $2, $3, ($4 == "build=reverted" ? " reverted" : "")}' "$AUDIT_OUT/fixmodel.txt")"
   if [ "${REFRESH_CHROME:-0}" = 1 ]; then
     for g in $CASE_GROUPS; do
       $PY "$AUDIT_DIR/diff/chrome.py" "$C/$g.cases" "$AUDIT_DIR/diff/chrome/$g.txt" "$CHROME_BIN" | sed "s/^/  $g /"
@@ -225,15 +223,16 @@ oracles() {
   cmp_run $CMP mixrust "$AUDIT_OUT/pion_mix.txt" "$AUDIT_OUT/rust_mixp.txt"
   echo "     (information: color 0.3.3 has no none-alpha carry, no ED powerless rules; see REPORT.md)"
   echo "  -- float64 spec_ref.py (ED sample code; matrices derived from the chromaticities)"
-  echo "     software math, constants equalised (gate <= 1e-9 of the range):"
+  echo "     software math gate (<= 1e-9 of the range): tried with the ED's constants first, then with the pre-2023"
+  echo "     Bradford / ProPhoto constants (alone or both); passing only with old constants = P2-2, not P0:"
   for g in numeric none mix relative syntax; do
-    cmp_run $CMP spec "$C/$g.cases" "$AUDIT_OUT/pion_$g.txt" package > "$AUDIT_OUT/spec_pkg_$g.txt"
+    cmp_run $CMP spec "$C/$g.cases" "$AUDIT_OUT/pion_$g.txt" auto > "$AUDIT_OUT/spec_$g.txt"
     r=$?
-    grep -E 'software|guard|> 1e-9' "$AUDIT_OUT/spec_pkg_$g.txt" | sed "s/^ */       [$g] /"
+    grep -E 'software|guard|> 1e-9' "$AUDIT_OUT/spec_$g.txt" | sed "s/^ */       [$g] /"
     [ $r = 1 ] && fail "software math error > 1e-9 ($g)"
   done
-  echo "     with the ED's current constants (drift = P2-2):"
-  cmp_run $CMP spec "$C/numeric.cases" "$AUDIT_OUT/pion_numeric.txt" ed | sed 's/^/  /'
+  echo "     with the ED's current constants (information):"
+  $CMP spec "$C/numeric.cases" "$AUDIT_OUT/pion_numeric.txt" ed | grep -v '^FINDINGS' | sed 's/^/  /'
   echo "  -- to_css() round trip"
   for g in numeric syntax relative mix wpt; do
     cmp_run $CMP roundtrip "$C/$g.cases" "$AUDIT_OUT/pion_$g.txt" | sed "s/^ */     [$g] /"
@@ -243,7 +242,7 @@ oracles() {
       P1-1) open_finding "P1-1: HSL/HWB of near-white/black colors (no ED epsilon guard): saturation up to 849%" ;;
       P1-2) open_finding "P1-2: relative-color channel keywords drop none / powerless-missing" ;;
       P2-1) open_finding "P2-1: to_css() corrupts |v| >= 9.2e12, writes NaN/Inf as 0, out-of-range lab L not lossless" ;;
-      P2-2) open_finding "P2-2: Bradford / ProPhoto constants and rec2020 transfer differ from the CSS Color 4 ED" ;;
+      P2-2) open_finding "P2-2: Bradford / ProPhoto constants differ from the CSS Color 4 ED (pre-2023 values)" ;;
       P2-3) open_finding "P2-3: hash / from token boundaries (#fffr accepted, from#f00 rejected)" ;;
       P2-4) open_finding "P2-4: calc() accepts invalid grammar and type mixes" ;;
       P2-5) open_finding "P2-5: valid calc() edge values / huge literals rejected" ;;
@@ -366,24 +365,39 @@ PY
 
 harness() {
   echo "==> harness: the gates must catch injected bugs (mutated copies in \$AUDIT_OUT)"
+  injected=0
   for bug in named_typo hue_shorter depth_guard matrix_coeff legacy_mixing; do
     H="$AUDIT_OUT/inject_$bug" && rm -rf "$H" && mkdir -p "$H" && cp -R "$PKG_DIR" "$H/css_color"
+    # each bug has alternatives so that it can still be injected into a fixed (rewritten) tree
     $PY - "$H/css_color/src" "$bug" <<'PY'
-import os, sys
+import os, re, sys
 d, bug = sys.argv[1], sys.argv[2]
-p, old, new = {
-    "named_typo": ("named.pion", '"coral" => Some((255, 127, 80, 255))', '"coral" => Some((255, 127, 81, 255))'),
-    "hue_shorter": ("mix.pion", "      if diff > 180.0 {\n        h1 = h1 + 360.0\n      } else if diff < -180.0 {\n        h2 = h2 + 360.0\n      }\n    }\n    HueInterpolation::Longer",
-                    "      if diff > 180.0 {\n        h2 = h2 + 360.0\n      } else if diff < -180.0 {\n        h1 = h1 + 360.0\n      }\n    }\n    HueInterpolation::Longer"),
-    "depth_guard": ("parser.pion", "fn parse_color_expr(cur : Cursor, depth : Int) -> Result[Color, ColorError] {\n  if depth > max_nesting_depth {",
-                    "fn parse_color_expr(cur : Cursor, depth : Int) -> Result[Color, ColorError] {\n  if depth > max_nesting_depth * 1000 {"),
-    "matrix_coeff": ("space.pion", "    0.41239079926595934,", "    0.41239179926595934,"),
-    "legacy_mixing": ("parser.pion", "    if p0 != p1 || p1 != p2 {", "    if false {"),
+alts = {
+    "named_typo": [("named.pion", r'"coral" => Some\(\(255, 127, 80, 255\)\)', '"coral" => Some((255, 127, 81, 255))')],
+    "hue_shorter": [("mix.pion", r"      if diff > 180\.0 \{\n        h1 = h1 \+ 360\.0\n      \} else if diff < -180\.0 \{\n        h2 = h2 \+ 360\.0\n      \}",
+                     "      if diff > 180.0 {\n        h2 = h2 + 360.0\n      } else if diff < -180.0 {\n        h1 = h1 + 360.0\n      }"),
+                    ("parser.pion", r'"shorter" => HueInterpolation::Shorter', '"shorter" => HueInterpolation::Increasing')],
+    "depth_guard": [("parser.pion", r"(fn parse_color_expr\(cur : Cursor, depth : Int\) -> Result\[Color, ColorError\] \{\n  if depth > max_nesting_depth) \{",
+                     r"\1 * 1000 {"),
+                    ("types.pion", r"pub let max_nesting_depth : Int = 32\b", "pub let max_nesting_depth : Int = 32000")],
+    "matrix_coeff": [("space.pion", r"0\.41239079926595934\b", "0.41239179926595934")],
+    "legacy_mixing": [("parser.pion", r"    if p0 != p1 \|\| p1 != p2 \{", "    if false {"),
+                      ("parser.pion", r"if (\w+) != (\w+) \|\| (\w+) != (\w+) \{", "if false {")],
 }[bug]
-s = open(os.path.join(d, p)).read()
-assert s.count(old) == 1, bug
-open(os.path.join(d, p), "w").write(s.replace(old, new))
+for p, pat, new in alts:
+    path = os.path.join(d, p)
+    s = open(path).read()
+    out, n = re.subn(pat, new, s, count=1)
+    if n:
+        open(path, "w").write(out)
+        sys.exit(0)
+sys.exit(4)
 PY
+    if [ $? = 4 ]; then
+      echo "  injected $bug: SKIP (no injection point left in this tree)"
+      continue
+    fi
+    injected=$((injected + 1))
     pionc build --release -o "$H/ca" "$H/css_color/audit" > /dev/null || { fail "harness build ($bug)"; continue; }
     caught=""
     for g in named mix relative numeric wpt; do
@@ -395,7 +409,7 @@ PY
       fi
       [ $? = 1 ] && caught="$caught $g"
     done
-    $CMP spec "$C/numeric.cases" "$H/numeric.txt" package > "$H/spec.log"
+    $CMP spec "$C/numeric.cases" "$H/numeric.txt" auto > "$H/spec.log"
     [ $? = 1 ] && caught="$caught spec_ref"
     $PY "$AUDIT_DIR/diff/dos.py" "$H/dos" "$H/ca" > "$H/dos.log"
     [ $? = 1 ] && caught="$caught dos"
@@ -407,6 +421,7 @@ PY
       echo "  injected $bug: caught by$caught"
     fi
   done
+  [ "$injected" -ge 3 ] || fail "harness: only $injected of 5 bugs could be injected (need >= 3)"
 }
 
 docs() {

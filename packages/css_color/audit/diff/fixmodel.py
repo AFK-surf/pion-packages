@@ -3,19 +3,37 @@
   python3 -I fixmodel.py <package dir> <out dir>      -> <out dir>/stage<k>/css_color (k = 1..N), prints `k id`
 Stage k contains the fixes of stages 1..k. compare.py attributes a value divergence from an oracle to the finding of the
 first stage whose output agrees with the oracle, so every attribution is backed by a working fix, not by a pattern.
-The fixes are minimal sketches for the reviewer of the fix branch, not drop-in patches."""
+The fixes are minimal sketches for the reviewer of the fix branch, not drop-in patches.
+On a source tree that is already (partly) fixed, every patch whose original snippet is gone is skipped (counted as
+"already changed") and the rest is applied; run_audit.sh drops a stage that then fails to build (it reuses the
+previous stage). On the audited baseline 7e78a4b every patch applies (`k id applied/total` on stdout)."""
 import os
 import re
 import shutil
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spec_ref as R  # noqa: E402
 
 
+TALLY = [0, 0]  # [applied, attempted] for the current stage
+
+
 def sub(text, old, new, count=1):
-    assert text.count(old) == count, (old[:80], text.count(old))
+    TALLY[1] += 1
+    if text.count(old) != count:
+        return text  # snippet already changed by a fix: skip this patch
+    TALLY[0] += 1
     return text.replace(old, new)
+
+
+def resub(pat, repl, text, flags=0):
+    TALLY[1] += 1
+    out, n = re.subn(pat, repl, text, flags=flags)
+    if n:
+        TALLY[0] += 1
+    return out
 
 
 def p1_1(f):  # HSL/HWB from (near-)white/black: CSS Color 4 ED rgbToHsl / rgbToHwb epsilon guards
@@ -102,7 +120,7 @@ fn CalcEnv::lookup_missing(self : CalcEnv, name : String) -> Bool {
 }
 
 fn CalcEnv::lookup(self : CalcEnv, name : String) -> Option[Double] {""")
-    s = re.sub(r"(CalcEnv::make\([^\n]*?, (\w+)\.alpha\))", r"\1.with_missing(\2.m0, \2.m1, \2.m2, \2.ma)", s)
+    s = resub(r"(CalcEnv::make\([^\n]*?, (\w+)\.alpha\))(?!\.with_missing)", r"\1.with_missing(\2.m0, \2.m1, \2.m2, \2.ma)", s)
     s = sub(s, "      Some(v) => return Ok((v, false, false))", "      Some(v) => return Ok((v, env.lookup_missing(ident), false))")
     f["parser.pion"] = s
 
@@ -186,39 +204,67 @@ def _mat(name, m):
     return name, args
 
 
-def p2_2(f):  # CSS Color 4 ED (2025): rec2020 uses the BT.1886 gamma 2.4 transfer (WPT follows, Chrome 159 does not yet)
+def p2_2(f):  # current ED Bradford and ProPhoto matrices (derived from the chromaticities in spec_ref.py)
     s = f["space.pion"]
-    s = re.sub(r"fn rec2020_to_linear_ch\(v : Double\) -> Double \{.*?\n\}\n",
-               "fn rec2020_to_linear_ch(v : Double) -> Double {\n  let sign = if v < 0.0 { -1.0 } else { 1.0 }\n  sign * f64_pow(f64_abs(v), 2.4)\n}\n", s, flags=re.S)
-    s = re.sub(r"fn rec2020_from_linear_ch\(v : Double\) -> Double \{.*?\n\}\n",
-               "fn rec2020_from_linear_ch(v : Double) -> Double {\n  let sign = if v < 0.0 { -1.0 } else { 1.0 }\n  sign * f64_pow(f64_abs(v), 1.0 / 2.4)\n}\n", s, flags=re.S)
-    # current ED Bradford and ProPhoto matrices (derived from the chromaticities in spec_ref.py)
     for fn, m in [("xyz_d65_to_d50", R.D65_TO_D50), ("xyz_d50_to_d65", R.D50_TO_D65),
                   ("lin_prophoto_to_xyz_d50", R.TO_XYZ["prophoto-rgb"]), ("xyz_d50_to_lin_prophoto", R.FROM_XYZ["prophoto-rgb"])]:
         pat = re.compile(r"(fn %s\([^)]*\) -> \(Double, Double, Double\) \{\n  mat3_mul\(\n)(.*?)(,\n    [a-z]+,\n    [a-z]+,\n    [a-z]+,\n  \)\n\})" % fn, re.S)
-        assert pat.search(s), fn
-        s = pat.sub(lambda mo: mo.group(1) + ",\n".join("    %r" % float(v) for row in m for v in row) + mo.group(3), s)
+        s = resub(pat, lambda mo: mo.group(1) + ",\n".join("    %r" % float(v) for row in m for v in row) + mo.group(3), s)
+    f["space.pion"] = s
+
+
+def wpt_rec2020(f):  # CSS Color 4 ED (2025): rec2020 uses BT.1886 gamma 2.4. WPT follows; Chrome 159, color 0.3.3 and
+    # spec_ref.py keep the BT.2020 piecewise OETF, so this stage only explains the 2 WPT vectors (oracle, not a finding)
+    s = f["space.pion"]
+    s = resub(r"fn rec2020_to_linear_ch\(v : Double\) -> Double \{.*?\n\}\n",
+              "fn rec2020_to_linear_ch(v : Double) -> Double {\n  let sign = if v < 0.0 { -1.0 } else { 1.0 }\n  sign * f64_pow(f64_abs(v), 2.4)\n}\n", s, flags=re.S)
+    s = resub(r"fn rec2020_from_linear_ch\(v : Double\) -> Double \{.*?\n\}\n",
+              "fn rec2020_from_linear_ch(v : Double) -> Double {\n  let sign = if v < 0.0 { -1.0 } else { 1.0 }\n  sign * f64_pow(f64_abs(v), 1.0 / 2.4)\n}\n", s, flags=re.S)
     f["space.pion"] = s
 
 
 STAGES = [("P1-1", p1_1), ("P2-8", p2_8), ("P1-2", p1_2), ("P2-7", p2_7), ("P2-11", p2_11), ("P2-12", p2_12),
-          ("P2-9", p2_9), ("P2-2", p2_2)]
+          ("P2-9", p2_9), ("P2-2", p2_2), ("ORACLE-wpt-rec2020", wpt_rec2020)]
+
+
+def write_stage(pkg, out, k, f, names):
+    d = os.path.join(out, "stage%d" % k, "css_color")
+    if os.path.exists(os.path.dirname(d)):
+        shutil.rmtree(os.path.dirname(d))
+    shutil.copytree(pkg, d, ignore=shutil.ignore_patterns("bench", "wasm_smoke", "*_test.pion"))
+    for n in names:
+        with open(os.path.join(d, "src", n), "w", encoding="utf-8") as fh:
+            fh.write(f[n])
+    return d
 
 
 def main():
+    """fixmodel.py <pkg> <out> [--build <bin dir> <base binary>]: with --build, stage k is compiled to
+    <bin dir>/fix<k>; a stage that does not compile (a fix already in the tree collides with a patch) is reverted to
+    the previous stage's source and binary, so later stages still build on a consistent tree."""
     pkg, out = sys.argv[1], sys.argv[2]
+    build = sys.argv[3] == "--build" if len(sys.argv) > 3 else False
     names = ["math.pion", "mix.pion", "parser.pion", "space.pion"]
     f = {n: open(os.path.join(pkg, "src", n), encoding="utf-8").read() for n in names}
+    prev_bin = sys.argv[5] if build else None
     for k, (fid, fn) in enumerate(STAGES, 1):
+        TALLY[0] = TALLY[1] = 0
+        good = dict(f)
         fn(f)
-        d = os.path.join(out, "stage%d" % k, "css_color")
-        if os.path.exists(os.path.dirname(d)):
-            shutil.rmtree(os.path.dirname(d))
-        shutil.copytree(pkg, d, ignore=shutil.ignore_patterns("bench", "wasm_smoke", "*_test.pion"))
-        for n in names:
-            with open(os.path.join(d, "src", n), "w", encoding="utf-8") as fh:
-                fh.write(f[n])
-        print(k, fid)
+        d = write_stage(pkg, out, k, f, names)
+        status = ""
+        if build:
+            b = os.path.join(sys.argv[4], "fix%d" % k)
+            r = subprocess.run(["pionc", "build", "--release", "-o", b, os.path.join(d, "audit")], capture_output=True, text=True)
+            if r.returncode == 0:
+                prev_bin, status = b, " build=ok"
+            else:
+                f = good
+                write_stage(pkg, out, k, f, names)
+                shutil.copyfile(prev_bin, b)
+                os.chmod(b, 0o755)
+                status = " build=reverted"
+        print(k, fid, "%d/%d%s" % (TALLY[0], TALLY[1], status))
 
 
 if __name__ == "__main__":

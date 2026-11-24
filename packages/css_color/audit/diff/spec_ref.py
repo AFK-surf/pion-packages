@@ -331,6 +331,21 @@ def _from_xyz50(space, x):
     return [gam("prophoto-rgb", v) for v in mv(FROM_XYZ["prophoto-rgb"], x)]
 
 
+def powerless_normalize(space, c):
+    """ED §4.4: a powerless hue (hsl S <= 0.001, hwb W + B >= 99.999, lch C <= 0.0015, oklch C <= 4e-6) becomes
+    missing, its chroma / saturation is set to 0 (only when > 0) and HWB's B to 100 - W. Missing = NaN here."""
+    c = list(c)
+    if space == "hsl" and c[1] <= 0.001:
+        c[0], c[1] = float("nan"), min(c[1], 0.0)
+    elif space == "hwb" and c[1] + c[2] >= 99.999:
+        c[0] = float("nan")
+        if c[1] + c[2] < 100:
+            c[2] = 100 - c[1]
+    elif space in ("lch", "oklch") and c[1] <= (0.0015 if space == "lch" else 0.000004):
+        c[1], c[2] = min(c[1], 0.0), float("nan")
+    return c
+
+
 def convert(src, c, dst):
     if src == dst:
         return list(c)
@@ -340,21 +355,35 @@ def convert(src, c, dst):
     return from_xyz65(dst, to_xyz65(src, c))
 
 
-def use_package_constants():
-    """Swap in the constants css_color ships (pre-2023 ED values for Bradford and ProPhoto, copied verbatim from
-    packages/css_color/src/space.pion) so that a comparison isolates the software math from the constant drift."""
+_ED = {"d65_d50": D65_TO_D50, "d50_d65": D50_TO_D65, "pro_to": TO_XYZ["prophoto-rgb"], "pro_from": FROM_XYZ["prophoto-rgb"]}
+_OLD = {  # pre-2023 ED values, as shipped by css_color 0.1.0 (packages/css_color/src/space.pion @ 7e78a4b)
+    "d65_d50": [[1.0479298208405488, 0.022946793341019088, -0.05019222954313557],
+                [0.029627815688159344, 0.990434484573249, -0.01707382502938514],
+                [-0.009243058152591178, 0.015055144896577895, 0.7518742899580008]],
+    "d50_d65": [[0.9554734527042182, -0.023098536874261423, 0.0632593086610217],
+                [-0.028369706963208136, 1.0099954580058226, 0.021041398966943008],
+                [0.012314001688319899, -0.020507696433477912, 1.3303659366080753]],
+    "pro_to": [[0.7977604896723027, 0.13518583717574031, 0.0313493495815248],
+               [0.2880711282292934, 0.7118432178101014, 0.00008565396060525902], [0.0, 0.0, 0.8251046025104601]],
+    "pro_from": [[1.3457989731028281, -0.25558010007997534, -0.05110628506753401],
+                 [-0.5446224939028347, 1.5082327413132781, 0.02053603239147973], [0.0, 0.0, 1.2119675456389454]],
+}
+
+
+def set_constants(bradford="ed", prophoto="ed", routing=False):
+    """Select the ED's current constants or the pre-2023 ones (css_color 0.1.0) for Bradford and ProPhoto separately,
+    and whether D50 <-> D50 conversions round-trip through XYZ-D65 like css_color 0.1.0 (routing=True)."""
     global D65_TO_D50, D50_TO_D65, PACKAGE_ROUTING
-    PACKAGE_ROUTING = True
-    D65_TO_D50 = [[1.0479298208405488, 0.022946793341019088, -0.05019222954313557],
-                  [0.029627815688159344, 0.990434484573249, -0.01707382502938514],
-                  [-0.009243058152591178, 0.015055144896577895, 0.7518742899580008]]
-    D50_TO_D65 = [[0.9554734527042182, -0.023098536874261423, 0.0632593086610217],
-                  [-0.028369706963208136, 1.0099954580058226, 0.021041398966943008],
-                  [0.012314001688319899, -0.020507696433477912, 1.3303659366080753]]
-    TO_XYZ["prophoto-rgb"] = [[0.7977604896723027, 0.13518583717574031, 0.0313493495815248],
-                              [0.2880711282292934, 0.7118432178101014, 0.00008565396060525902], [0.0, 0.0, 0.8251046025104601]]
-    FROM_XYZ["prophoto-rgb"] = [[1.3457989731028281, -0.25558010007997534, -0.05110628506753401],
-                                [-0.5446224939028347, 1.5082327413132781, 0.02053603239147973], [0.0, 0.0, 1.2119675456389454]]
+    src = _ED if bradford == "ed" else _OLD
+    D65_TO_D50, D50_TO_D65 = src["d65_d50"], src["d50_d65"]
+    src = _ED if prophoto == "ed" else _OLD
+    TO_XYZ["prophoto-rgb"], FROM_XYZ["prophoto-rgb"] = src["pro_to"], src["pro_from"]
+    PACKAGE_ROUTING = routing
+
+
+def use_package_constants():
+    """css_color 0.1.0's constants and routing, so that a comparison isolates the software math from the drift."""
+    set_constants("old", "old", True)
 
 
 # --- gamut mapping, CSS Color 4 ED "binary search gamut mapping with local MINDE" ---

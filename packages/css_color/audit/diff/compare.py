@@ -156,10 +156,12 @@ def hue_diff(a, b):
     return min(d, 360.0 - d)
 
 
-def to_space(rec, sp):
+def to_space(rec, sp, normalize=False):
     c = [0.0 if rec["m"][i] else rec["c"][i] for i in range(3)]
     if rec["space"] == sp:
         return list(c)
+    if normalize:  # ED powerless normalisation of the origin before the conversion (a P2-8 fix does this)
+        c = R.powerless_normalize(rec["space"], c)
     return R.convert(rec["space"], c, sp)
 
 
@@ -461,45 +463,85 @@ def cmd_chromewpt(vec_path, chrome_path):
     return 0
 
 
-def cmd_spec(cases_path, pion_path, constants="ed"):
-    """pion T (= c.convert(target)) against spec_ref.convert(native coords) per target space. With
-    constants=package, spec_ref uses css_color's own constants, so the residual is the software math error alone
-    (gate: <= 1e-9 of the reference range); with constants=ed it also shows the constant drift (P2-2).
-    HSL/HWB targets inside the ED near-white/black guard are counted for P1-1 and skipped."""
-    if constants == "package":
-        R.use_package_constants()
-    cases, pion = read_cases(cases_path), lines(pion_path)
-    worst, guard = {}, 0
+def _spec_errors(rec, ref):
+    """(max relative error, guard 0/1, p28 flag) of one record against one reference; -1 when skipped."""
+    if rec["tspace"] in ("hsl", "hwb"):
+        rgb = to_space(rec, "srgb")
+        li = (max(rgb) + min(rgb)) / 2
+        if abs(li) <= 1e-5 or abs(1 - li) < 1e-5 or ref[0] != ref[0]:
+            return (-1.0, 1 if any(abs(rec["t"][i] - ref[i]) > 1e-6 for i in (1, 2)) else 0, False)
+    hi = R.POLAR.get(rec["tspace"])
+    worst, p28 = 0.0, False
+    for i in range(3):
+        if rec["tm"][i] or ref[i] != ref[i]:
+            continue
+        if i == hi and ref[1] < 0.01 * SCALE[rec["tspace"]][1]:
+            continue  # hue of a near-achromatic color is ill-conditioned
+        if hi is not None and i == 1 and rec["tspace"] in ("lch", "oklch") and \
+                min(abs(rec["t"][1]), abs(ref[1])) <= (0.0015 if rec["tspace"] == "lch" else 0.000004):
+            if abs(rec["t"][1] - ref[1]) > 1e-12:
+                p28 = True
+            continue  # chroma inside the powerless epsilon (zeroed with a different threshold: P2-8)
+        if rec["tspace"] == "a98-rgb" and abs(ref[i]) < 1e-6:
+            continue  # pure-gamma transfer has an infinite slope at 0: 1e-17 residuals become 1e-8
+        d = hue_diff(rec["t"][i], ref[i]) if i == hi else abs(rec["t"][i] - ref[i])
+        worst = max(worst, d / (SCALE[rec["tspace"]][i] * max(1.0, abs(ref[i]) / SCALE[rec["tspace"]][i])))
+    return (worst, 0, p28)
+
+
+def spec_worst(cases, pion):
+    """Per target space: worst |pion - spec_ref| / range, plus the number of HSL/HWB results inside the ED's
+    near-white/black guard that differ (P1-1). Skips ill-conditioned channels (see comments)."""
+    worst, guard, p28 = {}, 0, False
     for (t, s), p in zip(cases, pion):
         rec = pion_rec(p)
         if rec is None or rec["tspace"] not in SCALE:
             continue
         if any(abs(v) > 1e6 for v in rec["c"]):
             continue
-        ref = to_space(rec, rec["tspace"])
-        if rec["tspace"] in ("hsl", "hwb"):
-            rgb = to_space(rec, "srgb")
-            li = (max(rgb) + min(rgb)) / 2
-            if abs(li) <= 1e-5 or abs(1 - li) < 1e-5 or ref[0] != ref[0]:
-                if any(abs(rec["t"][i] - ref[i]) > 1e-6 for i in (1, 2)):
-                    guard += 1
-                continue
-        hi = R.POLAR.get(rec["tspace"])
-        for i in range(3):
-            if rec["tm"][i] or ref[i] != ref[i]:
-                continue
-            if i == hi and ref[1] < 0.01 * SCALE[rec["tspace"]][1]:
-                continue  # hue of a near-achromatic color is ill-conditioned
-            if hi is not None and i == 1 and rec["tspace"] in ("lch", "oklch") and \
-                    min(abs(rec["t"][1]), abs(ref[1])) <= (0.0015 if rec["tspace"] == "lch" else 0.000004):
-                FOUND.add("P2-8")
-                continue  # chroma inside the powerless epsilon (zeroed with a different threshold: P2-8)
-            if rec["tspace"] == "a98-rgb" and abs(ref[i]) < 1e-6:
-                continue  # pure-gamma transfer has an infinite slope at 0: 1e-17 residuals become 1e-8
-            d = hue_diff(rec["t"][i], ref[i]) if i == hi else abs(rec["t"][i] - ref[i])
-            rel = d / (SCALE[rec["tspace"]][i] * max(1.0, abs(ref[i]) / SCALE[rec["tspace"]][i]))
-            if rel > worst.get(rec["tspace"], (0, "", ""))[0]:
-                worst[rec["tspace"]] = (rel, rec["space"], s)
+        res = [(norm, _spec_errors(rec, to_space(rec, rec["tspace"], norm))) for norm in (False, True)]
+        ok = [x for x in res if x[1][1] == 0 and x[1][0] <= 1e-9]  # matches (or skipped without a guard diff)
+        if ok:
+            e, g, q, norm = ok[0][1][0], 0, ok[0][1][2], ok[0][0]
+        elif any(x[1][1] for x in res):
+            e, g, q, norm = -1.0, 1, False, False
+        else:
+            norm, (e, g, q) = min(res, key=lambda x: x[1][0])
+        if not norm and e >= 0 and res[1][1][0] > 1e-9:
+            p28 = True  # the build does not normalise a powerless origin the way the ED does (P2-8)
+        guard += g
+        p28 = p28 or q
+        if e >= 0 and e > worst.get(rec["tspace"], (0, "", ""))[0]:
+            worst[rec["tspace"]] = (e, rec["space"], s)
+    return worst, guard, p28
+
+
+def cmd_spec(cases_path, pion_path, constants="ed"):
+    """pion T (= c.convert(target)) against spec_ref.convert(native coords) per target space.
+    constants=ed: the ED's current constants (information: also shows constant drift).
+    constants=package: css_color 0.1.0's pre-2023 Bradford / ProPhoto constants and routing.
+    constants=auto (the gate): ED constants first; if some target is > 1e-9 of the range, retry with the old
+    Bradford and/or ProPhoto constants (and with/without the D65 routing of D50 <-> D50 conversions). Passing only
+    with old constants = constant drift (P2-2, exit 3); failing with every set = software math error (exit 1).
+    HSL/HWB targets inside the ED near-white/black guard are counted for P1-1 and skipped."""
+    cases, pion = read_cases(cases_path), lines(pion_path)
+    if constants == "auto":
+        combos = [("ed", "ed", False), ("ed", "ed", True), ("old", "old", True), ("old", "old", False),
+                  ("ed", "old", False), ("ed", "old", True), ("old", "ed", True), ("old", "ed", False)]
+    elif constants == "package":
+        combos = [("old", "old", True)]
+    else:
+        combos = [("ed", "ed", False)]
+    chosen = None
+    for combo in combos:
+        R.set_constants(*combo)
+        worst, guard, p28 = spec_worst(cases, pion)
+        if all(v[0] <= 1e-9 for v in worst.values()):
+            chosen = combo
+            break
+    if chosen is None:  # report against the first set
+        R.set_constants(*combos[0])
+        worst, guard, p28 = spec_worst(cases, pion)
     bad = []
     for dst in R.SPACES:
         e, src, s = worst.get(dst, (0.0, "-", "-"))
@@ -511,12 +553,21 @@ def cmd_spec(cases_path, pion_path, constants="ed"):
     if guard:
         print("    %d HSL/HWB results inside the ED near-white/black guard differ (P1-1)" % guard)
         FOUND.add("P1-1")
-    if constants == "package":
-        print("  software math (constants equalised): %s" % ("FAIL > 1e-9: " + " ".join(bad) if bad else "all targets <= 1e-9"))
-        return 1 if bad else (3 if guard else 0)
-    if bad:
+    if p28:
+        FOUND.add("P2-8")
+    if constants == "ed":
+        if bad:
+            FOUND.add("P2-2")
+        return 3 if bad or guard else 0
+    if chosen is None:
+        print("  software math: FAIL > 1e-9 with every constant set: " + " ".join(bad))
+        return 1
+    drift = chosen[:2] != ("ed", "ed")
+    print("  software math: all targets <= 1e-9 with Bradford=%s ProPhoto=%s constants%s" % (
+        chosen[0], chosen[1], " (pre-2023 constants: P2-2)" if drift else ""))
+    if drift:
         FOUND.add("P2-2")
-    return 3 if bad or guard else 0
+    return 3 if drift or guard or p28 else 0
 
 
 def cmd_rust(cases_path, pion_path, rust_path):
@@ -532,6 +583,11 @@ def cmd_rust(cases_path, pion_path, rust_path):
         rs = w[8]
         if rs != rec_space(rp) or any(abs(v) > 1e6 for v in rp["c"]):
             continue
+        if rs in ("hsl", "hwb"):
+            rgb = to_space(rp, "srgb")
+            li = (max(rgb) + min(rgb)) / 2
+            if abs(li) <= 1e-5 or abs(1 - li) < 1e-5:
+                continue  # color 0.3.3 has the same missing near-white/black guard as css_color 0.1.0 (P1-1)
         n += 1
         hi = R.POLAR.get(rs)
         e = 0.0
@@ -610,8 +666,10 @@ def cmd_roundtrip(cases_path, pion_path, nex=4):
             continue
         if any(abs(v) >= 9.2e12 for v in rec["c"]):
             k = "P2-1 (|component| >= 2^63 / 1e6 is serialized as 9223372036854.775807)"
-        elif rec["space"] == "hsl" and not (0 <= rec["c"][1] <= 100 and 0 <= rec["c"][2] <= 100):
-            k = "P2-9 (hsl S > 100% / L outside 0..100 serialized, clamped again on re-parse)"
+        elif rec["space"] == "hsl" and rec["c"][1] > 100 and 0 <= rec["c"][2] <= 100:
+            k = "P2-9 (hsl S > 100% serialized, clamped again on re-parse)"
+        elif rec["space"] == "hsl" and not 0 <= rec["c"][2] <= 100:
+            k = "P2-1 (hsl L outside 0..100 serialized as hsl(), which clamps L on re-parse)"
         elif (rec["space"] in ("lab", "lch") and not 0 <= rec["c"][0] <= 100) or \
                 (rec["space"] in ("oklab", "oklch") and not 0 <= rec["c"][0] <= 1):
             k = "P2-1 (lab/oklab L outside the parse-time clamp range serialized as lab()/oklab())"

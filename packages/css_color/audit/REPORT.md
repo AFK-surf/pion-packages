@@ -14,7 +14,7 @@
 |---|---|---|
 | **P0** | **0** | No crash, trap, hang or nondeterminism. **33 151 corpus inputs** (named, hex, syntax matrix, `none`/powerless, `color-mix()`, relative/`calc()`, 6 000 numeric, **10 000 fuzz**, **11 654 WPT vectors**) + 1 424 gamut mappings + 228 DoS bombs + a 32 368-call API sweep with NaN/±Inf/subnormals give **byte-identical results in native debug/release and wasm32 debug/release**. Parsing is linear: a 16 KiB full binary `color-mix()` tree (depth 9, 512 leaves) takes 0.27 ms; 32/33-level guards hold for `color-mix`, `from` and `calc()`. Software `pow/cbrt/sin/cos/atan2/exp/ln/sqrt` match libm float64 to **≤ 1e-12** of the range on every conversion path. Every remaining divergence from WPT is reproduced and removed by a working candidate fix (fix model, below): **0 unexplained**. |
 | **P1** | 2 | **P1-1**: HSL/HWB of near-white / near-black colors lacks the ED epsilon guard. `lab(100 0 0)` converts to `hsl(91.76 848.95% 100%)`, and `color-mix(in hsl, lab(100 0 0), blue)` gives `hsl(165.9 474.5% 75%)`, a saturated cyan far outside sRGB. The WPT answer is `hsl(240 50% 75%)`. **P1-2**: relative-color channel keywords turn `none` and powerless hues into `0`. `oklch(from #808080 l c h)` gets hue 0° instead of `none`, so `color-mix(in oklch, oklch(from #808080 l c h), oklch(0.7 0.2 140))` gives hue **70°** (orange) instead of 140° (Chrome and WPT). This accounts for 335 WPT vectors. |
-| P2 | 14 | P2-1 `to_css()` corrupts \|v\| ≥ 9.2e12 and writes NaN/Inf as `0`. P2-2 Bradford/ProPhoto constants are pre-2023 values, and the rec2020 transfer differs from the ED. P2-3 hash/`from` token boundaries. P2-4 `calc()` is too lax. P2-5 `calc()`/literals are too strict. P2-6 CSS Color 5 ED `color-mix()` forms and `display-p3-linear` are rejected. P2-7 x/y/z analogs and analogous sets are not carried. P2-8 powerless epsilons. P2-9 `hsl()` clamps S > 100% and L. P2-10 `to_gamut` early exit. P2-11 `color-mix()` missing hue and zero-alpha rules. P2-12 hues ≥ 2^52·360 normalise to 0. P2-13 README/process claims. P2-14 WCAG helpers ignore alpha. |
+| P2 | 14 | P2-1 `to_css()` corrupts \|v\| ≥ 9.2e12 and writes NaN/Inf as `0`. P2-2 Bradford/ProPhoto constants are pre-2023 values. P2-3 hash/`from` token boundaries. P2-4 `calc()` is too lax. P2-5 `calc()`/literals are too strict. P2-6 CSS Color 5 ED `color-mix()` forms and `display-p3-linear` are rejected. P2-7 x/y/z analogs and analogous sets are not carried. P2-8 powerless epsilons. P2-9 `hsl()` clamps S > 100% and L. P2-10 `to_gamut` early exit. P2-11 `color-mix()` missing hue and zero-alpha rules. P2-12 hues ≥ 2^52·360 normalise to 0. P2-13 README/process claims. P2-14 WCAG helpers ignore alpha. |
 
 `run_audit.sh` exits **0** on the baseline (`AUDIT PASS (0 P0)`, with OPEN lines for P1-1, P1-2 and P2-1…P2-14). `STRICT=1 sh packages/css_color/audit/run_audit.sh` exits **1**.
 
@@ -33,7 +33,7 @@
 - **Numeric accuracy**:
   - `color =0.3.3` (f32): 6 000/6 000 random colors in 14 source forms × 14 target spaces agree to 3.1e-5 of the range; named and hex agree to 1e-7.
   - Chrome: 6 000/6 000 within its float32 tolerance.
-  - `spec_ref.py`, with css_color's constants swapped in so that only the math is compared: **every target ≤ 1e-9** (sRGB/P3/a98/rec2020/XYZ/Oklab ≈ 1e-13; Lab/LCh ≈ 1e-12).
+  - `spec_ref.py` (`compare.py spec … auto`): **every target ≤ 1e-9** (sRGB/P3/a98/rec2020/XYZ/Oklab ≈ 1e-13; Lab/LCh ≈ 1e-12). The gate first uses the ED's constants; if they fail, it retries with css_color 0.1.0's pre-2023 Bradford and/or ProPhoto constants and routing. Passing only with old constants means P2-2; failing with every set is a P0 math error. It also accepts an origin normalised the ED's powerless way, which is what a P2-8 fix does, and reports P2-8 while a build does not do it.
   - The sRGB, Display-P3, A98, Rec.2020 and Oklab matrices equal the ED's rational matrices to ≤ 2.2e-16.
 - **`color-mix()`**:
   - All 14 spaces and 4 hue modes are covered, crossing 0/360, exactly 180° apart (shorter goes increasing, as the ED specifies), one or both hues `none`, alpha `0`/`none`, and percentage normalisation (`< 100%` alpha multiplier, `> 100%` scaling, one or both omitted, `-10%` / `150%` rejected).
@@ -81,10 +81,12 @@
     - `ORACLE-chrome-powerless` (82): polar mixes or relative colors of near-achromatic inputs, where Chrome keeps float32 noise hues that the ED makes powerless;
     - `ORACLE-chrome-a98` (52): Chrome's a98-rgb path is off by up to 0.0064. `color(from red a98-rgb r g b)` gives `g = −0.0064` in Chrome, while the exact answer is 0 because red is an a98 primary; css_color matches `spec_ref` to 1e-15.
   - `ORACLE-ill-conditioned` (9): angles of 1e300rad/grad, where the double rounding of the unit conversion exceeds 360°.
-  - `ORACLE-chrome-rec2020-pre-ED` (0 on the baseline): Chrome 159 still uses the BT.2020 piecewise transfer, while the ED and WPT use gamma 2.4 (P2-2). The rule exists so that a fix branch following WPT is not flagged against the older Chrome golden. The baseline agrees with Chrome on every rec2020 conversion, and `spec_ref` checks rec2020 math either way.
+  - `ORACLE-wpt-rec2020` (2 WPT vectors): the 2025 ED and WPT moved rec2020 to BT.1886 gamma 2.4. Chrome 159, `color 0.3.3`, `spec_ref.py` and css_color keep the BT.2020 piecewise OETF, so this is an oracle disagreement, not a finding. It is explained by the last fix-model stage. `ORACLE-chrome-rec2020-pre-ED` (0 on the baseline) covers the opposite choice against the Chrome golden.
 - **Rust `color =0.3.3`** (`diff/oracle`, locked): a parse + convert oracle in f32. It parses neither `color-mix()`, relative colors nor `calc()`, and lacks the 7 `grey` aliases.
 - **`diff/spec_ref.py`**: a float64 port of the ED sample code. Matrices are derived from the primaries and white points with rational arithmetic, and match the ED's printed values. It also contains the ED gamut-mapping algorithm and the WCAG formula.
-- **Fix model** (`diff/fixmodel.py`): 8 cumulative candidate fixes applied to copies of `src/`, one per value finding (P1-1, P2-8, P1-2, P2-7, P2-11, P2-12, P2-9, P2-2).
+- **Fix model** (`diff/fixmodel.py`): 8 cumulative candidate fixes applied to copies of `src/`, one per value finding (P1-1, P2-8, P1-2, P2-7, P2-11, P2-12, P2-9, P2-2), plus the oracle stage `ORACLE-wpt-rec2020`.
+  - On a tree that is already (partly) fixed, a patch whose original snippet is gone is skipped. A stage that then fails to compile is reverted to the previous stage's source and binary, so the fix model never causes a P0. The `build` section prints `patches applied / reverted` per stage.
+  - The harness has alternative injection points for each bug. It needs at least 3 of the 5 to be injectable.
   - A value divergence is attributed to the first stage that makes css_color agree with the oracle, and only if the audited build's output equals the fix model's base output (so an injected bug cannot be "explained" away).
   - Acceptance divergences are attributed by narrow patterns (`compare.py classify_accept`).
   - Applying all 8 stages: WPT passes go from 9 849 to 10 349, the package's own 32 tests still pass, and red-team cases P1-1, P1-2, P2-2, P2-7, P2-8, P2-9, P2-11 and P2-12 flip to PASS. The remaining WPT gaps are the acceptance findings P2-4/5/6 and out of scope.
@@ -126,7 +128,7 @@ Severity follows the trigger: P1 = wrong visible output for ordinary, valid inpu
 ### P2-1 — `to_css()` fidelity (`format.pion:78-116`)
 
 - **Cause**: `format_num` computes `floor(|v| * 1e6 + 0.5).to_int64()`. That saturates for |v| ≥ 2^63/1e6 ≈ 9.22e12, so every such value is written as `9223372036854.775807`. NaN and ±Inf are written as `0` without notice. 22 syntax-corpus inputs are affected, e.g. `color(srgb 1e13 0 0)`; Chrome serializes `1.00000e+13`.
-- **Also**: an out-of-range Lab/Oklab L (reachable through `convert`) is serialized as `lab()`/`oklab()`, which clamps L when re-parsed.
+- **Also**: an out-of-range Lab/Oklab L (reachable through `convert`) is serialized as `lab()`/`oklab()`, and an HSL L outside 0..100 (relative colors such as `hsl(from color(display-p3 1 0 0) l h s)`) as `hsl()`. Both forms clamp L when re-parsed. A lossless form (e.g. `color(srgb …)`) is needed for such values.
 - Everything else round-trips: 6 000/6 000 numeric colors, and every in-range WPT result.
 - **Fix**: exponent notation for large magnitudes, and an explicit choice for non-finite values (`calc(infinity)` like Chrome, or an error).
 - **Case**: `redteam_p2_1_to_css_fidelity`.
@@ -136,7 +138,8 @@ Severity follows the trigger: P1 = wrong visible output for ordinary, valid inpu
 - **Bradford D65↔D50** is the pre-2023 matrix (max difference 7.7e-8). The ED's values equal the first-principles derivation in `spec_ref.py`.
 - **The ProPhoto RGB matrices** are the old ones (8e-6). With the ED's constants, conversions from ProPhoto move by up to 1.6e-4 of the range (sub-LSB in 8-bit).
 - **D50↔D50 conversions** (Lab↔ProPhoto, LCh↔XYZ-D50) round-trip through D65 with two matrices that are not exact inverses, adding ~1e-6.
-- **rec2020**: the ED now defines its transfer as BT.1886 gamma 2.4. css_color keeps the BT.2020 piecewise OETF, like Chrome 159 and `color 0.3.3`. 4 WPT vectors are attributed to fix-model stage 8: 2 follow the ED's rec2020 transfer, and 2 are the Bradford/ProPhoto drift amplified by `calc(c * 1000)`.
+- 2 WPT vectors (`lch(from hwb(180 99.96% 0%) l calc(c * 1000) h)`, `color-mix(in oklch, lch(20 0.00151 180), …)`) are this drift amplified, and are attributed to the P2-2 stage.
+- **rec2020** is not part of P2-2. The 2025 ED defines its transfer as BT.1886 gamma 2.4, but css_color correctly keeps the BT.2020 piecewise OETF, like Chrome 159 and `color 0.3.3`. The 2 WPT vectors that follow the new ED are classed `ORACLE-wpt-rec2020`.
 - The README's "exact §18 matrices, exact Bradford" claim is not accurate.
 - **Case**: `redteam_p2_2_ed_matrices`.
 
