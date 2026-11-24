@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 import spec_ref  # noqa: E402
 
 MODE_FLAGS = {
-    "parse": ["samesite_keep", "path_keep"],
+    "parse": ["samesite_keep", "path_keep", "format_nameless_raw", "format_nameless_always", "format_nameless_err"],
     "date": [],
     "psl": ["ip_trailing", "no_uts46", "psl_reject_noncanonical", "psl_reject_long"],
     "match": ["url_backslash", "url_reject_backslash"],
@@ -136,6 +136,8 @@ def cmd_spec(mode, cases_path, pion_path):
         for raw, got in zip(cases, pion):
             if mode in ("parse", "date") and got.startswith("ERR"):
                 got = "ERR"  # the error variant is the package's choice
+            if mode == "parse" and " F=ERR:" in got:
+                got = re.sub(r" F=ERR:\w+", " F=ERR", got)
             ref = model_line(mode, raw, set())
             if got == ref:
                 continue
@@ -241,7 +243,7 @@ def cmd_rustpsl(cases_path, pion_path, rust_path, newer):
     """Pion `ps` / `rd` vs psl 2.1.261 on inputs that are lower-case ASCII with no empty label / leading dot / IP."""
     cases, pion, rust = lines(cases_path), lines(pion_path), lines(rust_path)
     newer = set(newer)
-    n, agree, snap, nest, bad = 0, 0, 0, [], []
+    n, agree, snap, nest, bad, longref = 0, 0, 0, [], [], 0
     for raw, p, r in zip(cases, pion, rust):
         d = raw
         if raw.startswith("hex:") or not d or d != d.lower() or d.startswith(".") or d.endswith(".") or ".." in d \
@@ -254,6 +256,9 @@ def cmd_rustpsl(cases_path, pion_path, rust_path, newer):
             agree += 1
             continue
         labels = d.split(".")
+        if f[0] == "-" and (len(d) > 253 or any(len(x) > 63 for x in labels)):
+            longref += 1  # RFC 1035 limits: refusing the name is an accepted fail-closed choice
+            continue
         hits = [x for x in newer if any(".".join(labels[i:]) == x.lstrip("*.").lstrip("!") for i in range(len(labels)))]
         if hits:
             snap += 1
@@ -265,8 +270,10 @@ def cmd_rustpsl(cases_path, pion_path, rust_path, newer):
         n, agree, snap, ", ".join(sorted(newer))))
     print("    %d differ where psl 2.1.261 mis-handles a wildcard nested under a wildcard (oracle bug, e.g. %s: "
           "the PSL algorithm and Pion give the full name)" % (len(nest), nest[0] if nest else "-"))
+    if longref:
+        print("    %d names over 253 octets / labels over 63 octets refused by Pion (accepted alternative)" % longref)
     for d, p, r in bad[:5]:
-        print("    UNEXPLAINED %s pion=%s rust=%s" % (d, p, r))
+        print("    UNEXPLAINED %s pion=%s rust=%s" % (d[:120], p[:120], r[:120]))
     return 1 if bad else 0
 
 
@@ -308,6 +315,58 @@ def cmd_pslfile(pion_src, dat):
     return 0 if ok else 3
 
 
+def cmd_pslindex(index_src, data_src):
+    """A generated node-flag index (src/psl_index.pion, added by the fix) must agree with the rule table: one entry per
+    PSL node with flags 1/2 = ICANN/Private rule, 4/8 = ICANN/Private wildcard child, 16 = has children,
+    32 = has an exception child. Exit 0 consistent, 1 inconsistent (P0), 2 absent / unknown format (information)."""
+    if not os.path.exists(index_src):
+        print("  no psl_index.pion (rule table only)")
+        return 2
+    src = open(index_src, encoding="utf-8").read()
+    try:
+        def lit(name):
+            m = re.search(r"fn " + name + r'\(\) -> String \{\s*"(.*?)"\s*\}', src, re.S)
+            return m.group(1).encode("utf-8").decode("unicode_escape")
+        cnt = int(re.search(r"fn psl_node_count\(\) -> Int \{\s*(\d+)", src).group(1))
+        data, offs = lit("psl_node_data"), lit("psl_node_offsets")
+        dec6 = lambda c: ord(c) - 49 if ord(c) > 92 else ord(c) - 48
+        u18 = lambda s, i: (dec6(s[3 * i]) << 12) | (dec6(s[3 * i + 1]) << 6) | dec6(s[3 * i + 2])
+        nodes = {}
+        for i in range(cnt):
+            a, b = u18(offs, i), u18(offs, i + 1)
+            nodes[data[a:b - 1]] = dec6(data[b - 1])
+    except (AttributeError, IndexError, ValueError):
+        print("  psl_index.pion has an unknown layout: correctness rests on the end-to-end model / test_psl gates")
+        return 2
+    plit = re.search(r'"(.*)"', open(data_src, encoding="utf-8").read(), re.S).group(1)
+    R = {l.rsplit("\t", 1)[0]: l.rsplit("\t", 1)[1] for l in plit.encode("utf-8").decode("unicode_escape").split("\n") if l}
+    D = {}
+
+    def add(n, f=0):
+        D[n] = D.get(n, 0) | f
+    for r, sec in R.items():
+        if r.startswith("!"):
+            base = r[1:]
+            add(base.split(".", 1)[1], 32)
+        elif r.startswith("*."):
+            base = r[2:]
+            add(base, 4 if sec == "I" else 8)
+        else:
+            base = r
+            add(base, 1 if sec == "I" else 2)
+        labs = base.split(".")
+        for i in range(len(labs)):
+            add(".".join(labs[i:]))
+    for n in list(D):
+        if "." in n:
+            add(n.split(".", 1)[1], 16)
+    bad = [k for k in set(D) | set(nodes) if D.get(k, 0) != nodes.get(k, 0)]
+    srt = [k.encode() for k in nodes] == sorted(k.encode() for k in nodes)
+    print("  psl_index.pion: %d nodes, %s, %d disagree with the rule table%s" % (
+        len(nodes), "byte-sorted" if srt else "NOT sorted", len(bad), (" (e.g. %s)" % ", ".join(sorted(bad)[:4])) if bad else ""))
+    return 0 if (not bad and srt) else 1
+
+
 def main():
     a = sys.argv[1:]
     if a[0] == "same":
@@ -320,6 +379,8 @@ def main():
         sys.exit(cmd_rustpsl(a[1], a[2], a[3], a[4:]))
     if a[0] == "testpsl":
         sys.exit(cmd_testpsl(a[1], a[2]))
+    if a[0] == "pslindex":
+        sys.exit(cmd_pslindex(a[1], a[2]))
     if a[0] == "pslfile":
         sys.exit(cmd_pslfile(a[1], a[2]))
     print("bad arguments")

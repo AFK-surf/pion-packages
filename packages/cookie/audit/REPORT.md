@@ -40,6 +40,7 @@
 | P2-8 | Hosts are not canonicalised: trailing-dot IPv4 treated as a name, no UTS #46 mapping before the PSL lookup | `src/psl.pion:343-387`, `:236-261` |
 | P2-9 | PSL lookup 0.03x of `psl 2.1.261` (≈7.3 binary searches per match, 2 matches per op) | `src/psl.pion:399-462`, `:265-319` |
 | P2-10 | README claims: table size in KiB wrong (167.9 KiB, not 171.9), PSL snapshot not named, "lossless" export, parser "validates" Partitioned | `README.md:9,13,19` |
+| P2-11 | (re-audit of the fix) generated `src/psl_index.pion` has no generator in the repository | `src/psl_index.pion` @ `eaeb5880` |
 
 Severity scale: **P0** = crash / trap / hang on any input, mode divergence, or a broken advertised guarantee with no
 attacker precondition; **P1** = a security property the package advertises (prefixes, Secure / HttpOnly / SameSite
@@ -48,6 +49,38 @@ http://, a sibling subdomain, a cross-site page, or a caller passing through unt
 without a direct security consequence, robustness, performance or documentation.
 Trigger tiers (security-audit convention): ① default configuration, no special input; ② specific but legitimate
 configuration / timing; ③ attacker-controlled input across a trust boundary.
+
+## Re-audit of `origin/feat/pkg-cookie-fix` @ `eaeb5880` (E-cookie-Fix-1)
+
+Every changed file was reviewed (`parse.pion`, `date.pion`, `jar.pion`, `psl.pion`, new `psl_index.pion`, README) and
+this suite was run on the merged tree (`audit/` from this branch on top of `eaeb5880`).
+
+Audit-side correction found while running the fix: the model's `format_set_cookie` wrote a nameless value containing
+`=` without the leading `=` that `redteam_p2_4_format_date_range` requires, so the fixed formatter showed up as 21
+unexplained parse divergences. The model now writes `=<value>` (the conforming behaviour); the v0.1.0 behaviour is the
+P2-4 emulation flag `format_nameless_raw`, and "always `=`" / "refuse" are accepted alternatives. On `083024a1` the run
+is unchanged: `EXIT=0`, `STRICT=1` → `EXIT=1`, the same 16 findings, harness 5/5.
+
+Verified fixed on `eaeb5880`: P1-1 … P1-6, P2-1, P2-2, P2-3, P2-4, P2-6 (all bombs < 0.35 s native, < 0.52 s wasm32),
+P2-7, P2-9 (0.20x of `psl 2.1.261`, 6x faster; the node-flag index was decoded independently: 10,923 nodes,
+byte-sorted, 0 disagreements with the rule table — gate `compare.py pslindex`), P2-10. Model divergences: parse / date /
+match / jar 0; psl only P2-8 and accepted alternatives. No new P0 / P1. Residual, kept OPEN (gates extended):
+
+- **P2-5 (reopened, pre-existing gap missed in round 1)**: `import_text` accepts a domain cookie on a public suffix
+  (`sid evil co.uk host_only=0`) and `matching_cookies` sends it to every `*.co.uk` site; §5.7 step 9 never creates such
+  a cookie and §5.8.3 step 3 excludes it at retrieval. `redteam_p2_5_export_import` now also asserts that an imported
+  `Domain=co.uk` cookie is not sent to https://victim.co.uk/ (rejecting the record, dropping it, or filtering at
+  retrieval all pass).
+- **P2-8 (partially fixed)**: UTS #46 folding covers ASCII and Latin-1 only (`uts46_fold_codepoint`), so
+  `registrable_domain("x.ПР.СРБ")` = `ПР.СРБ` (the public suffix `пр.срб` in upper case) and `www.ＥＸＡＭＰＬＥ.com` →
+  `ＥＸＡＭＰＬＥ.com`. The case now also covers Cyrillic upper case and fullwidth Latin; mapping them (NFKC + lower
+  case) or refusing non-canonical input (None) both pass.
+- **P2-11 (new)**: `src/psl_index.pion` (194 KB of generated literals) has no generator in the repository, so a PSL
+  refresh cannot rebuild it and nothing but this audit ties it to `psl_data.pion`. Gate: a non-documentation file
+  outside `src/` / `audit/` (package or `scripts/`) that produces `psl_node_data`.
+- Information (not gated): `store_cookie(Cookie::new(..).with_domain(".example.com"))` is now refused
+  (`DomainMismatch`) because the store no longer strips a second dot (the P2-3 fix); worth a line in the README that
+  `with_domain` takes the domain without a leading dot.
 
 ## P1 findings
 

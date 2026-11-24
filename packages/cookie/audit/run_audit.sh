@@ -227,6 +227,7 @@ oracles() {
       P2-1) open_finding "P2-1: invalid SameSite keeps an earlier value; Lax exemption ignores non-HTTP retrievals" ;;
       P2-2) open_finding "P2-2: an invalid later Path does not reset the cookie-path to the default-path" ;;
       P2-3) open_finding "P2-3: Domain loses two leading dots (Domain=..example.com accepted)" ;;
+      P2-4) open_finding "P2-4: format_set_cookie writes a nameless value containing '=' as a named cookie" ;;
       P2-8) open_finding "P2-8: hosts are not canonicalised (trailing-dot IP, UTS #46 case / full stops)" ;;
       *) open_finding "$id: (reference model)" ;;
     esac
@@ -250,6 +251,17 @@ EOF
   if [ $r = 3 ]; then
     touch "$AUDIT_OUT/psl_snapshot_differs"
     echo "  (information) the package embeds another PSL snapshot: the model uses the embedded table from here on"
+  fi
+  $CMP pslindex "$PKG_DIR/src/psl_index.pion" "$PKG_DIR/src/psl_data.pion"
+  r=$?
+  [ $r = 1 ] && fail "generated PSL node index disagrees with the rule table"
+  if [ -f "$PKG_DIR/src/psl_index.pion" ]; then
+    # P2-11: a generated index needs its generator in the repository, or a PSL refresh cannot regenerate it
+    gen=$(grep -rl 'psl_node_data' "$PKG_DIR" "$ROOT_DIR/scripts" 2> /dev/null | grep -v "^$AUDIT_DIR/" | grep -v "^$PKG_DIR/src/" |
+      grep -vE '\.(md|txt|json)$' | head -1)
+    if [ -n "$gen" ]; then echo "  index generator: ${gen#$ROOT_DIR/}"; else
+      open_finding "P2-11: src/psl_index.pion is generated but no generator is in the repository (PSL refresh cannot rebuild it)"
+    fi
   fi
   $CMP testpsl "$C/testpsl.expect" "$AUDIT_OUT/pion_testpsl.txt" || fail "Mozilla test_psl.txt vector mismatch"
   "$BIN/oracle" psl "$C/psl.cases" > "$AUDIT_OUT/rust_psl.txt" || fail "oracle crashed on psl"
@@ -286,8 +298,8 @@ for d in open(os.path.join(sys.argv[3], "psl_corpus.txt")):
         if ".".join(labs[n - k:]) not in nodes:
             break
     cnt += 1
-print("  bench corpus: %.2f binary searches per match_psl_internal (exception + exact + wildcard per label);"
-      " a table with per-node flags needs %.2f" % (cur / cnt, opt / cnt))
+print("  bench corpus (information): the v0.1.0 walk needs %.2f binary searches per match (exception + exact +"
+      " wildcard per label); a walk over per-node flags needs %.2f" % (cur / cnt, opt / cnt))
 PY
 }
 

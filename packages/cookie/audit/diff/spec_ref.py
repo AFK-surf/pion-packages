@@ -32,12 +32,15 @@ FLAG_IDS = {
     "lax_nonhttp": "P2-1",
     "path_keep": "P2-2",
     "domain_multidot": "P2-3",
+    "format_nameless_raw": "P2-4",
     "ip_trailing": "P2-8",
     "no_uts46": "P2-8",
     # accepted alternatives (fail-closed choices a fix may make; not findings)
     "url_reject_backslash": "OK",
     "psl_reject_noncanonical": "OK",
     "psl_reject_long": "OK",
+    "format_nameless_always": "OK",
+    "format_nameless_err": "OK",
 }
 
 
@@ -279,8 +282,17 @@ def cookie_line(c):
         c["secure"], c["http_only"], c["same_site"] or "-", c["partitioned"])
 
 
-def format_set_cookie(c):
-    s = (c["name"] + b"=" + c["value"]) if c["name"] else c["value"]
+def format_set_cookie(c, flags=()):
+    """None = refused. A nameless cookie whose value contains '=' is written as `=<value>` so that it re-parses as a
+    nameless cookie (P2-4); always writing `=<value>` for nameless cookies, or refusing them, are accepted alternatives."""
+    if c["name"]:
+        s = c["name"] + b"=" + c["value"]
+    elif "format_nameless_err" in flags and b"=" in c["value"]:
+        return None
+    elif "format_nameless_always" in flags or (b"=" in c["value"] and "format_nameless_raw" not in flags):
+        s = b"=" + c["value"]
+    else:
+        s = c["value"]
     if c["expires"] is not None:
         s += b"; Expires=" + format_cookie_date(c["expires"]).encode()
     if c["max_age"] is not None:
@@ -305,7 +317,9 @@ def parse_line(b, flags=()):
     if c is None:
         return "ERR"
     base = cookie_line(c)
-    f = format_set_cookie(c)
+    f = format_set_cookie(c, flags)
+    if f is None:
+        return "OK %s F=ERR R=-" % base
     c2 = parse_set_cookie(f, flags)
     r = "E" if c2 is None else ("1" if cookie_line(c2) == base else "0")
     return "OK %s F=%s R=%s" % (base, esc(f), r)
@@ -376,7 +390,8 @@ def _labels(b, flags):
     except UnicodeDecodeError:
         return None
     if "psl_reject_noncanonical" in flags:
-        if any(ch in s for ch in "\u3002\uff0e\uff61") or any(not ch.isascii() and ch != ch.lower() for ch in s):
+        if any(ch in s for ch in "\u3002\uff0e\uff61") or \
+                any(not ch.isascii() and unicodedata.normalize("NFKC", ch).lower() != ch for ch in s):
             return None
     if "no_uts46" not in flags:
         s = s.replace("。", ".").replace("．", ".").replace("｡", ".")
@@ -398,7 +413,7 @@ def _labels(b, flags):
         if "no_uts46" in flags:
             lab = "".join(ch.lower() if ch.isascii() else ch for ch in lab)
         else:
-            lab = unicodedata.normalize("NFC", lab.lower())
+            lab = unicodedata.normalize("NFKC", lab).lower()  # UTS #46 mapping for the corpus' inputs
         disp.append(lab)
     asc = [_puny(x) for x in disp]
     if "psl_reject_long" in flags and (any(len(x) > 63 for x in asc) or len(".".join(asc)) > 253):
