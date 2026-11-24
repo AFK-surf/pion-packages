@@ -145,6 +145,11 @@ def named():
                   "\u00e6ble.dk", "c\u0153ur.fr", "k\u0131rm\u0131z\u0131.com.tr", "\u30dd\u30b1\u30e2\u30f3123.jp",
                   "\u30b3\u30fc\u30d2\u30fc1.jp", "\u0442\u0435\u0441\u0442.\u0440\u0444", "\u03b1\u03b8\u03ae\u03bd\u03b1.gr",
                   "\u03b1\u03b3\u03bf\u03c1\u03ac.gr", "\u0442\u0435\u0441\u0442.bg", "\u0440\u0430\u0431\u043e\u0442\u0430.ua"])
+    # whole-script rule across TLDs: ordinary Greek / Cyrillic words and spoofs on native and foreign TLDs
+    words = ("αθήνα ελλάδα κύπρος ήλιος θάλασσα νέα τουρισμός αγορά ορος τέχνη υγεία παιδιά "
+             "тест москва сайт весна город новости работа банк такси кино почта школа рот нос сосна тесто хор "
+             "соӧр ѕсһӧн аррӏе раураӏ ехо").split()
+    add("wsc", [w + tld for w in words for tld in (".gr", ".com", ".eu", ".\u0440\u0444", ".bg", ".ua", ".cy", ".\u03b5\u03bb")])
     # UAX #9 isolates (outside the reference UBA's scope: INFO-10 / INFO-12)
     add("bidi_iso", ["\u20671 2\u2069", "a\u2067b\u2069c", "\u2067lapyap\u2069", "\u05d0\u2066ab\u2069\u05d1",
                      "\u2068\u05d0 1\u2069"])

@@ -442,6 +442,10 @@ SMALL_CAPS = {0x0299, 0x029C, 0x1D00, 0x1D04, 0x1D07, 0x1D0A, 0x1D0B, 0x1D0D, 0x
 CJK_SLASH = {0x30CE, 0x30BD, 0x30BE, 0x30F3, 0x30FC, 0x4E36, 0x4E40, 0x4E41, 0x4E3F, 0x4E00}
 
 
+# ccTLDs where the script is native (fix branch policy, Chrome-style); script ids: 4 Cyrillic, 3 Greek
+NATIVE_CC = {4: {"bg", "by", "kz", "mk", "rs", "ru", "ua"}, 3: {"gr", "cy"}}
+
+
 def _cjk_context(c):
     s = 2 if (0x41 <= c <= 0x5A or 0x61 <= c <= 0x7A) else D.script.get(c, 0)
     return s in (5, 6, 7, 8, 30) or c in (0x30FC, 0x30FB, 0x3005, 0x3006, 0x3007)
@@ -502,13 +506,14 @@ def display(cps):
                 reasons.add("MixedScript")
         sk = skeleton_bidi(lc) or skeleton_bidi(lc, False)
         if any(c >= 0x80 for c in lc) and 2 not in ids and len(ids) == 1:
-            if ids[0] in tld_ids:
-                if sk and all(c < 0x80 for c in sk):
-                    reasons.add("WholeScriptConfusable")
-            else:
-                base = [c for c in sk if not D.is_mark(c)]
+            native = ids[0] in tld_ids or (ids[0] == 4 and tld in NATIVE_CC[4]) or (ids[0] == 3 and tld in NATIVE_CC[3])
+            if ids[0] == 4 and not native:
+                # Cyrillic outside its native TLDs: diacritics (not overlays, ccc 1) ignored, small capitals count
+                base = [c for c in sk if not (D.is_mark(c) and D.ccc.get(c, 0) != 1)]
                 if base and all(c < 0x80 or c in SMALL_CAPS for c in base):
                     reasons.add("WholeScriptConfusable")
+            elif sk and all(c < 0x80 for c in sk):
+                reasons.add("WholeScriptConfusable")
         if any(c >= 0x80 and c not in D.id_allowed for c in lc) and 2 in ids and len(ids) == 1:
             if sk and all(c < 0x80 for c in sk):
                 reasons.add("WholeScriptConfusable")
