@@ -87,6 +87,16 @@ def bombs():
     a("b32_abs_list_cpu", "P1-6: 1 MB BaseURL, 99,999 absolute SegmentURL@media",
       doc(rep_tpl('<SegmentList duration="1">' + '<SegmentURL media="http://c/s"/>' * 99999 + "</SegmentList>"),
           base="<BaseURL>http://h/" + "a" * 1000000 + "/</BaseURL>"), "P1-6")
+    # P1-6 (second variant): a relative reference that climbs out of a long BaseURL directory ('../'): the merge and
+    # dot-segment removal touch the whole directory per segment while the resulting URL stays short
+    tl = '<SegmentTemplate media="../s$Number$"><SegmentTimeline><S d="1" r="99998"/></SegmentTimeline></SegmentTemplate>'
+    a("b34_dotdot_media_cpu", "P1-6: 1 MB BaseURL directory, media '../s$Number$', 99,999 segments",
+      doc(rep_tpl(tl), base="<BaseURL>http://h/" + "a" * 1000000 + "/</BaseURL>"), "P1-6")
+    a("b35_dotdot_rootless_cpu", "P1-6: 1 MB relative BaseURL directory, media '../s$Number$', 99,999 segments",
+      doc(rep_tpl(tl), base="<BaseURL>rel/" + "a" * 1000000 + "/</BaseURL>"), "P1-6")
+    a("b36_dotdot_list_cpu", "P1-6: 1 MB BaseURL directory, 99,999 SegmentURL@media='../s'",
+      doc(rep_tpl('<SegmentList duration="1">' + '<SegmentURL media="../s"/>' * 99999 + "</SegmentList>"),
+          base="<BaseURL>http://h/" + "a" * 1000000 + "/</BaseURL>"), "P1-6")
     # P1-5: namespace prefix lookup is a linear scan over every in-scope binding
     decl = " ".join('xmlns:p%d="urn:x:%d"' % (i, i) for i in range(255))
     leaf = "<a " + " ".join('q:a%d=""' % i for i in range(250)) + "/>"

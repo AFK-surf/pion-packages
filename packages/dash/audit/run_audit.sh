@@ -53,7 +53,7 @@ title() {
     P1-3) echo "SegmentTimeline r=-1 ignores presentationTimeOffset at the Period end (0 / wrong segment count)" ;;
     P1-4) echo "max_xml_depth above a few thousand turns deep input into native SIGSEGV / wasm32 stack overflow" ;;
     P1-5) echo "namespace prefix lookup scans every in-scope binding: 15 MB of prefixed names -> > 20 s CPU (introduced by the P2-9 fix)" ;;
-    P1-6) echo "resolve_url re-scans the whole BaseURL per segment even for absolute references: 1 MB MPD -> 49 s CPU" ;;
+    P1-6) echo "segment URL resolution costs O(|BaseURL|) per segment when the URL itself is short (absolute refs, '../'): 1 MB MPD -> > 20 s CPU" ;;
     P2-1) echo "Period@start not inferred (first Period, previous start + duration); segment count floors fractional ticks" ;;
     P2-2) echo "SegmentTimeline S@r below -1 accepted (treated as -1)" ;;
     P2-3) echo "README.md claims the package is \`Send\`-safe: 8 public types are !Send" ;;

@@ -8,6 +8,29 @@ sh packages/dash/audit/run_audit.sh            # exit 1 while any P0 reproduces
 STRICT=1 sh packages/dash/audit/run_audit.sh   # exit 1 while any finding is open
 ```
 
+## Re-audit 2 of `3e43ddc` (`origin/feat/pkg-dash-fix`, "P1-5 O(1) namespace lookup and P1-6 pre-parsed BaseURL")
+
+**Verdict: NOT SIGNED.** P1-5 is closed (`xp_ns_lookup` now uses a prefix -> binding-stack `Map`; `b33`
+0.71 s native / 1.03 s wasm32, was 65 s). P1-6 is closed only for absolute references (`b31` 0.03 s, `b32` 0.07 s);
+a second variant still reproduces. `STRICT=1 sh packages/dash/audit/run_audit.sh`: `EXIT=1`, 1 OPEN (P1-6), 0 P0;
+everything else as in re-audit 1 (27/27 cases in 4 modes, model 2,216/2,216 + API 387/387 conforming, 4-mode
+determinism, smoke = README.md, bench 1.29x at load 9.5, 5/5 injections).
+
+**P1-6, relative variant.** `resolve_url_parsed` (`src/resolve.pion`) builds `pb.dir + r.path` and runs
+`remove_dot_segments` (or `rootless_norm`) over it for every segment. A reference that climbs out of the directory
+(`../s$Number$`, `SegmentURL media="../s"`) produces a short URL, so the 64 MiB output budget never triggers, while
+each segment costs O(|BaseURL directory|):
+
+| Bomb | Input | native `--release` |
+| --- | ---: | --- |
+| `b34` 1 MB absolute BaseURL directory, `media="../s$Number$"`, 99,999 segments | 976 KB | 27 s (> 20 s budget, also wasm32) |
+| `b35` the same with a relative BaseURL `rel/aaa.../` | 976 KB | 56 s |
+| `b36` 1 MB BaseURL directory, 99,999 `SegmentURL@media="../s"` | 3 MB | 27 s |
+
+Fix direction: split the (already normalised) base directory into segments once per track and, per reference,
+drop as many trailing segments as it has leading `../` before appending the rest; or charge the length of the
+merged path, not only the output, to `max_output_bytes`.
+
 ## Re-audit of `b9cd082` (`origin/feat/pkg-dash-fix`, "resolve all 15 red-team audit findings")
 
 **Verdict: NOT SIGNED.** All 15 original findings are closed, but the fix leaves one CPU amplification of the
