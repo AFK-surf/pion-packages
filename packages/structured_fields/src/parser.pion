@@ -1,0 +1,801 @@
+///| RFC 9651 §4.2 Structured Field Values parser.
+///| Pure Pion parser with exact integer arithmetic and explicit limits.
+
+struct Parser {
+  bytes : Bytes
+  len : Int
+  mut pos : Int
+  limits : SfvLimits
+}
+
+fn Parser::new(input : String, limits : SfvLimits) -> Result[Parser, SfvError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let bytes = input.to_bytes()
+  let len = bytes.length()
+  if len > limits.max_input_bytes {
+    return Err(SfvError::LimitExceeded("input exceeds max_input_bytes"))
+  }
+  // RFC 9651 §4.2 step 1: input must be pure ASCII (0x00..=0x7F).
+  let mut i = 0
+  while i < len {
+    if bytes[i].to_int() >= 128 {
+      return Err(SfvError::InvalidSyntax("non-ASCII byte in structured field input"))
+    }
+    i = i + 1
+  }
+  Ok(Parser::{ bytes: bytes, len: len, pos: 0, limits: limits })
+}
+
+fn Parser::skip_sp(self : Parser) -> Unit {
+  while self.pos < self.len && self.bytes[self.pos].to_int() == 32 {
+    self.pos = self.pos + 1
+  }
+}
+
+fn Parser::skip_ows(self : Parser) -> Unit {
+  while self.pos < self.len {
+    let b = self.bytes[self.pos].to_int()
+    if b == 32 || b == 9 {
+      self.pos = self.pos + 1
+    } else {
+      break
+    }
+  }
+}
+
+fn Parser::slice_ascii(self : Parser, start : Int, end : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = start
+  while i < end {
+    sb.write_byte(self.bytes[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| RFC 9651 §4.2.3.3 Parsing a Key.
+fn Parser::parse_key(self : Parser) -> Result[String, SfvError] {
+  if self.pos >= self.len {
+    return Err(SfvError::InvalidKey("unexpected end of input while parsing key"))
+  }
+  let first = self.bytes[self.pos].to_int()
+  if !is_key_first(first) {
+    return Err(SfvError::InvalidKey("invalid first character in key"))
+  }
+  let start = self.pos
+  self.pos = self.pos + 1
+  while self.pos < self.len && is_key_char(self.bytes[self.pos].to_int()) {
+    self.pos = self.pos + 1
+  }
+  if self.pos - start > self.limits.max_string_bytes {
+    return Err(SfvError::LimitExceeded("key exceeds max_string_bytes"))
+  }
+  Ok(self.slice_ascii(start, self.pos))
+}
+
+///| RFC 9651 §4.2.4 Parsing an Integer or Decimal.
+fn Parser::parse_number(self : Parser) -> Result[BareItem, SfvError] {
+  if self.pos >= self.len {
+    return Err(SfvError::InvalidNumber("unexpected end of input while parsing number"))
+  }
+  let mut negative = false
+  if self.bytes[self.pos].to_int() == 45 {
+    negative = true
+    self.pos = self.pos + 1
+  }
+  if self.pos >= self.len || !is_ascii_digit(self.bytes[self.pos].to_int()) {
+    return Err(SfvError::InvalidNumber("expected digit in number"))
+  }
+  let mut is_decimal = false
+  let mut int_digits = 0
+  let mut frac_digits = 0
+  let mut int_val = 0L
+  let mut frac_val = 0L
+  while self.pos < self.len {
+    let b = self.bytes[self.pos].to_int()
+    if is_ascii_digit(b) {
+      let d = (b - 48).to_int64()
+      if !is_decimal {
+        int_digits = int_digits + 1
+        if int_digits > 15 {
+          return Err(SfvError::InvalidNumber("integer exceeds 15 digits"))
+        }
+        int_val = int_val * 10L + d
+      } else {
+        frac_digits = frac_digits + 1
+        if frac_digits > 3 {
+          return Err(SfvError::InvalidNumber("decimal exceeds 3 fractional digits"))
+        }
+        frac_val = frac_val * 10L + d
+      }
+      self.pos = self.pos + 1
+    } else if b == 46 && !is_decimal {
+      if int_digits > 12 {
+        return Err(SfvError::InvalidNumber("decimal integer part exceeds 12 digits"))
+      }
+      is_decimal = true
+      self.pos = self.pos + 1
+    } else {
+      break
+    }
+  }
+  if !is_decimal {
+    let signed = if negative { -int_val } else { int_val }
+    if signed < sfv_min_int || signed > sfv_max_int {
+      return Err(SfvError::InvalidNumber("integer out of RFC 9651 range"))
+    }
+    return Ok(BareItem::Integer(signed))
+  }
+  if frac_digits == 0 {
+    return Err(SfvError::InvalidNumber("decimal missing fractional digits after '.'"))
+  }
+  let frac_milli = if frac_digits == 1 {
+    frac_val * 100L
+  } else if frac_digits == 2 {
+    frac_val * 10L
+  } else {
+    frac_val
+  }
+  let abs_milli = int_val * 1000L + frac_milli
+  let signed_milli = if negative { -abs_milli } else { abs_milli }
+  match Decimal::from_scaled_milli(signed_milli) {
+    Ok(d) => Ok(BareItem::Decimal(d))
+    Err(e) => Err(e)
+  }
+}
+
+///| RFC 9651 §4.2.5 Parsing a String.
+fn Parser::parse_string(self : Parser) -> Result[BareItem, SfvError] {
+  // Consume opening '"'
+  self.pos = self.pos + 1
+  let sb = StringBuilder::new()
+  let mut out_len = 0
+  while self.pos < self.len {
+    let b = self.bytes[self.pos].to_int()
+    self.pos = self.pos + 1
+    if b == 92 {
+      // Backslash escape: only \" and \\ allowed
+      if self.pos >= self.len {
+        return Err(SfvError::InvalidString("unterminated escape sequence in string"))
+      }
+      let next = self.bytes[self.pos].to_int()
+      self.pos = self.pos + 1
+      if next != 34 && next != 92 {
+        return Err(SfvError::InvalidString("invalid escape character in string"))
+      }
+      out_len = out_len + 1
+      if out_len > self.limits.max_string_bytes {
+        return Err(SfvError::LimitExceeded("string exceeds max_string_bytes"))
+      }
+      sb.write_byte(next.to_byte())
+    } else if b == 34 {
+      return Ok(BareItem::String(sb.to_string()))
+    } else if b < 32 || b > 126 {
+      return Err(SfvError::InvalidString("invalid character in string"))
+    } else {
+      out_len = out_len + 1
+      if out_len > self.limits.max_string_bytes {
+        return Err(SfvError::LimitExceeded("string exceeds max_string_bytes"))
+      }
+      sb.write_byte(b.to_byte())
+    }
+  }
+  Err(SfvError::InvalidString("unterminated string"))
+}
+
+///| RFC 9651 §4.2.6 Parsing a Token.
+fn Parser::parse_token(self : Parser) -> Result[BareItem, SfvError] {
+  let start = self.pos
+  self.pos = self.pos + 1
+  while self.pos < self.len && is_token_char(self.bytes[self.pos].to_int()) {
+    self.pos = self.pos + 1
+  }
+  if self.pos - start > self.limits.max_string_bytes {
+    return Err(SfvError::LimitExceeded("token exceeds max_string_bytes"))
+  }
+  Ok(BareItem::Token(self.slice_ascii(start, self.pos)))
+}
+
+///| RFC 9651 §4.2.7 Parsing a Byte Sequence (`:base64:`).
+fn Parser::parse_byte_sequence(self : Parser) -> Result[BareItem, SfvError] {
+  // Consume opening ':'
+  self.pos = self.pos + 1
+  let start = self.pos
+  let mut found_end = false
+  let mut pad_len = 0
+  let mut data_len = 0
+  while self.pos < self.len {
+    let b = self.bytes[self.pos].to_int()
+    if b == 58 {
+      found_end = true
+      break
+    }
+    if b == 61 {
+      pad_len = pad_len + 1
+    } else if b64_decode_sextet(b) >= 0 {
+      if pad_len > 0 {
+        return Err(SfvError::InvalidByteSequence("base64 padding before data character"))
+      }
+      data_len = data_len + 1
+    } else {
+      return Err(SfvError::InvalidByteSequence("invalid base64 character in byte sequence"))
+    }
+    self.pos = self.pos + 1
+  }
+  if !found_end {
+    return Err(SfvError::InvalidByteSequence("unterminated byte sequence"))
+  }
+  // Consume closing ':'
+  self.pos = self.pos + 1
+  let rem = data_len % 4
+  if rem == 1 {
+    return Err(SfvError::InvalidByteSequence("invalid base64 length"))
+  }
+  let max_pad = if rem == 0 { 0 } else { 4 - rem }
+  if pad_len > max_pad {
+    return Err(SfvError::InvalidByteSequence("excess base64 padding characters"))
+  }
+  let out_len = data_len / 4 * 3 +
+  if data_len % 4 == 2 {
+    1
+  } else if data_len % 4 == 3 {
+    2
+  } else {
+    0
+  }
+  if out_len > self.limits.max_string_bytes {
+    return Err(SfvError::LimitExceeded("byte sequence exceeds max_string_bytes"))
+  }
+  let out = Bytes::new(out_len)
+  let mut src = start
+  let mut dst = 0
+  let full_groups = data_len / 4
+  let mut g = 0
+  while g < full_groups {
+    let v0 = b64_decode_sextet(self.bytes[src].to_int())
+    let v1 = b64_decode_sextet(self.bytes[src + 1].to_int())
+    let v2 = b64_decode_sextet(self.bytes[src + 2].to_int())
+    let v3 = b64_decode_sextet(self.bytes[src + 3].to_int())
+    out[dst] = (v0 << 2 | v1 >> 4).to_byte()
+    out[dst + 1] = ((v1 & 15) << 4 | v2 >> 2).to_byte()
+    out[dst + 2] = ((v2 & 3) << 6 | v3).to_byte()
+    src = src + 4
+    dst = dst + 3
+    g = g + 1
+  }
+  let rem = data_len % 4
+  if rem == 2 {
+    let v0 = b64_decode_sextet(self.bytes[src].to_int())
+    let v1 = b64_decode_sextet(self.bytes[src + 1].to_int())
+    out[dst] = (v0 << 2 | v1 >> 4).to_byte()
+  } else if rem == 3 {
+    let v0 = b64_decode_sextet(self.bytes[src].to_int())
+    let v1 = b64_decode_sextet(self.bytes[src + 1].to_int())
+    let v2 = b64_decode_sextet(self.bytes[src + 2].to_int())
+    out[dst] = (v0 << 2 | v1 >> 4).to_byte()
+    out[dst + 1] = ((v1 & 15) << 4 | v2 >> 2).to_byte()
+  }
+  Ok(BareItem::ByteSequence(out))
+}
+
+///| RFC 9651 §4.2.8 Parsing a Boolean (`?1` / `?0`).
+fn Parser::parse_boolean(self : Parser) -> Result[BareItem, SfvError] {
+  // Consume '?'
+  self.pos = self.pos + 1
+  if self.pos >= self.len {
+    return Err(SfvError::InvalidBoolean("unexpected end of input after '?'"))
+  }
+  let b = self.bytes[self.pos].to_int()
+  self.pos = self.pos + 1
+  if b == 49 {
+    Ok(BareItem::Boolean(true))
+  } else if b == 48 {
+    Ok(BareItem::Boolean(false))
+  } else {
+    Err(SfvError::InvalidBoolean("expected '0' or '1' after '?'"))
+  }
+}
+
+///| RFC 9651 §4.2.9 Parsing a Date (`@<integer>`).
+fn Parser::parse_date(self : Parser) -> Result[BareItem, SfvError] {
+  // Consume '@'
+  self.pos = self.pos + 1
+  match self.parse_number() {
+    Ok(BareItem::Integer(v)) => Ok(BareItem::Date(v))
+    Ok(_) => Err(SfvError::InvalidDate("date must be an integer, not decimal"))
+    Err(_) => Err(SfvError::InvalidDate("invalid integer in date"))
+  }
+}
+
+///| RFC 9651 §4.2.10 Parsing a Display String (`%"..."`).
+fn Parser::parse_display_string(self : Parser) -> Result[BareItem, SfvError] {
+  // Consume '%' and verify '"'
+  self.pos = self.pos + 1
+  if self.pos >= self.len || self.bytes[self.pos].to_int() != 34 {
+    return Err(SfvError::InvalidDisplayString("expected '\"' after '%'"))
+  }
+  self.pos = self.pos + 1
+  let raw_bytes : Array[Byte] = []
+  while self.pos < self.len {
+    let b = self.bytes[self.pos].to_int()
+    self.pos = self.pos + 1
+    if b < 32 || b > 126 {
+      return Err(SfvError::InvalidDisplayString("invalid unescaped byte in display string"))
+    }
+    if b == 34 {
+      let n = raw_bytes.length()
+      let buf = Bytes::new(n)
+      let mut i = 0
+      while i < n {
+        buf[i] = raw_bytes[i]
+        i = i + 1
+      }
+      if !is_valid_utf8_bytes(buf) {
+        return Err(SfvError::InvalidDisplayString("decoded display string is not valid UTF-8"))
+      }
+      let sb = StringBuilder::new()
+      let mut j = 0
+      while j < n {
+        sb.write_byte(buf[j])
+        j = j + 1
+      }
+      return Ok(BareItem::DisplayString(sb.to_string()))
+    }
+    if b == 37 {
+      if self.pos + 1 >= self.len {
+        return Err(SfvError::InvalidDisplayString("truncated percent-escape in display string"))
+      }
+      let hi = hex_lower_val(self.bytes[self.pos].to_int())
+      let lo = hex_lower_val(self.bytes[self.pos + 1].to_int())
+      if hi < 0 || lo < 0 {
+        return Err(
+          SfvError::InvalidDisplayString(
+            "invalid hex escape in display string (must be lowercase 0-9a-f)",
+          ),
+        )
+      }
+      self.pos = self.pos + 2
+      if raw_bytes.length() >= self.limits.max_string_bytes {
+        return Err(SfvError::LimitExceeded("display string exceeds max_string_bytes"))
+      }
+      raw_bytes.push((hi * 16 + lo).to_byte())
+    } else {
+      if raw_bytes.length() >= self.limits.max_string_bytes {
+        return Err(SfvError::LimitExceeded("display string exceeds max_string_bytes"))
+      }
+      raw_bytes.push(b.to_byte())
+    }
+  }
+  Err(SfvError::InvalidDisplayString("unterminated display string"))
+}
+
+///| RFC 9651 §4.2.3.1 Parsing a Bare Item.
+fn Parser::parse_bare_item(self : Parser) -> Result[BareItem, SfvError] {
+  if self.pos >= self.len {
+    return Err(SfvError::InvalidSyntax("unexpected end of input while parsing bare item"))
+  }
+  let b = self.bytes[self.pos].to_int()
+  if b == 45 || is_ascii_digit(b) {
+    self.parse_number()
+  } else if b == 34 {
+    self.parse_string()
+  } else if is_token_first(b) {
+    self.parse_token()
+  } else if b == 58 {
+    self.parse_byte_sequence()
+  } else if b == 63 {
+    self.parse_boolean()
+  } else if b == 64 {
+    self.parse_date()
+  } else if b == 37 {
+    self.parse_display_string()
+  } else {
+    Err(SfvError::InvalidSyntax("unexpected character starting bare item"))
+  }
+}
+
+///| RFC 9651 §4.2.3.2 Parsing Parameters (O(1) duplicate overwrite via lazy Map).
+fn Parser::parse_params(self : Parser) -> Result[Array[Param], SfvError] {
+  if self.pos >= self.len || self.bytes[self.pos].to_int() != 59 {
+    return Ok([])
+  }
+  let params : Array[Param] = []
+  let mut index : Option[Map[String, Int]] = None
+  while self.pos < self.len && self.bytes[self.pos].to_int() == 59 {
+    self.pos = self.pos + 1
+    self.skip_sp()
+    let key = match self.parse_key() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    let value = if self.pos < self.len && self.bytes[self.pos].to_int() == 61 {
+      self.pos = self.pos + 1
+      match self.parse_bare_item() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    } else {
+      BareItem::Boolean(true)
+    }
+    let existing = match index {
+      Some(m) => m.get(key)
+      None => {
+        let mut found : Option[Int] = None
+        let mut i = 0
+        while i < params.length() {
+          if params[i].key == key {
+            found = Some(i)
+            break
+          }
+          i = i + 1
+        }
+        found
+      }
+    }
+    match existing {
+      Some(idx) => params[idx] = Param::new(key, value)
+      None => {
+        if params.length() >= self.limits.max_params {
+          return Err(SfvError::LimitExceeded("parameters exceed max_params"))
+        }
+        let new_idx = params.length()
+        params.push(Param::new(key, value))
+        match index {
+          Some(m) => m.set(key, new_idx)
+          None =>
+          if params.length() == 8 {
+            let m : Map[String, Int] = Map::new()
+            let mut j = 0
+            while j < params.length() {
+              m.set(params[j].key, j)
+              j = j + 1
+            }
+            index = Some(m)
+          }
+        }
+      }
+    }
+  }
+  Ok(params)
+}
+
+///| RFC 9651 §4.2.3 Parsing an Item.
+fn Parser::parse_item_inner(self : Parser) -> Result[Item, SfvError] {
+  let bare = match self.parse_bare_item() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let params = match self.parse_params() {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  Ok(Item::new(bare, params))
+}
+
+///| RFC 9651 §4.2.1.2 Parsing an Inner List.
+fn Parser::parse_inner_list(self : Parser) -> Result[InnerList, SfvError] {
+  // Consume '('
+  self.pos = self.pos + 1
+  let items : Array[Item] = []
+  while self.pos < self.len {
+    self.skip_sp()
+    if self.pos >= self.len {
+      return Err(SfvError::InvalidSyntax("unterminated inner list"))
+    }
+    if self.bytes[self.pos].to_int() == 41 {
+      self.pos = self.pos + 1
+      let params = match self.parse_params() {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      return Ok(InnerList::new(items, params))
+    }
+    if items.length() >= self.limits.max_inner_list_items {
+      return Err(SfvError::LimitExceeded("inner list exceeds max_inner_list_items"))
+    }
+    let item = match self.parse_item_inner() {
+      Ok(it) => it
+      Err(e) => return Err(e)
+    }
+    items.push(item)
+    if self.pos >= self.len {
+      return Err(SfvError::InvalidSyntax("unterminated inner list"))
+    }
+    let next = self.bytes[self.pos].to_int()
+    if next != 32 && next != 41 {
+      return Err(SfvError::InvalidSyntax("expected SP or ')' after inner list item"))
+    }
+  }
+  Err(SfvError::InvalidSyntax("unterminated inner list"))
+}
+
+///| RFC 9651 §4.2.1.1 Parsing an Item or Inner List.
+fn Parser::parse_item_or_inner_list(self : Parser) -> Result[ListEntry, SfvError] {
+  if self.pos < self.len && self.bytes[self.pos].to_int() == 40 {
+    match self.parse_inner_list() {
+      Ok(il) => Ok(ListEntry::InnerList(il))
+      Err(e) => Err(e)
+    }
+  } else {
+    match self.parse_item_inner() {
+      Ok(it) => Ok(ListEntry::Item(it))
+      Err(e) => Err(e)
+    }
+  }
+}
+
+fn join_field_lines(
+  fields : Array[String],
+  max_input_bytes : Int,
+) -> Result[String, SfvError] {
+  let n = fields.length()
+  if n == 0 {
+    return Ok("")
+  }
+  if n == 1 {
+    if fields[0].to_bytes().length() > max_input_bytes {
+      return Err(SfvError::LimitExceeded("input exceeds max_input_bytes"))
+    }
+    return Ok(fields[0])
+  }
+  let mut total = 0
+  let mut i = 0
+  while i < n {
+    let flen = fields[i].to_bytes().length()
+    if i > 0 {
+      if total > max_input_bytes - 2 {
+        return Err(SfvError::LimitExceeded("combined fields exceed max_input_bytes"))
+      }
+      total = total + 2
+    }
+    if flen > max_input_bytes - total {
+      return Err(SfvError::LimitExceeded("combined fields exceed max_input_bytes"))
+    }
+    total = total + flen
+    i = i + 1
+  }
+  let sb = StringBuilder::new()
+  let mut j = 0
+  while j < n {
+    if j > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(fields[j])
+    j = j + 1
+  }
+  Ok(sb.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Public Parsing API
+// ---------------------------------------------------------------------------
+
+///| Parse an RFC 9651 Item using default limits.
+pub fn parse_item(input : String) -> Result[Item, SfvError] {
+  parse_item_with_limits(input, SfvLimits::default())
+}
+
+///| Parse an RFC 9651 Item with explicit `SfvLimits`.
+pub fn parse_item_with_limits(
+  input : String,
+  limits : SfvLimits,
+) -> Result[Item, SfvError] {
+  let p = match Parser::new(input, limits) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  p.skip_sp()
+  if p.pos >= p.len {
+    return Err(SfvError::InvalidSyntax("empty input for item"))
+  }
+  let item = match p.parse_item_inner() {
+    Ok(it) => it
+    Err(e) => return Err(e)
+  }
+  p.skip_sp()
+  if p.pos < p.len {
+    return Err(SfvError::TrailingData("unexpected trailing data after item"))
+  }
+  Ok(item)
+}
+
+///| Parse an RFC 9651 List using default limits.
+pub fn parse_list(input : String) -> Result[Array[ListEntry], SfvError] {
+  parse_list_with_limits(input, SfvLimits::default())
+}
+
+///| Parse an RFC 9651 List with explicit `SfvLimits`.
+pub fn parse_list_with_limits(
+  input : String,
+  limits : SfvLimits,
+) -> Result[Array[ListEntry], SfvError] {
+  let p = match Parser::new(input, limits) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  p.skip_sp()
+  if p.pos >= p.len {
+    return Ok([])
+  }
+  let members : Array[ListEntry] = []
+  while p.pos < p.len {
+    if members.length() >= p.limits.max_list_members {
+      return Err(SfvError::LimitExceeded("list exceeds max_list_members"))
+    }
+    let entry = match p.parse_item_or_inner_list() {
+      Ok(e) => e
+      Err(err) => return Err(err)
+    }
+    members.push(entry)
+    p.skip_ows()
+    if p.pos >= p.len {
+      break
+    }
+    if p.bytes[p.pos].to_int() != 44 {
+      return Err(SfvError::TrailingData("expected ',' between list members"))
+    }
+    p.pos = p.pos + 1
+    p.skip_ows()
+    if p.pos >= p.len {
+      return Err(SfvError::InvalidSyntax("trailing comma in list"))
+    }
+  }
+  // RFC 9651 §4.2 step 7: trailing whitespace must be SP only (not HTAB).
+  // Note: if the last member was followed by HTAB at EOF, `skip_ows` consumed it!
+  // Let's verify the last byte of the original input before EOF wasn't HTAB!
+  if p.len > 0 && p.bytes[p.len - 1].to_int() == 9 {
+    return Err(SfvError::TrailingData("trailing HTAB not allowed in structured field"))
+  }
+  Ok(members)
+}
+
+///| Parse multiple HTTP field lines as a combined RFC 9651 List using default limits.
+pub fn parse_list_fields(fields : Array[String]) -> Result[Array[ListEntry], SfvError] {
+  parse_list_fields_with_limits(fields, SfvLimits::default())
+}
+
+///| Parse multiple HTTP field lines as a combined RFC 9651 List with explicit `SfvLimits`.
+pub fn parse_list_fields_with_limits(
+  fields : Array[String],
+  limits : SfvLimits,
+) -> Result[Array[ListEntry], SfvError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if fields.length() == 0 {
+    return Ok([])
+  }
+  let joined = match join_field_lines(fields, limits.max_input_bytes) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  parse_list_with_limits(joined, limits)
+}
+
+///| Parse an RFC 9651 Dictionary using default limits.
+pub fn parse_dictionary(input : String) -> Result[Array[DictMember], SfvError] {
+  parse_dictionary_with_limits(input, SfvLimits::default())
+}
+
+///| Parse an RFC 9651 Dictionary with explicit `SfvLimits`.
+///| Duplicate keys overwrite their value in place while preserving first-seen order
+///| (RFC 9651 §4.2.2) in O(1) amortized time.
+pub fn parse_dictionary_with_limits(
+  input : String,
+  limits : SfvLimits,
+) -> Result[Array[DictMember], SfvError] {
+  let p = match Parser::new(input, limits) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  p.skip_sp()
+  if p.pos >= p.len {
+    return Ok([])
+  }
+  let members : Array[DictMember] = []
+  let mut index : Option[Map[String, Int]] = None
+  while p.pos < p.len {
+    let key = match p.parse_key() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    let value = if p.pos < p.len && p.bytes[p.pos].to_int() == 61 {
+      p.pos = p.pos + 1
+      match p.parse_item_or_inner_list() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    } else {
+      let params = match p.parse_params() {
+        Ok(ps) => ps
+        Err(e) => return Err(e)
+      }
+      ListEntry::Item(Item::new(BareItem::Boolean(true), params))
+    }
+    let existing = match index {
+      Some(m) => m.get(key)
+      None => {
+        let mut found : Option[Int] = None
+        let mut i = 0
+        while i < members.length() {
+          if members[i].key == key {
+            found = Some(i)
+            break
+          }
+          i = i + 1
+        }
+        found
+      }
+    }
+    match existing {
+      Some(idx) => members[idx] = DictMember::new(key, value)
+      None => {
+        if members.length() >= p.limits.max_dict_members {
+          return Err(SfvError::LimitExceeded("dictionary exceeds max_dict_members"))
+        }
+        let new_idx = members.length()
+        members.push(DictMember::new(key, value))
+        match index {
+          Some(m) => m.set(key, new_idx)
+          None =>
+          if members.length() == 8 {
+            let m : Map[String, Int] = Map::new()
+            let mut j = 0
+            while j < members.length() {
+              m.set(members[j].key, j)
+              j = j + 1
+            }
+            index = Some(m)
+          }
+        }
+      }
+    }
+    p.skip_ows()
+    if p.pos >= p.len {
+      break
+    }
+    if p.bytes[p.pos].to_int() != 44 {
+      return Err(SfvError::TrailingData("expected ',' between dictionary members"))
+    }
+    p.pos = p.pos + 1
+    p.skip_ows()
+    if p.pos >= p.len {
+      return Err(SfvError::InvalidSyntax("trailing comma in dictionary"))
+    }
+  }
+  // Reject trailing HTAB at EOF (RFC 9651 §4.2 step 7 only allows SP at EOF).
+  if p.len > 0 && p.bytes[p.len - 1].to_int() == 9 {
+    return Err(SfvError::TrailingData("trailing HTAB not allowed in structured field"))
+  }
+  Ok(members)
+}
+
+///| Parse multiple HTTP field lines as a combined RFC 9651 Dictionary using default limits.
+pub fn parse_dictionary_fields(
+  fields : Array[String],
+) -> Result[Array[DictMember], SfvError] {
+  parse_dictionary_fields_with_limits(fields, SfvLimits::default())
+}
+
+///| Parse multiple HTTP field lines as a combined RFC 9651 Dictionary with explicit `SfvLimits`.
+pub fn parse_dictionary_fields_with_limits(
+  fields : Array[String],
+  limits : SfvLimits,
+) -> Result[Array[DictMember], SfvError] {
+  match validate_limits(limits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if fields.length() == 0 {
+    return Ok([])
+  }
+  let joined = match join_field_lines(fields, limits.max_input_bytes) {
+    Ok(s) => s
+    Err(e) => return Err(e)
+  }
+  parse_dictionary_with_limits(joined, limits)
+}
