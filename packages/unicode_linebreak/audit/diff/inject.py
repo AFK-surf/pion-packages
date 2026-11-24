@@ -59,7 +59,8 @@ M = [
      "P1-1 anchor: search starts one byte past the target"),
     ("linebreak.pion", "    res_cls == cls_QU ||\n", "", "P1-1 anchor: QU accepted as an anchor (loses LB19a / LB15a context)"),
     ("linebreak.pion", "if cont == 4 ||", "if cont == 3 ||", "P1-1 anchor: a 4-byte sequence's last continuation byte taken as standalone"),
-    ("linebreak.pion", "if np <= saved {", "if np < saved {", "P1-1 anchor: continuation byte at the end of its sequence taken as standalone"),
+    # (not a mutant: `np <= saved` -> `np < saved` only makes the anchor search step back to an earlier, still
+    #  valid boundary; it is an equivalent mutant for results and was measured as such, see REPORT.md)
     # LineBreakIter (second copy of the engine)
     ("linebreak.pion", "(cur == cls_HY || (cur == cls_BA && !cur_ea))", "(cur == cls_HY || cur == cls_BA)",
      "LineBreakIter: LB21a [BA - $EastAsian] exclusion dropped", 2),

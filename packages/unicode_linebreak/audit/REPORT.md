@@ -1,10 +1,55 @@
 # Red-team audit: `packages/unicode_linebreak` v0.1.0 (RT-unicode-linebreak)
 
-> **NOT SIGNED OFF** (re-audit 1 of `585254aa`, next section): P2-1..P2-4 are closed, P1-1 is only partly fixed.
-> `STRICT=1 sh packages/unicode_linebreak/audit/run_audit.sh` exits 1 until P1-1 is closed. The first audit of
-> `c79ed32` follows.
+> **SIGNED OFF** at `b84c35e83a4daa84cc708b540880775c0a26fae3` (next section). Re-audit 1 of `585254aa` and the
+> first audit of `c79ed32` follow.
 
-## Re-audit 1 (`origin/feat/pkg-unicode-linebreak` @ `585254aa04e8bdabdba7918fb565f618edf30f58`) — **NOT SIGNED OFF**
+## SIGN-OFF — `packages/unicode_linebreak` v0.1.0 at `origin/feat/pkg-unicode-linebreak` @ `b84c35e83a4daa84cc708b540880775c0a26fae3`
+
+**Signed off by RT-unicode-linebreak (independent red-team audit), 2026-11-24.** The 1 P1 and 4 P2 findings of the
+first audit are closed and verified; no new defect found. `STRICT=1 sh packages/unicode_linebreak/audit/run_audit.sh`
+exits 0 (0 P0, 0 OPEN) and `sh scripts/verify.sh packages/unicode_linebreak` passes in a git checkout with a
+clean worktree, both on Linux x86_64. The audit branch is a fast-forward of `b84c35e8` that only adds
+`packages/unicode_linebreak/audit/**`.
+
+Re-audit 2 reviewed `585254aa..b84c35e8` (README.md, src/linebreak.pion, src/linebreak_test.pion):
+
+- **P1-1 closed.** `is_reset_anchor` now accepts every resolved class except the 12 whose post-state depends on
+  left context (CM, ZWJ, SP, QU, HY, BA incl. U+2010, VI, SY, IS, CL, CP, RI); checked against the state-update
+  code (U+25CC and ExtPict&Cn anchors are exact because the sot initialisation sets those flags).
+  `find_backward_anchor` treats every non-continuation byte as a decoder boundary and resolves continuation runs
+  by maximal subpart (a run of 4 continuation bytes, or one its lead does not consume, is a standalone U+FFFD = AL
+  anchor). Iterating `next_break_opportunity` is now linear on every script measured: d25 Latin 7.1x / 4.3x
+  (4n/n, native / wasm32; gate < 8), d26 Korean 5.6x / 7.5x, d27 Hebrew 4.4x / 1.0x, d28 `"\xff "` 2.8x / 2.8x,
+  d29 small kana 2.9x / 0.8x, d30 CJK 2.1x / 2.5x, d31 mixed news text 4.2x / 2.5x (16-56 KB at 4n, 0.6-7.6 ms).
+  For text made only of the 12 non-anchor classes the per-call cost is O(distance to the nearest anchor), as
+  README.md now documents (d32-d35 `"- "`, RI SP, VI SP, U+2010 SP stay quadratic through
+  `next_break_opportunity` and are reported as *documented*), and the new **`LineBreakIter`**
+  (`line_break_iter(s)` / `next()`) is the O(n) way: d36-d41 (`"- "`, RI SP, VI SP, U+2010 SP, Korean, a + CM x
+  250k, up to 2.5 MB) 2.6-5.7x, 28-56 ms at 4n.
+- **`LineBreakIter` == `line_breaks`** on all 72,217 inputs (official vectors, named incl. 32 anchor seams, pairs,
+  fastpath, fuzz, long), native and wasm32, and stays exhausted (3 extra `next()` calls return `None`).
+  `next_break_opportunity` == `line_breaks` at every byte offset plus 8 hostile offsets: 1,380,777 calls on 55,893
+  inputs, 0 inconsistencies.
+- **Everything from the first audit still holds:** all 1,114,112 code points match the independent loader (0
+  mismatches incl. the 6 flag bits); 16,672/16,672 official vectors with Mandatory / Allowed kinds; model and Rust
+  `icu_segmenter 2.4.0` 0 unexplained divergences on every corpus (Pion == model on 72,217/72,217); 4 modes
+  byte-identical; 24 linear `line_breaks` / limits / single-call bombs up to 3 MB; `gen_tables.py --check` OK; no internal
+  names, no `__pycache__`, clean `git status --ignored`.
+- **README claims reproduced:** unit tests 21/21; `Send`: LineBreakClass, BreakKind, BreakOpportunity,
+  LineBreakError, LineBreakLimits, String; `!Send` (`E_NOT_SEND`): `Array[BreakOpportunity]`, `LineBreakIter`;
+  `wasm_smoke` stdout and SHA-256 `5b5e94c5…8b70` in 4 modes, wasm32 81,346 B; benchmark differential 123/123,
+  both stdout SHA-256 equal README, speed 0.17x / 0.17x of Rust (README 0.16x / 0.14x).
+- **Mutation proof:** 32/32 injected bugs caught, incl. the regressions of every fix (LB21a EA exclusion, LB10
+  flags, SP / RI / QU accepted as anchors, anchor search past the target, a 4-byte sequence's continuation taken
+  as standalone) and 5 mutants of the `LineBreakIter` copy of the engine (LB21a, LB10, LB30a, eot kind, sot
+  LB15a). `np <= saved` -> `np < saved` was tried and dropped: it only moves the anchor back to an earlier valid
+  boundary, an equivalent mutant.
+- **Remaining INFO (not blocking):** INFO-1 root `THIRD_PARTY_NOTICES.md` (release integration); INFO-2 single
+  Red-stage commit; INFO-4 Pion is about 6x slower than ICU; INFO-5 U+FFFD runs; the engine now exists twice
+  (`run_linebreak`, `LineBreakIter::next`), so every future rule change has to be made in both: this gate's
+  `LineBreakIter` equivalence sweep and mutants 29-33 cover that.
+
+## Re-audit 1 (`origin/feat/pkg-unicode-linebreak` @ `585254aa04e8bdabdba7918fb565f618edf30f58`) — not signed off (superseded)
 
 The audit branch is rebased onto `585254aa` (fast-forward, `audit/**` only). Re-run on Linux x86_64:
 
@@ -71,7 +116,7 @@ The audit branch is rebased onto `585254aa` (fast-forward, `audit/**` only). Re-
   `/tmp/pion-unicode-linebreak-audit`), and the run ends by checking that `git status --porcelain --ignored`
   shows nothing under `packages/unicode_linebreak` except the new `audit/`.
 
-## Summary
+## First audit (`c79ed32`) — summary
 
 | Dimension | Result |
 | --- | --- |
