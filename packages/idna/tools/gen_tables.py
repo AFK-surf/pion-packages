@@ -581,23 +581,7 @@ def write_uts46_tables(out_path: str, idna_ranges, idna_pool, ccc_ranges, full_d
     lines.append("///| Sources: IdnaMappingTable.txt, UnicodeData.txt, CompositionExclusions.txt,\n")
     lines.append("///| DerivedNormalizationProps.txt, DerivedBidiClass.txt, DerivedJoiningType.txt.\n\n")
 
-    lines.append("""fn vlq_digit(b : Int) -> (Int, Bool) {
-  if b >= 65 && b <= 90 {
-    (b - 65, false)
-  } else if b >= 97 && b <= 102 {
-    (b - 97 + 26, false)
-  } else if b >= 103 && b <= 122 {
-    (b - 103, true)
-  } else if b >= 48 && b <= 57 {
-    (b - 48 + 20, true)
-  } else if b == 45 {
-    (30, true)
-  } else {
-    (31, true)
-  }
-}
-
-fn decode_vlq_u_array(s : String, count : Int) -> FixedArray[Int] {
+    lines.append("""fn decode_vlq_u_array(s : String, count : Int) -> FixedArray[Int] {
   let arr : FixedArray[Int] = FixedArray::make(count, 0)
   let mut idx = 0
   let mut pos = 0
@@ -605,10 +589,23 @@ fn decode_vlq_u_array(s : String, count : Int) -> FixedArray[Int] {
     let mut v = 0
     let mut shift = 0
     while true {
-      let (d, more) = vlq_digit(s.code_unit_at(pos))
+      let b = s.code_unit_at(pos)
       pos = pos + 1
-      v = v | (d << shift)
-      if !more {
+      let r = if b >= 65 && b <= 90 {
+        b - 65
+      } else if b >= 103 && b <= 122 {
+        (b - 103) | 32
+      } else if b >= 97 && b <= 102 {
+        b - 71
+      } else if b >= 48 && b <= 57 {
+        (b - 28) | 32
+      } else if b == 45 {
+        62
+      } else {
+        63
+      }
+      v = v | ((r & 31) << shift)
+      if (r & 32) == 0 {
         break
       }
       shift = shift + 5
@@ -628,10 +625,23 @@ fn decode_vlq_delta_array(s : String, count : Int) -> FixedArray[Int] {
     let mut v = 0
     let mut shift = 0
     while true {
-      let (d, more) = vlq_digit(s.code_unit_at(pos))
+      let b = s.code_unit_at(pos)
       pos = pos + 1
-      v = v | (d << shift)
-      if !more {
+      let r = if b >= 65 && b <= 90 {
+        b - 65
+      } else if b >= 103 && b <= 122 {
+        (b - 103) | 32
+      } else if b >= 97 && b <= 102 {
+        b - 71
+      } else if b >= 48 && b <= 57 {
+        (b - 28) | 32
+      } else if b == 45 {
+        62
+      } else {
+        63
+      }
+      v = v | ((r & 31) << shift)
+      if (r & 32) == 0 {
         break
       }
       shift = shift + 5
@@ -655,10 +665,23 @@ fn decode_vlq_end_array(
     let mut v = 0
     let mut shift = 0
     while true {
-      let (d, more) = vlq_digit(s.code_unit_at(pos))
+      let b = s.code_unit_at(pos)
       pos = pos + 1
-      v = v | (d << shift)
-      if !more {
+      let r = if b >= 65 && b <= 90 {
+        b - 65
+      } else if b >= 103 && b <= 122 {
+        (b - 103) | 32
+      } else if b >= 97 && b <= 102 {
+        b - 71
+      } else if b >= 48 && b <= 57 {
+        (b - 28) | 32
+      } else if b == 45 {
+        62
+      } else {
+        63
+      }
+      v = v | ((r & 31) << shift)
+      if (r & 32) == 0 {
         break
       }
       shift = shift + 5
@@ -677,10 +700,23 @@ fn decode_vlq_i_array(s : String, count : Int) -> FixedArray[Int] {
     let mut u : Int64 = 0L
     let mut shift : Int64 = 0L
     while true {
-      let (d, more) = vlq_digit(s.code_unit_at(pos))
+      let b = s.code_unit_at(pos)
       pos = pos + 1
-      u = u | (d.to_int64() << shift)
-      if !more {
+      let r = if b >= 65 && b <= 90 {
+        b - 65
+      } else if b >= 103 && b <= 122 {
+        (b - 103) | 32
+      } else if b >= 97 && b <= 102 {
+        b - 71
+      } else if b >= 48 && b <= 57 {
+        (b - 28) | 32
+      } else if b == 45 {
+        62
+      } else {
+        63
+      }
+      u = u | ((r & 31).to_int64() << shift)
+      if (r & 32) == 0 {
         break
       }
       shift = shift + 5L
@@ -701,10 +737,23 @@ fn decode_vlq_delta_i64_array(s : String, count : Int) -> FixedArray[Int64] {
     let mut v : Int64 = 0L
     let mut shift : Int64 = 0L
     while true {
-      let (d, more) = vlq_digit(s.code_unit_at(pos))
+      let b = s.code_unit_at(pos)
       pos = pos + 1
-      v = v | (d.to_int64() << shift)
-      if !more {
+      let r = if b >= 65 && b <= 90 {
+        b - 65
+      } else if b >= 103 && b <= 122 {
+        (b - 103) | 32
+      } else if b >= 97 && b <= 102 {
+        b - 71
+      } else if b >= 48 && b <= 57 {
+        (b - 28) | 32
+      } else if b == 45 {
+        62
+      } else {
+        63
+      }
+      v = v | ((r & 31).to_int64() << shift)
+      if (r & 32) == 0 {
         break
       }
       shift = shift + 5L
@@ -809,22 +858,168 @@ fn uts46_lookup(cp : Int) -> Int {{
   }}
 }}
 
-fn build_latin1_uts46_lut() -> FixedArray[Int] {{
-  let lut : FixedArray[Int] = FixedArray::make(256, 0)
-  let mut cp = 0
-  while cp < 256 {{
-    lut[cp] = uts46_lookup(cp)
-    cp = cp + 1
+fn build_low_uts46_lut() -> FixedArray[Int] {{
+  let lut : FixedArray[Int] = FixedArray::make(4096, 0)
+  let starts = idna_start
+  let ends = idna_end
+  let vals = idna_val
+  let n = idna_count
+  let mut i = 0
+  while i < n {{
+    let s = starts[i]
+    if s >= 4096 {{
+      break
+    }}
+    let mut e = ends[i]
+    if e >= 4096 {{
+      e = 4095
+    }}
+    let v = vals[i]
+    let mut cp = s
+    while cp <= e {{
+      lut[cp] = v
+      cp = cp + 1
+    }}
+    i = i + 1
   }}
   lut
 }}
 
-let latin1_uts46_lut : FixedArray[Int] = build_latin1_uts46_lut()
+let low_uts46_lut : FixedArray[Int] = build_low_uts46_lut()
+
+///| Packed property table for `0..0x0FFF`:
+///| bit 0: may_need_nfc (ccc != 0 || nfc_qc != Yes)
+///| bit 1: may_be_rtl (bidi_class in {{1, 2, 6}})
+///| bit 2: is_mark
+///| bit 3: is_contexto
+///| bits 4..8: bidi_class (0..22)
+///| bits 9..16: ccc (0..254)
+///| bit 17: nfc_qc_not_yes
+fn build_low_props_lut() -> FixedArray[Int] {{
+  let lut : FixedArray[Int] = FixedArray::make(4096, 0)
+  let c_starts = ccc_start
+  let c_ends = ccc_end
+  let c_vals = ccc_val
+  let c_n = ccc_count
+  let mut i = 0
+  while i < c_n {{
+    let s = c_starts[i]
+    if s >= 4096 {{
+      break
+    }}
+    let mut e = c_ends[i]
+    if e >= 4096 {{
+      e = 4095
+    }}
+    let v = c_vals[i]
+    let bits = (v << 9) | 1
+    let mut cp = s
+    while cp <= e {{
+      lut[cp] = lut[cp] | bits
+      cp = cp + 1
+    }}
+    i = i + 1
+  }}
+  let q_starts = nfcqc_start
+  let q_ends = nfcqc_end
+  let q_n = nfcqc_count
+  i = 0
+  while i < q_n {{
+    let s = q_starts[i]
+    if s >= 4096 {{
+      break
+    }}
+    let mut e = q_ends[i]
+    if e >= 4096 {{
+      e = 4095
+    }}
+    let mut cp = s
+    while cp <= e {{
+      lut[cp] = lut[cp] | 131073
+      cp = cp + 1
+    }}
+    i = i + 1
+  }}
+  let b_starts = bidi_start
+  let b_ends = bidi_end
+  let b_vals = bidi_val
+  let b_n = bidi_count
+  i = 0
+  while i < b_n {{
+    let s = b_starts[i]
+    if s >= 4096 {{
+      break
+    }}
+    let mut e = b_ends[i]
+    if e >= 4096 {{
+      e = 4095
+    }}
+    let v = b_vals[i]
+    let bits = (v << 4) | (if v == 1 || v == 2 || v == 6 {{ 2 }} else {{ 0 }})
+    let mut cp = s
+    while cp <= e {{
+      lut[cp] = lut[cp] | bits
+      cp = cp + 1
+    }}
+    i = i + 1
+  }}
+  let m_starts = mark_start
+  let m_ends = mark_end
+  let m_n = mark_count
+  i = 0
+  while i < m_n {{
+    let s = m_starts[i]
+    if s >= 4096 {{
+      break
+    }}
+    let mut e = m_ends[i]
+    if e >= 4096 {{
+      e = 4095
+    }}
+    let mut cp = s
+    while cp <= e {{
+      lut[cp] = lut[cp] | 4
+      cp = cp + 1
+    }}
+    i = i + 1
+  }}
+  lut[0x00B7] = lut[0x00B7] | 8
+  lut[0x0375] = lut[0x0375] | 8
+  lut[0x05F3] = lut[0x05F3] | 8
+  lut[0x05F4] = lut[0x05F4] | 8
+  let mut d = 0x0660
+  while d <= 0x0669 {{
+    lut[d] = lut[d] | 8
+    d = d + 1
+  }}
+  d = 0x06F0
+  while d <= 0x06F9 {{
+    lut[d] = lut[d] | 8
+    d = d + 1
+  }}
+  let d_cps = decomp_cp
+  let d_n = decomp_count
+  i = 0
+  while i < d_n {{
+    let cp = d_cps[i]
+    if cp >= 4096 {{
+      break
+    }}
+    lut[cp] = lut[cp] | 262144
+    i = i + 1
+  }}
+  lut
+}}
+
+let low_props_lut : FixedArray[Int] = build_low_props_lut()
 
 fn uts46_lookup_fast(cp : Int) -> Int {{
-  if cp < 256 {{
-    latin1_uts46_lut[cp]
-  }} else if cp >= 0x4E00 && cp <= 0x9FFF {{
+  if cp < 4096 {{
+    low_uts46_lut[cp]
+  }} else if (cp >= 0x4E00 && cp <= 0x9FFF) ||
+  (cp >= 0xAC00 && cp <= 0xD7A3) ||
+  (cp >= 0x3041 && cp <= 0x3096) ||
+  (cp >= 0x30A1 && cp <= 0x30FA) {{
     1
   }} else {{
     uts46_lookup(cp)
@@ -833,6 +1028,15 @@ fn uts46_lookup_fast(cp : Int) -> Int {{
 
 fn unicode_ccc(cp : Int) -> Int {{
   if cp < 0x0300 {{
+    return 0
+  }}
+  if cp < 4096 {{
+    return (low_props_lut[cp] >> 9) & 255
+  }}
+  if (cp >= 0x4E00 && cp <= 0x9FFF) ||
+  (cp >= 0xAC00 && cp <= 0xD7A3) ||
+  (cp >= 0x3041 && cp <= 0x3096) ||
+  (cp >= 0x30A1 && cp <= 0x30FA) {{
     return 0
   }}
   let starts = ccc_start
@@ -897,6 +1101,15 @@ fn unicode_is_mark(cp : Int) -> Bool {{
   if cp < 0x0300 {{
     return false
   }}
+  if cp < 4096 {{
+    return (low_props_lut[cp] & 4) != 0
+  }}
+  if (cp >= 0x4E00 && cp <= 0x9FFF) ||
+  (cp >= 0xAC00 && cp <= 0xD7A3) ||
+  (cp >= 0x3041 && cp <= 0x3096) ||
+  (cp >= 0x30A1 && cp <= 0x30FA) {{
+    return false
+  }}
   let starts = mark_start
   let mut lo = 0
   let mut hi = mark_count - 1
@@ -913,7 +1126,13 @@ fn unicode_is_mark(cp : Int) -> Bool {{
 
 ///| Lookup Bidi_Class: 0=L, 1=R, 2=AL, 3=EN, 4=ES, 5=ET, 6=AN, 7=CS, 8=NSM, 9=BN, 10=ON, 11=OTHER.
 fn unicode_bidi_class(cp : Int) -> Int {{
-  if cp >= 97 && cp <= 122 {{
+  if cp < 4096 {{
+    return (low_props_lut[cp] >> 4) & 31
+  }}
+  if (cp >= 0x4E00 && cp <= 0x9FFF) ||
+  (cp >= 0xAC00 && cp <= 0xD7A3) ||
+  (cp >= 0x3041 && cp <= 0x3096) ||
+  (cp >= 0x30A1 && cp <= 0x30FA) {{
     return 0
   }}
   let starts = bidi_start
@@ -960,6 +1179,15 @@ fn unicode_joining_type(cp : Int) -> Int {{
 ///| Return true if `cp` has NFC_Quick_Check != Yes (No or Maybe) in Unicode 16.0.0.
 fn unicode_nfc_qc_not_yes(cp : Int) -> Bool {{
   if cp < 0x0300 {{
+    return false
+  }}
+  if cp < 4096 {{
+    return (low_props_lut[cp] & 131072) != 0
+  }}
+  if (cp >= 0x4E00 && cp <= 0x9FFF) ||
+  (cp >= 0xAC00 && cp <= 0xD7A3) ||
+  (cp >= 0x3041 && cp <= 0x3096) ||
+  (cp >= 0x30A1 && cp <= 0x30FA) {{
     return false
   }}
   let starts = nfcqc_start
