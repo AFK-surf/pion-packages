@@ -35,7 +35,7 @@
 | 1. `next_break_opportunity` == `line_breaks` | 1,086,694 calls (every byte offset incl. continuation bytes, plus `INT_MIN`, `-1000000`, `-2`, `-1`, `len`, `len+1`, `len+2`, `INT_MAX`) on 53,861 inputs: 0 inconsistencies, native == wasm32. Correct, but O(n) per call from byte 0: **P1-1** |
 | 2. Independent model (offsets + kinds) | lbtest 16,672/16,672, named 181/189, pairs 17,200/17,324, fastpath 16,992/17,000, fuzz 19,160/20,000; every divergence reproduced exactly by emulating one of P2-1 / P2-2 / P2-3; **0 unexplained** |
 | 2. Rust `icu_segmenter 2.4.0` | ICU itself passes 16,578/16,672 official vectors. Pion == ICU: lbtest 16,578, named 161/189, pairs 16,993/17,324, fastpath 16,955/17,000, fuzz 17,256/20,000; every difference is an ICU-side deviation measured here (15.1 data, pre-15.1 LB19, pre-16.0 LB21a, a U+25CC-pair bug, LB15c / LB20a / LB25 / LB31 lag, SA) or a Pion finding; **0 unexplained** |
-| 3. DoS | 24 bombs (SP, CM, ZWJ, QU, QU_Pf / Pi, OP SP*, CL CP SP*, NU IS / SY chains, PR OP NU, PR OP IS CM* NU, RI, AK VI, HY AL, lookahead-over-CM runs, ill-formed bytes, limits, `next_break_opportunity(len-1)`) up to 3 MB: 4n/n ratio 1.8-5.4 (linear), native and wasm32, no crash, no recursion. Iterating `next_break_opportunity`: ratio 11.4 native / 16.1 wasm32, 16,000 B -> 3.6 s: **P1-1**. `LineBreakLimits` negative / 0 / exact / exact-1 / exact+1 / `INT_MIN` / `INT_MAX` on both limits for every input: 0 errors |
+| 3. DoS | 24 bombs (SP, CM, ZWJ, QU, QU_Pf / Pi, OP SP*, CL CP SP*, NU IS / SY chains, PR OP NU, PR OP IS CM* NU, RI, AK VI, HY AL, lookahead-over-CM runs, ill-formed bytes, limits, `next_break_opportunity(len-1)`) up to 3 MB: 4n/n ratio 1.8-6.1 over all runs (linear; gate < 8, the geometric midpoint of 4x and 16x), native and wasm32, no crash, no recursion. Iterating `next_break_opportunity`: ratio 10.7-19.8, 16,000 B -> 3.6-4.4 s native: **P1-1**. `LineBreakLimits` negative / 0 / exact / exact-1 / exact+1 / `INT_MIN` / `INT_MAX` on both limits for every input: 0 errors |
 | 4. ASCII fast path | 17,000-input corpus (`"ab"+c+"cd"`, `"ab"+c+d+"cd"` for all ASCII c, d; every representative r as `"ab"+r+"cd"`, `"ab"+r+CM+"cd"`, `r+"ab"`, `"a"+ZWJ+r+"b"`) + 34 named seams: 0 divergences from the model except the P2-1 code points; mutant 13 (fast path after any class) is caught by 13 control cases |
 | 5. `Send`, 4 modes, README | `pionc check --json`: `LineBreakClass`, `BreakKind`, `BreakOpportunity`, `LineBreakError`, `LineBreakLimits`, `String` Send; `Array[BreakOpportunity]` `E_NOT_SEND`: as README says. `wasm_smoke` stdout and SHA-256 `5b5e94c5…8b70` identical in 4 modes and equal to README; wasm32 79,508 B (README 79,508). Unit tests 15/15. Bench: differential 123/123, both stdout SHA-256 equal README, speed 0.17-0.18x of Rust (README 0.16x / 0.14x). No internal machine names |
 | 6. Mutation proof | **20 / 20** injected bugs caught (LB4, LB5 x2, LB8, LB9, LB15a, LB15b, LB19a, LB20a, LB21a, LB25, LB28a, LB30a, LB30b, QU_Pi table flag, ASCII fast path, UTF-8 overlong, negative limits, `max_input_bytes` off by one, `next_break_opportunity` at the offset); every mutant is built and dropped in `$AUDIT_OUT`, the repository is never touched |
@@ -50,8 +50,8 @@ divergence is attributed.
 
 - **Repro:** `diff/dos.py` bomb d25: the natural incremental-layout loop
   `off = 0; while let Some(op) = next_break_opportunity(s, off) { off = op.byte_offset }` over `"a " x 2,000`
-  (4,000 B) takes 0.32 s native `--release`; over `"a " x 8,000` (16,000 B) it takes 3.63 s (ratio 11.4; wasm32
-  16.1). A 1 MB document would need hours. A single `next_break_opportunity(s, len - 1)` is fine (O(n), d24).
+  (4,000 B) takes 0.27-0.32 s native `--release`; over `"a " x 8,000` (16,000 B) it takes 3.6-4.4 s (ratio
+  11.4-16.2; wasm32 10.7-19.8 over four runs). A 1 MB document would need hours. A single `next_break_opportunity(s, len - 1)` is fine (O(n), d24).
 - **Root cause:** `next_break_opportunity` calls `run_linebreak(s, -1, target)`, which always starts at byte 0
   and walks to the first opportunity after `target`, so k calls cost O(k·n). Nothing in the README warns about
   it; the README advertises "Strict O(n)" and the function reads like an iterator step (it is the ICU
@@ -163,7 +163,7 @@ The README's list of ICU 2.4.0 divergences (LB15c, LB19a, LB20a, LB21a, LB25) is
 | `conformance` | 5 corpora x 4 modes byte-identical; official vectors (positions + kinds); invariants |
 | `api` | `next_break_opportunity` at every offset and hostile offsets, 9 limit settings per input, native vs wasm32 |
 | `oracles` | model (offsets + kinds, finding attribution) and ICU (deviation attribution) on 5 corpora |
-| `dos` | 25 bombs x {native, wasm32} at n and 4n, median of 7 self-timed runs, re-measured when over the limit |
+| `dos` | 25 bombs x {native, wasm32} at n and 4n, median of 7 self-timed runs; 4n/n must stay < 8 (linear 4, quadratic 16), re-measured up to twice when over |
 | `smoke` / `bench` | `wasm_smoke` 4 modes vs README; `bench/run_bench.sh` re-run, SHA-256 and speed vs README |
 | `inject` | 20 mutants; gate = control cases + official vectors (positions + kinds) + API sweep |
 

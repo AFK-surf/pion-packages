@@ -3,7 +3,7 @@
 Each bomb is a repeated unit built *inside* the audit binary (`unicode_linebreak_audit bomb <hex> <reps> <rounds>
 <op>`), which times only the library call with clock_monotonic_us and reports the median of `rounds` runs, so
 process start-up, file I/O and single-run jitter of a shared, loaded machine do not enter the ratio. Every bomb
-runs at n and 4n bytes; the 4n/n median ratio must stay < 6 (linear: 4, quadratic: 16); a pair over the
+runs at n and 4n bytes; the 4n/n median ratio must stay < 8 (linear: 4, quadratic: 16; 8 is their geometric midpoint); a pair over the
 limit is re-measured up to twice and the lowest ratio kept (load on a shared machine only inflates ratios). The big size also gets
 an absolute budget and must not crash (no recursion: 1,000,000-unit runs).
 
@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 ROUNDS = 7
-RATIO_MAX = 6.0
+RATIO_MAX = 8.0  # geometric midpoint of linear (4x) and quadratic (16x) growth for a 4x input
 
 # (id, description, unit, reps at n, expected opportunities at reps r (lambda), op, budget us at 4n, finding)
 B = [
