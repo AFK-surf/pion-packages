@@ -30,6 +30,10 @@ def _records(name):
             yield [p.strip() for p in body.split(";")]
 
 
+LONG_BIDI = {"Left_To_Right": "L", "Right_To_Left": "R", "Arabic_Letter": "AL", "European_Terminator": "ET",
+             "Boundary_Neutral": "BN", "Arabic_Number": "AN", "European_Number": "EN", "Other_Neutral": "ON"}
+
+
 class Data:
     def __init__(self):
         # --- UnicodeData: gc, ccc, canonical decompositions, Nd digit values
@@ -76,7 +80,7 @@ class Data:
         for line in _lines("DerivedBidiClass.txt"):
             if line.startswith("# @missing:"):
                 p = [x.strip() for x in line[len("# @missing:"):].split(";")]
-                missing.append((_rng(p[0]), p[1]))
+                missing.append((_rng(p[0]), LONG_BIDI.get(p[1], p[1])))
         self.bidi_missing = missing
         for r in _records("DerivedBidiClass.txt"):
             lo, hi = _rng(r[0])
@@ -106,6 +110,18 @@ class Data:
             if r[1] == "Default_Ignorable_Code_Point":
                 lo, hi = _rng(r[0])
                 self.di.update(range(lo, hi + 1))
+        # --- UAX #9 paired brackets and mirroring glyphs, UTS #39 Identifier_Status
+        self.brackets = {}
+        for r in _records("BidiBrackets.txt"):
+            self.brackets[int(r[0], 16)] = (int(r[1], 16), r[2])
+        self.mirror = {}
+        for r in _records("BidiMirroring.txt"):
+            self.mirror[int(r[0], 16)] = int(r[1], 16)
+        self.id_allowed = set()
+        for r in _records("IdentifierStatus.txt"):
+            if r[1] == "Allowed":
+                lo, hi = _rng(r[0])
+                self.id_allowed.update(range(lo, hi + 1))
         # --- confusables prototypes
         self.proto = {}
         for r in _records("confusables.txt"):

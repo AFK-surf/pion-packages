@@ -5,8 +5,9 @@
     CPython's older Unicode database already has, `selftest`)
   * UTS #46 16.0.0 §4 Processing, §4.1 Validity Criteria V1-V9, §4.2 ToASCII, §4.3 ToUnicode
   * RFC 5892 Appendix A ContextJ / ContextO, RFC 5893 §2 Bidi rules 1-6
-  * UTS #39 16.0.0 §4 skeleton (both the README formula NFD(map(NFD(X))) and the 16.0 internalSkeleton,
-    which also removes Default_Ignorable_Code_Point characters)
+  * UTS #39 16.0.0 §4 skeleton = bidiSkeleton(LTR, X): UAX #9 reordering (uba.py, incl. L3 / L4), then
+    internalSkeleton (NFD, Default_Ignorable_Code_Point removal, prototypes, NFD); the pre-15 README formula
+    NFD(map(NFD(X))) is kept to classify old behaviour
   * packages/idna README's display_domain policy (script sets, whole-script ASCII-skeleton test, invisible,
     mixed numbering systems), and its default IdnaLimits
 
@@ -18,6 +19,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uba  # noqa: E402
 from ucd import data  # noqa: E402
 
 D = data()
@@ -426,6 +428,25 @@ def skeleton_spec(cps):
     return nfd(out)
 
 
+def skeleton_bidi(cps, full=True):
+    """UTS #39 16.0 skeleton(X) = bidiSkeleton(LTR, X) = internalSkeleton(L4(L3(UBA L1-L2 order of X))).
+    full=False: the reduced reordering (see uba.py). None when X is outside the UBA model's scope."""
+    v = uba.visual(cps, full)
+    return None if v is None else skeleton_spec(v)
+
+
+# Small-capital Latin letters README.md (fix branch) counts as ASCII look-alikes in whole-script skeletons.
+SMALL_CAPS = {0x0299, 0x029C, 0x1D00, 0x1D04, 0x1D07, 0x1D0A, 0x1D0B, 0x1D0D, 0x1D0F, 0x1D18, 0x1D1B, 0x1D1C,
+              0x1D20, 0x1D21, 0x1D22}
+# Chrome kDangerousPattern CJK slash / dash look-alikes
+CJK_SLASH = {0x30CE, 0x30BD, 0x30BE, 0x30F3, 0x30FC, 0x4E36, 0x4E40, 0x4E41, 0x4E3F, 0x4E00}
+
+
+def _cjk_context(c):
+    s = 2 if (0x41 <= c <= 0x5A or 0x61 <= c <= 0x7A) else D.script.get(c, 0)
+    return s in (5, 6, 7, 8, 30) or c in (0x30FC, 0x30FB, 0x3005, 0x3006, 0x3007)
+
+
 def has_rtl(cps):
     return any(D.bidi_class(c) in ("R", "AL", "AN") for c in cps)
 
@@ -461,7 +482,7 @@ def display(cps):
         lc = [ord(c) for c in lab]
         if not lc:
             continue
-        if any(c in D.di for c in lc):
+        if any(c in D.di or 0x335 <= c <= 0x338 for c in lc):
             reasons.add("InvisibleCodePoint")
         systems = {D.digit_zero[c] for c in lc if c in D.digit_zero}
         if len(systems) > 1:
@@ -469,8 +490,16 @@ def display(cps):
         ids = scripts(lc)
         if not _script_set_ok(ids):
             reasons.add("MixedScript")
+        for k, c in enumerate(lc):
+            if c in CJK_SLASH and ((k > 0 and not _cjk_context(lc[k - 1])) or
+                                   (k + 1 < len(lc) and not _cjk_context(lc[k + 1]))):
+                reasons.add("MixedScript")
+        sk = skeleton_bidi(lc) or skeleton_bidi(lc, False)
         if any(c >= 0x80 for c in lc) and 2 not in ids and len(ids) == 1:
-            sk = skeleton_readme(lc)
+            base = [c for c in sk if not D.is_mark(c)]
+            if base and all(c < 0x80 or c in SMALL_CAPS for c in base):
+                reasons.add("WholeScriptConfusable")
+        if any(c >= 0x80 for c in lc) and 2 in ids and len(ids) == 1:
             if sk and all(c < 0x80 for c in sk):
                 reasons.add("WholeScriptConfusable")
     if reasons:
@@ -516,15 +545,17 @@ def dump_case(raw):
     if cps is None:
         out.append("K ?")
         out.append("C ?")
-        out.append("D 1 InvalidIdna " + h(raw) + " -")
+        out.append("D 1 InvalidIdna RAW -")
         out.append("P ERR utf8")
     else:
         sr = skeleton_readme(cps)
-        ss = skeleton_spec(cps)
-        out.append("K %s %s %s" % (h("".join(map(chr, sr))), h("".join(map(chr, ss))), "rtl" if has_rtl(cps) else "ltr"))
+        ss = skeleton_bidi(cps)
+        sb = skeleton_bidi(cps, False)
+        out.append("K %s %s %s %s" % (h("".join(map(chr, sr))), "?" if ss is None else h("".join(map(chr, ss))),
+                                      h("".join(map(chr, sb))), "rtl" if has_rtl(cps) else "ltr"))
         out.append("C " + (",".join(str(x) for x in scripts(cps)) or "-"))
         if too_big:
-            out.append("D 1 InvalidIdna " + h(raw) + " -")
+            out.append("D 1 InvalidIdna RAW -")
         else:
             f, rs, disp, a = display(cps)
             out.append("D %s %s %s %s" % (f, ",".join(sorted(rs)) or "-", "RAW" if disp is None else h(disp), h(a)))

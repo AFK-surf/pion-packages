@@ -18,6 +18,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 NFC_GAP = {0x114B0, 0x114BA, 0x114BD, 0x115AF, 0x11930, 0x16D67, 0x16D68} | set(range(0x1611E, 0x1612A))
 
 
+def _assigned():
+    from ucd import data
+    return set(data().gc)
+
+
+ASSIGNED = _assigned()
+
+
 def blocks(path):
     d = {}
     order = []
@@ -157,20 +165,28 @@ def model_cmp(cpath, ppath, mpath):
                     elif prof == "S" and pv[2] == "0" and mv[2] == "1" and 0x30FB in cp:
                         fid = "P2-3"
             elif key == "K":
+                # model: K <README pre-15 formula> <UTS #39 16.0 bidiSkeleton(LTR) | ?> <reduced UBA> <ltr|rtl>
                 if mv[1] == "?":
                     ok = True
+                elif mv[2] == "?":
+                    ok = pv[1] == mv[3]
+                    if ok:
+                        t.add("INFO-10", name, key, pv, mv)  # isolates / B / non-ignorable BN: out of model scope
                 else:
-                    ok = pv[1] == mv[2] or (pv[1] == mv[1] and mv[1] == mv[2])
-                    if not ok and pv[1] == mv[1]:
+                    ok = pv[1] == mv[2]
+                    if not ok and any(c not in ASSIGNED for c in cp) and mv[4] == "rtl":
+                        fid = "INFO-11"  # unassigned code points: tables give OTHER, not the @missing L / R / AL
+                    elif not ok and pv[1] == mv[3]:
+                        fid = "P2-7"  # reordering without X1-X8 / N0 / L1 / L3 / L4
+                    elif not ok and pv[1] == mv[1]:
                         fid = "P1-5"
             elif key == "C":
                 ok = mv[1] == "?" or pv[1] == mv[1]
             elif key == "D":
                 if mv[3] == "RAW":
-                    ok = pv[1] == "1" and pv[2] == "InvalidIdna"
-                    if ok and not is_ascii_hex(pv[3]):
-                        t.add("P1-2", name, key, pv, mv)
-                        t.checks += 0
+                    ok = pv[1] == "1" and pv[2] == "InvalidIdna" and is_ascii_hex(pv[3])
+                    if not ok and pv[1] == "1" and pv[2] == "InvalidIdna":
+                        fid = "P1-2"
                 else:
                     ok = pv[1] == mv[1] and set(pv[2].split(",")) == set(mv[2].split(",")) and pv[3] == mv[3] and \
                         pv[4] == mv[4]
@@ -223,6 +239,10 @@ def rust_cmp(cpath, ppath, rpath, assigned):
                     fid = "INFO-4"  # IdnaLimits (documented DoS bounds) stricter than Rust's
                 elif unassigned16 and (pv[2] in ("ERR", "0")) and rv[2] in ("OK", "1"):
                     fid = "INFO-3"  # Rust idna 1.1.0 / ICU4X 2.4 data is Unicode 17: code points unassigned in 16.0
+                elif key[2] == "U" and pk == "InvalidHyphens" and rv[2] in ("OK", "1") and any(
+                        lab.startswith("xn--") and any(ord(ch) >= 0x80 for ch in lab)
+                        for lab in unhex(r["U U"][3]).decode("utf-8", "replace").split(".")):
+                    fid = "INFO-9"  # Rust idna 1.1.0 lacks UTS #46 V4 (decoded label starting with xn--)
             if ok:
                 t.agree += 1
             else:
