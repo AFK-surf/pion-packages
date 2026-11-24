@@ -85,6 +85,8 @@ pionc run --target wasm32 packages/zstd/wasm_smoke
 pionc run --target wasm32 --release packages/zstd/wasm_smoke
 ```
 
+- Binary size (`v0.1.1`): `native debug` `205,200 B`, `native --release` `414,104 B`, Wasm32 debug `125,892 B`, Wasm32 `--release` `135,880 B`.
+
 ### Bidirectional Byte-Exact Parity (`193` Cross-Checks, `0` Mismatches)
 
 Verified via `sh packages/zstd/bench/run_bench.sh` across 8 deterministic corpora (empty, 1 byte, 64 KiB RLE, 200 KiB multi-block RLE, 32 KiB high-entropy, CJK UTF-8, 1 MiB Web HTML/CSS/JS/JSON, 1 MiB structured binary log):
@@ -108,9 +110,9 @@ Run via `sh packages/zstd/bench/run_bench.sh` using `scripts/bench_compare.py` (
 
 | Workload | `pion_zstd` Median (Throughput) | `rust_ruzstd` Median (Throughput) | `rust_zstd` (C libzstd) Median (Throughput) | `pion_zstd` vs Baseline |
 | --- | ---: | ---: | ---: | ---: |
-| Web HTML/CSS/JS/JSON Decompress (1 MiB × 10) | 44.857 ms (233.76 MB/s) | 27.052 ms (387.62 MB/s) | 9.932 ms (1055.71 MB/s) | **0.60x** vs `rust_ruzstd` |
-| Web HTML/CSS/JS/JSON Compress L3 (1 MiB × 5) | 33.449 ms (156.74 MB/s) | — | 11.047 ms (474.60 MB/s) | **0.33x** vs `rust_zstd` |
-| Structured Binary Log Decompress (1 MiB × 10) | 75.536 ms (138.82 MB/s) | 35.237 ms (297.57 MB/s) | 12.667 ms (827.81 MB/s) | **0.47x** vs `rust_ruzstd` |
-| Structured Binary Log Compress L3 (1 MiB × 5) | 99.179 ms (52.86 MB/s) | — | 22.213 ms (236.02 MB/s) | **0.22x** vs `rust_zstd` |
+| Web HTML/CSS/JS/JSON Decompress (1 MiB × 10) | 29.372 ms (357.00 MB/s) | 19.705 ms (532.13 MB/s) | 8.852 ms (1184.55 MB/s) | **0.67x** vs `rust_ruzstd` |
+| Web HTML/CSS/JS/JSON Compress L3 (1 MiB × 5) | 28.053 ms (186.89 MB/s) | — | 9.439 ms (555.45 MB/s) | **0.34x** vs `rust_zstd` |
+| Structured Binary Log Decompress (1 MiB × 10) | 42.608 ms (246.10 MB/s) | 33.079 ms (316.99 MB/s) | 12.702 ms (825.52 MB/s) | **0.78x** vs `rust_ruzstd` |
+| Structured Binary Log Compress L3 (1 MiB × 5) | 86.451 ms (60.65 MB/s) | — | 21.369 ms (245.35 MB/s) | **0.25x** vs `rust_zstd` |
 
-_Peak RSS reported `N/A` by `/usr/bin/time` on the Linux benchmark host._
+_`v0.1.1` (zero-alloc sequence/Huffman decode hot loops and LZ77 scratch reuse). Peak RSS reported `N/A` by `/usr/bin/time` on the Linux benchmark host. The remaining `< 1.0x` gaps (decompress vs `ruzstd`, L3 compress vs C `libzstd`) are tracked against `pionc` Wave L codegen work._

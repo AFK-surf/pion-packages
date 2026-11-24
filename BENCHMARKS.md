@@ -30,9 +30,11 @@
    - 峰值 RSS：macOS 通过 `/usr/bin/time -l` 解析 `maximum resident set size`（bytes），Linux 通过 `/usr/bin/time -v` 解析 `Maximum resident set size`（KiB）。
    - 相对倍率：以基线实现中位数为 `1.00x`，`speedup = baseline_median_ms / impl_median_ms`（`> 1.00x` 表示快于基线，`< 1.00x` 表示慢于基线）。
 
-## 基准总榜（v0.2.0 + Wave 4–15 + Wave 17–34 + `base64` + `effect` + `crypto` + 浏览器与多媒体沉淀波 1–10 + `fts`）
+## 基准总榜（v0.2.0 + Wave 4–15 + Wave 17–34 + `base64` + `effect` + `crypto` + 浏览器与多媒体沉淀波 1–10 + `fts` + `v0.1.1` 九包性能优化清零）
 
 `v0.2.0` 为最初 12 个包经红队对抗审计（`packages/<name>/audit/`）并修复后的版本；Wave 4 新增 `tar` / `semver` / `uuid` / `url` `v0.1.0`（首发即红队修复后版本），并发布 `markdown` `v0.2.1`（P49 性能优化）；Wave 5 新增 `http1` / `jwt` / `xml` / `csv` `v0.1.0`（首发即红队修复后版本）；Wave 6 新增 `regex` / `flate` / `decimal` / `template` `v0.1.0`（首发即红队修复后版本）；Wave 7 新增 `cron` / `msgpack` / `json5` / `html` `v0.1.0`（首发即红队修复后版本）；Wave 8 新增 `cli` / `sql` / `graph` / `css` `v0.1.0`（首发即红队修复后版本；`css` 由各包 `audit/scripts/perf.py` 交替采样，非 `bench_compare.py`，见明细）；随后单独发布 `base64` `v0.1.0` 与 `effect` `v0.1.0`（`effect` 以 Go 为基线，另列 Node.js），以及 `crypto` `v0.1.0`（以 Go 标准库为基线；Go 在 `darwin/arm64` 上使用 ARMv8 加密指令与汇编，本包为纯标量 Pion，见明细；后升至 `v0.2.0`，新增 X25519 / HKDF / ChaCha20-Poly1305 / P-256 / RSA，基准扩至 8 项）；随后发布 浏览器与多媒体沉淀波 1（`brotli` / `unicode_bidi` / `hyphenation` / `pdf`）与 `fts` `v0.1.0`（以 C SQLite FTS5 为基线，另列 Python `sqlite3`）。Wave 9 新增 `zip`（以 Go `archive/zip` 为基线，另列 Rust `zip`）、`dns`（以 Rust `hickory-proto` 为基线，另列 Go `miekg/dns`）、`protobuf`（以 Rust `prost` 为基线，另列 Go `protowire`；`DynamicMessage` 另与 Go `dynamicpb` 对比）与 `graphql`（以 Rust `apollo-parser` 为基线，另列 Node `graphql-js`）`v0.1.0`，首发即红队修复后版本。Wave 10 新增 `http2`（以 Rust `h2 0.4.20` 为基线，另列 Go `golang.org/x/net v0.62.0`）、`jsonschema`（以 Rust `jsonschema 0.29.1` 为基线，另列 Node `ajv 8.17.1`；另列去除固定启动开销后的稳态 `ns/op`）、`mime`（以 Go 1.27 标准库为基线，`Content-Type` 解析另以 Rust `mime 0.3.18`、魔数嗅探以 Rust `infer 0.16.0` 为基线）与 `asn1`（以 Go `crypto/x509` / `encoding/asn1` 为基线，另列 Rust `x509-parser 0.16.0` / `der 0.7.10`）`v0.1.0`，首发即红队修复后版本。Wave 11 新增 `cel`（以 Go `cel-go v0.24.1` 为基线）、`wasm`（以 Rust `wasmparser` / `wasm-encoder` / `wasmprinter 0.221.3` 为基线）、`ical`（以 Rust `rrule 0.14.0` / `icalendar 0.16.17` 为基线）与 `ssh`（以 Go `golang.org/x/crypto/ssh v0.38.0` 为基线；Go 缺失的 `|1|` 哈希主机、RFC 4253 分包与 `SSHSIG` 由等价 Go 实现补齐）`v0.1.0`，首发即红队修复后版本。Wave 12 新增 `git`（以 Rust `gix`（`gix-object 0.46` / `gix-pack 0.56` / `gix-index 0.37` / `gix-packetline 0.18`）为基线）、`jq`（以 Go `gojq v0.12.17` 为基线）、`qrcode`（以 Rust `qrcode 0.14.1` 为基线，另列 `qrcodegen 1.8.0` / `fast_qr 0.14.0`）与 `mqtt`（以 Rust `rumqttc 0.25.1` 为基线，另列 Go `paho.golang/packets v0.23.0`；`TopicTrie` 为同算法跨语言对照）`v0.1.0`，首发即红队修复后版本。Wave 13 新增 `bson`（以 Rust `bson 2.15.0` 为基线；解码另列零拷贝 `RawDocument` 遍历）、`resp`（以 Rust `redis-protocol 6.0.0` 零拷贝 `decode_bytes_mut` 为基线）、`hcl`（以 Go `hashicorp/hcl/v2 v2.23.0` 为基线）与 `email`（MIME 解析以 Rust `mail-parser 0.9.4`、地址 / 日期解析以 Go `net/mail`、DKIM 以 Go `go-msgauth v0.7.0` 为基线）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 14 新增 `jsonpath`（以 Rust `serde_json_path 0.7.2` + `json-patch 4.2.0` 为基线）、`svg`（以 Rust `svgtypes 0.15.3` / `roxmltree 0.20.0` 同算法实现为基线，另列地道 `kurbo 0.11.3` 与非等价参考 Node `svgo@3.3.2`）、`promql`（以 Go `prometheus/prometheus v0.302.1` 的 `promql/parser` 与 `promql.Engine` 为基线）与 `lua`（以 Go `gopher-lua v1.1.1` 为基线，W3 采用只开同等库子集的公平配置）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 15 新增 `openapi`（以 Go `kin-openapi v0.131.0` 为基线）、`avro`（以 Go `hamba/avro/v2 v2.28.0` 动态 `map[string]any` 为基线，另列 typed `struct`）、`kdl`（以 Rust `kdl 6.7.1` 无损 CST 解析器为基线，非同构对照）与 `xpath`（以 Rust `sxd-xpath 0.4.2` 为基线，另列 C `libxml2 -O2`）`v0.1.0`，首发即红队修复后版本，数据取自各包红队修复后刷新的 README；Wave 17 新增 `json`（以 Rust `serde_json =1.0.145` 为基线，另列 Go `encoding/json`）与 `sse`（以 Rust `eventsource-stream =0.2.3` 为基线）`v0.1.0`，并发布 `crypto` `v0.3.0`（新增 AES-256-GCM、P-256 ECDH 与 P-256 公钥校验 4 行，迭代数按红队 P2-1 加大到 Go 侧 ≥ 45 ms 实际工作量的稳态口径，原 8 行同步刷新）与 `markdown` `v0.3.0`（新增树状 AST 与纯文本提取吞吐，无上游同构实现，仅列 Pion 自身数据），数据取自各包红队修复后刷新的 README；Wave 18 新增 `proxy` `v0.1.0`（W1 / W2 以同输出的手写 Go 参考实现 `go_ref` 为基线，W3 以 Go `net/http` `ReadRequest` / `ReadResponse` 为基线，见明细）并发布 `crypto` `v0.4.0`（新增 PBKDF2-HMAC-SHA256 与 scrypt 2 行，以 Go `golang.org/x/crypto` `v0.58.0` 为基线，迭代数按 Go 侧 ≥ 50 ms 的稳态口径），数据取自各包红队修复后刷新的 README；Wave 19 新增 `gif`（以 Go `image/gif` 标准库为基线）与 `webvtt`（以同规则手写 Go 镜像 `go_ref` 为基线，按红队 F20 另列零拷贝 `go_tuned`）`v0.1.0`，首发即红队修复后版本；Wave 20 新增 `webp` `v0.1.0`（以 Go `golang.org/x/image/webp` `v0.48.0` 为基线），首发即红队修复后版本，数据为发布时同机复测；Wave 21 新增 `wgsl` `v0.1.0`（以 Rust `naga =24.0.0 --release` 为基线）、Wave 22 新增 `exif` `v0.1.0`（以 Rust `kamadak-exif =0.6.2 --release` 为基线）与 Wave 23 新增 `icc` `v0.1.0`（以预缓存 Rust `qcms =0.3.0`（`precache_output_transform()`）与 `moxcms =0.9.2 --release` 为基线）与 Wave 24 新增 `encoding` `v0.1.0`（以 Mozilla Rust `encoding_rs =0.8.44 --release` 为基线）与 Wave 25 新增 `css_color` `v0.1.0`（以 Rust Linebender `color =0.3.3 --release` 为基线）与 Wave 26 新增 `cookie` `v0.1.0`（以 Rust `cookie =0.18.3` 与 `psl =2.1.261 --release` 为基线）、Wave 27 新增 `opentype` `v0.1.0`（以 Rust `ttf-parser 0.25.1 --release` 为基线）、Wave 28 新增 `hls` `v0.1.0`（以 Rust `m3u8-rs 6.0.1 --release` 为基线）与 Wave 29 新增 `dash` `v0.1.0`（以 Rust `dash-mpd-core =0.1.0 --release` 为基线）、Wave 30 新增 `idna` `v0.1.0`（以 Rust `idna =1.1.0 --release` LTO 为基线）、Wave 31 新增 `structured_fields` `v0.1.0`（以 Rust `sfv =0.16.1 --release` 为基线，`Linux x86_64` 同机复测）、Wave 32 新增 `unicode_segment` `v0.1.0`（以 Rust `unicode-segmentation =1.12.0 --release` LTO 为基线，`Linux x86_64` 同机复测）、Wave 33 新增 `unicode_linebreak` `v0.1.0`（以 Rust `icu_segmenter =2.4.0 --release` LTO 为基线，`Linux x86_64` 同机复测）、Wave 34 新增 `zstd` `v0.1.0`（以 Rust `ruzstd =0.7.3 --release` 与 C `libzstd 1.5.7` 为基线，`Linux x86_64` 同机复测），均首发即红队修复后版本，数据为发布时同机复测。本榜数据如实摘录自各包 `packages/<name>/README.md`，绝大多数包在 Apple M5 Max (`Darwin arm64`) 上经 `scripts/bench_compare.py` 严格交替采样并通过 stdout SHA-256 逐字节一致校验，个别在明细段注明 Linux `x86_64` 节点的包（如 `crdt` 五方同机、`bzip2`、`lepton`、`preflate`）以明细段标注的同机实测为准；对抗基准由各包 `sh packages/<name>/audit/run_audit.sh` 产出。`Speedup > 1.00x` 表示 Pion 快于参考实现，`< 1.00x` 表示落后。`—` 表示来源未记录该项。
+
+`v0.1.1` 九包性能优化清零（`css_color` / `zstd` / `unicode_linebreak` / `cookie` / `structured_fields` / `unicode_segment` / `opentype` / `idna` / `encoding`）：本榜中这 9 个包的行已替换为 `v0.1.1` 在 `Linux x86_64` 上同机复测的数据（行首标 `v0.1.1`；`opentype` Arial.ttf 行本轮未复测，仍为 `v0.1.0` Darwin arm64 数据），`v0.1.0` 发布时的数据保留在各包明细段，汇总见下方「`v0.1.1` 九包性能优化清零」。
 
 | Package | Workload | Input | Pion Median | Reference Median | Speedup (vs Ref) | Pion Peak RSS | Ref Peak RSS |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -353,19 +355,19 @@
 | `icc` | 同上，AdobeRGB v2 `curv` gamma（× 20,000） | 8,640,000 B | **70.213 ms** (`3510.64 ns/op`) | 82.256 ms (`rust_qcms_pre`) / 895.762 ms (`rust_moxcms`) | **1.17x**（vs `moxcms` **12.76x**） | **2.06 MiB** | 2.36 / 2.69 MiB |
 | `icc` | 同上，Rec.2020 v4 `para3`（709 TRC，× 20,000） | 8,800,000 B | 71.605 ms (`3580.26 ns/op`) | **50.809 ms** (`rust_qcms_pre`) / 860.987 ms (`rust_moxcms`) | 0.71x（vs `moxcms` **12.02x**） | **2.06 MiB** | 2.41 / 2.89 MiB |
 | `icc` | 1920×1080 RGBA8 Display-P3 → sRGB × 20 帧（41,472,000 px） | 165,888,000 B | 107.813 ms (`2.60 ns/px`) | 100.764 ms (`rust_qcms_pre`) / **52.097 ms** (`rust_moxcms`，NEON) | 0.93x（vs `moxcms` 0.48x） | 17.98 MiB | **10.16** / 18.33 MiB |
-| `encoding` | 解码 UTF-8 ~1 MiB 真实 HTML（× 100） | 104,809,800 B | 47.195 ms (2220.79 MB/s) | **14.345 ms** (`rust_encoding_rs`) | 0.30x | **5.19 MiB** | 9.16 MiB |
-| `encoding` | 解码 GB18030 ~1 MiB HTML（× 100） | 104,815,200 B | 243.813 ms (429.90 MB/s) | **64.240 ms** (`rust_encoding_rs`) | 0.26x | 14.20 MiB | **9.20 MiB** |
-| `encoding` | 解码 Shift_JIS ~1 MiB HTML（× 100） | 104,830,200 B | 226.179 ms (463.48 MB/s) | **86.963 ms** (`rust_encoding_rs`) | 0.38x | **8.42 MiB** | 9.17 MiB |
-| `encoding` | `encode_html` Big5，~1 MiB UTF-8 HTML（NCR 回退，× 20） | 20,963,640 B | **357.426 ms** (58.65 MB/s) | 397.445 ms (`rust_encoding_rs`) | **1.11x** | 6.84 MiB | **5.17 MiB** |
-| `encoding` | `encode_html` gb18030，~1 MiB UTF-8 HTML（× 20） | 20,971,000 B | **363.519 ms** (57.69 MB/s) | 367.104 ms (`rust_encoding_rs`) | **1.01x** | **6.77 MiB** | 9.20 MiB |
-| `encoding` | `encode_html` Shift_JIS，~1 MiB UTF-8 HTML（× 20） | 20,962,800 B | 195.433 ms (107.26 MB/s) | **109.661 ms** (`rust_encoding_rs`) | 0.56x | 6.77 MiB | **5.17 MiB** |
-| `encoding` | `encode_html` EUC-KR，~1 MiB UTF-8 HTML（× 20） | 20,965,480 B | 308.335 ms (68.00 MB/s) | **60.401 ms** (`rust_encoding_rs`) | 0.20x | 6.80 MiB | **5.16 MiB** |
-| `css_color` | CSS Color 4 解析 + sRGB 转换（2,042 条 × 100，204,200 次） | 6,250,700 B | 66.646 ms (93.79 MB/s) | **29.791 ms** (`rust_color`) | 0.45x | 2.36 MiB | **2.23 MiB** |
-| `css_color` | 4 段管线 sRGB → Oklch → Display-P3 → Lab → sRGB（2,042 色 × 200，408,400 次） | — | 296.204 ms (725.28 ns/op) | **74.826 ms** (`rust_color`) | 0.25x | 2.56 MiB | **2.30 MiB** |
-| `cookie` | RFC 6265bis `Set-Cookie` 解析（200 条 × 2,000，400,000 次） | 26,000,000 B | 121.602 ms (213.81 MB/s) | **60.322 ms** (`rust_cookie`) | 0.50x | **2.03 MiB** | 2.30 MiB |
-| `cookie` | Mozilla PSL 可注册域 + 公共后缀查找（106 域 × 2,000，212,000 次） | 2,786,000 B | 88.841 ms (419.06 ns/op) | **17.468 ms** (`rust_psl`) | 0.20x | **2.19 MiB** | 2.58 MiB |
-| `opentype` | 惰性 `Face::parse` + 256 次 `cmap` / `hmtx` + 64 个 `glyf` 轮廓，Arial.ttf（× 200） | 154,647,200 B | 17.542 ms (87.71 µs/op) | **9.860 ms** (`rust_ttf_parser`) | 0.56x | 3.44 MiB | **2.72 MiB** |
-| `opentype` | 同上，合成 512 字形可变字体 `synthetic_512.ttf`（× 200） | 4,559,200 B | 12.215 ms (61.08 µs/op) | **9.698 ms** (`rust_ttf_parser`) | 0.79x | 2.00 MiB | 2.00 MiB |
+| `encoding` | v0.1.1 解码 UTF-8 ~1 MiB 真实 HTML（× 100，Linux x86_64） | 104,809,800 B | 51.695 ms (2027.47 MB/s) | **11.974 ms** (`rust_encoding_rs`) | 0.23x | — | — |
+| `encoding` | v0.1.1 解码 GB18030 ~1 MiB HTML（× 100，Linux x86_64） | 104,815,200 B | 241.405 ms (434.19 MB/s) | **85.870 ms** (`rust_encoding_rs`) | 0.36x | — | — |
+| `encoding` | v0.1.1 解码 Shift_JIS ~1 MiB HTML（× 100，Linux x86_64） | 104,830,200 B | 230.746 ms (454.31 MB/s) | **91.941 ms** (`rust_encoding_rs`) | 0.40x | — | — |
+| `encoding` | v0.1.1 `encode_html` Big5，~1 MiB UTF-8 HTML（NCR 回退，× 20，Linux x86_64） | 20,963,640 B | **222.858 ms** (94.07 MB/s) | 503.733 ms (`rust_encoding_rs`) | **2.26x** | — | — |
+| `encoding` | v0.1.1 `encode_html` gb18030，~1 MiB UTF-8 HTML（× 20，Linux x86_64） | 20,971,000 B | **166.894 ms** (125.65 MB/s) | 512.246 ms (`rust_encoding_rs`) | **3.07x** | — | — |
+| `encoding` | v0.1.1 `encode_html` Shift_JIS，~1 MiB UTF-8 HTML（× 20，Linux x86_64） | 20,962,800 B | **70.912 ms** (295.62 MB/s) | 132.529 ms (`rust_encoding_rs`) | **1.87x** | — | — |
+| `encoding` | v0.1.1 `encode_html` EUC-KR，~1 MiB UTF-8 HTML（× 20，Linux x86_64） | 20,965,480 B | **65.786 ms** (318.69 MB/s) | 135.709 ms (`rust_encoding_rs`) | **2.06x** | — | — |
+| `css_color` | v0.1.1 CSS Color 4 解析 + sRGB 转换（2,042 条 × 100，204,200 次，Linux x86_64） | 6,250,700 B | 42.549 ms (146.91 MB/s) | **40.947 ms** (`rust_color`) | 0.96x | 2.51 MiB | 2.67 MiB |
+| `css_color` | v0.1.1 4 段管线 sRGB → Oklch → Display-P3 → Lab → sRGB（2,042 色 × 200，408,400 次，Linux x86_64） | — | 111.433 ms (272.85 ns/op) | **93.553 ms** (`rust_color`) | 0.84x | 2.55 MiB | 2.86 MiB |
+| `cookie` | v0.1.1 RFC 6265bis `Set-Cookie` 解析（200 条 × 2,000，400,000 次，Linux x86_64） | 26,000,000 B | 91.080 ms (285.46 MB/s) | **84.426 ms** (`rust_cookie`) | 0.93x | **1.97 MiB** | 2.34 MiB |
+| `cookie` | v0.1.1 Mozilla PSL 可注册域 + 公共后缀查找（106 域 × 2,000，212,000 次，Linux x86_64） | 2,786,000 B | **25.161 ms** (118.68 ns/op) | 26.543 ms (`rust_psl`) | **1.05x** | **2.14 MiB** | 2.76 MiB |
+| `opentype` | 惰性 `Face::parse` + 256 次 `cmap` / `hmtx` + 64 个 `glyf` 轮廓，Arial.ttf（× 200；v0.1.0 Darwin arm64 数据，本轮未复测） | 154,647,200 B | 17.542 ms (87.71 µs/op) | **9.860 ms** (`rust_ttf_parser`) | 0.56x | 3.44 MiB | **2.72 MiB** |
+| `opentype` | v0.1.1 同上，合成 512 字形可变字体 `synthetic_512.ttf`（× 200，Linux x86_64） | 4,559,200 B | 4.466 ms (22.33 µs/op) | **2.988 ms** (`rust_ttf_parser`) | 0.67x | **10.90 MiB** | 11.29 MiB |
 | `hls` | 主语料：70 个 Master / Media / LL-HLS 播放列表解析（× 50，3,500 次） | 21,627,600 B | **97.242 ms** (222.41 MB/s) | 134.893 ms (`rust_m3u8_rs`) | **1.39x** | 4.03 MiB | **3.52 MiB** |
 | `hls` | `altbench` 现实语料：60 个长 URL / 逐分片 PDT / 密钥轮换 / 显式字节范围播放列表（× 5，300 次） | 42,287,085 B | 126.932 ms (333.15 MB/s) | **115.993 ms** (`rust_m3u8_rs`) | 0.91x | 27.44 MiB | **13.77 MiB** |
 | `dash` | 主语料：60 个 MPD 清单解析（静态 `SegmentBase` / 动态 `SegmentTemplate` + `SegmentTimeline` / 多 `Period` DRM / `SegmentList`，× 200，12,000 次） | 23,996,400 B | **212.539 ms** (112.90 MB/s) | 277.300 ms (`rust_dash_mpd`) | **1.30x** | **2.94 MiB** | 8.61 MiB |
@@ -378,18 +380,47 @@
 | `preflate` | RFC 1951 `analyze` + `reencode` 往返（zlib L1，Linux x86_64，× 3） | 2,892,498 B 明文（186,902 B DEFLATE） | 90.985 ms (31.79 MB/s) | **46.661 ms** (`rust_preflate_rs`) | 0.51x | **7.04 MiB** | 7.56 MiB |
 | `preflate` | RFC 1951 `analyze` + `reencode` 往返（zlib L6，Linux x86_64，× 3） | 2,892,498 B 明文（151,737 B DEFLATE） | 164.980 ms (17.53 MB/s) | **82.277 ms** (`rust_preflate_rs`) | 0.50x | **6.96 MiB** | 7.59 MiB |
 | `preflate` | RFC 1951 `analyze` + `reencode` 往返（zlib L9，Linux x86_64，× 3） | 2,892,498 B 明文（136,769 B DEFLATE） | 468.736 ms (6.17 MB/s) | **112.447 ms** (`rust_preflate_rs`) | 0.24x | **6.87 MiB** | 7.38 MiB |
-| `idna` | 多语种 IDN 语料：200 个 100% IDN / Punycode / NFD / 全角域名 × 200 次 `to_ascii` + `to_unicode`（80,000 次） | 649,000 B | 77.321 ms (8.39 MB/s) | **26.143 ms** (`rust_idna`) | 0.34x | 2.48 MiB | **2.17 MiB** |
-| `idna` | 真实浏览器流量语料：70% ASCII / 30% IDN 与 Punycode × 200 次 `to_ascii` + `to_unicode`（80,000 次） | 722,000 B | 24.835 ms (29.07 MB/s) | **19.740 ms** (`rust_idna`) | 0.79x | 2.48 MiB | **2.11 MiB** |
-| `structured_fields` | 真实浏览器请求头语料：24 种（`Sec-CH-UA`、`Permissions-Policy`、`Priority`、`Cache-Status`、`Signature-Input` 等）× 5,000 次解析 + 序列化（120,000 次，Linux x86_64） | 7,105,000 B | 176.599 ms (40.23 MB/s) | **65.457 ms** (`rust_sfv` `0.16.1`) | 0.37x | **2.08 MiB** | 2.18 MiB |
-| `structured_fields` | 复杂嵌套语料：16 种（嵌套字典、内层列表、Base64、UTF-8 Display String、Date、边界小数）× 4,000 次解析 + 序列化（64,000 次，Linux x86_64） | 7,156,000 B | 176.204 ms (40.61 MB/s) | **82.094 ms** (`rust_sfv` `0.16.1`) | 0.47x | **2.03 MiB** | 2.20 MiB |
-| `unicode_segment` | 多语种 Web / 社交语料（中 / 日 / 韩 / 英 / 德 / 希腊 / 俄 / 阿拉伯 / 希伯来 / 天城文 GB9c / Emoji ZWJ / 国旗）34,080 B × 40 轮，每轮字素 + 词 + `unicode_words` + 句四遍（Linux x86_64） | 5,452,800 B | 98.330 ms (55.45 MB/s) | **53.672 ms** (`rust_segment` `unicode-segmentation 1.12.0`) | 0.55x | 2.75 MiB | **2.05 MiB** |
-| `unicode_segment` | 技术文档与密集标点 / 数字 / 缩写语料 30,800 B × 40 轮，每轮字素 + 词 + `unicode_words` + 句四遍（Linux x86_64） | 4,928,000 B | 131.262 ms (37.54 MB/s) | **71.575 ms** (`rust_segment` `unicode-segmentation 1.12.0`) | 0.55x | 2.93 MiB | **2.13 MiB** |
-| `unicode_linebreak` | 多语种 Web / 新闻排版语料（中 / 日 / 韩 / 英 / 德 / 俄 / 阿拉伯 / 天城文 / Emoji / URL / 行内代码）41,916 B × 200 轮 `line_breaks`（Linux x86_64） | 8,383,200 B | 364.567 ms (23.00 MB/s) | **56.889 ms** (`rust_icu_segmenter` `2.4.0`) | 0.16x | 2.30 MiB | **2.20 MiB** |
-| `unicode_linebreak` | 技术文档语料（密集数字 / 货币 / 标点 / 引号 / 括号 / 连字符）43,600 B × 200 轮 `line_breaks`（Linux x86_64） | 8,720,000 B | 439.479 ms (19.84 MB/s) | **59.982 ms** (`rust_icu_segmenter` `2.4.0`) | 0.14x | 2.30 MiB | **2.16 MiB** |
-| `zstd` | Web HTML / CSS / JS / JSON 语料 1 MiB × 10 解压（官方 `zstd -3` 帧，Linux x86_64） | 10,485,760 B | 61.486 ms (170.54 MB/s) | **42.958 ms** (`rust_ruzstd` `0.7.3`；C `libzstd 1.5.7` 26.472 ms) | 0.70x | **5.43 MiB** | 8.48 MiB |
-| `zstd` | Web HTML / CSS / JS / JSON 语料 1 MiB × 5 L3 压缩（Linux x86_64） | 5,242,880 B | 51.940 ms (100.94 MB/s) | **26.775 ms** (`rust_zstd` C `libzstd 1.5.7`) | 0.52x | **5.18 MiB** | 5.50 MiB |
-| `zstd` | 结构化二进制日志 1 MiB × 10 解压（官方 `zstd -3` 帧，Linux x86_64） | 10,485,760 B | 104.792 ms (100.06 MB/s) | **73.303 ms** (`rust_ruzstd` `0.7.3`；C `libzstd 1.5.7` 43.680 ms) | 0.70x | **5.62 MiB** | 9.90 MiB |
-| `zstd` | 结构化二进制日志 1 MiB × 5 L3 压缩（Linux x86_64） | 5,242,880 B | 198.374 ms (26.43 MB/s) | **72.980 ms** (`rust_zstd` C `libzstd 1.5.7`) | 0.37x | 6.23 MiB | **6.00 MiB** |
+| `idna` | v0.1.1 多语种 IDN 语料：200 个 100% IDN / Punycode / NFD / 全角域名 × 200 次 `to_ascii` + `to_unicode`（80,000 次，Linux x86_64） | 649,000 B | **15.795 ms** (41.09 MB/s) | 16.471 ms (`rust_idna`) | **1.04x** | — | — |
+| `idna` | v0.1.1 真实浏览器流量语料：70% ASCII / 30% IDN 与 Punycode × 200 次 `to_ascii` + `to_unicode`（80,000 次，Linux x86_64） | 722,000 B | **6.996 ms** (103.21 MB/s) | 7.342 ms (`rust_idna`) | **1.05x** | — | — |
+| `structured_fields` | v0.1.1 真实浏览器请求头语料：24 种 × 5,000 次解析 + 序列化（120,000 次，Linux x86_64） | 7,105,000 B | **73.620 ms** (96.51 MB/s) | 76.044 ms (`rust_sfv` `0.16.1`) | **1.03x** | 2.09 MiB | 2.09 MiB |
+| `structured_fields` | v0.1.1 复杂嵌套语料：16 种 × 4,000 次解析 + 序列化（64,000 次，Linux x86_64） | 7,156,000 B | 99.589 ms (71.86 MB/s) | **90.799 ms** (`rust_sfv` `0.16.1`) | 0.91x | **2.07 MiB** | 2.15 MiB |
+| `unicode_segment` | v0.1.1 多语种 Web / 社交语料 34,080 B × 40 轮，每轮字素 + 词 + `unicode_words` + 句四遍（Linux x86_64） | 5,452,800 B | **25.709 ms** (212.09 MB/s) | 40.160 ms (`rust_segment` `unicode-segmentation 1.12.0`) | **1.56x** | — | — |
+| `unicode_segment` | v0.1.1 技术文档与密集标点 / 数字 / 缩写语料 30,800 B × 40 轮，每轮四遍（Linux x86_64） | 4,928,000 B | **18.473 ms** (266.77 MB/s) | 60.418 ms (`rust_segment` `unicode-segmentation 1.12.0`) | **3.27x** | — | — |
+| `unicode_linebreak` | v0.1.1 多语种 Web / 新闻排版语料 41,916 B × 200 轮 `line_breaks`（Linux x86_64） | 8,383,200 B | 53.230 ms (157.49 MB/s) | **46.286 ms** (`rust_icu_segmenter` `2.4.0`) | 0.87x | 2.30 MiB | **2.12 MiB** |
+| `unicode_linebreak` | v0.1.1 技术文档语料（密集数字 / 货币 / 标点）43,600 B × 200 轮 `line_breaks`（Linux x86_64） | 8,720,000 B | 65.854 ms (132.41 MB/s) | **58.761 ms** (`rust_icu_segmenter` `2.4.0`) | 0.89x | 2.30 MiB | **2.14 MiB** |
+| `zstd` | v0.1.1 Web HTML / CSS / JS / JSON 语料 1 MiB × 10 解压（官方 `zstd -3` 帧，Linux x86_64） | 10,485,760 B | 29.372 ms (357.00 MB/s) | **19.705 ms** (`rust_ruzstd` `0.7.3`；C `libzstd 1.5.7` 8.852 ms) | 0.67x | — | — |
+| `zstd` | v0.1.1 Web HTML / CSS / JS / JSON 语料 1 MiB × 5 L3 压缩（Linux x86_64） | 5,242,880 B | 28.053 ms (186.89 MB/s) | **9.439 ms** (`rust_zstd` C `libzstd 1.5.7`) | 0.34x | — | — |
+| `zstd` | v0.1.1 结构化二进制日志 1 MiB × 10 解压（官方 `zstd -3` 帧，Linux x86_64） | 10,485,760 B | 42.608 ms (246.10 MB/s) | **33.079 ms** (`rust_ruzstd` `0.7.3`；C `libzstd 1.5.7` 12.702 ms) | 0.78x | — | — |
+| `zstd` | v0.1.1 结构化二进制日志 1 MiB × 5 L3 压缩（Linux x86_64） | 5,242,880 B | 86.451 ms (60.65 MB/s) | **21.369 ms** (`rust_zstd` C `libzstd 1.5.7`) | 0.25x | — | — |
+
+## `v0.1.1` 九包性能优化清零
+
+本轮对 9 个包做热路径专项优化并统一升至 `v0.1.1`（`audit/**` 零改动，全部单测、4 模 `wasm_smoke` 与差分 / 互通校验不变）。数据取自各包 `packages/<name>/README.md` 最新实测（`zstd` 为本次发版集成时 `sh packages/zstd/bench/run_bench.sh` 复测），均在 `Linux x86_64` 上经 `scripts/bench_compare.py`（`--warmup 1 --rounds 5` 严格交替、stdout SHA-256 逐字节一致）产出。`v0.1.0` 列为发布时数据，其中 `encoding` / `css_color` / `cookie` / `opentype` / `idna` 的 `v0.1.0` 数据为 Darwin arm64，跨平台比值仅供参考。
+
+| Package | Workload | `v0.1.0` Speedup | `v0.1.1` Speedup（Linux x86_64） | 参考实现 |
+| --- | --- | ---: | ---: | --- |
+| `css_color` | A：解析 + sRGB 转换 | 0.45x | 0.96x | `color 0.3.3` |
+| `css_color` | B：4 段色彩空间管线 | 0.25x | 0.84x | `color 0.3.3` |
+| `zstd` | Web 语料解压 | 0.70x | 0.67x | `ruzstd 0.7.3` |
+| `zstd` | Web 语料 L3 压缩 | 0.52x | 0.34x | C `libzstd 1.5.7` |
+| `zstd` | 二进制日志解压 | 0.70x | 0.78x | `ruzstd 0.7.3` |
+| `zstd` | 二进制日志 L3 压缩 | 0.37x | 0.25x | C `libzstd 1.5.7` |
+| `unicode_linebreak` | 多语种 Web / 新闻 | 0.16x | 0.87x | `icu_segmenter 2.4.0` |
+| `unicode_linebreak` | 技术文档 | 0.14x | 0.89x | `icu_segmenter 2.4.0` |
+| `cookie` | `Set-Cookie` 解析 | 0.50x | 0.93x | `cookie 0.18.3` |
+| `cookie` | PSL 查找 | 0.20x | **1.05x** | `psl 2.1.261` |
+| `structured_fields` | 真实浏览器请求头 | 0.37x | **1.03x** | `sfv 0.16.1` |
+| `structured_fields` | 复杂嵌套 | 0.47x | 0.91x | `sfv 0.16.1` |
+| `unicode_segment` | 多语种 Web / 社交 | 0.55x | **1.56x** | `unicode-segmentation 1.12.0` |
+| `unicode_segment` | 技术文档 / 密集标点 | 0.55x | **3.27x** | `unicode-segmentation 1.12.0` |
+| `opentype` | Arial.ttf | 0.56x | —（本轮未复测） | `ttf-parser 0.25.1` |
+| `opentype` | `synthetic_512.ttf` | 0.79x | 0.67x | `ttf-parser 0.25.1` |
+| `idna` | 多语种 IDN | 0.34x | **1.04x** | `idna 1.1.0` |
+| `idna` | 真实浏览器流量 | 0.79x | **1.05x** | `idna 1.1.0` |
+| `encoding` | 解码 UTF-8 / GB18030 / Shift_JIS | 0.30x / 0.26x / 0.38x | 0.23x / 0.36x / 0.40x | `encoding_rs 0.8.44` |
+| `encoding` | `encode_html` Big5 / gb18030 / Shift_JIS / EUC-KR | 1.11x / 1.01x / 0.56x / 0.20x | **2.26x / 3.07x / 1.87x / 2.06x** | `encoding_rs 0.8.44` |
+
+如实说明：`zstd` 的 `v0.1.0` 列取自本榜旧行（同为 `Linux x86_64`），而 `v0.1.0` 包 README 记为 0.60x / 0.33x / 0.47x / 0.22x；本次复测时本机有其他并发负载，L3 压缩比值低于旧行。剩余 `< 1.0x` 项——`opentype`（`synthetic_512` 0.67x，Arial 未复测）、`css_color` Scenario B（0.84x）、`encoding` 标量解码（0.23–0.40x，`encoding_rs` 走 x86_64 SSE2 / AVX2 SIMD）、`zstd` 解压（0.67–0.78x）与 L3 压缩（0.25–0.34x）、`unicode_linebreak`（0.87–0.89x）、`cookie` `Set-Cookie`（0.93x）、`structured_fields` 复杂嵌套（0.91x）——已通过反汇编定位，对接 `pionc` Wave L 编译器侧优化。
 
 ## 各包明细
 
@@ -2810,6 +2841,22 @@ stdout 70 B，SHA-256 `304ed618391e46e05dcb4c4b9ba8c728aff1cb8539466affa99642f2a
 
 ### encoding
 
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+`sh packages/encoding/bench/run_bench.sh`（`warmup=1`、`rounds=5` 严格交替，stdout SHA-256 逐字节一致）。优化：外提不可变表、按桶索引的 CJK 反查二分、EUC-KR 韩文音节 O(1) 直查表（11,172 个 KS X 1001 + CP949 音节）、无分支 UTF-8 快路与无除法指针运算。Wasm32 `wasm_smoke` 549 / 550 KiB（debug / `--release`）。
+
+| Workload | `pion_encoding` Median (ms) | Throughput | `rust_encoding_rs` Median (ms) | Throughput | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Decode UTF-8 HTML | 51.695 | 2,027.47 MB/s | **11.974** | 8,753.00 MB/s | 0.23x |
+| Decode GB18030 HTML | 241.405 | 434.19 MB/s | **85.870** | 1,220.62 MB/s | 0.36x |
+| Decode Shift_JIS HTML | 230.746 | 454.31 MB/s | **91.941** | 1,140.20 MB/s | 0.40x |
+| Encode Big5 HTML | **222.858** | 94.07 MB/s | 503.733 | 41.62 MB/s | **2.26x** |
+| Encode gb18030 HTML | **166.894** | 125.65 MB/s | 512.246 | 40.94 MB/s | **3.07x** |
+| Encode Shift_JIS HTML | **70.912** | 295.62 MB/s | 132.529 | 158.18 MB/s | **1.87x** |
+| Encode EUC-KR HTML | **65.786** | 318.69 MB/s | 135.709 | 154.49 MB/s | **2.06x** |
+
+如实说明：四项 CJK `encode_html` 全部领先（1.87–3.07x）；三项解码仍落后（0.23–0.40x），`encoding_rs` 在 x86_64 上以 SSE2 / AVX2 SIMD 批量跳过 ASCII 并校验 UTF-8，本包为纯标量 Pion，已对接 `pionc` Wave L。以下为 `v0.1.0`（Wave 24）发布时的 Darwin arm64 数据，保留作历史记录。
+
 参考实现：Mozilla Rust [`encoding_rs`](https://crates.io/crates/encoding_rs) `=0.8.44`（`--release`，默认特性；解码走 ARM64 NEON SIMD ASCII / UTF-8 快路，编码走默认特性的直查 / 线性表），锁定 `Cargo.lock`，`bench/rust_bench`。输入由 `bench/gen_corpus.py` 确定性生成约 1 MiB 的真实 HTML：解码为 UTF-8（1,048,098 B）、GB18030（1,048,152 B）、Shift_JIS（1,048,302 B）三份，各迭代 100 次；编码为四份 UTF-8 HTML（含目标编码不可表示字符，走 WHATWG HTML `&#...;` NCR 回退），分别以 `encode_html` 编为 Big5（1,048,182 B）、gb18030（1,048,550 B）、Shift_JIS（1,048,140 B）、EUC-KR（1,048,274 B），各迭代 20 次；两端 stdout 均为输出摘要，依赖实际编解码结果。`sh packages/encoding/bench/run_bench.sh`（由 `STRICT=1 sh packages/encoding/audit/run_audit.sh bench` 原样调用）经 `scripts/bench_compare.py`（`warmup=1`、`rounds=5`，严格交替，stdout SHA-256 逐字节一致）运行，Darwin arm64（Apple M5 Max (Darwin arm64)，Apple M5 Max，机器负载约 7–11），Wave 24 发布复测。
 
 | Workload | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_encoding_rs`) |
@@ -2841,6 +2888,19 @@ stdout 70 B，SHA-256 `304ed618391e46e05dcb4c4b9ba8c728aff1cb8539466affa99642f2a
 红队：36 / 36 单测，`audit/` 与 `src/` 零改动；0 P0 + 2 P1 + 5 P2 全部修复（P1-1 旧 CJK 编码器线性查表最坏 1.4–5.6 s / MiB；P1-2 模块级可变 `FixedArray` 码表；P2-1 ISO-2022-JP `encode_html` 在 NCR 前离开 Roman 态；P2-2 `last = true` 后 `had_errors()` 丢失；P2-3 `DecodeError` 偏移按块计且可为负；P2-4 非法 UTF-8 `String` 使编码器出错；P2-5 README 声明无依据）。`STRICT=1 sh packages/encoding/audit/run_audit.sh <段>` 9 个可单独运行的核心门禁段逐段 `AUDIT PASS (0 P0)`、0 OPEN、exit 0，且每段末尾都执行 `clean_check`（`git status --porcelain --ignored -- packages/encoding` 干净；脚本无独立的 `clean_check` 段参数）：`build` 4 模编译 + `encoding_rs 0.8.44` oracle（`cargo --locked`）+ 10 组语料；`cases` 10 / 10（6 control + 4 红队）× 4 模；`unit` 包单测 36 / 36 + 审计 10 / 10；`diff` **1,921,335** 例（标签 7,766、单字节 15,196、DBCS 394,752、三字节 39,048、四字节 83,557、ISO-2022-JP 200,960、UTF 360,696、BOM 157,920、流式 96,000、编码 565,440）× 4 模逐字节一致，对 `encoding_rs` 0 差异；`dos` 4 MiB 解码炸弹（gb18030 4 字节回退 / 截断前导、GBK、ISO-2022-JP 转义、UTF-8 / UTF-16 截断、Big5、EUC-JP、Shift_JIS、EUC-KR、`x-user-defined`、windows-1252、`replacement`）native 整块 ≤ 77 ms、1 字节流式 ≤ 250 ms、RSS ≤ 48 MiB，wasm32 1 MiB gb18030 回退炸弹 1 字节流式 105 ms、Big5 `U+00E9` 编码最坏 42 ms；`portability` 0 `extern "C"` / 0 `World` / 0 import / 0 依赖 / 0 模块级 `let mut`（50 个不可变 `String` 表）；`smoke` 4 模输出一致且与 README 相同；`bench` 7 / 7 场景 SHA-256 一致；`harness` 注入 4 种解码缺陷（gb18030 回退字节、Big5 ASCII 尾字节、UTF-8 `EF BB` 续读、ISO-2022-JP 转义回放）均被差分门禁捕获。审计脚本的 `docs` 段（`run_audit.sh` 第 222 行）硬编码修复前的体积断言 `[ "$got" = "358 423 296 297" ]`，与 P1-1 新增 O(log N) 不可变反查表后的实测体积 `553 633 495 496` KiB（与包 README 一致）互斥；按 `audit/` 不可改原则未运行该段。`wasm_smoke` 4 模式（native debug / native `--release` / wasm32 debug / wasm32 `--release`，553 / 633 / 495 / 496 KiB）stdout 均为 `60 B`（`encoding_wasm_smoke: OK checks=13 fnv64=5273225285721917244`）、SHA-256 `0d48911ddc9b1d317b8d4ff6d2d2a2ab0868f1a67d231dec65589e56001ce4df`（与包 README 一致）。
 
 ### css_color
+
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+`sh packages/css_color/bench/run_bench.sh`（`warmup=1`、`rounds=5` 严格交替，stdout SHA-256 逐字节一致）。优化：硬件 `Double::sqrt()` + 位级 IEEE-754 `f64`（`to_bits` / `from_bits`、Estrin 形式 Chebyshev 传递函数、2 步 Halley `cbrt`），仍零 `extern "C"`、4 模逐位一致。Wasm32 `wasm_smoke` 180,751 / 179,811 B（debug / `--release`）。
+
+| Scenario | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput / ns/op | Peak RSS | Speedup (vs `rust_color`) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A 解析 + sRGB | `pion_css_color` | 42.549 | 40.855 | 46.664 | 146.91 MB/s · 208.37 ns/op | **2.51 MiB** | 0.96x |
+|  | `rust_color` | **40.947** | 40.240 | 42.376 | 152.65 MB/s · 200.53 ns/op | 2.67 MiB | 1.00x (baseline) |
+| B 4 段管线 | `pion_css_color` | 111.433 | 111.086 | 120.446 | 272.85 ns/op | **2.55 MiB** | 0.84x |
+|  | `rust_color` | **93.553** | 92.509 | 93.616 | 229.07 ns/op | 2.86 MiB | 1.00x (baseline) |
+
+如实说明：A 基本持平（0.96x），B 仍落后（0.84x，`color` 用 `f32` + 平台 `libm`，本包坚持纯 `f64` 逐位确定），已对接 `pionc` Wave L。以下为 `v0.1.0`（Wave 25）发布时的 Darwin arm64 数据，保留作历史记录。
 
 参考实现：Rust Linebender [`color`](https://crates.io/crates/color) `=0.3.3`（`--release`，`f32` + 平台 `libm`，锁定 `Cargo.lock`，`bench/rust_bench`，记作 `rust_color`，为基线）。输入由 `bench/gen_corpus.py` 确定性生成 2,042 条 `color 0.3.3` 也接受的 CSS Color 4 颜色串（62,507 B：命名色、hex、`rgb()` / `hsl()` / `hwb()`、`lab()` / `lch()` / `oklab()` / `oklch()`、`color()` 各空间）。Scenario A 每条解析并转为 sRGB、钳位后累加，迭代 100 次（204,200 次，6,250,700 B）；Scenario B 对同一批颜色做 4 段转换 `sRGB → Oklch → Display-P3 → Lab → sRGB`，迭代 200 次（408,400 次）；两端 stdout 均为依赖计算结果的累加器摘要，防死代码消除。`sh packages/css_color/bench/run_bench.sh`（`scripts/bench_compare.py`，`--warmup 1 --rounds 5` 严格交替）；本表为 Wave 25 发布复测，同次 `STRICT=1 audit/run_audit.sh` 的 `bench` 段复测为 0.45x / 0.25x。
 
@@ -2876,6 +2936,19 @@ stdout 38 B，SHA-256 `24a5eb3e4f3021341d8fffe960b9616ab5544804029514e6c80e9c580
 
 ### cookie
 
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+`sh packages/cookie/bench/run_bench.sh`（`warmup=1`、`rounds=5` 严格交替，stdout SHA-256 逐字节一致，差分 200 / 200 与 106 / 106 不变）。优化：单遍零分配 `Set-Cookie` 扫描（O(1) 属性分派 + 免装箱 IMF-fixdate 快路）；PSL 改为单块只读反向标签哈希字典树（26×26 ccTLD 直查表 + 4,096 槽 TLD 哈希 + 32,768 槽边哈希 + 去重标签池）。Wasm32 `wasm_smoke` 310 KiB（`v0.1.0` 448 KiB）。
+
+| Scenario | Implementation | Median (ms) | Throughput / ns/op | Peak RSS | Speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A `Set-Cookie` 解析 | `pion_cookie` | 91.080 | 285.46 MB/s · 227.70 ns/op | **1.97 MiB** | 0.93x |
+|  | `rust_cookie` `0.18.3` | **84.426** | 307.96 MB/s · 211.07 ns/op | 2.34 MiB | 1.00x (baseline) |
+| B PSL 查找 | `pion_cookie` | **25.161** | 110.73 MB/s · 118.68 ns/op | **2.14 MiB** | **1.05x** |
+|  | `rust_psl` `2.1.261` | 26.543 | 104.96 MB/s · 125.20 ns/op | 2.76 MiB | 1.00x (baseline) |
+
+如实说明：PSL 查找反超（1.05x）；`Set-Cookie` 解析接近持平（0.93x，本包额外执行完整 RFC 6265bis 校验）。以下为 `v0.1.0`（Wave 26）发布时的 Darwin arm64 数据，保留作历史记录。
+
 参考实现：Rust [`cookie`](https://crates.io/crates/cookie) `=0.18.3`（`--release`，记作 `rust_cookie`）与 [`psl`](https://crates.io/crates/psl) `=2.1.261`（`--release`，整张 PSL 在编译期生成 `match` 树，记作 `rust_psl`），锁定 `bench/rust/Cargo.lock`，两者分别为对应场景的基线。输入由 `bench/gen_data.py` 确定性生成：200 条只含两端语义重叠属性（`Expires` / `Max-Age` / `Domain` / `Path` / `Secure` / `HttpOnly` / `SameSite` / `Partitioned`、引号值、多 `=`、重复属性）的 `Set-Cookie` 头（13,000 B），以及 106 个 ASCII / Punycode 域名（Mozilla `test_psl.txt` 向量 + 常见 ICANN / Private / 通配符 / 例外 / IP，1,393 B）；各迭代 2,000 次。基准前先以 `iters=0` 逐行差分：`Set-Cookie` **200 / 200**、PSL **106 / 106**，0 分歧。两端 stdout 均为依赖解析结果的摘要，防死代码消除。`sh packages/cookie/bench/run_bench.sh`（`scripts/bench_compare.py`，`--warmup 1 --rounds 5` 严格交替）；本表为 Wave 26 发布复测，同次 `STRICT=1 audit/run_audit.sh` 的 `bench` 段复测为 0.49x / 0.21x，包 README 修复时为 0.51x / 0.22x。
 
 #### Scenario A：RFC 6265bis `Set-Cookie` 解析（200 条 × 2,000，400,000 次，26,000,000 B）
@@ -2901,6 +2974,17 @@ stdout 64 B，SHA-256 `cc25e7a528a65575e17713dee9c60da3799d06b35085150f88016f9cd
 红队（独立 Opus，三轮复审后 `SIGN-OFF`）：15 / 15 单测，`audit/` 与 `src/` 零改动；0 P0 + 6 P1 + 12 P2 全部修复。`STRICT=1 sh packages/cookie/audit/run_audit.sh`（全部 13 段）`RESULT: clean`、0 P0、0 OPEN、exit 0：`cases` 28 / 28 × 4 模；参考模型对 parse 3,922 / date 4,027 / match 2,032 例与 jar 450 个场景 0 分歧（psl 31,499 例中 8 例为可接受的 fail-closed 拒绝）；`test_psl.txt` 77 / 77；内嵌表与钉住的 PSL `@763a4c200052` 10,472 条规则逐条一致；全部语料 + 15 个 DoS 炸弹 + API 极值扫描 4 模逐字节一致；`dos` 最坏 0.344 s（Wasm32 0.528 s）；`harness` 5 / 5 注入缺陷被捕获。`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`，524,792 / 673,416 / 467,637 / 468,077 B）stdout `189 B`，SHA-256 `0769a8149bcd31b944aee1db152d40abe8bd34ea02a29936ff9d5e93caf08c4a`（与包 README 一致）。
 
 ### opentype
+
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+优化：零分配 `Face::parse`、流式简单 `glyf`、免装箱 `cmap` / `loca`。本轮只在 `Linux x86_64` 复测了 `synthetic_512.ttf`，Arial.ttf 未复测；Wasm32 `wasm_smoke` 92,288 / 92,015 B（debug / `--release`），SHA-256 前缀 `f8311f93f4000564` 4 模一致。
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | µs/op | Peak RSS | Speedup (vs `rust_ttf_parser`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_opentype`（`--release`） | 4.466 | 4.098 | 4.741 | 22.33 | **10.90 MiB** | 0.67x |
+| `rust_ttf_parser`（`0.25.1 --release`，LTO） | **2.988** | 2.772 | 3.342 | 14.94 | 11.29 MiB | 1.00x (baseline) |
+
+stdout SHA-256 `743e55b9beb82d9cda6edd244071c1bfac6f1f34b38520bbd4ad4aae3928f3f7`（两端全部轮次一致）。如实说明：仍落后（0.67x；`v0.1.0` Darwin arm64 为 0.79x，跨平台比值不可直接比较），已通过反汇编对接 `pionc` Wave L。以下为 `v0.1.0`（Wave 27）发布时的 Darwin arm64 数据，保留作历史记录。
 
 参考实现：Rust [`ttf-parser`](https://crates.io/crates/ttf-parser) `0.25.1`（`--release`，`opt-level = 3`、`lto = true`、`codegen-units = 1`，记作 `rust_ttf_parser`），锁定 `bench/rust_bench/Cargo.lock`。环境：Apple M5 Max (Darwin arm64)，`pionc 0.1.0`，`--release`。负载：每次迭代惰性 `Face::parse` + 256 次 `cmap` / `hmtx` 查询 + 64 个 `glyf` 轮廓，共 200 次；`Face::parse` 只触及被查询的表，因此报告单次迭代耗时（µs/op）而非整文件 MB/s（表中 Throughput 为 bench_compare 按整文件字节数折算的名义值，仅供参考）。输入：系统字体在原位只读（不复制、不提交），另由 `bench/gen_fallback_font.py` 确定性生成 512 字形 2 轴可变字体 `synthetic_512.ttf`（22,796 B）作为无系统字体环境的兜底。基准前先做逐项差分（TTC 面数、`head` / `hhea` / `OS/2` / `post`、全 Unicode `cmap` 摘要、全 `hmtx` 摘要、`gid < 256` 字偶对矩阵、全 `glyf` 包围盒、`gid < 512` 轮廓命令流、`fvar` 轴表）：**8 / 8** 字体面（`synthetic_512.ttf`、Arial、Georgia、Times New Roman、Courier New、Helvetica TTC 面 0 / 1、SFNS 可变字体）0 分歧。`sh packages/opentype/bench/run_bench.sh`（`scripts/bench_compare.py`，`--warmup 1 --rounds 5` 严格交替）；本表为 Wave 27 发布复测，同次 `STRICT=1 audit/run_audit.sh` 的 `bench` 段复测为 0.61x / 0.74x，包 README 记为 0.62x / 0.70x（测试时本机有其他并发负载，比值有数个百分点波动）。
 
@@ -3074,6 +3158,19 @@ stdout `136,769 B`，SHA-256 `8ca8b1c8a544151b6295829abddef3f9deef3af7a9d361096e
 
 ### idna
 
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+`scripts/bench_compare.py`（`--warmup 1 --rounds 5` 严格交替，stdout SHA-256 逐字节一致），200 域名 × 200 次 × (`to_ascii` + `to_unicode`) = 80,000 次。Wasm32 `wasm_smoke` 71,499 / 71,725 B（debug / `--release`）。
+
+| Corpus | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_idna`) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 多语种 IDN | `pion_idna` | **15.795** | 15.599 | 16.412 | 41.09 | 197.44 | **1.04x** |
+|  | `rust_idna` `1.1.0`（LTO） | 16.471 | 16.281 | 16.863 | 39.40 | 205.89 | 1.00x (baseline) |
+| 2 真实浏览器流量 | `pion_idna` | **6.996** | 6.692 | 7.192 | 103.21 | 87.45 | **1.05x** |
+|  | `rust_idna` `1.1.0`（LTO） | 7.342 | 7.314 | 7.991 | 98.34 | 91.77 | 1.00x (baseline) |
+
+stdout SHA-256：语料 1 `2c0f91c034c05db0125d616d557f0925e75817cb9684987aaf23452853673d1b`，语料 2 `fe08124d195da1027bb2c0a777a7085590492f2f1343a6502de21720e6127528`。Peak RSS 本节点 `/usr/bin/time` 未报告。以下为 `v0.1.0`（Wave 30）发布时的 Darwin arm64 数据，保留作历史记录。
+
 参考实现：Rust [`idna`](https://crates.io/crates/idna) `=1.1.0`（`--release`，LTO，记作 `rust_idna`），锁定 `bench/rust_bench/Cargo.lock`。环境：Apple M5 Max (Darwin arm64)，`pionc 0.1.0`（`AFK-surf/pion@1e609a5`），`--release`；`sh packages/idna/bench/run_bench.sh` 复测时 load average ≈ 6。工作量：每组 200 个域名 × 200 次，每次 `to_ascii` + `to_unicode`，共 80,000 次操作。差分先行：`bench/run_bench.sh` 的 258 例全选项差分语料（`url` 与 `strict_hyphens` 两组选项，`to_ascii` 输出 + `to_unicode` 有效性与输出）对 Rust `idna 1.1.0` **258 / 258 逐字节一致、0 偏差**。
 
 #### 语料 1：多语种 IDN（100% IDN / Punycode / NFD / 全角，649,000 B）
@@ -3100,6 +3197,19 @@ stdout 89 B，SHA-256 `fe08124d195da1027bb2c0a777a7085590492f2f1343a6502de21720e
 
 ### structured_fields
 
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+`sh packages/structured_fields/bench/run_bench.sh`（`--warmup 1 --rounds 5` 严格交替，stdout SHA-256 逐字节一致）。优化：零拷贝 `code_unit_at` / `slice` 解析、64 位位掩码字符分类、仅错误路径做 ASCII 扫描、`StringBuilder` 直写整数 / 小数 / 字符串。
+
+| Corpus | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_sfv`) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 真实浏览器请求头 | `pion` | **73.620** | 69.908 | 89.881 | 96.51 | 613.50 | 2.09 MiB | **1.03x** |
+|  | `rust_sfv` `0.16.1` | 76.044 | 68.881 | 81.949 | 93.43 | 633.70 | 2.09 MiB | 1.00x (baseline) |
+| 2 复杂嵌套 | `pion` | 99.589 | 87.863 | 111.735 | 71.86 | 1,556.08 | **2.07 MiB** | 0.91x |
+|  | `rust_sfv` `0.16.1` | **90.799** | 82.730 | 119.072 | 78.81 | 1,418.73 | 2.15 MiB | 1.00x (baseline) |
+
+stdout SHA-256：语料 1 `02d5fdad1e5bb9ddbb8dd72577d8ae8f8ce158884a7db93a1805b2c83207c5a6`，语料 2 `3debee67da84f79a28a8d51b9cbe60f1244b60f54b8d4c76aebb64d085bd2972`。如实说明：语料 2 剩余约 9% 差距来自 AST 节点逐个堆分配与引用计数（Rust 为扁平按值 `Vec` / `IndexMap`）。以下为 `v0.1.0`（Wave 31）发布时数据，保留作历史记录。
+
 参考实现：Rust [`sfv`](https://crates.io/crates/sfv) `=0.16.1`（`--release`，记作 `rust_sfv`），锁定 `bench/rust_bench/Cargo.lock`。环境：`Linux x86_64`（16 核共享机器，复测时 load average ≈ 8），`pionc 0.1.0`（abi `pionc-v0.19`），`--release`，`rustc 1.100.0`；`sh packages/structured_fields/bench/run_bench.sh`（`scripts/bench_compare.py --warmup 1 --rounds 5`，严格交替）。差分先行：`bench/run_bench.sh` 的 251 个官方 `httpwg/structured-field-tests` 核心向量（解析 + 序列化）对 Rust `sfv 0.16.1` **251 / 251 逐字节一致、0 偏差**。
 
 #### 语料 1：真实浏览器请求头（24 种 × 5,000 = 120,000 次解析 + 序列化，7,105,000 B）
@@ -3125,6 +3235,19 @@ stdout 64 B，SHA-256 `3debee67da84f79a28a8d51b9cbe60f1244b60f54b8d4c76aebb64d08
 红队（独立 Opus，`SIGN-OFF` 于 `aae61ca`）：30 / 30 单测；2 P2 全部修复（0 P0 / 0 P1）。`STRICT=1 sh packages/structured_fields/audit/run_audit.sh` `OPEN findings: none`、exit 0：红队 + 对照用例 14 / 14 × 4 模；官方 `httpwg/structured-field-tests` 全部 20 个文件 1,607 / 1,607 解析 + 553 / 553 序列化；24,857 个解析输入与 5,254 个序列化 AST 对独立参考模型与 Rust `sfv 0.16.1` 0 条未解释分歧；30 / 30 个 DoS 炸弹在 native 与 Wasm32 `--release` 上全部在预算内（最坏 1 M 不同键字典 native 1.27 s / 367 MiB、Wasm32 1.67 s）；15 / 15 注入缺陷被对照用例捕获。
 
 ### unicode_segment
+
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+`scripts/bench_compare.py`（`--warmup 1 --rounds 5` 严格交替，stdout SHA-256 逐字节一致），每轮字素 + 词 + `unicode_words` + 句四遍。Wasm32 `wasm_smoke` 93,774 / 93,749 B（debug / `--release`）。
+
+| Corpus | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_segment`) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 多语种 Web / 社交 | `pion_segment` | **25.709** | 23.421 | 43.238 | 212.09 | **1.56x** |
+|  | `rust_segment` `1.12.0`（LTO） | 40.160 | 37.239 | 60.102 | 135.78 | 1.00x (baseline) |
+| 2 技术文档 / 密集标点 | `pion_segment` | **18.473** | 17.589 | 23.381 | 266.77 | **3.27x** |
+|  | `rust_segment` `1.12.0`（LTO） | 60.418 | 58.123 | 62.916 | 81.57 | 1.00x (baseline) |
+
+stdout SHA-256：语料 1 `ec165b39282eeeee184088d9eb7422bb069d4f01fada5acd2dcd3d0008a9e9a8`，语料 2 `b5b966a2fa1a51a41723176d7a5f833609c13df3ccf66be50e45151e20c01472`。以下为 `v0.1.0`（Wave 32）发布时数据，保留作历史记录。
 
 参考实现：Rust [`unicode-segmentation`](https://github.com/unicode-rs/unicode-segmentation) `=1.12.0`（Unicode 16.0.0 的最后一个版本；`--release`、`lto = true`、`codegen-units = 1`，记作 `rust_segment`），锁定 `bench/rust_bench/Cargo.lock`。环境：`Linux x86_64`（16 核共享机器，复测时 load average ≈ 11–13），`pionc 0.1.0`（abi `pionc-v0.19`），`--release`，`rustc 1.100.0`；`sh packages/unicode_segment/bench/run_bench.sh`（`scripts/bench_compare.py --warmup 1 --rounds 5`，严格交替）。每轮对整个语料依次做字素簇、词边界、`unicode_words` 与句边界四遍分段，`--bytes` 按语料字节 × 40 轮 × 4 遍计。差分先行：`bench/run_bench.sh` 的 20 行多语种 / 边界语料在 `grapheme_indices`、`word_bounds`、`unicode_word_bounds`、`sentence_bounds` 上对 Rust `unicode-segmentation 1.12.0` **20 / 20 逐字节一致、0 偏差**。
 
@@ -3154,6 +3277,19 @@ stdout 73 B，SHA-256 `b5b966a2fa1a51a41723176d7a5f833609c13df3ccf66be50e45151e2
 
 ### unicode_linebreak
 
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+`scripts/bench_compare.py`（`--warmup 1 --rounds 5` 严格交替，stdout SHA-256 逐字节一致）。优化：3 级查找表 + `47×64` DFA 成对动作表合并为单块 `table_blob`（`45,326 B`），内联 ASCII 词 / 数字与 CJK 快路。Wasm32 `wasm_smoke` 94,646 B（debug 与 `--release`）。
+
+| Corpus | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_icu_segmenter`) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 多语种 Web / 新闻 | `pion_linebreak` | 53.230 | 51.745 | 61.350 | 157.49 | 2.30 MiB | 0.87x |
+|  | `rust_icu_segmenter` `2.4.0`（LTO） | **46.286** | 44.003 | 61.164 | 181.12 | **2.12 MiB** | 1.00x (baseline) |
+| 2 技术文档 | `pion_linebreak` | 65.854 | 60.288 | 81.442 | 132.41 | 2.30 MiB | 0.89x |
+|  | `rust_icu_segmenter` `2.4.0`（LTO） | **58.761** | 53.997 | 78.228 | 148.40 | **2.14 MiB** | 1.00x (baseline) |
+
+stdout SHA-256：语料 1 `4f3e0ed13a6f354869c8eef2e97ac96a6d28ae32f3edf72b4d8efbd8e3fec21d`，语料 2 `15c9425ff0699122e752b8361caabefe61c54c5231ee7211ec7ce2ef9eaf665e`。如实说明：较 `v0.1.0`（0.16x / 0.14x）大幅缩小，仍略落后。以下为 `v0.1.0`（Wave 33）发布时数据，保留作历史记录。
+
 参考实现：Rust [`icu_segmenter`](https://crates.io/crates/icu_segmenter) `=2.4.0`（`LineSegmenter::new_auto`，`Strict` / `Normal` 选项，`--release`、LTO，记作 `rust_icu_segmenter`），锁定 `bench/rust_bench/Cargo.lock`。环境：`Linux x86_64`（16 核共享机器，复测时 load average ≈ 19–20），`pionc 0.1.0`（abi `pionc-v0.19`），`--release`，`rustc 1.100.0`；`sh packages/unicode_linebreak/bench/run_bench.sh`（`scripts/bench_compare.py --warmup 1 --rounds 5`，严格交替）。每轮对整个语料求一遍全部断点（`line_breaks` / `segment_str`），输出断点数与 FNV-64 摘要。差分预言：`bench/gen_corpus.py` 生成的 **123 / 123** 例断点输出与 `icu_segmenter 2.4.0` 逐字节一致、**0 偏差**（`icu_segmenter 2.4.0` 偏离 Unicode 16.0.0 的规则，如 LB15c、CJK 旁 LB19a、LB20a 词首连字符、LB25 非数字 `$(` / `)$`，不进差分语料，由官方 `LineBreakTest.txt` 16,672 / 16,672 与审计参考模型单独覆盖）。
 
 #### 语料 1：多语种 Web / 新闻排版（41,916 B × 200 轮 = 8,383,200 B）
@@ -3181,6 +3317,19 @@ stdout 79 B，SHA-256 `15c9425ff0699122e752b8361caabefe61c54c5231ee7211ec7ce2ef9
 红队（独立 Opus，`SIGN-OFF` 于 `b84c35e`）：21 / 21 单测；1 P1 + 4 P2 全部修复（0 P0）。`STRICT=1 sh packages/unicode_linebreak/audit/run_audit.sh` `no open findings`、exit 0：1,114,112 个码点 0 错位（含 6 个标志位）；官方 `LineBreakTest.txt` 16.0.0 16,672 / 16,672（位置与种类）× 4 模；72,217 个输入对独立参考模型与 Rust `icu_segmenter 2.4.0` 0 条未解释分歧；41 种 DoS 炸弹中除文档声明的 d32–d35 外全部线性，Wasm32 `--release` 一致；32 / 32 注入缺陷被门禁捕获。
 
 ### zstd
+
+#### `v0.1.1` 性能优化复测（Linux x86_64）
+
+本次发版集成时 `sh packages/zstd/bench/run_bench.sh` 复测：双向互通 **193 / 193** 逐字节一致、0 偏差；`bench_compare.py`（`warmup=1`、`rounds=5` 严格交替，stdout SHA-256 逐字节一致）。优化：零分配序列 / Huffman 解码热循环与 LZ77 scratch 复用；压缩率不变（Web L3 10.25%、二进制日志 L3 33.66%）。`wasm_smoke` 4 模 SHA-256 `f0c876d54108186eaaf54a5145f74b569db0d110e91656ba5d44707b49903acd` 一致，体积 native debug / `--release` 205,200 / 414,104 B，Wasm32 debug / `--release` 125,892 / 135,880 B。
+
+| Workload | `pion_zstd` Median (MB/s) | `rust_ruzstd` Median (MB/s) | `rust_zstd`（C `libzstd`）Median (MB/s) | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Web 解压（1 MiB × 10） | 29.372 ms (357.00) | **19.705 ms** (532.13) | 8.852 ms (1184.55) | 0.67x vs `rust_ruzstd` |
+| Web L3 压缩（1 MiB × 5） | 28.053 ms (186.89) | — | **9.439 ms** (555.45) | 0.34x vs `rust_zstd` |
+| 二进制日志解压（1 MiB × 10） | 42.608 ms (246.10) | **33.079 ms** (316.99) | 12.702 ms (825.52) | 0.78x vs `rust_ruzstd` |
+| 二进制日志 L3 压缩（1 MiB × 5） | 86.451 ms (60.65) | — | **21.369 ms** (245.35) | 0.25x vs `rust_zstd` |
+
+stdout SHA-256：`ce547f687028b827577ad0a0bf2c84c9e71d663f54df593fe712ad74aa92dfe3` / `2b5d4428dca7838c019efd8f69db252906473b9ddedf19f0190d77c71f5b8c91` / `5f8e39c39b42cf20fad0f7f241155d9820aee99bc19dedc71cf02025a21edecd` / `abefb692fc74ff2a266a1de00f9d1a7501eb6685efcbb651262f0a4067362bab`。如实说明：解压与 L3 压缩仍落后（复测时本机有其他并发负载），已对接 `pionc` Wave L。以下为 `v0.1.0`（Wave 34）发布时数据，保留作历史记录。
 
 参考实现：纯安全 Rust [`ruzstd`](https://crates.io/crates/ruzstd) `0.7.3`（解压基线，记作 `rust_ruzstd`）与 C [`libzstd`](https://github.com/facebook/zstd) `1.5.7`（经 Rust `zstd 0.13.5` / `zstd-sys 2.1.3+zstd.1.5.7`，记作 `rust_zstd`，压缩基线），均为 `--release`，锁定 `bench/rust/Cargo.lock`。环境：`Linux x86_64`（16 核共享机器，复测时 load average ≈ 16），`pionc 0.1.0`（abi `pionc-v0.19`），`--release`，`rustc 1.100.0`，`zstd` CLI `v1.5.7`；`sh packages/zstd/bench/run_bench.sh`（`scripts/bench_compare.py --warmup 1 --rounds 5`，严格交替）。解压语料为官方 `zstd -3` 压出的帧，压缩为 Level 3；每轮输出解出 / 压出字节数与摘要，各实现 stdout 逐字节一致。双向互通预言：8 个确定性语料（空、1 字节、64 KiB RLE、200 KiB 多块 RLE、32 KiB 高熵、CJK UTF-8、1 MiB Web、1 MiB 二进制日志）上官方 `zstd 1.5.7`（`-1` / `-3` / `-9` / `-19`，带与不带 `--check`）→ Pion 解压 64 / 64、多帧 + Skippable 帧 1 / 1、Pion Level 0 / 1 / 3 / 6（带与不带校验和）→ 官方 `zstd -d` 与 `ruzstd` 128 / 128，合计 **193 / 193** 逐字节一致、**0 偏差**。
 
