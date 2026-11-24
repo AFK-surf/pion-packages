@@ -1,0 +1,554 @@
+///| Complete RFC 9649 VP8L lossless WebP encoder:
+///| - RIFF/WEBP container framing & 5-byte VP8L header
+///| - Hash-chain LZ77 with 120-entry 2D distance map, RLE fast path, and Color Cache
+///| - Strict `exact` mode preserving RGB bytes when `alpha == 0`
+///| - Pixel-count OOM guard (`default_max_pixels = 16,777,216`) prior to buffer allocation
+
+///| Reverse lookup table mapping `(y_off << 4) | (x_off + 7)` -> 2D distance code (`1..120`, or `0`).
+fn build_vp8l_plane_to_code() -> FixedArray[Int] {
+  let tbl = FixedArray::make(128, 0)
+  let mut i = 0
+  while i < 120 {
+    let dc = vp8l_dist_map_tbl[i]
+    let y_off = dc >> 4
+    let x_off = 8 - (dc & 0xF)
+    tbl[(y_off << 4) | (x_off + 7)] = i + 1
+    i = i + 1
+  }
+  tbl
+}
+
+let vp8l_plane_to_code_tbl : FixedArray[Int] = build_vp8l_plane_to_code()
+
+///| Map a linear pixel distance (`dist >= 1`) to a VP8L distance code (2D `1..120` or linear `dist + 120`).
+fn vp8l_dist_to_code(w : Int, dist : Int) -> Int {
+  if dist <= 7 * w + 8 {
+    let y0 = dist / w
+    if y0 <= 7 {
+      let x0 = dist - y0 * w
+      if x0 >= -7 && x0 <= 8 {
+        let c = vp8l_plane_to_code_tbl[(y0 << 4) | (x0 + 7)]
+        if c > 0 && vp8l_distance_map(w, c) == dist {
+          return c
+        }
+      }
+    }
+    let y1 = y0 + 1
+    if y1 <= 7 {
+      let x1 = dist - y1 * w
+      if x1 >= -7 && x1 <= 8 {
+        let c = vp8l_plane_to_code_tbl[(y1 << 4) | (x1 + 7)]
+        if c > 0 && vp8l_distance_map(w, c) == dist {
+          return c
+        }
+      }
+    }
+  }
+  dist + 120
+}
+
+///| Encode an LZ77 length or distance value (`value >= 1`) as `(prefix_sym, extra_bits, extra_val)`.
+fn vp8l_prefix_encode(value : Int) -> (Int, Int, Int) {
+  if value <= 4 {
+    return (value - 1, 0, 0)
+  }
+  let v = value - 1
+  let mut msb = 2
+  let mut t = v >> 3
+  while t > 0 {
+    msb = msb + 1
+    t = t >> 1
+  }
+  let extra_bits = msb - 1
+  let second_bit = (v >> extra_bits) & 1
+  let sym = (msb << 1) | second_bit
+  let extra_val = v & ((1 << extra_bits) - 1)
+  (sym, extra_bits, extra_val)
+}
+
+///| Encode a VP8L image (top-level or sub-image) into `bw`.
+fn vp8l_encode_image(
+  bw : BitWriter,
+  rgba : Bytes,
+  w : Int,
+  h : Int,
+  top_level : Bool,
+  use_cc : Bool,
+) -> Unit {
+  let npix = w * h
+  let cc_bits = if !use_cc || !top_level || npix < 16 {
+    0
+  } else if npix <= 1024 {
+    5
+  } else {
+    6
+  }
+  let cc_size = if cc_bits > 0 { 1 << cc_bits } else { 0 }
+  let cc_shift_u = (32 - cc_bits).to_uint()
+  let cc_mult_u : UInt = 0x1e35a7bdU
+
+  // Pack RGBA into 32-bit ARGB for fast LZ77 comparison and color-cache hashing.
+  let pix = FixedArray::make(npix, 0U)
+  let mut i = 0
+  while i < npix {
+    let off = i * 4
+    pix[i] = (rgba[off + 3].to_int().to_uint() << 24U) |
+    (rgba[off].to_int().to_uint() << 16U) |
+    (rgba[off + 1].to_int().to_uint() << 8U) |
+    rgba[off + 2].to_int().to_uint()
+    i = i + 1
+  }
+
+  // Token stream:
+  //   tok_a[t] >= 0:  literal at pixel index `tok_a[t]`
+  //   tok_a[t] == -1: color cache hit at `tok_b[t]`
+  //   tok_a[t] <= -2: LZ77 match of length `-(tok_a[t] + 1)`, distance code `tok_b[t]`
+  let tok_a = FixedArray::make(npix, 0)
+  let tok_b = FixedArray::make(npix, 0)
+  let mut ntok = 0
+
+  let cc_entries = FixedArray::make(cc_size, 0U)
+  let cc_valid = FixedArray::make(cc_size, false)
+
+  // Hash-chain LZ77 state (only allocated when image has >= 4 pixels).
+  let do_lz77 = npix >= 4
+  let hash_bits = 14
+  let hash_size = 1 << hash_bits
+  let hash_shift_u = (32 - hash_bits).to_uint()
+  let win_size = 32768
+  let win_mask = win_size - 1
+  let head = if do_lz77 { FixedArray::make(hash_size, -1) } else { FixedArray::make(0, 0) }
+  let prev = if do_lz77 { FixedArray::make(win_size, -1) } else { FixedArray::make(0, 0) }
+
+  let green_alpha_size = vp8l_n_literal_codes + vp8l_n_length_codes + cc_size
+  let g_freq = FixedArray::make(green_alpha_size, 0)
+  let r_freq = FixedArray::make(vp8l_n_literal_codes, 0)
+  let b_freq = FixedArray::make(vp8l_n_literal_codes, 0)
+  let a_freq = FixedArray::make(vp8l_n_literal_codes, 0)
+  let d_freq = FixedArray::make(vp8l_n_distance_codes, 0)
+
+  let mut pos = 0
+  while pos < npix {
+    let cur = pix[pos]
+    let mut best_len = 0
+    let mut best_dist = 0
+
+    if do_lz77 && pos > 0 {
+      let max_len = if npix - pos < 4096 { npix - pos } else { 4096 }
+
+      // 1. Fast RLE check (dist == 1).
+      if cur == pix[pos - 1] {
+        let mut rlen = 1
+        while rlen < max_len && pix[pos + rlen] == cur {
+          rlen = rlen + 1
+        }
+        best_len = rlen
+        best_dist = 1
+      }
+
+      // 2. Direct 2D top-row neighbor check (dist == w).
+      if best_len < 32 && pos >= w && cur == pix[pos - w] {
+        let mut tlen = 1
+        while tlen < max_len && pix[pos + tlen] == pix[pos - w + tlen] {
+          tlen = tlen + 1
+        }
+        if tlen > best_len {
+          best_len = tlen
+          best_dist = w
+        }
+      }
+
+      // 3. Hash-chain lookup for 2-pixel matches.
+      if best_len < 32 && pos + 1 < npix {
+        let hval = (((cur * 0x1e35a7bdU) ^ (pix[pos + 1] * 0x9e3779b1U)) >> hash_shift_u).to_int()
+        let mut cand = head[hval]
+        let mut steps = 0
+        while cand >= 0 && steps < 16 {
+          let dist = pos - cand
+          if dist > win_size {
+            break
+          }
+          if pix[cand] == cur && pix[cand + 1] == pix[pos + 1] {
+            let mut mlen = 2
+            while mlen < max_len && pix[cand + mlen] == pix[pos + mlen] {
+              mlen = mlen + 1
+            }
+            if mlen > best_len {
+              best_len = mlen
+              best_dist = dist
+              if best_len >= 64 {
+                break
+              }
+            }
+          }
+          cand = prev[cand & win_mask]
+          steps = steps + 1
+        }
+      }
+    }
+
+    let mut use_match = false
+    let mut best_dcode = 0
+    if best_len >= 2 {
+      best_dcode = vp8l_dist_to_code(w, best_dist)
+      if best_len >= 3 || best_dcode <= 120 {
+        use_match = true
+      }
+    }
+
+    if use_match {
+      tok_a[ntok] = -(best_len + 1)
+      tok_b[ntok] = best_dcode
+      ntok = ntok + 1
+      let (lsym, _, _) = vp8l_prefix_encode(best_len)
+      let (dsym, _, _) = vp8l_prefix_encode(best_dcode)
+      g_freq[vp8l_n_literal_codes + lsym] = g_freq[vp8l_n_literal_codes + lsym] + 1
+      d_freq[dsym] = d_freq[dsym] + 1
+
+      // Update color cache for every pixel in the match, and hash table for start/end positions.
+      let mut k = 0
+      while k < best_len {
+        let idx = pos + k
+        let px = pix[idx]
+        if cc_bits > 0 {
+          let key = ((px * cc_mult_u) >> cc_shift_u).to_int()
+          cc_entries[key] = px
+          cc_valid[key] = true
+        }
+        if do_lz77 && idx + 1 < npix && (k < 4 || k + 2 >= best_len) {
+          let hval = (((px * 0x1e35a7bdU) ^ (pix[idx + 1] * 0x9e3779b1U)) >> hash_shift_u).to_int()
+          prev[idx & win_mask] = head[hval]
+          head[hval] = idx
+        }
+        k = k + 1
+      }
+      pos = pos + best_len
+    } else {
+      let mut emitted_cc = false
+      if cc_bits > 0 {
+        let key = ((cur * cc_mult_u) >> cc_shift_u).to_int()
+        if cc_valid[key] && cc_entries[key] == cur {
+          tok_a[ntok] = -1
+          tok_b[ntok] = key
+          ntok = ntok + 1
+          g_freq[vp8l_n_literal_codes + vp8l_n_length_codes + key] =
+          g_freq[vp8l_n_literal_codes + vp8l_n_length_codes + key] + 1
+          emitted_cc = true
+        } else {
+          cc_entries[key] = cur
+          cc_valid[key] = true
+        }
+      }
+      if !emitted_cc {
+        tok_a[ntok] = pos
+        ntok = ntok + 1
+        let r = ((cur >> 16U) & 0xFFU).to_int()
+        let g = ((cur >> 8U) & 0xFFU).to_int()
+        let b = (cur & 0xFFU).to_int()
+        let a = ((cur >> 24U) & 0xFFU).to_int()
+        g_freq[g] = g_freq[g] + 1
+        r_freq[r] = r_freq[r] + 1
+        b_freq[b] = b_freq[b] + 1
+        a_freq[a] = a_freq[a] + 1
+      }
+      if do_lz77 && pos + 1 < npix {
+        let hval = (((cur * 0x1e35a7bdU) ^ (pix[pos + 1] * 0x9e3779b1U)) >> hash_shift_u).to_int()
+        prev[pos & win_mask] = head[hval]
+        head[hval] = pos
+      }
+      pos = pos + 1
+    }
+  }
+
+  // Write color cache header & meta-Huffman flag.
+  if cc_bits > 0 {
+    bw.write_bits(1, 1)
+    bw.write_bits(cc_bits, 4)
+  } else {
+    bw.write_bits(0, 1)
+  }
+  if top_level {
+    bw.write_bits(0, 1) // single Huffman group (use_meta = 0)
+  }
+
+  // Build and write the 5 canonical Huffman trees.
+  let g_len = FixedArray::make(green_alpha_size, 0)
+  let g_code = FixedArray::make(green_alpha_size, 0)
+  let r_len = FixedArray::make(vp8l_n_literal_codes, 0)
+  let r_code = FixedArray::make(vp8l_n_literal_codes, 0)
+  let b_len = FixedArray::make(vp8l_n_literal_codes, 0)
+  let b_code = FixedArray::make(vp8l_n_literal_codes, 0)
+  let a_len = FixedArray::make(vp8l_n_literal_codes, 0)
+  let a_code = FixedArray::make(vp8l_n_literal_codes, 0)
+  let d_len = FixedArray::make(vp8l_n_distance_codes, 0)
+  let d_code = FixedArray::make(vp8l_n_distance_codes, 0)
+
+  vp8l_write_huff_tree(bw, g_freq, green_alpha_size, g_len, g_code)
+  vp8l_write_huff_tree(bw, r_freq, vp8l_n_literal_codes, r_len, r_code)
+  vp8l_write_huff_tree(bw, b_freq, vp8l_n_literal_codes, b_len, b_code)
+  vp8l_write_huff_tree(bw, a_freq, vp8l_n_literal_codes, a_len, a_code)
+  vp8l_write_huff_tree(bw, d_freq, vp8l_n_distance_codes, d_len, d_code)
+
+  // Emit encoded token bitstream.
+  let mut t = 0
+  while t < ntok {
+    let ta = tok_a[t]
+    if ta >= 0 {
+      let argb = pix[ta]
+      let r = ((argb >> 16U) & 0xFFU).to_int()
+      let g = ((argb >> 8U) & 0xFFU).to_int()
+      let b = (argb & 0xFFU).to_int()
+      let a = ((argb >> 24U) & 0xFFU).to_int()
+      bw.write_bits(g_code[g], g_len[g])
+      bw.write_bits(r_code[r], r_len[r])
+      bw.write_bits(b_code[b], b_len[b])
+      bw.write_bits(a_code[a], a_len[a])
+    } else if ta == -1 {
+      let csym = vp8l_n_literal_codes + vp8l_n_length_codes + tok_b[t]
+      bw.write_bits(g_code[csym], g_len[csym])
+    } else {
+      let mlen = -(ta + 1)
+      let dcode = tok_b[t]
+      let (lsym, lebits, lextra) = vp8l_prefix_encode(mlen)
+      let gsym = vp8l_n_literal_codes + lsym
+      bw.write_bits(g_code[gsym], g_len[gsym])
+      if lebits > 0 {
+        bw.write_bits(lextra, lebits)
+      }
+      let (dsym, debits, dextra) = vp8l_prefix_encode(dcode)
+      bw.write_bits(d_code[dsym], d_len[dsym])
+      if debits > 0 {
+        bw.write_bits(dextra, debits)
+      }
+    }
+    t = t + 1
+  }
+}
+
+///| Validate dimensions, pixel-count OOM guard, and buffer length for lossless encoding.
+fn vp8l_validate_input(
+  buf_len : Int,
+  width : Int,
+  height : Int,
+  channels : Int,
+) -> Result[Unit, WebpError] {
+  if width <= 0 || height <= 0 || width > default_max_width || height > default_max_height {
+    return Err(WebpError::InvalidHeader("VP8L dimensions must be in 1..16384"))
+  }
+  let pixels64 = width.to_int64() * height.to_int64()
+  if pixels64 > default_max_pixels.to_int64() {
+    return Err(
+      WebpError::LimitExceeded(
+        "pixel count " +
+        pixels64.to_string() +
+        " exceeds default_max_pixels " +
+        default_max_pixels.to_string(),
+      ),
+    )
+  }
+  let expected = pixels64 * channels.to_int64()
+  if buf_len.to_int64() != expected {
+    return Err(
+      WebpError::InvalidHeader(
+        "pixel buffer length " +
+        buf_len.to_string() +
+        " does not match expected " +
+        expected.to_string(),
+      ),
+    )
+  }
+  Ok(())
+}
+
+///| Wrap a raw VP8L payload in a RIFF/WEBP container with even-byte chunk padding.
+fn wrap_riff_vp8l(vp8l : Bytes) -> Bytes {
+  let payload_len = vp8l.length()
+  let pad = payload_len & 1
+  let riff_size = 4 + 8 + payload_len + pad
+  let mut out = Bytes::new(8 + riff_size)
+  // "RIFF"
+  out[0] = 0x52.to_byte()
+  out[1] = 0x49.to_byte()
+  out[2] = 0x46.to_byte()
+  out[3] = 0x46.to_byte()
+  // RIFF chunk size (u32 LE)
+  out[4] = (riff_size & 0xFF).to_byte()
+  out[5] = ((riff_size >> 8) & 0xFF).to_byte()
+  out[6] = ((riff_size >> 16) & 0xFF).to_byte()
+  out[7] = ((riff_size >> 24) & 0xFF).to_byte()
+  // "WEBP"
+  out[8] = 0x57.to_byte()
+  out[9] = 0x45.to_byte()
+  out[10] = 0x42.to_byte()
+  out[11] = 0x50.to_byte()
+  // "VP8L"
+  out[12] = 0x56.to_byte()
+  out[13] = 0x50.to_byte()
+  out[14] = 0x38.to_byte()
+  out[15] = 0x4C.to_byte()
+  // VP8L chunk size (unpadded u32 LE)
+  out[16] = (payload_len & 0xFF).to_byte()
+  out[17] = ((payload_len >> 8) & 0xFF).to_byte()
+  out[18] = ((payload_len >> 16) & 0xFF).to_byte()
+  out[19] = ((payload_len >> 24) & 0xFF).to_byte()
+  let mut i = 0
+  while i < payload_len {
+    out[20 + i] = vp8l[i]
+    i = i + 1
+  }
+  if pad == 1 {
+    out[20 + payload_len] = 0.to_byte()
+  }
+  out
+}
+
+///| Encode tightly packed RGBA8888 pixels into a raw VP8L bitstream payload (without RIFF container).
+///| When `options.exact` is `false`, RGB channels of pixels with `alpha == 0` are zeroed for better
+///| compression; when `options.exact` is `true`, RGB bytes under `alpha == 0` are preserved verbatim.
+pub fn encode_vp8l_rgba(
+  rgba : Bytes,
+  width : Int,
+  height : Int,
+  options : EncodeOptions,
+) -> Result[Bytes, WebpError] {
+  match vp8l_validate_input(rgba.length(), width, height, 4) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+
+  // Scan alpha usage and optionally zero RGB where alpha == 0 when `!options.exact`.
+  let n = rgba.length()
+  let mut alpha_is_used = false
+  let mut work = Bytes::new(n)
+  let mut p = 0
+  while p < n {
+    let a = rgba[p + 3].to_int()
+    if a != 255 {
+      alpha_is_used = true
+    }
+    if a == 0 && !options.exact {
+      work[p] = 0.to_byte()
+      work[p + 1] = 0.to_byte()
+      work[p + 2] = 0.to_byte()
+      work[p + 3] = 0.to_byte()
+    } else {
+      work[p] = rgba[p]
+      work[p + 1] = rgba[p + 1]
+      work[p + 2] = rgba[p + 2]
+      work[p + 3] = rgba[p + 3]
+    }
+    p = p + 4
+  }
+
+  let bw = BitWriter::new()
+  // 5-byte VP8L header: signature 0x2F + 14-bit (w-1) + 14-bit (h-1) + 1-bit alpha + 3-bit version=0.
+  bw.write_bits(0x2F, 8)
+  bw.write_bits(width - 1, 14)
+  bw.write_bits(height - 1, 14)
+  bw.write_bits(if alpha_is_used { 1 } else { 0 }, 1)
+  bw.write_bits(0, 3)
+
+  let mut cur_w = width
+  let mut color_indexed = false
+
+  // 1. Optional ColorIndexing transform (palette delta + 1/2/4/8-bit packing).
+  if options.use_color_indexing {
+    let (applied, packed, new_w, n_colors, pal_delta) = vp8l_try_color_indexing(work, cur_w, height)
+    if applied {
+      color_indexed = true
+      bw.write_bits(1, 1) // transform present
+      bw.write_bits(vp8l_transform_color_indexing, 2)
+      bw.write_bits(n_colors - 1, 8)
+      vp8l_encode_image(bw, pal_delta, n_colors, 1, false, false)
+      work = packed
+      cur_w = new_w
+    }
+  }
+
+  if !color_indexed {
+    // 2. Optional SubtractGreen transform (in-place).
+    if options.use_subtract_green {
+      bw.write_bits(1, 1) // transform present
+      bw.write_bits(vp8l_transform_subtract_green, 2)
+      work = vp8l_forward_subtract_green(work)
+    }
+
+    // 3. Optional Predictor transform (per-tile best of modes 0..13).
+    if options.use_predictor && cur_w >= 2 && height >= 2 {
+      let (res, tiles, pred_bits, tw, th) = vp8l_forward_predictor(work, cur_w, height)
+      bw.write_bits(1, 1) // transform present
+      bw.write_bits(vp8l_transform_predictor, 2)
+      bw.write_bits(pred_bits - 2, 3)
+      vp8l_encode_image(bw, tiles, tw, th, false, false)
+      work = res
+    }
+  }
+
+  // Terminate transform list.
+  bw.write_bits(0, 1)
+
+  // Encode transformed pixel image.
+  vp8l_encode_image(bw, work, cur_w, height, true, options.use_color_cache)
+
+  Ok(bw.finish())
+}
+
+///| Encode tightly packed RGBA8888 pixels into a RIFF/WEBP VP8L container using explicit options.
+///| When `options.exact` is `false`, RGB channels of transparent pixels (`alpha == 0`) are zeroed
+///| for better compression; pass `EncodeOptions::exact()` to preserve hidden RGB bytes verbatim.
+pub fn encode_lossless_rgba_with_options(
+  rgba : Bytes,
+  width : Int,
+  height : Int,
+  options : EncodeOptions,
+) -> Result[Bytes, WebpError] {
+  match encode_vp8l_rgba(rgba, width, height, options) {
+    Ok(payload) => Ok(wrap_riff_vp8l(payload))
+    Err(e) => Err(e)
+  }
+}
+
+///| Encode tightly packed RGBA8888 pixels into a RIFF/WEBP VP8L container using `EncodeOptions::default()`
+///| (transforms and color cache enabled; RGB channels under `alpha == 0` are zeroed).
+pub fn encode_lossless_rgba(
+  rgba : Bytes,
+  width : Int,
+  height : Int,
+) -> Result[Bytes, WebpError] {
+  encode_lossless_rgba_with_options(rgba, width, height, EncodeOptions::default())
+}
+
+///| Encode tightly packed opaque RGB888 pixels into a RIFF/WEBP VP8L container using explicit options.
+pub fn encode_lossless_rgb_with_options(
+  rgb : Bytes,
+  width : Int,
+  height : Int,
+  options : EncodeOptions,
+) -> Result[Bytes, WebpError] {
+  match vp8l_validate_input(rgb.length(), width, height, 3) {
+    Ok(()) => ()
+    Err(e) => return Err(e)
+  }
+  let npix = width * height
+  let mut rgba = Bytes::new(npix * 4)
+  let mut i = 0
+  while i < npix {
+    let si = i * 3
+    let di = i * 4
+    rgba[di] = rgb[si]
+    rgba[di + 1] = rgb[si + 1]
+    rgba[di + 2] = rgb[si + 2]
+    rgba[di + 3] = 255.to_byte()
+    i = i + 1
+  }
+  encode_lossless_rgba_with_options(rgba, width, height, options)
+}
+
+///| Encode tightly packed opaque RGB888 pixels into a RIFF/WEBP VP8L container using `EncodeOptions::default()`.
+pub fn encode_lossless_rgb(
+  rgb : Bytes,
+  width : Int,
+  height : Int,
+) -> Result[Bytes, WebpError] {
+  encode_lossless_rgb_with_options(rgb, width, height, EncodeOptions::default())
+}

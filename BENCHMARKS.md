@@ -345,6 +345,7 @@
 | `webp` | VP8L 无损 512×512 → RGBA8888 × 30 | 30 MiB RGBA | **130.652 ms** | 154.463 ms (`go_x_image_webp`) | **1.18x** | **4.47 MiB** | 11.95 MiB |
 | `webp` | VP8 有损 512×512 → RGBA8888 × 30 | 30 MiB RGBA | 147.946 ms | **143.284 ms** (`go_x_image_webp`) | 0.97x | **4.39 MiB** | 12.89 MiB |
 | `webp` | VP8X + ALPH（VP8L alpha + VP8 有损）512×512 → RGBA8888 × 30 | 30 MiB RGBA | **179.968 ms** | 192.009 ms (`go_x_image_webp`) | **1.07x** | **4.80 MiB** | 11.97 MiB |
+| `webp` | v0.2.0 VP8L 无损编码 512×512 RGBA（`exact`，进程内，× 10，Linux x86_64） | 10 MiB RGBA | **583.544 ms** | 1267.907 ms (`libwebp_z4` C `-O2 -lwebp`) | **2.17x** | **8.79 MiB** | 27.07 MiB |
 | `wgsl` | WGSL 解析 + 校验 + MSL 2.x / GLSL 生成（PBR + Compute Reduce + Particles，200 × 3 份，1,400 次编译；两端管线工作量不同，见 [`wgsl`](#wgsl)） | 1,014,000 B | **121.677 ms** (`86911.79 ns/op`) | 165.073 ms (`rust_naga`，`naga =24.0.0`) | **1.36x**（审计复测 1.34x） | **3.19 MiB** | 4.47 MiB |
 | `exif` | EXIF 解析 + `format_canonical`（JPEG + BE TIFF + WebP + PNG 4 容器相机尺寸语料，72 tags / 文件，含 30 KB MakerNote 与 11 KB 缩略图，× 25,000 = 100,000 次解析） | 10,923,100,000 B | **465.537 ms** (`4655.37 ns/op`) | 618.723 ms (`rust_kamadak_exif`，`kamadak-exif =0.6.2`) | **1.33x**（审计复测 1.40x） | **3.45 MiB** | 4.09 MiB |
 | `icc` | 解析 + `Transform::to_srgb` + 饱和探针 `(200, 70, 40)`，Display-P3 v4 `para3`（× 20,000） | 8,880,000 B | **30.258 ms** (`1512.88 ns/op`) | 50.890 ms (`rust_qcms_pre`，`qcms =0.3.0` 预缓存) / 856.125 ms (`rust_moxcms`) | **1.68x**（vs `moxcms` **28.29x**） | **2.06 MiB** | 2.41 / 2.80 MiB |
@@ -2663,6 +2664,9 @@ Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000` | SHA-256: `
 | VP8 有损（Wave 20 发布复测） | 147.946 | 138.070 / 168.802 / 166.400 | **143.284** | 142.104 / 150.921 | 212.63 | 219.54 | **4.39 MiB** | 12.89 MiB | 0.97x | `290259f8f8ad61a0...` |
 | VP8X + ALPH（Wave 20 发布复测） | **179.968** | 175.499 / 185.194 / 184.285 | 192.009 | 187.954 / 205.486 | 174.79 | 163.83 | **4.80 MiB** | 11.97 MiB | **1.07x** | `19475dec78b0d4ff...` |
 | VP8L / VP8 / VP8X + ALPH（`audit/run_audit.sh` 基准段，同机数分钟前） | 137.7 / 146.5 / 179.1 | — | 151.6 / 146.4 / 200.1 | — | — | — | — | — | 1.10x / 1.00x / 1.12x | 同上 |
+| v0.2.0 VP8L 无损编码 512×512 RGBA（`exact`，进程内 ×10，Linux x86_64 vs C `libwebp 1.5.0 -z 4`） | **583.544** | 537.638 / — / 606.467 | 1267.907 | 1224.872 / 1446.911 (P95) | **17.97** | 8.27 | **8.79 MiB** | 27.07 MiB | **2.17x** | `e7da69a9c55682bc...` |
+
+v0.2.0 编码基准说明（Linux x86_64，同机 `sh packages/webp/bench/run_bench.sh`）：基线为进程内 C `-O2 -lwebp` 基准程序（`packages/webp/bench/c/libwebp_encode_bench.c`，调用 `WebPEncode` + `WebPConfigLosslessPreset(&config, 4)` + `config.exact = 1`），两侧均一次性将 `alpha_512.rgba`（1,048,576 B）读入内存并在单进程内连续编码 10 次，最后将编码结果解码回 RGBA8888 输出到 stdout 并通过 `bench_compare.py` 强制校验与原始输入 RGBA8888 的 SHA-256（`e7da69a9c55682bc...`）逐字节一致。Pion 编码速度快 2.17×、峰值 RSS 低 3.08×（8.79 MiB vs 27.07 MiB）；编码体积为 190,690 B（5.50×），比 `libwebp -z 4`（169,386 B，6.19×）大约 12.6%（未启用 CrossColor 与 Meta-Huffman）。
 
 诚实说明：VP8L 无损与 VP8X + ALPH 领先 Go；VP8 有损基本持平，本次发布复测落后 3%（0.97x，Pion 样本离散较大：138–169 ms），同机审计基准段为 1.00x（机器负载约 6–7）。三项峰值 RSS 均低 2.5–2.9×。三份输入都是确定性生成的单一图像，未计时 ANIM（本包不支持动画）、Meta-Huffman 大分组与多分区 VP8 路径，这些路径的正确性由差分语料与 fuzz 覆盖。对抗负载（`audit/run_audit.sh dos`，native release）：分配前拒绝的宽高炸弹均 ≤ 0.01 ms，34 字节 → 64 MiB RGBA 的 4096² 实心 VP8L 102.65 ms / 66.0 MiB，2,600 组完整最大 Huffman 码 194.23 ms / 77.4 MiB（libwebp 42 MiB），2,600 组不完整码 0.07 ms 返回 `InvalidHuffman`。
 

@@ -38,6 +38,7 @@ func runCwebp(inPNG, outWebP string, args ...string) {
 // 1. vp8l_512x512.webp (lossless with alpha, triggers Predictor, CrossColor, SubtractGreen, LZ77, ColorCache, Meta-Huffman)
 // 2. vp8_512x512.webp (lossy q=80, triggers I16x16, I4x4, normal loop filter)
 // 3. vp8x_alph_512x512.webp (VP8 lossy + VP8L-compressed filtered ALPH)
+// 4. alpha_512.rgba (raw RGBA8888 for lossless encode benchmarks)
 func generateCorpora(dir string) {
 	const w, h = 512, 512
 	opaque := image.NewNRGBA(image.Rect(0, 0, w, h))
@@ -99,6 +100,9 @@ func generateCorpora(dir string) {
 	alphaPNG := filepath.Join(dir, "alpha_512.png")
 	savePNG(opaquePNG, opaque)
 	savePNG(alphaPNG, alphaImg)
+	if err := os.WriteFile(filepath.Join(dir, "alpha_512.rgba"), alphaImg.Pix, 0644); err != nil {
+		panic(err)
+	}
 
 	runCwebp(alphaPNG, filepath.Join(dir, "vp8l_512x512.webp"), "-lossless", "-z", "6", "-quiet")
 	runCwebp(opaquePNG, filepath.Join(dir, "vp8_512x512.webp"), "-q", "80", "-quiet")
@@ -155,7 +159,7 @@ func decodeToRGBA(data []byte) ([]byte, error) {
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "usage:\n  go_webp_bench gen <dir>\n  go_webp_bench decode <webp_file> <iters>\n")
+		fmt.Fprintf(os.Stderr, "usage:\n  go_webp_bench gen <dir>\n  go_webp_bench decode <webp_file> <iters>\n  go_webp_bench verify-rgba <webp_file> <rgba_file> <exact|nonexact>\n")
 		os.Exit(1)
 	}
 	if os.Args[1] == "gen" {
@@ -186,6 +190,57 @@ func main() {
 			}
 		}
 		os.Stdout.Write(last)
+		return
+	}
+	if os.Args[1] == "verify-rgba" {
+		if len(os.Args) < 5 {
+			fmt.Fprintf(os.Stderr, "usage: go_webp_bench verify-rgba <webp_file> <rgba_file> <exact|nonexact>\n")
+			os.Exit(1)
+		}
+		webpData, err := os.ReadFile(os.Args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read webp error: %v\n", err)
+			os.Exit(1)
+		}
+		wantRGBA, err := os.ReadFile(os.Args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read rgba error: %v\n", err)
+			os.Exit(1)
+		}
+		exact := os.Args[4] == "exact"
+		gotRGBA, err := decodeToRGBA(webpData)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "go x/image/webp decode failed on %s: %v\n", os.Args[2], err)
+			os.Exit(1)
+		}
+		if len(gotRGBA) != len(wantRGBA) {
+			fmt.Fprintf(os.Stderr, "length mismatch on %s: got %d, want %d\n", os.Args[2], len(gotRGBA), len(wantRGBA))
+			os.Exit(1)
+		}
+		if exact {
+			if !bytes.Equal(gotRGBA, wantRGBA) {
+				for i := 0; i < len(wantRGBA); i++ {
+					if gotRGBA[i] != wantRGBA[i] {
+						fmt.Fprintf(os.Stderr, "exact mismatch on %s at byte %d: got %d, want %d\n", os.Args[2], i, gotRGBA[i], wantRGBA[i])
+						os.Exit(1)
+					}
+				}
+			}
+		} else {
+			for p := 0; p < len(wantRGBA); p += 4 {
+				if gotRGBA[p+3] != wantRGBA[p+3] {
+					fmt.Fprintf(os.Stderr, "alpha mismatch on %s at pixel %d: got %d, want %d\n", os.Args[2], p/4, gotRGBA[p+3], wantRGBA[p+3])
+					os.Exit(1)
+				}
+				if wantRGBA[p+3] != 0 {
+					if gotRGBA[p] != wantRGBA[p] || gotRGBA[p+1] != wantRGBA[p+1] || gotRGBA[p+2] != wantRGBA[p+2] {
+						fmt.Fprintf(os.Stderr, "rgb mismatch on %s at pixel %d\n", os.Args[2], p/4)
+						os.Exit(1)
+					}
+				}
+			}
+		}
+		fmt.Printf("OK %s (%d webp bytes, %d rgba bytes, exact=%v)\n", filepath.Base(os.Args[2]), len(webpData), len(gotRGBA), exact)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])

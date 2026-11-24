@@ -1,10 +1,17 @@
-# `webp` (v0.1.0)
+# `webp` (v0.2.0)
 
-Pure Pion RFC 9649 WebP decoder (`RIFF/WEBP` + `VP8L` lossless + `VP8` lossy + `VP8X`/`ALPH` alpha channel) with zero `extern "C"`, zero `World` dependency, zero external dependencies, and zero mutable module globals.
+Pure Pion RFC 9649 WebP codec (`RIFF/WEBP` + `VP8L` lossless decoder & encoder + `VP8` lossy decoder + `VP8X`/`ALPH` alpha channel) with zero `extern "C"`, zero `World` dependency, zero external dependencies, and zero mutable module globals.
 
 ## Features
 
 - **RIFF/WEBP Container & `probe_header`**: validates `RIFF`/`WEBP`, parses `VP8 `, `VP8L`, and `VP8X` headers (including `ICCP`/`ALPH`/`EXIF`/`XMP`/`ANIM` flags and 24-bit canvas dimensions), skips unknown/metadata chunks with 2-byte RIFF padding.
+- **Complete VP8L Lossless Encoder (RFC 9649)**:
+  - `encode_lossless_rgba`, `encode_lossless_rgba_with_options`, `encode_lossless_rgb`, `encode_lossless_rgb_with_options`, and raw `encode_vp8l_rgba`
+  - `EncodeOptions::default()` and `EncodeOptions::exact()` (strictly preserves RGB channel bytes when `alpha == 0`)
+  - Forward transforms: ColorIndexing (delta-encoded sorted palette + 1/2/4/8-bit pixel packing), SubtractGreen, and per-tile Predictor (modes 0..13)
+  - Hash-chain LZ77 backwards references with 120-entry 2D pixel distance map, RLE (`dist == 1`) fast path, and Color Cache
+  - Package-Merge length-limited Canonical Huffman coding (`<= 15` bits for the 5 alphabets, `<= 7` bits for code-length alphabet), Simple 1/2-symbol trees, and Normal RLE (codes 16/17/18)
+  - Strict input validation (`1..16384` dimensions, exact pixel buffer byte length)
 - **Complete VP8L Lossless Decoder (RFC 9649)**:
   - 64-bit LSB bit buffer with 32-bit batch refill
   - Simple & Normal Canonical Huffman using a contiguous 2-level flat `FixedArray[Int]` 9-bit LUT
@@ -27,8 +34,19 @@ Pure Pion RFC 9649 WebP decoder (`RIFF/WEBP` + `VP8L` lossless + `VP8` lossy + `
 import "webp"
 
 let hdr = webp::probe_header(bytes)
-let img = webp::decode(bytes)
-let img_limited = webp::decode_with_limits(bytes, webp::DecodeLimits::default())
+match webp::decode(bytes) {
+  Ok(img) => {
+    let encoded = webp::encode_lossless_rgba(img.rgba, img.width, img.height)
+    let exact = webp::encode_lossless_rgba_with_options(
+      img.rgba,
+      img.width,
+      img.height,
+      webp::EncodeOptions::exact(),
+    )
+    let _ = (encoded, exact)
+  }
+  Err(_) => ()
+}
 ```
 
 ## Verification & Benchmarks
@@ -50,4 +68,14 @@ Head-to-head against Go `golang.org/x/image/webp` `v0.48.0` (go1.27.3), measured
 
 Honest notes: VP8L lossless and VP8X+ALPH lead Go; VP8 lossy is roughly at parity and trailed Go slightly in this run (0.97x; the audit's own bench section measured 1.00x on the same machine minutes earlier, with load around 6). Peak RSS is 2.5–2.9× lower than Go on all three.
 
-Red-team audit (`sh packages/webp/audit/run_audit.sh`, `audit/` untouched): **exit 0, `AUDIT PASS`**. 1 P0 + 5 P2 findings fixed. 20 / 20 red-team and control cases pass in all 4 modes (native / wasm32 × debug / release), 11 / 11 package unit tests, 5 / 5 libwebp-adjudicated vectors, 622-file differential corpus identical to x/image/webp in all 4 modes (601 identical, 21 rejected by both), 10,000 byte-level mutants with 0 crashes and native == wasm32 on all of them, 12 / 12 DoS bombs within time and RSS budgets, and 0 `extern "C"` / 0 `World` / 0 module-level mutable state. `wasm_smoke` prints the same 55 B in all 4 modes (SHA-256 `8a00bb493b1061cbc6ec503a8fe400de88fbf6fb5fc39956ca9f54e41bd65eec`).
+### VP8L Lossless Encode (v0.2.0, Linux x86_64)
+
+Measured with `sh packages/webp/bench/run_bench.sh` (`scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved) against an in-process C `-O2 -lwebp` (`libwebp 1.5.0`, `WebPEncode` with `WebPConfigLosslessPreset(&config, 4)` + `config.exact = 1`) harness (`packages/webp/bench/c/libwebp_encode_bench.c`). Both implementations load the same deterministic 512×512 RGBA8888 buffer (`alpha_512.rgba`, 1,048,576 B) once into RAM, encode it 10 times in-process (10 MiB RGBA total), decode the final encoded WebP back to RGBA8888, and write it to stdout (`SHA-256: e7da69a9c55682bc157c95b4c7da770478848a95115b4d5387bcaaf18be605ff`, matching the raw input RGBA8888 byte-for-byte across every round):
+
+| Workload | Pion Median (ms) | Pion Min / P95 (ms) | `libwebp -z 4` Median (ms) | `libwebp` Min / P95 (ms) | Pion MB/s | `libwebp` MB/s | Pion Peak RSS | `libwebp` Peak RSS | Speedup | Pion Size | `libwebp -z 4` Size |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| VP8L Lossless Encode 512×512 RGBA (`exact`, in-process, ×10) | **583.544** | 537.638 / 606.467 | 1267.907 | 1224.872 / 1446.911 | **17.97** | 8.27 | **8.79 MiB** | 27.07 MiB | **2.17x** | 190,690 B (5.50x) | **169,386 B** (6.19x) |
+
+Honest notes: Pion encodes 2.17× faster than in-process `libwebp` `-z 4` with 3.08× lower peak RSS (8.79 MiB vs 27.07 MiB); `libwebp -z 4` achieves ~11% smaller output on the 512×512 photographic image due to CrossColor and Meta-Huffman entropy groups. On palette and solid images (e.g. 127×64 solid: 44 B / 738.9×, 127×64 pattern: 126 B / 258.0×, 33×32 2-color: 56 B), Pion matches or approaches `libwebp -z 4`.
+
+Verification (v0.2.0): **23 / 23** package unit tests pass (11 decode + 12 encode/regression tests including `exact` alpha=0 RGB preservation, ColorIndexing bitstream header verification, 300×300 multi-tile, Fibonacci 15-bit Huffman length cap, `1x257`/`257x1`/`16384x2` edge dimensions, and `LimitExceeded` OOM guard). All 19 cross-decode cases (18 synthetic/edge + 512×512 photo) decode byte-for-byte identically via Go `golang.org/x/image/webp` and `dwebp 1.5.0`. `wasm_smoke` passes all 5 checks with identical output across all 4 modes (native / wasm32 × debug / release): `webp_wasm_smoke: OK checks=5 fnv64=12293912141564746576`. Prior v0.1.0 decoder red-team audit (`sh packages/webp/audit/run_audit.sh`): **exit 0, `AUDIT PASS`** (20/20 red-team/control cases, 622-file differential corpus, 10,000 byte-level mutants, 12/12 DoS bombs, 0 `extern "C"` / 0 `World` / 0 module-level mutable state).
