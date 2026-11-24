@@ -168,6 +168,16 @@ def named():
                                 ("http://h/a/", "../../../x/"), ("http://h/a/", "/r/./s/../t/"), ("./", "a/"), ("", "")]):
         a(("url_%d" % i, mpd('type="static" mediaPresentationDuration="PT4S"',
                              ('<BaseURL>%s</BaseURL>' % b if b else '') + '<Period>' + as1('<BaseURL>%s</BaseURL><SegmentTemplate duration="2" media="s$Number$.m4s"/>' % r) + '</Period>')))
+    # --- segment references against parsed bases (P1-6 fast path must equal RFC 3986 resolution)
+    bases = ["http://h/a/b/c/", "http://h", "http://h/a//b/", "../../x/y/", "file.mp4", "urn:a/b", "urn:x", "v/", "https://c/p/?t=1"]
+    refs = ["../s$Number$", "../../../../s$Number$", "..//s$Number$", "./s$Number$/.", "s$Number$/..", "a//..",
+            "..", "x/../../y$Number$", "?q=$Number$", "#f$Number$", "//other/z$Number$", "/abs/$Number$"]
+    for bi, b0 in enumerate(bases):
+        a(("refbase_%d" % bi, mpd('type="static" mediaPresentationDuration="PT6S"', '<BaseURL>%s</BaseURL><Period>' % b0 +
+                                   "".join(as1('<SegmentTemplate duration="2" media="%s"/>' % r, 'id="r%d" bandwidth="1"' % k)
+                                           for k, r in enumerate(refs)) +
+                                   as1('<SegmentList><SegmentURL media="../l"/><SegmentURL media="..//l"/><SegmentURL/></SegmentList>', 'id="l" bandwidth="1"') +
+                                   '</Period>')))
     # --- DRM / descriptors
     a(("drm_multi", mpd('type="static"', '<Period><AdaptationSet>'
                         '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" cenc:default_KID="34e5db32-8625-47cd-ba06-68fca0655a72"/>'

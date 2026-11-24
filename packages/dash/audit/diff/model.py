@@ -19,7 +19,7 @@ Usage: model.py <cases-file>            -> '=<name>' blocks: 'S' alternatives an
 import sys
 import xml.parsers.expat
 
-FLAGS = ("P1-1", "P1-2", "P1-3", "P2-1", "P2-2", "P2-4", "P2-5", "P2-6", "P2-8")
+FLAGS = ("P1-1", "P1-2", "P1-3", "P2-1", "P2-2", "P2-4", "P2-5", "P2-6", "P2-8", "P2-11")
 
 I64_MAX = (1 << 63) - 1
 I64_MIN = -(1 << 63)
@@ -1178,6 +1178,93 @@ def pkg_resolve(base, rel):
     return (bc[:oe] if oe > 0 else b"") + norm(merged) + rs
 
 
+def fast_resolve(base, rel):
+    """Emu (P2-11): the package's per-track fast path (resolve_url_parsed / resolve_relative_path_parsed of
+    57ecbbd): the base directory is split once, '..' of the reference drop directory segments; a base path
+    without a leading '/' (non-hierarchical 'urn:x') loses the '/' that RFC 3986 rule C leaves when a segment of the
+    reference itself is cancelled ('s1/..', '../x/..')."""
+    if rel == b"":
+        return base
+    if base == b"":
+        return rel
+    rs, ra, rp, rq, rf = split_ref(rel)
+    if rs is not None:
+        return rfc_resolve(base, rel)
+    bs, ba, bp, bq, bf = split_ref(base)
+    if ra is not None or rp == b"" or rp.startswith(b"/"):
+        return rfc_resolve(base, rel)
+    eff = b"/" if (ba is not None and bp == b"") else (bp[:bp.rfind(b"/") + 1] if b"/" in bp else b"")
+    rootless = bs is None and ba is None and (eff == b"" or not eff.startswith(b"/"))
+    ends = []
+    if eff == b"":
+        ends.append(0)
+    elif not rootless and eff.startswith(b"/"):
+        ends.append(1)
+        ends += [i + 1 for i in range(1, len(eff)) if eff[i] == 47]
+    elif rootless:
+        i = 0
+        while i + 2 < len(eff) and eff[i:i + 3] == b"../":
+            i += 3
+        ends.append(i)
+        ends += [k + 1 for k in range(i, len(eff)) if eff[k] == 47]
+    else:
+        ends.append(0)
+        ends += [k + 1 for k in range(len(eff)) if eff[k] == 47]
+    pops = 0
+    tail = []
+    segs = rp.split(b"/")
+    for i, sg in enumerate(segs):
+        last = i == len(segs) - 1
+        if sg == b".":
+            if last:
+                tail.append(b"")
+        elif sg == b"..":
+            if tail:
+                tail.pop()
+            else:
+                pops += 1
+            if last:
+                tail.append(b"")
+        else:
+            tail.append(sg)
+    poppable = len(ends) - 1
+    keep = 0 if pops >= poppable else poppable - pops
+    pe = ends[keep]
+    out = eff[:pe]
+    if rootless:
+        out += b"../" * max(0, pops - poppable)
+    elif pops > 0 and poppable > 0 and keep == 0 and pe == 0:
+        out += b"/"
+    out += b"/".join(tail)
+    r = b""
+    if bs is not None:
+        r += bs + b":"
+    if ba is not None:
+        r += b"//" + ba
+    r += out
+    if rq is not None:
+        r += b"?" + rq
+    if rf is not None:
+        r += b"#" + rf
+    return r
+
+
+def seg_resolve(base, rel, fl):
+    """Resolution of segment / initialization references of SegmentTemplate and SegmentList (per-track path)."""
+    if fl.on("P2-11"):
+        pre = base
+        bs, ba, bp, bq, bf = split_ref(base)
+        if bp and b"/" in bp:
+            k = bp.rfind(b"/")
+            d = bp[:k + 1]
+            rootless = bs is None and ba is None and not d.startswith(b"/")
+            nd = rootless_norm(d) if rootless else remove_dot_segments(d)
+            pre = (bs + b":" if bs is not None else b"") + (b"//" + ba if ba is not None else b"") + nd + bp[k + 1:] + \
+                (b"?" + bq if bq is not None else b"") + (b"#" + bf if bf is not None else b"")
+        return fast_resolve(pre, rel)
+    return resolve(base, rel, fl)
+
+
 def resolve(base, rel, fl):
     a = pkg_resolve(base, rel)
     if fl.on("P1-1"):
@@ -1319,7 +1406,7 @@ def seg_line(t):
 
 
 def tpl_url(base, media, rid, num, bw, cur, fl):
-    return lambda: resolve(base, expand(media, rid, num, bw, cur), fl)
+    return lambda: seg_resolve(base, expand(media, rid, num, bw, cur), fl)
 
 
 def resolve_track(m, pi, ai, ri, fl):
@@ -1341,7 +1428,7 @@ def resolve_track(m, pi, ai, ri, fl):
         sn = 1 if tpl["start_number"] is None else tpl["start_number"]
         init = None
         if tpl["init"] is not None:
-            init = resolve(base, expand(tpl["init"], r["id"], sn, r["bandwidth"], 0), fl)
+            init = seg_resolve(base, expand(tpl["init"], r["id"], sn, r["bandwidth"], 0), fl)
         if tpl["media"] is None:
             return init, None, None, segs
         media = tpl["media"]
@@ -1425,7 +1512,7 @@ def resolve_track(m, pi, ai, ri, fl):
         ts = lst["timescale"] or 1
         d = lst["duration"] or 0
         sn = 1 if lst["start_number"] is None else lst["start_number"]
-        init = resolve(base, lst["init_src"], fl) if lst["init_src"] is not None else (
+        init = seg_resolve(base, lst["init_src"], fl) if lst["init_src"] is not None else (
             base if lst["init_range"] is not None and base else None)
         if len(lst["urls"]) > maxs:
             raise Err("LimitExceeded", "list")
@@ -1439,7 +1526,7 @@ def resolve_track(m, pi, ai, ri, fl):
                     raise Err("InvalidNumber", "number overflow")
                 else:
                     break
-            segs.append(seg(num, resolve(base, med, fl) if med is not None else base, cur, d, ts, mr))
+            segs.append(seg(num, seg_resolve(base, med, fl) if med is not None else base, cur, d, ts, mr))
             if d > 0:
                 if cur + d > I64_MAX:
                     raise Err("InvalidNumber", "time overflow")

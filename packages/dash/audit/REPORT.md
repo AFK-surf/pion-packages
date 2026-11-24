@@ -8,6 +8,33 @@ sh packages/dash/audit/run_audit.sh            # exit 1 while any P0 reproduces
 STRICT=1 sh packages/dash/audit/run_audit.sh   # exit 1 while any finding is open
 ```
 
+## Re-audit 3 of `57ecbbd` (`origin/feat/pkg-dash-fix`, P1-6 relative `../` variant)
+
+**Verdict: NOT SIGNED (one P2 left).** P1-6 is closed: `resolve_relative_path_parsed` splits the normalised base
+directory once per track and drops directory segments per leading `..`, so `b34` / `b35` / `b36` take 0.04 / 0.04 /
+0.09 s native and 0.17 / 0.16 / 0.33 s wasm32 (were 27 / 56 / 27 s). Re-checking the new fast path against RFC 3986
+with 108 new base x reference combinations (`refbase_*` named cases: rooted, authority-only, empty segments,
+rootless with leading `..`, path without `/`, `urn:` bases, query bases) finds one divergence, now P2-11.
+`STRICT=1 sh packages/dash/audit/run_audit.sh`: `EXIT=1`, 1 OPEN (P2-11), 0 P0; everything else passes (27/28 cases
+in 4 modes, model named 224/225 conforming + 1 explained by P2-11, fuzz 2,000/2,000, API 387/387, 4-mode
+determinism, 36 bombs: all in budget, smoke = README.md, bench 1.38x at load 41, 5/5 injections).
+
+### P2-11 (new, from the P1-6 fix) segment URL fast path differs from RFC 3986 / `resolve_url` for bases without `/`
+
+For a base whose path has no leading `/` (non-hierarchical, e.g. `urn:x`), RFC 3986 5.2.4 rule C leaves a leading
+`/` as soon as a segment is removed, including a segment of the reference itself. `resolve_relative_path_parsed`
+adds that `/` only when a *directory* segment is popped (`pops > 0 && poppable > 0`):
+
+| base | media | segment URL (fast path) | `resolve_url` / RFC 3986 |
+| --- | --- | --- | --- |
+| `urn:x` | `s$Number$/..` | `urn:` | `urn:/` |
+| `urn:x` | `../x$Number$/..` | `urn:` | `urn:/` |
+| `urn:x` | `a/../b$Number$` | `urn:b1` | `urn:/b1` |
+
+Hierarchical (`http`, `https`, `file`, relative) bases are not affected. Fix direction: also emit the `/` when a
+segment of `tail` was popped and nothing of the base directory remains (`prefix_end == 0`, base not rootless).
+`redteam_p2_11_fast_path_rfc_corner` compares the track URL with `resolve_url` for 4 bases x 4 references.
+
 ## Re-audit 2 of `3e43ddc` (`origin/feat/pkg-dash-fix`, "P1-5 O(1) namespace lookup and P1-6 pre-parsed BaseURL")
 
 **Verdict: NOT SIGNED.** P1-5 is closed (`xp_ns_lookup` now uses a prefix -> binding-stack `Map`; `b33`

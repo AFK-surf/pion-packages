@@ -64,7 +64,8 @@ title() {
     P2-8) echo "select_representation matches only the first codec of a multi-codec @codecs list" ;;
     P2-9) echo "namespace-unaware: foreign-namespace elements / attributes taken for DASH ones (x:Period, x:id)" ;;
     P2-10) echo "PlayReady <mspr:pro> payloads dropped (data model and format_mpd)" ;;
-    P2-11) echo "README.md benchmark / size / test-count claims not reproduced or not representative" ;;
+    P2-11) echo "segment URL fast path differs from RFC 3986 for 'urn:x'-like bases ('s1/..' -> 'urn:' instead of 'urn:/')" ;;
+    P2-12) echo "README.md benchmark / size / test-count claims not reproduced or not representative" ;;
     *) echo "(see REPORT.md)" ;;
   esac
 }
@@ -175,7 +176,7 @@ print("  audit tests under pionc test: %d pass, %d red-team open, %d control fai
 sys.exit(1 if bad else 0)
 PY
   got=$($PY -c 'import json,sys; print(sum(1 for t in json.load(open(sys.argv[1]))["tests"] if t.get("pkg")=="dash"))' "$AUDIT_OUT/unit_pkg.json")
-  [ "$got" = "$($RD tests)" ] || open_finding "P2-11: $(title P2-11)"
+  [ "$got" = "$($RD tests)" ] || open_finding "P2-12: $(title P2-12)"
 }
 
 cases() {
@@ -314,7 +315,7 @@ smoke() {
     want=$($RD wasm_${k}_kib)
     # the wasm32 binary embeds absolute source paths, so its size depends on the checkout path: tolerance 2 %
     echo "  wasm32 $k size: $got B = $((got / 1024)) KiB (README.md: $want KiB; path-dependent, tolerance 2 %)"
-    $PY -c 'import sys; g=int(sys.argv[1])/1024; w=float(sys.argv[2]); sys.exit(0 if abs(g-w) <= 0.02*w else 1)' "$got" "$want" || open_finding "P2-11: $(title P2-11)"
+    $PY -c 'import sys; g=int(sys.argv[1])/1024; w=float(sys.argv[2]); sys.exit(0 if abs(g-w) <= 0.02*w else 1)' "$got" "$want" || open_finding "P2-12: $(title P2-12)"
   done
 }
 
@@ -326,7 +327,7 @@ bench() {
   bsha=$(sed -nE 's/.*SHA-256 verified identical across all implementations and rounds: `([0-9a-f]{64})`.*/\1/p' "$AUDIT_OUT/bench.log" | head -1)
   [ -n "$bsha" ] || fail "benchmark stdout not byte-identical across implementations"
   [ "$bsha" = "$($RD bench_sha)" ] || fail "benchmark stdout sha256 $bsha != README.md"
-  $PY - "$AUDIT_OUT/bench.log" "$($RD speedup)" "$($RD throughput)" <<'PY' || open_finding "P2-11: $(title P2-11)"
+  $PY - "$AUDIT_OUT/bench.log" "$($RD speedup)" "$($RD throughput)" <<'PY' || open_finding "P2-12: $(title P2-12)"
 import os, re, sys
 t = open(sys.argv[1]).read()
 row = [l for l in t.split("\n") if l.startswith("| `pion_dash`")][0].split("|")
@@ -348,7 +349,7 @@ PY
     --baseline rust_dash_mpd --warmup 1 --rounds 5 --bytes $(($2 * 20)) --ops $(($1 * 20)) \
     --md-out "$AUDIT_OUT/alt_bench.md" --json-out "$AUDIT_OUT/alt_bench.json" > "$AUDIT_OUT/alt_bench.log" 2>&1 || { tail -5 "$AUDIT_OUT/alt_bench.log"; fail "alt benchmark failed (outputs differ?)"; }
   grep -E '^\| `|SHA-256 verified' "$AUDIT_OUT/alt_bench.log" | sed 's/^/    /' | cut -c1-260
-  $PY - "$AUDIT_OUT/alt_bench.log" "$($RD speedup)" "$README" <<'PY' || open_finding "P2-11: $(title P2-11)"
+  $PY - "$AUDIT_OUT/alt_bench.log" "$($RD speedup)" "$README" <<'PY' || open_finding "P2-12: $(title P2-12)"
 import re, sys
 t = open(sys.argv[1]).read()
 row = [l for l in t.split("\n") if l.startswith("| `pion_dash`")][0].split("|")
