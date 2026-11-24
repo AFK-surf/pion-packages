@@ -36,6 +36,7 @@ FLAG_IDS = {
     "ip_trailing": "P2-8",
     "no_uts46": "P2-8",
     "uts46_subset": "P2-8",
+    "reject_all_combining": "P2-12",
     # accepted alternatives (fail-closed choices a fix may make; not findings)
     "url_reject_backslash": "OK",
     "psl_reject_noncanonical": "OK",
@@ -413,6 +414,10 @@ def _labels(b, flags):
         s = b.decode("utf-8")
     except UnicodeDecodeError:
         return None
+    if "reject_all_combining" in flags:
+        # feat/pkg-cookie-fix @ 755d2d7f: every combining mark except four is refused, also canonical ones
+        if any(unicodedata.combining(ch) and ord(ch) not in (0x094D, 0x0BCD, 0x0C4D, 0x0E38) for ch in s):
+            return None
     if "uts46_subset" in flags:
         out = []
         for ch in s:

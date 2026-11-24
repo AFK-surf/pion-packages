@@ -182,7 +182,7 @@ def psl_cases(r):
         "256.1.1.1", "食狮.com.cn", "食狮.公司.cn", "www.食狮.公司.cn", "shishi.中国", "中国", "xn--55qx5d.cn",
         "www.Éxample.com", "WWW.ÉXAMPLE.COM", "www.example\u3002com", "x.ПР.СРБ", "x.пр.срб", "www.ＥＸＡＭＰＬＥ.com",
         "www.ΕΛ", "x.ČÁHCESUOLO.NO", "x.c\u030ca\u0301hcesuolo.no", "x.a\u030alesund.no", "x.\U0001d41example.com",
-        "x.\ufb01.com", "x.ҚАЗ", "Ünïcödé.de", "ab\u00df.de", "xn--zz.com",
+        "x.\ufb01.com", "x.ҚАЗ", "ร้าน.ไทย", "www.ร้าน.ไทย", "x.ธุรกิจ.ไทย", "Ünïcödé.de", "ab\u00df.de", "xn--zz.com",
         "a" * 63 + ".com", ".".join(["a"] * 200) + ".com", "x" * 300 + ".co.uk", "s3.amazonaws.com",
         "bucket.s3.amazonaws.com", "kawasaki.jp", "city.kawasaki.jp", "www.city.kawasaki.jp", "x.kawasaki.jp",
         "a.x.kawasaki.jp", "ck", "www.ck", "test.ck", "b.test.ck", "github.io", "a.github.io", "a.b.github.io",

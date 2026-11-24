@@ -41,6 +41,7 @@
 | P2-9 | PSL lookup 0.03x of `psl 2.1.261` (≈7.3 binary searches per match, 2 matches per op) | `src/psl.pion:399-462`, `:265-319` |
 | P2-10 | README claims: table size in KiB wrong (167.9 KiB, not 171.9), PSL snapshot not named, "lossless" export, parser "validates" Partitioned | `README.md:9,13,19` |
 | P2-11 | (re-audit of the fix) generated `src/psl_index.pion` has no generator in the repository | `src/psl_index.pion` @ `eaeb5880` |
+| P2-12 | (re-audit of the fix) every combining mark is refused, so canonical IDN labels such as `ร้าน.ไทย` resolve to None | `scripts/gen_unicode_noncanon.py` @ `755d2d7f` |
 
 Severity scale: **P0** = crash / trap / hang on any input, mode divergence, or a broken advertised guarantee with no
 attacker precondition; **P1** = a security property the package advertises (prefixes, Secure / HttpOnly / SameSite
@@ -49,6 +50,31 @@ http://, a sibling subdomain, a cross-site page, or a caller passing through unt
 without a direct security consequence, robustness, performance or documentation.
 Trigger tiers (security-audit convention): ① default configuration, no special input; ② specific but legitimate
 configuration / timing; ③ attacker-controlled input across a trust boundary.
+
+## Re-audit 3: `origin/feat/pkg-cookie-fix` @ `755d2d7f`
+
+`755d2d7f` adds `scripts/gen_unicode_noncanon.py` (`--check` passes) and `src/unicode_noncanon.pion` (980 ranges); the
+IDN path now returns None for any code point in the table, and `store_cookie` / `import_text` refuse a Domain whose
+PSL lookup is None. `audit/` is byte-identical to `031ea974`; with it `STRICT=1` reports `RESULT: clean` (re-run here:
+`EXIT=0`, harness 5/5). P2-8 is closed: `x.ČÁHCESUOLO.NO`, the NFD spelling and `x.𝐞xample.com` are refused, and
+`Domain=ČÁHCESUOLO.NO` is no longer stored.
+
+New regression (**P2-12**, gate added): the table marks *every* code point with a non-zero combining class as
+non-canonical, except four hand-picked marks that occur in PSL rules (U+094D, U+0BCD, U+0C4D, U+0E38). Marks that never
+compose under NFC are canonical and IDNA2008-valid, so canonical Unicode hosts now resolve to None:
+`registrable_domain("www.ร้าน.ไทย")` = None (v0.1.0: `ร้าน.ไทย`; U+0E49 THAI MAI THO has ccc 107 and composes with
+nothing), and `Domain=ร้าน.ไทย` from `https://www.ร้าน.ไทย/` is refused with a misleading `PublicSuffixRejected`.
+Fail-closed (no bypass), but a functional regression for every label with a Thai / Lao tone mark, Arabic harakat,
+Hebrew points, etc., and the whitelist breaks as soon as a PSL refresh adds a rule with another mark. Fix (verified on
+a scratch copy, which then passes every gate with `STRICT=1`): in the generator, replace the `combining(ch) != 0`
+clause and the whitelist by the set of marks that are the second element of a canonical primary composite
+(`unicodedata.decomposition` two-element canonical mappings that `NFC` recomposes) plus the Hangul V/T jamo
+(U+1161..U+1175, U+11A8..U+11C2). That still refuses every NFD spelling of a precomposed character (U+030C, U+0301,
+U+030A, …) and keeps U+093C refused (it composes with U+0928), which the gate accepts.
+
+Gate changes in this round: `redteam_p2_12_canonical_combining_marks`; model flag `reject_all_combining` (P2-12) and
+corpus inputs `ร้าน.ไทย`, `www.ร้าน.ไทย`, `x.ธุรกิจ.ไทย`; the attribution now tries accepted-alternative flags first, so a
+conforming fail-closed output is never charged to a finding.
 
 ## Re-audit 2: `origin/feat/pkg-cookie-fix` @ `e4dbe752`
 
