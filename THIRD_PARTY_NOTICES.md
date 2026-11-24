@@ -225,3 +225,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 - **Upstream**: `publicsuffix/list` @ `763a4c200052` (`public_suffix_list.dat`; audit vectors `tests/test_psl.txt` @ `6ca11f5`, pinned with sha256 in `packages/cookie/audit/psl/PINNED`)
 - **Copyright**: Mozilla Foundation and Public Suffix List contributors
 - **License**: Mozilla Public License 2.0 (MPL-2.0), https://mozilla.org/MPL/2.0/; MPL-2.0 headers are kept in each file, and the embedded rule table holds the same 10,472 rules re-sorted for O(log N) lookup
+
+### bzip2 / libbzip2-rs (`packages/bzip2/`)
+- **Upstream**: `bzip2`/`libbzip2` by Julian R Seward; `libbzip2-rs` (`libbz2-rs-sys` 0.2.3) by Trifecta Tech Foundation (<https://github.com/trifectatechfoundation/libbzip2-rs>)
+- **Copyright**: Copyright (C) 1996-2021 Julian R Seward; Copyright (C) 2019-2020 Federico Mena Quintero; Copyright (C) 2021 Micah Snyder; Copyright (C) 2024-2025 Trifecta Tech Foundation and contributors
+- **License**: `bzip2-1.0.6` (full license text and copyright notice in [`packages/bzip2/NOTICE`](packages/bzip2/NOTICE)); Pion port additions are licensed under MIT (full text in `LICENSE`), so `packages/bzip2` is licensed under `MIT AND bzip2-1.0.6`.
+- **Modification Notice**: Altered version — rewritten and ported to pure Pion as a standalone stream compressor and decompressor.
