@@ -1,160 +1,251 @@
 #!/usr/bin/env python3
-"""Deterministic EXIF benchmark corpus generator (JPEG, Big-Endian TIFF, WebP, PNG)."""
+"""Deterministic camera-sized EXIF benchmark corpus generator (JPEG, Big-Endian TIFF, WebP, PNG).
+
+Generates realistic smartphone/DSLR-scale metadata matching `audit/diff/gen_bench_real.py`:
+  - IFD0 (12 tags), ExifIFD (38 tags incl. 30 KB MakerNote), GPSIFD (14 tags),
+    InteropIFD (2 tags), IFD1 (6 tags + 11 KB JPEG thumbnail)
+  - `camera_iphone.jpg`: APP0 + EXIF APP1 (LE) + XMP APP1 + ICC APP2 + DQT/SOF/DHT/SOS + 256 KB scan
+  - `camera_be.tiff`: same camera TIFF block in Big-Endian
+  - `photo_webp.webp`: VP8X + ICCP (odd-padded) + VP8L + EXIF (LE)
+  - `photo_png.png`: IHDR + eXIf (BE) + IDAT (4 KB) + IEND
+"""
 
 import os
 import struct
 import sys
 
+BYTE, ASCII, SHORT, LONG, RATIONAL, SBYTE, UNDEF, SSHORT, SLONG, SRATIONAL = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+)
 
-def build_camera_tiff(be: bool, orientation: int, lat_ref: str, lon_ref: str) -> bytes:
+DEFAULT_MAKERNOTE_BYTES = 30000
+
+
+def enc_values(e: str, typ: int, vals):
+    if typ in (BYTE, UNDEF, ASCII) and isinstance(vals, (bytes, bytearray)):
+        return len(vals), bytes(vals)
+    if typ == BYTE:
+        return len(vals), bytes(v & 0xFF for v in vals)
+    if typ == SHORT:
+        return len(vals), b"".join(struct.pack(e + "H", v) for v in vals)
+    if typ == LONG:
+        return len(vals), b"".join(struct.pack(e + "I", v) for v in vals)
+    if typ == RATIONAL:
+        return len(vals), b"".join(struct.pack(e + "II", n, d) for n, d in vals)
+    if typ == SRATIONAL:
+        return len(vals), b"".join(struct.pack(e + "ii", n, d) for n, d in vals)
+    raise ValueError(typ)
+
+
+def asc(s: str) -> bytes:
+    return s.encode("ascii") + b"\x00"
+
+
+def build_tiff(be: bool, ifds: dict) -> bytes:
     e = ">" if be else "<"
-    hdr = b"MM" if be else b"II"
-    hdr += struct.pack(e + "HI", 42, 8)
+    order = list(ifds.keys())
+    pos = 8
+    offs = {}
+    for name in order:
+        offs[name] = pos
+        pos += 2 + 12 * len(ifds[name]["entries"]) + 4
+    data = bytearray()
+    data_base = pos
+    out = bytearray(b"MM" if be else b"II")
+    out += struct.pack(e + "HI", 42, offs[order[0]])
+    for name in order:
+        ents = ifds[name]["entries"]
+        out += struct.pack(e + "H", len(ents))
+        for tag, typ, val, ptr in ents:
+            if ptr is not None:
+                cnt, payload = enc_values(e, typ, [offs[ptr]])
+            else:
+                cnt, payload = enc_values(e, typ, val)
+            out += struct.pack(e + "HHI", tag, typ, cnt)
+            if len(payload) <= 4:
+                out += payload + b"\x00" * (4 - len(payload))
+            else:
+                if len(data) % 2:
+                    data += b"\x00"
+                out += struct.pack(e + "I", data_base + len(data))
+                data += payload
+        nxt = ifds[name].get("next")
+        out += struct.pack(e + "I", offs[nxt] if nxt is not None else 0)
+    assert len(out) == data_base
+    return bytes(out + data)
 
-    # Layout:
-    # IFD0 at 8: 9 entries -> 2 + 108 + 4 = 114 -> ends 122
-    # ExifIFD at 122: 10 entries -> 2 + 120 + 4 = 126 -> ends 248
-    # GPSIFD at 248: 6 entries -> 2 + 72 + 4 = 78 -> ends 326
-    # InteropIFD at 326: 2 entries -> 2 + 24 + 4 = 30 -> ends 356
-    # IFD1 at 356: 1 entry -> 2 + 12 + 4 = 18 -> ends 374
-    off_exif = 122
-    off_gps = 248
-    off_interop = 326
-    off_ifd1 = 356
-    data_base = 374
-    ext = bytearray()
 
-    def add_ext(b: bytes) -> int:
-        off = data_base + len(ext)
-        ext.extend(b)
-        return off
+def build_camera_tiff(be: bool, mn_bytes: int = DEFAULT_MAKERNOTE_BYTES) -> bytes:
+    thumb = b"\xff\xd8" + bytes((i * 7) & 0xFF for i in range(11000)) + b"\xff\xd9"
+    ifds = {
+        "ifd0": {
+            "entries": [
+                (0x010F, ASCII, asc("Apple"), None),
+                (0x0110, ASCII, asc("iPhone 16 Pro"), None),
+                (0x0112, SHORT, [6], None),
+                (0x011A, RATIONAL, [(72, 1)], None),
+                (0x011B, RATIONAL, [(72, 1)], None),
+                (0x0128, SHORT, [2], None),
+                (0x0131, ASCII, asc("18.1"), None),
+                (0x0132, ASCII, asc("2026:11:24 09:30:00"), None),
+                (0x013C, ASCII, asc("iPhone 16 Pro"), None),
+                (0x0213, SHORT, [1], None),
+                (0x8769, LONG, None, "exif"),
+                (0x8825, LONG, None, "gps"),
+            ],
+            "next": "ifd1",
+        },
+        "exif": {
+            "entries": [
+                (0x829A, RATIONAL, [(1, 121)], None),
+                (0x829D, RATIONAL, [(178, 100)], None),
+                (0x8822, SHORT, [2], None),
+                (0x8827, SHORT, [64], None),
+                (0x9000, UNDEF, b"0232", None),
+                (0x9003, ASCII, asc("2026:11:24 09:30:00"), None),
+                (0x9004, ASCII, asc("2026:11:24 09:30:00"), None),
+                (0x9010, ASCII, asc("+09:00"), None),
+                (0x9011, ASCII, asc("+09:00"), None),
+                (0x9012, ASCII, asc("+09:00"), None),
+                (0x9101, UNDEF, b"\x01\x02\x03\x00", None),
+                (0x9201, SRATIONAL, [(691947, 99950)], None),
+                (0x9202, RATIONAL, [(14447, 8530)], None),
+                (0x9203, SRATIONAL, [(44357, 6981)], None),
+                (0x9204, SRATIONAL, [(0, 1)], None),
+                (0x9207, SHORT, [5], None),
+                (0x9209, SHORT, [16], None),
+                (0x920A, RATIONAL, [(6765, 1000)], None),
+                (0x9214, SHORT, [2009, 1502, 2208, 1387], None),
+                (0x927C, UNDEF, b"Apple iOS\x00\x00\x01MM" + bytes((i * 31) & 0xFF for i in range(mn_bytes)), None),
+                (0x9290, ASCII, asc("123"), None),
+                (0x9291, ASCII, asc("123"), None),
+                (0x9292, ASCII, asc("123"), None),
+                (0xA000, UNDEF, b"0100", None),
+                (0xA001, SHORT, [1], None),
+                (0xA002, LONG, [4032], None),
+                (0xA003, LONG, [3024], None),
+                (0xA217, SHORT, [2], None),
+                (0xA301, UNDEF, b"\x01", None),
+                (0xA402, SHORT, [0], None),
+                (0xA403, SHORT, [0], None),
+                (0xA405, SHORT, [24], None),
+                (0xA406, SHORT, [0], None),
+                (0xA432, RATIONAL, [(1559, 1000), (9, 1), (178, 100), (28, 10)], None),
+                (0xA433, ASCII, asc("Apple"), None),
+                (0xA434, ASCII, asc("iPhone 16 Pro back triple camera 6.765mm f/1.78"), None),
+                (0xA460, SHORT, [2], None),
+                (0xA005, LONG, None, "interop"),
+            ]
+        },
+        "gps": {
+            "entries": [
+                (0x0001, ASCII, asc("N"), None),
+                (0x0002, RATIONAL, [(35, 1), (40, 1), (3450, 100)], None),
+                (0x0003, ASCII, asc("E"), None),
+                (0x0004, RATIONAL, [(139, 1), (45, 1), (1234, 100)], None),
+                (0x0005, BYTE, [0], None),
+                (0x0006, RATIONAL, [(42500, 1000)], None),
+                (0x0007, RATIONAL, [(0, 1), (30, 1), (0, 1)], None),
+                (0x000C, ASCII, asc("K"), None),
+                (0x000D, RATIONAL, [(0, 1)], None),
+                (0x0010, ASCII, asc("T"), None),
+                (0x0011, RATIONAL, [(1832, 10)], None),
+                (0x0017, ASCII, asc("T"), None),
+                (0x0018, RATIONAL, [(1832, 10)], None),
+                (0x001D, ASCII, asc("2026:11:24"), None),
+            ]
+        },
+        "interop": {
+            "entries": [
+                (0x0001, ASCII, asc("R98"), None),
+                (0x0002, UNDEF, b"0100", None),
+            ]
+        },
+        "ifd1": {
+            "entries": [
+                (0x0103, SHORT, [6], None),
+                (0x011A, RATIONAL, [(72, 1)], None),
+                (0x011B, RATIONAL, [(72, 1)], None),
+                (0x0128, SHORT, [2], None),
+                (0x0201, LONG, [0], None),
+                (0x0202, LONG, [len(thumb)], None),
+            ]
+        },
+    }
+    t = bytearray(build_tiff(be, ifds))
+    e = ">" if be else "<"
+    off = len(t)
+    t += thumb
+    i = t.find(struct.pack(e + "HHI", 0x0201, LONG, 1))
+    t[i + 8 : i + 12] = struct.pack(e + "I", off)
+    return bytes(t)
 
-    def entry_ext(tag: int, ftype: int, count: int, off: int) -> bytes:
-        return struct.pack(e + "HHII", tag, ftype, count, off)
 
-    def entry_inline(tag: int, ftype: int, count: int, raw4: bytes) -> bytes:
-        assert len(raw4) == 4
-        return struct.pack(e + "HHI", tag, ftype, count) + raw4
+def seg(marker: int, payload: bytes) -> bytes:
+    return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
 
-    def u16_inline(v: int) -> bytes:
-        return struct.pack(e + "H", v) + b"\x00\x00"
 
-    def u8_inline(v: int) -> bytes:
-        return bytes([v, 0, 0, 0])
+def riff_chunk(fourcc: bytes, payload: bytes) -> bytes:
+    pad = b"\x00" if (len(payload) & 1) else b""
+    return fourcc + struct.pack("<I", len(payload)) + payload + pad
 
-    off_make = add_ext(b"Apple\x00")
-    off_model = add_ext(b"iPhone 16 Pro\x00")
-    off_sw = add_ext(b"18.1\x00")
-    off_dt = add_ext(b"2026:11:24 09:30:00\x00")
-    off_xres = add_ext(struct.pack(e + "II", 72, 1))
-    off_yres = add_ext(struct.pack(e + "II", 72, 1))
-    off_exp = add_ext(struct.pack(e + "II", 1, 125))
-    off_fnum = add_ext(struct.pack(e + "II", 178, 100))
-    off_focal = add_ext(struct.pack(e + "II", 6765, 1000))
-    off_lens = add_ext(b"iPhone 16 Pro back triple camera\x00")
-    off_lat = add_ext(struct.pack(e + "IIIIII", 35, 1, 40, 1, 3450, 100))
-    off_lon = add_ext(struct.pack(e + "IIIIII", 139, 1, 45, 1, 0, 1))
-    off_alt = add_ext(struct.pack(e + "II", 425, 10))
 
-    # IFD0 (9 entries)
-    ifd0 = bytearray(struct.pack(e + "H", 9))
-    ifd0 += entry_ext(0x010F, 2, 6, off_make)
-    ifd0 += entry_ext(0x0110, 2, 14, off_model)
-    ifd0 += entry_inline(0x0112, 3, 1, u16_inline(orientation))
-    ifd0 += entry_ext(0x011A, 5, 1, off_xres)
-    ifd0 += entry_ext(0x011B, 5, 1, off_yres)
-    ifd0 += entry_ext(0x0131, 2, 5, off_sw)
-    ifd0 += entry_ext(0x0132, 2, 20, off_dt)
-    ifd0 += entry_ext(0x8769, 4, 1, off_exif)
-    ifd0 += entry_ext(0x8825, 4, 1, off_gps)
-    ifd0 += struct.pack(e + "I", off_ifd1)
-
-    # ExifIFD (10 entries)
-    exif_ifd = bytearray(struct.pack(e + "H", 10))
-    exif_ifd += entry_ext(0x829A, 5, 1, off_exp)
-    exif_ifd += entry_ext(0x829D, 5, 1, off_fnum)
-    exif_ifd += entry_inline(0x8827, 3, 1, u16_inline(64))
-    exif_ifd += entry_ext(0x9003, 2, 20, off_dt)
-    exif_ifd += entry_ext(0x920A, 5, 1, off_focal)
-    exif_ifd += entry_inline(0xA001, 3, 1, u16_inline(1))
-    exif_ifd += entry_ext(0xA002, 4, 1, 4032)
-    exif_ifd += entry_ext(0xA003, 4, 1, 3024)
-    exif_ifd += entry_ext(0xA005, 4, 1, off_interop)
-    exif_ifd += entry_ext(0xA434, 2, 33, off_lens)
-    exif_ifd += struct.pack(e + "I", 0)
-
-    # GPSIFD (6 entries)
-    gps_ifd = bytearray(struct.pack(e + "H", 6))
-    gps_ifd += entry_inline(0x0001, 2, 2, lat_ref.encode("ascii") + b"\x00\x00\x00")
-    gps_ifd += entry_ext(0x0002, 5, 3, off_lat)
-    gps_ifd += entry_inline(0x0003, 2, 2, lon_ref.encode("ascii") + b"\x00\x00\x00")
-    gps_ifd += entry_ext(0x0004, 5, 3, off_lon)
-    gps_ifd += entry_inline(0x0005, 1, 1, u8_inline(0))
-    gps_ifd += entry_ext(0x0006, 5, 1, off_alt)
-    gps_ifd += struct.pack(e + "I", 0)
-
-    # InteropIFD (2 entries)
-    interop_ifd = bytearray(struct.pack(e + "H", 2))
-    interop_ifd += entry_inline(0x0001, 2, 4, b"R98\x00")
-    interop_ifd += entry_inline(0x0002, 7, 4, b"0100")
-    interop_ifd += struct.pack(e + "I", 0)
-
-    # IFD1 (1 entry)
-    ifd1 = bytearray(struct.pack(e + "H", 1))
-    ifd1 += entry_inline(0x0103, 3, 1, u16_inline(6))
-    ifd1 += struct.pack(e + "I", 0)
-
-    out = bytes(hdr + ifd0 + exif_ifd + gps_ifd + interop_ifd + ifd1 + ext)
-    assert len(hdr + ifd0) == off_exif
-    assert len(hdr + ifd0 + exif_ifd) == off_gps
-    assert len(hdr + ifd0 + exif_ifd + gps_ifd) == off_interop
-    assert len(hdr + ifd0 + exif_ifd + gps_ifd + interop_ifd) == off_ifd1
-    assert len(hdr + ifd0 + exif_ifd + gps_ifd + interop_ifd + ifd1) == data_base
-    return out
+def png_chunk(ctype: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + ctype + payload + b"CRC_"
 
 
 def wrap_jpeg(tiff: bytes) -> bytes:
-    buf = bytearray(b"\xFF\xD8")
-    # APP0 JFIF
-    app0 = b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
-    buf += b"\xFF\xE0" + struct.pack(">H", len(app0) + 2) + app0
-    # XMP APP1 (to exercise skipping non-EXIF APP1)
-    xmp = b"http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta/>"
-    buf += b"\xFF\xFF\xE1" + struct.pack(">H", len(xmp) + 2) + xmp
-    # EXIF APP1
-    exif_seg = b"Exif\x00\x00" + tiff
-    buf += b"\xFF\xE1" + struct.pack(">H", len(exif_seg) + 2) + exif_seg
-    # Dummy SOS + scan data + EOI
-    buf += b"\xFF\xDA\x00\x02" + (b"\x00" * 256) + b"\xFF\xD9"
-    return bytes(buf)
+    jfif = seg(0xE0, b"JFIF\x00\x01\x02\x00\x00\x01\x00\x01\x00\x00")
+    xmp = seg(0xE1, b"http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta xmlns:x='adobe:ns:meta/'/>")
+    icc = seg(0xE2, b"ICC_PROFILE\x00\x01\x01" + bytes(560))
+    scan = bytes((i * 13 + 1) & 0x7F for i in range(256 * 1024))
+    tail = (
+        seg(0xDB, bytes(130))
+        + seg(0xC0, b"\x08\x0b\xd0\x0f\xc0\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01")
+        + seg(0xC4, bytes(418))
+        + b"\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00"
+        + scan
+        + b"\xff\xd9"
+    )
+    return b"\xff\xd8" + jfif + seg(0xE1, b"Exif\x00\x00" + tiff) + xmp + icc + tail
 
 
 def wrap_webp(tiff: bytes) -> bytes:
-    junk = b"JUNK" + struct.pack("<I", 3) + b"\x01\x02\x03\x00"
-    pad = b"\x00" if (len(tiff) & 1) else b""
-    exif_chunk = b"EXIF" + struct.pack("<I", len(tiff)) + tiff + pad
-    riff_size = 4 + len(junk) + len(exif_chunk)
-    return b"RIFF" + struct.pack("<I", riff_size) + b"WEBP" + junk + exif_chunk
+    vp8x = riff_chunk(b"VP8X", bytes([0x08, 0, 0, 0]) + b"\x00\x00\x00\x00\x00\x00")
+    iccp = riff_chunk(b"ICCP", b"\x00" * 7)
+    vp8l = riff_chunk(b"VP8L", b"\x2f\x00\x00\x00\x00\x88\x88\x08\x00")
+    body = b"WEBP" + vp8x + iccp + vp8l + riff_chunk(b"EXIF", tiff)
+    return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
 def wrap_png(tiff: bytes) -> bytes:
     sig = b"\x89PNG\r\n\x1a\n"
-    ihdr_data = struct.pack(">IIBBBBB", 4032, 3024, 8, 2, 0, 0, 0)
-    ihdr = struct.pack(">I", len(ihdr_data)) + b"IHDR" + ihdr_data + b"\x00\x00\x00\x00"
-    exif_chunk = struct.pack(">I", len(tiff)) + b"eXIf" + tiff + b"\x00\x00\x00\x00"
-    iend = struct.pack(">I", 0) + b"IEND" + b"\x00\x00\x00\x00"
-    return sig + ihdr + exif_chunk + iend
+    ihdr = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    exif = png_chunk(b"eXIf", tiff)
+    idat = png_chunk(b"IDAT", b"\x78\x9c" + bytes(4000))
+    iend = png_chunk(b"IEND", b"")
+    return sig + ihdr + exif + idat + iend
 
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: gen_corpus.py <out_dir>", file=sys.stderr)
+        print("usage: gen_corpus.py <out_dir> [makernote_bytes]", file=sys.stderr)
         return 1
     out_dir = sys.argv[1]
+    mn_bytes = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_MAKERNOTE_BYTES
     os.makedirs(out_dir, exist_ok=True)
 
-    tiff_le = build_camera_tiff(be=False, orientation=6, lat_ref="N", lon_ref="E")
-    tiff_be = build_camera_tiff(be=True, orientation=8, lat_ref="S", lon_ref="W")
+    tiff_le = build_camera_tiff(be=False, mn_bytes=mn_bytes)
+    tiff_be = build_camera_tiff(be=True, mn_bytes=mn_bytes)
 
     files = {
         "camera_iphone.jpg": wrap_jpeg(tiff_le),
