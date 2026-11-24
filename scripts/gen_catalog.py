@@ -196,6 +196,8 @@ PACKAGE_META = {
             ["sse", "eventsource", "server-sent-events", "streaming", "llm", "推送"]),
     "ssh": ("crypto-auth", "OpenSSH wire format, keys, fingerprints, certificates, SSHSIG and authorized_keys",
             ["ssh", "openssh", "ed25519", "certificate", "fingerprint", "authorized_keys", "sshsig", "密钥"]),
+    "structured_fields": ("web-net", "RFC 9651 (ex-8941) HTTP Structured Field Values parser, serializer & browser header helpers",
+                          ["http", "structured-fields", "sfv", "rfc9651", "rfc8941", "headers", "priority", "permissions-policy", "结构化字段"]),
     "stun": ("web-net", "RFC 8489 STUN codec with integrity/fingerprint and Sans-IO ICE state machine",
              ["stun", "ice", "webrtc", "nat", "turn", "fingerprint", "穿透"]),
     "svg": ("markup-docs", "SVG path parsing, transforms, exact geometry, DOM, shape-to-path and SVGO-style optimizer",
