@@ -50,7 +50,7 @@ Unit tests include 32 core tests (`src/css_color_test.pion`) plus ported WPT `cs
 
 - Output: `css_color_wasm_smoke: OK samples=22 fnv64=5651596144648448670`
 - SHA-256 (all 4 modes): `74a7423765ce57c187e60dbb52669bd4d3fee96f6d1ebcba914c45546d1e5455`
-- Wasm32 binary size: `171,519 B` (debug), `170,015 B` (`--release`)
+- Wasm32 binary size: `180,751 B` (debug), `179,811 B` (`--release`)
 
 ### Differential Accuracy vs Rust Linebender `color 0.3.3`
 
@@ -64,20 +64,20 @@ Verified via `sh packages/css_color/bench/run_bench.sh` (`bench/diff_oracle.py`)
 
 ### Fair Head-to-Head Benchmarks vs Rust Linebender `color 0.3.3`
 
-Measured on `Darwin arm64` (`sh packages/css_color/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, byte-identical stdout SHA-256 verified):
+Measured on `Linux x86_64` (`sh packages/css_color/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, byte-identical stdout SHA-256 verified):
 
 #### Scenario A: CSS Color 4 Parse + sRGB Convert (204,200 ops, 6.25 MB)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_color`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_css_color` (`--release`, pure f64) | 65.024 | 64.507 | 65.349 | 96.13 | 318.43 | 2.38 MiB | 0.43x |
-| `rust_color` (`0.3.3 --release`, f32 + libm) | 28.138 | 28.044 | 29.465 | 222.14 | 137.80 | 2.23 MiB | 1.00x (baseline) |
+| `pion_css_color` (`--release`, pure f64) | 42.549 | 40.855 | 46.664 | 146.91 | 208.37 | 2.51 MiB | 0.96x |
+| `rust_color` (`0.3.3 --release`, f32 + libm) | 40.947 | 40.240 | 42.376 | 152.65 | 200.53 | 2.67 MiB | 1.00x (baseline) |
 
 #### Scenario B: 4-Stage Color Space Pipeline `sRGB → Oklch → Display-P3 → Lab → sRGB` (408,400 ops)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_color`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_css_color` (`--release`, pure f64 software math) | 289.015 | 286.648 | 304.008 | 707.68 | 2.58 MiB | 0.25x |
-| `rust_color` (`0.3.3 --release`, f32 + libm) | 73.150 | 72.023 | 75.038 | 179.11 | 2.30 MiB | 1.00x (baseline) |
+| `pion_css_color` (`--release`, pure f64 bit-exact) | 111.433 | 111.086 | 120.446 | 272.85 | 2.55 MiB | 0.84x |
+| `rust_color` (`0.3.3 --release`, f32 + libm) | 93.553 | 92.509 | 93.616 | 229.07 | 2.86 MiB | 1.00x (baseline) |
 
-Note: `pion_css_color` evaluates all transcendental functions (`pow`, `cbrt`, `sin`, `cos`, `atan2`, `sqrt`) in pure-Pion IEEE-754 `f64` with zero `extern "C"` for 100% Native/Wasm32 bit-determinism, whereas Rust `color` uses `f32` with platform `libm`.
+Note: `pion_css_color` uses hardware `Double::sqrt()` + O(1) bit-level IEEE-754 `f64` math (`Double::to_bits`/`Double::from_bits`, Estrin-scheme Chebyshev transfer functions, 2-Halley `cbrt`) with zero `extern "C"` for 100% Native/Wasm32 bit-determinism, whereas Rust `color` uses `f32` with platform `libm`.
