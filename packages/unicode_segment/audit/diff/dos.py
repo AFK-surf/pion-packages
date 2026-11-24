@@ -108,8 +108,18 @@ def main():
             max_rss = max(max_rss, rss4)
             ratio = t4 / max(t1, 1)
             flag = ""
+            if t4 <= BUDGET_US and t1 >= 5000 and ratio > RATIO_MAX:
+                # one scheduling burst on a shared machine can slow all 3 runs of one size: re-measure both sizes
+                # (fastest of 7) before calling it non-linear; a real quadratic stays at ~16x
+                _, _, r1, _ = timed(native + ["bomb", kind, str(n), api], 7)
+                _, _, r4, _ = timed(native + ["bomb", kind, str(4 * n), api], 7)
+                n_runs += 14
+                if r1 and r4:
+                    t1, t4 = min(t1, r1[1]), min(t4, r4[1])
+                    ratio = t4 / max(t1, 1)
+                    flag = "  (re-measured)"
             if t4 > BUDGET_US or (t1 >= 5000 and ratio > RATIO_MAX):
-                flag = "  <-- NON-LINEAR"
+                flag += "  <-- NON-LINEAR"
                 bad.append("%s %s: ratio %.1f, %d us" % (kind, api, ratio, t4))
             if t4 > worst[0]:
                 worst = (t4, "%s/%s %d B" % (kind, api, b4))
