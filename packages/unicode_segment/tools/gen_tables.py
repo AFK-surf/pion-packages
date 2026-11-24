@@ -141,13 +141,21 @@ def parse_numeric_gc(path):
     return num
 
 
-def enc_b64_4(v):
+def enc_off35_byte(v):
+    assert 0 <= v <= 91, f"value out of range for off35 encoding: {v}"
+    c = chr(35 + v)
+    if c == "\\":
+        return "\\\\"
+    return c
+
+
+def enc_off35_u24(v):
     assert 0 <= v < (1 << 24)
     return (
-        B64[(v >> 18) & 63]
-        + B64[(v >> 12) & 63]
-        + B64[(v >> 6) & 63]
-        + B64[v & 63]
+        enc_off35_byte((v >> 18) & 63)
+        + enc_off35_byte((v >> 12) & 63)
+        + enc_off35_byte((v >> 6) & 63)
+        + enc_off35_byte(v & 63)
     )
 
 
@@ -163,9 +171,10 @@ def build_table(fn, default_val):
             pages[chunk] = idx
             page_list.append(chunk)
         page_idx.append(idx)
-    assert len(page_list) <= 64, f"too many BMP pages: {len(page_list)}"
-    idx_str = "".join(B64[i] for i in page_idx)
-    data_str = "".join(chr(65 + b) for chunk in page_list for b in chunk)
+    assert len(page_list) <= 92, f"too many BMP pages: {len(page_list)}"
+    idx_str = "".join(enc_off35_byte(i) for i in page_idx)
+    data_str = "".join(enc_off35_byte(b) for chunk in page_list for b in chunk)
+    data_len = len(page_list) * 256
 
     ranges = []
     cur_lo = cur_hi = cur_v = None
@@ -187,10 +196,10 @@ def build_table(fn, default_val):
         ranges.append((cur_lo, cur_hi, cur_v))
 
     smp_str = "".join(
-        enc_b64_4(lo - 0x10000) + enc_b64_4(hi - 0x10000) + chr(65 + v)
+        enc_off35_u24(lo - 0x10000) + enc_off35_u24(hi - 0x10000) + enc_off35_byte(v)
         for lo, hi, v in ranges
     )
-    return idx_str, data_str, smp_str, len(ranges)
+    return idx_str, data_str, data_len, smp_str, len(ranges)
 
 
 def generate(ucd_dir):
@@ -241,29 +250,59 @@ def generate(ucd_dir):
     w_combos.insert(0, w_default_tuple)
     w_id = {t: i for i, t in enumerate(w_combos)}
 
-    g_idx, g_data, g_smp, g_smp_n = build_table(
-        lambda cp: g_id[
-            (
-                GCB_ID[gcb.get(cp, "Other")],
-                1 if cp in extpict else 0,
-                INCB_ID[incb.get(cp, "None")],
-            )
-        ],
-        0,
-    )
-    w_idx, w_data, w_smp, w_smp_n = build_table(
-        lambda cp: w_id[
-            (
-                WB_ID[wb.get(cp, "Other")],
-                1 if cp in extpict else 0,
-                1 if (cp in alpha or cp in num) else 0,
-            )
-        ],
-        0,
-    )
-    s_idx, s_data, s_smp, s_smp_n = build_table(
-        lambda cp: SB_ID[sb.get(cp, "Other")],
-        0,
+    g_fn = lambda cp: g_id[
+        (
+            GCB_ID[gcb.get(cp, "Other")],
+            1 if cp in extpict else 0,
+            INCB_ID[incb.get(cp, "None")],
+        )
+    ]
+    w_fn = lambda cp: w_id[
+        (
+            WB_ID[wb.get(cp, "Other")],
+            1 if cp in extpict else 0,
+            1 if (cp in alpha or cp in num) else 0,
+        )
+    ]
+    s_fn = lambda cp: SB_ID[sb.get(cp, "Other")]
+
+    g_idx, g_data, g_data_len, g_smp, g_smp_n = build_table(g_fn, 0)
+    w_idx, w_data, w_data_len, w_smp, w_smp_n = build_table(w_fn, 0)
+    s_idx, s_data, s_data_len, s_smp, s_smp_n = build_table(s_fn, 0)
+
+    w_ascii_str = "".join(enc_off35_byte(w_fn(cp)) for cp in range(128))
+    s_ascii_str = "".join(enc_off35_byte(s_fn(cp)) for cp in range(128))
+    w_c2wb_str = "".join(enc_off35_byte(w) for (w, _ep, _al) in w_combos)
+    w_c2fl_str = "".join(enc_off35_byte(ep | (al << 1)) for (_w, ep, al) in w_combos)
+
+    off_w_ascii = 0
+    off_s_ascii = off_w_ascii + 128
+    off_w_c2wb = off_s_ascii + 128
+    off_w_c2fl = off_w_c2wb + len(w_combos)
+    off_g_bmp_idx = off_w_c2fl + len(w_combos)
+    off_g_bmp_data = off_g_bmp_idx + 256
+    off_g_smp = off_g_bmp_data + g_data_len
+    off_w_bmp_idx = off_g_smp + g_smp_n * 9
+    off_w_bmp_data = off_w_bmp_idx + 256
+    off_w_smp = off_w_bmp_data + w_data_len
+    off_s_bmp_idx = off_w_smp + w_smp_n * 9
+    off_s_bmp_data = off_s_bmp_idx + 256
+    off_s_smp = off_s_bmp_data + s_data_len
+
+    table_blob = (
+        w_ascii_str
+        + s_ascii_str
+        + w_c2wb_str
+        + w_c2fl_str
+        + g_idx
+        + g_data
+        + g_smp
+        + w_idx
+        + w_data
+        + w_smp
+        + s_idx
+        + s_data
+        + s_smp
     )
 
     lines = []
@@ -277,7 +316,7 @@ def generate(ucd_dir):
         "///| emoji-data.txt (Extended_Pictographic), DerivedCoreProperties.txt (InCB, Alphabetic),"
     )
     lines.append("///| UnicodeData.txt (General_Category Nd/Nl/No). License: Unicode-3.0.")
-    lines.append("///| Zero FixedArray, zero mutable globals: immutable String literals only.")
+    lines.append("///| Zero FixedArray, zero mutable globals: single immutable String `table_blob` only.")
     lines.append("")
 
     # Constants
@@ -294,56 +333,79 @@ def generate(ucd_dir):
         lines.append(f"let sb_{name.lower()} : Int = {i}")
     lines.append("")
 
-    # Base64 decoder
-    lines.append("fn b64_val(b : Int) -> Int {")
-    lines.append("  if b >= 65 && b <= 90 {")
-    lines.append("    b - 65")
-    lines.append("  } else if b >= 97 && b <= 122 {")
-    lines.append("    b - 97 + 26")
-    lines.append("  } else if b >= 48 && b <= 57 {")
-    lines.append("    b - 48 + 52")
-    lines.append("  } else if b == 45 {")
-    lines.append("    62")
-    lines.append("  } else {")
-    lines.append("    63")
-    lines.append("  }")
+    # Hot word combo IDs
+    lines.append(f"let w_cid_other : Int = {w_id[(WB_ID['Other'], 0, 0)]}")
+    lines.append(f"let w_cid_other_alnum : Int = {w_id[(WB_ID['Other'], 0, 1)]}")
+    lines.append(f"let w_cid_aletter_alnum : Int = {w_id[(WB_ID['ALetter'], 0, 1)]}")
+    lines.append(f"let w_cid_numeric_alnum : Int = {w_id[(WB_ID['Numeric'], 0, 1)]}")
+    lines.append(f"let w_cid_katakana_alnum : Int = {w_id[(WB_ID['Katakana'], 0, 1)]}")
+    lines.append("")
+
+    # Unified blob offsets
+    lines.append(f"let off_w_ascii : Int = {off_w_ascii}")
+    lines.append(f"let off_s_ascii : Int = {off_s_ascii}")
+    lines.append(f"let off_w_c2wb : Int = {off_w_c2wb}")
+    lines.append(f"let off_w_c2fl : Int = {off_w_c2fl}")
+    lines.append(f"let off_g_bmp_idx : Int = {off_g_bmp_idx}")
+    lines.append(f"let off_g_bmp_data : Int = {off_g_bmp_data}")
+    lines.append(f"let off_g_smp : Int = {off_g_smp}")
+    lines.append(f"let g_smp_count : Int = {g_smp_n}")
+    lines.append(f"let off_w_bmp_idx : Int = {off_w_bmp_idx}")
+    lines.append(f"let off_w_bmp_data : Int = {off_w_bmp_data}")
+    lines.append(f"let off_w_smp : Int = {off_w_smp}")
+    lines.append(f"let w_smp_count : Int = {w_smp_n}")
+    lines.append(f"let off_s_bmp_idx : Int = {off_s_bmp_idx}")
+    lines.append(f"let off_s_bmp_data : Int = {off_s_bmp_data}")
+    lines.append(f"let off_s_smp : Int = {off_s_smp}")
+    lines.append(f"let s_smp_count : Int = {s_smp_n}")
+    lines.append("")
+
+    # Unified table blob
+    lines.append(f'let table_blob : String = "{table_blob}"')
+    lines.append("")
+
+    # Branchless 24-bit integer decoder (off35 base-64)
+    lines.append("fn blob_u24(tbl : String, off : Int) -> Int {")
+    lines.append("  ((tbl.code_unit_at(off) - 35) << 18) |")
+    lines.append("  ((tbl.code_unit_at(off + 1) - 35) << 12) |")
+    lines.append("  ((tbl.code_unit_at(off + 2) - 35) << 6) |")
+    lines.append("  (tbl.code_unit_at(off + 3) - 35)")
     lines.append("}")
     lines.append("")
-    lines.append("fn b64_u24(s : String, off : Int) -> Int {")
-    lines.append("  (b64_val(s.code_unit_at(off)) << 18) |")
-    lines.append("  (b64_val(s.code_unit_at(off + 1)) << 12) |")
-    lines.append("  (b64_val(s.code_unit_at(off + 2)) << 6) |")
-    lines.append("  b64_val(s.code_unit_at(off + 3))")
-    lines.append("}")
-    lines.append("")
-    lines.append(
-        "fn lookup_table(cp : Int, idx_s : String, data_s : String, smp_s : String, smp_n : Int) -> Int {"
-    )
-    lines.append("  if cp < 0 || cp > 0x10FFFF {")
-    lines.append("    return 0")
-    lines.append("  }")
-    lines.append("  if cp < 0x10000 {")
-    lines.append("    let page = b64_val(idx_s.code_unit_at(cp >> 8))")
-    lines.append("    return data_s.code_unit_at((page << 8) | (cp & 255)) - 65")
-    lines.append("  }")
+
+    lines.append("fn lookup_smp(tbl : String, cp : Int, smp_off : Int, smp_n : Int) -> Int {")
     lines.append("  let target = cp - 0x10000")
     lines.append("  let mut lo = 0")
     lines.append("  let mut hi = smp_n - 1")
     lines.append("  while lo <= hi {")
     lines.append("    let mid = (lo + hi) >> 1")
-    lines.append("    let off = mid * 9")
-    lines.append("    let r_lo = b64_u24(smp_s, off)")
+    lines.append("    let off = smp_off + mid * 9")
+    lines.append("    let r_lo = blob_u24(tbl, off)")
     lines.append("    if target < r_lo {")
     lines.append("      hi = mid - 1")
     lines.append("    } else {")
-    lines.append("      let r_hi = b64_u24(smp_s, off + 4)")
+    lines.append("      let r_hi = blob_u24(tbl, off + 4)")
     lines.append("      if target <= r_hi {")
-    lines.append("        return smp_s.code_unit_at(off + 8) - 65")
+    lines.append("        return tbl.code_unit_at(off + 8) - 35")
     lines.append("      }")
     lines.append("      lo = mid + 1")
     lines.append("    }")
     lines.append("  }")
     lines.append("  0")
+    lines.append("}")
+    lines.append("")
+
+    lines.append(
+        "fn lookup_blob(tbl : String, cp : Int, idx_off : Int, data_off : Int, smp_off : Int, smp_n : Int) -> Int {"
+    )
+    lines.append("  if cp < 0 || cp > 0x10FFFF {")
+    lines.append("    return 0")
+    lines.append("  }")
+    lines.append("  if cp < 0x10000 {")
+    lines.append("    let page = tbl.code_unit_at(idx_off + (cp >> 8)) - 35")
+    lines.append("    return tbl.code_unit_at(data_off + ((page << 8) | (cp & 255))) - 35")
+    lines.append("  }")
+    lines.append("  lookup_smp(tbl, cp, smp_off, smp_n)")
     lines.append("}")
     lines.append("")
 
@@ -371,33 +433,23 @@ def generate(ucd_dir):
     lines.append("}")
     lines.append("")
 
-    # Tables as immutable String literals
-    lines.append(f'let g_bmp_idx : String = "{g_idx}"')
-    lines.append(f'let g_bmp_data : String = "{g_data}"')
-    lines.append(f'let g_smp_ranges : String = "{g_smp}"')
-    lines.append(f"let g_smp_count : Int = {g_smp_n}")
-    lines.append("")
-    lines.append(f'let w_bmp_idx : String = "{w_idx}"')
-    lines.append(f'let w_bmp_data : String = "{w_data}"')
-    lines.append(f'let w_smp_ranges : String = "{w_smp}"')
-    lines.append(f"let w_smp_count : Int = {w_smp_n}")
-    lines.append("")
-    lines.append(f'let s_bmp_idx : String = "{s_idx}"')
-    lines.append(f'let s_bmp_data : String = "{s_data}"')
-    lines.append(f'let s_smp_ranges : String = "{s_smp}"')
-    lines.append(f"let s_smp_count : Int = {s_smp_n}")
-    lines.append("")
-
     lines.append("fn lookup_grapheme_packed(cp : Int) -> Int {")
-    lines.append("  decode_g_combo(lookup_table(cp, g_bmp_idx, g_bmp_data, g_smp_ranges, g_smp_count))")
+    lines.append("  let tbl = table_blob")
+    lines.append(
+        "  decode_g_combo(lookup_blob(tbl, cp, off_g_bmp_idx, off_g_bmp_data, off_g_smp, g_smp_count))"
+    )
     lines.append("}")
     lines.append("")
     lines.append("fn lookup_word_packed(cp : Int) -> Int {")
-    lines.append("  decode_w_combo(lookup_table(cp, w_bmp_idx, w_bmp_data, w_smp_ranges, w_smp_count))")
+    lines.append("  let tbl = table_blob")
+    lines.append(
+        "  decode_w_combo(lookup_blob(tbl, cp, off_w_bmp_idx, off_w_bmp_data, off_w_smp, w_smp_count))"
+    )
     lines.append("}")
     lines.append("")
     lines.append("fn lookup_sentence_prop(cp : Int) -> Int {")
-    lines.append("  lookup_table(cp, s_bmp_idx, s_bmp_data, s_smp_ranges, s_smp_count)")
+    lines.append("  let tbl = table_blob")
+    lines.append("  lookup_blob(tbl, cp, off_s_bmp_idx, off_s_bmp_data, off_s_smp, s_smp_count)")
     lines.append("}")
     lines.append("")
 

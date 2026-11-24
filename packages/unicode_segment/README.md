@@ -111,7 +111,7 @@ All three normative Unicode 16.0.0 UAX #29 test files pass with **0 failures**:
 
 - Stdout: `unicode_segment_wasm_smoke: OK samples=7 g=129 w=72 uw=34 s=16 lim=1 fnv64=5958427692630882875`
 - Stdout SHA-256 (all 4 modes): `89e7ea936b3cbdde07b4a38e5ded9546787d5f30c3aab9d7d2055c3676d1ccbb`
-- Wasm32 binary size: `84,973 B` (debug) / `84,948 B` (`--release`)
+- Wasm32 binary size: `93,774 B` (debug) / `93,749 B` (`--release`)
 
 ### Differential Oracle & Head-to-Head Benchmarks vs Rust `unicode-segmentation 1.12.0`
 
@@ -122,8 +122,8 @@ All three normative Unicode 16.0.0 UAX #29 test files pass with **0 failures**:
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_segment`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `pion_segment` (`--release`) | 81.680 | 75.547 | 129.691 | 66.76 | 0.51x |
-| `rust_segment` (`1.12.0 --release`, LTO) | 41.823 | 39.710 | 58.587 | 130.38 | 1.00x (baseline) |
+| `pion_segment` (`--release`) | 25.709 | 23.421 | 43.238 | 212.09 | 1.56x |
+| `rust_segment` (`1.12.0 --release`, LTO) | 40.160 | 37.239 | 60.102 | 135.78 | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `ec165b39282eeeee184088d9eb7422bb069d4f01fada5acd2dcd3d0008a9e9a8`
 
@@ -131,7 +131,7 @@ All three normative Unicode 16.0.0 UAX #29 test files pass with **0 failures**:
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_segment`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `pion_segment` (`--release`) | 143.558 | 110.670 | 201.887 | 34.33 | 0.45x |
-| `rust_segment` (`1.12.0 --release`, LTO) | 65.265 | 60.670 | 81.522 | 75.51 | 1.00x (baseline) |
+| `pion_segment` (`--release`) | 18.473 | 17.589 | 23.381 | 266.77 | 3.27x |
+| `rust_segment` (`1.12.0 --release`, LTO) | 60.418 | 58.123 | 62.916 | 81.57 | 1.00x (baseline) |
 
 - Verified stdout SHA-256: `b5b966a2fa1a51a41723176d7a5f833609c13df3ccf66be50e45151e20c01472`
