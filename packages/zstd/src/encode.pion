@@ -1,0 +1,732 @@
+///| Pure-Pion RFC 8878 Zstandard compressor (levels 0..9, optional xxHash64 checksum).
+///| Produces 100% standard-compliant Zstandard frames verified against official `zstd -d`
+///| and Rust `ruzstd`.
+
+///| Simple growable byte writer for encoding frames and blocks.
+struct ByteVec {
+  mut buf : Bytes
+  mut len : Int
+}
+
+///|
+fn ByteVec::new(cap : Int) -> ByteVec {
+  let c = if cap < 64 { 64 } else { cap }
+  ByteVec::{ buf: Bytes::new(c), len: 0 }
+}
+
+///|
+fn ByteVec::ensure(self : ByteVec, extra : Int) -> Unit {
+  if self.len + extra <= self.buf.length() {
+    return
+  }
+  let mut new_cap = self.buf.length() * 2
+  while new_cap < self.len + extra {
+    new_cap = new_cap * 2
+  }
+  let nb = Bytes::new(new_cap)
+  let mut i = 0
+  while i < self.len {
+    nb[i] = self.buf[i]
+    i = i + 1
+  }
+  self.buf = nb
+}
+
+///|
+fn ByteVec::push_byte(self : ByteVec, b : Byte) -> Unit {
+  self.ensure(1)
+  self.buf[self.len] = b
+  self.len = self.len + 1
+}
+
+///|
+fn ByteVec::push_u16_le(self : ByteVec, v : Int) -> Unit {
+  self.ensure(2)
+  self.buf[self.len] = (v & 255).to_byte()
+  self.buf[self.len + 1] = ((v >> 8) & 255).to_byte()
+  self.len = self.len + 2
+}
+
+///|
+fn ByteVec::push_u24_le(self : ByteVec, v : Int) -> Unit {
+  self.ensure(3)
+  self.buf[self.len] = (v & 255).to_byte()
+  self.buf[self.len + 1] = ((v >> 8) & 255).to_byte()
+  self.buf[self.len + 2] = ((v >> 16) & 255).to_byte()
+  self.len = self.len + 3
+}
+
+///|
+fn ByteVec::push_u32_le(self : ByteVec, v : UInt) -> Unit {
+  self.ensure(4)
+  self.buf[self.len] = (v & 255U).to_int().to_byte()
+  self.buf[self.len + 1] = ((v >> 8) & 255U).to_int().to_byte()
+  self.buf[self.len + 2] = ((v >> 16) & 255U).to_int().to_byte()
+  self.buf[self.len + 3] = ((v >> 24) & 255U).to_int().to_byte()
+  self.len = self.len + 4
+}
+
+///|
+fn ByteVec::push_slice(
+  self : ByteVec,
+  src : Bytes,
+  start : Int,
+  count : Int,
+) -> Unit {
+  if count <= 0 {
+    return
+  }
+  self.ensure(count)
+  let dst = self.buf
+  let mut dp = self.len
+  let mut sp = start
+  let end = start + count
+  while sp + 4 <= end {
+    dst[dp] = src[sp]
+    dst[dp + 1] = src[sp + 1]
+    dst[dp + 2] = src[sp + 2]
+    dst[dp + 3] = src[sp + 3]
+    dp = dp + 4
+    sp = sp + 4
+  }
+  while sp < end {
+    dst[dp] = src[sp]
+    dp = dp + 1
+    sp = sp + 1
+  }
+  self.len = dp
+}
+
+///|
+fn ByteVec::to_bytes(self : ByteVec) -> Bytes {
+  if self.len == self.buf.length() {
+    self.buf
+  } else {
+    self.buf.slice(0, self.len)
+  }
+}
+
+///|
+fn is_all_same_byte(data : Bytes, start : Int, len : Int) -> Bool {
+  if len <= 1 {
+    return false
+  }
+  let first = data[start]
+  let mut i = start + 1
+  let end = start + len
+  while i < end {
+    if data[i] != first {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Count matching bytes starting at `p1` and `p2` (already matched 4 bytes), up to `blk_end`.
+fn count_match_len(data : Bytes, p1 : Int, p2 : Int, blk_end : Int) -> Int {
+  let mut m = 4
+  while p2 + m < blk_end && data[p1 + m] == data[p2 + m] {
+    m = m + 1
+  }
+  m
+}
+
+///| Search the hash chain starting at `init_cand` for a better match than `(init_len, init_off)`.
+fn search_hash_chain(
+  data : Bytes,
+  pos : Int,
+  blk_end : Int,
+  max_window : Int,
+  chain_limit : Int,
+  prev : FixedArray[Int],
+  prev_mask : Int,
+  init_cand : Int,
+  init_len : Int,
+  init_off : Int,
+  init_is_rep : Bool,
+) -> (Int, Int) {
+  let mut best_len = init_len
+  let mut best_off = init_off
+  let mut best_is_rep = init_is_rep
+  let mut cand = init_cand
+  let mut steps = 0
+  let min_pos = if pos > max_window { pos - max_window } else { 0 }
+  while cand >= min_pos && steps < chain_limit {
+    let off = pos - cand
+    if off > 0 && off <= max_window && pos + best_len < blk_end {
+      if data[cand + best_len] == data[pos + best_len] &&
+      data[cand] == data[pos] &&
+      data[cand + 1] == data[pos + 1] &&
+      data[cand + 2] == data[pos + 2] &&
+      data[cand + 3] == data[pos + 3] {
+        let m = count_match_len(data, cand, pos, blk_end)
+        if m > best_len + (if best_is_rep { 1 } else { 0 }) {
+          best_len = m
+          best_off = off
+          best_is_rep = false
+          if best_len >= 128 {
+            break
+          }
+        }
+      }
+    }
+    let next_cand = prev[cand & prev_mask]
+    if next_cand >= cand {
+      break
+    }
+    cand = next_cand
+    steps = steps + 1
+  }
+  (best_len, best_off)
+}
+
+///| 4-byte hash for LZ77 match finding.
+fn hash4(data : Bytes, pos : Int, shift : Int) -> Int {
+  let v = data[pos].to_int().to_uint() |
+  (data[pos + 1].to_int().to_uint() << 8) |
+  (data[pos + 2].to_int().to_uint() << 16) |
+  (data[pos + 3].to_int().to_uint() << 24)
+  ((v * 2654435761U) >> shift).to_int()
+}
+
+///| Initialize FSE encoder state for symbol `s` (FSE_initCState2).
+fn fse_init_cstate(tbl : FseEncTable, s : Int) -> Int {
+  let nb_bits_out = (tbl.delta_nb_bits[s] + 32768) >> 16
+  let init_val = (nb_bits_out << 16) - tbl.delta_nb_bits[s]
+  tbl.state_table[(init_val >> nb_bits_out) + tbl.delta_find_state[s]]
+}
+
+///| Encode one symbol transition into `bw` and return updated FSE state.
+fn fse_encode_sym(
+  tbl : FseEncTable,
+  state : Int,
+  s : Int,
+  bw : BitWriter,
+) -> Int {
+  let nb_bits_out = (state + tbl.delta_nb_bits[s]) >> 16
+  bw.write_bits(state, nb_bits_out)
+  tbl.state_table[(state >> nb_bits_out) + tbl.delta_find_state[s]]
+}
+
+///| Encode literals section (Raw, RLE, or Huffman) into `blk`.
+fn write_literals_section(blk : ByteVec, lits : Bytes, lit_len : Int) -> Unit {
+  if lit_len == 0 {
+    // Raw literals, size=0 (1-byte header: 0x00)
+    blk.push_byte((0).to_byte())
+    return
+  }
+  if is_all_same_byte(lits, 0, lit_len) {
+    // RLE_Literals_Block (type 1)
+    if lit_len < 32 {
+      blk.push_byte(((lit_len << 3) | 1).to_byte())
+    } else if lit_len < 4096 {
+      let h = (lit_len << 4) | 5
+      blk.push_u16_le(h)
+    } else {
+      let h = (lit_len << 4) | 13
+      blk.push_u24_le(h)
+    }
+    blk.push_byte(lits[0])
+    return
+  }
+
+  // Try Huffman compression if literals are large enough
+  match huff_try_encode_literals(lits, lit_len) {
+    Some((huf_payload, four_streams)) => {
+      let comp_len = huf_payload.length()
+      if !four_streams && lit_len < 1024 && comp_len < 1024 {
+        let h = 2 | (lit_len << 4) | (comp_len << 14)
+        blk.push_u24_le(h)
+      } else if four_streams && lit_len < 1024 && comp_len < 1024 {
+        let h = 2 | (1 << 2) | (lit_len << 4) | (comp_len << 14)
+        blk.push_u24_le(h)
+      } else if four_streams && lit_len < 16384 && comp_len < 16384 {
+        let h = (2 | (2 << 2) | (lit_len << 4) | (comp_len << 18)).to_uint()
+        blk.push_u32_le(h)
+      } else {
+        // 5-byte header (size_fmt = 3, 18-bit regen & comp sizes)
+        let v : UInt64 = 2UL | (3UL << 2) |
+        (lit_len.to_int64().to_uint64() << 4) |
+        (comp_len.to_int64().to_uint64() << 22)
+        blk.push_u32_le((v & 0xFFFFFFFFUL).to_int().to_uint())
+        blk.push_byte(((v >> 32) & 255UL).to_int().to_byte())
+      }
+      blk.push_slice(huf_payload, 0, comp_len)
+      return
+    }
+    None => ()
+  }
+
+  // Fallback: Raw_Literals_Block (type 0)
+  if lit_len < 32 {
+    blk.push_byte((lit_len << 3).to_byte())
+  } else if lit_len < 4096 {
+    blk.push_u16_le((lit_len << 4) | 4)
+  } else {
+    blk.push_u24_le((lit_len << 4) | 12)
+  }
+  blk.push_slice(lits, 0, lit_len)
+}
+
+///| Compress a single block `data[blk_start .. blk_start + blk_len]` using LZ77 + FSE/Predefined/RLE.
+///| Returns `Some((compressed_block_bytes, new_rep1, new_rep2, new_rep3))` if smaller than `blk_len`.
+fn compress_block_lz77(
+  data : Bytes,
+  blk_start : Int,
+  blk_len : Int,
+  max_window : Int,
+  chain_limit : Int,
+  hash_bits : Int,
+  head : FixedArray[Int],
+  prev : FixedArray[Int],
+  prev_mask : Int,
+  init_rep1 : Int,
+  init_rep2 : Int,
+  init_rep3 : Int,
+  ll_base : FixedArray[Int],
+  ll_bits : FixedArray[Int],
+  ml_base : FixedArray[Int],
+  ml_bits : FixedArray[Int],
+  enc_ll : FseEncTable,
+  enc_of : FseEncTable,
+  enc_ml : FseEncTable,
+) -> Option[(Bytes, Int, Int, Int)] {
+  let blk_end = blk_start + blk_len
+  let hash_shift = 32 - hash_bits
+
+  let lit_buf = ByteVec::new(blk_len)
+  let seq_ll : Array[Int] = []
+  let seq_ml : Array[Int] = []
+  let seq_ov : Array[Int] = []
+
+  let mut rep1 = init_rep1
+  let mut rep2 = init_rep2
+  let mut rep3 = init_rep3
+  let mut anchor = blk_start
+  let mut pos = blk_start
+  let match_limit = blk_end - 4
+
+  while pos <= match_limit {
+    // Insert current position into hash chain
+    let h = hash4(data, pos, hash_shift)
+    let mut cand = head[h]
+    prev[pos & prev_mask] = cand
+    head[h] = pos
+
+    let mut best_len = 3
+    let mut best_off = 0
+    let mut best_is_rep = false
+
+    // 1. Check repeat offsets first (high value: tiny offset encoding!)
+    let cur_ll = pos - anchor
+    let try_rep = if cur_ll == 0 { rep2 } else { rep1 }
+    if try_rep > 0 && try_rep <= pos && try_rep <= max_window {
+      let rp = pos - try_rep
+      if data[rp] == data[pos] &&
+      data[rp + 1] == data[pos + 1] &&
+      data[rp + 2] == data[pos + 2] &&
+      data[rp + 3] == data[pos + 3] {
+        best_len = count_match_len(data, rp, pos, blk_end)
+        best_off = try_rep
+        best_is_rep = true
+      }
+    }
+
+    // 2. Search hash chain if repeat didn't already give a long match
+    if best_len < 64 && pos + best_len < blk_end {
+      let (clen, coff) = search_hash_chain(
+        data,
+        pos,
+        blk_end,
+        max_window,
+        chain_limit,
+        prev,
+        prev_mask,
+        cand,
+        best_len,
+        best_off,
+        best_is_rep,
+      )
+      best_len = clen
+      best_off = coff
+    }
+
+    if best_off > 0 && best_len >= 4 {
+      let ll = pos - anchor
+      if ll > 0 {
+        lit_buf.push_slice(data, anchor, ll)
+      }
+
+      // Compute RFC 8878 offset_value and update repeat offsets
+      let offset_val = if ll == 0 {
+        if best_off == rep2 {
+          rep2 = rep1
+          rep1 = best_off
+          1
+        } else if best_off == rep3 {
+          rep3 = rep2
+          rep2 = rep1
+          rep1 = best_off
+          2
+        } else if best_off == rep1 - 1 && best_off > 0 {
+          rep3 = rep2
+          rep2 = rep1
+          rep1 = best_off
+          3
+        } else {
+          rep3 = rep2
+          rep2 = rep1
+          rep1 = best_off
+          best_off + 3
+        }
+      } else if best_off == rep1 {
+        1
+      } else if best_off == rep2 {
+        rep2 = rep1
+        rep1 = best_off
+        2
+      } else if best_off == rep3 {
+        rep3 = rep2
+        rep2 = rep1
+        rep1 = best_off
+        3
+      } else {
+        rep3 = rep2
+        rep2 = rep1
+        rep1 = best_off
+        best_off + 3
+      }
+
+      seq_ll.push(ll)
+      seq_ml.push(best_len)
+      seq_ov.push(offset_val)
+
+      // Insert skipped positions into hash table (up to a cap for speed)
+      let next_pos = pos + best_len
+      let insert_end = if next_pos - 1 < match_limit {
+        next_pos - 1
+      } else {
+        match_limit
+      }
+      let mut ip = pos + 1
+      let mut inserted = 0
+      while ip <= insert_end && inserted < 16 {
+        let ih = hash4(data, ip, hash_shift)
+        prev[ip & prev_mask] = head[ih]
+        head[ih] = ip
+        ip = ip + 1
+        inserted = inserted + 1
+      }
+      pos = next_pos
+      anchor = next_pos
+    } else {
+      pos = pos + 1
+    }
+  }
+
+  // Trailing literals
+  if anchor < blk_end {
+    lit_buf.push_slice(data, anchor, blk_end - anchor)
+  }
+
+  let num_seq = seq_ll.length()
+  let blk = ByteVec::new(blk_len)
+  write_literals_section(blk, lit_buf.buf, lit_buf.len)
+
+  // Sequences header
+  if num_seq == 0 {
+    blk.push_byte((0).to_byte())
+    if blk.len < blk_len {
+      return Some((blk.to_bytes(), rep1, rep2, rep3))
+    }
+    return None
+  }
+
+  if num_seq < 128 {
+    blk.push_byte(num_seq.to_byte())
+  } else if num_seq < 0x7F00 {
+    blk.push_byte(((num_seq >> 8) + 128).to_byte())
+    blk.push_byte((num_seq & 255).to_byte())
+  } else {
+    let rem = num_seq - 0x7F00
+    blk.push_byte(255.to_byte())
+    blk.push_u16_le(rem)
+  }
+
+  // Precompute codes and check if any stream is constant (RLE_Mode)
+  let ll_codes : FixedArray[Int] = FixedArray::make(num_seq, 0)
+  let of_codes : FixedArray[Int] = FixedArray::make(num_seq, 0)
+  let ml_codes : FixedArray[Int] = FixedArray::make(num_seq, 0)
+  let mut ll_const = true
+  let mut of_const = true
+  let mut ml_const = true
+  let mut i = 0
+  while i < num_seq {
+    let lc = ll_to_code(seq_ll[i])
+    let oc = high_bit(seq_ov[i])
+    let mc = ml_to_code(seq_ml[i])
+    ll_codes[i] = lc
+    of_codes[i] = oc
+    ml_codes[i] = mc
+    if i > 0 {
+      if lc != ll_codes[0] {
+        ll_const = false
+      }
+      if oc != of_codes[0] {
+        of_const = false
+      }
+      if mc != ml_codes[0] {
+        ml_const = false
+      }
+    }
+    i = i + 1
+  }
+
+  let ll_mode = if ll_const { 1 } else { 0 }
+  let of_mode = if of_const { 1 } else { 0 }
+  let ml_mode = if ml_const { 1 } else { 0 }
+  let modes_byte = (ll_mode << 6) | (of_mode << 4) | (ml_mode << 2)
+  blk.push_byte(modes_byte.to_byte())
+  if ll_mode == 1 {
+    blk.push_byte(ll_codes[0].to_byte())
+  }
+  if of_mode == 1 {
+    blk.push_byte(of_codes[0].to_byte())
+  }
+  if ml_mode == 1 {
+    blk.push_byte(ml_codes[0].to_byte())
+  }
+
+  // Encode sequences in reverse order into backward bitstream
+  let bw = BitWriter::new(num_seq * 4 + 16)
+  let last = num_seq - 1
+  let mut st_ll = if ll_mode == 0 { fse_init_cstate(enc_ll, ll_codes[last]) } else { 0 }
+  let mut st_of = if of_mode == 0 { fse_init_cstate(enc_of, of_codes[last]) } else { 0 }
+  let mut st_ml = if ml_mode == 0 { fse_init_cstate(enc_ml, ml_codes[last]) } else { 0 }
+
+  // Extra bits for last sequence: LL, ML, OF
+  let lc_last = ll_codes[last]
+  let mc_last = ml_codes[last]
+  let oc_last = of_codes[last]
+  bw.write_bits(seq_ll[last] - ll_base[lc_last], ll_bits[lc_last])
+  bw.write_bits(seq_ml[last] - ml_base[mc_last], ml_bits[mc_last])
+  bw.write_bits(seq_ov[last] - (1 << oc_last), oc_last)
+
+  let mut idx = last - 1
+  while idx >= 0 {
+    let lc = ll_codes[idx]
+    let mc = ml_codes[idx]
+    let oc = of_codes[idx]
+
+    // State transitions in reverse of decoder order: OF, ML, LL
+    if of_mode == 0 {
+      st_of = fse_encode_sym(enc_of, st_of, oc, bw)
+    }
+    if ml_mode == 0 {
+      st_ml = fse_encode_sym(enc_ml, st_ml, mc, bw)
+    }
+    if ll_mode == 0 {
+      st_ll = fse_encode_sym(enc_ll, st_ll, lc, bw)
+    }
+
+    // Extra bits in reverse of decoder order: LL, ML, OF
+    bw.write_bits(seq_ll[idx] - ll_base[lc], ll_bits[lc])
+    bw.write_bits(seq_ml[idx] - ml_base[mc], ml_bits[mc])
+    bw.write_bits(seq_ov[idx] - (1 << oc), oc)
+
+    idx = idx - 1
+  }
+
+  // Final states in reverse of decoder initial read order: ML, OF, LL
+  if ml_mode == 0 {
+    bw.write_bits(st_ml - (1 << enc_ml.accuracy_log), enc_ml.accuracy_log)
+  }
+  if of_mode == 0 {
+    bw.write_bits(st_of - (1 << enc_of.accuracy_log), enc_of.accuracy_log)
+  }
+  if ll_mode == 0 {
+    bw.write_bits(st_ll - (1 << enc_ll.accuracy_log), enc_ll.accuracy_log)
+  }
+
+  let seq_stream = bw.finish_with_sentinel()
+  blk.push_slice(seq_stream, 0, seq_stream.length())
+
+  if blk.len < blk_len {
+    Some((blk.to_bytes(), rep1, rep2, rep3))
+  } else {
+    None
+  }
+}
+
+///| Internal compression entry point.
+fn compress_internal(
+  data : Bytes,
+  level : Int,
+  with_checksum : Bool,
+) -> Result[Bytes, ZstdError] {
+  if level < 0 || level > 9 {
+    return Err(ZstdError::InvalidLevel(level))
+  }
+  let n = data.length()
+  let out = ByteVec::new(n + 32)
+
+  // Magic number
+  out.push_u32_le(zstd_magic)
+
+  // Frame Header Descriptor: Single_Segment=1 when n <= 128 KiB, else Window_Descriptor (1 MiB window)
+  let use_single_seg = n <= 131072
+  let chk_bit = if with_checksum { 4 } else { 0 }
+  if use_single_seg {
+    if n < 256 {
+      // fcs_flag=0, single_segment=1 => 1-byte FCS
+      out.push_byte((0x20 | chk_bit).to_byte())
+      out.push_byte(n.to_byte())
+    } else if n < 65792 {
+      // fcs_flag=1, single_segment=1 => 2-byte FCS (n - 256)
+      out.push_byte((0x60 | chk_bit).to_byte())
+      out.push_u16_le(n - 256)
+    } else {
+      // fcs_flag=2, single_segment=1 => 4-byte FCS
+      out.push_byte((0xA0 | chk_bit).to_byte())
+      out.push_u32_le(n.to_uint())
+    }
+  } else {
+    // Window_Descriptor = 1 MiB (exponent = 10 => 1 << 20 = 1048576, mantissa = 0 => 0x50)
+    // fcs_flag=2 (4-byte FCS), single_segment=0
+    out.push_byte((0x80 | chk_bit).to_byte())
+    out.push_byte(0x50.to_byte())
+    out.push_u32_le(n.to_uint())
+  }
+
+  // Empty input: emit 1 empty Raw_Block with Last_Block=1
+  if n == 0 {
+    out.push_u24_le(1)
+    if with_checksum {
+      let chk = (xxhash64_slice(data, 0, 0, 0UL) & 0xFFFFFFFFUL).to_int().to_uint()
+      out.push_u32_le(chk)
+    }
+    return Ok(out.to_bytes())
+  }
+
+  // Level parameters
+  let max_window = if use_single_seg { n } else { 1048576 }
+  let chain_limit = if level == 0 {
+    0
+  } else if level == 1 {
+    1
+  } else if level == 2 {
+    2
+  } else if level == 3 {
+    4
+  } else if level == 4 {
+    8
+  } else if level == 5 {
+    16
+  } else if level == 6 {
+    32
+  } else if level == 7 {
+    64
+  } else if level == 8 {
+    128
+  } else {
+    256
+  }
+
+  let ll_base = build_ll_base()
+  let ll_bits = build_ll_bits()
+  let ml_base = build_ml_base()
+  let ml_bits = build_ml_bits()
+  let enc_ll = fse_build_enc_table(build_predef_ll_norm(), 35, 6)
+  let enc_of = fse_build_enc_table(build_predef_of_norm(), 28, 5)
+  let enc_ml = fse_build_enc_table(build_predef_ml_norm(), 52, 6)
+
+  let hash_bits = if level <= 2 { 13 } else { 15 }
+  let hash_size = 1 << hash_bits
+  let head : FixedArray[Int] = if level > 0 {
+    FixedArray::make(hash_size, -1)
+  } else {
+    FixedArray::make(1, -1)
+  }
+  let prev_size = if level > 0 {
+    if n < 65536 { 65536 } else { 131072 }
+  } else {
+    1
+  }
+  let prev_mask = prev_size - 1
+  let prev : FixedArray[Int] = FixedArray::make(prev_size, -1)
+
+  let mut rep1 = 1
+  let mut rep2 = 4
+  let mut rep3 = 8
+  let mut pos = 0
+
+  while pos < n {
+    let rem = n - pos
+    let blk_len = if rem > max_block_size_limit {
+      max_block_size_limit
+    } else {
+      rem
+    }
+    let last_flag = if pos + blk_len == n { 1 } else { 0 }
+
+    if is_all_same_byte(data, pos, blk_len) {
+      // RLE_Block (type 1): 3-byte header + 1 byte
+      let bh = last_flag | (1 << 1) | (blk_len << 3)
+      out.push_u24_le(bh)
+      out.push_byte(data[pos])
+    } else if level == 0 || blk_len < 16 {
+      // Raw_Block (type 0)
+      let bh = last_flag | (blk_len << 3)
+      out.push_u24_le(bh)
+      out.push_slice(data, pos, blk_len)
+    } else {
+      match
+      compress_block_lz77(
+        data,
+        pos,
+        blk_len,
+        max_window,
+        chain_limit,
+        hash_bits,
+        head,
+        prev,
+        prev_mask,
+        rep1,
+        rep2,
+        rep3,
+        ll_base,
+        ll_bits,
+        ml_base,
+        ml_bits,
+        enc_ll,
+        enc_of,
+        enc_ml,
+      ) {
+        Some((cblk, nr1, nr2, nr3)) => {
+          let bh = last_flag | (2 << 1) | (cblk.length() << 3)
+          out.push_u24_le(bh)
+          out.push_slice(cblk, 0, cblk.length())
+          rep1 = nr1
+          rep2 = nr2
+          rep3 = nr3
+        }
+        None => {
+          // Fallback to Raw_Block (repeat offsets unchanged!)
+          let bh = last_flag | (blk_len << 3)
+          out.push_u24_le(bh)
+          out.push_slice(data, pos, blk_len)
+        }
+      }
+    }
+
+    pos = pos + blk_len
+  }
+
+  if with_checksum {
+    let chk = (xxhash64_slice(data, 0, n, 0UL) & 0xFFFFFFFFUL).to_int().to_uint()
+    out.push_u32_le(chk)
+  }
+
+  Ok(out.to_bytes())
+}

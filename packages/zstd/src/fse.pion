@@ -1,0 +1,496 @@
+///| RFC 8878 §4.1 Finite State Entropy (FSE) table construction, header parsing,
+///| backward bitstream reader, and FSE sequence encoder.
+
+///| Flat FSE decoding table (all arrays have length `1 << accuracy_log`).
+struct FseTable {
+  sym : FixedArray[Int]
+  nb_bits : FixedArray[Int]
+  baseline : FixedArray[Int]
+  accuracy_log : Int
+}
+
+///| Build a single-symbol RLE FSE table (`accuracy_log = 0`, always emits `symbol`).
+fn fse_build_rle_table(symbol : Int) -> FseTable {
+  let sym : FixedArray[Int] = FixedArray::make(1, symbol)
+  let nb_bits : FixedArray[Int] = FixedArray::make(1, 0)
+  let baseline : FixedArray[Int] = FixedArray::make(1, 0)
+  FseTable::{ sym: sym, nb_bits: nb_bits, baseline: baseline, accuracy_log: 0 }
+}
+
+///| Advance FSE spread position, skipping the reserved `-1` probability tail.
+fn fse_next_pos(pos : Int, step : Int, mask : Int, high_threshold : Int) -> Int {
+  let mut p = (pos + step) & mask
+  while p > high_threshold {
+    p = (p + step) & mask
+  }
+  p
+}
+
+///| Spread `p` occurrences of symbol `s` in `table_sym` and return the updated position.
+fn fse_spread_sym(
+  table_sym : FixedArray[Int],
+  s : Int,
+  p : Int,
+  start_pos : Int,
+  step : Int,
+  mask : Int,
+  high_threshold : Int,
+) -> Int {
+  let mut pos = start_pos
+  let mut i = 0
+  while i < p {
+    table_sym[pos] = s
+    pos = fse_next_pos(pos, step, mask, high_threshold)
+    i = i + 1
+  }
+  pos
+}
+
+///| Forward LSB-first bitstream reader for RFC 8878 §4.1.1 FSE headers.
+struct FwdBitReader {
+  data : Bytes
+  end : Int
+  mut byte_pos : Int
+  mut bit_buf : UInt64
+  mut bit_cnt : Int
+}
+
+///|
+fn FwdBitReader::refill(self : FwdBitReader) -> Unit {
+  while self.bit_cnt <= 56 && self.byte_pos < self.end {
+    self.bit_buf = self.bit_buf |
+    (self.data[self.byte_pos].to_int().to_int64().to_uint64() << self.bit_cnt)
+    self.byte_pos = self.byte_pos + 1
+    self.bit_cnt = self.bit_cnt + 8
+  }
+}
+
+///| Build an FSE decoding table from normalized probabilities `norm[0..=max_sym]`.
+fn fse_build_table(
+  norm : FixedArray[Int],
+  max_sym : Int,
+  accuracy_log : Int,
+) -> Result[FseTable, ZstdError] {
+  if accuracy_log < 0 || accuracy_log > 9 {
+    return Err(ZstdError::InvalidFseTable("accuracy_log out of range"))
+  }
+  let table_size = 1 << accuracy_log
+  let mask = table_size - 1
+  let step = (table_size >> 1) + (table_size >> 3) + 3
+  let table_sym : FixedArray[Int] = FixedArray::make(table_size, 0)
+  let sym_next : FixedArray[Int] = FixedArray::make(max_sym + 1, 0)
+
+  let mut high_threshold = table_size - 1
+  let mut total = 0
+  let mut s = 0
+  while s <= max_sym {
+    let p = norm[s]
+    if p == -1 {
+      if high_threshold < 0 {
+        return Err(ZstdError::InvalidFseTable("too many -1 probabilities"))
+      }
+      table_sym[high_threshold] = s
+      high_threshold = high_threshold - 1
+      sym_next[s] = 1
+      total = total + 1
+    } else if p > 0 {
+      sym_next[s] = p
+      total = total + p
+    } else if p < -1 {
+      return Err(ZstdError::InvalidFseTable("invalid negative probability"))
+    }
+    s = s + 1
+  }
+  if total != table_size {
+    return Err(ZstdError::InvalidFseTable("probability sum != table_size"))
+  }
+
+  let mut pos = 0
+  s = 0
+  while s <= max_sym {
+    let p = norm[s]
+    if p > 0 {
+      pos = fse_spread_sym(table_sym, s, p, pos, step, mask, high_threshold)
+    }
+    s = s + 1
+  }
+  if pos != 0 {
+    return Err(ZstdError::InvalidFseTable("symbol spread did not wrap to 0"))
+  }
+
+  let nb_bits : FixedArray[Int] = FixedArray::make(table_size, 0)
+  let baseline : FixedArray[Int] = FixedArray::make(table_size, 0)
+  let mut i = 0
+  while i < table_size {
+    let symbol = table_sym[i]
+    let next_state = sym_next[symbol]
+    sym_next[symbol] = next_state + 1
+    let nb = accuracy_log - high_bit(next_state)
+    nb_bits[i] = nb
+    baseline[i] = (next_state << nb) - table_size
+    i = i + 1
+  }
+
+  Ok(FseTable::{
+    sym: table_sym,
+    nb_bits: nb_bits,
+    baseline: baseline,
+    accuracy_log: accuracy_log,
+  })
+}
+
+///| Parse an RFC 8878 §4.1.1 FSE distribution header starting at `data[start..end]`.
+///| Returns `(FseTable, next_byte_pos)`.
+fn fse_read_distribution(
+  data : Bytes,
+  start : Int,
+  end : Int,
+  max_sym_limit : Int,
+  max_alog : Int,
+) -> Result[(FseTable, Int), ZstdError] {
+  if start >= end {
+    return Err(ZstdError::UnexpectedEof("empty FSE distribution header"))
+  }
+  let fr = FwdBitReader::{
+    data: data,
+    end: end,
+    byte_pos: start,
+    bit_buf: 0UL,
+    bit_cnt: 0,
+  }
+  fr.refill()
+
+  if fr.bit_cnt < 4 {
+    return Err(ZstdError::UnexpectedEof("truncated FSE accuracy_log"))
+  }
+  let accuracy_log = (fr.bit_buf & 15UL).to_int() + 5
+  fr.bit_buf = fr.bit_buf >> 4
+  fr.bit_cnt = fr.bit_cnt - 4
+  if accuracy_log > max_alog {
+    return Err(ZstdError::InvalidFseTable("accuracy_log exceeds maximum"))
+  }
+
+  let norm : FixedArray[Int] = FixedArray::make(max_sym_limit + 1, 0)
+  let mut remaining = (1 << accuracy_log) + 1
+  let mut threshold = 1 << accuracy_log
+  let mut nb_bits = accuracy_log + 1
+  let mut sym = 0
+  let mut prev_zero = false
+
+  while remaining > 1 && sym <= max_sym_limit {
+    fr.refill()
+
+    if prev_zero {
+      let mut repeat = 0
+      let mut done_rep = false
+      while !done_rep {
+        fr.refill()
+        if fr.bit_cnt < 2 {
+          return Err(ZstdError::UnexpectedEof("truncated FSE zero repeat"))
+        }
+        let r = (fr.bit_buf & 3UL).to_int()
+        fr.bit_buf = fr.bit_buf >> 2
+        fr.bit_cnt = fr.bit_cnt - 2
+        repeat = repeat + r
+        if r < 3 {
+          done_rep = true
+        }
+      }
+      sym = sym + repeat
+      if sym > max_sym_limit + 1 {
+        return Err(ZstdError::InvalidFseTable("zero repeat exceeded max_symbol"))
+      }
+      prev_zero = false
+      if sym > max_sym_limit {
+        break
+      }
+    }
+
+    fr.refill()
+
+    let max_val = 2 * threshold - 1 - remaining
+    let low_bits = nb_bits - 1
+    if fr.bit_cnt < low_bits {
+      return Err(ZstdError::UnexpectedEof("truncated FSE probability"))
+    }
+    let low_mask = (1UL << low_bits) - 1UL
+    let small = (fr.bit_buf & low_mask).to_int()
+    let v = if small < max_val {
+      fr.bit_buf = fr.bit_buf >> low_bits
+      fr.bit_cnt = fr.bit_cnt - low_bits
+      small
+    } else {
+      if fr.bit_cnt < nb_bits {
+        return Err(ZstdError::UnexpectedEof("truncated FSE probability (full)"))
+      }
+      let full_mask = (1UL << nb_bits) - 1UL
+      let full = (fr.bit_buf & full_mask).to_int()
+      fr.bit_buf = fr.bit_buf >> nb_bits
+      fr.bit_cnt = fr.bit_cnt - nb_bits
+      if full >= threshold {
+        full - max_val
+      } else {
+        full
+      }
+    }
+
+    let prob = v - 1
+    let weight = if prob == -1 { 1 } else { prob }
+    if weight > remaining - 1 {
+      return Err(ZstdError::InvalidFseTable("probability exceeds remaining"))
+    }
+    remaining = remaining - weight
+    norm[sym] = prob
+    sym = sym + 1
+    prev_zero = prob == 0
+
+    while remaining < threshold {
+      nb_bits = nb_bits - 1
+      threshold = threshold >> 1
+    }
+  }
+
+  if remaining != 1 {
+    return Err(ZstdError::InvalidFseTable("FSE distribution sum mismatch"))
+  }
+
+  // Compute exact consumed bytes (round up consumed bits to next byte boundary)
+  let unread_full_bytes = fr.bit_cnt >> 3
+  let next_pos = fr.byte_pos - unread_full_bytes
+  let max_sym = if sym > 0 { sym - 1 } else { 0 }
+  match fse_build_table(norm, max_sym, accuracy_log) {
+    Ok(tbl) => Ok((tbl, next_pos))
+    Err(e) => Err(e)
+  }
+}
+
+///| Backward bitstream reader for RFC 8878 FSE and Huffman streams.
+struct BackBitReader {
+  data : Bytes
+  start : Int
+  mut byte_pos : Int
+  mut bit_buf : UInt64
+  mut bits_avail : Int
+}
+
+///| Initialize a backward bitstream reader over `data[start..end]`.
+fn BackBitReader::init(
+  data : Bytes,
+  start : Int,
+  end : Int,
+) -> Result[BackBitReader, ZstdError] {
+  if end <= start || start < 0 || end > data.length() {
+    return Err(ZstdError::InvalidBitstream("empty backward bitstream"))
+  }
+  let last = data[end - 1].to_int()
+  if last == 0 {
+    return Err(ZstdError::InvalidBitstream("missing sentinel 1-bit"))
+  }
+  let hb = high_bit(last)
+  let init_bits = (last & ((1 << hb) - 1)).to_int64().to_uint64()
+  let br = BackBitReader::{
+    data: data,
+    start: start,
+    byte_pos: end - 1,
+    bit_buf: init_bits,
+    bits_avail: hb,
+  }
+  br.refill()
+  Ok(br)
+}
+
+///| Refill `bit_buf` from `data` (up to 56+ bits available).
+fn BackBitReader::refill(self : BackBitReader) -> Unit {
+  while self.bits_avail <= 32 && self.byte_pos >= self.start + 4 {
+    let p = self.byte_pos
+    let w = (self.data[p - 1].to_int().to_int64().to_uint64() << 24) |
+    (self.data[p - 2].to_int().to_int64().to_uint64() << 16) |
+    (self.data[p - 3].to_int().to_int64().to_uint64() << 8) |
+    self.data[p - 4].to_int().to_int64().to_uint64()
+    self.bit_buf = (self.bit_buf << 32) | w
+    self.byte_pos = p - 4
+    self.bits_avail = self.bits_avail + 32
+  }
+  while self.bits_avail <= 56 && self.byte_pos > self.start {
+    self.byte_pos = self.byte_pos - 1
+    self.bit_buf = (self.bit_buf << 8) |
+    self.data[self.byte_pos].to_int().to_int64().to_uint64()
+    self.bits_avail = self.bits_avail + 8
+  }
+}
+
+///| Total unread bits remaining in the backward stream.
+fn BackBitReader::remaining_bits(self : BackBitReader) -> Int {
+  self.bits_avail + (self.byte_pos - self.start) * 8
+}
+
+///| Read `n` bits (`0 <= n <= 32`) from the backward stream.
+fn BackBitReader::read_bits(
+  self : BackBitReader,
+  n : Int,
+) -> Result[Int, ZstdError] {
+  if n == 0 {
+    return Ok(0)
+  }
+  if self.bits_avail < n {
+    self.refill()
+    if self.bits_avail < n {
+      return Err(ZstdError::InvalidBitstream("backward bitstream underflow"))
+    }
+  }
+  self.bits_avail = self.bits_avail - n
+  let mask = (1UL << n) - 1UL
+  Ok(((self.bit_buf >> self.bits_avail) & mask).to_int())
+}
+
+///| FSE encoding table (for compressor: maps `(symbol, state)` -> `(bits_to_emit, nb_bits, next_state)`).
+struct FseEncTable {
+  accuracy_log : Int
+  delta_nb_bits : FixedArray[Int]
+  delta_find_state : FixedArray[Int]
+  state_table : FixedArray[Int]
+}
+
+///| Build an FSE encoding table from normalized probabilities `norm[0..=max_sym]`.
+fn fse_build_enc_table(
+  norm : FixedArray[Int],
+  max_sym : Int,
+  accuracy_log : Int,
+) -> FseEncTable {
+  let table_size = 1 << accuracy_log
+  let mask = table_size - 1
+  let step = (table_size >> 1) + (table_size >> 3) + 3
+  let cumul : FixedArray[Int] = FixedArray::make(max_sym + 2, 0)
+  let table_sym : FixedArray[Int] = FixedArray::make(table_size, 0)
+  let mut high_threshold = table_size - 1
+
+  let mut s = 0
+  while s <= max_sym {
+    let p = norm[s]
+    if p == -1 {
+      cumul[s + 1] = cumul[s] + 1
+      table_sym[high_threshold] = s
+      high_threshold = high_threshold - 1
+    } else if p > 0 {
+      cumul[s + 1] = cumul[s] + p
+    } else {
+      cumul[s + 1] = cumul[s]
+    }
+    s = s + 1
+  }
+
+  let mut pos = 0
+  s = 0
+  while s <= max_sym {
+    let p = norm[s]
+    if p > 0 {
+      pos = fse_spread_sym(table_sym, s, p, pos, step, mask, high_threshold)
+    }
+    s = s + 1
+  }
+
+  let state_table : FixedArray[Int] = FixedArray::make(table_size, 0)
+  let mut i = 0
+  while i < table_size {
+    let symbol = table_sym[i]
+    let idx = cumul[symbol]
+    cumul[symbol] = idx + 1
+    state_table[idx] = table_size + i
+    i = i + 1
+  }
+
+  let delta_nb_bits : FixedArray[Int] = FixedArray::make(max_sym + 1, 0)
+  let delta_find_state : FixedArray[Int] = FixedArray::make(max_sym + 1, 0)
+  let mut total = 0
+  s = 0
+  while s <= max_sym {
+    let p = norm[s]
+    if p == 0 {
+      delta_nb_bits[s] = ((accuracy_log + 1) << 16) - (1 << accuracy_log)
+      delta_find_state[s] = 0
+    } else if p == -1 || p == 1 {
+      delta_nb_bits[s] = (accuracy_log << 16) - (1 << accuracy_log)
+      delta_find_state[s] = total - 1
+      total = total + 1
+    } else {
+      let max_bits_out = accuracy_log - high_bit(p - 1)
+      let min_state_plus = p << max_bits_out
+      delta_nb_bits[s] = (max_bits_out << 16) - min_state_plus
+      delta_find_state[s] = total - p
+      total = total + p
+    }
+    s = s + 1
+  }
+
+  FseEncTable::{
+    accuracy_log: accuracy_log,
+    delta_nb_bits: delta_nb_bits,
+    delta_find_state: delta_find_state,
+    state_table: state_table,
+  }
+}
+
+///| Forward bit writer used to build RFC 8878 backward bitstreams (emits bits LSB-first,
+///| appends sentinel `1`-bit at the end).
+struct BitWriter {
+  mut buf : Bytes
+  mut len : Int
+  mut bit_buf : UInt64
+  mut bit_cnt : Int
+}
+
+///|
+fn BitWriter::new(cap : Int) -> BitWriter {
+  let c = if cap < 64 { 64 } else { cap }
+  BitWriter::{ buf: Bytes::new(c), len: 0, bit_buf: 0UL, bit_cnt: 0 }
+}
+
+///|
+fn BitWriter::ensure(self : BitWriter, extra : Int) -> Unit {
+  if self.len + extra <= self.buf.length() {
+    return
+  }
+  let mut new_cap = self.buf.length() * 2
+  while new_cap < self.len + extra {
+    new_cap = new_cap * 2
+  }
+  let nb = Bytes::new(new_cap)
+  let mut i = 0
+  while i < self.len {
+    nb[i] = self.buf[i]
+    i = i + 1
+  }
+  self.buf = nb
+}
+
+///|
+fn BitWriter::write_bits(self : BitWriter, bits : Int, n : Int) -> Unit {
+  if n <= 0 {
+    return
+  }
+  let mask = (1UL << n) - 1UL
+  self.bit_buf = self.bit_buf | ((bits.to_int64().to_uint64() & mask) << self.bit_cnt)
+  self.bit_cnt = self.bit_cnt + n
+  if self.bit_cnt >= 32 {
+    self.ensure(8)
+    while self.bit_cnt >= 8 {
+      self.buf[self.len] = (self.bit_buf & 255UL).to_int().to_byte()
+      self.len = self.len + 1
+      self.bit_buf = self.bit_buf >> 8
+      self.bit_cnt = self.bit_cnt - 8
+    }
+  }
+}
+
+///| Finish backward bitstream by writing the sentinel `1`-bit and flushing remaining bits.
+fn BitWriter::finish_with_sentinel(self : BitWriter) -> Bytes {
+  self.write_bits(1, 1)
+  self.ensure(8)
+  while self.bit_cnt > 0 {
+    self.buf[self.len] = (self.bit_buf & 255UL).to_int().to_byte()
+    self.len = self.len + 1
+    self.bit_buf = self.bit_buf >> 8
+    self.bit_cnt = if self.bit_cnt >= 8 { self.bit_cnt - 8 } else { 0 }
+  }
+  self.buf.slice(0, self.len)
+}
