@@ -11,6 +11,45 @@ STRICT=1 sh packages/hls/audit/run_audit.sh   # exit 1 while anything is OPEN
 sh packages/hls/audit/run_audit.sh <section>  # build static unit cases determinism oracles dos smoke bench inject
 ```
 
+## Re-audit of `feat/pkg-hls-fix @ 58a5430b` (2026-11-24): NOT SIGNED OFF
+
+`58a5430b` changes nothing under `audit/` and nothing outside `packages/hls/` (verified). The full diff
+(`d4f3d1e2..58a5430b`, +1,589 / −362 in `src/`, README, tests, bench, wasm_smoke) was read line by line and the
+whole audit re-run on a separate worktree (`STRICT=1`, the first run below was made before the gates were tightened):
+
+| check | result on 58a5430b |
+| --- | --- |
+| red-team / control cases, 4 modes | 27/27 pass in all 4 modes (all 18 original red-team cases closed) |
+| pionc test (package / audit) | 13/13 · 27/27 |
+| determinism | 4,280 corpus inputs, API sweep, 14 bombs, wasm_smoke: 4 modes byte-identical |
+| reference model | 0 unexplained divergences (named 236/260 identical, fuzz 3,682/4,020) |
+| DoS bombs (native / wasm32 `--release`) | all 18 within budget, 0 crash / 0 OOM / 0 trap: b00/b01 (P0-1) now `LimitExceeded` in 0.02 s / 0.05 s, 19-78 MiB |
+| P1-3 at the new limit | 16,384 defines + 1.4 M references (13.2 MB): 0.06 s native, 0.17 s wasm32 (was 38.7 s). Pion's `Map` uses a per-process random hash seed (native and wasm32, verified with key order across runs), so crafted collisions are not a practical attack; `src/` never iterates a `Map`, so output stays deterministic |
+| bench | 1.40x / 217 MB/s (README 1.35x), second corpus 0.88x (README 0.84x, now documented) |
+| bug injection | 5/5 caught |
+
+Verified closed: P0-1 (aggregate `max_expanded_bytes`, per-kind limits), P1-1 (checked add), P1-2 (parse-time
+overflow rejection + saturating resolver), P1-3 (`Map` + `max_defines`), P1-4 (`keys`, per-KEYFORMAT resolver,
+all keys written), P1-5 (`media_sequence + SKIPPED-SEGMENTS`), P1-6 (custom tag names `#EXT[A-Z0-9-]*`, reserved
+tags refused, client keys `X-[A-Z0-9-]+`), P2-1, P2-2, P2-3, P2-4 (NAME/VALUE DEFINEs no longer written), P2-5,
+P2-7, P2-8, P2-9, P2-10, P2-13 (benchmarks re-measured; second corpus documented).
+
+Not closed (gates added in this commit; `STRICT=1` fails on them):
+
+| id | what is still wrong | repro (input → result on 58a5430b) | where |
+| --- | --- | --- | --- |
+| P2-6 (residual) | unknown tags are kept with their segment only after the first EXTINF / first segment; a tag before the **first** segment is still moved to the end, and KEY / MAP order is kept only as one flag | `#EXT-X-CUE-OUT:30` then segments `a.ts b.ts #EXT-X-CUE-IN c.ts` → formatted `… c.ts\n#EXT-X-CUE-OUT:30` (the ad break now starts after the last segment); `KEY k1, MAP, KEY k2, EXTINF` → written `KEY k1, KEY k2, MAP` (the init section becomes encrypted with k2) | `src/parser.pion` `in_segment_body` (custom tags before the first EXTINF go to the playlist list), `pending_key_before_map` (one Bool for N keys) |
+| P2-11 (residual) | the implicit EXT-X-PART offset chain is not reset at a segment boundary | part `BYTERANGE="100@0"` of `s1.mp4`, then the first part of `s2.mp4` with `BYTERANGE="100"` → accepted as `100@100` (bis §4.4.4.9: "previous Partial Segment belonging to the same Parent Segment"; there is none) | `src/parser.pion` `prev_part_uri` / `prev_part_br_end` not cleared in `handle_uri_line` |
+| P2-12 | README.md line 3 says the `!Send` AST types "should be wrapped in `Mutex` or transferred via `move` across `spawn`". `pionc check` (Wave H-1 `1e609a5`): `Mutex::new(playlist)` compiles but the `Mutex[Playlist]` itself is `E_NOT_SEND` inside `spawn` (SPEC: `Mutex[T]` needs `T: Send` or a shareable `Array`/`Map` container, a struct with `Array` fields is neither). `move` into a `spawn` closure compiles and runs (native + wasm32). The 5 `Send` types are correct. | probe in `run_audit.sh static` | README.md line 3: drop the `Mutex` claim, e.g. "can be handed to a `spawn` closure only by ownership transfer (`move`), or serialized with `format_playlist` and sent as a `String`" (gate verified to close with that wording) |
+| P2-14 (new) | `parse_playlist_with_context` does not validate IMPORT / QUERYPARAM values | QUERYPARAM `t = "x\n#EXT-X-ENDLIST"` → accepted, segment URI contains LF; IMPORT `t = "k\",IV=0x1"` → accepted into the quoted KEY URI (the formatter refuses both, the parse result carries them to the application) | `src/parser.pion` `parse_define_attrs` (`lookup_kv` results); bis §4.4.2.3: the value "MUST NOT contain any of the characters disallowed in quoted-strings" |
+
+Gate changes (`audit/` only): `redteam_p2_6` and `redteam_p2_11` gained the two residual checks, new
+`redteam_p2_14_context_values`; the `static` Send probe now reads the README.md claim sentence (`diff/readme.py
+send_claims`) and checks each claim with `pionc check` (types said to be `Send` are `Send`; `!Send` types are
+listed; a claimed `move` / `Mutex` transfer compiles); the wasm32 size check tolerates 1 % because the binary embeds
+the absolute source path (+196 B for a 69-character longer checkout path), which made the exact-size gate fail for
+reasons outside the package.
+
 ## Summary
 
 | Severity | Count | Findings |

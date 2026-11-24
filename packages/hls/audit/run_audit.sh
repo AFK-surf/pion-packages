@@ -63,8 +63,9 @@ title() {
     P2-9) echo "ISO 8601 date-times without zone / basic offsets fail the whole playlist" ;;
     P2-10) echo "lexical / value-type rules only partly enforced (control chars, quoted enums, CR at EOF)" ;;
     P2-11) echo "EXT-X-PART BYTERANGE without offset not resolved" ;;
-    P2-12) echo "parse results (Playlist, Master/MediaPlaylist, MediaSegment, DateRange) are not Send (README: Send-safe)" ;;
+    P2-12) echo "Send status of public types differs from README.md (re-audit: Mutex[Playlist] cannot cross spawn)" ;;
     P2-13) echo "README.md benchmark / size claims not reproduced or not representative" ;;
+    P2-14) echo "parse_playlist_with_context does not validate IMPORT / QUERYPARAM values (LF, '\"')" ;;
     *) echo "(see REPORT.md)" ;;
   esac
 }
@@ -119,15 +120,42 @@ static() {
   echo "  Double / Float use (incl. Double::to_string): $n"; [ "$n" = 0 ] || fail "floating point in src"
   n=$(grep -ciE 'tokyo|pvg-office|afk-ap|gt1|gt2|office-host|mac-studio|stillfail|/Users/|/home/' "$README")
   echo "  README internal machine names / paths: $n"; [ "$n" = 0 ] || fail "internal names in README.md"
-  echo "  Send probe: public values crossing a spawn boundary"
+  echo "  Send probe: public values crossing a spawn boundary, checked against what README.md claims"
   P="$AUDIT_OUT/send_probe" && rm -rf "$P" && mkdir -p "$P/src"
   printf '[package]\nname = "send_probe"\nversion = "0.1.0"\n\n[dependencies]\nhls = { path = "%s" }\n' "$PKG_DIR" > "$P/pion.toml"
+  claims=$($RD send_claims)
+  c_send=" $(printf '%s\n' "$claims" | sed -n 's/^send //p') "
+  c_not=" $(printf '%s\n' "$claims" | sed -n 's/^notsend //p') "
+  c_mutex=$(printf '%s\n' "$claims" | sed -n 's/^mutex //p')
+  c_move=$(printf '%s\n' "$claims" | sed -n 's/^move //p')
+  probe() { # <type> <body using v>: prints Send/OK or the diagnostic codes
+    printf 'import "hls"\n\nfn probe(v : %s, world : World) -> Unit {\n%s\n}\n\n///|\npub fn main(world : World) -> Int {\n  0\n}\n' "$1" "$2" > "$P/src/main.pion"
+    pionc check --json "$P" 2>&1 | $PY -c 'import json,sys; d=json.load(sys.stdin); print("ok" if d.get("ok") else ",".join(x.get("code","?") for x in d.get("diagnostics",[])))' 2>/dev/null
+  }
   for v in hls::HlsLimits hls::HlsError hls::EncryptionKey hls::VariantStream hls::ResolvedSegment hls::Playlist \
     hls::MasterPlaylist hls::MediaPlaylist hls::MediaSegment hls::DateRange; do
-    printf 'import "hls"\n\nfn probe(v : %s, world : World) -> Unit {\n  scope(world, fn(s : Scope) -> Unit { spawn(s, fn() -> Unit { let _ = v }) })\n}\n\n///|\npub fn main(world : World) -> Int {\n  0\n}\n' "$v" > "$P/src/main.pion"
-    r=$(pionc check --json "$P" 2>&1 | $PY -c 'import json,sys; d=json.load(sys.stdin); print("Send" if d.get("ok") else ",".join(x.get("code","?") for x in d.get("diagnostics",[])))' 2>/dev/null)
-    printf '    %-24s %s\n' "$v" "${r:-compile-error}"
-    [ "$r" = Send ] || open_finding "P2-12: $(title P2-12)"
+    t=${v#hls::}
+    r=$(probe "$v" '  scope(world, fn(s : Scope) -> Unit { spawn(s, fn() -> Unit { let _ = v }) })')
+    extra=""
+    if [ "$r" = ok ]; then
+      r=Send
+    else
+      case "$c_not" in *" $t "*) ;; *) open_finding "P2-12: $(title P2-12)"; extra="$extra (!Send, README.md does not say so)" ;; esac
+      if [ "$c_move" = 1 ]; then
+        m=$(probe "$v" '  scope(world, fn(s : Scope) -> Unit { spawn(s, fn() -> Unit { let q = move v
+  let _ = q }) })')
+        extra="$extra move-into-spawn:$m"
+        [ "$m" = ok ] || open_finding "P2-12: $(title P2-12)"
+      fi
+      if [ "$c_mutex" = 1 ]; then
+        m=$(probe "$v" "  let m = Mutex::new(v)
+  scope(world, fn(s : Scope) -> Unit { spawn(s, fn() -> Unit { m.with_lock(fn(x : $v) -> Unit { let _ = x }) }) })")
+        extra="$extra Mutex-into-spawn:$m"
+        [ "$m" = ok ] || { open_finding "P2-12: $(title P2-12)"; extra="$extra (README.md claims Mutex wrapping works)"; }
+      fi
+    fi
+    case "$c_send" in *" $t "*) [ "$r" = Send ] || { open_finding "P2-12: $(title P2-12)"; extra="$extra (README.md claims Send)"; } ;; esac
+    printf '    %-24s %s%s\n' "$v" "${r:-compile-error}" "$extra"
   done
 }
 
@@ -276,8 +304,10 @@ smoke() {
   for k in dbg rel; do
     got=$(wc -c < "$BIN/smoke_$k.wasm" | tr -d ' ')
     want=$($RD wasm_$k)
-    echo "  wasm32 $k size: $got B (README.md: $want B)"
-    [ "$got" = "$want" ] || open_finding "P2-13: $(title P2-13)"
+    # the wasm32 binary embeds the absolute source path, so its size depends on where the tree is checked out
+    # (measured: +196 B for a 69-character longer path); accept README.md numbers within 1 %
+    echo "  wasm32 $k size: $got B (README.md: $want B; path-dependent, tolerance 1 %)"
+    [ $(( (got - want) * (got - want) * 10000 )) -le $(( want * want )) ] || open_finding "P2-13: $(title P2-13)"
   done
 }
 
