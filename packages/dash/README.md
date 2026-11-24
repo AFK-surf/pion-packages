@@ -1,6 +1,6 @@
 # `dash` (v0.1.0)
 
-100% pure Pion **ISO/IEC 23009-1 MPEG-DASH** (`.mpd`) manifest parser, hierarchical `BaseURL` + `SegmentTemplate`/`SegmentTimeline` URL expander, ABR representation selector, and deterministic XML serializer — zero external dependencies, zero `extern "C"`, zero `World`, zero mutable globals, zero `Double::to_string`, `Send`-safe, and Native + Wasm32 portable.
+100% pure Pion **ISO/IEC 23009-1 MPEG-DASH** (`.mpd`) manifest parser, hierarchical `BaseURL` + `SegmentTemplate`/`SegmentTimeline` URL expander, ABR representation selector, and deterministic XML serializer — zero external dependencies, zero `extern "C"`, zero `World`, zero mutable globals, zero `Double::to_string`, and Native + Wasm32 portable.
 
 ## Features
 
@@ -49,11 +49,18 @@ pionc run --target wasm32 packages/dash/wasm_smoke
 sh packages/dash/bench/run_bench.sh
 ```
 
-- **Unit & Red-Team Test Suite (`packages/dash/src/dash_test.pion`)**: **25** test groups passing (`pionc test --json packages/dash`), covering static VOD `SegmentBase`, dynamic live `SegmentTemplate` + `SegmentTimeline` (`r=0`, `r>0`, `r=-1`), duration-based `SegmentTemplate`, `SegmentList`, `Period`-level inheritance, DRM `ContentProtection`/`cenc:pssh`, ISO-8601 duration/datetime/leap years, rational frame rates, ABR selection, canonical XML roundtrip, and red-team DoS/security cases (XXE, Billion Laughs, `r=999999999`, `$Number%999999999d$`, deep XML nesting, `Int64` overflow, negative/zero limits, invalid numeric char refs, control characters).
+- **Unit & Red-Team Test Suite (`packages/dash/src/dash_test.pion`)**: **26** test groups passing (`pionc test --json packages/dash`), covering static VOD `SegmentBase`, dynamic live `SegmentTemplate` + `SegmentTimeline` (`r=0`, `r>0`, `r=-1`, PTO), duration-based `SegmentTemplate`, `SegmentList`, `Period`-level inheritance & timing inference, DRM `ContentProtection`/`cenc:pssh`/`mspr:pro`, ISO-8601 duration/datetime/leap years, rational frame rates, multi-codec ABR selection, namespace-aware matching, canonical XML roundtrip, and red-team DoS/security cases (XXE, Billion Laughs, `r=999999999`, `$Number%999999999d$`, deep XML nesting, `Int64` overflow, negative/zero limits, invalid numeric char refs, control characters, aggregate URL output byte cap).
+
+## Concurrency & `Send` Guarantees
+
+Verified with `pionc check` across a `spawn` boundary:
+
+- **`Send` value / config types (10)**: `DashLimits` is `Send`, `DashError` is `Send`, `Rational` is `Send`, `MpdType` is `Send`, `ContentType` is `Send`, `Descriptor` is `Send`, `SegmentBase` is `Send`, `SegmentUrl` is `Send`, `SegmentTimelineEntry` is `Send`, and `ResolvedSegment` is `Send`.
+- **`!Send` container types (8, holding `Array[T]`)**: `Mpd`, `Period`, `AdaptationSet`, `Representation`, `SegmentTemplate`, `SegmentList`, `ContentProtection`, and `ResolvedTrack`. To transfer these across `spawn`, transfer ownership with `move v` into the spawned closure, or serialize an `Mpd` to `String` via `format_mpd` and re-parse in the worker.
 - **Differential Parity vs Rust `dash-mpd-core v0.1.0` (the core MPD parser crate of `dash-mpd v0.21.0`, locked `Cargo.lock`)**:
   - **60 / 60** synthetic MPD manifests (15 static `SegmentBase`, 15 dynamic live `SegmentTemplate`+`SegmentTimeline`, 15 multi-`Period` DRM with Widevine/PlayReady `cenc:pssh`, 15 `SegmentList`), field-by-field comparison across `MPD`, `Period`, `AdaptationSet`, `Role`, `ContentProtection`/`pssh`, `SegmentTemplate`/`SegmentTimeline`, `Representation`, `SegmentBase`, and `SegmentList`: **0 divergences**.
 - **4-Mode Verification (`packages/dash/wasm_smoke`)**:
-  - `native debug` (**261 KiB**), `native --release` (**728 KiB**), `wasm32 debug` (**181 KiB**), `wasm32 --release` (**174 KiB**) all compile cleanly and emit byte-identical stdout:
+  - `native debug`, `native --release`, `wasm32 debug` (**213 KiB**), `wasm32 --release` (**206 KiB**) all compile cleanly and emit byte-identical stdout:
   - `dash_wasm_smoke:ok`
   - `summary=PT1H2M3.5S|1709209845000000|1|https://cdn.example.com/stream/av1_1080/init.mp4|https://cdn.example.com/stream/av1_1080/chunk_0004_12000.m4s|1256|xxe_blocked fnv64=c1ae0a91eab891cb`
   - SHA-256: `2ce81a010a29ef5fc9e0715fb3a1c7af049a3ebea6ed2c41549a1b08074ec625`
