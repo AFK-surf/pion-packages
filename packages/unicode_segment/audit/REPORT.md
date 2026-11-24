@@ -1,7 +1,69 @@
 # Red-team audit: `packages/unicode_segment` v0.1.0 (RT-unicode-segment)
 
-> **NOT SIGNED OFF.** 1 P1 and 1 P2 finding are OPEN (below). No P0: every correctness, determinism,
-> table, conformance and mutation check passes.
+> **SIGNED OFF** at `d67d755d0e3159dc414f721a45c57660656c8ece` (`origin/feat/pkg-unicode-segment-fix`, next
+> section). The first audit of `aa2d0a1` (P1-1, P2-1, both closed) follows.
+
+## SIGN-OFF — `packages/unicode_segment` v0.1.0 at `origin/feat/pkg-unicode-segment-fix` @ `d67d755d0e3159dc414f721a45c57660656c8ece`
+
+**Signed off by RT-unicode-segment (independent Opus red-team audit), 2026-11-24.** Both findings of the first
+audit are closed and verified; no new defect found.
+
+Re-audit reviewed `4c66c00..d67d755d` (6 files: `src/grapheme.pion`, `src/segment_test.pion`, `README.md`,
+`bench/run_bench.sh`, `bench/rust_bench/Cargo.{toml,lock}`; `audit/` untouched):
+
+- **P1-1 closed.** `find_safe_grapheme_anchor` now stops at the nearest code point X (after Y) that is not
+  `Extend` / `ZWJ` / `InCB=Linker|Extend` and where `grapheme_should_break(Y, X)` holds under the most joining
+  state reachable after Y (`ri_odd = true`, `ep_state = 2` iff Y is ZWJ, `incb_state = 2` iff Y is
+  InCB=Linker|Extend). Reviewed: state only ever *removes* breaks (GB9c / GB11 / GB12-13), so "breaks under the
+  most joining state" implies "breaks under every state"; and excluding Extend / ZWJ / Linker / InCB=Extend makes
+  the DFA state after X independent of what precedes Y, so the fresh state at X is exact (RI X after RI Y never
+  qualifies, X=RI after non-RI gives ri_odd = true in both). Ill-formed bytes are never an X candidate on the
+  first step, and every anchor is a forward decode position. `prev_grapheme_boundary` now anchors at
+  `offset - 1`, `is_grapheme_boundary` short-cuts `anchor == offset`. Cursor walks: `ko_prose` 31,200 B
+  **1.3 ms** (was 4.7 s; ratio 4.0; Rust `GraphemeCursor` 0.34 ms), `gb_hangul` 48,000 B **1.7–2.1 ms** (was
+  10.2 s; Rust 0.48 ms); every other cursor walk stays linear, long RI runs remain INFO-4 as in Rust.
+  Cursor results equal `grapheme_indices` at every byte offset −3..=n+3 (incl. inner UTF-8 bytes) of all 34,528
+  gate inputs (1,814 with ill-formed UTF-8) in 4 modes, plus a separate 30,000-string stress corpus drawn only
+  from RI / ZWJ / ExtPict / Extend / Linker / Consonant / Prepend / L / V / T / LV / LVT / CR / LF / Control /
+  SpacingMark / FE0F / ill-formed bytes: 0 violations, 0 differences from Rust 1.12.0.
+- **P2-1 closed.** `bench/rust_bench/Cargo.toml` pins `unicode-segmentation = "=1.12.0"`, `Cargo.lock` locks
+  1.12.0, README and `run_bench.sh` name 1.12.0 ("the Unicode 16.0.0 release"); `bench/run_bench.sh` PASS 20/20,
+  stdout SHA-256s `ec165b39…` / `b5b966a2…` (= README). README's limits wording (INFO-2) and the cursor complexity
+  statement were also corrected.
+- **New in this re-audit (harness, not package): INFO-9.** With `FUZZ_N=20000` (31,000 fuzz inputs) 4 inputs
+  differ from Rust 1.12.0 on `word_bounds` only: Rust keeps `AHLetter|Numeric (MidLetter|MidNum|MidNumLetQ) ZWJ
+  ExtPict` (e.g. `a:‍⌚`) in one word, while WB6 / WB12 require a break before the punctuation because the next
+  non-ignorable is ExtPict (WB3c only joins ZWJ × ExtPict). An independent rule-by-rule UAX #29 16.0.0 word
+  segmenter (`diff/wbref.py`, 1,826/1,826 on WordBreakTest) agrees with Pion on all 31,000 inputs. Present since
+  `aa2d0a1`, unrelated to the fix; the comparator now explains a W/U-only difference solely when Pion equals the
+  reference, and `n_wb_mid_zwj_ep_rust_defect` pins it. (Against 1.13.3 the same rule also absorbs W/U differences
+  caused by Unicode 17 drift, e.g. WordBreakTest 1733/1734, where Pion is again the 16.0.0-correct side.)
+
+`STRICT=1 FUZZ_N=20000 sh packages/unicode_segment/audit/run_audit.sh` on `d67d755d` + audit commit, pvg-office-2
+(x86_64 Linux, load ~13): **EXIT=0, 0 OPEN, 0 P0**; default mode (`FUZZ_N=4000`) **EXIT=0**;
+`sh scripts/verify.sh packages/unicode_segment` (strict, in a clean git checkout) **PASS**, worktree clean after
+all runs.
+
+| Section | Result |
+| --- | --- |
+| static | MIT, 0 deps, 0 `extern "C"` / `World` / `FixedArray` / `panic` / module-level state / floats / host names; tables regenerate byte-identically; README `Send` / `!Send` list true, `move` and `Mutex::new(...)` into `spawn` compile; `count_in_worker` runs |
+| unit | 13/13 package tests (= README), 5/5 audit control tests, `verify.sh` PASS |
+| tables | 1,114,112 code points × 7 properties: 0 mismatches |
+| conformance | 1,093/1,093, 1,826/1,826, 512/512 with tiling / concat / cursor-at-every-byte / limits, 4 modes; `wbref.py` 1,826/1,826 |
+| oracles | Rust 1.12.0: 34,528 inputs × 4 APIs, 0 unexplained (4 INFO-9); Rust 1.13.3: 0 unexplained (drift INFO-3, INFO-9) |
+| determinism | 34,528 inputs + limit sweep: native / wasm32 × debug / release byte-identical |
+| dos | 315 bomb runs at N / 4N, all linear (worst 0.18 s, RSS ≤ 69 MiB), wasm32 agrees; cursor walks linear except RI runs (INFO-4) |
+| smoke / bench | `wasm_smoke` SHA-256 = README in 4 modes, sizes 84,969 / 84,944 B (README 84,973 / 84,948); bench SHA-256s = README, speedups 0.48x / 0.68x at load ~13 (README 0.51x / 0.45x, INFO-5) |
+| inject | 14/14 injected defects caught |
+
+Residual INFO (accepted, not defects): INFO-1 (root `THIRD_PARTY_NOTICES.md` must list the Unicode 16.0.0 data at
+release integration), INFO-2 (wording, now fixed in README), INFO-3 (Rust 1.13.3 is Unicode 17), INFO-4 (RI-run
+cursor walks, inherent, same in Rust), INFO-5 (load-dependent speedups), INFO-7 (equivalent mutant), INFO-8
+(ill-formed byte = one U+FFFD of length 1), INFO-9 (Rust word-boundary defect, Pion correct).
+
+## First audit of `aa2d0a1` (findings below are closed at `d67d755d`)
+
+> NOT SIGNED OFF at `aa2d0a1`: 1 P1 and 1 P2 finding were OPEN. No P0.
 
 - **Audited commit:** `origin/feat/pkg-unicode-segment` @ `aa2d0a146c437fb2bcdceb03c249c102de000849`
 - **Scope:** UAX #29 16.0.0 grapheme / word / sentence segmentation, `unicode_words`, cursor APIs
@@ -39,7 +101,7 @@ Without `STRICT` the same run exits 0.
 | bench | `bench/run_bench.sh`: 20/20; stdout SHA-256 `ec165b39…` / `b5b966a2…` (= README); speedups 0.60x / 0.42x vs README 0.53x / 0.40x |
 | inject | **14/14** injected defects caught |
 
-## OPEN findings
+## Findings (OPEN at `aa2d0a1`, closed at `d67d755d`)
 
 ### P1-1 — cursor APIs are O(n²) on ordinary Korean text (and any run without two adjacent "neutral" code points)
 
@@ -145,7 +207,7 @@ The gate closes this when the README's stated Unicode version of the locked orac
 
 `run_audit.sh` (gate), `src/main.pion` (audit CLI: `dump`, `bomb`, `cursor`, `api`), `redteam_test.pion`
 (control tests), `tabprobe/*.in` (table accessor + dumper, compiled only against a copy of the package),
-`diff/ucd.py` (UCD reader, table check, 16 → 17 drift set), `diff/gen.py` (corpora), `diff/compare.py`,
+`diff/ucd.py` (UCD reader, table check, 16 → 17 drift set), `diff/wbref.py` (independent UAX #29 word-boundary reference), `diff/gen.py` (corpora), `diff/compare.py`,
 `diff/dos.py`, `diff/inject.py` (14 mutants), `diff/readme.py`, `diff/rust` (`=1.13.3`) and `diff/rust12`
 (`=1.12.0`) oracles, `ucd/` (official Unicode 16.0.0 data + test files and the 17.0.0 property files, gzip,
 Unicode License v3 in `ucd/LICENSE`).
