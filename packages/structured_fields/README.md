@@ -17,13 +17,14 @@ Pure-Pion, zero-dependency implementation of **RFC 9651 (Structured Field Values
   - **Item** (`parse_item` / `serialize_item`), **List** (`parse_list` / `serialize_list` + `InnerList`), **Dictionary** (`parse_dictionary` / `serialize_dictionary`), and **Parameters** (ordered `Key -> BareItem`, strict lowercase keys).
   - Duplicate dictionary and parameter keys overwrite values in place while preserving first-seen key order (RFC 9651 §4.2.2 / §4.2.3.2), backed by a lazy `Map[String, Int]` index for O(1) amortized lookup against quadratic CPU DoS.
   - Multi-header field joining: `parse_list_fields` and `parse_dictionary_fields` combine multiple HTTP field lines with `", "` while enforcing `max_input_bytes` prior to allocation.
-  - Strict whitespace handling: leading/trailing SP (`0x20`) only; OWS (`SP / HTAB`) around list/dictionary commas; rejects trailing HTAB, `\r`, `\n`, and trailing garbage.
+  - Strict whitespace handling: leading SP (`0x20`) only on all types; trailing SP (`0x20`) only on Items (rejecting trailing `HTAB`); OWS (`SP / HTAB`) around commas and trailing OWS on Lists and Dictionaries (per RFC 9651 §4.2.1 / §4.2.2); rejects `\r`, `\n`, and trailing garbage.
 - **Strict Serializer Validation & `SfvLimits` DoS Protection**:
-  - Every serializer validates integer/decimal/date bounds, key/token charsets, printable ASCII strings (blocking CRLF header injection), and valid UTF-8 display strings, enforcing `max_output_bytes` incrementally.
+  - Every serializer validates integer/decimal/date bounds, key/token charsets, printable ASCII strings (blocking CRLF header injection), valid UTF-8 display strings, and unique dictionary/parameter keys (rejecting hand-built duplicate keys with `SfvError::InvalidKey` in O(n) time so serialized output is always a canonical fixed point), enforcing `max_output_bytes` incrementally.
+  - Note: per RFC 9651 §4.1, an empty List or Dictionary serializes to `""`; callers MUST omit the HTTP header rather than sending an empty field value.
   - Any negative field in `SfvLimits` is immediately rejected with `SfvError::LimitExceeded`; `0` strictly means `0` allowed.
 - **Browser-Oriented Helpers**:
   - `parse_priority` / `serialize_priority` (RFC 9218 HTTP `Priority: u=1, i`).
-  - `parse_permissions_policy` (W3C `Permissions-Policy` directives).
+  - `parse_permissions_policy` (W3C `Permissions-Policy` directives; returned origin strings are unvalidated SFV strings and callers MUST validate origins per W3C Permissions Policy §9.2 before enforcing policy).
   - `get_param`, `get_dict_member`, `is_valid_key`, `is_valid_token`.
 
 ## Public API
@@ -146,7 +147,7 @@ match structured_fields::parse_priority("u=1, i") {
 sh scripts/verify.sh packages/structured_fields
 ```
 
-- **Unit & Security Suite**: `pionc test --json packages/structured_fields` — **28 / 28 tests passing**, covering all 8 bare items, 3 top-level structures, exact `Int64` `Decimal` & round-half-to-even, RFC 9651 Dates & Display Strings (including lowercase `%xx` and UTF-8 overlong/surrogate rejection), duplicate key overwrite order, multi-header field joining, strict whitespace/trailing rejection, serializer anti-injection checks, all 7 `SfvLimits` negative/zero bounds, 10,000-key O(1) DoS stress test, and browser helpers.
+- **Unit & Security Suite**: `pionc test --json packages/structured_fields` — **30 / 30 tests passing**, covering all 8 bare items, 3 top-level structures, exact `Int64` `Decimal` & round-half-to-even, RFC 9651 Dates & Display Strings (including lowercase `%xx` and UTF-8 overlong/surrogate rejection), duplicate key overwrite order, multi-header field joining, strict whitespace/trailing rejection, serializer anti-injection and duplicate-key rejection checks, all 7 `SfvLimits` negative/zero bounds, 10,000-key O(1) DoS stress test, and browser helpers.
 - **Official IETF & Rust `sfv` Bidirectional Cross-Check**: **251 / 251** core vectors from [`httpwg/structured-field-tests`](https://github.com/httpwg/structured-field-tests) (`binary.json`, `boolean.json`, `date.json`, `dictionary.json`, `display-string.json`, `examples.json`, `item.json`, `list.json`, `listlist.json`, `number.json`, `param-dict.json`, `param-list.json`, `param-listlist.json`, `string.json`, `token.json`) verified **100% byte-for-byte identical** (`parse + serialize`) against Rust `sfv 0.16.1` (**0 unexplained discrepancies**).
 
 ### 4-Mode `wasm_smoke` Verification
@@ -155,10 +156,10 @@ All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `w
 
 | Mode | Binary Size (`Linux x86_64` / `wasm32`) | Stdout SHA-256 (`271 B`) |
 | --- | ---: | --- |
-| Native Debug | `140,576 B` | `f8311f93f4000564...` |
-| Native Release | `234,784 B` | `f8311f93f4000564...` |
-| Wasm32 Debug | `73,535 B` | `f8311f93f4000564...` |
-| Wasm32 Release | `71,470 B` | `f8311f93f4000564...` |
+| Native Debug | `140,656 B` | `f8311f93f4000564...` |
+| Native Release | `238,960 B` | `f8311f93f4000564...` |
+| Wasm32 Debug | `74,994 B` | `f8311f93f4000564...` |
+| Wasm32 Release | `72,929 B` | `f8311f93f4000564...` |
 
 ## Head-to-Head Benchmarks
 
