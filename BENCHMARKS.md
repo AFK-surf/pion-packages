@@ -368,6 +368,8 @@
 | `opentype` | 同上，合成 512 字形可变字体 `synthetic_512.ttf`（× 200） | 4,559,200 B | 12.215 ms (61.08 µs/op) | **9.698 ms** (`rust_ttf_parser`) | 0.79x | 2.00 MiB | 2.00 MiB |
 | `hls` | 主语料：70 个 Master / Media / LL-HLS 播放列表解析（× 50，3,500 次） | 21,627,600 B | **97.242 ms** (222.41 MB/s) | 134.893 ms (`rust_m3u8_rs`) | **1.39x** | 4.03 MiB | **3.52 MiB** |
 | `hls` | `altbench` 现实语料：60 个长 URL / 逐分片 PDT / 密钥轮换 / 显式字节范围播放列表（× 5，300 次） | 42,287,085 B | 126.932 ms (333.15 MB/s) | **115.993 ms** (`rust_m3u8_rs`) | 0.91x | 27.44 MiB | **13.77 MiB** |
+| `bzip2` | L6 压缩：结构化 JSON 日志语料（768 KiB × 3，Linux x86_64） | 2,359,296 B | 656.495 ms (3.59 MB/s) | **269.012 ms** (`rust_bzip2` `0.6.1`) | 0.41x | 15.34 MiB | **7.77 MiB** |
+| `bzip2` | L6 解压：结构化 JSON 日志语料（768 KiB × 10，Linux x86_64） | 7,864,320 B | 267.268 ms (29.42 MB/s) | **182.432 ms** (`rust_bzip2` `0.6.1`) | 0.68x | 8.79 MiB | **6.46 MiB** |
 
 ## 各包明细
 
@@ -2902,3 +2904,27 @@ SHA-256 `5435f14cac58923a0ea773283d88c4212c0bd043e4e3d5f1150582c4e6a482e4`（两
 如实说明：主语料领先 **1.39x**，峰值 RSS 略高（4.03 vs 3.52 MiB）；现实语料落后（**0.91x**），峰值 RSS 约为 Rust 的 2 倍（27.44 vs 13.77 MiB），原因是本包执行完整 RFC 8216bis 严格校验、ISO 8601 日期校验并保留逐分片元数据，而 `m3u8-rs` 不做这些校验。包 README 记录的上一次测量为主语料 1.35x、现实语料 0.84x，与本次同机复测方向一致。
 
 红队（独立 Opus，多轮复审后 `SIGN-OFF`）：13 / 13 单测；1 P0 + 6 P1 + 14 P2 共 21 项全部修复。`STRICT=1 sh packages/hls/audit/run_audit.sh` `no open findings`、exit 0：红队 + 对照用例 28 / 28 × 4 模；4,280 个输入（260 命名 + 4,020 种子与变异）对独立 RFC 8216bis 参考模型 0 条未解释偏差；命名、变异、API 与 DoS 输出 4 模逐字节一致；18 个 DoS 炸弹在 native 与 Wasm32 `--release` 上全部在预算内；5 / 5 注入缺陷被捕获。`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）stdout SHA-256 `ccb403999c3dd751365666e2813bb49a01ea55e6fd3bfe0c34a52f4ebb4fb933`（与包 README 一致），Wasm32 debug / `--release` 实测 239,459 / 237,733 B。
+
+### bzip2
+
+参考实现：Rust [`bzip2`](https://crates.io/crates/bzip2) `0.6.1`（锁定 `libbz2-rs-sys` `=0.2.7` 后端，`--release`，记作 `rust_bzip2`；编码器金标测试另对齐 `libbz2-rs-sys 0.2.3`）。环境：Intel Xeon Platinum 8581C（`Linux x86_64`），`pionc 0.1.0 (amd64_sysv, self-hosted)` `--release`，`rustc 1.96.0`。`sh packages/bzip2/bench/run_bench.sh`（`scripts/bench_compare.py`，`--warmup 1 --rounds 5` 严格交替）。输入为确定性生成的 768 KiB（`786,432 B`）结构化 JSON/HTTP 日志语料；基准前先做全量字节 SHA-256 校验，压缩输出（`786,432 B → 34,946 B`，`sha256:d4cb2a2a092f2c02...`）与解压输出（`34,946 B → 786,432 B`，`sha256:ea091dc1e46ec9ab...`）两端均逐字节一致。
+
+#### 1. L6 压缩（768 KiB × 3 = 2,359,296 B）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_bzip2`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_bzip2`（`--release`） | 656.495 | 518.935 | 1252.113 | 3.59 | 15.34 MiB | 0.41x |
+| `rust_bzip2`（`0.6.1 --release`） | **269.012** | 259.422 | 386.063 | 8.77 | **7.77 MiB** | 1.00x (baseline) |
+
+stdout 98 B，SHA-256 `07e5114911044ec15c475eca5f1bf25c341775bb97a9827a93c381a2c735b725`（两端全部轮次一致）。
+
+#### 2. L6 解压（768 KiB × 10 = 7,864,320 B）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_bzip2`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_bzip2`（`--release`） | 267.268 | 220.058 | 348.702 | 29.42 | 8.79 MiB | 0.68x |
+| `rust_bzip2`（`0.6.1 --release`） | **182.432** | 150.926 | 224.205 | 43.11 | **6.46 MiB** | 1.00x (baseline) |
+
+stdout 94 B，SHA-256 `ccde469114e3ca2cddabfae68d2ee9c68bdea42889495e9d4119e3960495cff2`（两端全部轮次一致）。
+
+如实说明：两项均落后 Rust——L6 压缩 **0.41x**（主要在 BWT 块排序内循环，Peak RSS 15.34 vs 7.77 MiB），L6 解压 **0.68x**（Peak RSS 8.79 vs 6.46 MiB）。12 / 12 单测通过；`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）stdout SHA-256 `3e8ba80c873e78ff09aa9f9cdc8c6dde0b9aeb3ecc48890e141b6594a6594de4` 逐字节一致。
