@@ -55,6 +55,8 @@ PACKAGE_META = {
                ["brotli", "decompress", "rfc7932", "compression", "br", "content-encoding", "解压"]),
     "bson": ("data-formats", "BSON 1.1 codec with ObjectId, Decimal128 and MongoDB Extended JSON v2",
              ["bson", "mongodb", "objectid", "decimal128", "extended-json", "binary", "序列化"]),
+    "bzip2": ("compression-archive", "Pure-Pion bzip2 (BZh1-BZh9) compressor and decompressor with libbz2-rs-sys parity and output limits",
+              ["bzip2", "bz2", "bwt", "huffman", "compression", "decompress", "压缩"]),
     "cbor": ("data-formats", "RFC 8949 CBOR codec with deterministic/CTAP2 canonical encoding, float16 and diagnostic notation",
              ["cbor", "rfc8949", "binary", "ctap2", "webauthn", "canonical", "float16", "序列化"]),
     "cel": ("query-lang", "Google Common Expression Language: parser, macros, type checker and compiled program evaluator",

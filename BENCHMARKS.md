@@ -371,6 +371,8 @@
 | `lepton` | Baseline 512×512 RGB JPEG (`SOF0`, 50,288 B) 往返 ×10（Linux x86_64） | 502,880 B | 446.070 ms (1.13 MB/s) | **212.924 ms** (`rust_lepton_jpeg`) | 0.48x | **4.89 MiB** | 8.71 MiB |
 | `lepton` | Progressive 512×512 Luma JPEG (`SOF2`, 44,142 B) 往返 ×10（Linux x86_64） | 441,420 B | 385.331 ms (1.15 MB/s) | **262.010 ms** (`rust_lepton_jpeg`) | 0.68x | **4.58 MiB** | 8.26 MiB |
 | `lepton` | Baseline 512×512 RGB JPEG (`SOF0`, 50,288 B) 解码 ×10（Linux x86_64） | 502,880 B | 216.703 ms (2.32 MB/s) | **155.921 ms** (`rust_lepton_jpeg`) | 0.72x | **4.30 MiB** | 8.13 MiB |
+| `bzip2` | L6 压缩：结构化 JSON 日志语料（768 KiB × 3，Linux x86_64） | 2,359,296 B | 656.495 ms (3.59 MB/s) | **269.012 ms** (`rust_bzip2` `0.6.1`) | 0.41x | 15.34 MiB | **7.77 MiB** |
+| `bzip2` | L6 解压：结构化 JSON 日志语料（768 KiB × 10，Linux x86_64） | 7,864,320 B | 267.268 ms (29.42 MB/s) | **182.432 ms** (`rust_bzip2` `0.6.1`) | 0.68x | 8.79 MiB | **6.46 MiB** |
 
 ## 各包明细
 
@@ -2938,3 +2940,27 @@ stdout 44,142 B，SHA-256 `ae6a32d2b290b90721081c6723ac8e17660aaaf467d279735d59f
 stdout 50,288 B，SHA-256 `7e9035d180b1c0be324c85c16b4048a7500c10b2c65d71e11ac903945216689d`（两端全部轮次与原图逐字节一致）。
 
 如实说明：单线程纯 Pion `lepton` 在三项吞吐上均落后多线程 Rust `lepton_jpeg`（`0.48x`–`0.72x`），压缩率相差 1.6–2.3 个百分点（基线 −25.41% vs −27.72%，渐进 −24.64% vs −26.26%）；由于 `rust_lepton_jpeg` 使用 `DEFAULT_THREAD_POOL`（多线程），其峰值 RSS 与多核加速比会随线程数与共享 Linux VM 负载波动（Pion 峰值 RSS 约低 1.3–1.9×，本次实测 4.30–4.89 MiB vs 8.13–8.71 MiB）。`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）输出 `lepton_wasm_smoke: OK checks=4 base=151 prog=1201 fnv64=979157046982172007`，SHA-256 `311e4623416b52a481bfadd5dcf1d1e37a4dd03df06ac336fc2fde7e0bbe60c0` 全部一致。
+
+### bzip2
+
+参考实现：Rust [`bzip2`](https://crates.io/crates/bzip2) `0.6.1`（锁定 `libbz2-rs-sys` `=0.2.7` 后端，`--release`，记作 `rust_bzip2`；编码器金标测试另对齐 `libbz2-rs-sys 0.2.3`）。环境：Intel Xeon Platinum 8581C（`Linux x86_64`），`pionc 0.1.0 (amd64_sysv, self-hosted)` `--release`，`rustc 1.96.0`。`sh packages/bzip2/bench/run_bench.sh`（`scripts/bench_compare.py`，`--warmup 1 --rounds 5` 严格交替）。输入为确定性生成的 768 KiB（`786,432 B`）结构化 JSON/HTTP 日志语料；基准前先做全量字节 SHA-256 校验，压缩输出（`786,432 B → 34,946 B`，`sha256:d4cb2a2a092f2c02...`）与解压输出（`34,946 B → 786,432 B`，`sha256:ea091dc1e46ec9ab...`）两端均逐字节一致。
+
+#### 1. L6 压缩（768 KiB × 3 = 2,359,296 B）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_bzip2`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_bzip2`（`--release`） | 656.495 | 518.935 | 1252.113 | 3.59 | 15.34 MiB | 0.41x |
+| `rust_bzip2`（`0.6.1 --release`） | **269.012** | 259.422 | 386.063 | 8.77 | **7.77 MiB** | 1.00x (baseline) |
+
+stdout 98 B，SHA-256 `07e5114911044ec15c475eca5f1bf25c341775bb97a9827a93c381a2c735b725`（两端全部轮次一致）。
+
+#### 2. L6 解压（768 KiB × 10 = 7,864,320 B）
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_bzip2`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion_bzip2`（`--release`） | 267.268 | 220.058 | 348.702 | 29.42 | 8.79 MiB | 0.68x |
+| `rust_bzip2`（`0.6.1 --release`） | **182.432** | 150.926 | 224.205 | 43.11 | **6.46 MiB** | 1.00x (baseline) |
+
+stdout 94 B，SHA-256 `ccde469114e3ca2cddabfae68d2ee9c68bdea42889495e9d4119e3960495cff2`（两端全部轮次一致）。
+
+如实说明：两项均落后 Rust——L6 压缩 **0.41x**（主要在 BWT 块排序内循环，Peak RSS 15.34 vs 7.77 MiB），L6 解压 **0.68x**（Peak RSS 8.79 vs 6.46 MiB）。12 / 12 单测通过；`wasm_smoke` 4 模（native debug / native `--release` / wasm32 debug / wasm32 `--release`）stdout SHA-256 `3e8ba80c873e78ff09aa9f9cdc8c6dde0b9aeb3ecc48890e141b6594a6594de4` 逐字节一致。
