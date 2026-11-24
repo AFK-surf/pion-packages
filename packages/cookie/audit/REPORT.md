@@ -51,6 +51,28 @@ without a direct security consequence, robustness, performance or documentation.
 Trigger tiers (security-audit convention): ① default configuration, no special input; ② specific but legitimate
 configuration / timing; ③ attacker-controlled input across a trust boundary.
 
+## SIGN-OFF: `origin/feat/pkg-cookie-fix` @ `df670114` (audit `29e39a60`)
+
+`df670114` changes only `scripts/gen_unicode_noncanon.py` and the regenerated `src/unicode_noncanon.pion` relative to
+`755d2d7f`: the hard-coded whitelist is gone and only trailing code points of canonical primary composites plus Hangul
+V/T jamo are refused (P2-12 closed: `www.ร้าน.ไทย` → `ร้าน.ไทย`, `Domain=ร้าน.ไทย` stored; `x.ČÁHCESUOLO.NO`, NFD
+spellings, U+0958, conjoining jamo still refused). `audit/` is byte-identical to `29e39a60`; both generators pass
+`--check`.
+
+`STRICT=1 sh packages/cookie/audit/run_audit.sh` on `df670114`: **`EXIT=0`, `RESULT: clean`, 0 P0, 0 OPEN** — 28/28
+cases in native debug / release and wasm32 debug / release, package tests 15/15, all corpora 4-mode byte-identical,
+reference model 0 divergences on parse / date / match / jar (psl: 8 accepted fail-closed refusals), test_psl 77/77,
+`psl 2.1.261` differences only the 3 newer rules, its nested-wildcard bug and refused over-long names, every DoS bomb
+< 0.33 s native / < 0.51 s wasm32, shipped bench SHA-256 identical (Set-Cookie 0.49x, PSL 0.20x of Rust), wasm_smoke
+SHA-256 `0769a814…` in 4 modes, harness 5/5. Baseline `083024a1` with the same audit: `EXIT=0`, `STRICT=1` → `EXIT=1`,
+all 16 original findings reproduce, harness 5/5.
+
+**Signed off for release as `cookie` v0.1.0.** Non-blocking notes: (1) `gen_unicode_noncanon.py` reflects the Unicode
+version of the Python that runs it (the committed table is Unicode 13.0 from Python 3.9); characters added later are
+treated as stable and `--check` fails on a Python with a different Unicode version — pin the version in the script's
+docstring when it is next touched. (2) Binary sizes measured 512 / 658 / 457 / 457 KiB vs README 496 / 625 / 448 / 448
+KiB (within the 10 % gate).
+
 ## Re-audit 3: `origin/feat/pkg-cookie-fix` @ `755d2d7f`
 
 `755d2d7f` adds `scripts/gen_unicode_noncanon.py` (`--check` passes) and `src/unicode_noncanon.pion` (980 ranges); the
