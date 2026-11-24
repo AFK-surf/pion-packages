@@ -18,14 +18,16 @@ Re-audit 2 reviewed `585254aa..b84c35e8` (README.md, src/linebreak.pion, src/lin
   code (U+25CC and ExtPict&Cn anchors are exact because the sot initialisation sets those flags).
   `find_backward_anchor` treats every non-continuation byte as a decoder boundary and resolves continuation runs
   by maximal subpart (a run of 4 continuation bytes, or one its lead does not consume, is a standalone U+FFFD = AL
-  anchor). Iterating `next_break_opportunity` is now linear on every script measured: d25 Latin 7.1x / 4.3x
-  (4n/n, native / wasm32; gate < 8), d26 Korean 5.6x / 7.5x, d27 Hebrew 4.4x / 1.0x, d28 `"\xff "` 2.8x / 2.8x,
-  d29 small kana 2.9x / 0.8x, d30 CJK 2.1x / 2.5x, d31 mixed news text 4.2x / 2.5x (16-56 KB at 4n, 0.6-7.6 ms).
+  anchor). Iterating `next_break_opportunity` is now linear on every script measured (final run, 4n/n native /
+  wasm32, gate < 8): d25 Latin 3.8x / 2.2x, d26 Korean 4.2x / 1.8x, d27 Hebrew 4.2x / 2.0x, d28 `"\xff "`
+  4.1x / 1.4x, d29 small kana 4.2x / 3.4x, d30 CJK 4.0x / 1.7x, d31 mixed news text 4.2x / 1.4x (64-224 KB at 4n,
+  5-14 ms). (These bombs were enlarged 4x for the final run: at < 1 ms per run, wasm32 JIT tiering made one d31
+  measurement read 14.9x; at the new size it is 1.4-2.6x.)
   For text made only of the 12 non-anchor classes the per-call cost is O(distance to the nearest anchor), as
   README.md now documents (d32-d35 `"- "`, RI SP, VI SP, U+2010 SP stay quadratic through
   `next_break_opportunity` and are reported as *documented*), and the new **`LineBreakIter`**
   (`line_break_iter(s)` / `next()`) is the O(n) way: d36-d41 (`"- "`, RI SP, VI SP, U+2010 SP, Korean, a + CM x
-  250k, up to 2.5 MB) 2.6-5.7x, 28-56 ms at 4n.
+  250k, up to 2.5 MB) 3.0-8.0x (all < 8), 30-123 ms at 4n.
 - **`LineBreakIter` == `line_breaks`** on all 72,217 inputs (official vectors, named incl. 32 anchor seams, pairs,
   fastpath, fuzz, long), native and wasm32, and stays exhausted (3 extra `next()` calls return `None`).
   `next_break_opportunity` == `line_breaks` at every byte offset plus 8 hostile offsets: 1,380,777 calls on 55,893
@@ -38,7 +40,7 @@ Re-audit 2 reviewed `585254aa..b84c35e8` (README.md, src/linebreak.pion, src/lin
 - **README claims reproduced:** unit tests 21/21; `Send`: LineBreakClass, BreakKind, BreakOpportunity,
   LineBreakError, LineBreakLimits, String; `!Send` (`E_NOT_SEND`): `Array[BreakOpportunity]`, `LineBreakIter`;
   `wasm_smoke` stdout and SHA-256 `5b5e94c5…8b70` in 4 modes, wasm32 81,346 B; benchmark differential 123/123,
-  both stdout SHA-256 equal README, speed 0.17x / 0.17x of Rust (README 0.16x / 0.14x).
+  both stdout SHA-256 equal README, speed 0.14x / 0.27x of Rust on a loaded machine (README 0.16x / 0.14x; earlier run 0.17x / 0.17x).
 - **Mutation proof:** 32/32 injected bugs caught, incl. the regressions of every fix (LB21a EA exclusion, LB10
   flags, SP / RI / QU accepted as anchors, anchor search past the target, a 4-byte sequence's continuation taken
   as standalone) and 5 mutants of the `LineBreakIter` copy of the engine (LB21a, LB10, LB30a, eot kind, sot
