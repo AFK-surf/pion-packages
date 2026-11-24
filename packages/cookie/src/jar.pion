@@ -1,15 +1,16 @@
 ///| RFC 6265bis CookieJar with CHIPS partitioning, Mozilla PSL guards, SameSite,
-///| HttpOnly/Secure isolation, deterministic eviction, and text export/import.
+///| HttpOnly/Secure isolation, per-site eviction, and atomic text export/import.
 
 pub struct CookieJar {
   limits : JarLimits
   cookies : Array[StoredCookie]
+  site_keys : Array[String]
   mut next_seq : Int64
 }
 
 ///| Create a `CookieJar` with custom limits and policies.
 pub fn CookieJar::with_limits(limits : JarLimits) -> CookieJar {
-  CookieJar::{ limits: limits, cookies: [], next_seq: 1L }
+  CookieJar::{ limits: limits, cookies: [], site_keys: [], next_seq: 1L }
 }
 
 ///| Create a `CookieJar` with default RFC 6265bis limits.
@@ -48,18 +49,50 @@ fn is_cookie_expired(c : StoredCookie, now : Int64) -> Bool {
   }
 }
 
+fn has_edge_wsp(s : String) -> Bool {
+  let n = s.length()
+  if n == 0 {
+    return false
+  }
+  is_wsp(s.code_unit_at(0) & 255) || is_wsp(s.code_unit_at(n - 1) & 255)
+}
+
+fn validate_cookie_name_value(
+  name : String,
+  value : String,
+  max_cookie_bytes : Int,
+) -> Result[Unit, CookieError] {
+  if name.length() == 0 && value.length() == 0 {
+    return Err(CookieError::InvalidHeader("empty cookie name and value"))
+  }
+  if name.length() + value.length() > max_cookie_bytes {
+    return Err(CookieError::SizeExceeded("cookie exceeds jar max_cookie_bytes"))
+  }
+  if has_forbidden_ctl(name) || contains_byte(name, 59) || contains_byte(name, 61) || has_edge_wsp(name) {
+    return Err(CookieError::InvalidName("forbidden character or padding in cookie name"))
+  }
+  if has_forbidden_ctl(value) || contains_byte(value, 59) || has_edge_wsp(value) {
+    return Err(CookieError::InvalidValue("forbidden character or padding in cookie value"))
+  }
+  Ok(())
+}
+
+fn compute_site_key(domain : String, include_private : Bool) -> String {
+  let reg = if include_private {
+    registrable_domain(domain)
+  } else {
+    registrable_domain_icann(domain)
+  }
+  match reg {
+    Some(r) => r
+    None => domain
+  }
+}
+
 fn normalize_partition_site(site : String, include_private : Bool) -> String {
   match parse_request_url(site) {
     Ok(u) => {
-      let reg = if include_private {
-        registrable_domain(u.host)
-      } else {
-        registrable_domain_icann(u.host)
-      }
-      let site_host = match reg {
-        Some(r) => r
-        None => u.host
-      }
+      let site_host = compute_site_key(u.host, include_private)
       u.scheme + "://" + site_host
     }
     Err(_) => ascii_lower_str(site)
@@ -70,15 +103,7 @@ fn compute_partition_key(ctx : RequestContext, parsed : ParsedUrl, include_priva
   match ctx.top_level_site {
     Some(s) => normalize_partition_site(s, include_private)
     None => {
-      let reg = if include_private {
-        registrable_domain(parsed.host)
-      } else {
-        registrable_domain_icann(parsed.host)
-      }
-      let site_host = match reg {
-        Some(r) => r
-        None => parsed.host
-      }
+      let site_host = compute_site_key(parsed.host, include_private)
       parsed.scheme + "://" + site_host
     }
   }
@@ -94,6 +119,15 @@ fn saturating_add_i64(a : Int64, b : Int64) -> Int64 {
   }
 }
 
+fn saturating_sub_1_i64(a : Int64) -> Int64 {
+  let min_i64 = -9223372036854775807L - 1L
+  if a == min_i64 {
+    min_i64
+  } else {
+    a - 1L
+  }
+}
+
 fn is_psl_with_mode(host : String, include_private : Bool) -> Bool {
   if include_private {
     is_public_suffix(host)
@@ -102,12 +136,13 @@ fn is_psl_with_mode(host : String, include_private : Bool) -> Bool {
   }
 }
 
-///| Pick the best eviction victim index among indices matching `domain_filter`
+///| Pick the best eviction victim index among indices matching `site_filter`
 ///| (`None` = global eviction).
 ///| RFC 6265bis §5.7 priority: expired > non-Secure > oldest last_access_time.
 fn pick_eviction_victim(
   cookies : Array[StoredCookie],
-  domain_filter : Option[String],
+  site_keys : Array[String],
+  site_filter : Option[String],
   now : Int64,
 ) -> Int {
   let mut best = -1
@@ -118,15 +153,15 @@ fn pick_eviction_victim(
 
   let mut i = 0
   while i < cookies.length() {
-    let c = cookies[i]
-    let matches_dom = match domain_filter {
-      Some(d) => c.domain == d
+    let matches_site = match site_filter {
+      Some(s) => site_keys[i] == s
       None => true
     }
-    if !matches_dom {
+    if !matches_site {
       i = i + 1
       continue
     }
+    let c = cookies[i]
     let exp = is_cookie_expired(c, now)
     let non_sec = !c.secure
     if best == -1 {
@@ -158,21 +193,23 @@ fn pick_eviction_victim(
   best
 }
 
-fn remove_at(cookies : Array[StoredCookie], idx : Int) -> Unit {
+fn remove_cookie_at(cookies : Array[StoredCookie], site_keys : Array[String], idx : Int) -> Unit {
   let n = cookies.length()
   let mut i = idx
   while i + 1 < n {
     cookies[i] = cookies[i + 1]
+    site_keys[i] = site_keys[i + 1]
     i = i + 1
   }
   let _ = cookies.pop()
+  let _ = site_keys.pop()
 }
 
-fn count_domain_cookies(cookies : Array[StoredCookie], domain : String) -> Int {
+fn count_site_cookies(site_keys : Array[String], site : String) -> Int {
   let mut cnt = 0
   let mut i = 0
-  while i < cookies.length() {
-    if cookies[i].domain == domain {
+  while i < site_keys.length() {
+    if site_keys[i] == site {
       cnt = cnt + 1
     }
     i = i + 1
@@ -191,11 +228,23 @@ pub fn CookieJar::store_cookie(
     Ok(u) => u
     Err(e) => return Err(e)
   }
-  if cookie.name.length() == 0 && cookie.value.length() == 0 {
-    return Err(CookieError::InvalidHeader("empty cookie name and value"))
+  match validate_cookie_name_value(cookie.name, cookie.value, self.limits.max_cookie_bytes) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
   }
-  if cookie.name.length() + cookie.value.length() > self.limits.max_cookie_bytes {
-    return Err(CookieError::SizeExceeded("cookie exceeds jar max_cookie_bytes"))
+  match cookie.domain {
+    Some(d) =>
+    if has_forbidden_ctl(d) || contains_byte(d, 59) {
+      return Err(CookieError::InvalidFormat("forbidden character in Domain"))
+    }
+    None => ()
+  }
+  match cookie.path {
+    Some(p) =>
+    if has_forbidden_ctl(p) || contains_byte(p, 59) {
+      return Err(CookieError::InvalidFormat("forbidden character in Path"))
+    }
+    None => ()
   }
   if cookie.http_only && !ctx.is_http_api {
     return Err(CookieError::HttpOnlyViolation("non-HTTP API cannot set HttpOnly cookie"))
@@ -223,16 +272,23 @@ pub fn CookieJar::store_cookie(
   if same_site_eq(effective_ss, SameSite::None) && !cookie.secure {
     return Err(CookieError::SecureOriginRequired("SameSite=None requires Secure"))
   }
+  // RFC 6265bis §5.7 step 18: reject cross-site sets for SameSite != None
+  // unless from an HTTP top-level navigation.
+  if !same_site_eq(effective_ss, SameSite::None) &&
+  !ctx.is_same_site &&
+  (!ctx.is_http_api || !ctx.is_top_level_navigation) {
+    return Err(CookieError::InvalidHeader("cross-site context cannot set SameSite cookie"))
+  }
 
-  // Domain validation & PSL check (RFC 6265bis §5.7)
+  // Domain validation & PSL check (RFC 6265bis §5.7 steps 7-10)
+  // Note: parse_set_cookie already strips at most one leading '.'; do not strip a second one here.
   let (domain, host_only) = match cookie.domain {
     Some(raw_d) => {
-      let mut d = ascii_lower_str(raw_d)
-      if d.length() > 0 && d.code_unit_at(0) == 46 {
-        d = d.slice(1, d.length())
-      }
+      let d = ascii_lower_str(raw_d)
       if d.length() == 0 {
         (parsed.host, true)
+      } else if !is_ip_address(d) && public_suffix_info(d, self.limits.include_private_psl) is None {
+        return Err(CookieError::PublicSuffixRejected(d))
       } else if is_psl_with_mode(d, self.limits.include_private_psl) {
         if d == parsed.host {
           (parsed.host, true)
@@ -263,7 +319,7 @@ pub fn CookieJar::store_cookie(
   let (persistent, expiry_time) : (Bool, Option[Int64]) = match cookie.max_age {
     Some(ma) =>
     if ma <= 0L {
-      (true, Some(ctx.now_unix_secs - 1L))
+      (true, Some(saturating_sub_1_i64(ctx.now_unix_secs)))
     } else {
       let capped = match self.limits.max_lifetime_secs {
         Some(cap) => if ma > cap { cap } else { ma }
@@ -287,13 +343,31 @@ pub fn CookieJar::store_cookie(
     }
   }
 
-  // Find existing cookie with identical (name, domain, path, partition_key)
+  // RFC 6265bis §5.7 step 16 ("leave secure cookies alone"):
+  // A non-secure origin cannot shadow an existing Secure cookie with the same name
+  // whose domain domain-matches either way and whose path is path-matched by the new path.
+  if !cookie.secure && !parsed.is_secure {
+    let mut si = 0
+    while si < self.cookies.length() {
+      let old = self.cookies[si]
+      if old.name == cookie.name &&
+      old.secure &&
+      (domain_matches(old.domain, domain) || domain_matches(domain, old.domain)) &&
+      path_matches(path, old.path) {
+        return Err(CookieError::SecureOriginRequired("non-secure origin cannot shadow Secure cookie"))
+      }
+      si = si + 1
+    }
+  }
+
+  // RFC 6265bis §5.7 step 23: identity is (name, domain, host_only, path, partition_key)
   let mut existing_idx = -1
   let mut i = 0
   while i < self.cookies.length() {
     let c = self.cookies[i]
     if c.name == cookie.name &&
     c.domain == domain &&
+    c.host_only == host_only &&
     c.path == path &&
     opt_string_eq(c.partition_key, partition_key) {
       existing_idx = i
@@ -312,7 +386,7 @@ pub fn CookieJar::store_cookie(
       return Err(CookieError::SecureOriginRequired("non-secure origin cannot overwrite Secure cookie"))
     }
     creation_time = old.creation_time
-    remove_at(self.cookies, existing_idx)
+    remove_cookie_at(self.cookies, self.site_keys, existing_idx)
   }
 
   // If already expired, do not store (any prior cookie with the same key was deleted above)
@@ -324,24 +398,24 @@ pub fn CookieJar::store_cookie(
     None => ()
   }
 
-  // Enforce per-domain limit
+  // Enforce per-site (eTLD+1) limit and global limit
   if self.limits.max_cookies_per_domain <= 0 || self.limits.max_cookies <= 0 {
     return Ok(false)
   }
-  while count_domain_cookies(self.cookies, domain) >= self.limits.max_cookies_per_domain {
-    let victim = pick_eviction_victim(self.cookies, Some(domain), ctx.now_unix_secs)
+  let site_key = compute_site_key(domain, self.limits.include_private_psl)
+  while count_site_cookies(self.site_keys, site_key) >= self.limits.max_cookies_per_domain {
+    let victim = pick_eviction_victim(self.cookies, self.site_keys, Some(site_key), ctx.now_unix_secs)
     if victim < 0 {
       break
     }
-    remove_at(self.cookies, victim)
+    remove_cookie_at(self.cookies, self.site_keys, victim)
   }
-  // Enforce global limit
   while self.cookies.length() >= self.limits.max_cookies {
-    let victim = pick_eviction_victim(self.cookies, None, ctx.now_unix_secs)
+    let victim = pick_eviction_victim(self.cookies, self.site_keys, None, ctx.now_unix_secs)
     if victim < 0 {
       break
     }
-    remove_at(self.cookies, victim)
+    remove_cookie_at(self.cookies, self.site_keys, victim)
   }
 
   let stored = StoredCookie::{
@@ -361,6 +435,7 @@ pub fn CookieJar::store_cookie(
     persistent: persistent,
   }
   self.cookies.push(stored)
+  self.site_keys.push(site_key)
   self.next_seq = self.next_seq + 1L
   Ok(true)
 }
@@ -389,7 +464,7 @@ fn cookie_should_send_samesite(c : StoredCookie, ctx : RequestContext) -> Bool {
   }
   match c.same_site {
     SameSite::None => true
-    SameSite::Lax => ctx.is_top_level_navigation && ctx.is_safe_method
+    SameSite::Lax => ctx.is_http_api && ctx.is_top_level_navigation && ctx.is_safe_method
     SameSite::Strict => false
   }
 }
@@ -404,7 +479,7 @@ pub fn CookieJar::matching_cookies(
     Ok(u) => u
     Err(e) => return Err(e)
   }
-  let req_pkey = compute_partition_key(ctx, parsed, self.limits.include_private_psl)
+  let mut req_pkey_cache : Option[String] = None
 
   let matched : Array[StoredCookie] = []
   let mut i = 0
@@ -417,7 +492,7 @@ pub fn CookieJar::matching_cookies(
     let dom_ok = if c.host_only {
       parsed.host == c.domain
     } else {
-      domain_matches(parsed.host, c.domain)
+      domain_matches(parsed.host, c.domain) && !is_psl_with_mode(c.domain, self.limits.include_private_psl)
     }
     if !dom_ok {
       i = i + 1
@@ -439,14 +514,21 @@ pub fn CookieJar::matching_cookies(
       i = i + 1
       continue
     }
-    // CHIPS partition isolation:
-    // Partitioned cookies only match when their partition_key equals the request's top-level site.
-    // Unpartitioned cookies (partition_key == None) match any top-level site.
+    // CHIPS partition isolation (lazy partition key computation)
     match c.partition_key {
-      Some(pk) =>
-      if pk != req_pkey {
-        i = i + 1
-        continue
+      Some(pk) => {
+        let rpk = match req_pkey_cache {
+          Some(v) => v
+          None => {
+            let v = compute_partition_key(ctx, parsed, self.limits.include_private_psl)
+            req_pkey_cache = Some(v)
+            v
+          }
+        }
+        if pk != rpk {
+          i = i + 1
+          continue
+        }
       }
       None => ()
     }
@@ -532,38 +614,55 @@ pub fn CookieJar::cookie_header(
 pub fn CookieJar::clear(self : CookieJar) -> Unit {
   while self.cookies.length() > 0 {
     let _ = self.cookies.pop()
+    let _ = self.site_keys.pop()
   }
 }
 
-///| Remove all cookies belonging to `domain` (case-insensitive exact domain match).
+///| Remove all cookies belonging to `domain` (case-insensitive exact domain match) in O(N).
 ///| Returns the number of cookies removed.
 pub fn CookieJar::clear_domain(self : CookieJar, domain : String) -> Int {
   let target = ascii_lower_str(domain)
-  let mut removed = 0
+  let n = self.cookies.length()
+  let mut w = 0
   let mut i = 0
-  while i < self.cookies.length() {
-    if self.cookies[i].domain == target {
-      remove_at(self.cookies, i)
-      removed = removed + 1
-    } else {
-      i = i + 1
+  while i < n {
+    if self.cookies[i].domain != target {
+      if w != i {
+        self.cookies[w] = self.cookies[i]
+        self.site_keys[w] = self.site_keys[i]
+      }
+      w = w + 1
     }
+    i = i + 1
+  }
+  let removed = n - w
+  while self.cookies.length() > w {
+    let _ = self.cookies.pop()
+    let _ = self.site_keys.pop()
   }
   removed
 }
 
-///| Remove all cookies expired at or before `now_unix_secs`.
+///| Remove all cookies expired at or before `now_unix_secs` in O(N).
 ///| Returns the number of cookies removed.
 pub fn CookieJar::purge_expired(self : CookieJar, now_unix_secs : Int64) -> Int {
-  let mut removed = 0
+  let n = self.cookies.length()
+  let mut w = 0
   let mut i = 0
-  while i < self.cookies.length() {
-    if is_cookie_expired(self.cookies[i], now_unix_secs) {
-      remove_at(self.cookies, i)
-      removed = removed + 1
-    } else {
-      i = i + 1
+  while i < n {
+    if !is_cookie_expired(self.cookies[i], now_unix_secs) {
+      if w != i {
+        self.cookies[w] = self.cookies[i]
+        self.site_keys[w] = self.site_keys[i]
+      }
+      w = w + 1
     }
+    i = i + 1
+  }
+  let removed = n - w
+  while self.cookies.length() > w {
+    let _ = self.cookies.pop()
+    let _ = self.site_keys.pop()
   }
   removed
 }
@@ -583,9 +682,7 @@ fn escape_field(s : String) -> String {
     } else if c == 13 {
       sb.write_string("\\r")
     } else {
-      let b = Bytes::new(1)
-      b[0] = c.to_byte()
-      sb.write_string(b.to_string())
+      sb.write_byte(c.to_byte())
     }
     i = i + 1
   }
@@ -611,14 +708,14 @@ fn unescape_field(s : String) -> Result[String, CookieError] {
         sb.write_string("\n")
       } else if next == 114 {
         sb.write_string("\r")
+      } else if next == 45 {
+        sb.write_string("-")
       } else {
         return Err(CookieError::InvalidFormat("unknown escape sequence"))
       }
       i = i + 2
     } else {
-      let b = Bytes::new(1)
-      b[0] = c.to_byte()
-      sb.write_string(b.to_string())
+      sb.write_byte(c.to_byte())
       i = i + 1
     }
   }
@@ -651,7 +748,12 @@ pub fn CookieJar::export_text(self : CookieJar) -> String {
     sb.write_string(if c.partitioned { "1" } else { "0" })
     sb.write_string("\t")
     match c.partition_key {
-      Some(pk) => sb.write_string(escape_field(pk))
+      Some(pk) =>
+      if pk == "-" {
+        sb.write_string("\\-")
+      } else {
+        sb.write_string(escape_field(pk))
+      }
       None => sb.write_string("-")
     }
     sb.write_string("\t")
@@ -684,6 +786,16 @@ fn split_tabs(line : String) -> Array[String] {
   parts
 }
 
+fn parse_bool_strict(s : String, field : String) -> Result[Bool, CookieError] {
+  if s == "1" {
+    Ok(true)
+  } else if s == "0" {
+    Ok(false)
+  } else {
+    Err(CookieError::InvalidFormat("invalid boolean for " + field + ": " + s))
+  }
+}
+
 fn parse_i64_strict(s : String) -> Result[Int64, CookieError] {
   match parse_max_age_value(s, 0, s.length()) {
     Some(v) => Ok(v)
@@ -691,11 +803,55 @@ fn parse_i64_strict(s : String) -> Result[Int64, CookieError] {
   }
 }
 
-///| Import cookies from `export_text()` output. Returns number of imported cookies.
+fn fnv1a_hash_str(h0 : UInt64, s : String) -> UInt64 {
+  let mut h = h0
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    h = (h ^ (s.code_unit_at(i) & 255).to_int64().to_uint64()) * 1099511628211UL
+    i = i + 1
+  }
+  (h ^ 255UL) * 1099511628211UL
+}
+
+fn cookie_identity_hash(c : StoredCookie) -> UInt64 {
+  let mut h = 14695981039346656037UL
+  h = fnv1a_hash_str(h, c.name)
+  h = fnv1a_hash_str(h, c.domain)
+  h = (h ^ (if c.host_only { 1UL } else { 0UL })) * 1099511628211UL
+  h = fnv1a_hash_str(h, c.path)
+  match c.partition_key {
+    Some(pk) => fnv1a_hash_str(h, pk)
+    None => (h ^ 17UL) * 1099511628211UL
+  }
+}
+
+fn cookie_same_identity(a : StoredCookie, b : StoredCookie) -> Bool {
+  a.name == b.name &&
+  a.domain == b.domain &&
+  a.host_only == b.host_only &&
+  a.path == b.path &&
+  opt_string_eq(a.partition_key, b.partition_key)
+}
+
+fn next_pow2(n : Int) -> Int {
+  let mut cap = 16
+  while cap < n {
+    cap = cap * 2
+  }
+  cap
+}
+
+///| Import cookies from `export_text()` output atomically (all-or-nothing),
+///| enforcing field validation, identity deduplication, and `JarLimits` in O(N).
+///| Returns number of cookies parsed and accepted.
 pub fn CookieJar::import_text(self : CookieJar, data : String) -> Result[Int, CookieError] {
+  let incoming : Array[StoredCookie] = []
+  let incoming_sites : Array[String] = []
   let n = data.length()
   let mut pos = 0
-  let mut count = 0
+  let mut last_domain = ""
+  let mut last_site = ""
   while pos < n {
     let start = pos
     while pos < n && data.code_unit_at(pos) != 10 {
@@ -723,30 +879,84 @@ pub fn CookieJar::import_text(self : CookieJar, data : String) -> Result[Int, Co
       Ok(v) => v
       Err(e) => return Err(e)
     }
+    match validate_cookie_name_value(name, value, self.limits.max_cookie_bytes) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    if name.length() == 0 {
+      if starts_with_ascii_icase(value, "__secure-") ||
+      starts_with_ascii_icase(value, "__host-") ||
+      starts_with_ascii_icase(value, "__http-") ||
+      starts_with_ascii_icase(value, "__host-http-") {
+        return Err(CookieError::PrefixViolation("nameless cookie value cannot begin with reserved prefix"))
+      }
+    }
     let domain = match unescape_field(cols[2]) {
+      Ok(v) => ascii_lower_str(v)
+      Err(e) => return Err(e)
+    }
+    if domain.length() == 0 || has_forbidden_ctl(domain) || contains_byte(domain, 59) {
+      return Err(CookieError::InvalidFormat("invalid domain in jar export"))
+    }
+    let host_only = match parse_bool_strict(cols[3], "host_only") {
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    let host_only = cols[3] == "1"
+    if !host_only &&
+    (is_psl_with_mode(domain, self.limits.include_private_psl) ||
+      (!is_ip_address(domain) && public_suffix_info(domain, self.limits.include_private_psl) is None)) {
+      return Err(CookieError::PublicSuffixRejected(domain))
+    }
     let path = match unescape_field(cols[4]) {
       Ok(v) => v
       Err(e) => return Err(e)
     }
-    let secure = cols[5] == "1"
-    let http_only = cols[6] == "1"
+    if path.length() == 0 || path.code_unit_at(0) != 47 || has_forbidden_ctl(path) || contains_byte(path, 59) {
+      return Err(CookieError::InvalidFormat("invalid path in jar export"))
+    }
+    let secure = match parse_bool_strict(cols[5], "secure") {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let http_only = match parse_bool_strict(cols[6], "http_only") {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
     let same_site = if cols[7] == "Strict" {
       SameSite::Strict
+    } else if cols[7] == "Lax" {
+      SameSite::Lax
     } else if cols[7] == "None" {
       SameSite::None
     } else {
-      SameSite::Lax
+      return Err(CookieError::InvalidFormat("invalid SameSite: " + cols[7]))
     }
-    let partitioned = cols[8] == "1"
+    if same_site_eq(same_site, SameSite::None) && !secure {
+      return Err(CookieError::SecureOriginRequired("SameSite=None requires Secure"))
+    }
+    let partitioned = match parse_bool_strict(cols[8], "partitioned") {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if partitioned && !secure {
+      return Err(CookieError::PartitionedRequiresSecure("Partitioned requires Secure"))
+    }
     let partition_key : Option[String] = if cols[9] == "-" {
+      if partitioned {
+        return Err(CookieError::InvalidFormat("partitioned cookie missing partition_key"))
+      }
       None
     } else {
+      if !partitioned {
+        return Err(CookieError::InvalidFormat("unpartitioned cookie has partition_key"))
+      }
       match unescape_field(cols[9]) {
-        Ok(v) => Some(v)
+        Ok(v) => {
+          if has_forbidden_ctl(v) {
+            return Err(CookieError::InvalidFormat("forbidden character in partition_key"))
+          }
+          Some(v)
+        }
         Err(e) => return Err(e)
       }
     }
@@ -766,7 +976,15 @@ pub fn CookieJar::import_text(self : CookieJar, data : String) -> Result[Int, Co
         Err(e) => return Err(e)
       }
     }
-    self.cookies.push(StoredCookie::{
+    let sk = if domain == last_domain && last_site.length() > 0 {
+      last_site
+    } else {
+      let s = compute_site_key(domain, self.limits.include_private_psl)
+      last_domain = domain
+      last_site = s
+      s
+    }
+    incoming.push(StoredCookie::{
       name: name,
       value: value,
       domain: domain,
@@ -782,7 +1000,130 @@ pub fn CookieJar::import_text(self : CookieJar, data : String) -> Result[Int, Co
       expiry_time: expiry_time,
       persistent: persistent,
     })
-    count = count + 1
+    incoming_sites.push(sk)
   }
-  Ok(count)
+
+  let parsed_count = incoming.length()
+  if parsed_count == 0 {
+    return Ok(0)
+  }
+  if self.limits.max_cookies_per_domain <= 0 || self.limits.max_cookies <= 0 {
+    self.clear()
+    return Ok(0)
+  }
+
+  // Combine existing + incoming, deduplicating by identity in O(N) (later wins)
+  let combined : Array[StoredCookie] = []
+  let combined_sites : Array[String] = []
+  let total_raw = self.cookies.length() + parsed_count
+  let cap = next_pow2(total_raw * 2 + 1)
+  let mask = cap - 1
+  let slots : Array[Int] = []
+  let mut si = 0
+  while si < cap {
+    slots.push(-1)
+    si = si + 1
+  }
+
+  let mut idx_existing = 0
+  while idx_existing < self.cookies.length() {
+    let c = self.cookies[idx_existing]
+    let sk = self.site_keys[idx_existing]
+    let mut h = (cookie_identity_hash(c) & mask.to_int64().to_uint64()).to_int()
+    let mut found = -1
+    while slots[h] != -1 {
+      let pos_c = slots[h]
+      if cookie_same_identity(combined[pos_c], c) {
+        found = pos_c
+        break
+      }
+      h = (h + 1) & mask
+    }
+    if found >= 0 {
+      combined[found] = c
+      combined_sites[found] = sk
+    } else {
+      slots[h] = combined.length()
+      combined.push(c)
+      combined_sites.push(sk)
+    }
+    idx_existing = idx_existing + 1
+  }
+
+  let mut idx_inc = 0
+  while idx_inc < parsed_count {
+    let c = incoming[idx_inc]
+    let sk = incoming_sites[idx_inc]
+    let mut h = (cookie_identity_hash(c) & mask.to_int64().to_uint64()).to_int()
+    let mut found = -1
+    while slots[h] != -1 {
+      let pos_c = slots[h]
+      if cookie_same_identity(combined[pos_c], c) {
+        found = pos_c
+        break
+      }
+      h = (h + 1) & mask
+    }
+    if found >= 0 {
+      combined[found] = c
+      combined_sites[found] = sk
+    } else {
+      slots[h] = combined.length()
+      combined.push(c)
+      combined_sites.push(sk)
+    }
+    idx_inc = idx_inc + 1
+  }
+
+  // Enforce per-site limit in O(N) by walking backwards (keeping newest entries per site)
+  let max_per = self.limits.max_cookies_per_domain
+  let max_glob = self.limits.max_cookies
+  let m = combined.length()
+  let keep : Array[Bool] = []
+  let mut ki = 0
+  while ki < m {
+    keep.push(false)
+    ki = ki + 1
+  }
+
+  // Hash table for per-site counts
+  let sc_cap = next_pow2(m * 2 + 1)
+  let sc_mask = sc_cap - 1
+  let sc_keys : Array[String] = []
+  let sc_vals : Array[Int] = []
+  let mut sci = 0
+  while sci < sc_cap {
+    sc_keys.push("")
+    sc_vals.push(0)
+    sci = sci + 1
+  }
+
+  let mut kept_total = 0
+  let mut rev = m - 1
+  while rev >= 0 && kept_total < max_glob {
+    let sk = combined_sites[rev]
+    let mut h = (fnv1a_hash_str(14695981039346656037UL, sk) & sc_mask.to_int64().to_uint64()).to_int()
+    while sc_vals[h] > 0 && sc_keys[h] != sk {
+      h = (h + 1) & sc_mask
+    }
+    if sc_vals[h] < max_per {
+      sc_keys[h] = sk
+      sc_vals[h] = sc_vals[h] + 1
+      keep[rev] = true
+      kept_total = kept_total + 1
+    }
+    rev = rev - 1
+  }
+
+  // Commit atomically into self.cookies and self.site_keys
+  self.clear()
+  let mut fi = 0
+  while fi < m {
+    if keep[fi] {
+      self.cookies.push(combined[fi])
+      self.site_keys.push(combined_sites[fi])
+    }
+    fi = fi + 1
+  }
+  Ok(parsed_count)
 }
