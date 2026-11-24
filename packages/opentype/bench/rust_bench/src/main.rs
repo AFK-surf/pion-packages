@@ -106,9 +106,11 @@ fn main() {
         for cp in 0u32..=0x10FFFF {
             if let Some(c) = char::from_u32(cp) {
                 if let Some(gid) = face.glyph_index(c) {
-                    cmap_cnt += 1;
-                    cmap_h = fnv1a_i64(cmap_h, cp as i64);
-                    cmap_h = fnv1a_i64(cmap_h, gid.0 as i64);
+                    if gid.0 != 0 {
+                        cmap_cnt += 1;
+                        cmap_h = fnv1a_i64(cmap_h, cp as i64);
+                        cmap_h = fnv1a_i64(cmap_h, gid.0 as i64);
+                    }
                 }
             }
         }
