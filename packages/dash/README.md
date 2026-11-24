@@ -60,7 +60,7 @@ Verified with `pionc check` across a `spawn` boundary:
 - **Differential Parity vs Rust `dash-mpd-core v0.1.0` (the core MPD parser crate of `dash-mpd v0.21.0`, locked `Cargo.lock`)**:
   - **60 / 60** synthetic MPD manifests (15 static `SegmentBase`, 15 dynamic live `SegmentTemplate`+`SegmentTimeline`, 15 multi-`Period` DRM with Widevine/PlayReady `cenc:pssh`, 15 `SegmentList`), field-by-field comparison across `MPD`, `Period`, `AdaptationSet`, `Role`, `ContentProtection`/`pssh`, `SegmentTemplate`/`SegmentTimeline`, `Representation`, `SegmentBase`, and `SegmentList`: **0 divergences**.
 - **4-Mode Verification (`packages/dash/wasm_smoke`)**:
-  - `native debug`, `native --release`, `wasm32 debug` (**217 KiB**), `wasm32 --release` (**210 KiB**) all compile cleanly and emit byte-identical stdout:
+  - `native debug`, `native --release`, `wasm32 debug` (**220 KiB**), `wasm32 --release` (**214 KiB**) all compile cleanly and emit byte-identical stdout:
   - `dash_wasm_smoke:ok`
   - `summary=PT1H2M3.5S|1709209845000000|1|https://cdn.example.com/stream/av1_1080/init.mp4|https://cdn.example.com/stream/av1_1080/chunk_0004_12000.m4s|1256|xxe_blocked fnv64=c1ae0a91eab891cb`
   - SHA-256: `2ce81a010a29ef5fc9e0715fb3a1c7af049a3ebea6ed2c41549a1b08074ec625`
