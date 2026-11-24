@@ -1,10 +1,16 @@
-# `unicode_linebreak` (`v0.1.0`)
+# `unicode_linebreak` (`v0.1.2`)
 
 Pure Pion, zero-external-dependency implementation of the **Unicode 16.0.0 Line Breaking Algorithm (UAX #14, Revision 53)** covering all rules **LB1–LB31**.
 
 - Zero external dependencies (`[dependencies]` empty), zero `extern "C"`, zero `World` dependency, zero `Double`/`Float`, zero `FixedArray`, zero module-level mutable globals/containers, and full Wasm32 compatibility.
 - Strict **O(n)** single-pass streaming scanner with bounded O(1) lookahead cache — resistant to 100,000+ adversarial `SP`/`CM`/`ZWJ`/`QU`/`NU`/`OP`/`CL`/`RI`/`AK+VI` runs without backtracking or stack overflow.
 - Compact 3-level pure-ASCII immutable `String` lookup table + `47×64` DFA pair-action table packed into a single `table_blob` (`45,326 B` in `src/tables.pion`) with O(1) lookup across all 1,114,112 Unicode code points (`U+0000..U+10FFFF`), including inline ASCII word/digit and CJK fast paths.
+
+## Changelog
+
+- **`v0.1.2`**: fixes a `v0.1.1` regression in `line_breaks`: the inline CJK `ID ÷ ID` tight loop left `prev_is_ea` stale when the run followed a non-East-Asian `ID` (e.g. `U+1F6E0`, `U+2600`, `U+2764`), so LB19a wrongly suppressed the break before a following quotation mark (`"🛠岩“東"` now yields `[4, 7, 13]`). `line_breaks_with_limits`, `LineBreakIter`, and `next_break_opportunity` were unaffected.
+- **`v0.1.1`**: `47×64` DFA pair table and zero-allocation hot loops.
+- **`v0.1.0`**: initial release.
 
 ## Features
 
@@ -83,8 +89,8 @@ sh packages/unicode_linebreak/bench/run_bench.sh
 
 ### Unit, Red → Green & Adversarial Suite
 
-- Red → Green verified: `1/15` passed on stub build (`14/15` failed as expected), **`21/21` passed** after full implementation and red-team hardening.
-- Covers mandatory vs allowed breaks (`CR+LF`/`CR`/`LF`/`NL`/`BK`), CJK kinsoku, `ZW`/`SP`/`GL`/`WJ`/`CM`, Emoji ZWJ & skin-tone modifiers (`EB × EM`, `ExtPict(Cn) × EM`), RI flag pairs, LB10 remaining `CM`/`ZWJ` East_Asian_Width clearing, LB15a/b/c/d, LB19/19a, LB20a/21a (including `[BA - $EastAsian]` exclusion), LB25, LB28a Brahmic syllables, unassigned Supplemental Arrows-C `U+1F80C..U+1F8FF` (`XX`), invalid UTF-8 safety, `next_break_opportunity` O(n) backward-anchor iteration across ASCII, Korean (`H2`/`H3`), Hebrew (`HL`), Kana (`CJ→NS`), ill-formed `0xFF`/`0x80` runs, and negative/mid-UTF-8/bounds handling, `LineBreakIter` strict worst-case O(n) streaming on pure non-anchor punctuation streams, `LineBreakLimits` negative/zero/exact bounds, and 100,000-character O(n) DoS stress runs.
+- Red → Green verified: `1/15` passed on stub build (`14/15` failed as expected), **`22/22` passed** after full implementation and red-team hardening.
+- Covers mandatory vs allowed breaks (`CR+LF`/`CR`/`LF`/`NL`/`BK`), CJK kinsoku, `ZW`/`SP`/`GL`/`WJ`/`CM`, Emoji ZWJ & skin-tone modifiers (`EB × EM`, `ExtPict(Cn) × EM`), RI flag pairs, LB10 remaining `CM`/`ZWJ` East_Asian_Width clearing, LB15a/b/c/d, LB19/19a (including the `East_Asian_Width` state across non-East-Asian `ID` + CJK `ID` runs), LB20a/21a (including `[BA - $EastAsian]` exclusion), LB25, LB28a Brahmic syllables, unassigned Supplemental Arrows-C `U+1F80C..U+1F8FF` (`XX`), invalid UTF-8 safety, `next_break_opportunity` O(n) backward-anchor iteration across ASCII, Korean (`H2`/`H3`), Hebrew (`HL`), Kana (`CJ→NS`), ill-formed `0xFF`/`0x80` runs, and negative/mid-UTF-8/bounds handling, `LineBreakIter` strict worst-case O(n) streaming on pure non-anchor punctuation streams, `LineBreakLimits` negative/zero/exact bounds, and 100,000-character O(n) DoS stress runs.
 
 ### Official Unicode 16.0.0 `LineBreakTest.txt` Conformance
 
