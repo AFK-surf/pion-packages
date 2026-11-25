@@ -1,5 +1,6 @@
 ///| RFC 7541 Appendix B Canonical Huffman Codec (256 symbols + EOS)
-///| using a precomputed 4-bit nibble DFA (256 states x 16 transitions = 4096 entries).
+///| using a 64-bit MSB-aligned bit buffer + 10-bit dual-symbol L1 lookup table (4 KiB)
+///| with exact binary-trie fallback for 11..30-bit codes and strict EOS/padding checks.
 
 ///|
 let huff_codes : Array[Int64] = [
@@ -53,29 +54,60 @@ let huff_lens : Array[Int] = [
   26, 23, 26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
 ]
 
-///| Packed 4-bit DFA flags:
-///| bits 0..7   = emitted byte (when huff_flag_sym is set)
-///| bits 8..15  = next DFA state (0..255)
-///| bit 16      = huff_flag_sym
-///| bit 17      = huff_flag_accepted (valid end-of-stream padding <= 7 all-1 bits)
-///| bit 18      = huff_flag_fail (EOS encountered or invalid transition)
-let huff_flag_sym : Int = 0x10000
-let huff_flag_accepted : Int = 0x20000
-let huff_flag_fail : Int = 0x40000
+///| Packed encoding table: `(code << 6) | len` for single-load lookup.
+fn build_huff_enc_packed() -> FixedArray[UInt64] {
+  let out : FixedArray[UInt64] = FixedArray::make(256, 0UL)
+  let mut i = 0
+  while i < 256 {
+    let c = huff_codes[i].to_uint64()
+    let l = huff_lens[i].to_int64().to_uint64()
+    out[i] = (c << 6) | l
+    i = i + 1
+  }
+  out
+}
 
 ///|
-fn build_huffman_dfa() -> Array[Int] {
-  // Build binary trie of 256 symbols + EOS (257 leaves -> 513 total nodes, 256 internal nodes)
+fn build_huff_lens_fa() -> FixedArray[Int] {
+  let out : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut i = 0
+  while i < 256 {
+    out[i] = huff_lens[i]
+    i = i + 1
+  }
+  out
+}
+
+///|
+let huff_enc_packed : FixedArray[UInt64] = build_huff_enc_packed()
+
+///|
+let huff_lens_fa : FixedArray[Int] = build_huff_lens_fa()
+
+///| Precomputed Huffman decode tables:
+///| - `lut12`: 4096-entry L1 table (16 KiB) indexed by top 12 bits of MSB-aligned 64-bit buffer.
+///|   - `0`: code length > 12 bits (fall back to binary trie)
+///|   - `bits 0..3`: total bits consumed (5..12)
+///|   - `bits 4..7`: first symbol bit length `l1` (5..12)
+///|   - `bits 8..15`: `sym1`
+///|   - `bits 16..23`: `sym2` (valid when bit 24 is set)
+///|   - `bit 24 (0x1000000)`: 2 symbols decoded in one lookup (5+5, 5+6, 6+5, 6+6, 5+7, 7+5)
+///| - `left`/`right`/`leaf_sym`: binary trie (513 nodes) for 13..30-bit codes & EOS detection.
+struct HuffDecodeTables {
+  lut12 : FixedArray[Int]
+  left : FixedArray[Int]
+  right : FixedArray[Int]
+  leaf_sym : FixedArray[Int]
+}
+
+///|
+fn build_huffman_tables() -> HuffDecodeTables {
   let max_nodes = 520
-  let left = Array::make(max_nodes, -1)
-  let right = Array::make(max_nodes, -1)
-  let leaf_sym = Array::make(max_nodes, -1)
-  let depth = Array::make(max_nodes, 0)
-  let all_ones = Array::make(max_nodes, false)
-  all_ones[0] = true
+  let left : FixedArray[Int] = FixedArray::make(max_nodes, -1)
+  let right : FixedArray[Int] = FixedArray::make(max_nodes, -1)
+  let leaf_sym : FixedArray[Int] = FixedArray::make(max_nodes, -1)
   let mut node_count = 1
 
-  // Insert 256 symbols
   let mut sym = 0
   while sym < 256 {
     let code = huff_codes[sym]
@@ -89,8 +121,6 @@ fn build_huffman_dfa() -> Array[Int] {
           let nxt = node_count
           node_count = node_count + 1
           left[cur] = nxt
-          depth[nxt] = depth[cur] + 1
-          all_ones[nxt] = false
         }
         cur = left[cur]
       } else {
@@ -98,8 +128,6 @@ fn build_huffman_dfa() -> Array[Int] {
           let nxt = node_count
           node_count = node_count + 1
           right[cur] = nxt
-          depth[nxt] = depth[cur] + 1
-          all_ones[nxt] = all_ones[cur]
         }
         cur = right[cur]
       }
@@ -109,7 +137,6 @@ fn build_huffman_dfa() -> Array[Int] {
     sym = sym + 1
   }
 
-  // Insert EOS (sym = 256, 30 ones = 0x3FFFFFFF)
   let mut eos_cur = 0
   let mut eb = 0
   while eb < 30 {
@@ -117,87 +144,61 @@ fn build_huffman_dfa() -> Array[Int] {
       let nxt = node_count
       node_count = node_count + 1
       right[eos_cur] = nxt
-      depth[nxt] = depth[eos_cur] + 1
-      all_ones[nxt] = all_ones[eos_cur]
     }
     eos_cur = right[eos_cur]
     eb = eb + 1
   }
   leaf_sym[eos_cur] = 256
 
-  // Assign dense state IDs 0..255 to internal nodes (root = 0)
-  let state_of = Array::make(max_nodes, -1)
-  let node_of = Array::make(256, 0)
-  let mut state_count = 0
-  let mut ni = 0
-  while ni < node_count {
-    if leaf_sym[ni] < 0 {
-      state_of[ni] = state_count
-      node_of[state_count] = ni
-      state_count = state_count + 1
-    }
-    ni = ni + 1
-  }
-
-  // Build 256 x 16 transition table
-  let dfa = Array::make(4096, huff_flag_fail)
-  let mut s = 0
-  while s < state_count {
-    let start_node = node_of[s]
-    let mut nib = 0
-    while nib < 16 {
-      let mut cur = start_node
-      let mut failed = false
-      let mut has_sym = false
-      let mut emitted = 0
-      let mut shift = 3
-      while shift >= 0 {
-        let bit = (nib >> shift) & 1
-        cur = if bit == 0 { left[cur] } else { right[cur] }
-        if cur < 0 {
-          failed = true
+  let lut12 : FixedArray[Int] = FixedArray::make(4096, 0)
+  let mut idx = 0
+  while idx < 4096 {
+    let mut cur = 0
+    let mut sym1 = -1
+    let mut l1 = 0
+    let mut sym2 = -1
+    let mut l2 = 0
+    let mut k = 11
+    while k >= 0 {
+      let bit = (idx >> k) & 1
+      cur = if bit == 0 { left[cur] } else { right[cur] }
+      if cur < 0 {
+        break
+      }
+      let ls = leaf_sym[cur]
+      if ls >= 0 {
+        if sym1 < 0 {
+          sym1 = ls
+          l1 = 12 - k
+          cur = 0
+        } else {
+          sym2 = ls
+          l2 = 12 - k
           break
         }
-        let ls = leaf_sym[cur]
-        if ls >= 0 {
-          if ls == 256 {
-            failed = true
-            break
-          }
-          has_sym = true
-          emitted = ls
-          cur = 0
-        }
-        shift = shift - 1
       }
-      if failed {
-        dfa[(s << 4) | nib] = huff_flag_fail
-      } else {
-        let ns = state_of[cur]
-        let acc = all_ones[cur] && depth[cur] <= 7
-        let mut entry = (ns << 8) | emitted
-        if has_sym {
-          entry = entry | huff_flag_sym
-        }
-        if acc {
-          entry = entry | huff_flag_accepted
-        }
-        dfa[(s << 4) | nib] = entry
-      }
-      nib = nib + 1
+      k = k - 1
     }
-    s = s + 1
+    if sym1 >= 0 {
+      if sym2 >= 0 {
+        lut12[idx] = 0x1000000 | (sym2 << 16) | (sym1 << 8) | (l1 << 4) | l2
+      } else {
+        lut12[idx] = (sym1 << 8) | (l1 << 4) | l1
+      }
+    }
+    idx = idx + 1
   }
-  dfa
+
+  HuffDecodeTables::{ lut12: lut12, left: left, right: right, leaf_sym: leaf_sym }
 }
 
 ///|
-let huff_dfa : Array[Int] = build_huffman_dfa()
+let huff_tables : HuffDecodeTables = build_huffman_tables()
 
 ///| Compute exact Huffman-encoded byte length without allocating.
 pub fn huffman_encoded_len(input : Bytes) -> Int {
   let n = input.length()
-  let lens = huff_lens
+  let lens = huff_lens_fa
   let mut bits = 0
   let mut i = 0
   while i < n {
@@ -207,75 +208,10 @@ pub fn huffman_encoded_len(input : Bytes) -> Int {
   (bits + 7) >> 3
 }
 
-///| Encode bytes using RFC 7541 Appendix B canonical Huffman coding.
-pub fn huffman_encode(input : Bytes) -> Bytes {
-  let out_len = huffman_encoded_len(input)
-  if out_len == 0 {
-    return Bytes::new(0)
-  }
-  let mut out = Bytes::new(out_len)
-  let codes = huff_codes
-  let lens = huff_lens
-  let n = input.length()
-  let mut acc = 0L
-  let mut nbits = 0
-  let mut opos = 0
-  let mut i = 0
-  while i < n {
-    let b = input[i].to_int()
-    let l = lens[b]
-    acc = (acc << l) | codes[b]
-    nbits = nbits + l
-    while nbits >= 8 {
-      nbits = nbits - 8
-      out[opos] = ((acc >> nbits) & 0xFFL).to_int().to_byte()
-      opos = opos + 1
-    }
-    i = i + 1
-  }
-  if nbits > 0 {
-    let pad = 8 - nbits
-    let last = (((acc << pad) | ((1L << pad) - 1L)) & 0xFFL).to_int()
-    out[opos] = last.to_byte()
-  }
-  out
-}
-
-///| Internal: encode `input` directly into a pre-allocated buffer starting at `dst_off`.
-///| Returns the number of bytes written.
-fn huffman_encode_into(input : Bytes, dst : Bytes, dst_off : Int) -> Int {
-  let codes = huff_codes
-  let lens = huff_lens
-  let n = input.length()
-  let mut acc = 0L
-  let mut nbits = 0
-  let mut opos = dst_off
-  let mut i = 0
-  while i < n {
-    let b = input[i].to_int()
-    let l = lens[b]
-    acc = (acc << l) | codes[b]
-    nbits = nbits + l
-    while nbits >= 8 {
-      nbits = nbits - 8
-      dst[opos] = ((acc >> nbits) & 0xFFL).to_int().to_byte()
-      opos = opos + 1
-    }
-    i = i + 1
-  }
-  if nbits > 0 {
-    let pad = 8 - nbits
-    let last = (((acc << pad) | ((1L << pad) - 1L)) & 0xFFL).to_int()
-    dst[opos] = last.to_byte()
-    opos = opos + 1
-  }
-  opos - dst_off
-}
-
 ///| Internal: compute exact Huffman-encoded byte length of a String without allocating.
 fn huffman_encoded_len_str(input : String) -> Int {
   let n = input.length()
-  let lens = huff_lens
+  let lens = huff_lens_fa
   let mut bits = 0
   let mut i = 0
   while i < n {
@@ -285,82 +221,353 @@ fn huffman_encoded_len_str(input : String) -> Int {
   (bits + 7) >> 3
 }
 
-///| Internal: encode String `input` directly into a pre-allocated buffer starting at `dst_off`.
-///| Returns the number of bytes written.
-fn huffman_encode_str_into(input : String, dst : Bytes, dst_off : Int) -> Int {
-  let codes = huff_codes
-  let lens = huff_lens
+///| Internal: encode `input` directly into a `Bytes` buffer starting at `dst_off`.
+///| Uses 64-bit accumulator with 4-byte bulk flushes. Returns bytes written.
+fn huffman_encode_into_bytes(
+  input : Bytes,
+  dst : Bytes,
+  dst_off : Int,
+) -> Int {
+  let packed = huff_enc_packed
   let n = input.length()
-  let mut acc = 0L
+  let mut acc = 0UL
   let mut nbits = 0
   let mut opos = dst_off
   let mut i = 0
   while i < n {
-    let b = input.code_unit_at(i)
-    let l = lens[b]
-    acc = (acc << l) | codes[b]
+    let p = packed[input[i].to_int()]
+    let l = (p & 63UL).to_int()
+    acc = (acc << l) | (p >> 6)
     nbits = nbits + l
-    while nbits >= 8 {
-      nbits = nbits - 8
-      dst[opos] = ((acc >> nbits) & 0xFFL).to_int().to_byte()
-      opos = opos + 1
+    if nbits >= 32 {
+      let shift = nbits - 32
+      let w = acc >> shift
+      dst[opos] = ((w >> 24) & 0xFFUL).to_int().to_byte()
+      dst[opos + 1] = ((w >> 16) & 0xFFUL).to_int().to_byte()
+      dst[opos + 2] = ((w >> 8) & 0xFFUL).to_int().to_byte()
+      dst[opos + 3] = (w & 0xFFUL).to_int().to_byte()
+      opos = opos + 4
+      nbits = shift
     }
     i = i + 1
   }
+  while nbits >= 8 {
+    nbits = nbits - 8
+    dst[opos] = ((acc >> nbits) & 0xFFUL).to_int().to_byte()
+    opos = opos + 1
+  }
   if nbits > 0 {
     let pad = 8 - nbits
-    let last = (((acc << pad) | ((1L << pad) - 1L)) & 0xFFL).to_int()
+    let last = (((acc << pad) | ((1UL << pad) - 1UL)) & 0xFFUL).to_int()
     dst[opos] = last.to_byte()
     opos = opos + 1
   }
   opos - dst_off
 }
 
-///| Internal: decode Huffman bytes from `input[start .. start + len]` into caller-supplied `out`
-///| (must have capacity >= ((len * 8) / 5) + 1). Returns decoded byte count.
-fn huffman_decode_into(
+///| Internal: encode String `input` directly into a `Bytes` buffer starting at `dst_off`.
+///| Returns bytes written.
+fn huffman_encode_str_into_bytes(
+  input : String,
+  dst : Bytes,
+  dst_off : Int,
+  packed : FixedArray[UInt64],
+) -> Int {
+  let n = input.length()
+  let mut acc = 0UL
+  let mut nbits = 0
+  let mut opos = dst_off
+  let mut i = 0
+  while i < n {
+    let p = packed[input.code_unit_at(i)]
+    let l = (p & 63UL).to_int()
+    acc = (acc << l) | (p >> 6)
+    nbits = nbits + l
+    if nbits >= 32 {
+      let shift = nbits - 32
+      let w = acc >> shift
+      dst[opos] = ((w >> 24) & 0xFFUL).to_int().to_byte()
+      dst[opos + 1] = ((w >> 16) & 0xFFUL).to_int().to_byte()
+      dst[opos + 2] = ((w >> 8) & 0xFFUL).to_int().to_byte()
+      dst[opos + 3] = (w & 0xFFUL).to_int().to_byte()
+      opos = opos + 4
+      nbits = shift
+    }
+    i = i + 1
+  }
+  while nbits >= 8 {
+    nbits = nbits - 8
+    dst[opos] = ((acc >> nbits) & 0xFFUL).to_int().to_byte()
+    opos = opos + 1
+  }
+  if nbits > 0 {
+    let pad = 8 - nbits
+    let last = (((acc << pad) | ((1UL << pad) - 1UL)) & 0xFFUL).to_int()
+    dst[opos] = last.to_byte()
+    opos = opos + 1
+  }
+  opos - dst_off
+}
+
+///| Internal: single-pass Huffman encode of String `input` (len < 127) into `dst[dst_off..]`.
+///| Aborts and returns `-1` if Huffman output would not be strictly shorter than `rlen`.
+///| Caller must guarantee `dst` has at least `dst_off + rlen + 4` capacity.
+fn huffman_encode_str_if_shorter(
+  input : String,
+  rlen : Int,
+  dst : Bytes,
+  dst_off : Int,
+  packed : FixedArray[UInt64],
+) -> Int {
+  let max_end = dst_off + rlen
+  let mut acc = 0UL
+  let mut nbits = 0
+  let mut opos = dst_off
+  let mut i = 0
+  let lim2 = rlen - 1
+  while i < lim2 {
+    let p0 = packed[input.code_unit_at(i)]
+    let l0 = (p0 & 63UL).to_int()
+    acc = (acc << l0) | (p0 >> 6)
+    nbits = nbits + l0
+    if nbits >= 32 {
+      if opos + 4 >= max_end {
+        return -1
+      }
+      let shift = nbits - 32
+      let w = acc >> shift
+      dst[opos] = ((w >> 24) & 0xFFUL).to_int().to_byte()
+      dst[opos + 1] = ((w >> 16) & 0xFFUL).to_int().to_byte()
+      dst[opos + 2] = ((w >> 8) & 0xFFUL).to_int().to_byte()
+      dst[opos + 3] = (w & 0xFFUL).to_int().to_byte()
+      opos = opos + 4
+      nbits = shift
+    }
+    let p1 = packed[input.code_unit_at(i + 1)]
+    let l1 = (p1 & 63UL).to_int()
+    acc = (acc << l1) | (p1 >> 6)
+    nbits = nbits + l1
+    if nbits >= 32 {
+      if opos + 4 >= max_end {
+        return -1
+      }
+      let shift = nbits - 32
+      let w = acc >> shift
+      dst[opos] = ((w >> 24) & 0xFFUL).to_int().to_byte()
+      dst[opos + 1] = ((w >> 16) & 0xFFUL).to_int().to_byte()
+      dst[opos + 2] = ((w >> 8) & 0xFFUL).to_int().to_byte()
+      dst[opos + 3] = (w & 0xFFUL).to_int().to_byte()
+      opos = opos + 4
+      nbits = shift
+    }
+    i = i + 2
+  }
+  if i < rlen {
+    let p = packed[input.code_unit_at(i)]
+    let l = (p & 63UL).to_int()
+    acc = (acc << l) | (p >> 6)
+    nbits = nbits + l
+    if nbits >= 32 {
+      if opos + 4 >= max_end {
+        return -1
+      }
+      let shift = nbits - 32
+      let w = acc >> shift
+      dst[opos] = ((w >> 24) & 0xFFUL).to_int().to_byte()
+      dst[opos + 1] = ((w >> 16) & 0xFFUL).to_int().to_byte()
+      dst[opos + 2] = ((w >> 8) & 0xFFUL).to_int().to_byte()
+      dst[opos + 3] = (w & 0xFFUL).to_int().to_byte()
+      opos = opos + 4
+      nbits = shift
+    }
+  }
+  while nbits >= 8 {
+    if opos >= max_end {
+      return -1
+    }
+    nbits = nbits - 8
+    dst[opos] = ((acc >> nbits) & 0xFFUL).to_int().to_byte()
+    opos = opos + 1
+  }
+  if nbits > 0 {
+    if opos >= max_end {
+      return -1
+    }
+    let pad = 8 - nbits
+    let last = (((acc << pad) | ((1UL << pad) - 1UL)) & 0xFFUL).to_int()
+    dst[opos] = last.to_byte()
+    opos = opos + 1
+  }
+  let written = opos - dst_off
+  if written < rlen {
+    written
+  } else {
+    -1
+  }
+}
+
+///| Encode bytes using RFC 7541 Appendix B canonical Huffman coding.
+pub fn huffman_encode(input : Bytes) -> Bytes {
+  let out_len = huffman_encoded_len(input)
+  if out_len == 0 {
+    return Bytes::new(0)
+  }
+  let out = Bytes::new(out_len)
+  let _ = huffman_encode_into_bytes(input, out, 0)
+  out
+}
+
+///| Internal: zero-boxing Huffman decode directly into `Bytes` (`out` capacity >= ((len * 8) / 5) + 2).
+///| Returns:
+///|   >= 0 : decoded byte count
+///|   -1   : EOS or invalid code
+///|   -2   : invalid padding (> 7 bits or non-all-1s)
+fn huffman_decode_into_bytes(
   input : Bytes,
   start : Int,
   len : Int,
   out : Bytes,
-) -> Result[Int, H2Error] {
+  lut12 : FixedArray[Int],
+  t_left : FixedArray[Int],
+  t_right : FixedArray[Int],
+  t_sym : FixedArray[Int],
+) -> Int {
   if len == 0 {
-    return Ok(0)
+    return 0
   }
-  let mut opos = 0
-  let dfa = huff_dfa
-  let mut state = 0
-  let mut accepted = true
   let end = start + len
   let mut i = start
-  while i < end {
-    let b = input[i].to_int()
-    let e1 = dfa[(state << 4) | (b >> 4)]
-    if (e1 & huff_flag_fail) != 0 {
-      return Err(H2Error::CompressionError("huffman EOS or invalid code"))
-    }
-    if (e1 & huff_flag_sym) != 0 {
-      out[opos] = (e1 & 0xFF).to_byte()
-      opos = opos + 1
-    }
-    state = (e1 >> 8) & 0xFF
+  let mut opos = 0
+  let mut acc = 0UL
+  let mut nbits = 0
 
-    let e2 = dfa[(state << 4) | (b & 0x0F)]
-    if (e2 & huff_flag_fail) != 0 {
-      return Err(H2Error::CompressionError("huffman EOS or invalid code"))
+  while true {
+    if nbits <= 32 && i + 4 <= end {
+      let w = ((input[i].to_int() << 24) |
+        (input[i + 1].to_int() << 16) |
+        (input[i + 2].to_int() << 8) |
+        input[i + 3].to_int()).to_int64().to_uint64() & 0xFFFFFFFFUL
+      acc = acc | (w << (32 - nbits))
+      nbits = nbits + 32
+      i = i + 4
     }
-    if (e2 & huff_flag_sym) != 0 {
-      out[opos] = (e2 & 0xFF).to_byte()
-      opos = opos + 1
+    while nbits <= 56 && i < end {
+      acc = acc | (input[i].to_int().to_int64().to_uint64() << (56 - nbits))
+      nbits = nbits + 8
+      i = i + 1
     }
-    state = (e2 >> 8) & 0xFF
-    accepted = (e2 & huff_flag_accepted) != 0
-    i = i + 1
+    if nbits < 12 {
+      break
+    }
+    while nbits >= 24 {
+      let e0 = lut12[(acc >> 52).to_int()]
+      if e0 == 0 {
+        break
+      }
+      let b0 = e0 & 15
+      out[opos] = ((e0 >> 8) & 0xFF).to_byte()
+      if (e0 & 0x1000000) != 0 {
+        out[opos + 1] = ((e0 >> 16) & 0xFF).to_byte()
+        opos = opos + 2
+      } else {
+        opos = opos + 1
+      }
+      acc = acc << b0
+      nbits = nbits - b0
+
+      let e1 = lut12[(acc >> 52).to_int()]
+      if e1 == 0 {
+        break
+      }
+      let b1 = e1 & 15
+      out[opos] = ((e1 >> 8) & 0xFF).to_byte()
+      if (e1 & 0x1000000) != 0 {
+        out[opos + 1] = ((e1 >> 16) & 0xFF).to_byte()
+        opos = opos + 2
+      } else {
+        opos = opos + 1
+      }
+      acc = acc << b1
+      nbits = nbits - b1
+    }
+    while nbits >= 12 {
+      let idx = (acc >> 52).to_int()
+      let e = lut12[idx]
+      if e != 0 {
+        let bits = e & 15
+        out[opos] = ((e >> 8) & 0xFF).to_byte()
+        if (e & 0x1000000) != 0 {
+          out[opos + 1] = ((e >> 16) & 0xFF).to_byte()
+          opos = opos + 2
+        } else {
+          opos = opos + 1
+        }
+        acc = acc << bits
+        nbits = nbits - bits
+      } else {
+        while nbits <= 56 && i < end {
+          acc = acc | (input[i].to_int().to_int64().to_uint64() << (56 - nbits))
+          nbits = nbits + 8
+          i = i + 1
+        }
+        let mut cur = 0
+        let mut consumed = 0
+        let mut found = false
+        while consumed < nbits {
+          let bit = ((acc >> (63 - consumed)) & 1UL).to_int()
+          cur = if bit == 0 { t_left[cur] } else { t_right[cur] }
+          consumed = consumed + 1
+          if cur < 0 {
+            return -1
+          }
+          let ls = t_sym[cur]
+          if ls >= 0 {
+            if ls == 256 {
+              return -1
+            }
+            out[opos] = ls.to_byte()
+            opos = opos + 1
+            acc = acc << consumed
+            nbits = nbits - consumed
+            found = true
+            break
+          }
+        }
+        if !found {
+          return -2
+        }
+      }
+    }
   }
-  if !accepted {
-    return Err(H2Error::CompressionError("invalid huffman padding"))
+
+  // Drain any remaining complete 5..11-bit symbols
+  while nbits >= 5 {
+    let idx = (acc >> 52).to_int()
+    let e = lut12[idx]
+    if e == 0 {
+      break
+    }
+    let l1 = (e >> 4) & 15
+    if l1 > nbits {
+      break
+    }
+    out[opos] = ((e >> 8) & 0xFF).to_byte()
+    opos = opos + 1
+    acc = acc << l1
+    nbits = nbits - l1
   }
-  Ok(opos)
+
+  // Strict RFC 7541 §5.2 padding validation: <= 7 bits, all 1s
+  if nbits > 7 {
+    return -2
+  }
+  if nbits > 0 {
+    let pad_mask = (1UL << nbits) - 1UL
+    if (acc >> (64 - nbits)) != pad_mask {
+      return -2
+    }
+  }
+  opos
 }
 
 ///| Internal: decode Huffman bytes from `input[start .. start + len]` with strict RFC 7541 §5.2 checks.
@@ -372,12 +579,26 @@ fn huffman_decode_slice(
   if len == 0 {
     return Ok(Bytes::new(0))
   }
-  let max_out = ((len * 8) / 5) + 1
+  let max_out = ((len * 8) / 5) + 2
   let out = Bytes::new(max_out)
-  match huffman_decode_into(input, start, len, out) {
-    Ok(opos) => Ok(out.slice(0, opos))
-    Err(e) => Err(e)
+  let tbl = huff_tables
+  let r = huffman_decode_into_bytes(
+    input,
+    start,
+    len,
+    out,
+    tbl.lut12,
+    tbl.left,
+    tbl.right,
+    tbl.leaf_sym,
+  )
+  if r == -1 {
+    return Err(H2Error::CompressionError("huffman EOS or invalid code"))
   }
+  if r < 0 {
+    return Err(H2Error::CompressionError("invalid huffman padding"))
+  }
+  Ok(out.slice(0, r))
 }
 
 ///| Decode a Huffman-encoded byte string with strict RFC 7541 §5.2 validation.

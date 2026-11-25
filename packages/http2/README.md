@@ -7,10 +7,10 @@ Designed and differentially verified alongside Rust [`h2` 0.4.20](https://github
 ## Features
 
 - **RFC 7541 HPACK Header Compression Engine**:
-  - Complete 61-entry Static Table (`static_table_get`) with fast first-byte dispatch on encode.
-  - $O(1)$ circular-buffer Dynamic FIFO Table with $O(1)$ open-addressing `(name, value)` and `name` hash indices on encode, zero-copy string writing, reusable Huffman decode scratch buffer, automatic eviction, and strict RFC 7541 §4.2 / §6.3 Dynamic Table Size Update validation (deferred `set_max_table_size` upper bound; size updates must appear only at the start of a header block and must not exceed the negotiated `SETTINGS_HEADER_TABLE_SIZE`).
+  - Complete 61-entry Static Table (`static_table_get`) with `FixedArray`-backed precomputed lengths/sizes and fast first-byte dispatch on encode.
+  - $O(1)$ circular-buffer Dynamic FIFO Table (`FixedArray`-backed) with 512-slot (<50% load) $O(1)$ open-addressing `(name, value)` and `name` hash indices on encode, zero-boxing cursor decoding, single-pass speculative Huffman string encoding, reusable Huffman decode scratch buffer, automatic eviction, and strict RFC 7541 §4.2 / §6.3 Dynamic Table Size Update validation (deferred `set_max_table_size` upper bound; size updates must appear only at the start of a header block and must not exceed the negotiated `SETTINGS_HEADER_TABLE_SIZE`).
   - Complete variable-length integer codec (`1..=8`-bit prefixes, `hpack_encode_int` / `hpack_decode_int`) rejecting 64-bit overflow, overlong continuation sequences, and 64-bit index truncation/aliasing before narrowing.
-  - Complete **256-symbol + EOS Canonical Huffman Codec** (RFC 7541 Appendix B): precomputed 256-state × 16-nibble 4-bit DFA (`4096` entries) decoding 2 lookups/byte while strictly rejecting explicit EOS (`0x3FFFFFFF`), padding > 7 bits, and non-all-1 padding.
+  - Complete **256-symbol + EOS Canonical Huffman Codec** (RFC 7541 Appendix B): 64-bit MSB-aligned bit buffer + 12-bit dual-symbol L1 lookup table (`4096` entries, 16 KiB, decoding 1–2 symbols per lookup with 2× unrolled loop) + exact binary-trie fallback for 13..30-bit codes, and 64-bit 4-byte bulk-flush encoder, strictly rejecting explicit EOS (`0x3FFFFFFF`), padding > 7 bits, and non-all-1 padding.
   - All 4 header representations: Indexed, Literal with Incremental Indexing, Literal without Indexing, and Literal Never Indexed (`HeaderField.sensitive`).
 - **RFC 9113 HTTP/2 Frame Codec**:
   - 9-byte `FrameHeader` + `Bytes.slice` payloads for all 10 frame types: `DATA`, `HEADERS`, `PRIORITY`, `RST_STREAM`, `SETTINGS`, `PUSH_PROMISE`, `PING`, `GOAWAY`, `WINDOW_UPDATE`, `CONTINUATION`, plus `Frame::Unknown` extension passthrough.
@@ -76,47 +76,47 @@ Run `sh packages/http2/proofs/run_proofs.sh` (or `sh scripts/verify-lean.sh http
 
 ## Head-to-Head Benchmarks
 
-Run with `sh packages/http2/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `go.sum` / `Cargo.lock`, mandatory full-content stdout SHA-256 verification) on **Darwin arm64** against modern production HTTP/2 engines:
-- **Go 1.27.3** `golang.org/x/net` **v0.62.0** (`http2.Framer` + `ReadMetaHeaders` + `http2/hpack`, `-mod=readonly`)
-- **Rust 1.100.0** **`h2` 0.4.20** (its own `hpack` engine + `h2::Codec`, `--release --locked`, Huffman ON)
+Run with `sh packages/http2/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `go.sum` / `Cargo.lock`, mandatory full-content stdout SHA-256 verification) on **Linux x86_64** against modern production HTTP/2 engines:
+- **Go** `golang.org/x/net` **v0.62.0** (`http2.Framer` + `ReadMetaHeaders` + `http2/hpack`, `-mod=readonly`)
+- **Rust** **`h2` 0.4.20** (its own `hpack` engine + `h2::Codec`, `--release --locked`, Huffman ON)
 
 ### 1. HPACK Header Stream Decode (100,000 header blocks, Huffman + Dynamic Table)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `66 B` (`sha256:1612b3b496634b49...`) | Input: `3445400 B` | Ops: `100000`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `66 B` (`sha256:1612b3b496634b49...`) | Input: `3445400 B` | Ops: `100000`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_h2_0.4.20) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 145.847 | 144.318 | 148.793 | 23.62 | 1458.47 | 2.16 MiB | 0.80x |
-| `go_x_net_v0.62` | 135.819 | 135.606 | 136.535 | 25.37 | 1358.19 | 16.70 MiB | 0.86x |
-| `rust_h2_0.4.20` | 116.742 | 113.514 | 117.552 | 29.51 | 1167.42 | 2.17 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs rust_h2_0.4.20) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 167.889 | 151.105 | 191.216 | 20.52 | 1678.89 | **1.31x** |
+| `go_x_net_v0.62` | 428.630 | 389.119 | 611.351 | 8.04 | 4286.30 | 0.51x |
+| `rust_h2_0.4.20` | 219.293 | 209.641 | 235.187 | 15.71 | 2192.93 | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `1612b3b496634b49335a3f0368965080d2bd520bc4b686084ac5736acfaf2294`._
 
 ### 2. HPACK Batch Header Encode (100,000 header blocks, Huffman ON + Dynamic Table)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `73 B` (`sha256:d966eddf243ed850...`) | Input: `28562500 B` | Ops: `100000`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `73 B` (`sha256:d966eddf243ed850...`) | Input: `28562500 B` | Ops: `100000`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_h2_0.4.20) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 55.688 | 54.932 | 55.860 | 512.90 | 556.88 | 3.56 MiB | 0.73x |
-| `go_x_net_v0.62` | 59.137 | 58.811 | 60.249 | 482.99 | 591.37 | 14.31 MiB | 0.69x |
-| `rust_h2_0.4.20` | 40.547 | 40.198 | 40.835 | 704.43 | 405.47 | 5.28 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs rust_h2_0.4.20) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 118.212 | 115.705 | 159.561 | 241.62 | 1182.12 | **1.07x** |
+| `go_x_net_v0.62` | 182.881 | 163.580 | 284.228 | 156.18 | 1828.82 | 0.69x |
+| `rust_h2_0.4.20` | 126.790 | 106.747 | 137.087 | 225.27 | 1267.90 | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `d966eddf243ed850ad2685fd406e46937173b02817e5dd9293ddbced9d986693`._
 
 ### 3. Mixed HTTP/2 Frame Engine (200,000 frames: Deframe + CONTINUATION + HPACK)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `59 B` (`sha256:e96a6c442cacb947...`) | Input: `5689500 B` | Ops: `200000`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `59 B` (`sha256:e96a6c442cacb947...`) | Input: `5689500 B` | Ops: `200000`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_h2_0.4.20) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 82.564 | 81.492 | 83.443 | 68.91 | 412.82 | 2.17 MiB | 0.87x |
-| `go_x_net_v0.62` | 84.889 | 83.337 | 85.383 | 67.02 | 424.44 | 16.41 MiB | 0.85x |
-| `rust_h2_0.4.20` | 72.177 | 71.340 | 72.691 | 78.83 | 360.88 | 2.28 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs rust_h2_0.4.20) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 137.648 | 115.469 | 151.801 | 41.33 | 688.24 | **1.05x** |
+| `go_x_net_v0.62` | 358.146 | 300.498 | 806.483 | 15.89 | 1790.73 | 0.40x |
+| `rust_h2_0.4.20` | 144.096 | 136.831 | 189.925 | 39.48 | 720.48 | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `e96a6c442cacb947bdf20398303b9c673a6c0d0b90c43b0bc60b5bb80bfd910c`._
 
 ### Objective Analysis
-- **HPACK Encode (Huffman ON)**: With the $O(1)$ open-addressing dynamic-table hash index and zero-copy string Huffman encoding, Pion (`55.7 ms`, `512.9 MB/s`) is **faster than Go `x/net v0.62.0`** (`59.1 ms`, `483.0 MB/s`) and reaches **0.73×** of Rust `h2 0.4.20` (`40.5 ms`), at `3.56 MiB` peak RSS (vs `5.28 MiB` Rust / `14.31 MiB` Go).
-- **Frame Engine (200k frames)**: Pion (`82.6 ms`, `68.9 MB/s`) is **faster than Go `x/net v0.62.0` `Framer + ReadMetaHeaders`** (`84.9 ms`, `67.0 MB/s`) and reaches **0.87×** of Rust `h2::Codec` (`72.2 ms`), at `2.17 MiB` peak RSS (level with Rust `2.28 MiB`).
-- **HPACK Decode (100k blocks)**: With reusable Huffman scratch buffers and zero `to_bytes()` length copies, Pion (`145.8 ms`, `23.6 MB/s`) reaches **0.80×** of Rust `h2 0.4.20` (`116.7 ms`) and stays within 7% of Go `x/net v0.62.0` (`135.8 ms`, `0.86×`).
+- **HPACK Decode (100k blocks)**: With the 64-bit bit-buffer + 12-bit dual-symbol Huffman LUT, zero-boxing decode cursor, hoisted `FixedArray` static/dynamic tables, and split register-resident indexed loop, Pion (`167.9 ms`, `20.5 MB/s`) runs **1.31× faster than Rust `h2 0.4.20 --release`** (`219.3 ms`) and **2.55× faster than Go `x/net v0.62.0`** (`428.6 ms`).
+- **HPACK Encode (Huffman ON, 100k blocks)**: With direct `HeaderField` field reads (zero `val struct` boxing), 512-slot (<50% load) open-addressing dynamic index, single-pass speculative 64-bit Huffman string writer, and fast static-exact dispatch, Pion (`118.2 ms`, `241.6 MB/s`) runs **1.07× faster than Rust `h2 0.4.20 --release`** (`126.8 ms`) and **1.55× faster than Go `x/net v0.62.0`** (`182.9 ms`).
+- **Frame Engine (200k frames)**: With inlined 9-byte `FrameHeader` parsing, hot/rare frame dispatch splitting, and the accelerated HPACK decoder, Pion (`137.6 ms`, `41.3 MB/s`) runs **1.05× faster than Rust `h2::Codec`** (`144.1 ms`) and **2.60× faster than Go `x/net v0.62.0` `Framer + ReadMetaHeaders`** (`358.1 ms`).
