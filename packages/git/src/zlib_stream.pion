@@ -1,6 +1,8 @@
-///| Zero-copy offset-aware RFC 1950 zlib stream decompressor for Git Packfiles.
+///| High-performance zero-copy offset-aware RFC 1950 zlib stream decompressor for Git Packfiles.
 ///| Reuses `flate::zlib_check_header`, `flate::adler32`, `flate::is_valid_btype`,
-///| `flate::is_valid_stored_nlen`, `flate::bit_reverse`, and `flate::huff_*` primitives.
+///| `flate::is_valid_stored_nlen`, and `flate::bit_reverse` primitives.
+///| Uses 64-bit bitbuf with 32-bit batch refill, 10-bit/9-bit packed Huffman LUTs,
+///| split fast/slow Huffman decode loops, and 8-byte unrolled back-reference copies.
 ///| Returns `(decompressed_bytes, next_byte_offset_after_adler32)`.
 
 let git_len_base : FixedArray[Int] = [
@@ -25,29 +27,50 @@ let git_cl_order : FixedArray[Int] = [
   16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ]
 
-///| Reusable scratch tables for packfile zlib inflation.
-struct PackInflateScratch {
-  lit_lut : FixedArray[Int]
-  dist_lut : FixedArray[Int]
-  cl_lut : FixedArray[Int]
-  cl_lens : FixedArray[Int]
-  code_lens : FixedArray[Int]
-  lit_lens : FixedArray[Int]
-  dist_lens : FixedArray[Int]
-  bl_count : FixedArray[Int]
-  next_code : FixedArray[Int]
-  fixed_lit_lut : FixedArray[Int]
-  fixed_dist_lut : FixedArray[Int]
+let git_bit_masks : FixedArray[UInt64] = [
+  0UL, 1UL, 3UL, 7UL, 15UL, 31UL, 63UL, 127UL, 255UL, 511UL, 1023UL, 2047UL, 4095UL, 8191UL,
+  16383UL, 32767UL,
+]
+
+///| Pack a literal/length symbol into a direct LUT entry:
+///| - Literal (0..255): `(sym << 8) | 32 | bits`
+///| - EOB (256): `64 | bits`
+///| - Length (257..285): `(lbase << 12) | (lextra << 8) | 128 | bits`
+///| - Invalid (286..287): `(sym << 9) | bits`
+fn git_pack_litlen_entry(sym : Int, bits : Int) -> Int {
+  if sym < 256 {
+    (sym << 8) | 32 | bits
+  } else if sym == 256 {
+    64 | bits
+  } else if sym <= 285 {
+    let li = sym - 257
+    (git_len_base[li] << 12) | (git_len_extra[li] << 8) | 128 | bits
+  } else {
+    (sym << 9) | bits
+  }
 }
 
-///| Build a two-level (primary `primary_bits` + secondary) Huffman lookup table.
-fn git_build_huff_lut(
+///| Pack a distance symbol into a direct LUT entry:
+///| - Valid (0..29): `(dbase << 10) | (dextra << 6) | 32 | bits`
+///| - Invalid (30..31): `(sym << 7) | bits`
+fn git_pack_dist_entry(sym : Int, bits : Int) -> Int {
+  if sym < 30 {
+    (git_dist_base[sym] << 10) | (git_dist_extra[sym] << 6) | 32 | bits
+  } else {
+    (sym << 7) | bits
+  }
+}
+
+///| Build a two-level packed Huffman LUT (`kind`: 0 = code-length, 1 = litlen, 2 = dist).
+fn git_build_packed_lut(
   lens : FixedArray[Int],
   num_syms : Int,
   primary_bits : Int,
+  kind : Int,
   lut : FixedArray[Int],
   bl_count : FixedArray[Int],
   next_code : FixedArray[Int],
+  sub_bits_arr : FixedArray[Int],
 ) -> Bool {
   let primary_size = 1 << primary_bits
   let mut i = 0
@@ -78,7 +101,6 @@ fn git_build_huff_lut(
   if max_len == 0 {
     return true
   }
-  // Check oversubscribed / canonical codes
   let mut left = 1
   let mut b = 1
   while b <= 15 {
@@ -97,9 +119,16 @@ fn git_build_huff_lut(
     bits = bits + 1
   }
 
-  // First pass: assign primary entries and find max length per secondary prefix
-  let mut sub_alloc = primary_size
-  let sub_bits_arr : FixedArray[Int] = FixedArray::make(primary_size, 0)
+  let has_sub = max_len > primary_bits
+  if has_sub {
+    let mut sb_i = 0
+    while sb_i < primary_size {
+      sub_bits_arr[sb_i] = 0
+      sb_i = sb_i + 1
+    }
+  }
+
+  let primary_mask = primary_size - 1
   let mut sym = 0
   while sym < num_syms {
     let l = lens[sym]
@@ -108,7 +137,13 @@ fn git_build_huff_lut(
       next_code[l] = c + 1
       let rev = flate::bit_reverse(c, l)
       if l <= primary_bits {
-        let entry = flate::huff_direct_entry(sym, l)
+        let entry = if kind == 1 {
+          git_pack_litlen_entry(sym, l)
+        } else if kind == 2 {
+          git_pack_dist_entry(sym, l)
+        } else {
+          (sym << 5) | l
+        }
         let step = 1 << l
         let mut idx = rev
         while idx < primary_size {
@@ -116,7 +151,7 @@ fn git_build_huff_lut(
           idx = idx + step
         }
       } else {
-        let prefix = rev & (primary_size - 1)
+        let prefix = rev & primary_mask
         let extra = l - primary_bits
         if extra > sub_bits_arr[prefix] {
           sub_bits_arr[prefix] = extra
@@ -126,16 +161,21 @@ fn git_build_huff_lut(
     sym = sym + 1
   }
 
-  // Allocate secondary subtables
+  if !has_sub {
+    return true
+  }
+
+  let mut sub_alloc = primary_size
+  let lut_cap = lut.length()
   let mut p = 0
   while p < primary_size {
     let sb = sub_bits_arr[p]
     if sb > 0 {
       let sub_sz = 1 << sb
-      if sub_alloc + sub_sz > lut.length() {
+      if sub_alloc + sub_sz > lut_cap {
         return false
       }
-      lut[p] = flate::huff_subtable_entry(sub_alloc, sb)
+      lut[p] = (sub_alloc << 5) | 16 | sb
       let mut k = 0
       while k < sub_sz {
         lut[sub_alloc + k] = 0
@@ -146,85 +186,153 @@ fn git_build_huff_lut(
     p = p + 1
   }
 
-  // Second pass: fill secondary entries
-  if max_len > primary_bits {
-    code = 0
-    next_code[0] = 0
-    bits = 1
-    while bits <= 15 {
-      code = (code + bl_count[bits - 1]) << 1
-      next_code[bits] = code
-      bits = bits + 1
-    }
-    sym = 0
-    while sym < num_syms {
-      let l = lens[sym]
-      if l > 0 {
-        let c = next_code[l]
-        next_code[l] = c + 1
-        if l > primary_bits {
-          let rev = flate::bit_reverse(c, l)
-          let prefix = rev & (primary_size - 1)
-          let sub_hdr = lut[prefix]
-          let sub_off = sub_hdr >> 5
-          let sub_b = sub_hdr & 15
-          let sub_sz = 1 << sub_b
-          let extra = l - primary_bits
-          let entry = flate::huff_direct_entry(sym, extra)
-          let step = 1 << extra
-          let mut idx = rev >> primary_bits
-          while idx < sub_sz {
-            lut[sub_off + idx] = entry
-            idx = idx + step
-          }
+  code = 0
+  next_code[0] = 0
+  bits = 1
+  while bits <= 15 {
+    code = (code + bl_count[bits - 1]) << 1
+    next_code[bits] = code
+    bits = bits + 1
+  }
+  sym = 0
+  while sym < num_syms {
+    let l = lens[sym]
+    if l > 0 {
+      let c = next_code[l]
+      next_code[l] = c + 1
+      if l > primary_bits {
+        let rev = flate::bit_reverse(c, l)
+        let prefix = rev & primary_mask
+        let sub_hdr = lut[prefix]
+        let sub_off = sub_hdr >> 5
+        let sub_b = sub_hdr & 15
+        let sub_sz = 1 << sub_b
+        let extra = l - primary_bits
+        let entry = if kind == 1 {
+          git_pack_litlen_entry(sym, extra)
+        } else if kind == 2 {
+          git_pack_dist_entry(sym, extra)
+        } else {
+          (sym << 5) | extra
+        }
+        let step = 1 << extra
+        let mut idx = rev >> primary_bits
+        while idx < sub_sz {
+          lut[sub_off + idx] = entry
+          idx = idx + step
         }
       }
-      sym = sym + 1
     }
+    sym = sym + 1
   }
   true
 }
 
 ///|
-fn PackInflateScratch::new() -> PackInflateScratch {
-  let bl_count : FixedArray[Int] = FixedArray::make(16, 0)
-  let next_code : FixedArray[Int] = FixedArray::make(16, 0)
-  let fixed_lit_lens : FixedArray[Int] = FixedArray::make(288, 0)
+fn build_git_fixed_litlen_lut() -> FixedArray[Int] {
+  let lens : FixedArray[Int] = FixedArray::make(288, 0)
   let mut i = 0
   while i <= 143 {
-    fixed_lit_lens[i] = 8
+    lens[i] = 8
     i = i + 1
   }
   while i <= 255 {
-    fixed_lit_lens[i] = 9
+    lens[i] = 9
     i = i + 1
   }
   while i <= 279 {
-    fixed_lit_lens[i] = 7
+    lens[i] = 7
     i = i + 1
   }
   while i <= 287 {
-    fixed_lit_lens[i] = 8
+    lens[i] = 8
     i = i + 1
   }
-  let fixed_dist_lens : FixedArray[Int] = FixedArray::make(32, 5)
-  let fixed_lit_lut : FixedArray[Int] = FixedArray::make(2048, 0)
-  let fixed_dist_lut : FixedArray[Int] = FixedArray::make(1024, 0)
-  let _ = git_build_huff_lut(fixed_lit_lens, 288, 9, fixed_lit_lut, bl_count, next_code)
-  let _ = git_build_huff_lut(fixed_dist_lens, 32, 8, fixed_dist_lut, bl_count, next_code)
+  let lut : FixedArray[Int] = FixedArray::make(1024, 0)
+  let bl : FixedArray[Int] = FixedArray::make(16, 0)
+  let nc : FixedArray[Int] = FixedArray::make(16, 0)
+  let sb : FixedArray[Int] = FixedArray::make(1024, 0)
+  let _ = git_build_packed_lut(lens, 288, 10, 1, lut, bl, nc, sb)
+  lut
+}
+
+///|
+fn build_git_fixed_dist_lut() -> FixedArray[Int] {
+  let lens : FixedArray[Int] = FixedArray::make(32, 5)
+  let lut : FixedArray[Int] = FixedArray::make(32, 0)
+  let bl : FixedArray[Int] = FixedArray::make(16, 0)
+  let nc : FixedArray[Int] = FixedArray::make(16, 0)
+  let sb : FixedArray[Int] = FixedArray::make(32, 0)
+  let _ = git_build_packed_lut(lens, 32, 5, 2, lut, bl, nc, sb)
+  lut
+}
+
+let git_fixed_litlen_lut : FixedArray[Int] = build_git_fixed_litlen_lut()
+
+let git_fixed_dist_lut : FixedArray[Int] = build_git_fixed_dist_lut()
+
+///| Reusable scratch tables for packfile zlib inflation (dynamic tables allocated lazily).
+struct PackInflateScratch {
+  mut initialized : Bool
+  mut lit_lut : FixedArray[Int]
+  mut dist_lut : FixedArray[Int]
+  mut cl_lut : FixedArray[Int]
+  mut cl_lens : FixedArray[Int]
+  mut code_lens : FixedArray[Int]
+  mut lit_lens : FixedArray[Int]
+  mut dist_lens : FixedArray[Int]
+  mut bl_count : FixedArray[Int]
+  mut next_code : FixedArray[Int]
+  mut sub_bits : FixedArray[Int]
+}
+
+///|
+fn PackInflateScratch::new() -> PackInflateScratch {
+  let empty : FixedArray[Int] = FixedArray::make(0, 0)
   PackInflateScratch::{
-    lit_lut: FixedArray::make(2048, 0),
-    dist_lut: FixedArray::make(1024, 0),
-    cl_lut: FixedArray::make(128, 0),
-    cl_lens: FixedArray::make(19, 0),
-    code_lens: FixedArray::make(320, 0),
-    lit_lens: FixedArray::make(288, 0),
-    dist_lens: FixedArray::make(32, 0),
-    bl_count: bl_count,
-    next_code: next_code,
-    fixed_lit_lut: fixed_lit_lut,
-    fixed_dist_lut: fixed_dist_lut,
+    initialized: false,
+    lit_lut: empty,
+    dist_lut: empty,
+    cl_lut: empty,
+    cl_lens: empty,
+    code_lens: empty,
+    lit_lens: empty,
+    dist_lens: empty,
+    bl_count: empty,
+    next_code: empty,
+    sub_bits: empty,
   }
+}
+
+///|
+fn ensure_pack_inflate_scratch(s : PackInflateScratch) -> Unit {
+  if !s.initialized {
+    s.lit_lut = FixedArray::make(2048, 0)
+    s.dist_lut = FixedArray::make(1024, 0)
+    s.cl_lut = FixedArray::make(128, 0)
+    s.cl_lens = FixedArray::make(19, 0)
+    s.code_lens = FixedArray::make(320, 0)
+    s.lit_lens = FixedArray::make(288, 0)
+    s.dist_lens = FixedArray::make(32, 0)
+    s.bl_count = FixedArray::make(16, 0)
+    s.next_code = FixedArray::make(16, 0)
+    s.sub_bits = FixedArray::make(1024, 0)
+    s.initialized = true
+  }
+}
+
+///| Mutable state for a single inflate stream.
+struct GitInflateState {
+  mut in_pos : Int
+  mut bitbuf : UInt64
+  mut bitcnt : Int
+  mut out : Bytes
+  mut out_len : Int
+  mut out_cap : Int
+  mut safe_end : Int
+  mut dist_mask : UInt64
+  max_output_bytes : Int
+  init_hint : Int
 }
 
 ///|
@@ -254,6 +362,689 @@ fn grow_out_buf(buf : Bytes, used : Int, needed : Int, max_cap : Int) -> Bytes {
   }
 }
 
+///|
+fn git_inflate_ensure_out(
+  state : GitInflateState,
+  cur_out : Bytes,
+  cur_len : Int,
+  extra : Int,
+) -> Bool {
+  if extra > state.max_output_bytes - cur_len {
+    return false
+  }
+  let next = grow_out_buf(cur_out, cur_len, cur_len + extra, state.max_output_bytes)
+  let cap = next.length()
+  state.out = next
+  state.out_cap = cap
+  state.safe_end = if cap < state.max_output_bytes { cap } else { state.max_output_bytes }
+  true
+}
+
+///| Leaf helper: 8-byte unrolled non-overlapping LZ77 copy (`dist >= 8`).
+fn git_copy_dist8(out : Bytes, out_len : Int, dist : Int, match_len : Int) -> Int {
+  let mut d = out_len
+  let mut s = out_len - dist
+  let end = out_len + match_len
+  let end8 = end - 8
+  while d <= end8 {
+    out[d] = out[s]
+    out[d + 1] = out[s + 1]
+    out[d + 2] = out[s + 2]
+    out[d + 3] = out[s + 3]
+    out[d + 4] = out[s + 4]
+    out[d + 5] = out[s + 5]
+    out[d + 6] = out[s + 6]
+    out[d + 7] = out[s + 7]
+    d = d + 8
+    s = s + 8
+  }
+  while d < end {
+    out[d] = out[s]
+    d = d + 1
+    s = s + 1
+  }
+  end
+}
+
+///| Leaf helper: 8-byte unrolled RLE fill (`dist == 1`).
+fn git_fill_rle1(out : Bytes, out_len : Int, match_len : Int) -> Int {
+  let fill = out[out_len - 1]
+  let mut d = out_len
+  let end = out_len + match_len
+  let end8 = end - 8
+  while d <= end8 {
+    out[d] = fill
+    out[d + 1] = fill
+    out[d + 2] = fill
+    out[d + 3] = fill
+    out[d + 4] = fill
+    out[d + 5] = fill
+    out[d + 6] = fill
+    out[d + 7] = fill
+    d = d + 8
+  }
+  while d < end {
+    out[d] = fill
+    d = d + 1
+  }
+  end
+}
+
+///| Cold helper: overlapping LZ77 copy (`2 <= dist < 8`).
+fn git_copy_overlap(out : Bytes, out_len : Int, dist : Int, match_len : Int) -> Int {
+  let mut d = out_len
+  let mut s = out_len - dist
+  let end = out_len + match_len
+  while d < end {
+    out[d] = out[s]
+    d = d + 1
+    s = s + 1
+  }
+  end
+}
+
+///| Ultra-lean hot loop: runs while >= 8 input bytes and >= 258 output bytes remain.
+///| `out` is immutable here (never grown/reassigned), zero EOF/cap checks.
+///| Returns: `0` on EOB, `-1` when buffer/input margin reached, `> 0` on error.
+fn git_inflate_huffman_fast(
+  data : Bytes,
+  cur_litlen : FixedArray[Int],
+  cur_dist : FixedArray[Int],
+  out : Bytes,
+  state : GitInflateState,
+) -> Int {
+  let mut in_pos = state.in_pos
+  let mut bitbuf = state.bitbuf
+  let mut bitcnt = state.bitcnt
+  let mut out_len = state.out_len
+  let in_lim8 = data.length() - 8
+  let out_safe = state.safe_end - 258
+  let dist_mask = state.dist_mask
+  let mut rc = -1
+
+  while in_pos <= in_lim8 && out_len <= out_safe {
+    if bitcnt <= 32 {
+      let mut w : UInt = data[in_pos].to_int().to_uint()
+      w = w | (data[in_pos + 1].to_int().to_uint() << 8)
+      w = w | (data[in_pos + 2].to_int().to_uint() << 16)
+      w = w | (data[in_pos + 3].to_int().to_uint() << 24)
+      bitbuf = bitbuf | (w.to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 4
+      bitcnt = bitcnt + 32
+    }
+
+    let mut ent = cur_litlen[(bitbuf & 1023UL).to_int()]
+    if (ent & 48) == 32 {
+      let nb = ent & 15
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+      out[out_len] = (ent >> 8).to_byte()
+      out_len = out_len + 1
+      let mut fell_through = false
+      while bitcnt >= 20 && out_len <= out_safe {
+        ent = cur_litlen[(bitbuf & 1023UL).to_int()]
+        if (ent & 48) != 32 {
+          fell_through = true
+          break
+        }
+        let nb2 = ent & 15
+        bitbuf = bitbuf >> nb2
+        bitcnt = bitcnt - nb2
+        out[out_len] = (ent >> 8).to_byte()
+        out_len = out_len + 1
+      }
+      if !fell_through {
+        continue
+      }
+    }
+
+    if (ent & 16) != 0 {
+      let sub_bits = ent & 15
+      let sub_off = ent >> 5
+      let sub_ent = cur_litlen[sub_off + ((bitbuf >> 10) & ((1UL << sub_bits) - 1UL)).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        rc = 4
+        break
+      }
+      let total_nb = 10 + sub_nb
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      ent = sub_ent
+      if (ent & 32) != 0 {
+        out[out_len] = (ent >> 8).to_byte()
+        out_len = out_len + 1
+        continue
+      }
+    } else {
+      let nb = ent & 15
+      if nb == 0 {
+        rc = 6
+        break
+      }
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+    }
+
+    if (ent & 64) != 0 {
+      rc = 0
+      break
+    }
+    if (ent & 128) == 0 {
+      rc = 7
+      break
+    }
+
+    let lextra = (ent >> 8) & 15
+    let mut match_len = ent >> 12
+    if lextra > 0 {
+      match_len = match_len + (bitbuf & ((1UL << lextra) - 1UL)).to_int()
+      bitbuf = bitbuf >> lextra
+      bitcnt = bitcnt - lextra
+    }
+
+    if bitcnt < 28 {
+      let mut w : UInt = data[in_pos].to_int().to_uint()
+      w = w | (data[in_pos + 1].to_int().to_uint() << 8)
+      w = w | (data[in_pos + 2].to_int().to_uint() << 16)
+      w = w | (data[in_pos + 3].to_int().to_uint() << 24)
+      bitbuf = bitbuf | (w.to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 4
+      bitcnt = bitcnt + 32
+    }
+
+    let mut dent = cur_dist[(bitbuf & dist_mask).to_int()]
+    if (dent & 48) == 32 {
+      let dnb = dent & 15
+      bitbuf = bitbuf >> dnb
+      bitcnt = bitcnt - dnb
+    } else if (dent & 16) != 0 {
+      let sub_bits = dent & 15
+      let sub_off = dent >> 5
+      let sub_ent = cur_dist[sub_off + ((bitbuf >> 9) & ((1UL << sub_bits) - 1UL)).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        rc = 11
+        break
+      }
+      let total_nb = 9 + sub_nb
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      dent = sub_ent
+      if (dent & 32) == 0 {
+        rc = 7
+        break
+      }
+    } else {
+      let dnb = dent & 15
+      if dnb == 0 {
+        rc = 13
+        break
+      }
+      rc = 7
+      break
+    }
+
+    let dextra = (dent >> 6) & 15
+    let mut dist = dent >> 10
+    if dextra > 0 {
+      dist = dist + (bitbuf & ((1UL << dextra) - 1UL)).to_int()
+      bitbuf = bitbuf >> dextra
+      bitcnt = bitcnt - dextra
+    }
+
+    if dist <= 0 || dist > out_len {
+      rc = 15
+      break
+    } else if dist >= 8 {
+      out_len = git_copy_dist8(out, out_len, dist, match_len)
+    } else if dist == 1 {
+      out_len = git_fill_rle1(out, out_len, match_len)
+    } else {
+      out_len = git_copy_overlap(out, out_len, dist, match_len)
+    }
+  }
+
+  state.in_pos = in_pos
+  state.bitbuf = bitbuf
+  state.bitcnt = bitcnt
+  state.out_len = out_len
+  rc
+}
+
+///| Exact boundary-checked slow loop for final <= 8 input bytes or <= 258 output bytes.
+fn git_inflate_huffman_slow(
+  data : Bytes,
+  in_len : Int,
+  cur_litlen : FixedArray[Int],
+  cur_dist : FixedArray[Int],
+  state : GitInflateState,
+) -> Int {
+  let mut in_pos = state.in_pos
+  let mut bitbuf = state.bitbuf
+  let mut bitcnt = state.bitcnt
+  let mut out = state.out
+  let mut out_len = state.out_len
+  let mut safe_end = state.safe_end
+  let dist_mask = state.dist_mask
+  let masks = git_bit_masks
+
+  while true {
+    while bitcnt <= 56 && in_pos < in_len {
+      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 1
+      bitcnt = bitcnt + 8
+    }
+
+    let mut ent = cur_litlen[(bitbuf & 1023UL).to_int()]
+    if (ent & 48) == 32 {
+      let nb = ent & 15
+      if bitcnt < nb {
+        return 1
+      }
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+      if out_len >= safe_end {
+        if !git_inflate_ensure_out(state, out, out_len, 1) {
+          return 2
+        }
+        out = state.out
+        safe_end = state.safe_end
+      }
+      out[out_len] = (ent >> 8).to_byte()
+      out_len = out_len + 1
+      continue
+    }
+
+    if (ent & 16) != 0 {
+      if bitcnt < 10 {
+        return 3
+      }
+      let sub_bits = ent & 15
+      let sub_off = ent >> 5
+      let sub_ent = cur_litlen[sub_off + ((bitbuf >> 10) & masks[sub_bits]).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        return 4
+      }
+      let total_nb = 10 + sub_nb
+      if bitcnt < total_nb {
+        return 5
+      }
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      ent = sub_ent
+      if (ent & 32) != 0 {
+        if out_len >= safe_end {
+          if !git_inflate_ensure_out(state, out, out_len, 1) {
+            return 2
+          }
+          out = state.out
+          safe_end = state.safe_end
+        }
+        out[out_len] = (ent >> 8).to_byte()
+        out_len = out_len + 1
+        continue
+      }
+    } else {
+      let nb = ent & 15
+      if nb == 0 {
+        return 6
+      }
+      if bitcnt < nb {
+        return 1
+      }
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+    }
+
+    if (ent & 64) != 0 {
+      break
+    }
+    if (ent & 128) == 0 {
+      return 7
+    }
+
+    let lextra = (ent >> 8) & 15
+    let mut match_len = ent >> 12
+    if lextra > 0 {
+      if bitcnt < lextra {
+        return 8
+      }
+      match_len = match_len + (bitbuf & masks[lextra]).to_int()
+      bitbuf = bitbuf >> lextra
+      bitcnt = bitcnt - lextra
+    }
+
+    while bitcnt <= 56 && in_pos < in_len {
+      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 1
+      bitcnt = bitcnt + 8
+    }
+
+    let mut dent = cur_dist[(bitbuf & dist_mask).to_int()]
+    if (dent & 48) == 32 {
+      let dnb = dent & 15
+      if bitcnt < dnb {
+        return 9
+      }
+      bitbuf = bitbuf >> dnb
+      bitcnt = bitcnt - dnb
+    } else if (dent & 16) != 0 {
+      if bitcnt < 9 {
+        return 10
+      }
+      let sub_bits = dent & 15
+      let sub_off = dent >> 5
+      let sub_ent = cur_dist[sub_off + ((bitbuf >> 9) & masks[sub_bits]).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        return 11
+      }
+      let total_nb = 9 + sub_nb
+      if bitcnt < total_nb {
+        return 12
+      }
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      dent = sub_ent
+      if (dent & 32) == 0 {
+        return 7
+      }
+    } else {
+      let dnb = dent & 15
+      if dnb == 0 {
+        return 13
+      }
+      if bitcnt < dnb {
+        return 9
+      }
+      return 7
+    }
+
+    let dextra = (dent >> 6) & 15
+    let mut dist = dent >> 10
+    if dextra > 0 {
+      if bitcnt < dextra {
+        return 14
+      }
+      dist = dist + (bitbuf & masks[dextra]).to_int()
+      bitbuf = bitbuf >> dextra
+      bitcnt = bitcnt - dextra
+    }
+
+    if dist <= 0 || dist > out_len {
+      return 15
+    }
+    if match_len > safe_end - out_len {
+      if !git_inflate_ensure_out(state, out, out_len, match_len) {
+        return 2
+      }
+      out = state.out
+      safe_end = state.safe_end
+    }
+
+    if dist >= 8 {
+      out_len = git_copy_dist8(out, out_len, dist, match_len)
+    } else if dist == 1 {
+      out_len = git_fill_rle1(out, out_len, match_len)
+    } else {
+      out_len = git_copy_overlap(out, out_len, dist, match_len)
+    }
+  }
+
+  state.in_pos = in_pos
+  state.bitbuf = bitbuf
+  state.bitcnt = bitcnt
+  state.out = out
+  state.out_len = out_len
+  state.safe_end = safe_end
+  0
+}
+
+///|
+fn git_inflate_rc_to_error(rc : Int) -> GitError {
+  if rc == 2 {
+    GitError::LimitExceeded("decompressed size exceeds limit")
+  } else if rc == 1 || rc == 3 || rc == 5 || rc == 8 || rc == 9 || rc == 10 || rc == 12 || rc == 14 {
+    GitError::Truncated("unexpected EOF in deflate stream")
+  } else if rc == 15 {
+    GitError::DecompressError("back-reference distance exceeds output")
+  } else {
+    GitError::DecompressError("invalid deflate huffman code")
+  }
+}
+
+///| Decode RFC 1951 §3.2.7 Dynamic Huffman tables into `scratch`.
+fn git_read_dynamic_trees(
+  data : Bytes,
+  in_len : Int,
+  state : GitInflateState,
+  scratch : PackInflateScratch,
+) -> Result[Unit, GitError] {
+  ensure_pack_inflate_scratch(scratch)
+  let cl_lut = scratch.cl_lut
+  let cl_lens = scratch.cl_lens
+  let code_lens = scratch.code_lens
+  let lit_lens = scratch.lit_lens
+  let dist_lens = scratch.dist_lens
+  let clo = git_cl_order
+
+  let mut pos = state.in_pos
+  let mut bitbuf = state.bitbuf
+  let mut bitcnt = state.bitcnt
+
+  while bitcnt < 14 {
+    if pos >= in_len {
+      return Err(GitError::Truncated("unexpected EOF in dynamic huffman header"))
+    }
+    bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
+    bitcnt = bitcnt + 8
+    pos = pos + 1
+  }
+  let hlit = (bitbuf & 0x1FUL).to_int() + 257
+  let hdist = ((bitbuf >> 5) & 0x1FUL).to_int() + 1
+  let hclen = ((bitbuf >> 10) & 0x0FUL).to_int() + 4
+  bitbuf = bitbuf >> 14
+  bitcnt = bitcnt - 14
+  if hlit > 286 || hdist > 30 {
+    return Err(GitError::DecompressError("invalid dynamic huffman counts"))
+  }
+  let mut ci = 0
+  while ci < 19 {
+    cl_lens[ci] = 0
+    ci = ci + 1
+  }
+  ci = 0
+  while ci < hclen {
+    while bitcnt < 3 {
+      if pos >= in_len {
+        return Err(GitError::Truncated("unexpected EOF in code length table"))
+      }
+      bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
+      bitcnt = bitcnt + 8
+      pos = pos + 1
+    }
+    cl_lens[clo[ci]] = (bitbuf & 7UL).to_int()
+    bitbuf = bitbuf >> 3
+    bitcnt = bitcnt - 3
+    ci = ci + 1
+  }
+  if !git_build_packed_lut(
+    cl_lens,
+    19,
+    7,
+    0,
+    cl_lut,
+    scratch.bl_count,
+    scratch.next_code,
+    scratch.sub_bits,
+  ) {
+    return Err(GitError::DecompressError("invalid code-length huffman tree"))
+  }
+
+  let total_codes = hlit + hdist
+  let mut idx = 0
+  while idx < total_codes {
+    while bitcnt < 15 && pos < in_len {
+      bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
+      bitcnt = bitcnt + 8
+      pos = pos + 1
+    }
+    let e = cl_lut[(bitbuf & 127UL).to_int()]
+    let nb = e & 15
+    if nb == 0 || nb > bitcnt {
+      return Err(GitError::DecompressError("invalid code-length symbol"))
+    }
+    let sym = e >> 5
+    bitbuf = bitbuf >> nb
+    bitcnt = bitcnt - nb
+    if sym < 16 {
+      code_lens[idx] = sym
+      idx = idx + 1
+    } else if sym == 16 {
+      if idx == 0 {
+        return Err(GitError::DecompressError("repeat prev length at start"))
+      }
+      while bitcnt < 2 {
+        if pos >= in_len {
+          return Err(GitError::Truncated("EOF in repeat 16"))
+        }
+        bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
+        bitcnt = bitcnt + 8
+        pos = pos + 1
+      }
+      let rep = 3 + (bitbuf & 3UL).to_int()
+      bitbuf = bitbuf >> 2
+      bitcnt = bitcnt - 2
+      if idx + rep > total_codes {
+        return Err(GitError::DecompressError("code-length repeat overflow"))
+      }
+      let prev = code_lens[idx - 1]
+      let mut r = 0
+      while r < rep {
+        code_lens[idx] = prev
+        idx = idx + 1
+        r = r + 1
+      }
+    } else if sym == 17 {
+      while bitcnt < 3 {
+        if pos >= in_len {
+          return Err(GitError::Truncated("EOF in repeat 17"))
+        }
+        bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
+        bitcnt = bitcnt + 8
+        pos = pos + 1
+      }
+      let rep = 3 + (bitbuf & 7UL).to_int()
+      bitbuf = bitbuf >> 3
+      bitcnt = bitcnt - 3
+      if idx + rep > total_codes {
+        return Err(GitError::DecompressError("code-length zero repeat overflow"))
+      }
+      let mut r = 0
+      while r < rep {
+        code_lens[idx] = 0
+        idx = idx + 1
+        r = r + 1
+      }
+    } else if sym == 18 {
+      while bitcnt < 7 {
+        if pos >= in_len {
+          return Err(GitError::Truncated("EOF in repeat 18"))
+        }
+        bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
+        bitcnt = bitcnt + 8
+        pos = pos + 1
+      }
+      let rep = 11 + (bitbuf & 127UL).to_int()
+      bitbuf = bitbuf >> 7
+      bitcnt = bitcnt - 7
+      if idx + rep > total_codes {
+        return Err(GitError::DecompressError("code-length long zero repeat overflow"))
+      }
+      let mut r = 0
+      while r < rep {
+        code_lens[idx] = 0
+        idx = idx + 1
+        r = r + 1
+      }
+    } else {
+      return Err(GitError::DecompressError("invalid code-length sym"))
+    }
+  }
+
+  let mut li = 0
+  while li < hlit {
+    lit_lens[li] = code_lens[li]
+    li = li + 1
+  }
+  let mut di = 0
+  while di < hdist {
+    dist_lens[di] = code_lens[hlit + di]
+    di = di + 1
+  }
+  if !git_build_packed_lut(
+    lit_lens,
+    hlit,
+    10,
+    1,
+    scratch.lit_lut,
+    scratch.bl_count,
+    scratch.next_code,
+    scratch.sub_bits,
+  ) {
+    return Err(GitError::DecompressError("invalid literal/length huffman tree"))
+  }
+  if !git_build_packed_lut(
+    dist_lens,
+    hdist,
+    9,
+    2,
+    scratch.dist_lut,
+    scratch.bl_count,
+    scratch.next_code,
+    scratch.sub_bits,
+  ) {
+    return Err(GitError::DecompressError("invalid distance huffman tree"))
+  }
+  state.in_pos = pos
+  state.bitbuf = bitbuf
+  state.bitcnt = bitcnt
+  Ok(())
+}
+
+///| Dispatch Fixed/Dynamic Huffman block: stay in fast loop, grow as needed, finish in slow loop.
+fn git_inflate_huffman_block(
+  data : Bytes,
+  in_len : Int,
+  cur_litlen : FixedArray[Int],
+  cur_dist : FixedArray[Int],
+  state : GitInflateState,
+) -> Int {
+  let in_lim8 = in_len - 8
+  while true {
+    if state.in_pos <= in_lim8 && state.out_len <= state.safe_end - 258 {
+      let rc = git_inflate_huffman_fast(data, cur_litlen, cur_dist, state.out, state)
+      if rc >= 0 {
+        return rc
+      }
+      if state.in_pos <= in_lim8 &&
+      state.out_len > state.safe_end - 258 &&
+      state.out_cap != state.init_hint &&
+      state.safe_end < state.max_output_bytes &&
+      state.max_output_bytes - state.out_len >= 258 {
+        if !git_inflate_ensure_out(state, state.out, state.out_len, 258) {
+          return 2
+        }
+        continue
+      }
+    }
+    return git_inflate_huffman_slow(data, in_len, cur_litlen, cur_dist, state)
+  }
+  0
+}
+
 ///| Decompress an RFC 1950 zlib stream starting at `data[start..]`.
 ///| Returns `(decompressed, next_byte_offset_after_adler32)`.
 fn zlib_inflate_at(
@@ -276,397 +1067,147 @@ fn zlib_inflate_at(
     return Err(GitError::DecompressError("zlib preset dictionary unsupported in packfile"))
   }
 
-  let mut pos = start + 2
-  let mut bitbuf : UInt64 = 0UL
-  let mut bitcnt = 0
-
   let init_cap = if size_hint >= 0 && size_hint <= max_output_bytes {
     size_hint
+  } else if max_output_bytes < 256 {
+    max_output_bytes
   } else {
     256
   }
-  let mut out = Bytes::new(init_cap)
-  let mut out_len = 0
+  let out_init = Bytes::new(init_cap)
+  let state = GitInflateState::{
+    in_pos: start + 2,
+    bitbuf: 0UL,
+    bitcnt: 0,
+    out: out_init,
+    out_len: 0,
+    out_cap: init_cap,
+    safe_end: init_cap,
+    dist_mask: 31UL,
+    max_output_bytes: max_output_bytes,
+    init_hint: init_cap,
+  }
+
+  let flit = git_fixed_litlen_lut
+  let fdist = git_fixed_dist_lut
   let mut bfinal = false
 
   while !bfinal {
-    while bitcnt < 3 {
-      if pos >= n {
+    while state.bitcnt < 3 {
+      if state.in_pos >= n {
         return Err(GitError::Truncated("unexpected EOF in deflate block header"))
       }
-      bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-      bitcnt = bitcnt + 8
-      pos = pos + 1
+      state.bitbuf = state.bitbuf |
+      (data[state.in_pos].to_int().to_int64().to_uint64() << state.bitcnt)
+      state.bitcnt = state.bitcnt + 8
+      state.in_pos = state.in_pos + 1
     }
-    bfinal = (bitbuf & 1UL) != 0UL
-    let btype = ((bitbuf >> 1) & 3UL).to_int()
-    bitbuf = bitbuf >> 3
-    bitcnt = bitcnt - 3
+    bfinal = (state.bitbuf & 1UL) != 0UL
+    let btype = ((state.bitbuf >> 1) & 3UL).to_int()
+    state.bitbuf = state.bitbuf >> 3
+    state.bitcnt = state.bitcnt - 3
 
     if !flate::is_valid_btype(btype) {
       return Err(GitError::DecompressError("invalid deflate block type 3"))
     }
 
     if btype == 0 {
-      // Stored block: discard partial byte and return full unread bytes to `pos`
-      let drop = bitcnt & 7
-      bitbuf = bitbuf >> drop
-      bitcnt = bitcnt - drop
-      pos = pos - (bitcnt >> 3)
-      bitbuf = 0UL
-      bitcnt = 0
-      if pos + 4 > n {
+      let drop = state.bitcnt & 7
+      state.bitbuf = state.bitbuf >> drop
+      state.bitcnt = state.bitcnt - drop
+      state.in_pos = state.in_pos - (state.bitcnt >> 3)
+      state.bitbuf = 0UL
+      state.bitcnt = 0
+      if state.in_pos + 4 > n {
         return Err(GitError::Truncated("truncated stored block header"))
       }
-      let slen = data[pos].to_int() | (data[pos + 1].to_int() << 8)
-      let nlen = data[pos + 2].to_int() | (data[pos + 3].to_int() << 8)
-      pos = pos + 4
+      let p = state.in_pos
+      let slen = data[p].to_int() | (data[p + 1].to_int() << 8)
+      let nlen = data[p + 2].to_int() | (data[p + 3].to_int() << 8)
+      state.in_pos = p + 4
       if !flate::is_valid_stored_nlen(slen, nlen) {
         return Err(GitError::DecompressError("stored block NLEN mismatch"))
       }
-      if pos + slen > n {
+      if state.in_pos + slen > n {
         return Err(GitError::Truncated("truncated stored block payload"))
       }
-      if out_len + slen > max_output_bytes {
+      if state.out_len + slen > max_output_bytes {
         return Err(GitError::LimitExceeded("decompressed size exceeds limit"))
       }
-      if out_len + slen > out.length() {
-        out = grow_out_buf(out, out_len, out_len + slen, max_output_bytes)
+      if state.out_len == 0 && bfinal {
+        let end_pos = state.in_pos + slen
+        if end_pos + 4 > n {
+          return Err(GitError::Truncated("truncated zlib Adler-32 trailer"))
+        }
+        let res = data.slice(state.in_pos, end_pos)
+        let expected_adler = read_u32_be(data, end_pos)
+        let actual_adler = flate::adler32(res)
+        if expected_adler != actual_adler {
+          return Err(GitError::ChecksumMismatch("zlib Adler-32 mismatch in pack entry"))
+        }
+        return Ok((res, end_pos + 4))
       }
+      if state.out_len + slen > state.out_cap {
+        if !git_inflate_ensure_out(state, state.out, state.out_len, slen) {
+          return Err(GitError::LimitExceeded("decompressed size exceeds limit"))
+        }
+      }
+      let out = state.out
+      let dst = state.out_len
+      let src = state.in_pos
       let mut k = 0
+      let lim8 = slen - 8
+      while k <= lim8 {
+        out[dst + k] = data[src + k]
+        out[dst + k + 1] = data[src + k + 1]
+        out[dst + k + 2] = data[src + k + 2]
+        out[dst + k + 3] = data[src + k + 3]
+        out[dst + k + 4] = data[src + k + 4]
+        out[dst + k + 5] = data[src + k + 5]
+        out[dst + k + 6] = data[src + k + 6]
+        out[dst + k + 7] = data[src + k + 7]
+        k = k + 8
+      }
       while k < slen {
-        out[out_len + k] = data[pos + k]
+        out[dst + k] = data[src + k]
         k = k + 1
       }
-      out_len = out_len + slen
-      pos = pos + slen
+      state.out_len = dst + slen
+      state.in_pos = src + slen
       continue
     }
 
-    let mut cur_lit_lut = scratch.fixed_lit_lut
-    let mut cur_dist_lut = scratch.fixed_dist_lut
+    let mut cur_lit = flit
+    let mut cur_dist = fdist
+    state.dist_mask = 31UL
 
     if btype == 2 {
-      while bitcnt < 14 {
-        if pos >= n {
-          return Err(GitError::Truncated("unexpected EOF in dynamic huffman header"))
-        }
-        bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-        bitcnt = bitcnt + 8
-        pos = pos + 1
+      match git_read_dynamic_trees(data, n, state, scratch) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
       }
-      let hlit = (bitbuf & 0x1FUL).to_int() + 257
-      let hdist = ((bitbuf >> 5) & 0x1FUL).to_int() + 1
-      let hclen = ((bitbuf >> 10) & 0x0FUL).to_int() + 4
-      bitbuf = bitbuf >> 14
-      bitcnt = bitcnt - 14
-      if hlit > 286 || hdist > 30 {
-        return Err(GitError::DecompressError("invalid dynamic huffman counts"))
-      }
-      let mut ci = 0
-      while ci < 19 {
-        scratch.cl_lens[ci] = 0
-        ci = ci + 1
-      }
-      ci = 0
-      while ci < hclen {
-        while bitcnt < 3 {
-          if pos >= n {
-            return Err(GitError::Truncated("unexpected EOF in code length table"))
-          }
-          bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-          bitcnt = bitcnt + 8
-          pos = pos + 1
-        }
-        scratch.cl_lens[git_cl_order[ci]] = (bitbuf & 7UL).to_int()
-        bitbuf = bitbuf >> 3
-        bitcnt = bitcnt - 3
-        ci = ci + 1
-      }
-      if !git_build_huff_lut(
-        scratch.cl_lens,
-        19,
-        7,
-        scratch.cl_lut,
-        scratch.bl_count,
-        scratch.next_code,
-      ) {
-        return Err(GitError::DecompressError("invalid code-length huffman tree"))
-      }
-      let total_codes = hlit + hdist
-      let mut idx = 0
-      while idx < total_codes {
-        while bitcnt < 15 && pos < n {
-          bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-          bitcnt = bitcnt + 8
-          pos = pos + 1
-        }
-        let e = scratch.cl_lut[(bitbuf & 127UL).to_int()]
-        let nb = e & 15
-        if nb == 0 || nb > bitcnt {
-          return Err(GitError::DecompressError("invalid code-length symbol"))
-        }
-        let sym = e >> 5
-        bitbuf = bitbuf >> nb
-        bitcnt = bitcnt - nb
-        if sym < 16 {
-          scratch.code_lens[idx] = sym
-          idx = idx + 1
-        } else if sym == 16 {
-          if idx == 0 {
-            return Err(GitError::DecompressError("repeat prev length at start"))
-          }
-          while bitcnt < 2 {
-            if pos >= n {
-              return Err(GitError::Truncated("EOF in repeat 16"))
-            }
-            bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-            bitcnt = bitcnt + 8
-            pos = pos + 1
-          }
-          let rep = 3 + (bitbuf & 3UL).to_int()
-          bitbuf = bitbuf >> 2
-          bitcnt = bitcnt - 2
-          if idx + rep > total_codes {
-            return Err(GitError::DecompressError("code-length repeat overflow"))
-          }
-          let prev = scratch.code_lens[idx - 1]
-          let mut r = 0
-          while r < rep {
-            scratch.code_lens[idx] = prev
-            idx = idx + 1
-            r = r + 1
-          }
-        } else if sym == 17 {
-          while bitcnt < 3 {
-            if pos >= n {
-              return Err(GitError::Truncated("EOF in repeat 17"))
-            }
-            bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-            bitcnt = bitcnt + 8
-            pos = pos + 1
-          }
-          let rep = 3 + (bitbuf & 7UL).to_int()
-          bitbuf = bitbuf >> 3
-          bitcnt = bitcnt - 3
-          if idx + rep > total_codes {
-            return Err(GitError::DecompressError("code-length zero repeat overflow"))
-          }
-          let mut r = 0
-          while r < rep {
-            scratch.code_lens[idx] = 0
-            idx = idx + 1
-            r = r + 1
-          }
-        } else if sym == 18 {
-          while bitcnt < 7 {
-            if pos >= n {
-              return Err(GitError::Truncated("EOF in repeat 18"))
-            }
-            bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-            bitcnt = bitcnt + 8
-            pos = pos + 1
-          }
-          let rep = 11 + (bitbuf & 127UL).to_int()
-          bitbuf = bitbuf >> 7
-          bitcnt = bitcnt - 7
-          if idx + rep > total_codes {
-            return Err(GitError::DecompressError("code-length long zero repeat overflow"))
-          }
-          let mut r = 0
-          while r < rep {
-            scratch.code_lens[idx] = 0
-            idx = idx + 1
-            r = r + 1
-          }
-        } else {
-          return Err(GitError::DecompressError("invalid code-length sym"))
-        }
-      }
-      let mut li = 0
-      while li < hlit {
-        scratch.lit_lens[li] = scratch.code_lens[li]
-        li = li + 1
-      }
-      let mut di = 0
-      while di < hdist {
-        scratch.dist_lens[di] = scratch.code_lens[hlit + di]
-        di = di + 1
-      }
-      if !git_build_huff_lut(
-        scratch.lit_lens,
-        hlit,
-        9,
-        scratch.lit_lut,
-        scratch.bl_count,
-        scratch.next_code,
-      ) {
-        return Err(GitError::DecompressError("invalid literal/length huffman tree"))
-      }
-      if !git_build_huff_lut(
-        scratch.dist_lens,
-        hdist,
-        8,
-        scratch.dist_lut,
-        scratch.bl_count,
-        scratch.next_code,
-      ) {
-        return Err(GitError::DecompressError("invalid distance huffman tree"))
-      }
-      cur_lit_lut = scratch.lit_lut
-      cur_dist_lut = scratch.dist_lut
+      cur_lit = scratch.lit_lut
+      cur_dist = scratch.dist_lut
+      state.dist_mask = 511UL
     }
 
-    // Main symbol decode loop
-    while true {
-      while bitcnt < 24 && pos < n {
-        bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-        bitcnt = bitcnt + 8
-        pos = pos + 1
-      }
-      let e0 = cur_lit_lut[(bitbuf & 511UL).to_int()]
-      let mut sym = 0
-      if (e0 & 16) == 0 {
-        let nb = e0 & 15
-        if nb == 0 || nb > bitcnt {
-          return Err(GitError::DecompressError("invalid literal/length code"))
-        }
-        sym = e0 >> 5
-        bitbuf = bitbuf >> nb
-        bitcnt = bitcnt - nb
-      } else {
-        if bitcnt < 9 {
-          return Err(GitError::Truncated("truncated secondary lit code"))
-        }
-        let sub_off = e0 >> 5
-        let sub_b = e0 & 15
-        let sub_mask = ((1 << sub_b) - 1).to_int64().to_uint64()
-        let e1 = cur_lit_lut[sub_off + ((bitbuf >> 9) & sub_mask).to_int()]
-        let nb2 = e1 & 15
-        let total_nb = 9 + nb2
-        if nb2 == 0 || total_nb > bitcnt {
-          return Err(GitError::DecompressError("invalid secondary lit code"))
-        }
-        sym = e1 >> 5
-        bitbuf = bitbuf >> total_nb
-        bitcnt = bitcnt - total_nb
-      }
-
-      if sym < 256 {
-        if out_len >= max_output_bytes {
-          return Err(GitError::LimitExceeded("decompressed size exceeds limit"))
-        }
-        if out_len >= out.length() {
-          out = grow_out_buf(out, out_len, out_len + 1, max_output_bytes)
-        }
-        out[out_len] = sym.to_byte()
-        out_len = out_len + 1
-      } else if sym == 256 {
-        break
-      } else {
-        let li = sym - 257
-        if li < 0 || li >= 29 {
-          return Err(GitError::DecompressError("invalid length symbol"))
-        }
-        let lextra = git_len_extra[li]
-        while bitcnt < lextra {
-          if pos >= n {
-            return Err(GitError::Truncated("EOF in length extra bits"))
-          }
-          bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-          bitcnt = bitcnt + 8
-          pos = pos + 1
-        }
-        let match_len = git_len_base[li] + (bitbuf & ((1 << lextra) - 1).to_int64().to_uint64()).to_int()
-        bitbuf = bitbuf >> lextra
-        bitcnt = bitcnt - lextra
-
-        while bitcnt < 24 && pos < n {
-          bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-          bitcnt = bitcnt + 8
-          pos = pos + 1
-        }
-        let d0 = cur_dist_lut[(bitbuf & 255UL).to_int()]
-        let mut dsym = 0
-        if (d0 & 16) == 0 {
-          let nb = d0 & 15
-          if nb == 0 || nb > bitcnt {
-            return Err(GitError::DecompressError("invalid distance code"))
-          }
-          dsym = d0 >> 5
-          bitbuf = bitbuf >> nb
-          bitcnt = bitcnt - nb
-        } else {
-          if bitcnt < 8 {
-            return Err(GitError::Truncated("truncated secondary dist code"))
-          }
-          let sub_off = d0 >> 5
-          let sub_b = d0 & 15
-          let sub_mask = ((1 << sub_b) - 1).to_int64().to_uint64()
-          let d1 = cur_dist_lut[sub_off + ((bitbuf >> 8) & sub_mask).to_int()]
-          let nb2 = d1 & 15
-          let total_nb = 8 + nb2
-          if nb2 == 0 || total_nb > bitcnt {
-            return Err(GitError::DecompressError("invalid secondary dist code"))
-          }
-          dsym = d1 >> 5
-          bitbuf = bitbuf >> total_nb
-          bitcnt = bitcnt - total_nb
-        }
-        if dsym >= 30 {
-          return Err(GitError::DecompressError("invalid distance symbol"))
-        }
-        let dextra = git_dist_extra[dsym]
-        while bitcnt < dextra {
-          if pos >= n {
-            return Err(GitError::Truncated("EOF in distance extra bits"))
-          }
-          bitbuf = bitbuf | (data[pos].to_int().to_int64().to_uint64() << bitcnt)
-          bitcnt = bitcnt + 8
-          pos = pos + 1
-        }
-        let dist = git_dist_base[dsym] + (bitbuf & ((1 << dextra) - 1).to_int64().to_uint64()).to_int()
-        bitbuf = bitbuf >> dextra
-        bitcnt = bitcnt - dextra
-
-        if dist > out_len {
-          return Err(GitError::DecompressError("back-reference distance exceeds output"))
-        }
-        if out_len + match_len > max_output_bytes {
-          return Err(GitError::LimitExceeded("decompressed size exceeds limit"))
-        }
-        if out_len + match_len > out.length() {
-          out = grow_out_buf(out, out_len, out_len + match_len, max_output_bytes)
-        }
-        let mut src = out_len - dist
-        let mut dst = out_len
-        let end_dst = out_len + match_len
-        if dist == 1 {
-          let bval = out[src]
-          while dst < end_dst {
-            out[dst] = bval
-            dst = dst + 1
-          }
-        } else {
-          while dst < end_dst {
-            out[dst] = out[src]
-            src = src + 1
-            dst = dst + 1
-          }
-        }
-        out_len = end_dst
-      }
+    let rc = git_inflate_huffman_block(data, n, cur_lit, cur_dist, state)
+    if rc != 0 {
+      return Err(git_inflate_rc_to_error(rc))
     }
   }
 
-  // Align to byte boundary and rewind unused full bytes in bitbuf
-  let rem_bits = bitcnt & 7
-  bitcnt = bitcnt - rem_bits
-  let end_pos = pos - (bitcnt >> 3)
+  let rem_bits = state.bitcnt & 7
+  state.bitcnt = state.bitcnt - rem_bits
+  let end_pos = state.in_pos - (state.bitcnt >> 3)
   if end_pos + 4 > n {
     return Err(GitError::Truncated("truncated zlib Adler-32 trailer"))
   }
-  let res = if out_len == out.length() { out } else { out.slice(0, out_len) }
+  let res = if state.out_len == state.out_cap {
+    state.out
+  } else {
+    state.out.slice(0, state.out_len)
+  }
   let expected_adler = read_u32_be(data, end_pos)
   let actual_adler = flate::adler32(res)
   if expected_adler != actual_adler {
