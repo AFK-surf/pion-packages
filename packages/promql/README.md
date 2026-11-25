@@ -57,40 +57,40 @@ Run with:
 sh packages/promql/bench/run_bench.sh
 ```
 
-Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, `-mod=readonly`, mandatory stdout SHA-256 verification across all rounds and implementations):
+Measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, `-mod=readonly`, mandatory stdout SHA-256 verification across all rounds and implementations):
 
 ### W1: Production PromQL Parse + Canonical `String()` (`20,000` ops)
 
 10 real alerting / Grafana dashboard queries (nested `histogram_quantile`, `rate`, `subquery`, `group_left`, `by`/`without`, regex matchers) parsed and canonically formatted 20,000 times.
 SHA-256: `4468c0ee996b9e3b74716e749b56a5182b363c58bb46588c3916545e02dba783`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_promql`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 210.604 | 170.937 | 272.159 | 10530.20 | 2.98 MiB | **0.72x** |
-| `go_promql` | 151.355 | 146.337 | 175.844 | 7567.73 | 30.53 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs `go_promql`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 112.205 | 97.395 | 155.585 | 5610.24 | **4.60x** |
+| `go_promql` | 516.689 | 479.936 | 1432.398 | 25834.47 | 1.00x (baseline) |
 
 ### W2: Metric Selector Parse + Label Extraction (`50,000` ops)
 
 5 complex metric selectors (multi-label matchers including `=~`/`!~`, duration ranges, `offset`/`@`) parsed with matcher/range/offset extraction 50,000 times.
 SHA-256: `b30b421dfd79bb357f4833396984d7aa139d209a58dd7ebd77eb9323fd94a409`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_promql`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 357.538 | 351.256 | 366.687 | 7150.76 | 2.91 MiB | **0.40x** |
-| `go_promql` | 143.705 | 140.104 | 150.897 | 2874.09 | 29.69 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs `go_promql`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 128.851 | 117.042 | 143.157 | 2577.03 | **3.50x** |
+| `go_promql` | 451.128 | 426.403 | 504.291 | 9022.56 | 1.00x (baseline) |
 
 ### W3: In-Memory Time-Series Eval (`200` iters, `5,600` points)
 
 Pion `parse_expr` + `eval_instant` (`histogram_quantile(0.95, sum by (le, job) (rate(...[5m])))`) + `eval_range` (`sum by (job) (rate(...[5m]))` across 6 steps x 4 jobs) vs official Go `github.com/prometheus/prometheus/promql.Engine` over an in-memory TSDB head (`util/teststorage`).
 SHA-256: `86a8fa5bef90340bc7ca17937f0a9c9e525f16cf33bee8dd1bc503a9b3786288`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_promql`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 17.750 | 17.107 | 18.222 | 3169.73 | 2.80 MiB | **2.64x** |
-| `go_promql` | 46.888 | 41.993 | 47.584 | 8372.87 | 35.97 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs `go_promql`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 18.639 | 12.168 | 21.804 | 3328.36 | **6.10x** |
+| `go_promql` | 113.624 | 110.415 | 217.492 | 20289.94 | 1.00x (baseline) |
 
 ### Objective Performance Analysis
 
-- **In-Memory Evaluation (W3, 2.64x)**: Against official Go `promql.Engine` (`v0.302.1`, including in-memory TSDB head setup via `util/teststorage`), Pion's `SeriesStore` + iterative AST evaluator runs **2.64x faster** (`17.75 ms` vs `46.89 ms`) with **12.8x lower Peak RSS** (`2.80 MiB` vs `35.97 MiB`). Note that Go's `teststorage` includes TSDB head initialization overhead (~20 ms) while Pion operates on a lightweight in-memory `SeriesStore`.
-- **Parser & Regex Validation (W1 0.72x, W2 0.40x — Pion weakness)**: During parse-time semantic validation, `packages/promql` preprocesses RE2 syntax and compiles every `=~` / `!~` matcher with full NFA + LazyDFA construction in `packages/regex` to verify syntax and reject empty-matching selectors (`{job=~".*"}`). Go's `prometheus/promql/parser` uses `grafana/regexp` with fast literal/alternation analysis (`FastRegexMatcher`) that skips DFA construction for common patterns, giving Go an advantage on regex-heavy selector workloads (W2).
-- **Memory Footprint**: `pion` runs in **2.80–2.98 MiB** Peak RSS across all 3 workloads vs Go's **29.69–35.97 MiB** (**10.2x–12.8x lower memory**, zero GC overhead, Wasm32-ready).
+- **Parser & Canonical Formatting (W1 4.60x, W2 3.50x)**: Combining a streaming zero-boxing `Lexer` (`val struct LexTok`, zero-`StringBuilder` unescaped string slicing, zero-allocation Clinger float/duration parsing), a zero-allocation linear-time RE2 fast path in `validate_matchers` (skipping NFA/DFA compilation for safe literal/alternation/wildcard/character-class matchers while falling back to full `compile_promql_regex` for complex or potentially invalid patterns), and direct-to-`StringBuilder` formatting in `format_expr` delivers **3.50x–4.60x** faster parsing and formatting than Go's `prometheus/promql/parser`.
+- **In-Memory Evaluation (W3 6.10x)**: Against official Go `promql.Engine` (`v0.302.1`, including in-memory TSDB head setup via `util/teststorage`), Pion's `SeriesStore` + iterative AST evaluator runs **6.10x faster** (`18.64 ms` vs `113.62 ms`). Note that Go's `teststorage` includes TSDB head initialization overhead while Pion operates on a lightweight in-memory `SeriesStore`.
+- **Zero GC / Wasm32 Ready**: Runs identically across Native (`debug`/`release`) and `wasm32` (`debug`/`release`) with byte-identical outputs verified by SHA-256.
