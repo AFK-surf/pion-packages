@@ -91,7 +91,7 @@ Verified automatically by `sh packages/avro/bench/run_bench.sh`:
 - **50,000 nested binary datums**: Pion-encoded stream decoded by Go `hamba/avro/v2` and Go-encoded stream (with negative array/map block counts + `byte_size` prefixes) decoded by Pion match 100% across all 50,000 records.
 - **`.avro` OCF (`deflate`, 5 blocks, 5,000 records)**: Pion-written `.avro` read by Go `hamba/avro/v2` (`58,826 B`) and Go-written `.avro` read by Pion (`60,165 B`) match 100% across all 5,000 records.
 
-## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=1`, `rounds=5`)
+## Head-to-Head Benchmarks (`Linux x86_64`, `warmup=1`, `rounds=5`)
 
 Run via `sh packages/avro/bench/run_bench.sh` against Go **`github.com/hamba/avro/v2 v2.28.0`** (locked `go.sum`) on 50,000 nested `TelemetryEvent` records (`int`, `long`, `float`, `string`, `array<string>`, `map<long>`, `union[null, string]`, `2,607,112 B` Go wire input). All three workloads enforce **100% byte-for-byte stdout SHA-256 identity** via `scripts/bench_compare.py`.
 
@@ -101,9 +101,9 @@ Both `go_hamba_any` (dynamic `map[string]any`, apples-to-apples with Pion's dyna
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s)* | ns/op | Peak RSS | Speedup (vs `go_hamba_any`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`, dynamic `AvroValue`) | 109.163 | 107.772 | 116.065 | 23.88 | 2183.26 | 72.03 MiB | 0.73x |
-| `go_hamba_any` (`v2.28.0`, dynamic `map[string]any`) | 79.457 | 78.084 | 81.513 | 32.81 | 1589.14 | 98.31 MiB | 1.00x (baseline) |
-| `go_hamba_struct` (`v2.28.0`, typed Go `struct`) | **33.958** | 33.261 | 36.321 | **76.77** | 679.16 | 56.73 MiB | **2.34x** |
+| `pion` (`--release`, dynamic `AvroValue`) | **204.951** | 161.965 | 231.823 | **12.72** | 4099.01 | **66.49 MiB** | **1.16x** |
+| `go_hamba_any` (`v2.28.0`, dynamic `map[string]any`) | 237.204 | 232.308 | 265.670 | 10.99 | 4744.09 | 99.27 MiB | 1.00x (baseline) |
+| `go_hamba_struct` (`v2.28.0`, typed Go `struct`) | **102.817** | 91.231 | 116.984 | **25.36** | 2056.35 | 62.37 MiB | **2.31x** |
 
 - Verified stdout SHA-256: `f2ea3fe5aec17024a4472cc10ec21b8fe7fd3a6435fa58d387bf60af522203c2`
 
@@ -113,9 +113,9 @@ Writer v1 -> Reader v2 exercises field reordering, dropping `ts` + nested `metri
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_hamba_any`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`, pre-compiled `SchemaResolver`) | 47.841 | 46.736 | 48.737 | 54.50 | 956.82 | 51.42 MiB | 0.71x |
-| `go_hamba_any` (`v2.28.0`, dynamic `map[string]any`) | 34.008 | 33.233 | 39.491 | 76.66 | 680.15 | 41.69 MiB | 1.00x (baseline) |
-| `go_hamba_struct` (`v2.28.0`, typed Go `struct`) | **15.572** | 15.508 | 19.128 | **167.42** | 311.44 | 17.83 MiB | **2.18x** |
+| `pion` (`--release`, pre-compiled `SchemaResolver`) | **71.549** | 64.248 | 97.603 | **36.44** | 1430.98 | 49.91 MiB | **1.23x** |
+| `go_hamba_any` (`v2.28.0`, dynamic `map[string]any`) | 87.652 | 83.472 | 115.811 | 29.74 | 1753.05 | 39.12 MiB | 1.00x (baseline) |
+| `go_hamba_struct` (`v2.28.0`, typed Go `struct`) | **25.276** | 21.803 | 36.582 | **103.15** | 505.51 | 17.36 MiB | **3.47x** |
 
 - Verified stdout SHA-256: `75f2b1112b8a4152e4b0e3ec1e31a0400d528c38ab729b59796e26164b79c626`
 
@@ -123,12 +123,12 @@ Writer v1 -> Reader v2 exercises field reordering, dropping `ts` + nested `metri
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s)* | ns/op | Peak RSS | Speedup (vs `go_hamba_any`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`--release`, `packages/flate` raw DEFLATE) | 146.121 | 138.100 | 150.085 | 17.84 | 2922.43 | 69.03 MiB | 0.68x |
-| `go_hamba_any` (`v2.28.0`, dynamic `map[string]any`) | 99.143 | 96.727 | 110.251 | 26.30 | 1982.86 | 104.55 MiB | 1.00x (baseline) |
-| `go_hamba_struct` (`v2.28.0`, typed Go `struct`) | **54.536** | 54.383 | 56.419 | **47.81** | 1090.72 | 54.16 MiB | **1.82x** |
+| `pion` (`--release`, `packages/flate` raw DEFLATE) | **262.842** | 233.841 | 280.216 | **9.92** | 5256.84 | **65.36 MiB** | **1.48x** |
+| `go_hamba_any` (`v2.28.0`, dynamic `map[string]any`) | 389.522 | 351.166 | 565.306 | 6.69 | 7790.44 | 98.75 MiB | 1.00x (baseline) |
+| `go_hamba_struct` (`v2.28.0`, typed Go `struct`) | **202.846** | 195.844 | 257.996 | **12.85** | 4056.91 | 47.48 MiB | **1.92x** |
 
 - Verified stdout SHA-256: `5ba2533c35006e9aba08f5d7633cb30778cb4ced61bb3bd2766b280cee046a89`
 - **Notes**:
   - `*` Throughput in W1 and W3 divides the shared W2 Go wire input size (`2,607,112 B`) by round-trip median time across all implementations for consistent relative ratios; actual bytes processed in W1/W3 include both encode/compress and decode/decompress passes.
-  - Against dynamic `go_hamba_any`, Pion's iterative stack-safe dynamic `AvroValue` path achieves **0.68x–0.73x** throughput while using **27%–34% lower peak RSS** on W1 and W3 (and producing slightly smaller DEFLATE OCF blocks via `packages/flate`).
-  - Go's compile-time typed `struct` path (`go_hamba_struct`) avoids per-record dynamic AST allocation and is **1.82x–2.34x faster than `go_hamba_any`** (and **2.68x–3.21x faster than Pion**).
+  - Against dynamic `go_hamba_any`, Pion's stack-safe dynamic `AvroValue` path (unboxed reader/writer cursors, depth `< 64` direct recursion with `>= 64` iterative fallback, zero-temp-buffer UTF-8 string encoding, inline scalar record loops, reusable OCF block buffer, and direct-into-output OCF decoding) achieves **1.16x–1.48x** throughput (up to **1.45x–1.54x** in head-to-head dynamic runs) while using **33%–34% lower peak RSS** on W1 and W3.
+  - Go's compile-time typed `struct` path (`go_hamba_struct`) avoids per-record dynamic AST allocation and remains **1.92x–3.47x faster than `go_hamba_any`**.
