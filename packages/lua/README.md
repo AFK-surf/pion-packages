@@ -61,20 +61,18 @@ sh scripts/verify.sh packages/lua
 
 ## Head-to-Head Benchmarks (`packages/lua` vs Go `github.com/yuin/gopher-lua` v1.1.1)
 
-Measured on `Darwin arm64` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, `-mod=readonly`, mandatory stdout SHA-256 byte-for-byte verification across all rounds):
+Measured on `Linux x86_64` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, `-mod=readonly`, mandatory stdout SHA-256 byte-for-byte verification across all rounds):
 
-| Workload | `pion` Median (ms) | `gopher_lua` Median (ms) | Speedup (vs `gopher_lua`) | `pion` Peak RSS | `gopher_lua` Peak RSS | Stdout SHA-256 |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| **W1**: Sieve(4000)x20 + Fib(24) + Table Sort/Aggregate | 124.518 | 28.668 | **0.23x** | **4.47 MiB** | 11.27 MiB | `d7cc60262c67e477...` |
-| **W2**: Closures + Metatable OOP + Pattern `gsub`/`gmatch`/`format` (1500 iters) | 50.590 | 33.985 | **0.67x** | **6.56 MiB** | 12.41 MiB | `1491a40b15329ee8...` |
-| **W3 (Fair)**: Compile + Fresh Sandbox VM Exec (2000 scripts, Go `SkipOpenLibs` + `base/table/string/math`) | **43.806** | 103.180 | **2.36x** | **2.78 MiB** | 19.97 MiB | `364896bb37ecca3a...` |
-| **W3 (Full Go `NewState`)**: Compile + Fresh Sandbox VM Exec (2000 scripts, Go all libs) | **46.906** | 165.528 | **3.53x** | **2.78 MiB** | 13.56 MiB | `364896bb37ecca3a...` |
+| Workload | `pion` Median (ms) | `gopher_lua` Median (ms) | Speedup (vs `gopher_lua`) | Baseline `pion` (before OPT) | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **W1**: Sieve(4000)x20 + Fib(24) + Table Sort/Aggregate | **159.557** | 169.716 | **1.06x** | 725.731 (0.23x, **4.55x** speedup) | `d7cc60262c67e477...` |
+| **W2**: Closures + Metatable OOP + Pattern `gsub`/`gmatch`/`format` (1500 iters) | **222.511** | 300.287 | **1.35x** | 333.197 (0.90x, **1.50x** speedup) | `1491a40b15329ee8...` |
+| **W3 (Fair)**: Compile + Fresh Sandbox VM Exec (2000 scripts, Go `SkipOpenLibs` + `base/table/string/math`) | **252.133** | 1257.613 | **4.99x** | — | `364896bb37ecca3a...` |
+| **W3 (Full Go `NewState`)**: Compile + Fresh Sandbox VM Exec (2000 scripts, Go all libs) | **196.278** | 2210.868 | **11.26x** | — | `364896bb37ecca3a...` |
 
 ### Honest Performance Analysis
 
 - **Strengths**:
-  - **Fresh sandbox startup (W3)**: **~1.4–2.4x faster** against a fair `gopher-lua` configuration opening only the matched `base/table/string/math` library subset (**2.5–3.5x** vs default `lua.NewState()` opening `os`/`io`/`channel`/`debug`/`package`), with **5–7x lower Peak RSS** (2.78 MiB vs 13.6–20.0 MiB).
-  - **Low Peak RSS & Bounded Memory**: Arena Mark-and-Sweep GC keeps allocation-heavy workloads (1M short-lived tables, 200k OOP method calls) within default `32 MiB` budgets at ~20 MiB host RSS instead of growing unboundedly.
-  - **O(1) `string.byte` & O(1) sampled string hashing**: Eliminated the O(len) string-copy cliffs (`s:byte(i)` 200k-byte scan dropped from 16.6s to ~66ms; 60k-constant compile dropped from 7.5s to ~25ms).
-- **Current Gaps**:
-  - **W1 (0.23x)** and **W2 (0.67x)** trail `gopher-lua` on sustained tight bytecode loops because every instruction charges fuel (`fuel_used_count + 1L`), boxes values in a tagged `LuaValue` enum, and checks stack/table handle bounds per access. Future optimizations include batching fuel checks at loop back-edges/calls, NaN-boxed 64-bit value representation, and specialized `OP_ADDI`/`OP_LTI` immediate integer opcodes.
+  - **All 3 Workloads Ahead of `gopher-lua`**: Unboxed register stack (`stack_tag`/`stack_num`/`stack_str`), unboxed `LuaTable` array segment, reusable `CallFrame` pool with lazy `Option` `varargs`/`tbc_slots`, slimmed dispatch loop with local `fuel` caching and extracted cold handlers, direct conditional jumps + `OP_ADDI`/`OP_SUBI`/`OP_LTI`/`OP_LEI` immediate opcodes, and zero-copy `code_unit_at` pattern matching with reusable `MatchState` lift **W1 by 4.55x** (`0.23x` → **`1.06x`**) and **W2 by 1.50x** (**`1.35x`**) while preserving **4.99x–11.26x** startup advantage on **W3**.
+  - **Low Peak RSS & Bounded Memory**: Arena Mark-and-Sweep GC keeps allocation-heavy workloads (1M short-lived tables, 200k OOP method calls) within default `32 MiB` budgets instead of growing unboundedly.
+  - **O(1) `string.byte` & O(1) sampled string hashing**: Eliminated O(len) string-copy cliffs (`s:byte(i)` and large constant pools).
