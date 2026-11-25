@@ -9,10 +9,11 @@ Designed with a **Sans-IO** architecture: no `World` dependency, no C/FFI bindin
 - **RFC 1951 Raw DEFLATE (`src/inflate.pion`, `src/deflate.pion`, `src/huffman.pion`)**:
   - **Decompressor (`deflate_decompress`, `deflate_decompress_with_limit`)**:
     - Supports all three block types: Stored (`BTYPE=00`), Fixed Huffman (`BTYPE=01`), and Dynamic Huffman (`BTYPE=10`).
-    - 64-bit bit buffer (`UInt64`) with 32-bit bulk refills, **10-bit primary + secondary packed Huffman LUTs** (length/distance bases & extra bit counts packed directly into LUT entries), opportunistic multi-literal decoding per refill, zero-loop Stored block slicing (`Bytes::slice` + balanced pairwise `Bytes::concat`), fast RLE `dist == 1` memset fill, and 8-byte unrolled `dist >= 8` back-reference copies.
+    - 64-bit bit buffer (`UInt64`) with sequential 32-bit refills, **10-bit primary + secondary packed Huffman LUTs**, split fast/slow Huffman decode loops (immutable `out` in `inflate_huffman_fast`, single exit point, zero per-symbol EOF/bounds/`Result` overhead, literal-to-match LUT fall-through), safe `ISIZE` trailer pre-allocation hint for single-member gzip streams, zero-loop Stored block slicing (`Bytes::slice` + balanced pairwise `Bytes::concat`), fast RLE `dist == 1` fill, and 8-byte unrolled `dist >= 8` back-reference copies.
     - Handles overlapping RLE copies (`dist < len`), full 32 KiB sliding window (`dist == 32768`), and preset dictionary history (for zlib `FDICT`).
   - **Compressor (`deflate_compress`, `deflate_compress_default`)**:
-    - Supports all compression levels `0..9`: level `0` (Stored blocks), levels `1..3` (fast greedy LZ77 with adaptive miss-skipping), levels `4..9` (lazy-matching LZ77 with carry-over, 32 KiB sliding window, 15-bit multiplicative hash chains, and standard zlib-style `good_length`/`max_lazy`/`nice_length` early exit).
+    - Supports all compression levels `0..9`: level `0` (Stored blocks), level `1` (1-slot 14-bit direct-hash fast LZ77 with zero `prev` chain allocation), levels `2..3` (lean greedy LZ77 with adaptive miss-skipping), levels `4..9` (lazy-matching LZ77 with carry-over, 32 KiB sliding window, 15-bit multiplicative hash chains, 6-arg register-only `lz77_find_match`, and standard zlib-style `good_length`/`max_lazy`/`nice_length` early exit).
+    - Zero-COW `FixedArray[Byte]` `BitWriter` with hoisted local `bitbuf`/`bitcnt` and packed `(code << 5) | nbits` / `len_pack` / `dist_pack` token emission.
     - **Incompressible / high-entropy fast path**: cheap entropy + 3-byte-match probe skips LZ77 & Package-Merge on random/already-compressed chunks and emits Stored blocks directly via native `Bytes::slice` `memcpy`.
     - Exact **Package-Merge** length-limited (`<= 15` bit litlen/dist, `<= 7` bit code-length) Canonical Huffman encoder and per-block minimum-cost selection among Stored, Fixed Huffman, and Dynamic Huffman.
 - **RFC 1950 zlib (`src/zlib.pion`)**:
@@ -24,8 +25,8 @@ Designed with a **Sans-IO** architecture: no `World` dependency, no C/FFI bindin
   - Strict RFC 1952 §2.3.1 **ISO-8859-1 (Latin-1)** wire encoding/decoding for `FNAME` and `FCOMMENT`: rejects NUL (`\u{0}`) and characters outside U+0001..U+00FF with `Err(FlateError::InvalidHeader(_))`.
   - Multi-member concatenated gzip decoding (`member_count`) with reusable inflate scratch tables, lazy output allocation (zero buffer allocation for empty members), per-member `CRC-32` + `ISIZE` trailer validation, and cumulative `max_output_bytes` enforcement.
 - **High-Throughput Checksums (`src/checksum.pion`)**:
-  - **IEEE CRC-32**: **Slice-by-16** (`16 × 256` `FixedArray[UInt]` lookup tables) — `crc32`, `crc32_update`, `crc32_update_slice`, and streaming `Crc32`.
-  - **Adler-32**: `NMAX = 5552` deferred modulo with 16-byte unrolled tree-reduced inner loop — `adler32`, `adler32_update`, `adler32_update_slice`, and streaming `Adler32`.
+  - **IEEE CRC-32**: Single flat `4096`-entry (`16 × 256`) `FixedArray[UInt]` Slice-by-16 lookup table (zero multi-table pointer spills) — `crc32`, `crc32_update`, `crc32_update_slice`, and streaming `Crc32`.
+  - **Adler-32**: `NMAX = 5552` deferred modulo with low-register-pressure 8-byte (2×4-byte) unrolled inner loop — `adler32`, `adler32_update`, `adler32_update_slice`, and streaming `Adler32`.
 
 ## Output Limits & Memory Model
 
@@ -77,66 +78,53 @@ let gout = match gz {
 
 Every check below is reproducible with `sh packages/flate/audit/run_audit.sh all`:
 
-- **Unit & Red-Team Compliance Suite**: **20 / 20 passing** (`pionc test --json packages/flate`) + **11 / 11 passing** (`pionc test --json packages/flate/audit`, including all 4 `redteam_*` compliance guards and 7 `control_*` regression guards).
+- **Unit & Red-Team Compliance Suite**: **21 / 21 passing** (`pionc test --json packages/flate`) + **11 / 11 passing** (`pionc test --json packages/flate/audit`, including all 4 `redteam_*` compliance guards and 7 `control_*` regression guards).
 - **Differential RFC Edge Vectors (`difftest.py vectors`)**: **81 / 81** vectors pass across 5 decoders (Pion Native, Pion Wasm32, Go `compress/*`, Rust `flate2/miniz_oxide`, CPython `zlib`), with **0** Native vs Wasm32 mismatches.
 - **Compressor Interoperability (`difftest.py compress`)**: **100 / 100** streams (10 pathological & real corpora × levels `0..9`, including Fibonacci-frequency literals forcing 15-bit Package-Merge clamping) decode byte-identically across Pion, Go, Rust `miniz_oxide`, and CPython `zlib`.
 - **Differential Mutation Fuzz (`difftest.py fuzz`)**: **24,000** mutated raw/zlib/gzip cases with **0** crashes/hangs, **0** Native vs Wasm32 diffs, and **0** disagreements vs unanimous `(Go, Rust, Python)`.
-- **Dual-Target Smoke (`packages/flate/wasm_smoke`)**: Native debug/release + Wasm32 debug/release all 4 modes exit `0`.
+- **Dual-Target Smoke (`packages/flate/wasm_smoke`)**: Native debug/release + Wasm32 debug/release all 4 modes exit `0` with identical stdout SHA-256.
 - **Formatting & Typecheck**: `pionc fmt --check packages/flate` and `pionc check --json packages/flate` pass with 0 diagnostics.
 
 ## Multi-Shape Benchmarks
 
-Measured via `sh packages/flate/audit/run_audit.sh bench` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification where compress modes re-decompress and print output length + CRC-32 so a broken encoder cannot win) on Apple M5 Max (`Darwin arm64`) against **Rust `flate2 1.1.11` (`rust_backend` / `miniz_oxide`, `--release`)** and **Go `go1.27.3` `compress/gzip` + `hash/{crc32,adler32}`**.
+Measured via `sh packages/flate/audit/run_audit.sh bench` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) on Linux `x86_64` (AMD Ryzen 7 PRO 8845HS) against **Rust `flate2 1.1.11` (`rust_backend` / `miniz_oxide` + `crc32fast`/`simd-adler32`, `--release`)** and **Go `go1.24.4` `compress/gzip` + `hash/{crc32,adler32}`**.
 
-### 1. Throughput Across 6 Real & Pathological Corpora (MB/s)
+### 1. Throughput Across 6 Real & Pathological Corpora (MB/s, Linux `x86_64`)
 
-| Corpus | Operation | Pion Before | **Pion After** | `miniz_oxide` | Go | Pion vs `miniz` | Pion vs Go |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `entropy` (4 MiB rand) | gzip decompress | 530.6 | **639.6** | 1959.9 | 1765.1 | 0.33× | 0.36× |
-| `entropy` | compress L1 | 37.0 | **538.5** | 277.2 | 1592.4 | **1.94×** | 0.34× |
-| `entropy` | compress L6 | 33.7 | **542.3** | 68.1 | 1470.6 | **7.96×** | 0.37× |
-| `entropy` | compress L9 | 34.1 | **410.4** | 64.8 | 183.1 | **6.33×** | **2.24×** |
-| `html` (4 MiB Go spec) | gzip decompress | 260.5 | **305.5** | 392.7 | 291.4 | 0.78× | **1.05×** |
-| `html` | compress L1 / L6 / L9 | 83.4 / 30.2 / 17.7 | **100.8 / 44.4 / 21.3** | 216.1 / 51.4 / 37.8 | 216.0 / 139.1 / 29.0 | 0.47 / 0.86 / 0.56× | 0.47 / 0.32 / 0.74× |
-| `json` (4 MiB records) | gzip decompress | 268.3 | **291.9** | 401.2 | 269.3 | 0.73× | **1.08×** |
-| `json` | compress L1 / L6 / L9 | 88.9 / 35.2 / 10.3 | **98.1 / 52.8 / 17.1** | 255.2 / 45.8 / 23.6 | 240.9 / 138.8 / 24.7 | 0.38 / **1.15** / 0.72× | 0.41 / 0.38 / 0.69× |
-| `source` (4 MiB Go src) | gzip decompress | 268.4 | **321.2** | 409.6 | 293.9 | 0.78× | **1.09×** |
-| `source` | compress L1 / L6 / L9 | 84.5 / 26.7 / 19.0 | **103.7 / 49.8 / 25.9** | 236.0 / 55.8 / 43.4 | 222.0 / 143.6 / 40.9 | 0.44 / 0.89 / 0.60× | 0.47 / 0.35 / 0.63× |
-| `text` (2.4 MiB words) | gzip decompress | 191.5 | **247.5** | 337.9 | 229.3 | 0.73× | **1.08×** |
-| `text` | compress L1 / L6 / L9 | 70.5 / 20.9 / 6.4 | **93.3 / 26.7 / 9.9** | 207.6 / 29.2 / 15.5 | 180.3 / 101.6 / 17.0 | 0.45 / 0.91 / 0.64× | 0.52 / 0.26 / 0.58× |
-| `big16` (16 MiB mix) | gzip decompress | 232.5 | **290.7** | 412.3 | 283.5 | 0.71× | **1.03×** |
-| `big16` | compress L1 / L6 / L9 | 64.0 / 23.1 / 11.4 | **87.2 / 37.5 / 15.4** | 182.2 / 36.0 / 24.8 | 167.9 / 110.3 / 23.5 | 0.48 / **1.04** / 0.62× | 0.52 / 0.34 / 0.65× |
-| All 6 corpora | CRC-32 + Adler-32 | 702–826 | **843–1007** | 1721–2450 | 1175–1510 | 0.40–0.49× | 0.63–0.72× |
+| Corpus | Operation | **Pion** | `miniz_oxide` | Go | Pion vs `miniz` | Pion vs Go |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `entropy` (4 MiB rand) | gzip decompress | **249.0** | 1128.6 | 196.9 | 0.22× | **1.26×** |
+| `entropy` | compress L1 / L6 / L9 | **207.8 / 114.0 / 91.1** | 159.3 / 26.2 / 18.1 | 201.3 / 15.4 / 13.8 | **1.30 / 4.36 / 5.03×** | **1.03 / 7.41 / 6.59×** |
+| `html` (4 MiB) | gzip decompress | **104.1** | 208.1 | 69.5 | 0.50× | **1.50×** |
+| `html` | compress L1 / L6 / L9 | **36.3 / 17.7 / 7.8** | 103.7 / 18.6 / 8.9 | 41.4 / 21.8 / 6.0 | 0.35 / 0.95 / 0.87× | 0.88 / 0.81 / **1.31×** |
+| `json` (4 MiB) | gzip decompress | **97.0** | 165.0 | 57.1 | 0.59× | **1.70×** |
+| `json` | compress L1 / L6 / L9 | **39.2 / 26.2 / 10.2** | 94.2 / 20.8 / 13.3 | 42.8 / 15.2 / 12.9 | 0.42 / **1.26** / 0.77× | 0.92 / **1.73** / 0.79× |
+| `source` (4 MiB) | gzip decompress | **225.0** | 425.7 | 84.9 | 0.53× | **2.65×** |
+| `source` | compress L1 / L6 / L9 | **71.5 / 13.7 / 6.7** | 169.8 / 16.4 / 10.8 | 83.2 / 16.5 / 9.2 | 0.42 / 0.83 / 0.62× | 0.86 / 0.83 / 0.73× |
+| `text` (1.8 MiB) | gzip decompress | **134.2** | 198.8 | 58.3 | 0.67× | **2.30×** |
+| `text` | compress L1 / L6 / L9 | **54.2 / 14.1 / 15.4** | 119.8 / 26.7 / 27.9 | 65.7 / 17.0 / 16.7 | 0.45 / 0.53 / 0.55× | 0.83 / 0.83 / 0.92× |
+| `big16` (16 MiB mix) | gzip decompress | **158.0** | 338.9 | 92.7 | 0.47× | **1.70×** |
+| `big16` | compress L1 / L6 / L9 | **69.7 / 23.3 / 14.4** | 137.2 / 22.2 / 17.9 | 70.4 / 19.8 / 14.8 | 0.51 / **1.05** / 0.81× | 0.99 / **1.18** / 0.97× |
+| All 6 corpora | CRC-32 + Adler-32 | **251–610** | 1116–3353 | 389–1213 | 0.18–0.34× | 0.50–0.85× |
 
 ### 2. Compressed Sizes Across All 6 Corpora (Bytes)
 
 | Corpus | Level 1 (Pion / `miniz` / Go) | Level 6 (Pion / `miniz` / Go) | Level 9 (Pion / `miniz` / Go) |
 | --- | ---: | ---: | ---: |
-| `entropy` (4,194,304 B) | 4,194,629 / 4,198,186 / 4,194,631 | 4,194,629 / 4,194,969 / 4,194,631 | 4,194,629 / 4,194,969 / 4,194,946 |
-| `html` (4,194,304 B) | 1,377,159 / 1,624,878 / 1,386,629 | 1,137,769 / 1,118,477 / 1,164,462 | 1,115,022 / 1,115,149 / 1,110,233 |
-| `json` (4,194,304 B) | 1,493,524 / 1,479,550 / 1,344,991 | 1,286,711 / 1,230,323 / 1,210,476 | 1,238,121 / 1,217,228 / 1,144,530 |
-| `source` (4,194,304 B) | 1,289,950 / 1,515,528 / 1,301,005 | 1,076,127 / 1,061,930 / 1,096,465 | 1,059,646 / 1,059,129 / 1,055,047 |
-| `text` (2,493,885 B) | 822,484 / 958,958 / 896,916 | 759,198 / 756,053 / 795,315 | 759,909 / 755,944 / 742,391 |
-| `big16` (16,777,216 B) | 6,272,725 / 6,873,194 / 6,187,274 | 5,512,700 / 5,383,712 / 5,489,706 | 5,418,442 / 5,368,321 / 5,270,229 |
+| `entropy` (4,194,304 B) | 4,194,629 / 4,198,186 / 4,194,634 | 4,194,629 / 4,194,969 / 4,195,589 | 4,194,629 / 4,194,969 / 4,195,589 |
+| `html` (4,194,304 B) | 923,350 / 809,282 / 837,888 | 838,072 / 814,778 / 771,640 | 816,275 / 812,165 / 755,919 |
+| `json` (4,194,304 B) | 1,563,148 / 1,479,560 / 1,415,960 | 1,286,775 / 1,230,479 / 1,148,484 | 1,238,253 / 1,217,349 / 1,132,428 |
+| `source` (4,194,304 B) | 1,449,152 / 1,539,452 / 1,348,233 | 1,088,605 / 1,074,313 / 1,079,970 | 1,071,690 / 1,071,384 / 1,078,039 |
+| `text` (1,876,229 B) | 1,188,755 / 1,118,606 / 1,053,552 | 1,112,611 / 1,107,337 / 1,029,624 | 1,112,599 / 1,107,337 / 1,029,624 |
+| `big16` (16,777,216 B) | 6,635,066 / 6,475,708 / 6,083,993 | 5,738,004 / 5,607,918 / 5,408,464 | 5,660,972 / 5,590,263 / 5,376,163 |
 
-### 3. DoS & Adversarial Pathological Inputs (`run_audit.sh dos`)
-
-| Workload | Pion Before | **Pion After** | `miniz_oxide` | Go |
-| --- | ---: | ---: | ---: | ---: |
-| `empty_members_100k.gz` (100k empty members) | 0.49 s | **0.00 s (5.8 MiB RSS)** | 0.16 s (4.0 MiB) | 0.02 s (6.4 MiB) |
-| `bomb_1GiB.gz` (limit = 1 MiB) | 0.00 s (5 MiB) | **0.00 s (6.0 MiB RSS)** | 0.00 s (5.1 MiB) | 0.00 s (8.4 MiB) |
-| `bomb_1GiB.gz` (limit = 256 MiB) | 0.13 s (391 MiB) | **0.16 s (394.1 MiB RSS)** | 0.04 s (293.1 MiB) | 0.12 s (580.2 MiB) |
-| `adv_ab_4M` compress L6 / L9 | — / 4.40 s | **0.22 s / 2.06 s** | 0.27 s / 1.08 s | 0.02 s / 37.35 s |
-| `adv_prefix3_4M` compress L6 / L9 | — / 1.61 s | **0.20 s / 0.46 s** | 0.23 s / 0.74 s | 0.02 s / 0.18 s |
-
-### Honest Performance Analysis
+### 3. Honest Performance Analysis
 
 - **Strengths**:
-  - **Decompression beats Go across all 5 compressible/mixed corpora** (`1.03–1.09×` Go; `0.71–0.78×` `miniz_oxide`) with zero C/FFI and full Wasm32 portability.
-  - **Level-6 compression matches or beats `miniz_oxide`** on `big16` (`1.04×`), `json` (`1.15×`), and `entropy` (`7.96×`), and reaches `0.86–0.91×` on `html`/`source`/`text`, while staying within ~0–4.6% of `miniz_oxide` compressed size (and 8–15% *smaller* than `miniz_oxide` at L1 on `html`/`source`/`text`/`big16`).
-  - **Incompressible/random compression** jumped **12–16×** (`34–37 MB/s -> 410–542 MB/s`), beating `miniz_oxide` at L1/L6/L9 (`1.94–7.96×`) and Go at L9 (`2.24×`).
-  - **100,000 empty gzip members** dropped from `0.49 s` to **`0.00 s`** (`5.8 MiB` RSS), faster than both Go (`0.02 s`) and `miniz_oxide` (`0.16 s`).
+  - **Decompression beats Go across all 6 corpora by `1.26–2.65×`** (`1.26×` on `entropy`, `1.50×` on `html`, `1.70×` on `json`/`big16`, `2.30×` on `text`, `2.65×` on `source`) with zero C/FFI and full Wasm32 portability.
+  - **Level-6 compression beats both `miniz_oxide` and Go** on `big16` (`1.05×` / `1.18×`), `json` (`1.26×` / `1.73×`), and `entropy` (`4.36×` / `7.41×`), and reaches `0.95×` `miniz_oxide` on `html`.
+  - **Adversarial LZ77 inputs (`run_audit.sh dos`)**: `adv_ab_4M` L6 (`0.27 s` vs `0.36 s` Rust / `1.23 s` Go), `adv_acgt_4M` L6 (`0.51 s` vs `0.99 s` Rust / `1.91 s` Go), and `adv_prefix3_4M` L9 (`0.72 s` vs `1.50 s` Rust).
 - **Remaining Gaps**:
-  - **CRC-32 (`0.40–0.49×` `miniz_oxide`, `0.63–0.72×` Go)** and **entropy gzip decompress (`0.33×` `miniz_oxide`)**: both Rust (`crc32fast`) and Go (`crc32_arm64.s`) use ARMv8 hardware `CRC32X` instructions and single-pass `memcpy`, whereas pure Pion pays scalar byte-indexed Slice-by-16 CRC-32 plus pairwise `Bytes::concat` passes.
-  - **Level-1 compression (`0.38–0.48×` `miniz_oxide` on compressible data)** and **Go L6 (`0.26–0.38×` Go)**: Pion lacks unaligned 64-bit loads (`u64::from_le_bytes`) for 8-byte LZ77 match comparisons and `Bytes::blit` in-place bulk copy.
+  - **CRC-32 + Adler-32 (`0.18–0.34×` Rust, `0.50–0.85×` Go)** and **gzip decompress vs `miniz_oxide` (`0.47–0.67×` on compressible corpora, `0.22×` on `entropy`)**: `objdump -d` confirms Rust (`crc32fast::specialized::pclmulqdq::calculate_avx2` with 40 `pclmulqdq` instructions + `simd-adler32` AVX2) and Go (`crc32_amd64.s`) use hardware SIMD/CLMUL instructions, whereas pure Pion uses scalar single-table Slice-by-16 (`crc32_update_slice` = 600 insns, 38 stack accesses). In gzip decompress, scalar CRC-32 verification accounts for ~35–45% of total time.
+  - **Level-1 compression vs `miniz_oxide` (`0.35–0.51×` on compressible corpora, `0.83–0.99×` Go)**: Pion lacks unaligned 64-bit loads (`u64::from_le_bytes`) for 8-byte LZ77 match comparisons and `Bytes::blit` in-place bulk copy.
   - **Streaming API**: All entry points remain one-shot `Bytes -> Bytes`; streaming `Inflater`/`Deflater` with a constant 32 KiB ring buffer is future work.

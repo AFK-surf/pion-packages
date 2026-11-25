@@ -1,8 +1,10 @@
 ///| High-performance RFC 1951 raw DEFLATE decompressor.
 ///| Uses a 64-bit bit buffer, 10-bit primary + secondary packed Huffman LUTs,
-///| zero-loop Stored block slicing (`Bytes::slice` / `Bytes::concat`),
-///| fast RLE (`dist == 1`) and 8-byte unrolled back-reference copies,
-///| preset dictionary support (for zlib FDICT), and strict `max_output_bytes` Zip Bomb guard.
+///| split fast/slow Huffman decode loops (immutable `out` in fast loop with zero
+///| per-symbol EOF/bounds/Result overhead), zero-loop Stored block slicing
+///| (`Bytes::slice` / `Bytes::concat`), fast RLE (`dist == 1`) and 8-byte unrolled
+///| back-reference copies, preset dictionary support (for zlib FDICT), and strict
+///| `max_output_bytes` Zip Bomb guard.
 
 ///| RFC 1951 §3.2.3: valid DEFLATE block types are `0` (stored), `1` (fixed), `2` (dynamic); `3` is reserved.
 pub fn is_valid_btype(btype : Int) -> Bool {
@@ -53,6 +55,23 @@ fn ensure_inflate_scratch(s : InflateScratch) -> Unit {
     s.dist_lens = FixedArray::make(32, 0)
     s.initialized = true
   }
+}
+
+///| Mutable inflate stream state shared across block handlers.
+struct InflateState {
+  mut in_pos : Int
+  mut bitbuf : UInt64
+  mut bitcnt : Int
+  mut out : Bytes
+  mut out_len : Int
+  mut out_cap : Int
+  mut safe_end : Int
+  mut dist_mask : UInt64
+  mut err_sym : Int
+  dict : Bytes
+  dict_len : Int
+  max_output_bytes : Int
+  init_hint : Int
 }
 
 ///| Grow `buf` to at least `needed` bytes (clamped to `max_cap`), copying `used` bytes.
@@ -109,6 +128,762 @@ fn grow_bytes(buf : Bytes, used : Int, needed : Int, max_cap : Int, init_hint : 
   next
 }
 
+///| Ensure `state.out` has room for `extra` bytes beyond `cur_len`, enforcing `max_output_bytes`.
+///| Returns `true` on success, `false` if `max_output_bytes` would be exceeded.
+fn inflate_ensure_out(
+  state : InflateState,
+  cur_out : Bytes,
+  cur_len : Int,
+  extra : Int,
+) -> Bool {
+  if extra > state.max_output_bytes - cur_len {
+    return false
+  }
+  let next = grow_bytes(
+    cur_out,
+    cur_len,
+    cur_len + extra,
+    state.max_output_bytes,
+    state.init_hint,
+  )
+  let cap = next.length()
+  state.out = next
+  state.out_cap = cap
+  state.safe_end = if cap < state.max_output_bytes { cap } else { state.max_output_bytes }
+  true
+}
+
+///| Cold helper: copy LZ77 match crossing from preset `dict` tail into `out`.
+fn inflate_copy_dict(
+  out : Bytes,
+  start_len : Int,
+  dict : Bytes,
+  dict_len : Int,
+  dist : Int,
+  match_len : Int,
+) -> Int {
+  let mut out_len = start_len
+  let mut rem = match_len
+  while rem > 0 {
+    if dist > out_len {
+      let d_off = dict_len - (dist - out_len)
+      out[out_len] = dict[d_off]
+    } else {
+      out[out_len] = out[out_len - dist]
+    }
+    out_len = out_len + 1
+    rem = rem - 1
+  }
+  out_len
+}
+
+///| Leaf helper: non-overlapping 8-byte unrolled LZ77 copy (`dist >= 8`).
+fn inflate_copy_dist8(
+  out : Bytes,
+  out_len : Int,
+  dist : Int,
+  match_len : Int,
+) -> Int {
+  let mut d = out_len
+  let mut s = out_len - dist
+  let end = out_len + match_len
+  let end8 = end - 8
+  while d <= end8 {
+    out[d] = out[s]
+    out[d + 1] = out[s + 1]
+    out[d + 2] = out[s + 2]
+    out[d + 3] = out[s + 3]
+    out[d + 4] = out[s + 4]
+    out[d + 5] = out[s + 5]
+    out[d + 6] = out[s + 6]
+    out[d + 7] = out[s + 7]
+    d = d + 8
+    s = s + 8
+  }
+  while d < end {
+    out[d] = out[s]
+    d = d + 1
+    s = s + 1
+  }
+  end
+}
+
+///| Leaf helper: 8-byte unrolled RLE fill (`dist == 1`).
+fn inflate_fill_rle1(
+  out : Bytes,
+  out_len : Int,
+  match_len : Int,
+) -> Int {
+  let fill = out[out_len - 1]
+  let mut d = out_len
+  let end = out_len + match_len
+  let end8 = end - 8
+  while d <= end8 {
+    out[d] = fill
+    out[d + 1] = fill
+    out[d + 2] = fill
+    out[d + 3] = fill
+    out[d + 4] = fill
+    out[d + 5] = fill
+    out[d + 6] = fill
+    out[d + 7] = fill
+    d = d + 8
+  }
+  while d < end {
+    out[d] = fill
+    d = d + 1
+  }
+  end
+}
+
+///| Cold helper: overlapping LZ77 copy (`2 <= dist < 8`).
+fn inflate_copy_overlap(
+  out : Bytes,
+  out_len : Int,
+  dist : Int,
+  match_len : Int,
+) -> Int {
+  let src_start = out_len - dist
+  let mut k = 0
+  while k < match_len {
+    out[out_len + k] = out[src_start + k]
+    k = k + 1
+  }
+  out_len + match_len
+}
+
+///| Cold helper: decode RFC 1951 §3.2.7 Dynamic Huffman tables into `scratch`.
+fn inflate_read_dynamic_trees(
+  data : Bytes,
+  in_len : Int,
+  state : InflateState,
+  scratch : InflateScratch,
+) -> Result[Unit, FlateError] {
+  ensure_inflate_scratch(scratch)
+  let cl_lut = scratch.cl_lut
+  let cl_lens = scratch.cl_lens
+  let code_lens = scratch.code_lens
+  let litlen_lens = scratch.litlen_lens
+  let dist_lens = scratch.dist_lens
+  let dyn_litlen_lut = scratch.dyn_litlen_lut
+  let dyn_dist_lut = scratch.dyn_dist_lut
+  let clo = cl_order
+
+  let mut in_pos = state.in_pos
+  let mut bitbuf = state.bitbuf
+  let mut bitcnt = state.bitcnt
+
+  // Dynamic Huffman block header: HLIT (5b), HDIST (5b), HCLEN (4b) = 14 bits
+  while bitcnt < 14 && in_pos < in_len {
+    bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+    in_pos = in_pos + 1
+    bitcnt = bitcnt + 8
+  }
+  if bitcnt < 14 {
+    return Err(FlateError::UnexpectedEof("truncated dynamic block header"))
+  }
+  let hlit = (bitbuf & 31UL).to_int() + 257
+  let hdist = ((bitbuf >> 5) & 31UL).to_int() + 1
+  let hclen = ((bitbuf >> 10) & 15UL).to_int() + 4
+  bitbuf = bitbuf >> 14
+  bitcnt = bitcnt - 14
+  if hlit > 286 || hdist > 30 {
+    return Err(FlateError::InvalidHuffmanTree("HLIT > 286 or HDIST > 30"))
+  }
+  let mut ci = 0
+  while ci < 19 {
+    cl_lens[ci] = 0
+    ci = ci + 1
+  }
+  ci = 0
+  while ci < hclen {
+    while bitcnt < 3 && in_pos < in_len {
+      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 1
+      bitcnt = bitcnt + 8
+    }
+    if bitcnt < 3 {
+      return Err(FlateError::UnexpectedEof("truncated code-length table"))
+    }
+    cl_lens[clo[ci]] = (bitbuf & 7UL).to_int()
+    bitbuf = bitbuf >> 3
+    bitcnt = bitcnt - 3
+    ci = ci + 1
+  }
+  match build_inflate_table(cl_lens, 19, cl_lut, 7, false) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  // Decode hlit + hdist code lengths
+  let total_codes = hlit + hdist
+  let mut idx = 0
+  while idx < total_codes {
+    while bitcnt < 15 && in_pos < in_len {
+      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 1
+      bitcnt = bitcnt + 8
+    }
+    let ent = cl_lut[(bitbuf & 127UL).to_int()]
+    let nb = ent & 15
+    if nb == 0 {
+      return Err(FlateError::InvalidHuffmanTree("invalid code-length symbol"))
+    }
+    if bitcnt < nb {
+      return Err(FlateError::UnexpectedEof("truncated code-length symbol"))
+    }
+    let csym = ent >> 5
+    bitbuf = bitbuf >> nb
+    bitcnt = bitcnt - nb
+    if csym < 16 {
+      code_lens[idx] = csym
+      idx = idx + 1
+    } else {
+      let mut rep_val = 0
+      let mut rep_cnt = 0
+      if csym == 16 {
+        if idx == 0 {
+          return Err(FlateError::InvalidHuffmanTree("repeat code 16 with no previous length"))
+        }
+        while bitcnt < 2 && in_pos < in_len {
+          bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+          in_pos = in_pos + 1
+          bitcnt = bitcnt + 8
+        }
+        if bitcnt < 2 {
+          return Err(FlateError::UnexpectedEof("truncated repeat-16 extra bits"))
+        }
+        rep_val = code_lens[idx - 1]
+        rep_cnt = 3 + (bitbuf & 3UL).to_int()
+        bitbuf = bitbuf >> 2
+        bitcnt = bitcnt - 2
+      } else if csym == 17 {
+        while bitcnt < 3 && in_pos < in_len {
+          bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+          in_pos = in_pos + 1
+          bitcnt = bitcnt + 8
+        }
+        if bitcnt < 3 {
+          return Err(FlateError::UnexpectedEof("truncated repeat-17 extra bits"))
+        }
+        rep_val = 0
+        rep_cnt = 3 + (bitbuf & 7UL).to_int()
+        bitbuf = bitbuf >> 3
+        bitcnt = bitcnt - 3
+      } else {
+        while bitcnt < 7 && in_pos < in_len {
+          bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+          in_pos = in_pos + 1
+          bitcnt = bitcnt + 8
+        }
+        if bitcnt < 7 {
+          return Err(FlateError::UnexpectedEof("truncated repeat-18 extra bits"))
+        }
+        rep_val = 0
+        rep_cnt = 11 + (bitbuf & 127UL).to_int()
+        bitbuf = bitbuf >> 7
+        bitcnt = bitcnt - 7
+      }
+      if idx + rep_cnt > total_codes {
+        return Err(FlateError::InvalidHuffmanTree("code-length repeat exceeds HLIT+HDIST"))
+      }
+      let mut r = 0
+      while r < rep_cnt {
+        code_lens[idx] = rep_val
+        idx = idx + 1
+        r = r + 1
+      }
+    }
+  }
+
+  if code_lens[256] == 0 {
+    return Err(FlateError::InvalidHuffmanTree("missing EOB symbol 256"))
+  }
+  let mut li = 0
+  while li < hlit {
+    litlen_lens[li] = code_lens[li]
+    li = li + 1
+  }
+  while li < 288 {
+    litlen_lens[li] = 0
+    li = li + 1
+  }
+  let mut di = 0
+  while di < hdist {
+    dist_lens[di] = code_lens[hlit + di]
+    di = di + 1
+  }
+  while di < 32 {
+    dist_lens[di] = 0
+    di = di + 1
+  }
+
+  match build_litlen_inflate_table(litlen_lens, hlit, dyn_litlen_lut, 10) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  match build_dist_inflate_table(dist_lens, hdist, dyn_dist_lut, 9, true) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+
+  state.in_pos = in_pos
+  state.bitbuf = bitbuf
+  state.bitcnt = bitcnt
+  Ok(())
+}
+
+///| Map `inflate_huffman_block` integer error code to `FlateError`.
+fn inflate_rc_to_error(rc : Int, state : InflateState) -> FlateError {
+  if rc == 1 {
+    FlateError::UnexpectedEof("truncated litlen code")
+  } else if rc == 2 {
+    FlateError::OutputLimitExceeded(state.max_output_bytes)
+  } else if rc == 3 {
+    FlateError::UnexpectedEof("truncated litlen subtable prefix")
+  } else if rc == 4 {
+    FlateError::InvalidHuffmanTree("invalid litlen subtable code")
+  } else if rc == 5 {
+    FlateError::UnexpectedEof("truncated litlen subtable code")
+  } else if rc == 6 {
+    FlateError::InvalidHuffmanTree("invalid litlen code")
+  } else if rc == 7 {
+    FlateError::InvalidSymbol(state.err_sym)
+  } else if rc == 8 {
+    FlateError::UnexpectedEof("truncated length extra bits")
+  } else if rc == 9 {
+    FlateError::UnexpectedEof("truncated distance code")
+  } else if rc == 10 {
+    FlateError::UnexpectedEof("truncated distance subtable prefix")
+  } else if rc == 11 {
+    FlateError::InvalidHuffmanTree("invalid distance subtable code")
+  } else if rc == 12 {
+    FlateError::UnexpectedEof("truncated distance subtable code")
+  } else if rc == 13 {
+    FlateError::InvalidHuffmanTree("invalid distance code")
+  } else if rc == 14 {
+    FlateError::UnexpectedEof("truncated distance extra bits")
+  } else {
+    FlateError::InvalidDistance("distance exceeds available history")
+  }
+}
+
+///| Ultra-lean hot loop: runs while >= 8 input bytes and >= 258 output bytes remain.
+///| `out` is immutable here (never grown or reassigned), single exit point, zero EOF/cap checks.
+///| Returns: `0` on EOB, `-1` when buffer/input margin reached (resume in slow/grow loop), `> 0` on error.
+fn inflate_huffman_fast(
+  data : Bytes,
+  cur_litlen : FixedArray[Int],
+  cur_dist : FixedArray[Int],
+  out : Bytes,
+  state : InflateState,
+) -> Int {
+  let mut in_pos = state.in_pos
+  let mut bitbuf = state.bitbuf
+  let mut bitcnt = state.bitcnt
+  let mut out_len = state.out_len
+  let in_lim8 = data.length() - 8
+  let out_safe = state.safe_end - 258
+  let dist_mask = state.dist_mask
+  let mut rc = -1
+
+  while in_pos <= in_lim8 && out_len <= out_safe {
+    // Guaranteed >= 8 input bytes remain: sequential 32-bit refill (low register pressure)
+    if bitcnt <= 32 {
+      let mut w : UInt = data[in_pos].to_int().to_uint()
+      w = w | (data[in_pos + 1].to_int().to_uint() << 8)
+      w = w | (data[in_pos + 2].to_int().to_uint() << 16)
+      w = w | (data[in_pos + 3].to_int().to_uint() << 24)
+      bitbuf = bitbuf | (w.to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 4
+      bitcnt = bitcnt + 32
+    }
+
+    // Decode literal/length symbol via 10-bit primary LUT
+    let mut ent = cur_litlen[(bitbuf & 1023UL).to_int()]
+    if (ent & 48) == 32 {
+      let nb = ent & 15
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+      out[out_len] = (ent >> 8).to_byte()
+      out_len = out_len + 1
+      // Drain consecutive direct literals while >= 20 bits and safe room remain;
+      // if the next symbol is a match/EOB/subtable, fall straight through without re-reading LUT!
+      let mut fell_through = false
+      while bitcnt >= 20 && out_len <= out_safe {
+        ent = cur_litlen[(bitbuf & 1023UL).to_int()]
+        if (ent & 48) != 32 {
+          fell_through = true
+          break
+        }
+        let nb2 = ent & 15
+        bitbuf = bitbuf >> nb2
+        bitcnt = bitcnt - nb2
+        out[out_len] = (ent >> 8).to_byte()
+        out_len = out_len + 1
+      }
+      if !fell_through {
+        continue
+      }
+    }
+
+    if (ent & 16) != 0 {
+      let sub_bits = ent & 15
+      let sub_off = ent >> 5
+      let sub_ent = cur_litlen[sub_off + ((bitbuf >> 10) & ((1UL << sub_bits) - 1UL)).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        rc = 4
+        break
+      }
+      let total_nb = 10 + sub_nb
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      ent = sub_ent
+      if (ent & 32) != 0 {
+        out[out_len] = (ent >> 8).to_byte()
+        out_len = out_len + 1
+        continue
+      }
+    } else {
+      let nb = ent & 15
+      if nb == 0 {
+        rc = 6
+        break
+      }
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+    }
+
+    // EOB (sym 256)
+    if (ent & 64) != 0 {
+      rc = 0
+      break
+    }
+
+    // Invalid symbol (286..287)
+    if (ent & 128) == 0 {
+      state.err_sym = ent >> 9
+      rc = 7
+      break
+    }
+
+    // Packed length: lbase + lextra extra bits
+    let lextra = (ent >> 8) & 15
+    let mut match_len = ent >> 12
+    if lextra > 0 {
+      match_len = match_len + (bitbuf & ((1UL << lextra) - 1UL)).to_int()
+      bitbuf = bitbuf >> lextra
+      bitcnt = bitcnt - lextra
+    }
+
+    // Guaranteed >= 4 input bytes still remain: refill before distance if bitcnt < 28
+    if bitcnt < 28 {
+      let mut w : UInt = data[in_pos].to_int().to_uint()
+      w = w | (data[in_pos + 1].to_int().to_uint() << 8)
+      w = w | (data[in_pos + 2].to_int().to_uint() << 16)
+      w = w | (data[in_pos + 3].to_int().to_uint() << 24)
+      bitbuf = bitbuf | (w.to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 4
+      bitcnt = bitcnt + 32
+    }
+
+    // Decode packed distance symbol
+    let mut dent = cur_dist[(bitbuf & dist_mask).to_int()]
+    if (dent & 48) == 32 {
+      let dnb = dent & 15
+      bitbuf = bitbuf >> dnb
+      bitcnt = bitcnt - dnb
+    } else if (dent & 16) != 0 {
+      let sub_bits = dent & 15
+      let sub_off = dent >> 5
+      let sub_ent = cur_dist[sub_off + ((bitbuf >> 9) & ((1UL << sub_bits) - 1UL)).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        rc = 11
+        break
+      }
+      let total_nb = 9 + sub_nb
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      dent = sub_ent
+      if (dent & 32) == 0 {
+        state.err_sym = dent >> 7
+        rc = 7
+        break
+      }
+    } else {
+      let dnb = dent & 15
+      if dnb == 0 {
+        rc = 13
+        break
+      }
+      state.err_sym = dent >> 7
+      rc = 7
+      break
+    }
+
+    let dextra = (dent >> 6) & 15
+    let mut dist = dent >> 10
+    if dextra > 0 {
+      dist = dist + (bitbuf & ((1UL << dextra) - 1UL)).to_int()
+      bitbuf = bitbuf >> dextra
+      bitcnt = bitcnt - dextra
+    }
+
+    if dist <= 0 || dist > out_len {
+      if dist <= 0 || dist > out_len + state.dict_len {
+        rc = 15
+        break
+      }
+      out_len = inflate_copy_dict(out, out_len, state.dict, state.dict_len, dist, match_len)
+    } else if dist >= 8 {
+      out_len = inflate_copy_dist8(out, out_len, dist, match_len)
+    } else if dist == 1 {
+      out_len = inflate_fill_rle1(out, out_len, match_len)
+    } else {
+      out_len = inflate_copy_overlap(out, out_len, dist, match_len)
+    }
+  }
+
+  state.in_pos = in_pos
+  state.bitbuf = bitbuf
+  state.bitcnt = bitcnt
+  state.out_len = out_len
+  rc
+}
+
+///| Exact boundary-checked slow loop for the final <= 8 input bytes or <= 258 bytes before `max_output_bytes`.
+fn inflate_huffman_slow(
+  data : Bytes,
+  in_len : Int,
+  cur_litlen : FixedArray[Int],
+  cur_dist : FixedArray[Int],
+  state : InflateState,
+) -> Int {
+  let mut in_pos = state.in_pos
+  let mut bitbuf = state.bitbuf
+  let mut bitcnt = state.bitcnt
+  let mut out = state.out
+  let mut out_len = state.out_len
+  let mut safe_end = state.safe_end
+  let dist_mask = state.dist_mask
+  let masks = bit_masks
+
+  while true {
+    while bitcnt <= 56 && in_pos < in_len {
+      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 1
+      bitcnt = bitcnt + 8
+    }
+
+    let mut ent = cur_litlen[(bitbuf & 1023UL).to_int()]
+    if (ent & 48) == 32 {
+      let nb = ent & 15
+      if bitcnt < nb {
+        return 1
+      }
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+      if out_len >= safe_end {
+        if !inflate_ensure_out(state, out, out_len, 1) {
+          return 2
+        }
+        out = state.out
+        safe_end = state.safe_end
+      }
+      out[out_len] = (ent >> 8).to_byte()
+      out_len = out_len + 1
+      continue
+    }
+
+    if (ent & 16) != 0 {
+      if bitcnt < 10 {
+        return 3
+      }
+      let sub_bits = ent & 15
+      let sub_off = ent >> 5
+      let sub_ent = cur_litlen[sub_off + ((bitbuf >> 10) & masks[sub_bits]).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        return 4
+      }
+      let total_nb = 10 + sub_nb
+      if bitcnt < total_nb {
+        return 5
+      }
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      ent = sub_ent
+      if (ent & 32) != 0 {
+        if out_len >= safe_end {
+          if !inflate_ensure_out(state, out, out_len, 1) {
+            return 2
+          }
+          out = state.out
+          safe_end = state.safe_end
+        }
+        out[out_len] = (ent >> 8).to_byte()
+        out_len = out_len + 1
+        continue
+      }
+    } else {
+      let nb = ent & 15
+      if nb == 0 {
+        return 6
+      }
+      if bitcnt < nb {
+        return 1
+      }
+      bitbuf = bitbuf >> nb
+      bitcnt = bitcnt - nb
+    }
+
+    if (ent & 64) != 0 {
+      break
+    }
+    if (ent & 128) == 0 {
+      state.err_sym = ent >> 9
+      return 7
+    }
+
+    let lextra = (ent >> 8) & 15
+    let mut match_len = ent >> 12
+    if lextra > 0 {
+      if bitcnt < lextra {
+        return 8
+      }
+      match_len = match_len + (bitbuf & masks[lextra]).to_int()
+      bitbuf = bitbuf >> lextra
+      bitcnt = bitcnt - lextra
+    }
+
+    while bitcnt <= 56 && in_pos < in_len {
+      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+      in_pos = in_pos + 1
+      bitcnt = bitcnt + 8
+    }
+
+    let mut dent = cur_dist[(bitbuf & dist_mask).to_int()]
+    if (dent & 48) == 32 {
+      let dnb = dent & 15
+      if bitcnt < dnb {
+        return 9
+      }
+      bitbuf = bitbuf >> dnb
+      bitcnt = bitcnt - dnb
+    } else if (dent & 16) != 0 {
+      if bitcnt < 9 {
+        return 10
+      }
+      let sub_bits = dent & 15
+      let sub_off = dent >> 5
+      let sub_ent = cur_dist[sub_off + ((bitbuf >> 9) & masks[sub_bits]).to_int()]
+      let sub_nb = sub_ent & 15
+      if sub_nb == 0 {
+        return 11
+      }
+      let total_nb = 9 + sub_nb
+      if bitcnt < total_nb {
+        return 12
+      }
+      bitbuf = bitbuf >> total_nb
+      bitcnt = bitcnt - total_nb
+      dent = sub_ent
+      if (dent & 32) == 0 {
+        state.err_sym = dent >> 7
+        return 7
+      }
+    } else {
+      let dnb = dent & 15
+      if dnb == 0 {
+        return 13
+      }
+      if bitcnt < dnb {
+        return 9
+      }
+      state.err_sym = dent >> 7
+      return 7
+    }
+
+    let dextra = (dent >> 6) & 15
+    let mut dist = dent >> 10
+    if dextra > 0 {
+      if bitcnt < dextra {
+        return 14
+      }
+      dist = dist + (bitbuf & masks[dextra]).to_int()
+      bitbuf = bitbuf >> dextra
+      bitcnt = bitcnt - dextra
+    }
+
+    if dist <= 0 || dist > out_len + state.dict_len {
+      return 15
+    }
+    if match_len > safe_end - out_len {
+      if !inflate_ensure_out(state, out, out_len, match_len) {
+        return 2
+      }
+      out = state.out
+      safe_end = state.safe_end
+    }
+
+    if dist > out_len {
+      out_len = inflate_copy_dict(out, out_len, state.dict, state.dict_len, dist, match_len)
+    } else {
+      out_len = inflate_copy_overlap(out, out_len, dist, match_len)
+    }
+  }
+
+  state.in_pos = in_pos
+  state.bitbuf = bitbuf
+  state.bitcnt = bitcnt
+  state.out = out
+  state.out_len = out_len
+  state.safe_end = safe_end
+  0
+}
+
+///| Dispatch Fixed/Dynamic Huffman block: stay in `inflate_huffman_fast`, grow as needed, finish in `inflate_huffman_slow`.
+fn inflate_huffman_block(
+  data : Bytes,
+  in_len : Int,
+  cur_litlen : FixedArray[Int],
+  cur_dist : FixedArray[Int],
+  state : InflateState,
+) -> Int {
+  let in_lim8 = in_len - 8
+  while true {
+    if state.in_pos <= in_lim8 {
+      if state.out_cap == 0 && state.init_hint > 0 {
+        if !inflate_ensure_out(state, state.out, 0, 1) {
+          return 2
+        }
+      }
+      if state.out_len <= state.safe_end - 258 {
+        let rc = inflate_huffman_fast(data, cur_litlen, cur_dist, state.out, state)
+        if rc >= 0 {
+          return rc
+        }
+        // Only pre-grow when we are not already at an exact ISIZE hint tail;
+        // otherwise finish the final <= 258 bytes in slow loop without doubling the buffer.
+        if state.in_pos <= in_lim8 &&
+        state.out_len > state.safe_end - 258 &&
+        state.out_cap != state.init_hint &&
+        state.safe_end < state.max_output_bytes &&
+        state.max_output_bytes - state.out_len >= 258 {
+          if !inflate_ensure_out(state, state.out, state.out_len, 258) {
+            return 2
+          }
+          continue
+        }
+      }
+    }
+    return inflate_huffman_slow(data, in_len, cur_litlen, cur_dist, state)
+  }
+  0
+}
+
 ///| Core RFC 1951 Inflate engine starting at `data[start..]`.
 ///| `max_output_bytes` is an exact non-negative limit (0 means at most 0 output bytes).
 ///| Returns `(decompressed_bytes, next_byte_offset_in_data)`.
@@ -124,10 +899,6 @@ fn inflate_raw_into(
     return Err(FlateError::OutputLimitExceeded(max_output_bytes))
   }
   let in_len = data.length()
-  let mut in_pos = start
-  let mut bitbuf : UInt64 = 0UL
-  let mut bitcnt = 0
-
   let rem_in = in_len - start
   let mut init_hint = if hint_cap >= 0 {
     hint_cap
@@ -139,35 +910,44 @@ fn inflate_raw_into(
     init_hint = max_output_bytes
   }
 
-  let mut out = Bytes::new(0)
-  let mut out_len = 0
-  let mut out_cap = 0
-  let mut safe_end = 0
+  let state = InflateState::{
+    in_pos: start,
+    bitbuf: 0UL,
+    bitcnt: 0,
+    out: Bytes::new(0),
+    out_len: 0,
+    out_cap: 0,
+    safe_end: 0,
+    dist_mask: 31UL,
+    err_sym: 0,
+    dict: dict,
+    dict_len: dict.length(),
+    max_output_bytes: max_output_bytes,
+    init_hint: init_hint,
+  }
 
   let stored_chunks : Array[Bytes] = []
   let mut stored_total = 0
 
-  let dict_len = dict.length()
-  let clo = cl_order
   let flit = fixed_litlen_lut
   let fdist = fixed_dist_lut
-  let masks = bit_masks
 
   let mut bfinal = 0
   while bfinal == 0 {
     // Refill for 3-bit block header
-    while bitcnt < 3 && in_pos < in_len {
-      bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-      in_pos = in_pos + 1
-      bitcnt = bitcnt + 8
+    while state.bitcnt < 3 && state.in_pos < in_len {
+      state.bitbuf = state.bitbuf |
+      (data[state.in_pos].to_int().to_int64().to_uint64() << state.bitcnt)
+      state.in_pos = state.in_pos + 1
+      state.bitcnt = state.bitcnt + 8
     }
-    if bitcnt < 3 {
+    if state.bitcnt < 3 {
       return Err(FlateError::UnexpectedEof("missing DEFLATE block header"))
     }
-    bfinal = (bitbuf & 1UL).to_int()
-    let btype = ((bitbuf >> 1) & 3UL).to_int()
-    bitbuf = bitbuf >> 3
-    bitcnt = bitcnt - 3
+    bfinal = (state.bitbuf & 1UL).to_int()
+    let btype = ((state.bitbuf >> 1) & 3UL).to_int()
+    state.bitbuf = state.bitbuf >> 3
+    state.bitcnt = state.bitcnt - 3
 
     if !is_valid_btype(btype) {
       return Err(FlateError::InvalidBlockType(btype))
@@ -175,551 +955,116 @@ fn inflate_raw_into(
 
     if btype == 0 {
       // Stored block: discard remaining bits in current byte, rewind whole bytes
-      let drop = bitcnt & 7
-      bitbuf = bitbuf >> drop
-      bitcnt = bitcnt - drop
-      in_pos = in_pos - (bitcnt >> 3)
-      bitbuf = 0UL
-      bitcnt = 0
-      if in_pos + 4 > in_len {
+      let drop = state.bitcnt & 7
+      state.bitbuf = state.bitbuf >> drop
+      state.bitcnt = state.bitcnt - drop
+      state.in_pos = state.in_pos - (state.bitcnt >> 3)
+      state.bitbuf = 0UL
+      state.bitcnt = 0
+      if state.in_pos + 4 > in_len {
         return Err(FlateError::UnexpectedEof("truncated stored block header"))
       }
-      let slen = data[in_pos].to_int() | (data[in_pos + 1].to_int() << 8)
-      let nlen = data[in_pos + 2].to_int() | (data[in_pos + 3].to_int() << 8)
-      in_pos = in_pos + 4
+      let p = state.in_pos
+      let slen = data[p].to_int() | (data[p + 1].to_int() << 8)
+      let nlen = data[p + 2].to_int() | (data[p + 3].to_int() << 8)
+      state.in_pos = p + 4
       if !is_valid_stored_nlen(slen, nlen) {
         return Err(FlateError::InvalidStoredLength("NLEN != ~LEN"))
       }
-      if in_pos + slen > in_len {
+      if state.in_pos + slen > in_len {
         return Err(FlateError::UnexpectedEof("truncated stored block payload"))
       }
       if slen == 0 {
         continue
       }
-      if out_len == 0 {
+      if state.out_len == 0 {
         if slen > max_output_bytes - stored_total {
           return Err(FlateError::OutputLimitExceeded(max_output_bytes))
         }
         if stored_total == 0 && bfinal == 1 {
-          return Ok((data.slice(in_pos, in_pos + slen), in_pos + slen))
+          return Ok((data.slice(state.in_pos, state.in_pos + slen), state.in_pos + slen))
         }
-        stored_chunks.push(data.slice(in_pos, in_pos + slen))
+        stored_chunks.push(data.slice(state.in_pos, state.in_pos + slen))
         stored_total = stored_total + slen
-        in_pos = in_pos + slen
+        state.in_pos = state.in_pos + slen
         continue
       }
-      if slen > max_output_bytes - out_len {
-        return Err(FlateError::OutputLimitExceeded(max_output_bytes))
+      if slen > state.safe_end - state.out_len {
+        if !inflate_ensure_out(state, state.out, state.out_len, slen) {
+          return Err(FlateError::OutputLimitExceeded(max_output_bytes))
+        }
       }
-      if out_len + slen > out_cap {
-        out = grow_bytes(out, out_len, out_len + slen, max_output_bytes, init_hint)
-        out_cap = out.length()
-        safe_end = if out_cap < max_output_bytes { out_cap } else { max_output_bytes }
-      }
+      let out = state.out
+      let dst = state.out_len
+      let src = state.in_pos
       let mut k = 0
       let lim8 = slen - 8
       while k <= lim8 {
-        out[out_len + k] = data[in_pos + k]
-        out[out_len + k + 1] = data[in_pos + k + 1]
-        out[out_len + k + 2] = data[in_pos + k + 2]
-        out[out_len + k + 3] = data[in_pos + k + 3]
-        out[out_len + k + 4] = data[in_pos + k + 4]
-        out[out_len + k + 5] = data[in_pos + k + 5]
-        out[out_len + k + 6] = data[in_pos + k + 6]
-        out[out_len + k + 7] = data[in_pos + k + 7]
+        out[dst + k] = data[src + k]
+        out[dst + k + 1] = data[src + k + 1]
+        out[dst + k + 2] = data[src + k + 2]
+        out[dst + k + 3] = data[src + k + 3]
+        out[dst + k + 4] = data[src + k + 4]
+        out[dst + k + 5] = data[src + k + 5]
+        out[dst + k + 6] = data[src + k + 6]
+        out[dst + k + 7] = data[src + k + 7]
         k = k + 8
       }
       while k < slen {
-        out[out_len + k] = data[in_pos + k]
+        out[dst + k] = data[src + k]
         k = k + 1
       }
-      in_pos = in_pos + slen
-      out_len = out_len + slen
+      state.in_pos = src + slen
+      state.out_len = dst + slen
       continue
     }
 
     // Materialize any preceding stored blocks before Huffman decoding
     if stored_total > 0 {
-      out = concat_bytes_chunks(stored_chunks)
-      out_len = stored_total
-      out_cap = out.length()
-      safe_end = if out_cap < max_output_bytes { out_cap } else { max_output_bytes }
+      let mat = concat_bytes_chunks(stored_chunks)
+      state.out = mat
+      state.out_len = stored_total
+      state.out_cap = mat.length()
+      state.safe_end = if state.out_cap < max_output_bytes {
+        state.out_cap
+      } else {
+        max_output_bytes
+      }
       stored_total = 0
     }
 
     let mut cur_litlen = flit
     let mut cur_dist = fdist
-    let mut dist_mask : UInt64 = 31UL
+    state.dist_mask = 31UL
 
     if btype == 2 {
-      ensure_inflate_scratch(scratch)
-      let cl_lut = scratch.cl_lut
-      let cl_lens = scratch.cl_lens
-      let code_lens = scratch.code_lens
-      let litlen_lens = scratch.litlen_lens
-      let dist_lens = scratch.dist_lens
-      let dyn_litlen_lut = scratch.dyn_litlen_lut
-      let dyn_dist_lut = scratch.dyn_dist_lut
-
-      // Dynamic Huffman block header: HLIT (5b), HDIST (5b), HCLEN (4b) = 14 bits
-      while bitcnt < 14 && in_pos < in_len {
-        bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-        in_pos = in_pos + 1
-        bitcnt = bitcnt + 8
-      }
-      if bitcnt < 14 {
-        return Err(FlateError::UnexpectedEof("truncated dynamic block header"))
-      }
-      let hlit = (bitbuf & 31UL).to_int() + 257
-      let hdist = ((bitbuf >> 5) & 31UL).to_int() + 1
-      let hclen = ((bitbuf >> 10) & 15UL).to_int() + 4
-      bitbuf = bitbuf >> 14
-      bitcnt = bitcnt - 14
-      if hlit > 286 || hdist > 30 {
-        return Err(FlateError::InvalidHuffmanTree("HLIT > 286 or HDIST > 30"))
-      }
-      let mut ci = 0
-      while ci < 19 {
-        cl_lens[ci] = 0
-        ci = ci + 1
-      }
-      ci = 0
-      while ci < hclen {
-        while bitcnt < 3 && in_pos < in_len {
-          bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-          in_pos = in_pos + 1
-          bitcnt = bitcnt + 8
-        }
-        if bitcnt < 3 {
-          return Err(FlateError::UnexpectedEof("truncated code-length table"))
-        }
-        cl_lens[clo[ci]] = (bitbuf & 7UL).to_int()
-        bitbuf = bitbuf >> 3
-        bitcnt = bitcnt - 3
-        ci = ci + 1
-      }
-      match build_inflate_table(cl_lens, 19, cl_lut, 7, false) {
+      match inflate_read_dynamic_trees(data, in_len, state, scratch) {
         Ok(_) => ()
         Err(e) => return Err(e)
       }
-
-      // Decode hlit + hdist code lengths
-      let total_codes = hlit + hdist
-      let mut idx = 0
-      while idx < total_codes {
-        while bitcnt < 15 && in_pos < in_len {
-          bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-          in_pos = in_pos + 1
-          bitcnt = bitcnt + 8
-        }
-        let ent = cl_lut[(bitbuf & 127UL).to_int()]
-        let nb = ent & 15
-        if nb == 0 {
-          return Err(FlateError::InvalidHuffmanTree("invalid code-length symbol"))
-        }
-        if bitcnt < nb {
-          return Err(FlateError::UnexpectedEof("truncated code-length symbol"))
-        }
-        let csym = ent >> 5
-        bitbuf = bitbuf >> nb
-        bitcnt = bitcnt - nb
-        if csym < 16 {
-          code_lens[idx] = csym
-          idx = idx + 1
-        } else {
-          let mut rep_val = 0
-          let mut rep_cnt = 0
-          if csym == 16 {
-            if idx == 0 {
-              return Err(FlateError::InvalidHuffmanTree("repeat code 16 with no previous length"))
-            }
-            if bitcnt < 2 {
-              while bitcnt < 2 && in_pos < in_len {
-                bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-                in_pos = in_pos + 1
-                bitcnt = bitcnt + 8
-              }
-              if bitcnt < 2 {
-                return Err(FlateError::UnexpectedEof("truncated repeat-16 extra bits"))
-              }
-            }
-            rep_val = code_lens[idx - 1]
-            rep_cnt = 3 + (bitbuf & 3UL).to_int()
-            bitbuf = bitbuf >> 2
-            bitcnt = bitcnt - 2
-          } else if csym == 17 {
-            if bitcnt < 3 {
-              while bitcnt < 3 && in_pos < in_len {
-                bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-                in_pos = in_pos + 1
-                bitcnt = bitcnt + 8
-              }
-              if bitcnt < 3 {
-                return Err(FlateError::UnexpectedEof("truncated repeat-17 extra bits"))
-              }
-            }
-            rep_val = 0
-            rep_cnt = 3 + (bitbuf & 7UL).to_int()
-            bitbuf = bitbuf >> 3
-            bitcnt = bitcnt - 3
-          } else {
-            if bitcnt < 7 {
-              while bitcnt < 7 && in_pos < in_len {
-                bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-                in_pos = in_pos + 1
-                bitcnt = bitcnt + 8
-              }
-              if bitcnt < 7 {
-                return Err(FlateError::UnexpectedEof("truncated repeat-18 extra bits"))
-              }
-            }
-            rep_val = 0
-            rep_cnt = 11 + (bitbuf & 127UL).to_int()
-            bitbuf = bitbuf >> 7
-            bitcnt = bitcnt - 7
-          }
-          if idx + rep_cnt > total_codes {
-            return Err(FlateError::InvalidHuffmanTree("code-length repeat exceeds HLIT+HDIST"))
-          }
-          let mut r = 0
-          while r < rep_cnt {
-            code_lens[idx] = rep_val
-            idx = idx + 1
-            r = r + 1
-          }
-        }
-      }
-
-      if code_lens[256] == 0 {
-        return Err(FlateError::InvalidHuffmanTree("missing EOB symbol 256"))
-      }
-      let mut li = 0
-      while li < hlit {
-        litlen_lens[li] = code_lens[li]
-        li = li + 1
-      }
-      while li < 288 {
-        litlen_lens[li] = 0
-        li = li + 1
-      }
-      let mut di = 0
-      while di < hdist {
-        dist_lens[di] = code_lens[hlit + di]
-        di = di + 1
-      }
-      while di < 32 {
-        dist_lens[di] = 0
-        di = di + 1
-      }
-
-      match build_litlen_inflate_table(litlen_lens, hlit, dyn_litlen_lut, litlen_root_bits) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
-      }
-      match build_dist_inflate_table(dist_lens, hdist, dyn_dist_lut, dist_root_bits, true) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
-      }
-      cur_litlen = dyn_litlen_lut
-      cur_dist = dyn_dist_lut
-      dist_mask = dist_root_mask
+      cur_litlen = scratch.dyn_litlen_lut
+      cur_dist = scratch.dyn_dist_lut
+      state.dist_mask = 511UL
     }
 
-    // Main Huffman decode hot loop for this block
-    while true {
-      // Fast 32-bit refill when >= 4 input bytes remain
-      if bitcnt <= 32 && in_pos + 4 <= in_len {
-        let w = data[in_pos].to_int().to_int64().to_uint64() |
-        (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
-        (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
-        (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
-        bitbuf = bitbuf | (w << bitcnt)
-        in_pos = in_pos + 4
-        bitcnt = bitcnt + 32
-      } else {
-        while bitcnt <= 56 && in_pos < in_len {
-          bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-          in_pos = in_pos + 1
-          bitcnt = bitcnt + 8
-        }
-      }
-
-      // Decode literal/length symbol via packed 10-bit primary + secondary LUT
-      let mut ent = cur_litlen[(bitbuf & litlen_root_mask).to_int()]
-      // Ultra-fast direct literal path (handles up to 3 literals per refill)
-      if (ent & 48) == 32 {
-        let nb = ent & 15
-        if bitcnt < nb {
-          return Err(FlateError::UnexpectedEof("truncated litlen code"))
-        }
-        bitbuf = bitbuf >> nb
-        bitcnt = bitcnt - nb
-        if out_len >= safe_end {
-          if out_len >= max_output_bytes {
-            return Err(FlateError::OutputLimitExceeded(max_output_bytes))
-          }
-          out = grow_bytes(out, out_len, out_len + 1, max_output_bytes, init_hint)
-          out_cap = out.length()
-          safe_end = if out_cap < max_output_bytes { out_cap } else { max_output_bytes }
-        }
-        out[out_len] = (ent >> 8).to_byte()
-        out_len = out_len + 1
-
-        // Opportunistic 2nd & 3rd direct literals while bitbuf has >= 16 bits and room remains
-        if bitcnt >= 16 && out_len < safe_end {
-          let ent2 = cur_litlen[(bitbuf & litlen_root_mask).to_int()]
-          if (ent2 & 48) == 32 {
-            let nb2 = ent2 & 15
-            bitbuf = bitbuf >> nb2
-            bitcnt = bitcnt - nb2
-            out[out_len] = (ent2 >> 8).to_byte()
-            out_len = out_len + 1
-            if bitcnt >= 16 && out_len < safe_end {
-              let ent3 = cur_litlen[(bitbuf & litlen_root_mask).to_int()]
-              if (ent3 & 48) == 32 {
-                let nb3 = ent3 & 15
-                bitbuf = bitbuf >> nb3
-                bitcnt = bitcnt - nb3
-                out[out_len] = (ent3 >> 8).to_byte()
-                out_len = out_len + 1
-              }
-            }
-          }
-        }
-        continue
-      }
-
-      if (ent & 16) != 0 {
-        // Subtable lookup (code length > 10)
-        if bitcnt < 10 {
-          return Err(FlateError::UnexpectedEof("truncated litlen subtable prefix"))
-        }
-        let sub_bits = ent & 15
-        let sub_off = ent >> 5
-        let sub_ent = cur_litlen[sub_off + ((bitbuf >> 10) & masks[sub_bits]).to_int()]
-        let sub_nb = sub_ent & 15
-        if sub_nb == 0 {
-          return Err(FlateError::InvalidHuffmanTree("invalid litlen subtable code"))
-        }
-        let total_nb = 10 + sub_nb
-        if bitcnt < total_nb {
-          return Err(FlateError::UnexpectedEof("truncated litlen subtable code"))
-        }
-        bitbuf = bitbuf >> total_nb
-        bitcnt = bitcnt - total_nb
-        ent = sub_ent
-        if (ent & 32) != 0 {
-          if out_len >= safe_end {
-            if out_len >= max_output_bytes {
-              return Err(FlateError::OutputLimitExceeded(max_output_bytes))
-            }
-            out = grow_bytes(out, out_len, out_len + 1, max_output_bytes, init_hint)
-            out_cap = out.length()
-            safe_end = if out_cap < max_output_bytes { out_cap } else { max_output_bytes }
-          }
-          out[out_len] = (ent >> 8).to_byte()
-          out_len = out_len + 1
-          continue
-        }
-      } else {
-        let nb = ent & 15
-        if nb == 0 {
-          return Err(FlateError::InvalidHuffmanTree("invalid litlen code"))
-        }
-        if bitcnt < nb {
-          return Err(FlateError::UnexpectedEof("truncated litlen code"))
-        }
-        bitbuf = bitbuf >> nb
-        bitcnt = bitcnt - nb
-      }
-
-      // EOB (sym 256)
-      if (ent & 64) != 0 {
-        break
-      }
-
-      // Invalid symbol (286..287)
-      if (ent & 128) == 0 {
-        return Err(FlateError::InvalidSymbol(ent >> 9))
-      }
-
-      // Packed length: lbase + lextra extra bits
-      let lextra = (ent >> 8) & 15
-      let mut match_len = ent >> 12
-      if lextra > 0 {
-        if bitcnt < lextra {
-          return Err(FlateError::UnexpectedEof("truncated length extra bits"))
-        }
-        match_len = match_len + (bitbuf & masks[lextra]).to_int()
-        bitbuf = bitbuf >> lextra
-        bitcnt = bitcnt - lextra
-      }
-
-      // Refill before distance symbol + up to 13 extra bits (max 28 bits needed)
-      if bitcnt < 28 {
-        if bitcnt <= 32 && in_pos + 4 <= in_len {
-          let w = data[in_pos].to_int().to_int64().to_uint64() |
-          (data[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
-          (data[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
-          (data[in_pos + 3].to_int().to_int64().to_uint64() << 24)
-          bitbuf = bitbuf | (w << bitcnt)
-          in_pos = in_pos + 4
-          bitcnt = bitcnt + 32
-        } else {
-          while bitcnt <= 56 && in_pos < in_len {
-            bitbuf = bitbuf | (data[in_pos].to_int().to_int64().to_uint64() << bitcnt)
-            in_pos = in_pos + 1
-            bitcnt = bitcnt + 8
-          }
-        }
-      }
-
-      // Decode packed distance symbol
-      let mut dent = cur_dist[(bitbuf & dist_mask).to_int()]
-      if (dent & 48) == 32 {
-        let dnb = dent & 15
-        if bitcnt < dnb {
-          return Err(FlateError::UnexpectedEof("truncated distance code"))
-        }
-        bitbuf = bitbuf >> dnb
-        bitcnt = bitcnt - dnb
-      } else if (dent & 16) != 0 {
-        if bitcnt < 9 {
-          return Err(FlateError::UnexpectedEof("truncated distance subtable prefix"))
-        }
-        let sub_bits = dent & 15
-        let sub_off = dent >> 5
-        let sub_ent = cur_dist[sub_off + ((bitbuf >> 9) & masks[sub_bits]).to_int()]
-        let sub_nb = sub_ent & 15
-        if sub_nb == 0 {
-          return Err(FlateError::InvalidHuffmanTree("invalid distance subtable code"))
-        }
-        let total_nb = 9 + sub_nb
-        if bitcnt < total_nb {
-          return Err(FlateError::UnexpectedEof("truncated distance subtable code"))
-        }
-        bitbuf = bitbuf >> total_nb
-        bitcnt = bitcnt - total_nb
-        dent = sub_ent
-        if (dent & 32) == 0 {
-          return Err(FlateError::InvalidSymbol(dent >> 7))
-        }
-      } else {
-        let dnb = dent & 15
-        if dnb == 0 {
-          return Err(FlateError::InvalidHuffmanTree("invalid distance code"))
-        }
-        if bitcnt < dnb {
-          return Err(FlateError::UnexpectedEof("truncated distance code"))
-        }
-        return Err(FlateError::InvalidSymbol(dent >> 7))
-      }
-
-      let dextra = (dent >> 6) & 15
-      let mut dist = dent >> 10
-      if dextra > 0 {
-        if bitcnt < dextra {
-          return Err(FlateError::UnexpectedEof("truncated distance extra bits"))
-        }
-        dist = dist + (bitbuf & masks[dextra]).to_int()
-        bitbuf = bitbuf >> dextra
-        bitcnt = bitcnt - dextra
-      }
-
-      if dist <= 0 || dist > out_len + dict_len {
-        return Err(FlateError::InvalidDistance("distance exceeds available history"))
-      }
-
-      if match_len > max_output_bytes - out_len {
-        return Err(FlateError::OutputLimitExceeded(max_output_bytes))
-      }
-      if out_len + match_len > out_cap {
-        out = grow_bytes(out, out_len, out_len + match_len, max_output_bytes, init_hint)
-        out_cap = out.length()
-        safe_end = if out_cap < max_output_bytes { out_cap } else { max_output_bytes }
-      }
-
-      if dist > out_len {
-        // Preset dictionary copy (crosses from dict tail into out)
-        let mut rem = match_len
-        let cur_dist_pos = dist
-        while rem > 0 {
-          if cur_dist_pos > out_len {
-            let d_off = dict_len - (cur_dist_pos - out_len)
-            out[out_len] = dict[d_off]
-          } else {
-            out[out_len] = out[out_len - cur_dist_pos]
-          }
-          out_len = out_len + 1
-          rem = rem - 1
-        }
-      } else if dist == 1 {
-        // Fast RLE memset fill
-        let fill = out[out_len - 1]
-        let mut k = 0
-        let lim8 = match_len - 8
-        while k <= lim8 {
-          out[out_len + k] = fill
-          out[out_len + k + 1] = fill
-          out[out_len + k + 2] = fill
-          out[out_len + k + 3] = fill
-          out[out_len + k + 4] = fill
-          out[out_len + k + 5] = fill
-          out[out_len + k + 6] = fill
-          out[out_len + k + 7] = fill
-          k = k + 8
-        }
-        while k < match_len {
-          out[out_len + k] = fill
-          k = k + 1
-        }
-        out_len = out_len + match_len
-      } else if dist >= 8 {
-        // Non-overlapping 8-byte unrolled copy
-        let src_start = out_len - dist
-        let mut k = 0
-        let lim8 = match_len - 8
-        while k <= lim8 {
-          out[out_len + k] = out[src_start + k]
-          out[out_len + k + 1] = out[src_start + k + 1]
-          out[out_len + k + 2] = out[src_start + k + 2]
-          out[out_len + k + 3] = out[src_start + k + 3]
-          out[out_len + k + 4] = out[src_start + k + 4]
-          out[out_len + k + 5] = out[src_start + k + 5]
-          out[out_len + k + 6] = out[src_start + k + 6]
-          out[out_len + k + 7] = out[src_start + k + 7]
-          k = k + 8
-        }
-        while k < match_len {
-          out[out_len + k] = out[src_start + k]
-          k = k + 1
-        }
-        out_len = out_len + match_len
-      } else {
-        // Overlapping RLE copy (2 <= dist < 8)
-        let src_start = out_len - dist
-        let mut k = 0
-        while k < match_len {
-          out[out_len + k] = out[src_start + k]
-          k = k + 1
-        }
-        out_len = out_len + match_len
-      }
+    let rc = inflate_huffman_block(data, in_len, cur_litlen, cur_dist, state)
+    if rc != 0 {
+      return Err(inflate_rc_to_error(rc, state))
     }
   }
 
   // Rewind whole unused bytes left in bitbuf
-  let end_pos = in_pos - (bitcnt >> 3)
-  if out_len == 0 && stored_total > 0 {
+  let end_pos = state.in_pos - (state.bitcnt >> 3)
+  if state.out_len == 0 && stored_total > 0 {
     return Ok((concat_bytes_chunks(stored_chunks), end_pos))
   }
-  if out_len == 0 {
+  if state.out_len == 0 {
     return Ok((Bytes::new(0), end_pos))
   }
-  if out_len == out_cap {
-    return Ok((out, end_pos))
+  if state.out_len == state.out_cap {
+    return Ok((state.out, end_pos))
   }
-  Ok((out.slice(0, out_len), end_pos))
+  Ok((state.out.slice(0, state.out_len), end_pos))
 }
 
 ///| Decompress a raw RFC 1951 DEFLATE stream using default output limit (256 MiB).
