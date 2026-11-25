@@ -1,12 +1,16 @@
-///| Fast single-buffer `ByteBuf`, overflow-safe growth, zero-allocation ASCII number writers,
-///| WinAnsi (cp1252) text encoding, UTF-16BE `/Info` text strings, and ISO 32000-1 §7.3.4.2 escaping.
+///| Fast `ByteBuf` backed by a zero-COW `FixedArray[Byte]` staging buffer + zero-copy `Bytes` chunks
+///| for large payloads, overflow-safe budgeting, zero-allocation ASCII number writers, WinAnsi (cp1252)
+///| text encoding, UTF-16BE `/Info` text strings, and ISO 32000-1 §7.3.4.2 bulk-scanned escaping.
 
 ///| Maximum safe capacity for a single `ByteBuf` (1 GiB, well below 32-bit `Int` overflow).
 let bytebuf_hard_max : Int = 1073741824
 
-///| Growable byte buffer backed by a single `Bytes` slice with overflow-safe growth and optional budget.
+///| Growable byte buffer backed by zero-COW `FixedArray[Byte]` + zero-copy `Bytes` chunks.
 struct ByteBuf {
-  mut buf : Bytes
+  mut buf : FixedArray[Byte]
+  mut cap : Int
+  mut cur : Int
+  chunks : Array[Bytes]
   mut n : Int
   mut max_bytes : Int
   mut overflowed : Bool
@@ -28,7 +32,10 @@ fn ByteBuf::with_capacity(cap : Int) -> ByteBuf {
     cap
   }
   ByteBuf::{
-    buf: Bytes::new(init_cap),
+    buf: FixedArray::make(init_cap, (0).to_byte()),
+    cap: init_cap,
+    cur: 0,
+    chunks: [],
     n: 0,
     max_bytes: bytebuf_hard_max,
     overflowed: false,
@@ -51,11 +58,83 @@ fn ByteBuf::with_budget(cap : Int, max_bytes : Int) -> ByteBuf {
     cap
   }
   ByteBuf::{
-    buf: Bytes::new(init_cap),
+    buf: FixedArray::make(init_cap, (0).to_byte()),
+    cap: init_cap,
+    cur: 0,
+    chunks: [],
     n: 0,
     max_bytes: eff_max,
     overflowed: false,
     virtual_n: 0,
+  }
+}
+
+///| Copy `src[0..n]` into a fresh `Bytes` using 8-byte unrolled stores.
+fn fixed_to_bytes(src : FixedArray[Byte], n : Int) -> Bytes {
+  let mut out = Bytes::new(n)
+  let mut i = 0
+  let lim8 = n - 8
+  while i <= lim8 {
+    out[i] = src[i]
+    out[i + 1] = src[i + 1]
+    out[i + 2] = src[i + 2]
+    out[i + 3] = src[i + 3]
+    out[i + 4] = src[i + 4]
+    out[i + 5] = src[i + 5]
+    out[i + 6] = src[i + 6]
+    out[i + 7] = src[i + 7]
+    i = i + 8
+  }
+  while i < n {
+    out[i] = src[i]
+    i = i + 1
+  }
+  out
+}
+
+///| Concatenate an array of `Bytes` chunks into a single `Bytes` with a single allocation (no tree Peak RSS).
+fn concat_bytes_chunks(chunks : Array[Bytes], total_len : Int) -> Bytes {
+  let n = chunks.length()
+  if n == 0 {
+    return Bytes::new(0)
+  }
+  if n == 1 {
+    return chunks[0]
+  }
+  let mut out = Bytes::new(total_len)
+  let mut dst = 0
+  let mut ci = 0
+  while ci < n {
+    let c = chunks[ci]
+    let clen = c.length()
+    let mut i = 0
+    let lim8 = clen - 8
+    while i <= lim8 {
+      out[dst + i] = c[i]
+      out[dst + i + 1] = c[i + 1]
+      out[dst + i + 2] = c[i + 2]
+      out[dst + i + 3] = c[i + 3]
+      out[dst + i + 4] = c[i + 4]
+      out[dst + i + 5] = c[i + 5]
+      out[dst + i + 6] = c[i + 6]
+      out[dst + i + 7] = c[i + 7]
+      i = i + 8
+    }
+    while i < clen {
+      out[dst + i] = c[i]
+      i = i + 1
+    }
+    dst = dst + clen
+    ci = ci + 1
+  }
+  out
+}
+
+///| Flush the staging `FixedArray[Byte]` into `self.chunks`.
+fn ByteBuf::flush_staging(self : ByteBuf) -> Unit {
+  if self.cur > 0 {
+    self.chunks.push(fixed_to_bytes(self.buf, self.cur))
+    self.cur = 0
   }
 }
 
@@ -68,8 +147,51 @@ fn ByteBuf::add_virtual(self : ByteBuf, extra : Int) -> Unit {
   self.virtual_n = if sum64 > 2147483647L { 2147483647 } else { sum64.to_int() }
 }
 
-///| Overflow-safe capacity reservation in `Int64`. Returns `false` if budget or 1 GiB cap is exceeded.
+///| Overflow-safe budget + staging capacity reservation.
 fn ByteBuf::ensure(self : ByteBuf, extra : Int) -> Bool {
+  if !self.overflowed && extra >= 0 && self.max_bytes - self.n >= extra {
+    if self.cur + extra <= self.cap {
+      return true
+    }
+    let need = self.cur + extra
+    let mut new_cap = self.cap * 2
+    if new_cap < 64 {
+      new_cap = 64
+    }
+    while new_cap < need {
+      if new_cap >= self.max_bytes / 2 {
+        new_cap = self.max_bytes
+        break
+      }
+      new_cap = new_cap * 2
+    }
+    if new_cap > self.max_bytes {
+      new_cap = self.max_bytes
+    }
+    let bigger = FixedArray::make(new_cap, (0).to_byte())
+    let old = self.buf
+    let c = self.cur
+    let mut i = 0
+    let lim8 = c - 8
+    while i <= lim8 {
+      bigger[i] = old[i]
+      bigger[i + 1] = old[i + 1]
+      bigger[i + 2] = old[i + 2]
+      bigger[i + 3] = old[i + 3]
+      bigger[i + 4] = old[i + 4]
+      bigger[i + 5] = old[i + 5]
+      bigger[i + 6] = old[i + 6]
+      bigger[i + 7] = old[i + 7]
+      i = i + 8
+    }
+    while i < c {
+      bigger[i] = old[i]
+      i = i + 1
+    }
+    self.buf = bigger
+    self.cap = new_cap
+    return true
+  }
   if extra < 0 {
     self.overflowed = true
     return false
@@ -85,38 +207,29 @@ fn ByteBuf::ensure(self : ByteBuf, extra : Int) -> Bool {
     self.add_virtual(extra)
     return false
   }
-  let cur_cap64 = self.buf.length().to_int64()
-  if need64 <= cur_cap64 {
+  true
+}
+
+///| Budget check only (for zero-copy chunk appends).
+fn ByteBuf::check_budget(self : ByteBuf, extra : Int) -> Bool {
+  if !self.overflowed && extra >= 0 && self.max_bytes - self.n >= extra {
     return true
   }
-  let hard64 = if limit64 < bytebuf_hard_max.to_int64() {
-    limit64
-  } else {
-    bytebuf_hard_max.to_int64()
+  if extra < 0 {
+    self.overflowed = true
+    return false
   }
-  let mut cap64 = cur_cap64 * 2L
-  if cap64 < 64L {
-    cap64 = 64L
+  if self.overflowed {
+    self.add_virtual(extra)
+    return false
   }
-  while cap64 < need64 {
-    if cap64 >= hard64 {
-      cap64 = hard64
-      break
-    }
-    cap64 = cap64 * 2L
+  let need64 = self.n.to_int64() + extra.to_int64()
+  let limit64 = self.max_bytes.to_int64()
+  if need64 > limit64 || need64 > bytebuf_hard_max.to_int64() {
+    self.overflowed = true
+    self.add_virtual(extra)
+    return false
   }
-  if cap64 > hard64 {
-    cap64 = hard64
-  }
-  let new_cap = cap64.to_int()
-  let mut bigger = Bytes::new(new_cap)
-  let mut i = 0
-  let n = self.n
-  while i < n {
-    bigger[i] = self.buf[i]
-    i = i + 1
-  }
-  self.buf = bigger
   true
 }
 
@@ -125,7 +238,8 @@ fn ByteBuf::write_byte(self : ByteBuf, b : Int) -> Unit {
   if !self.ensure(1) {
     return
   }
-  self.buf[self.n] = (b & 0xFF).to_byte()
+  self.buf[self.cur] = (b & 0xFF).to_byte()
+  self.cur = self.cur + 1
   self.n = self.n + 1
   self.virtual_n = self.n
 }
@@ -136,16 +250,41 @@ fn ByteBuf::write_bytes(self : ByteBuf, src : Bytes) -> Unit {
   if len == 0 {
     return
   }
+  // Zero-copy chunk append for large payloads (compressed streams / images)
+  if len >= 1024 {
+    if !self.check_budget(len) {
+      return
+    }
+    self.flush_staging()
+    self.chunks.push(src)
+    self.n = self.n + len
+    self.virtual_n = self.n
+    return
+  }
   if !self.ensure(len) {
     return
   }
-  let base = self.n
+  let buf = self.buf
+  let base = self.cur
   let mut i = 0
+  let lim8 = len - 8
+  while i <= lim8 {
+    buf[base + i] = src[i]
+    buf[base + i + 1] = src[i + 1]
+    buf[base + i + 2] = src[i + 2]
+    buf[base + i + 3] = src[i + 3]
+    buf[base + i + 4] = src[i + 4]
+    buf[base + i + 5] = src[i + 5]
+    buf[base + i + 6] = src[i + 6]
+    buf[base + i + 7] = src[i + 7]
+    i = i + 8
+  }
   while i < len {
-    self.buf[base + i] = src[i]
+    buf[base + i] = src[i]
     i = i + 1
   }
-  self.n = base + len
+  self.cur = base + len
+  self.n = self.n + len
   self.virtual_n = self.n
 }
 
@@ -157,25 +296,182 @@ fn ByteBuf::write_slice(self : ByteBuf, src : Bytes, start : Int, len : Int) -> 
   if !self.ensure(len) {
     return
   }
-  let base = self.n
+  let buf = self.buf
+  let base = self.cur
   let mut i = 0
+  let lim8 = len - 8
+  while i <= lim8 {
+    buf[base + i] = src[start + i]
+    buf[base + i + 1] = src[start + i + 1]
+    buf[base + i + 2] = src[start + i + 2]
+    buf[base + i + 3] = src[start + i + 3]
+    buf[base + i + 4] = src[start + i + 4]
+    buf[base + i + 5] = src[start + i + 5]
+    buf[base + i + 6] = src[start + i + 6]
+    buf[base + i + 7] = src[start + i + 7]
+    i = i + 8
+  }
   while i < len {
-    self.buf[base + i] = src[start + i]
+    buf[base + i] = src[start + i]
     i = i + 1
   }
-  self.n = base + len
+  self.cur = base + len
+  self.n = self.n + len
   self.virtual_n = self.n
 }
 
 ///|
 fn ByteBuf::write_str(self : ByteBuf, s : String) -> Unit {
-  self.write_bytes(s.to_bytes())
+  let len = s.length()
+  if len == 0 {
+    return
+  }
+  if !self.ensure(len) {
+    return
+  }
+  let buf = self.buf
+  let base = self.cur
+  let mut i = 0
+  let lim4 = len - 4
+  while i <= lim4 {
+    buf[base + i] = s.code_unit_at(i).to_byte()
+    buf[base + i + 1] = s.code_unit_at(i + 1).to_byte()
+    buf[base + i + 2] = s.code_unit_at(i + 2).to_byte()
+    buf[base + i + 3] = s.code_unit_at(i + 3).to_byte()
+    i = i + 4
+  }
+  while i < len {
+    buf[base + i] = s.code_unit_at(i).to_byte()
+    i = i + 1
+  }
+  self.cur = base + len
+  self.n = self.n + len
+  self.virtual_n = self.n
+}
+
+///|
+fn ByteBuf::write_substring(self : ByteBuf, s : String, start : Int, end : Int) -> Unit {
+  let len = end - start
+  if len <= 0 {
+    return
+  }
+  if !self.ensure(len) {
+    return
+  }
+  let buf = self.buf
+  let base = self.cur
+  let mut i = 0
+  let lim4 = len - 4
+  while i <= lim4 {
+    buf[base + i] = s.code_unit_at(start + i).to_byte()
+    buf[base + i + 1] = s.code_unit_at(start + i + 1).to_byte()
+    buf[base + i + 2] = s.code_unit_at(start + i + 2).to_byte()
+    buf[base + i + 3] = s.code_unit_at(start + i + 3).to_byte()
+    i = i + 4
+  }
+  while i < len {
+    buf[base + i] = s.code_unit_at(start + i).to_byte()
+    i = i + 1
+  }
+  self.cur = base + len
+  self.n = self.n + len
+  self.virtual_n = self.n
+}
+
+///| Write a non-negative `Int` in `[0, 2147483647]` with zero heap allocations.
+fn ByteBuf::write_uint_fast(self : ByteBuf, v : Int) -> Unit {
+  if v < 10 {
+    if !self.ensure(1) {
+      return
+    }
+    self.buf[self.cur] = (48 + v).to_byte()
+    self.cur = self.cur + 1
+    self.n = self.n + 1
+    self.virtual_n = self.n
+    return
+  }
+  if v < 100 {
+    if !self.ensure(2) {
+      return
+    }
+    let buf = self.buf
+    let p = self.cur
+    let d0 = v / 10
+    buf[p] = (48 + d0).to_byte()
+    buf[p + 1] = (48 + (v - d0 * 10)).to_byte()
+    self.cur = p + 2
+    self.n = self.n + 2
+    self.virtual_n = self.n
+    return
+  }
+  if v < 1000 {
+    if !self.ensure(3) {
+      return
+    }
+    let buf = self.buf
+    let p = self.cur
+    let d0 = v / 100
+    let r1 = v - d0 * 100
+    let d1 = r1 / 10
+    buf[p] = (48 + d0).to_byte()
+    buf[p + 1] = (48 + d1).to_byte()
+    buf[p + 2] = (48 + (r1 - d1 * 10)).to_byte()
+    self.cur = p + 3
+    self.n = self.n + 3
+    self.virtual_n = self.n
+    return
+  }
+  if v < 10000 {
+    if !self.ensure(4) {
+      return
+    }
+    let buf = self.buf
+    let p = self.cur
+    let d0 = v / 1000
+    let r1 = v - d0 * 1000
+    let d1 = r1 / 100
+    let r2 = r1 - d1 * 100
+    let d2 = r2 / 10
+    buf[p] = (48 + d0).to_byte()
+    buf[p + 1] = (48 + d1).to_byte()
+    buf[p + 2] = (48 + d2).to_byte()
+    buf[p + 3] = (48 + (r2 - d2 * 10)).to_byte()
+    self.cur = p + 4
+    self.n = self.n + 4
+    self.virtual_n = self.n
+    return
+  }
+  // Pack up to 10 reversed BCD digits in a single UInt64 (zero heap allocation)
+  let mut x = v
+  let mut bcd : UInt64 = 0UL
+  let mut count = 0
+  while x > 0 {
+    let q = x / 10
+    bcd = (bcd << 4) | (x - q * 10).to_uint().to_uint64()
+    x = q
+    count = count + 1
+  }
+  if !self.ensure(count) {
+    return
+  }
+  let buf = self.buf
+  let mut p = self.cur
+  let mut rem = count
+  while rem > 0 {
+    buf[p] = (48 + (bcd & 0xFUL).to_int()).to_byte()
+    bcd = bcd >> 4
+    p = p + 1
+    rem = rem - 1
+  }
+  self.cur = p
+  self.n = self.n + count
+  self.virtual_n = self.n
 }
 
 ///| Write a signed 64-bit integer in ASCII decimal with zero heap allocations.
 fn ByteBuf::write_int64(self : ByteBuf, value : Int64) -> Unit {
-  if value == 0L {
-    self.write_byte(48)
+  if value >= 0L && value <= 2147483647L {
+    self.write_uint_fast(value.to_int())
     return
   }
   let mut v = value
@@ -183,28 +479,42 @@ fn ByteBuf::write_int64(self : ByteBuf, value : Int64) -> Unit {
     self.write_byte(45) // '-'
     v = -v
   }
-  let digits = FixedArray::make(20, 0)
-  let mut count = 0
-  while v > 0L {
-    digits[count] = (v % 10L).to_int() + 48
-    v = v / 10L
-    count = count + 1
-  }
-  if !self.ensure(count) {
+  if v <= 2147483647L {
+    self.write_uint_fast(v.to_int())
     return
   }
-  let mut i = count - 1
-  while i >= 0 {
-    self.buf[self.n] = digits[i].to_byte()
-    self.n = self.n + 1
-    i = i - 1
+  let hi = v / 1000000000L
+  let lo = (v - hi * 1000000000L).to_int()
+  self.write_int64(hi)
+  if !self.ensure(9) {
+    return
   }
+  let buf = self.buf
+  let mut p = self.cur
+  let mut div = 100000000
+  let mut rem = lo
+  while div > 0 {
+    let d = rem / div
+    rem = rem - d * div
+    buf[p] = (48 + d).to_byte()
+    p = p + 1
+    div = div / 10
+  }
+  self.cur = p
+  self.n = self.n + 9
   self.virtual_n = self.n
 }
 
 ///| Write a signed `Int` in ASCII decimal with zero heap allocations.
 fn ByteBuf::write_int(self : ByteBuf, value : Int) -> Unit {
-  self.write_int64(value.to_int64())
+  if value >= 0 {
+    self.write_uint_fast(value)
+  } else if value == -2147483648 {
+    self.write_str("-2147483648")
+  } else {
+    self.write_byte(45)
+    self.write_uint_fast(-value)
+  }
 }
 
 ///| Write an exact 10-digit zero-padded non-negative integer for PDF xref entries.
@@ -212,21 +522,84 @@ fn ByteBuf::write_pad10(self : ByteBuf, value : Int) -> Unit {
   if !self.ensure(10) {
     return
   }
+  let buf = self.buf
+  let base = self.cur
   let mut v = if value < 0 { 0 } else { value }
-  let base = self.n
   let mut i = 9
   while i >= 0 {
-    self.buf[base + i] = (48 + v % 10).to_byte()
-    v = v / 10
+    let q = v / 10
+    buf[base + i] = (48 + (v - q * 10)).to_byte()
+    v = q
     i = i - 1
   }
-  self.n = base + 10
+  self.cur = base + 10
+  self.n = self.n + 10
   self.virtual_n = self.n
 }
 
 ///| Return true if `value` is finite and within the safe PDF 1.4 representable range `[-1e14, 1e14]`.
 fn is_valid_pdf_num(value : Double) -> Bool {
   value == value && value >= -1.0e14 && value <= 1.0e14
+}
+
+///| Write a 6-digit fractional part (`1..999999`) with trailing zeros trimmed, zero allocations.
+fn ByteBuf::write_frac6(self : ByteBuf, scaled6 : Int) -> Unit {
+  if !self.ensure(7) {
+    return
+  }
+  let buf = self.buf
+  let p = self.cur
+  buf[p] = 46.to_byte()
+  let mut rem = scaled6
+  let d0 = rem / 100000
+  rem = rem - d0 * 100000
+  buf[p + 1] = (48 + d0).to_byte()
+  if rem == 0 {
+    self.cur = p + 2
+    self.n = self.n + 2
+    self.virtual_n = self.n
+    return
+  }
+  let d1 = rem / 10000
+  rem = rem - d1 * 10000
+  buf[p + 2] = (48 + d1).to_byte()
+  if rem == 0 {
+    self.cur = p + 3
+    self.n = self.n + 3
+    self.virtual_n = self.n
+    return
+  }
+  let d2 = rem / 1000
+  rem = rem - d2 * 1000
+  buf[p + 3] = (48 + d2).to_byte()
+  if rem == 0 {
+    self.cur = p + 4
+    self.n = self.n + 4
+    self.virtual_n = self.n
+    return
+  }
+  let d3 = rem / 100
+  rem = rem - d3 * 100
+  buf[p + 4] = (48 + d3).to_byte()
+  if rem == 0 {
+    self.cur = p + 5
+    self.n = self.n + 5
+    self.virtual_n = self.n
+    return
+  }
+  let d4 = rem / 10
+  rem = rem - d4 * 10
+  buf[p + 5] = (48 + d4).to_byte()
+  if rem == 0 {
+    self.cur = p + 6
+    self.n = self.n + 6
+    self.virtual_n = self.n
+    return
+  }
+  buf[p + 6] = (48 + rem).to_byte()
+  self.cur = p + 7
+  self.n = self.n + 7
+  self.virtual_n = self.n
 }
 
 ///| Write a PDF real/integer number without scientific notation (ISO 32000-1 §7.3.3).
@@ -258,7 +631,7 @@ fn ByteBuf::write_num(self : ByteBuf, value : Double) -> Unit {
   }
   if int_part == 0L && frac < 0.0001 {
     // High-precision small value (e.g. 1e-5..1e-12) without scientific notation
-    let mut scaled = (frac * 1000000000000.0 + 0.5).to_int64()
+    let scaled = (frac * 1000000000000.0 + 0.5).to_int64()
     if scaled <= 0L {
       self.write_byte(48)
       return
@@ -275,31 +648,23 @@ fn ByteBuf::write_num(self : ByteBuf, value : Double) -> Unit {
     }
     self.write_byte(48)
     self.write_byte(46)
-    let digits = FixedArray::make(12, 0)
-    let mut k = 11
-    while k >= 0 {
-      digits[k] = (scaled % 10L).to_int()
-      scaled = scaled / 10L
-      k = k - 1
-    }
-    let mut last = 11
-    while last > 0 && digits[last] == 0 {
-      last = last - 1
-    }
-    let mut j = 0
-    while j <= last {
-      self.write_byte(48 + digits[j])
-      j = j + 1
+    let mut rem64 = scaled
+    let mut div64 = 100000000000L
+    while rem64 > 0L && div64 > 0L {
+      let d = (rem64 / div64).to_int()
+      rem64 = rem64 - d.to_int64() * div64
+      self.write_byte(48 + d)
+      div64 = div64 / 10L
     }
     return
   }
   // Standard range: 6 fractional decimal places, trimming trailing zeros
-  let mut scaled6 = (frac * 1000000.0 + 0.5).to_int64()
-  if scaled6 >= 1000000L {
+  let mut scaled6 = (frac * 1000000.0 + 0.5).to_int64().to_int()
+  if scaled6 >= 1000000 {
     int_part = int_part + 1L
-    scaled6 = 0L
+    scaled6 = 0
   }
-  if int_part == 0L && scaled6 == 0L {
+  if int_part == 0L && scaled6 == 0 {
     self.write_byte(48)
     return
   }
@@ -307,61 +672,64 @@ fn ByteBuf::write_num(self : ByteBuf, value : Double) -> Unit {
     self.write_byte(45)
   }
   self.write_int64(int_part)
-  if scaled6 > 0L {
-    self.write_byte(46)
-    let digits = FixedArray::make(6, 0)
-    let mut k = 5
-    while k >= 0 {
-      digits[k] = (scaled6 % 10L).to_int()
-      scaled6 = scaled6 / 10L
-      k = k - 1
-    }
-    let mut last = 5
-    while last > 0 && digits[last] == 0 {
-      last = last - 1
-    }
-    let mut j = 0
-    while j <= last {
-      self.write_byte(48 + digits[j])
-      j = j + 1
-    }
+  if scaled6 > 0 {
+    self.write_frac6(scaled6)
   }
 }
 
 ///| Write a single byte escaped for a PDF literal string `(...)`.
 fn ByteBuf::write_pdf_escaped_byte(self : ByteBuf, b : Int) -> Unit {
   if b == 40 {
-    self.write_byte(92)
-    self.write_byte(40)
+    if !self.ensure(2) {
+      return
+    }
+    let p = self.cur
+    self.buf[p] = 92.to_byte()
+    self.buf[p + 1] = 40.to_byte()
+    self.cur = p + 2
+    self.n = self.n + 2
+    self.virtual_n = self.n
   } else if b == 41 {
-    self.write_byte(92)
-    self.write_byte(41)
+    if !self.ensure(2) {
+      return
+    }
+    let p = self.cur
+    self.buf[p] = 92.to_byte()
+    self.buf[p + 1] = 41.to_byte()
+    self.cur = p + 2
+    self.n = self.n + 2
+    self.virtual_n = self.n
   } else if b == 92 {
-    self.write_byte(92)
-    self.write_byte(92)
+    if !self.ensure(2) {
+      return
+    }
+    let p = self.cur
+    self.buf[p] = 92.to_byte()
+    self.buf[p + 1] = 92.to_byte()
+    self.cur = p + 2
+    self.n = self.n + 2
+    self.virtual_n = self.n
   } else if b == 10 {
-    self.write_byte(92)
-    self.write_byte(110)
+    self.write_str("\\n")
   } else if b == 13 {
-    self.write_byte(92)
-    self.write_byte(114)
+    self.write_str("\\r")
   } else if b == 9 {
-    self.write_byte(92)
-    self.write_byte(116)
+    self.write_str("\\t")
   } else if b == 8 {
-    self.write_byte(92)
-    self.write_byte(98)
+    self.write_str("\\b")
   } else if b == 12 {
-    self.write_byte(92)
-    self.write_byte(102)
+    self.write_str("\\f")
   } else if b < 32 || b >= 127 {
     if !self.ensure(4) {
       return
     }
-    self.buf[self.n] = 92.to_byte()
-    self.buf[self.n + 1] = (48 + ((b >> 6) & 7)).to_byte()
-    self.buf[self.n + 2] = (48 + ((b >> 3) & 7)).to_byte()
-    self.buf[self.n + 3] = (48 + (b & 7)).to_byte()
+    let buf = self.buf
+    let p = self.cur
+    buf[p] = 92.to_byte()
+    buf[p + 1] = (48 + ((b >> 6) & 7)).to_byte()
+    buf[p + 2] = (48 + ((b >> 3) & 7)).to_byte()
+    buf[p + 3] = (48 + (b & 7)).to_byte()
+    self.cur = p + 4
     self.n = self.n + 4
     self.virtual_n = self.n
   } else {
@@ -370,14 +738,59 @@ fn ByteBuf::write_pdf_escaped_byte(self : ByteBuf, b : Int) -> Unit {
 }
 
 ///| Write an escaped PDF literal string body (without outer `(` and `)`) directly into `ByteBuf`.
+///| Uses 4-byte unrolled safe-ASCII bulk scanning and zero-copy `write_substring`.
 fn ByteBuf::write_pdf_escaped_string(self : ByteBuf, s : String) -> Unit {
-  let raw = s.to_bytes()
-  let n = raw.length()
-  let _ = self.ensure(n)
+  let n = s.length()
+  let mut chunk_start = 0
   let mut i = 0
   while i < n {
-    self.write_pdf_escaped_byte(raw[i].to_int() & 0xFF)
-    i = i + 1
+    while i + 4 <= n {
+      let b0 = s.code_unit_at(i)
+      let b1 = s.code_unit_at(i + 1)
+      let b2 = s.code_unit_at(i + 2)
+      let b3 = s.code_unit_at(i + 3)
+      if b0 >= 32 &&
+      b0 < 127 &&
+      b0 != 40 &&
+      b0 != 41 &&
+      b0 != 92 &&
+      b1 >= 32 &&
+      b1 < 127 &&
+      b1 != 40 &&
+      b1 != 41 &&
+      b1 != 92 &&
+      b2 >= 32 &&
+      b2 < 127 &&
+      b2 != 40 &&
+      b2 != 41 &&
+      b2 != 92 &&
+      b3 >= 32 &&
+      b3 < 127 &&
+      b3 != 40 &&
+      b3 != 41 &&
+      b3 != 92 {
+        i = i + 4
+        continue
+      }
+      break
+    }
+    if i >= n {
+      break
+    }
+    let b = s.code_unit_at(i)
+    if b >= 32 && b < 127 && b != 40 && b != 41 && b != 92 {
+      i = i + 1
+    } else {
+      if i > chunk_start {
+        self.write_substring(s, chunk_start, i)
+      }
+      self.write_pdf_escaped_byte(b)
+      i = i + 1
+      chunk_start = i
+    }
+  }
+  if chunk_start < n {
+    self.write_substring(s, chunk_start, n)
   }
 }
 
@@ -421,75 +834,129 @@ fn unicode_to_winansi(cp : Int) -> Int {
   }
 }
 
-///| Decode the next UTF-8 codepoint from `raw` starting at `i`, returning `(codepoint, next_i)`.
-fn utf8_next_codepoint(raw : Bytes, i : Int) -> (Int, Int) {
-  let n = raw.length()
-  let b0 = raw[i].to_int() & 0xFF
+///| Decode the next UTF-8 codepoint from `s` starting at byte offset `i`.
+///| Returns bit-packed `(codepoint << 3) | byte_len` (zero heap allocation).
+fn utf8_next_codepoint_str(s : String, i : Int, n : Int) -> Int {
+  let b0 = s.code_unit_at(i)
   if b0 < 0x80 {
-    return (b0, i + 1)
+    return (b0 << 3) | 1
   }
   if (b0 & 0xE0) == 0xC0 && i + 1 < n {
-    let b1 = raw[i + 1].to_int() & 0xFF
+    let b1 = s.code_unit_at(i + 1)
     if (b1 & 0xC0) == 0x80 {
-      return (((b0 & 0x1F) << 6) | (b1 & 0x3F), i + 2)
+      return ((((b0 & 0x1F) << 6) | (b1 & 0x3F)) << 3) | 2
     }
   } else if (b0 & 0xF0) == 0xE0 && i + 2 < n {
-    let b1 = raw[i + 1].to_int() & 0xFF
-    let b2 = raw[i + 2].to_int() & 0xFF
+    let b1 = s.code_unit_at(i + 1)
+    let b2 = s.code_unit_at(i + 2)
     if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 {
-      return (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F), i + 3)
+      return ((((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)) << 3) | 3
     }
   } else if (b0 & 0xF8) == 0xF0 && i + 3 < n {
-    let b1 = raw[i + 1].to_int() & 0xFF
-    let b2 = raw[i + 2].to_int() & 0xFF
-    let b3 = raw[i + 3].to_int() & 0xFF
+    let b1 = s.code_unit_at(i + 1)
+    let b2 = s.code_unit_at(i + 2)
+    let b3 = s.code_unit_at(i + 3)
     if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 {
       return (
-        ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F),
-        i + 4,
-      )
+        (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)) << 3
+      ) | 4
     }
   }
-  (0x3F, i + 1)
+  (0x3F << 3) | 1
 }
 
 ///| Write a UTF-8 string transcoded to WinAnsiEncoding (cp1252) inside a PDF literal string.
 ///| Unmappable Unicode scalar values outside WinAnsi are substituted with `?` (0x3F).
+///| Safe printable ASCII spans are bulk-written via `write_substring`.
 fn ByteBuf::write_pdf_winansi_string(self : ByteBuf, s : String) -> Unit {
-  let raw = s.to_bytes()
-  let n = raw.length()
+  let n = s.length()
+  let mut chunk_start = 0
   let mut i = 0
   while i < n {
-    let b0 = raw[i].to_int() & 0xFF
-    if b0 < 0x80 {
+    while i + 4 <= n {
+      let b0 = s.code_unit_at(i)
+      let b1 = s.code_unit_at(i + 1)
+      let b2 = s.code_unit_at(i + 2)
+      let b3 = s.code_unit_at(i + 3)
+      if b0 >= 32 &&
+      b0 < 127 &&
+      b0 != 40 &&
+      b0 != 41 &&
+      b0 != 92 &&
+      b1 >= 32 &&
+      b1 < 127 &&
+      b1 != 40 &&
+      b1 != 41 &&
+      b1 != 92 &&
+      b2 >= 32 &&
+      b2 < 127 &&
+      b2 != 40 &&
+      b2 != 41 &&
+      b2 != 92 &&
+      b3 >= 32 &&
+      b3 < 127 &&
+      b3 != 40 &&
+      b3 != 41 &&
+      b3 != 92 {
+        i = i + 4
+        continue
+      }
+      break
+    }
+    if i >= n {
+      break
+    }
+    let b0 = s.code_unit_at(i)
+    if b0 >= 32 && b0 < 127 && b0 != 40 && b0 != 41 && b0 != 92 {
+      i = i + 1
+    } else if b0 < 0x80 {
+      if i > chunk_start {
+        self.write_substring(s, chunk_start, i)
+      }
       self.write_pdf_escaped_byte(b0)
       i = i + 1
+      chunk_start = i
     } else {
-      let (cp, next_i) = utf8_next_codepoint(raw, i)
+      if i > chunk_start {
+        self.write_substring(s, chunk_start, i)
+      }
+      let packed = utf8_next_codepoint_str(s, i, n)
+      let cp = packed >> 3
       let wa = unicode_to_winansi(cp)
       self.write_pdf_escaped_byte(if wa >= 0 { wa } else { 0x3F })
-      i = next_i
+      i = i + (packed & 7)
+      chunk_start = i
     }
+  }
+  if chunk_start < n {
+    self.write_substring(s, chunk_start, n)
   }
 }
 
 ///| Write a single byte as 2 uppercase hex ASCII characters.
 fn ByteBuf::write_hex_byte(self : ByteBuf, b : Int) -> Unit {
+  if !self.ensure(2) {
+    return
+  }
   let hi = (b >> 4) & 0xF
   let lo = b & 0xF
-  self.write_byte(if hi < 10 { 48 + hi } else { 55 + hi })
-  self.write_byte(if lo < 10 { 48 + lo } else { 55 + lo })
+  let buf = self.buf
+  let p = self.cur
+  buf[p] = (if hi < 10 { 48 + hi } else { 55 + hi }).to_byte()
+  buf[p + 1] = (if lo < 10 { 48 + lo } else { 55 + lo }).to_byte()
+  self.cur = p + 2
+  self.n = self.n + 2
+  self.virtual_n = self.n
 }
 
 ///| Write an ISO 32000-1 §7.9.2.2 PDF text string for `/Info` metadata:
 ///| pure ASCII is written as a literal `(...)`, non-ASCII is written as UTF-16BE with BOM `<FEFF...>`.
 fn ByteBuf::write_pdf_text_string(self : ByteBuf, s : String) -> Unit {
-  let raw = s.to_bytes()
-  let n = raw.length()
+  let n = s.length()
   let mut has_non_ascii = false
   let mut i = 0
   while i < n {
-    if (raw[i].to_int() & 0xFF) >= 0x80 {
+    if s.code_unit_at(i) >= 0x80 {
       has_non_ascii = true
       break
     }
@@ -505,7 +972,8 @@ fn ByteBuf::write_pdf_text_string(self : ByteBuf, s : String) -> Unit {
   self.write_str("<FEFF")
   let mut pos = 0
   while pos < n {
-    let (cp, next_pos) = utf8_next_codepoint(raw, pos)
+    let packed = utf8_next_codepoint_str(s, pos, n)
+    let cp = packed >> 3
     if cp <= 0xFFFF {
       self.write_hex_byte((cp >> 8) & 0xFF)
       self.write_hex_byte(cp & 0xFF)
@@ -518,18 +986,18 @@ fn ByteBuf::write_pdf_text_string(self : ByteBuf, s : String) -> Unit {
       self.write_hex_byte((lo >> 8) & 0xFF)
       self.write_hex_byte(lo & 0xFF)
     }
-    pos = next_pos
+    pos = pos + (packed & 7)
   }
   self.write_byte(62) // '>'
 }
 
 ///|
 fn ByteBuf::to_bytes(self : ByteBuf) -> Bytes {
-  if self.n == self.buf.length() {
-    self.buf
-  } else {
-    self.buf.slice(0, self.n)
+  if self.chunks.length() == 0 {
+    return fixed_to_bytes(self.buf, self.cur)
   }
+  self.flush_staging()
+  concat_bytes_chunks(self.chunks, self.n)
 }
 
 ///| Escape a string for inclusion in a PDF literal string `(...)` (ISO 32000-1 §7.3.4.2).

@@ -49,13 +49,16 @@ let bytes = doc.encode()
 
 ## Benchmarks (`packages/pdf/bench/run_bench.sh`)
 
-Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against **Rust `pdf-writer 0.12.1` + `flate2 1.1` (`rust_backend`, `--release`)**:
+Measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against **Rust `pdf-writer 0.12.1` + `flate2 1.1` (`rust_backend`, `--release`)** (Peak RSS measured via `wait4` `ru_maxrss`):
 
-| Workload | Pion Median | Rust `pdf-writer` Median | Pion Throughput / ns/op | Pion Peak RSS | Rust Peak RSS | Speedup vs Rust |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100-Page Vector + Text Report (`/FlateDecode`) | 22.71 ms | 14.57 ms | 227.1 us/page | 4.11 MiB | 6.36 MiB | **0.64×** |
-| 10-Page 800×600 RGBA Image Export (`/FlateDecode`, 14.4 MB RGB) | 75.77 ms | 74.52 ms | 190.06 MB/s | 24.62 MiB | 27.61 MiB | **0.98×** |
-| 10-Page 800×600 RGBA Image Export (`/RunLengthDecode`, 14.4 MB RGB) | 64.56 ms | 37.54 ms | 223.05 MB/s | 55.41 MiB | 38.20 MiB | **0.58×** |
+| Workload | Pion Median (Opt) | Pion Median (Base `9f6e1634`) | Rust `pdf-writer` Median | Pion Opt Throughput / ns/op | Pion Peak RSS | Rust Peak RSS | Speedup vs Rust (vs Base) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100-Page Vector + Text Report (`/FlateDecode`) | 14.45 ms | 16.5–26.8 ms | 6.31 ms | 144.5 us/page | 5.85 MiB | 5.85 MiB | **0.44×** (**1.14×** vs base) |
+| 10-Page 800×600 RGBA Image Export (`/FlateDecode`, 14.4 MB RGB) | 125.09 ms | 132–197 ms | 101.48 ms | 115.12 MB/s | 23.54 MiB | 23.30 MiB | **0.81×** (**~1.03×** vs base) |
+| 10-Page 800×600 RGBA Image Export (`/RunLengthDecode`, 14.4 MB RGB) | 72.89 ms | 110–142 ms | 54.75 ms | 197.57 MB/s | 44.10 MiB | 33.30 MiB | **0.75×** (**1.51×** vs base) |
 
-- **Output sizes**: `report100` Pion `93 KB` vs Rust `97 KB`; `images_flate` Pion `833 KB` vs Rust `814 KB`; `images_rle` Pion `11 MB` vs Rust `11 MB`.
-- **Honest notes**: On `images_flate`, Pion is effectively tied with Rust `--release` (`0.98×`, lower Peak RSS `24.62` vs `27.61 MiB`). On `report100` (`0.64×`, lower Peak RSS `4.11` vs `6.36 MiB`), per-stream `flate` state initialization accounts for ~11 ms of the 22.7 ms total. On `images_rle` (`0.58×`), scalar PackBits scanning and byte-by-byte buffer copying account for the remaining gap vs LLVM auto-vectorized Rust.
+- **Output sizes**: `report100` Pion `93 KB` vs Rust `98 KB`; `images_flate` Pion `834 KB` vs Rust `814 KB`; `images_rle` Pion `11 MB` vs Rust `11 MB`.
+- **Phase breakdown (`audit/probe perf`, best of 5)**:
+  - `report100`: `build_content_ms=1`, `encode_uncompressed_ms=0`, `encode_flate6_ms=8` — `packages/pdf` content building + PDF assembly is ~1 ms total; the remaining ~8 ms is per-page `flate::zlib_compress` (100× 3.5 KB streams in `packages/flate`).
+  - `images10`: `rgba_to_white_rgb_ms=19`, `rle_encode_ms=10` (~1.44 GB/s), `flate_encode6_ms=77`, `full_flate_ms=96`, `full_uncompressed_ms=26`.
+- **Honest notes**: Zero-COW `FixedArray[Byte]` `ByteBuf` + zero-copy large-payload chunking + zero-allocation `write_int`/`write_num`/`write_pad10` + 4-byte unrolled ASCII escaping + single-pass fused scan+copy `rle_encode` improved `images_rle` by **1.51×** (and cut Peak RSS by **10.5 MiB**, from `54.61` to `44.10 MiB`) and `report100` by **1.14×** (with `packages/pdf` itself at ~1 ms). Remaining gap vs Rust `--release` on `report100` (`0.44×`) and `images_flate` (`0.81×`) is dominated by `packages/flate`'s `zlib_compress` (not modified by `packages/pdf`), and on `images_rle` (`0.75×`) by synthetic RGBA input generation and scalar QBE bounds-checked byte loops vs LLVM auto-vectorization.
