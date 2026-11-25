@@ -10,7 +10,7 @@ Zero-dependency, pure-Pion implementation (`v0.1.1`) of the [WHATWG URL Standard
 - **Red-Team Audit Suite (`packages/url/audit`)**: **31 / 31 (100.0%)** — 0 non-idempotent round-trips across 15,876 parsed URLs, 0 `PION_BUG` across `fastpath`/`fuzz`/`random`/`wpt`/`setters`/`query`/`pct`/`idnareal`
 - **`QueryParams` & Percent-Encoding**: **7 / 7 (100.0%)** (`query_params_test.pion`, including UTF-16 code-unit `sort()`)
 - **Day-1 Red-Team Security Suite**: **8 / 8 (100.0%)** (`redteam_test.pion` — O(N) linear 20K `/a/..` paths, O(N) `@` authority flood, Punycode length bounds 1000/2000, IPv4/IPv6/port integer overflow bounds, zero raw C0/CR/LF/TAB smuggling)
-- **Wasm32**: `pionc build --release --target wasm32 packages/url/wasm_smoke` builds cleanly (`298 KiB` `.wasm` including embedded Unicode 16.0.0 UTS #46 / NFC / Bidi / JoiningType tables, validated via Node.js `WebAssembly.compile`)
+- **Wasm32**: `pionc build --release --target wasm32 packages/url/wasm_smoke` builds cleanly (`253 KiB` / `258,652 B` `.wasm` including embedded Unicode 16.0.0 UTS #46 / NFC / Bidi / JoiningType single-literal VLQ tables, 4-mode native/wasm32 debug/release stdout SHA-256 verified identical: `01e3a2114949a491...`)
 
 ## Features
 
@@ -44,7 +44,7 @@ pub fn example() -> String {
 
 ## Head-to-Head Benchmarks (Pion Native vs Rust `url =2.5.9 --release`)
 
-Measured on `Darwin arm64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
+Measured on `Linux x86_64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
 
 ### Template Corpora (`sh packages/url/bench/run_bench.sh`)
 
@@ -53,20 +53,20 @@ Measured on `Darwin arm64` using `scripts/bench_compare.py` (`--warmup 1 --round
 Input: `14,278,136 B` (100,000 mixed HTTP/HTTPS/WS/FTP/IPv4/IPv6/IDN/dot-segment/relative-`join` URLs × 2 steady-state rounds)
 Stdout SHA-256 (verified identical): `fca6fb3c1d9083d88088188f61cf4c5826e7590a91413844c11058010c4ae9fa`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_url`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | **114.091** | 113.282 | 115.684 | **125.15** | **570.45** | 21.25 MiB | **1.05x** |
-| `rust_url` (`=2.5.9 --release`) | 120.056 | 116.615 | 123.861 | 118.93 | 600.28 | 10.59 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_url`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 161.412 | 149.366 | 173.326 | 88.46 | 807.06 | **0.90x** |
+| `rust_url` (`=2.5.9 --release`) | **145.522** | 138.343 | 158.460 | **98.12** | **727.61** | 1.00x (baseline) |
 
 #### Workload 2: `URLSearchParams` Parse + Mutate + Sort + Serialize (200,000 ops)
 
 Input: `16,996,736 B` (100,000 query strings × 2 steady-state rounds: `parse` + `delete` + `set` + `append` + `sort` + `to_string`)
 Stdout SHA-256 (verified identical): `6d553a71ae368c6396941bb3e9f9675f928965d8ecc500d7ea840461612832d0`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_url`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 244.434 | 242.438 | 246.535 | 69.54 | 1222.17 | 23.33 MiB | **0.97x** |
-| `rust_url` (`=2.5.9 --release`) | **237.788** | 236.731 | 240.629 | **71.48** | **1188.94** | 11.75 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_url`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 379.602 | 320.810 | 489.711 | 44.78 | 1898.01 | **0.86x** |
+| `rust_url` (`=2.5.9 --release`) | **325.113** | 284.532 | 512.364 | **52.28** | **1625.56** | 1.00x (baseline) |
 
 ### Adversarial / Non-Template Corpora (`sh packages/url/audit/run_audit.sh` §6)
 
@@ -74,14 +74,14 @@ Net library time (median minus matching no-op driver median; `> 1.0x` = Pion fas
 
 | Workload | Cases | Net Pion (ms) | Net Rust (ms) | Speedup (vs `rust_url`) |
 | --- | ---: | ---: | ---: | ---: |
-| `adv_ipv4` (dec / hex / octal / 32-bit) | 200,000 | **59.3** | 79.9 | **1.35x** |
-| `adv_setters` (7 setters per URL) | 40,000 | 107.6 | 104.5 | **0.97x** |
-| `adv_ipv6` (compressed / embedded-v4 / upper) | 200,000 | 88.3 | 78.2 | **0.89x** |
-| `adv_big_url` (325 KB URLs) | 200 | 78.3 | 65.6 | **0.84x** |
-| `adv_idn` (full Unicode 16.0 UTS #46 IDNs) | 100,000 | 89.0 | 66.4 | **0.75x** |
-| `adv_query_sort` (8–300 pairs, mutate + sort) | 7,500 | 133.3 | 82.9 | **0.62x** |
-| `adv_pct` (heavy path/query/frag + `\t` encoding) | 100,000 | 218.8 | 125.6 | **0.57x** |
-| `adv_join` (varied relative refs, 4 bases) | 200,000 | 103.7 | 55.5 | **0.54x** |
+| `adv_idn` (full Unicode 16.0 UTS #46 IDNs) | 100,000 | **181.3** | 388.7 | **2.14x** |
+| `adv_ipv4` (dec / hex / octal / 32-bit) | 200,000 | **109.2** | 138.4 | **1.27x** |
+| `adv_pct` (heavy path/query/frag + `\t` encoding) | 100,000 | **199.3** | 220.2 | **1.10x** |
+| `adv_big_url` (325 KB URLs) | 200 | 125.5 | 114.9 | **0.92x** |
+| `adv_join` (varied relative refs, 4 bases) | 200,000 | 92.1 | 83.5 | **0.91x** |
+| `adv_setters` (7 setters per URL) | 40,000 | 182.5 | 143.0 | **0.78x** |
+| `adv_ipv6` (compressed / embedded-v4 / upper) | 200,000 | 503.3 | 377.1 | **0.75x** |
+| `adv_query_sort` (8–300 pairs, mutate + sort) | 7,500 | 219.9 | 151.2 | **0.69x** |
 
 ### Adversarial DoS Scaling (`sh packages/url/audit/run_audit.sh` §5)
 
