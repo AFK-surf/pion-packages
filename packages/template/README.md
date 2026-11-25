@@ -80,34 +80,34 @@ pionc run --release --target wasm32 packages/template/wasm_smoke
 
 ## Head-to-Head Benchmark
 
-Benchmarked via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte identity) on `Darwin arm64` against **Rust `minijinja =3.1.0`** (`--release`, `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, features `["builtins", "json", "preserve_order"]`, without `speedups` SIMD `v_htmlescape`).
+Benchmarked via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte identity) on `Linux x86_64` against **Rust `minijinja =3.1.0`** (`--release`, `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, features `["builtins", "json", "preserve_order"]`, without `speedups` SIMD `v_htmlescape`).
 
 ### Standard Workloads (`sh packages/template/bench/run_bench.sh`)
 
 #### Bench 1: HTML Page SSR (`extends` + `block` + `super()` + `for` 20 rows + HTML auto-escape + filters, 10,000 renders, 23.77 MB output)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_minijinja`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 156.054 | 151.756 | 163.427 | 152.32 | 15605.36 | 2.50 MiB | **0.77x** |
-| `rust_minijinja` | 119.374 | 118.096 | 128.775 | 199.12 | 11937.37 | 3.08 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_minijinja`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 614.150 | 388.001 | 913.920 | 38.70 | 61415.05 | **1.33x** |
+| `rust_minijinja` | 815.957 | 377.581 | 1372.185 | 29.13 | 81595.66 | 1.00x (baseline) |
 
 _SHA-256 verified identical: `e4fc33828ccace7ee949020a4217baa4ddde3f1f54a4c1d0e4085d3695ee1b39`._
 
 #### Bench 2: AI Agent Prompt Rendering (conditionals + tool list + HTML-safe `tojson(indent=2)` + `join` + `default`, 20,000 renders, 9.14 MB output)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_minijinja`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 69.348 | 67.615 | 75.506 | 131.80 | 3467.40 | 2.41 MiB | **1.39x** |
-| `rust_minijinja` | 96.668 | 93.433 | 98.112 | 94.55 | 4833.41 | 2.88 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_minijinja`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 186.259 | 153.514 | 205.205 | 49.07 | 9312.94 | **1.27x** |
+| `rust_minijinja` | 236.070 | 172.734 | 383.947 | 38.72 | 11803.52 | 1.00x (baseline) |
 
 _SHA-256 verified identical: `ed6753c873c8a3aeace7d3ceb6df3ce580c9d238f3e45261441a2f6907135a0a`._
 
 #### Bench 3: Compile + Render End-to-End (parse & compile 3 templates with `extends` + `include` + `for` + HTML escape, 2,000 iterations, 938 KB output)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_minijinja`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 25.865 | 23.871 | 26.727 | 36.27 | 12932.44 | 2.30 MiB | **1.52x** |
-| `rust_minijinja` | 39.368 | 37.992 | 40.312 | 23.83 | 19683.79 | 3.12 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_minijinja`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 145.638 | 79.678 | 486.090 | 6.44 | 72818.88 | **0.66x** |
+| `rust_minijinja` | 96.024 | 57.636 | 188.580 | 9.77 | 48012.19 | 1.00x (baseline) |
 
 _SHA-256 verified identical: `1561f2114958a0d8e74a73a6d50ccf3a69514b983377865297dfef8698fa5b63`._
 
@@ -115,23 +115,23 @@ _SHA-256 verified identical: `1561f2114958a0d8e74a73a6d50ccf3a69514b983377865297
 
 | Workload | `pion` median | `rust_minijinja` median | Speedup (vs `rust_minijinja`) |
 | --- | ---: | ---: | ---: |
-| `bench_set_concat_20k` (`ns.s ~ 'x'`) | 18.87 ms | 54.55 ms | **2.89x** |
-| `bench_unique_20k` (`range(20000)\|unique`) | 10.95 ms | 15.96 ms | **1.46x** (was 738.4 ms / 0.026x) |
-| `bench_macro_50k` | 29.98 ms | 30.71 ms | **1.02x** |
-| `bench_html_escape_50k` | 31.19 ms | 25.39 ms | **0.81x** |
-| `bench_filters_50k` | 54.00 ms | 43.52 ms | **0.81x** |
-| `bench_loop_200k` | 36.79 ms | 24.73 ms | **0.67x** |
-| `bench_sort_20k` (reversed `\|sort`) | 13.50 ms | 9.10 ms | **0.67x** (was 1757.8 ms / 0.005x) |
-| `bench_attr_lookup_100k` | 56.65 ms | 30.91 ms | **0.55x** |
+| `bench_attr_lookup_100k` | 56.37 ms | 110.08 ms | **1.95x** (was 0.55x) |
+| `bench_unique_20k` (`range(20000)\|unique`) | 33.51 ms | 53.06 ms | **1.58x** |
+| `bench_loop_200k` | 93.66 ms | 128.33 ms | **1.37x** (was 0.67x) |
+| `bench_set_concat_20k` (`ns.s ~ 'x'`) | 26.00 ms | 27.08 ms | **1.04x** |
+| `bench_macro_50k` | 105.66 ms | 106.23 ms | **1.01x** |
+| `bench_html_escape_50k` | 70.83 ms | 67.26 ms | **0.95x** |
+| `bench_sort_20k` (reversed `\|sort`) | 15.62 ms | 13.18 ms | **0.84x** (was 0.67x) |
+| `bench_filters_50k` | 148.52 ms | 119.89 ms | **0.81x** |
 
 ### Honest Performance Analysis
 
 - **Where `template` (Pion) leads**:
-  - **Prompt rendering (`1.39x`) & Compile+Render (`1.52x`)**: Direct `StringBuilder` HTML-safe JSON serialization and single-pass recursive-descent AST compilation have lower compile and allocation overhead than MiniJinja's bytecode compiler + serde layer.
-  - **`bench_set_concat_20k` (`2.89x`) & `bench_unique_20k` (`1.46x`)**: O(N) hash-bucketed `|unique` and lightweight string concatenation beat Rust `minijinja`'s `Value` hashing/cloning overhead.
-  - **Memory footprint**: Consistently lower peak RSS across standard workloads (`2.30–2.50 MiB` vs `2.88–3.12 MiB`).
+  - **Attribute lookup (`1.95x`) & tight loops (`1.37x`)**: `ValueMap` uses parallel arrays for small maps and an O(1) hash index for `len >= 8`, paired with a 2-slot immutable `root_ctx` MRU cache, flat lexical scopes, unboxed `Range` loop variables, and zero-allocation `loop.*` / `loop.cycle` fast paths.
+  - **HTML Page SSR (`1.33x`) & Prompt rendering (`1.27x`)**: Direct `StringBuilder` streaming (`emit_expr_fast`, single-pass HTML escaping, ASCII streaming `|upper`/`|lower`, zero-copy static `extends`, and direct `super()` streaming) beats MiniJinja's bytecode + serde layer.
+  - **`bench_unique_20k` (`1.58x`), `bench_set_concat_20k` (`1.04x`) & `bench_macro_50k` (`1.01x`)**: O(N) hash-bucketed `|unique` and flat scope reuse avoid per-iteration container allocations.
 - **Where Rust `minijinja` leads**:
-  - **Render-heavy tight loops & attribute lookups (`0.55x–0.81x`)**: MiniJinja's flat bytecode VM and hash-indexed object lookups have better cache locality and dispatch efficiency than Pion's tree-walking AST evaluator and linear map/filter scan. Note also that the Rust baseline is built without MiniJinja's optional `speedups` SIMD `v_htmlescape` feature.
+  - **Compile-heavy E2E (`0.66x` on Linux x86_64) & chained string filter pipelines (`0.81x–0.95x`)**: Multi-pass string filter chains (`|upper|replace|trim|title`) allocate intermediate `String`s per stage, and recursive-descent AST compilation allocates AST nodes on every iteration when templates are not pre-compiled. Note also that the Rust baseline is built without MiniJinja's optional `speedups` SIMD `v_htmlescape` feature.
 
 ## Known P2 Differences vs Rust `minijinja =3.1.0` (32 / 283 differential cases)
 
