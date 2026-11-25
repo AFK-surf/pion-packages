@@ -3,12 +3,12 @@
 #   Pion Native (`packages/json`, --release)
 #   vs Rust (`serde_json =1.0.145`, --release)
 #   vs Go (`encoding/json`, stdlib)
-# All temporary artifacts and corpora are written under /private/tmp/w17-json-bench.
+# All temporary artifacts and corpora are written under ${TMPDIR:-/tmp}/w17-json-bench.
 set -eu
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/w17-json-bench"
+OUT_DIR="${TMPDIR:-/tmp}/w17-json-bench"
 BIN_DIR="$OUT_DIR/bin"
 mkdir -p "$BIN_DIR"
 
