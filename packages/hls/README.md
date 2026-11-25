@@ -62,7 +62,7 @@ sh packages/hls/bench/run_bench.sh
 `packages/hls/wasm_smoke` builds cleanly and produces byte-identical output across `native debug`, `native --release`, `wasm32 debug`, and `wasm32 --release`:
 
 - SHA-256 (all 4 modes): `ccb403999c3dd751365666e2813bb49a01ea55e6fd3bfe0c34a52f4ebb4fb933`
-- Wasm32 binary size: `237,697 B` (debug), `235,971 B` (`--release`)
+- Wasm32 binary size: `252,719 B` (debug), `251,101 B` (`--release`)
 
 ### Differential Oracle vs Rust `m3u8-rs 6.0.1`
 
@@ -72,11 +72,11 @@ Verified via `sh packages/hls/bench/run_bench.sh` (`bench/diff_oracle.py`) acros
 
 ### Fair Head-to-Head Benchmark vs Rust `m3u8-rs 6.0.1`
 
-Measured on `Darwin arm64` (`sh packages/hls/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, 3,500 playlists / 21.63 MB total input, byte-identical stdout SHA-256 `79b0e9cdc47d0b92698be972697b6d660bd8896edbf6cfc2f20e08b790d3bcce`):
+Measured on `Linux x86_64` (`sh packages/hls/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, 3,500 playlists / 21.63 MB total input, byte-identical stdout SHA-256 `79b0e9cdc47d0b92698be972697b6d660bd8896edbf6cfc2f20e08b790d3bcce`):
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_m3u8_rs`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_hls` (`--release`) | 110.403 | 105.946 | 119.837 | 195.90 | 31543.67 | 4.06 MiB | **1.35x** |
-| `rust_m3u8_rs` (`6.0.1 --release`) | 149.593 | 147.403 | 173.834 | 144.58 | 42740.95 | 4.28 MiB | 1.00x (baseline) |
+| `pion_hls` (`--release`) | 291.970 | 216.575 | 380.380 | 74.07 | 83419.95 | 3.33 MiB | **2.58x** |
+| `rust_m3u8_rs` (`6.0.1 --release`) | 752.746 | 541.939 | 1424.675 | 28.73 | 215070.34 | 2.94 MiB | 1.00x (baseline) |
 
-On a second corpus (`audit/diff/altbench.py` — long URLs, `EXT-X-PROGRAM-DATE-TIME` per segment, key rotation, and explicit byte ranges; byte-identical stdout SHA-256 `5435f14cac58923a0ea773283d88c4212c0bd043e4e3d5f1150582c4e6a482e4`), `pion_hls` runs at **0.84x** vs `rust_m3u8_rs` (160.646 ms / 263.23 MB/s vs 135.219 ms / 312.73 MB/s) with higher peak RSS (27.45 MiB vs 15.28 MiB) due to full strict RFC 8216bis validation, ISO-8601 checking, and per-segment metadata retention.
+On a second corpus (`audit/diff/altbench.py` — long URLs, `EXT-X-PROGRAM-DATE-TIME` per segment, key rotation, and explicit byte ranges; byte-identical stdout SHA-256 `5435f14cac58923a0ea773283d88c4212c0bd043e4e3d5f1150582c4e6a482e4`), `pion_hls` runs at **1.92x** vs `rust_m3u8_rs` (186.790 ms / 226.39 MB/s vs 359.058 ms / 117.77 MB/s, Peak RSS 18.07 MiB vs 12.85 MiB) while performing full strict RFC 8216bis validation, ISO-8601 calendar checking, and per-segment metadata retention.
