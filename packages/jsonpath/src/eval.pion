@@ -55,10 +55,32 @@ struct EvalState {
   root : JsonValue
   limits : JsonPathLimits
   mut visited : Int
+  mut has_err : Bool
+  mut err : Option[JsonPathError]
 }
 
 fn EvalState::new(root : JsonValue, limits : JsonPathLimits) -> EvalState {
-  EvalState::{ root: root, limits: limits, visited: 0 }
+  EvalState::{
+    root: root,
+    limits: limits,
+    visited: 0,
+    has_err: false,
+    err: Option::None,
+  }
+}
+
+fn EvalState::set_err(self : EvalState, e : JsonPathError) -> Unit {
+  if !self.has_err {
+    self.has_err = true
+    self.err = Some(e)
+  }
+}
+
+fn EvalState::take_err(self : EvalState) -> JsonPathError {
+  match self.err {
+    Some(e) => e
+    None => JsonPathError::new(JsonPathErrorKind::LimitExceeded, 0, "query limit exceeded")
+  }
 }
 
 fn EvalState::visit(self : EvalState) -> Result[Unit, JsonPathError] {
@@ -75,14 +97,761 @@ fn EvalState::visit(self : EvalState) -> Result[Unit, JsonPathError] {
   Ok(())
 }
 
-///| Evaluate a compiled `JsonPath` returning only matched `JsonValue`s (fast path: no path string allocations).
+///| Check whether `segments[start..]` consists solely of single-selector `Child([Name])` or `Child([Index])`.
+fn is_singular_segments(segments : Array[Segment], start : Int) -> Bool {
+  let mut i = start
+  let n = segments.length()
+  while i < n {
+    match segments[i] {
+      Segment::Child(sels) => {
+        if sels.length() != 1 {
+          return false
+        }
+        match sels[0] {
+          Selector::Name(_) => ()
+          Selector::Index(_) => ()
+          _ => return false
+        }
+      }
+      Segment::Descendant(_) => return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Zero-allocation walk of a singular tail `segments[start..]` starting from `node`.
+fn follow_singular_tail(
+  node : JsonValue,
+  segments : Array[Segment],
+  start : Int,
+) -> Option[JsonValue] {
+  let mut cur = node
+  let mut i = start
+  let n = segments.length()
+  while i < n {
+    match segments[i] {
+      Segment::Child(sels) => {
+        match sels[0] {
+          Selector::Name(key) => {
+            match cur {
+              JsonValue::Object(entries) => {
+                match json_object_get(entries, key) {
+                  Some(v) => cur = v
+                  None => return Option::None
+                }
+              }
+              _ => return Option::None
+            }
+          }
+          Selector::Index(idx) => {
+            match cur {
+              JsonValue::Array(items) => {
+                let len64 = items.length().to_int64()
+                let norm = if idx >= 0L { idx } else { len64 + idx }
+                if norm >= 0L && norm < len64 {
+                  cur = items[norm.to_int()]
+                } else {
+                  return Option::None
+                }
+              }
+              _ => return Option::None
+            }
+          }
+          _ => return Option::None
+        }
+      }
+      Segment::Descendant(_) => return Option::None
+    }
+    i = i + 1
+  }
+  Some(cur)
+}
+
+///| Check if a `FilterExpr` is a pure single-node comparison (no root `$` or node-visiting subqueries).
+fn is_pure_local_cmp(expr : FilterExpr) -> Bool {
+  match expr {
+    FilterExpr::Comparison(
+      Comparable::SingularQuery(true, segs),
+      _,
+      Comparable::Literal(_),
+    ) => segs.length() == 1
+    _ => false
+  }
+}
+
+///| Check if a `FilterExpr` is `length(@.<key>) <op> <Int>`.
+fn is_pure_local_len_cmp(expr : FilterExpr) -> Bool {
+  match expr {
+    FilterExpr::Comparison(
+      Comparable::FuncCall(f),
+      _,
+      Comparable::Literal(JsonValue::Int(_)),
+    ) => {
+      if f.name != "length" || f.args.length() != 1 {
+        return false
+      }
+      match f.args[0] {
+        FuncArg::FilterQuery(true, segs) => {
+          if segs.length() == 1 {
+            match segs[0] {
+              Segment::Child(sels) => {
+                if sels.length() == 1 {
+                  match sels[0] {
+                    Selector::Name(_) => true
+                    _ => false
+                  }
+                } else {
+                  false
+                }
+              }
+              Segment::Descendant(_) => false
+            }
+          } else {
+            false
+          }
+        }
+        _ => false
+      }
+    }
+    _ => false
+  }
+}
+
+///| Fast specialized field comparison on `entries` for common literal types (`Bool`, `Int`, `Str`).
+fn match_local_name_cmp(
+  entries : Array[(String, JsonValue)],
+  key : String,
+  key_len : Int,
+  op : CompOp,
+  lit : JsonValue,
+) -> Bool {
+  let mut i = entries.length() - 1
+  while i >= 0 {
+    let (ek, ev) = entries[i]
+    if ek.length() == key_len && ek == key {
+      return match (ev, lit) {
+        (JsonValue::Bool(x), JsonValue::Bool(y)) => {
+          match op {
+            CompOp::Eq => x == y
+            CompOp::Ne => x != y
+            CompOp::Le => x == y
+            CompOp::Ge => x == y
+            _ => false
+          }
+        }
+        (JsonValue::Int(x), JsonValue::Int(y)) => {
+          match op {
+            CompOp::Eq => x == y
+            CompOp::Ne => x != y
+            CompOp::Lt => x < y
+            CompOp::Le => x <= y
+            CompOp::Gt => x > y
+            CompOp::Ge => x >= y
+          }
+        }
+        (JsonValue::Str(x), JsonValue::Str(y)) => {
+          match op {
+            CompOp::Eq => x.length() == y.length() && x == y
+            CompOp::Ne => x.length() != y.length() || x != y
+            CompOp::Lt => json_value_lt(ev, lit)
+            CompOp::Le => (x.length() == y.length() && x == y) || json_value_lt(ev, lit)
+            CompOp::Gt => json_value_lt(lit, ev)
+            CompOp::Ge => (x.length() == y.length() && x == y) || json_value_lt(lit, ev)
+          }
+        }
+        _ => compare_json_values(ev, op, lit)
+      }
+    }
+    i = i - 1
+  }
+  compare_nothing_vs_value(op)
+}
+
+///| Evaluate `length(@.<key>) <op> target` directly on `entries` with zero heap allocations.
+fn match_local_len_name_cmp(
+  entries : Array[(String, JsonValue)],
+  key : String,
+  key_len : Int,
+  op : CompOp,
+  target : Int64,
+) -> Bool {
+  let mut i = entries.length() - 1
+  while i >= 0 {
+    let (ek, ev) = entries[i]
+    if ek.length() == key_len && ek == key {
+      let len64 = match ev {
+        JsonValue::Str(s) => utf8_codepoint_count(s).to_int64()
+        JsonValue::Array(items) => items.length().to_int64()
+        JsonValue::Object(es) => es.length().to_int64()
+        _ => -1L
+      }
+      if len64 < 0L {
+        return compare_nothing_vs_value(op)
+      }
+      return compare_int64_op(len64, op, target)
+    }
+    i = i - 1
+  }
+  compare_nothing_vs_value(op)
+}
+
+///| Evaluate a compiled `JsonPath` returning only matched `JsonValue`s (fast path: zero intermediate allocations).
 pub fn eval_query_values(
   path : JsonPath,
   root : JsonValue,
   limits : JsonPathLimits,
 ) -> Result[Array[JsonValue], JsonPathError] {
+  let segments = path.segments
+  let n_segs = segments.length()
+  let mut cur = root
+  let mut s_idx = 0
+  // 1. Zero-allocation walk of leading singular Child([Name]) / Child([Index]) segments
+  while s_idx < n_segs {
+    match segments[s_idx] {
+      Segment::Child(sels) => {
+        if sels.length() == 1 {
+          match sels[0] {
+            Selector::Name(key) => {
+              match cur {
+                JsonValue::Object(entries) => {
+                  let key_len = key.length()
+                  let mut found = false
+                  let mut ei = entries.length() - 1
+                  while ei >= 0 {
+                    let (ek, ev) = entries[ei]
+                    if ek.length() == key_len && ek == key {
+                      cur = ev
+                      found = true
+                      break
+                    }
+                    ei = ei - 1
+                  }
+                  if found {
+                    if limits.max_results <= 0 {
+                      return Err(
+                        JsonPathError::new(
+                          JsonPathErrorKind::LimitExceeded,
+                          0,
+                          "query exceeded max_results",
+                        ),
+                      )
+                    }
+                    s_idx = s_idx + 1
+                    continue
+                  }
+                  return Ok([])
+                }
+                _ => return Ok([])
+              }
+            }
+            Selector::Index(idx) => {
+              match cur {
+                JsonValue::Array(items) => {
+                  let len64 = items.length().to_int64()
+                  let norm = if idx >= 0L { idx } else { len64 + idx }
+                  if norm >= 0L && norm < len64 {
+                    if limits.max_results <= 0 {
+                      return Err(
+                        JsonPathError::new(
+                          JsonPathErrorKind::LimitExceeded,
+                          0,
+                          "query exceeded max_results",
+                        ),
+                      )
+                    }
+                    cur = items[norm.to_int()]
+                    s_idx = s_idx + 1
+                    continue
+                  }
+                  return Ok([])
+                }
+                _ => return Ok([])
+              }
+            }
+            _ => break
+          }
+        }
+        break
+      }
+      Segment::Descendant(_) => break
+    }
+  }
+  if s_idx == n_segs {
+    return Ok([cur])
+  }
+  // 2. Single-pass fused fast path for Child([Wildcard | Slice | Filter]) followed by optional singular tail
+  match segments[s_idx] {
+    Segment::Child(sels) => {
+      if sels.length() == 1 && is_singular_segments(segments, s_idx + 1) {
+        let tail_start = s_idx + 1
+        let has_tail = tail_start < n_segs
+        match sels[0] {
+          Selector::Wildcard => {
+            match cur {
+              JsonValue::Array(items) => {
+                let n = items.length()
+                if n <= limits.max_nodes_visited && n <= limits.max_results {
+                  let out : Array[JsonValue] = Array::with_capacity(n)
+                  let mut i = 0
+                  while i < n {
+                    if has_tail {
+                      match follow_singular_tail(items[i], segments, tail_start) {
+                        Some(tv) => out.push(tv)
+                        None => ()
+                      }
+                    } else {
+                      out.push(items[i])
+                    }
+                    i = i + 1
+                  }
+                  return Ok(out)
+                }
+              }
+              JsonValue::Object(entries) => {
+                let n = entries.length()
+                if n <= limits.max_nodes_visited && n <= limits.max_results {
+                  let out : Array[JsonValue] = Array::with_capacity(n)
+                  let mut i = 0
+                  while i < n {
+                    let (_, v) = entries[i]
+                    if has_tail {
+                      match follow_singular_tail(v, segments, tail_start) {
+                        Some(tv) => out.push(tv)
+                        None => ()
+                      }
+                    } else {
+                      out.push(v)
+                    }
+                    i = i + 1
+                  }
+                  return Ok(out)
+                }
+              }
+              _ => return Ok([])
+            }
+          }
+          Selector::Slice(s_opt, e_opt, step_opt) => {
+            match cur {
+              JsonValue::Array(items) => {
+                let n = items.length()
+                if n <= limits.max_results {
+                  let (lower, upper, step) = slice_bounds(n, s_opt, e_opt, step_opt)
+                  let out : Array[JsonValue] = Array::with_capacity(if n < 16 { n } else { 16 })
+                  let mut slice_tail_key = ""
+                  let mut has_slice_tail = false
+                  if has_tail && tail_start + 1 == n_segs {
+                    match segments[tail_start] {
+                      Segment::Child(tsels) => {
+                        match tsels[0] {
+                          Selector::Name(tk) => {
+                            slice_tail_key = tk
+                            has_slice_tail = true
+                          }
+                          _ => ()
+                        }
+                      }
+                      Segment::Descendant(_) => ()
+                    }
+                  }
+                  let slice_tail_len = slice_tail_key.length()
+                  if step > 0L {
+                    let mut i = lower
+                    while i < upper {
+                      let item = items[i.to_int()]
+                      if has_slice_tail {
+                        match item {
+                          JsonValue::Object(entries) => {
+                            let mut ei = entries.length() - 1
+                            while ei >= 0 {
+                              let (ek, ev) = entries[ei]
+                              if ek.length() == slice_tail_len && ek == slice_tail_key {
+                                out.push(ev)
+                                break
+                              }
+                              ei = ei - 1
+                            }
+                          }
+                          _ => ()
+                        }
+                      } else if has_tail {
+                        match follow_singular_tail(item, segments, tail_start) {
+                          Some(tv) => out.push(tv)
+                          None => ()
+                        }
+                      } else {
+                        out.push(item)
+                      }
+                      i = i + step
+                    }
+                  } else if step < 0L {
+                    let mut i = upper
+                    while i > lower {
+                      let item = items[i.to_int()]
+                      if has_slice_tail {
+                        match item {
+                          JsonValue::Object(entries) => {
+                            let mut ei = entries.length() - 1
+                            while ei >= 0 {
+                              let (ek, ev) = entries[ei]
+                              if ek.length() == slice_tail_len && ek == slice_tail_key {
+                                out.push(ev)
+                                break
+                              }
+                              ei = ei - 1
+                            }
+                          }
+                          _ => ()
+                        }
+                      } else if has_tail {
+                        match follow_singular_tail(item, segments, tail_start) {
+                          Some(tv) => out.push(tv)
+                          None => ()
+                        }
+                      } else {
+                        out.push(item)
+                      }
+                      i = i + step
+                    }
+                  }
+                  return Ok(out)
+                }
+              }
+              _ => return Ok([])
+            }
+          }
+          Selector::Filter(expr) => {
+            // Check for single-key tail `.key` to avoid Option allocation per match
+            let mut single_tail_key = ""
+            let mut has_single_tail = false
+            if has_tail && tail_start + 1 == n_segs {
+              match segments[tail_start] {
+                Segment::Child(tsels) => {
+                  match tsels[0] {
+                    Selector::Name(tk) => {
+                      single_tail_key = tk
+                      has_single_tail = true
+                    }
+                    _ => ()
+                  }
+                }
+                Segment::Descendant(_) => ()
+              }
+            }
+            let tail_key_len = single_tail_key.length()
+            match cur {
+              JsonValue::Array(items) => {
+                let n = items.length()
+                if n <= limits.max_results && n <= limits.max_nodes_visited {
+                  // Hoisted zero-EvalState fast paths for common Array filter shapes!
+                  match expr {
+                    // Shape 1: `[?@.k <op> <lit>]`
+                    FilterExpr::Comparison(
+                      Comparable::SingularQuery(true, fsegs),
+                      op,
+                      Comparable::Literal(lit),
+                    ) => {
+                      if fsegs.length() == 1 {
+                        match fsegs[0] {
+                          SingularSeg::Name(fk) => {
+                            let fk_len = fk.length()
+                            let out : Array[JsonValue] = Array::with_capacity(if n < 16 { n } else { 16 })
+                            let mut i = 0
+                            while i < n {
+                              let item = items[i]
+                              let ok = match item {
+                                JsonValue::Object(entries) => match_local_name_cmp(entries, fk, fk_len, op, lit)
+                                _ => compare_nothing_vs_value(op)
+                              }
+                              if ok {
+                                if has_single_tail {
+                                  match item {
+                                    JsonValue::Object(entries) => {
+                                      let mut ei = entries.length() - 1
+                                      while ei >= 0 {
+                                        let (ek, ev) = entries[ei]
+                                        if ek.length() == tail_key_len && ek == single_tail_key {
+                                          out.push(ev)
+                                          break
+                                        }
+                                        ei = ei - 1
+                                      }
+                                    }
+                                    _ => ()
+                                  }
+                                } else if has_tail {
+                                  match follow_singular_tail(item, segments, tail_start) {
+                                    Some(tv) => out.push(tv)
+                                    None => ()
+                                  }
+                                } else {
+                                  out.push(item)
+                                }
+                              }
+                              i = i + 1
+                            }
+                            return Ok(out)
+                          }
+                          _ => ()
+                        }
+                      }
+                    }
+                    // Shape 2: `[?c0 && c1]` where c0, c1 are local field / length comparisons
+                    FilterExpr::And(clauses) => {
+                      if clauses.length() == 2 && is_pure_local_cmp(clauses[1]) {
+                        match clauses[1] {
+                          FilterExpr::Comparison(
+                            Comparable::SingularQuery(true, fsegs2),
+                            op2,
+                            Comparable::Literal(lit2),
+                          ) => {
+                            match fsegs2[0] {
+                              SingularSeg::Name(fk2) => {
+                                let fk2_len = fk2.length()
+                                if is_pure_local_cmp(clauses[0]) {
+                                  match clauses[0] {
+                                    FilterExpr::Comparison(
+                                      Comparable::SingularQuery(true, fsegs1),
+                                      op1,
+                                      Comparable::Literal(lit1),
+                                    ) => {
+                                      match fsegs1[0] {
+                                        SingularSeg::Name(fk1) => {
+                                          let fk1_len = fk1.length()
+                                          let out : Array[JsonValue] = Array::with_capacity(if n < 16 { n } else { 16 })
+                                          let mut i = 0
+                                          while i < n {
+                                            let item = items[i]
+                                            let ok = match item {
+                                              JsonValue::Object(entries) =>
+                                              match_local_name_cmp(entries, fk1, fk1_len, op1, lit1) &&
+                                              match_local_name_cmp(entries, fk2, fk2_len, op2, lit2)
+                                              _ => compare_nothing_vs_value(op1) && compare_nothing_vs_value(op2)
+                                            }
+                                            if ok {
+                                              if has_single_tail {
+                                                match item {
+                                                  JsonValue::Object(entries) => {
+                                                    let mut ei = entries.length() - 1
+                                                    while ei >= 0 {
+                                                      let (ek, ev) = entries[ei]
+                                                      if ek.length() == tail_key_len && ek == single_tail_key {
+                                                        out.push(ev)
+                                                        break
+                                                      }
+                                                      ei = ei - 1
+                                                    }
+                                                  }
+                                                  _ => ()
+                                                }
+                                              } else if has_tail {
+                                                match follow_singular_tail(item, segments, tail_start) {
+                                                  Some(tv) => out.push(tv)
+                                                  None => ()
+                                                }
+                                              } else {
+                                                out.push(item)
+                                              }
+                                            }
+                                            i = i + 1
+                                          }
+                                          return Ok(out)
+                                        }
+                                        _ => ()
+                                      }
+                                    }
+                                    _ => ()
+                                  }
+                                } else if is_pure_local_len_cmp(clauses[0]) {
+                                  match clauses[0] {
+                                    FilterExpr::Comparison(
+                                      Comparable::FuncCall(f1),
+                                      op1,
+                                      Comparable::Literal(JsonValue::Int(target1)),
+                                    ) => {
+                                      match f1.args[0] {
+                                        FuncArg::FilterQuery(true, lsegs) => {
+                                          match lsegs[0] {
+                                            Segment::Child(lsels) => {
+                                              match lsels[0] {
+                                                Selector::Name(lk1) => {
+                                                  let lk1_len = lk1.length()
+                                                  let out : Array[JsonValue] = Array::with_capacity(if n < 16 { n } else { 16 })
+                                                  let mut i = 0
+                                                  while i < n {
+                                                    let item = items[i]
+                                                    let ok = match item {
+                                                      JsonValue::Object(entries) =>
+                                                      // Both clauses are pure & side-effect-free: evaluate cheap field comparison before UTF-8 length scan!
+                                                      match_local_name_cmp(entries, fk2, fk2_len, op2, lit2) &&
+                                                      match_local_len_name_cmp(entries, lk1, lk1_len, op1, target1)
+                                                      _ => compare_nothing_vs_value(op1) && compare_nothing_vs_value(op2)
+                                                    }
+                                                    if ok {
+                                                      if has_single_tail {
+                                                        match item {
+                                                          JsonValue::Object(entries) => {
+                                                            let mut ei = entries.length() - 1
+                                                            while ei >= 0 {
+                                                              let (ek, ev) = entries[ei]
+                                                              if ek.length() == tail_key_len && ek == single_tail_key {
+                                                                out.push(ev)
+                                                                break
+                                                              }
+                                                              ei = ei - 1
+                                                            }
+                                                          }
+                                                          _ => ()
+                                                        }
+                                                      } else if has_tail {
+                                                        match follow_singular_tail(item, segments, tail_start) {
+                                                          Some(tv) => out.push(tv)
+                                                          None => ()
+                                                        }
+                                                      } else {
+                                                        out.push(item)
+                                                      }
+                                                    }
+                                                    i = i + 1
+                                                  }
+                                                  return Ok(out)
+                                                }
+                                                _ => ()
+                                              }
+                                            }
+                                            Segment::Descendant(_) => ()
+                                          }
+                                        }
+                                        _ => ()
+                                      }
+                                    }
+                                    _ => ()
+                                  }
+                                }
+                              }
+                              _ => ()
+                            }
+                          }
+                          _ => ()
+                        }
+                      }
+                    }
+                    _ => ()
+                  }
+                }
+                if n <= limits.max_results {
+                  let st = EvalState::new(root, limits)
+                  let out : Array[JsonValue] = Array::with_capacity(if n < 16 { n } else { 16 })
+                  let mut i = 0
+                  while i < n {
+                    st.visited = st.visited + 1
+                    if st.visited > st.limits.max_nodes_visited {
+                      return Err(
+                        JsonPathError::new(
+                          JsonPathErrorKind::LimitExceeded,
+                          0,
+                          "query exceeded max_nodes_visited",
+                        ),
+                      )
+                    }
+                    let item = items[i]
+                    let ok = st.eval_filter_bool(expr, item)
+                    if st.has_err {
+                      return Err(st.take_err())
+                    }
+                    if ok {
+                      if has_single_tail {
+                        match item {
+                          JsonValue::Object(entries) => {
+                            let mut ei = entries.length() - 1
+                            while ei >= 0 {
+                              let (ek, ev) = entries[ei]
+                              if ek.length() == tail_key_len && ek == single_tail_key {
+                                out.push(ev)
+                                break
+                              }
+                              ei = ei - 1
+                            }
+                          }
+                          _ => ()
+                        }
+                      } else if has_tail {
+                        match follow_singular_tail(item, segments, tail_start) {
+                          Some(tv) => out.push(tv)
+                          None => ()
+                        }
+                      } else {
+                        out.push(item)
+                      }
+                    }
+                    i = i + 1
+                  }
+                  return Ok(out)
+                }
+              }
+              JsonValue::Object(entries) => {
+                let n = entries.length()
+                if n <= limits.max_results {
+                  let st = EvalState::new(root, limits)
+                  let out : Array[JsonValue] = Array::with_capacity(if n < 16 { n } else { 16 })
+                  let mut i = 0
+                  while i < n {
+                    st.visited = st.visited + 1
+                    if st.visited > st.limits.max_nodes_visited {
+                      return Err(
+                        JsonPathError::new(
+                          JsonPathErrorKind::LimitExceeded,
+                          0,
+                          "query exceeded max_nodes_visited",
+                        ),
+                      )
+                    }
+                    let (_, v) = entries[i]
+                    let ok = st.eval_filter_bool(expr, v)
+                    if st.has_err {
+                      return Err(st.take_err())
+                    }
+                    if ok {
+                      if has_single_tail {
+                        match v {
+                          JsonValue::Object(ventries) => {
+                            let mut ei = ventries.length() - 1
+                            while ei >= 0 {
+                              let (ek, ev) = ventries[ei]
+                              if ek.length() == tail_key_len && ek == single_tail_key {
+                                out.push(ev)
+                                break
+                              }
+                              ei = ei - 1
+                            }
+                          }
+                          _ => ()
+                        }
+                      } else if has_tail {
+                        match follow_singular_tail(v, segments, tail_start) {
+                          Some(tv) => out.push(tv)
+                          None => ()
+                        }
+                      } else {
+                        out.push(v)
+                      }
+                    }
+                    i = i + 1
+                  }
+                  return Ok(out)
+                }
+              }
+              _ => return Ok([])
+            }
+          }
+          _ => ()
+        }
+      }
+    }
+    Segment::Descendant(_) => ()
+  }
   let st = EvalState::new(root, limits)
-  st.eval_segments_values([root], path.segments)
+  st.eval_segments_values_from([cur], segments, s_idx)
 }
 
 ///| Shared parent-pointer Normalized Path chain (O(depth) memory during traversal).
@@ -551,8 +1320,17 @@ fn EvalState::eval_segments_values(
   initial : Array[JsonValue],
   segments : Array[Segment],
 ) -> Result[Array[JsonValue], JsonPathError] {
+  self.eval_segments_values_from(initial, segments, 0)
+}
+
+fn EvalState::eval_segments_values_from(
+  self : EvalState,
+  initial : Array[JsonValue],
+  segments : Array[Segment],
+  start_idx : Int,
+) -> Result[Array[JsonValue], JsonPathError] {
   let mut current = initial
-  let mut s_idx = 0
+  let mut s_idx = start_idx
   let n_segs = segments.length()
   while s_idx < n_segs {
     // Zero-allocation fast path for single-node Child([Name]) / Child([Index])
@@ -1056,6 +1834,16 @@ fn eval_val_lt(a : EvalVal, b : EvalVal) -> Bool {
   }
 }
 
+fn eval_val_le(a : EvalVal, b : EvalVal) -> Bool {
+  match (a, b) {
+    (EvalVal::Nothing, EvalVal::Nothing) => true
+    (EvalVal::Value(JsonValue::Int(x)), EvalVal::Value(JsonValue::Int(y))) => x <= y
+    (EvalVal::Value(JsonValue::Float(x)), EvalVal::Value(JsonValue::Float(y))) => x <= y
+    (EvalVal::Value(va), EvalVal::Value(vb)) => json_value_lt(va, vb) || json_value_eq_impl(va, vb)
+    _ => false
+  }
+}
+
 fn EvalState::eval_comparable(
   self : EvalState,
   comp : Comparable,
@@ -1080,6 +1868,12 @@ fn EvalState::eval_arg_as_value(
     FuncArg::Literal(v) => Ok(EvalVal::Value(v))
     FuncArg::FilterQuery(is_rel, segs) => {
       let base = if is_rel { current } else { self.root }
+      if self.limits.max_results > 0 && is_singular_segments(segs, 0) {
+        return match follow_singular_tail(base, segs, 0) {
+          Some(v) => Ok(EvalVal::Value(v))
+          None => Ok(EvalVal::Nothing)
+        }
+      }
       let nodes = match self.eval_segments_values([base], segs) {
         Ok(ns) => ns
         Err(e) => return Err(e)
@@ -1187,73 +1981,368 @@ fn EvalState::eval_func_logical(
   }
 }
 
+fn compare_json_values(va : JsonValue, op : CompOp, vb : JsonValue) -> Bool {
+  match (va, vb) {
+    (JsonValue::Int(x), JsonValue::Int(y)) => {
+      match op {
+        CompOp::Eq => x == y
+        CompOp::Ne => x != y
+        CompOp::Lt => x < y
+        CompOp::Le => x <= y
+        CompOp::Gt => x > y
+        CompOp::Ge => x >= y
+      }
+    }
+    (JsonValue::Bool(x), JsonValue::Bool(y)) => {
+      match op {
+        CompOp::Eq => x == y
+        CompOp::Ne => x != y
+        CompOp::Le => x == y
+        CompOp::Ge => x == y
+        _ => false
+      }
+    }
+    (JsonValue::Str(x), JsonValue::Str(y)) => {
+      match op {
+        CompOp::Eq => x == y
+        CompOp::Ne => x != y
+        CompOp::Lt => json_value_lt(va, vb)
+        CompOp::Le => x == y || json_value_lt(va, vb)
+        CompOp::Gt => json_value_lt(vb, va)
+        CompOp::Ge => x == y || json_value_lt(vb, va)
+      }
+    }
+    (JsonValue::Float(x), JsonValue::Float(y)) => {
+      match op {
+        CompOp::Eq => x == y
+        CompOp::Ne => x != y
+        CompOp::Lt => x < y
+        CompOp::Le => x <= y
+        CompOp::Gt => x > y
+        CompOp::Ge => x >= y
+      }
+    }
+    _ => {
+      match op {
+        CompOp::Eq => json_value_eq_impl(va, vb)
+        CompOp::Ne => !json_value_eq_impl(va, vb)
+        CompOp::Lt => json_value_lt(va, vb)
+        CompOp::Le => json_value_lt(va, vb) || json_value_eq_impl(va, vb)
+        CompOp::Gt => json_value_lt(vb, va)
+        CompOp::Ge => json_value_lt(vb, va) || json_value_eq_impl(va, vb)
+      }
+    }
+  }
+}
+
+fn compare_int64_op(x : Int64, op : CompOp, y : Int64) -> Bool {
+  match op {
+    CompOp::Eq => x == y
+    CompOp::Ne => x != y
+    CompOp::Lt => x < y
+    CompOp::Le => x <= y
+    CompOp::Gt => x > y
+    CompOp::Ge => x >= y
+  }
+}
+
+fn compare_nothing_vs_value(op : CompOp) -> Bool {
+  match op {
+    CompOp::Ne => true
+    _ => false
+  }
+}
+
+///| Zero-allocation comparison of a singular query against a literal `JsonValue`.
+fn eval_singular_cmp_lit(
+  base : JsonValue,
+  segs : Array[SingularSeg],
+  op : CompOp,
+  lit : JsonValue,
+) -> Bool {
+  let n = segs.length()
+  if n == 1 {
+    match segs[0] {
+      SingularSeg::Name(k) => {
+        match base {
+          JsonValue::Object(entries) => {
+            let mut i = entries.length() - 1
+            while i >= 0 {
+              let (ek, ev) = entries[i]
+              if ek == k {
+                return compare_json_values(ev, op, lit)
+              }
+              i = i - 1
+            }
+            return compare_nothing_vs_value(op)
+          }
+          _ => return compare_nothing_vs_value(op)
+        }
+      }
+      SingularSeg::Index(idx) => {
+        match base {
+          JsonValue::Array(items) => {
+            let len64 = items.length().to_int64()
+            let norm = if idx >= 0L { idx } else { len64 + idx }
+            if norm >= 0L && norm < len64 {
+              return compare_json_values(items[norm.to_int()], op, lit)
+            }
+            return compare_nothing_vs_value(op)
+          }
+          _ => return compare_nothing_vs_value(op)
+        }
+      }
+    }
+  }
+  let mut cur = base
+  let mut i = 0
+  while i < n {
+    match segs[i] {
+      SingularSeg::Name(k) => {
+        match cur {
+          JsonValue::Object(entries) => {
+            let mut found = false
+            let mut ei = entries.length() - 1
+            while ei >= 0 {
+              let (ek, ev) = entries[ei]
+              if ek == k {
+                cur = ev
+                found = true
+                break
+              }
+              ei = ei - 1
+            }
+            if !found {
+              return compare_nothing_vs_value(op)
+            }
+          }
+          _ => return compare_nothing_vs_value(op)
+        }
+      }
+      SingularSeg::Index(idx) => {
+        match cur {
+          JsonValue::Array(items) => {
+            let len64 = items.length().to_int64()
+            let norm = if idx >= 0L { idx } else { len64 + idx }
+            if norm >= 0L && norm < len64 {
+              cur = items[norm.to_int()]
+            } else {
+              return compare_nothing_vs_value(op)
+            }
+          }
+          _ => return compare_nothing_vs_value(op)
+        }
+      }
+    }
+    i = i + 1
+  }
+  compare_json_values(cur, op, lit)
+}
+
+///| Fast unboxed `length(arg)` evaluation returning `-1L` for `Nothing`.
+fn EvalState::eval_length_fast(
+  self : EvalState,
+  arg : FuncArg,
+  current : JsonValue,
+) -> Int64 {
+  match arg {
+    FuncArg::FilterQuery(is_rel, segs) => {
+      let base = if is_rel { current } else { self.root }
+      let n = segs.length()
+      if n == 1 && self.limits.max_results > 0 {
+        match segs[0] {
+          Segment::Child(sels) => {
+            if sels.length() == 1 {
+              match sels[0] {
+                Selector::Name(k) => {
+                  match base {
+                    JsonValue::Object(entries) => {
+                      let mut i = entries.length() - 1
+                      while i >= 0 {
+                        let (ek, ev) = entries[i]
+                        if ek == k {
+                          return match ev {
+                            JsonValue::Str(s) => utf8_codepoint_count(s).to_int64()
+                            JsonValue::Array(items) => items.length().to_int64()
+                            JsonValue::Object(es) => es.length().to_int64()
+                            _ => -1L
+                          }
+                        }
+                        i = i - 1
+                      }
+                      return -1L
+                    }
+                    _ => return -1L
+                  }
+                }
+                _ => ()
+              }
+            }
+          }
+          Segment::Descendant(_) => ()
+        }
+      } else if n == 0 {
+        return match base {
+          JsonValue::Str(s) => utf8_codepoint_count(s).to_int64()
+          JsonValue::Array(items) => items.length().to_int64()
+          JsonValue::Object(es) => es.length().to_int64()
+          _ => -1L
+        }
+      }
+      match self.eval_arg_as_value(arg, current) {
+        Ok(EvalVal::Value(JsonValue::Str(s))) => utf8_codepoint_count(s).to_int64()
+        Ok(EvalVal::Value(JsonValue::Array(items))) => items.length().to_int64()
+        Ok(EvalVal::Value(JsonValue::Object(es))) => es.length().to_int64()
+        Ok(_) => -1L
+        Err(e) => {
+          self.set_err(e)
+          -1L
+        }
+      }
+    }
+    _ => {
+      match self.eval_arg_as_value(arg, current) {
+        Ok(EvalVal::Value(JsonValue::Str(s))) => utf8_codepoint_count(s).to_int64()
+        Ok(EvalVal::Value(JsonValue::Array(items))) => items.length().to_int64()
+        Ok(EvalVal::Value(JsonValue::Object(es))) => es.length().to_int64()
+        Ok(_) => -1L
+        Err(e) => {
+          self.set_err(e)
+          -1L
+        }
+      }
+    }
+  }
+}
+
+fn EvalState::eval_filter_bool(
+  self : EvalState,
+  expr : FilterExpr,
+  current : JsonValue,
+) -> Bool {
+  match expr {
+    FilterExpr::Or(items) => {
+      let mut i = 0
+      let n = items.length()
+      while i < n {
+        let b = self.eval_filter_bool(items[i], current)
+        if self.has_err {
+          return false
+        }
+        if b {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    FilterExpr::And(items) => {
+      let mut i = 0
+      let n = items.length()
+      while i < n {
+        let b = self.eval_filter_bool(items[i], current)
+        if self.has_err || !b {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    FilterExpr::Not(inner) => {
+      let b = self.eval_filter_bool(inner, current)
+      if self.has_err {
+        return false
+      }
+      !b
+    }
+    FilterExpr::Comparison(lhs_c, op, rhs_c) => {
+      // Zero-allocation fast paths for SingularQuery vs Literal and length(...) vs Int
+      match (lhs_c, rhs_c) {
+        (Comparable::SingularQuery(is_rel, segs), Comparable::Literal(lit)) => {
+          return eval_singular_cmp_lit(if is_rel { current } else { self.root }, segs, op, lit)
+        }
+        (Comparable::FuncCall(f), Comparable::Literal(JsonValue::Int(target))) => {
+          if f.name == "length" {
+            let len64 = self.eval_length_fast(f.args[0], current)
+            if self.has_err {
+              return false
+            }
+            if len64 < 0L {
+              return compare_nothing_vs_value(op)
+            }
+            return compare_int64_op(len64, op, target)
+          }
+        }
+        _ => ()
+      }
+      let lhs = match lhs_c {
+        Comparable::Literal(v) => EvalVal::Value(v)
+        Comparable::SingularQuery(is_rel, segs) => eval_singular(if is_rel { current } else { self.root }, segs)
+        Comparable::FuncCall(f) => match self.eval_func_value(f, current) {
+          Ok(v) => v
+          Err(e) => {
+            self.set_err(e)
+            return false
+          }
+        }
+      }
+      let rhs = match rhs_c {
+        Comparable::Literal(v) => EvalVal::Value(v)
+        Comparable::SingularQuery(is_rel, segs) => eval_singular(if is_rel { current } else { self.root }, segs)
+        Comparable::FuncCall(f) => match self.eval_func_value(f, current) {
+          Ok(v) => v
+          Err(e) => {
+            self.set_err(e)
+            return false
+          }
+        }
+      }
+      match op {
+        CompOp::Eq => eval_val_eq(lhs, rhs)
+        CompOp::Ne => !eval_val_eq(lhs, rhs)
+        CompOp::Lt => eval_val_lt(lhs, rhs)
+        CompOp::Le => eval_val_le(lhs, rhs)
+        CompOp::Gt => eval_val_lt(rhs, lhs)
+        CompOp::Ge => eval_val_le(rhs, lhs)
+      }
+    }
+    FilterExpr::TestQuery(is_rel, segs) => {
+      let base = if is_rel { current } else { self.root }
+      if self.limits.max_results > 0 && is_singular_segments(segs, 0) {
+        return match follow_singular_tail(base, segs, 0) {
+          Some(_) => true
+          None => false
+        }
+      }
+      match self.eval_segments_values([base], segs) {
+        Ok(ns) => ns.length() > 0
+        Err(e) => {
+          self.set_err(e)
+          false
+        }
+      }
+    }
+    FilterExpr::TestFunc(f) => {
+      match self.eval_func_logical(f, current) {
+        Ok(b) => b
+        Err(e) => {
+          self.set_err(e)
+          false
+        }
+      }
+    }
+  }
+}
+
 fn EvalState::eval_filter(
   self : EvalState,
   expr : FilterExpr,
   current : JsonValue,
 ) -> Result[Bool, JsonPathError] {
-  match expr {
-    FilterExpr::Or(items) => {
-      let mut i = 0
-      while i < items.length() {
-        let b = match self.eval_filter(items[i], current) {
-          Ok(v) => v
-          Err(e) => return Err(e)
-        }
-        if b {
-          return Ok(true)
-        }
-        i = i + 1
-      }
-      Ok(false)
-    }
-    FilterExpr::And(items) => {
-      let mut i = 0
-      while i < items.length() {
-        let b = match self.eval_filter(items[i], current) {
-          Ok(v) => v
-          Err(e) => return Err(e)
-        }
-        if !b {
-          return Ok(false)
-        }
-        i = i + 1
-      }
-      Ok(true)
-    }
-    FilterExpr::Not(inner) => {
-      match self.eval_filter(inner, current) {
-        Ok(v) => Ok(!v)
-        Err(e) => Err(e)
-      }
-    }
-    FilterExpr::Comparison(lhs_c, op, rhs_c) => {
-      let lhs = match self.eval_comparable(lhs_c, current) {
-        Ok(v) => v
-        Err(e) => return Err(e)
-      }
-      let rhs = match self.eval_comparable(rhs_c, current) {
-        Ok(v) => v
-        Err(e) => return Err(e)
-      }
-      let res = match op {
-        CompOp::Eq => eval_val_eq(lhs, rhs)
-        CompOp::Ne => !eval_val_eq(lhs, rhs)
-        CompOp::Lt => eval_val_lt(lhs, rhs)
-        CompOp::Le => eval_val_lt(lhs, rhs) || eval_val_eq(lhs, rhs)
-        CompOp::Gt => eval_val_lt(rhs, lhs)
-        CompOp::Ge => eval_val_lt(rhs, lhs) || eval_val_eq(lhs, rhs)
-      }
-      Ok(res)
-    }
-    FilterExpr::TestQuery(is_rel, segs) => {
-      let base = if is_rel { current } else { self.root }
-      let nodes = match self.eval_segments_values([base], segs) {
-        Ok(ns) => ns
-        Err(e) => return Err(e)
-      }
-      Ok(nodes.length() > 0)
-    }
-    FilterExpr::TestFunc(f) => self.eval_func_logical(f, current)
+  let b = self.eval_filter_bool(expr, current)
+  if self.has_err {
+    Err(self.take_err())
+  } else {
+    Ok(b)
   }
 }

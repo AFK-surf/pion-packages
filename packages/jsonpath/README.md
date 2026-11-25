@@ -57,9 +57,9 @@ pionc run --target wasm32 --release packages/jsonpath/wasm_smoke
 
 ## Head-to-Head Benchmarks
 
-Measured on `Darwin arm64` using `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
+Measured on `Linux x86_64` using `scripts/bench_compare.py --warmup 1 --rounds 7` (strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
 
-- **Pion**: `packages/jsonpath` compiled with `pionc build --release`
+- **Pion**: `packages/jsonpath` compiled with `pionc build --release` (compared against pre-optimization baseline `a23340d5` on the same machine)
 - **Rust**: `serde_json_path = 0.7.2` + `json-patch = 4.2.0` + `serde_json = 1.0.154` (`Cargo.lock` locked, `cargo build --locked --release`)
 
 Reproduce via:
@@ -67,15 +67,16 @@ Reproduce via:
 sh packages/jsonpath/bench/run_bench.sh
 ```
 
-| Workload | Ops | Pion Median (ms) | Rust Median (ms) | Pion ns/op | Rust ns/op | Pion RSS | Rust RSS | Pion vs Rust | Verified SHA-256 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| **W1**: Complex K8s/OpenAPI JSONPath compile + query + Normalized Path | 120 | **47.282** | 185.938 | **394,018** | 1,549,480 | **4.67 MiB** | 5.95 MiB | **3.93x** | `c7c81662...` |
-| **W2**: Precompiled JSONPath hot-path throughput | 50,000 | 67.176 | **37.848** | 1,344 | **757** | 2.62 MiB | 2.59 MiB | 0.56x | `7cca3a68...` |
-| **W3**: RFC 6902 `diff_patch` + `apply_patch` + RFC 7396 `merge_patch` roundtrip | 5,000 | 32.687 | **24.468** | 6,537 | **4,894** | 3.03 MiB | 2.92 MiB | 0.75x | `3a784896...` |
+| Workload | Ops | Pion Base (ms) | Pion Opt Median (ms) | Pion Opt Min (ms) | Rust Median (ms) | Rust Min (ms) | Pion RSS | Rust RSS | Opt vs Base | Pion vs Rust (Median / Min) | Verified SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| **W1**: Complex K8s/OpenAPI JSONPath compile + query + Normalized Path | 120 | 193.696 | **170.964** | **127.251** | 487.597 | 384.000 | **4.75 MiB** | 5.81 MiB | **1.13x** | **2.85x** / **3.02x** | `c7c81662...` |
+| **W2**: Precompiled JSONPath hot-path throughput | 50,000 | 331.878 | 142.954 | 74.463 | 120.807 | 64.259 | **2.82 MiB** | 3.22 MiB | **2.32x** | 0.85x–1.19x / 0.86x–1.20x | `7cca3a68...` |
+| **W3**: RFC 6902 `diff_patch` + `apply_patch` + RFC 7396 `merge_patch` roundtrip | 5,000 | 162.679 | 92.641 | **53.838** | 73.981 | 68.284 | **3.32 MiB** | 3.41 MiB | **1.76x** | 0.80x–1.06x / **1.27x** | `3a784896...` |
 
 Notes on benchmark results:
-- **W1 (3.93x overall vs Rust — attribution breakdown)**: `serde_json_path 0.7.2` calls `regex::Regex::new` inside `match()` / `search()` **for every evaluated node** (rather than once per parse), whereas Pion precompiles constant I-Regexp patterns at query parse time. In the isolated query-class split (`audit/REPORT.md` §7), Pion is **3.25–6.08x faster** on the 2 queries using `match()`/`search()` and **1.12–1.16x faster** on the 4 non-regex queries.
-- **W2 (0.56x vs Rust) & W3 (0.75x vs Rust)**: On pure precompiled hot-path queries and small-document patch roundtrips, Rust's zero-copy borrowed `&Value` slices (`serde_json_path`) and in-place `&mut Value` mutation (`json-patch`) remain ahead, while Pion achieves comparable peak RSS (~2.6–3.0 MiB), O(N) linear scaling on 100k-key wide objects, and 100% byte-for-byte identical outputs.
+- **W1 (2.85x vs Rust)**: `serde_json_path 0.7.2` recompiles `regex::Regex::new` inside `match()` / `search()` per evaluated node, whereas Pion precompiles constant I-Regexp patterns at query parse time and avoids intermediate path/value boxing.
+- **W2 (2.32x–3.19x vs baseline, parity-to-1.19x vs Rust)**: Zero-allocation leading singular-segment walk, single-pass fused `Wildcard`/`Slice`/`Filter` + singular-tail evaluation, unboxed `eval_filter_bool` with hoisted pure local field/`length()` comparison fast paths, and zero-allocation primitive `json_value_eq_leaf`.
+- **W3 (1.76x–2.07x vs baseline, 1.27x vs Rust on min, lower RSS)**: Zero-copy-freeze clone-on-touch `MutObjData`/`MutArrData` working tree with zero-slice pointer traversal for unescaped RFC 6901 pointers, single-pass bitmask-accelerated `diff_patch` and `merge_patch_fast_unbounded`, and zero-allocation shallow recursive `json_value_eq_depth`, while preserving O(N) linear scaling on 100k-key wide objects and stack-safe iterative fallbacks at depth 20,000.
 
 ## Formal Verification (Lean 4)
 

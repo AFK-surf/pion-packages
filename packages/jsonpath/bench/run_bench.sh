@@ -8,7 +8,7 @@ export PATH="$HOME/.pion/bin:$HOME/.cargo/bin:$PATH"
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/w14-jsonpath-bench"
+OUT_DIR="${JP_BENCH_OUT:-${TMPDIR:-/tmp}/w14-jsonpath-bench}"
 BIN_DIR="$OUT_DIR/bin"
 
 W1_ITERS="${JP_W1_ITERS:-20}"
