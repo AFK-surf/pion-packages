@@ -22,7 +22,7 @@ Zero-dependency, 100% pure-Pion arbitrary-precision signed integer package (`Big
 - `BigInt::from_hex(s : String) -> Result[BigInt, BigIntError]` — strict base-16 with optional leading `+`/`-` and optional `0x`/`0X` prefix.
   - Strict parsing rejects empty strings, bare signs (`"+"`, `"-"`), bare prefixes (`"0x"`, `"-0x"`), whitespace, underscores, and out-of-radix characters with `Err(...)` (never panics).
 - `to_string(self) -> String` — base-10 formatting via $10^9$ chunked division.
-- `to_radix(self, radix : Int) -> Result[String, BigIntError]` — lowercase `0-9a-z` for radix `2..=36` (bit-shift fast paths for radices 2/4/8/16/32 with 64-bit length overflow guard returning `Err(BigIntError::OutputTooLarge)` if output exceeds `INT32_MAX`; chunked division for general radices).
+- `to_radix(self, radix : Int) -> Result[String, BigIntError]` — lowercase `0-9a-z` for radix `2..=36` (bit-shift fast paths for radices 2/4/8/16/32 with 64-bit length overflow guard returning `Err(BigIntError::OutputTooLarge)` if output including sign exceeds Pion's `Bytes` container limit `2,147,483,631`; chunked division for general radices).
 - `to_int(self) -> Option[Int]`, `to_int64(self) -> Option[Int64]`, `to_uint64(self) -> Option[UInt64]` — returns `None` on overflow; `INT32_MIN` (`-2147483648`) and `INT64_MIN` (`-9223372036854775808L`) roundtrip losslessly.
 
 ### Arithmetic, Comparison & Single-Limb Fast Paths
@@ -46,7 +46,7 @@ Zero-dependency, 100% pure-Pion arbitrary-precision signed integer package (`Big
 
 - **Red → Green Unit Suite (`bigint_test.pion`)**: 11 / 11 test groups pass, covering Go `math/big/int_test.go` (`sumZZ`, `prodZZ`, `divisionSignsTests`, `quoTests`, `lshTests`/`rshTests`, `bitwiseTests`, `stringTests`), MoonBit `core/bigint` vectors, `INT32_MIN`/`INT64_MIN`/`UINT64_MAX` roundtrips, strict parsing rejections, aliasing safety, `Send` via `Channel[BigInt]`, `BigIntBuf` snapshot immutability & `div_small_uint` `Option[UInt]` boundaries, 64-bit `bit_len_from_top`/`pow2_format_len` overflow guards, and Knuth Algorithm D adversarial vectors including the true Step D6 add-back vector ($v = 2^{95} + 1, u = 2^{96} + 1$, verified via D6-disabled counterproof).
 - **Cross-Package Encapsulation**: Verified with `pionc check` that external packages cannot access `BigIntBuf`'s `priv mut` fields (`neg`/`limbs`/`len`) or construct it via struct literal (`E_PRIVATE_FIELD`).
-- **Python Differential Fuzzing (`bench/diff_fuzz.py`)**: **10,236 cases (44,248 exact operations)** with boundary-limb-biased generation across `div`/`rem`/`div_rem`, `pow`, `from_radix`/`to_radix` (2..36), `from_hex`, `to_int*`/`bit_len`/`signum`, shifts, bitwise ops, `gcd`, single-limb ops, and all `BigIntBuf` methods (including `div_small_uint` valid + overflow `None` cases) — **0 mismatches** on both **Native** and **Wasm32**.
+- **Python Differential Fuzzing (`bench/diff_fuzz.py`)**: **10,236 cases, 0 mismatches** per target (Native and Wasm32) with boundary-limb-biased generation across `div`/`rem`/`div_rem`, `pow`, `from_radix`/`to_radix` (2..36), `from_hex`, `to_int*`/`bit_len`/`signum`, shifts, bitwise ops, `gcd`, single-limb ops, and all `BigIntBuf` methods (including `div_small_uint` valid + overflow `None` cases).
 - **4-Mode `wasm_smoke`**: Native debug, Native release, Wasm32 debug (Node + `pion_wasm_rt.mjs`), and Wasm32 release produce byte-identical stdout (`sha256: 4f863ceb52f2bab3eb3aa87538a3b423c62991db84c2fab97f30e5c5fcc68498`).
 
 ## Head-to-Head Benchmarks

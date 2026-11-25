@@ -215,7 +215,7 @@ def main():
                         break
             if mismatches > 0:
                 return 1
-            print(f"PASS [{label}]: {len(cases)} cases ({total_ops} exact ops) 0 mismatches")
+            print(f"PASS [{label}]: {len(cases)} cases, 0 mismatches")
     finally:
         os.unlink(case_file)
     return 0
