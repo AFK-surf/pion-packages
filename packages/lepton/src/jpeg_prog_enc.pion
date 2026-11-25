@@ -12,34 +12,54 @@ fn max_dht_eobrun(ac_tbl : HuffTable) -> Int {
   1
 }
 
-///| Flush a pending progressive EOBRUN and buffered refinement bits.
+///| Grow a reusable `FixedArray[Int]` bit buffer when full.
+fn grow_int_buf(old : FixedArray[Int], len : Int) -> FixedArray[Int] {
+  let next = FixedArray::make(old.length() * 2, 0)
+  let mut i = 0
+  while i < len {
+    next[i] = old[i]
+    i = i + 1
+  }
+  next
+}
+
+///| Flush a pending progressive EOBRUN and `ref_len` buffered refinement bits.
 fn flush_prog_eobrun(
   bw : JpegBitWriter,
   ac_tbl : HuffTable,
   eobrun : Int,
-  ref_bits : Array[Int]
-) -> Result[Unit, String] {
+  ref_bits : FixedArray[Int],
+  ref_len : Int
+) -> Bool {
   if eobrun > 0 {
-    let mut temp = eobrun
-    let mut nbits = 0
-    while temp > 1 {
-      temp = temp >> 1
-      nbits = nbits + 1
-    }
-    match jbw_write_huff(bw, ac_tbl, nbits << 4) {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+    let nbits = floor_log2(eobrun)
+    if !jbw_write_huff_fast(bw, ac_tbl, nbits << 4) {
+      return false
     }
     if nbits > 0 {
       jbw_write_bits(bw, eobrun - (1 << nbits), nbits)
     }
   }
-  let mut i = 0
-  while i < ref_bits.length() {
-    jbw_write_bits(bw, ref_bits[i], 1)
-    i = i + 1
+  if ref_len > 0 {
+    let mut bitbuf = bw.bitbuf
+    let mut bitcnt = bw.bitcnt
+    let mut i = 0
+    while i < ref_len {
+      bitbuf = (bitbuf << 1) | ref_bits[i].to_int64().to_uint64()
+      bitcnt = bitcnt + 1
+      if bitcnt >= 32 {
+        bw.bitbuf = bitbuf
+        bw.bitcnt = bitcnt
+        jbw_drain_bytes(bw)
+        bitbuf = bw.bitbuf
+        bitcnt = bw.bitcnt
+      }
+      i = i + 1
+    }
+    bw.bitbuf = bitbuf
+    bw.bitcnt = bitcnt
   }
-  Ok(())
+  true
 }
 
 ///| Encode a progressive scan (`SOF2`) from `coeffs` into `out`.
@@ -54,11 +74,20 @@ fn encode_progressive_scan(
   let ns = scan.comps.length()
   let prev_dc = FixedArray::make(4, 0)
   let mut eobrun = 0
-  let mut ref_bits : Array[Int] = []
-  let has_recorded_eob = meta.prog_eob_runs.length() > 0
+  let mut ref_bits = FixedArray::make(256, 0)
+  let mut ref_len = 0
+  let pending = FixedArray::make(64, 0)
+  let eob_runs_len = meta.prog_eob_runs.length()
+  let has_recorded_eob = eob_runs_len > 0
+  let zrl_len = meta.seq_trailing_zrls.length()
   let mut eob_cursor = 0
   let mut zrl_cursor = 0
-  let max_eob = if scan.ss > 0 {
+  let ss = scan.ss
+  let se = scan.se
+  let ah = scan.ah
+  let al = scan.al
+  let dri = scan.dri
+  let max_eob = if ss > 0 {
     max_dht_eobrun(scan.ac_tables[scan.comps[0].ac_tbl])
   } else {
     0x7FFF
@@ -74,59 +103,98 @@ fn encode_progressive_scan(
   let mut mcu_idx = 0
   let mut interval_idx = 0
   let mut mcu_in_interval = 0
-  while mcu_idx < total_mcus {
-    if bw_total_len(out) > max_output_bytes {
-      return Err("reconstructed JPEG exceeds output limit")
-    }
-    if scan.ss == 0 {
-      if ns == 1 {
-        let sc = scan.comps[0]
-        let ci = img.components[sc.comp_idx]
-        let bx = mcu_idx % ci.actual_w
-        let by = mcu_idx / ci.actual_w
-        let base = (by * ci.stride_w + bx) * 64
-        let v = coeffs[sc.comp_idx][base]
-        if scan.ah == 0 {
-          let dc = v >> scan.al
+
+  if ss == 0 {
+    if ns == 1 {
+      let sc = scan.comps[0]
+      let ci = img.components[sc.comp_idx]
+      let dc_tbl = scan.dc_tables[sc.dc_tbl]
+      let blk = coeffs[sc.comp_idx]
+      let actual_w = ci.actual_w
+      let stride_w = ci.stride_w
+      let mut bx = 0
+      let mut by = 0
+      while mcu_idx < total_mcus {
+        if bw_total_len(out) > max_output_bytes {
+          return Err("reconstructed JPEG exceeds output limit")
+        }
+        let base = (by * stride_w + bx) * 64
+        let v = blk[base]
+        if ah == 0 {
+          let dc = v >> al
           let diff = dc - prev_dc[0]
           prev_dc[0] = dc
           let cat = jpeg_category(diff)
-          match jbw_write_huff(bw, scan.dc_tables[sc.dc_tbl], cat) {
-            Ok(_) => ()
-            Err(e) => return Err(e)
+          if !jbw_write_huff_fast(bw, dc_tbl, cat) {
+            return Err("symbol missing from DHT table")
           }
           jbw_write_coeff_bits(bw, diff, cat)
         } else {
-          jbw_write_bits(bw, (v >> scan.al) & 1, 1)
+          jbw_write_bits(bw, (v >> al) & 1, 1)
         }
-      } else {
-        let mx = mcu_idx % img.mcu_w
-        let my = mcu_idx / img.mcu_w
+        bx = bx + 1
+        if bx == actual_w {
+          bx = 0
+          by = by + 1
+        }
+        mcu_idx = mcu_idx + 1
+        mcu_in_interval = mcu_in_interval + 1
+        if dri > 0 && mcu_in_interval == dri && mcu_idx < total_mcus {
+          let pv = if meta.pad_mode == 2 && interval_idx < meta.pad_bits.length() {
+            meta.pad_bits[interval_idx]
+          } else {
+            0
+          }
+          jbw_finish_interval(bw, meta.pad_mode, pv)
+          let eff = if meta.rst_extra_ff_mode == 1 && interval_idx < meta.rst_extra_ff.length() {
+            meta.rst_extra_ff[interval_idx]
+          } else {
+            0
+          }
+          match jbw_write_rst(bw, interval_idx, eff, max_output_bytes) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          interval_idx = interval_idx + 1
+          mcu_in_interval = 0
+          prev_dc[0] = 0
+        }
+      }
+    } else {
+      let mcu_w = img.mcu_w
+      let mut mx = 0
+      let mut my = 0
+      while mcu_idx < total_mcus {
+        if bw_total_len(out) > max_output_bytes {
+          return Err("reconstructed JPEG exceeds output limit")
+        }
         let mut s = 0
         while s < ns {
           let sc = scan.comps[s]
           let ci = img.components[sc.comp_idx]
+          let dc_tbl = scan.dc_tables[sc.dc_tbl]
           let blk = coeffs[sc.comp_idx]
+          let stride_w = ci.stride_w
+          let base_bx = mx * ci.h_samp
+          let base_by = my * ci.v_samp
           let mut vy = 0
           while vy < ci.v_samp {
+            let row_base = (base_by + vy) * stride_w + base_bx
             let mut hx = 0
             while hx < ci.h_samp {
-              let bx = mx * ci.h_samp + hx
-              let by = my * ci.v_samp + vy
-              let base = (by * ci.stride_w + bx) * 64
+              let base = (row_base + hx) * 64
               let v = blk[base]
-              if scan.ah == 0 {
-                let dc = v >> scan.al
+              if ah == 0 {
+                let dc = v >> al
                 let diff = dc - prev_dc[s]
                 prev_dc[s] = dc
                 let cat = jpeg_category(diff)
-                match jbw_write_huff(bw, scan.dc_tables[sc.dc_tbl], cat) {
-                  Ok(_) => ()
-                  Err(e) => return Err(e)
+                if !jbw_write_huff_fast(bw, dc_tbl, cat) {
+                  return Err("symbol missing from DHT table")
                 }
                 jbw_write_coeff_bits(bw, diff, cat)
               } else {
-                jbw_write_bits(bw, (v >> scan.al) & 1, 1)
+                jbw_write_bits(bw, (v >> al) & 1, 1)
               }
               hx = hx + 1
             }
@@ -134,89 +202,187 @@ fn encode_progressive_scan(
           }
           s = s + 1
         }
+        mx = mx + 1
+        if mx == mcu_w {
+          mx = 0
+          my = my + 1
+        }
+        mcu_idx = mcu_idx + 1
+        mcu_in_interval = mcu_in_interval + 1
+        if dri > 0 && mcu_in_interval == dri && mcu_idx < total_mcus {
+          let pv = if meta.pad_mode == 2 && interval_idx < meta.pad_bits.length() {
+            meta.pad_bits[interval_idx]
+          } else {
+            0
+          }
+          jbw_finish_interval(bw, meta.pad_mode, pv)
+          let eff = if meta.rst_extra_ff_mode == 1 && interval_idx < meta.rst_extra_ff.length() {
+            meta.rst_extra_ff[interval_idx]
+          } else {
+            0
+          }
+          match jbw_write_rst(bw, interval_idx, eff, max_output_bytes) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          interval_idx = interval_idx + 1
+          mcu_in_interval = 0
+          prev_dc[0] = 0
+          prev_dc[1] = 0
+          prev_dc[2] = 0
+          prev_dc[3] = 0
+        }
       }
-    } else {
-      let sc = scan.comps[0]
-      let ci = img.components[sc.comp_idx]
-      let ac_tbl = scan.ac_tables[sc.ac_tbl]
-      let bx = mcu_idx % ci.actual_w
-      let by = mcu_idx / ci.actual_w
-      let base = (by * ci.stride_w + bx) * 64
-      let blk = coeffs[sc.comp_idx]
-      let eob_limit = if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
-        meta.prog_eob_runs[eob_cursor]
-      } else {
-        max_eob
-      }
-      let extra_zrls = if zrl_cursor < meta.seq_trailing_zrls.length() {
-        let (bidx, cnt) = meta.seq_trailing_zrls[zrl_cursor]
-        if bidx == mcu_idx {
-          zrl_cursor = zrl_cursor + 1
-          cnt
+    }
+  } else {
+    let sc = scan.comps[0]
+    let ci = img.components[sc.comp_idx]
+    let ac_tbl = scan.ac_tables[sc.ac_tbl]
+    let ac_codes = ac_tbl.enc_code
+    let ac_lens = ac_tbl.enc_len
+    let blk = coeffs[sc.comp_idx]
+    let actual_w = ci.actual_w
+    let stride_w = ci.stride_w
+    let mut bx = 0
+    let mut by = 0
+
+    if ah == 0 {
+      let cat_lut = build_cat_lut()
+      let mut bitbuf = bw.bitbuf
+      let mut bitcnt = bw.bitcnt
+      while mcu_idx < total_mcus {
+        if out.total_len > max_output_bytes {
+          return Err("reconstructed JPEG exceeds output limit")
+        }
+        let base = (by * stride_w + bx) * 64
+        let extra_zrls = if zrl_cursor < zrl_len {
+          let (bidx, cnt) = meta.seq_trailing_zrls[zrl_cursor]
+          if bidx == mcu_idx {
+            zrl_cursor = zrl_cursor + 1
+            cnt
+          } else {
+            0
+          }
         } else {
           0
         }
-      } else {
-        0
-      }
-      if scan.ah == 0 {
         let mut run = 0
         let mut has_nz = false
-        let mut k = scan.ss
-        while k <= scan.se {
+        let mut k = ss
+        while k <= se {
           let raw = blk[base + k]
-          let q = if raw >= 0 { raw >> scan.al } else { -((-raw) >> scan.al) }
+          let q = if al == 0 {
+            raw
+          } else if raw >= 0 {
+            raw >> al
+          } else {
+            -((-raw) >> al)
+          }
           if q == 0 {
             run = run + 1
           } else {
             if !has_nz {
               if eobrun > 0 {
-                match flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits) {
-                  Ok(_) => ()
-                  Err(e) => return Err(e)
+                if eobrun == 1 {
+                  let elen = ac_lens[0]
+                  if elen <= 0 {
+                    return Err("symbol missing from DHT table")
+                  }
+                  bitbuf = (bitbuf << elen) | ac_codes[0].to_int64().to_uint64()
+                  bitcnt = bitcnt + elen
+                  if bitcnt >= 32 {
+                    bw.bitbuf = bitbuf
+                    bw.bitcnt = bitcnt
+                    jbw_drain_bytes(bw)
+                    bitbuf = bw.bitbuf
+                    bitcnt = bw.bitcnt
+                  }
+                } else {
+                  bw.bitbuf = bitbuf
+                  bw.bitcnt = bitcnt
+                  if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+                    return Err("symbol missing from DHT table")
+                  }
+                  bitbuf = bw.bitbuf
+                  bitcnt = bw.bitcnt
                 }
-                if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+                if has_recorded_eob && eob_cursor < eob_runs_len {
                   eob_cursor = eob_cursor + 1
                 }
                 eobrun = 0
-                ref_bits = []
+                ref_len = 0
               }
               has_nz = true
             }
             while run >= 16 {
-              match jbw_write_huff(bw, ac_tbl, 0xF0) {
-                Ok(_) => ()
-                Err(e) => return Err(e)
+              let zlen = ac_lens[0xF0]
+              if zlen <= 0 {
+                return Err("symbol missing from DHT table")
+              }
+              bitbuf = (bitbuf << zlen) | ac_codes[0xF0].to_int64().to_uint64()
+              bitcnt = bitcnt + zlen
+              if bitcnt >= 32 {
+                bw.bitbuf = bitbuf
+                bw.bitcnt = bitcnt
+                jbw_drain_bytes(bw)
+                bitbuf = bw.bitbuf
+                bitcnt = bw.bitcnt
               }
               run = run - 16
             }
-            let cat = jpeg_category(q)
-            match jbw_write_huff(bw, ac_tbl, (run << 4) | cat) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
+            let aq = if q < 0 { -q } else { q }
+            let cat = if aq < 256 { cat_lut[aq] } else { jpeg_category(aq) }
+            let rs = (run << 4) | cat
+            let rlen = ac_lens[rs]
+            if rlen <= 0 {
+              return Err("symbol missing from DHT table")
             }
-            jbw_write_coeff_bits(bw, q, cat)
+            let cbits = if q < 0 { q + ((1 << cat) - 1) } else { q }
+            let tot = rlen + cat
+            bitbuf = (bitbuf << tot)
+            | (ac_codes[rs].to_int64().to_uint64() << cat)
+            | cbits.to_int64().to_uint64()
+            bitcnt = bitcnt + tot
+            if bitcnt >= 32 {
+              bw.bitbuf = bitbuf
+              bw.bitcnt = bitcnt
+              jbw_drain_bytes(bw)
+              bitbuf = bw.bitbuf
+              bitcnt = bw.bitcnt
+            }
             run = 0
           }
           k = k + 1
         }
         if extra_zrls > 0 {
           if !has_nz && eobrun > 0 {
-            match flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
+            bw.bitbuf = bitbuf
+            bw.bitcnt = bitcnt
+            if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+              return Err("symbol missing from DHT table")
             }
-            if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+            bitbuf = bw.bitbuf
+            bitcnt = bw.bitcnt
+            if has_recorded_eob && eob_cursor < eob_runs_len {
               eob_cursor = eob_cursor + 1
             }
             eobrun = 0
-            ref_bits = []
+            ref_len = 0
           }
           let mut z = 0
           while z < extra_zrls && run >= 16 {
-            match jbw_write_huff(bw, ac_tbl, 0xF0) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
+            let zlen = ac_lens[0xF0]
+            if zlen <= 0 {
+              return Err("symbol missing from DHT table")
+            }
+            bitbuf = (bitbuf << zlen) | ac_codes[0xF0].to_int64().to_uint64()
+            bitcnt = bitcnt + zlen
+            if bitcnt >= 32 {
+              bw.bitbuf = bitbuf
+              bw.bitcnt = bitcnt
+              jbw_drain_bytes(bw)
+              bitbuf = bw.bitbuf
+              bitcnt = bw.bitcnt
             }
             run = run - 16
             z = z + 1
@@ -224,77 +390,146 @@ fn encode_progressive_scan(
         }
         if run > 0 {
           eobrun = eobrun + 1
-          let cur_lim = if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+          let cur_lim = if has_recorded_eob && eob_cursor < eob_runs_len {
             meta.prog_eob_runs[eob_cursor]
           } else {
             max_eob
           }
           if eobrun == cur_lim || eobrun == max_eob {
-            match flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
+            bw.bitbuf = bitbuf
+            bw.bitcnt = bitcnt
+            if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+              return Err("symbol missing from DHT table")
             }
-            if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+            bitbuf = bw.bitbuf
+            bitcnt = bw.bitcnt
+            if has_recorded_eob && eob_cursor < eob_runs_len {
               eob_cursor = eob_cursor + 1
             }
             eobrun = 0
-            ref_bits = []
+            ref_len = 0
           }
         }
-      } else {
-        // AC refinement encoding
+        bx = bx + 1
+        if bx == actual_w {
+          bx = 0
+          by = by + 1
+        }
+        mcu_idx = mcu_idx + 1
+        mcu_in_interval = mcu_in_interval + 1
+        if dri > 0 && mcu_in_interval == dri && mcu_idx < total_mcus {
+          bw.bitbuf = bitbuf
+          bw.bitcnt = bitcnt
+          if eobrun > 0 {
+            if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+              return Err("symbol missing from DHT table")
+            }
+            if has_recorded_eob && eob_cursor < eob_runs_len {
+              eob_cursor = eob_cursor + 1
+            }
+            eobrun = 0
+            ref_len = 0
+          }
+          let pv = if meta.pad_mode == 2 && interval_idx < meta.pad_bits.length() {
+            meta.pad_bits[interval_idx]
+          } else {
+            0
+          }
+          jbw_finish_interval(bw, meta.pad_mode, pv)
+          let eff = if meta.rst_extra_ff_mode == 1 && interval_idx < meta.rst_extra_ff.length() {
+            meta.rst_extra_ff[interval_idx]
+          } else {
+            0
+          }
+          match jbw_write_rst(bw, interval_idx, eff, max_output_bytes) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          bitbuf = bw.bitbuf
+          bitcnt = bw.bitcnt
+          interval_idx = interval_idx + 1
+          mcu_in_interval = 0
+        }
+      }
+      bw.bitbuf = bitbuf
+      bw.bitcnt = bitcnt
+    } else {
+      // AC refinement encoding
+      while mcu_idx < total_mcus {
+        if bw_total_len(out) > max_output_bytes {
+          return Err("reconstructed JPEG exceeds output limit")
+        }
+        let base = (by * stride_w + bx) * 64
+        let eob_limit = if has_recorded_eob && eob_cursor < eob_runs_len {
+          meta.prog_eob_runs[eob_cursor]
+        } else {
+          max_eob
+        }
+        let extra_zrls = if zrl_cursor < zrl_len {
+          let (bidx, cnt) = meta.seq_trailing_zrls[zrl_cursor]
+          if bidx == mcu_idx {
+            zrl_cursor = zrl_cursor + 1
+            cnt
+          } else {
+            0
+          }
+        } else {
+          0
+        }
         let mut last_new = -1
-        let mut k = scan.ss
-        while k <= scan.se {
+        let mut k = ss
+        while k <= se {
           let a = blk[base + k]
           let abs_a = if a < 0 { -a } else { a }
-          if (abs_a >> scan.al) == 1 {
+          if (abs_a >> al) == 1 {
             last_new = k
           }
           k = k + 1
         }
         if last_new < 0 && extra_zrls == 0 {
-          k = scan.ss
-          while k <= scan.se {
+          k = ss
+          while k <= se {
             let a = blk[base + k]
             let abs_a = if a < 0 { -a } else { a }
-            if (abs_a >> scan.ah) > 0 {
-              ref_bits.push((abs_a >> scan.al) & 1)
+            if (abs_a >> ah) > 0 {
+              if ref_len >= ref_bits.length() {
+                ref_bits = grow_int_buf(ref_bits, ref_len)
+              }
+              ref_bits[ref_len] = (abs_a >> al) & 1
+              ref_len = ref_len + 1
             }
             k = k + 1
           }
           eobrun = eobrun + 1
           if eobrun == eob_limit || eobrun == max_eob {
-            match flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
+            if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+              return Err("symbol missing from DHT table")
             }
-            if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+            if has_recorded_eob && eob_cursor < eob_runs_len {
               eob_cursor = eob_cursor + 1
             }
             eobrun = 0
-            ref_bits = []
+            ref_len = 0
           }
         } else {
           if eobrun > 0 {
-            match flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
+            if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+              return Err("symbol missing from DHT table")
             }
-            if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+            if has_recorded_eob && eob_cursor < eob_runs_len {
               eob_cursor = eob_cursor + 1
             }
             eobrun = 0
-            ref_bits = []
+            ref_len = 0
           }
           let mut run = 0
           let mut emitted_tz = 0
-          let mut pending : Array[Int] = []
-          k = scan.ss
-          while k <= scan.se {
+          let mut pending_len = 0
+          k = ss
+          while k <= se {
             let a = blk[base + k]
             let abs_a = if a < 0 { -a } else { a }
-            let shifted = abs_a >> scan.al
+            let shifted = abs_a >> al
             if shifted == 0 {
               run = run + 1
               let emit_zrl = if run == 16 {
@@ -310,103 +545,106 @@ fn encode_progressive_scan(
                 false
               }
               if emit_zrl {
-                match jbw_write_huff(bw, ac_tbl, 0xF0) {
-                  Ok(_) => ()
-                  Err(e) => return Err(e)
+                if !jbw_write_huff_fast(bw, ac_tbl, 0xF0) {
+                  return Err("symbol missing from DHT table")
                 }
                 let mut j = 0
-                while j < pending.length() {
+                while j < pending_len {
                   jbw_write_bits(bw, pending[j], 1)
                   j = j + 1
                 }
-                pending = []
+                pending_len = 0
                 run = 0
               }
             } else if shifted == 1 {
-              match jbw_write_huff(bw, ac_tbl, (run << 4) | 1) {
-                Ok(_) => ()
-                Err(e) => return Err(e)
+              if !jbw_write_huff_fast(bw, ac_tbl, (run << 4) | 1) {
+                return Err("symbol missing from DHT table")
               }
               jbw_write_bits(bw, if a > 0 { 1 } else { 0 }, 1)
               let mut j = 0
-              while j < pending.length() {
+              while j < pending_len {
                 jbw_write_bits(bw, pending[j], 1)
                 j = j + 1
               }
-              pending = []
+              pending_len = 0
               run = 0
             } else {
-              pending.push(shifted & 1)
+              pending[pending_len] = shifted & 1
+              pending_len = pending_len + 1
             }
             k = k + 1
           }
-          if run > 0 || pending.length() > 0 {
+          if run > 0 || pending_len > 0 {
             eobrun = 1
-            ref_bits = pending
-            let next_lim = if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+            if pending_len > ref_bits.length() {
+              ref_bits = FixedArray::make(pending_len * 2, 0)
+            }
+            let mut j = 0
+            while j < pending_len {
+              ref_bits[j] = pending[j]
+              j = j + 1
+            }
+            ref_len = pending_len
+            let next_lim = if has_recorded_eob && eob_cursor < eob_runs_len {
               meta.prog_eob_runs[eob_cursor]
             } else {
               max_eob
             }
             if eobrun == next_lim || eobrun == max_eob {
-              match flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits) {
-                Ok(_) => ()
-                Err(e) => return Err(e)
+              if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+                return Err("symbol missing from DHT table")
               }
-              if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
+              if has_recorded_eob && eob_cursor < eob_runs_len {
                 eob_cursor = eob_cursor + 1
               }
               eobrun = 0
-              ref_bits = []
+              ref_len = 0
             }
           }
         }
-      }
-    }
-
-    mcu_idx = mcu_idx + 1
-    mcu_in_interval = mcu_in_interval + 1
-    if scan.dri > 0 && mcu_in_interval == scan.dri && mcu_idx < total_mcus {
-      if scan.ss > 0 && eobrun > 0 {
-        let sc = scan.comps[0]
-        match flush_prog_eobrun(bw, scan.ac_tables[sc.ac_tbl], eobrun, ref_bits) {
-          Ok(_) => ()
-          Err(e) => return Err(e)
+        bx = bx + 1
+        if bx == actual_w {
+          bx = 0
+          by = by + 1
         }
-        if has_recorded_eob && eob_cursor < meta.prog_eob_runs.length() {
-          eob_cursor = eob_cursor + 1
+        mcu_idx = mcu_idx + 1
+        mcu_in_interval = mcu_in_interval + 1
+        if dri > 0 && mcu_in_interval == dri && mcu_idx < total_mcus {
+          if eobrun > 0 {
+            if !flush_prog_eobrun(bw, ac_tbl, eobrun, ref_bits, ref_len) {
+              return Err("symbol missing from DHT table")
+            }
+            if has_recorded_eob && eob_cursor < eob_runs_len {
+              eob_cursor = eob_cursor + 1
+            }
+            eobrun = 0
+            ref_len = 0
+          }
+          let pv = if meta.pad_mode == 2 && interval_idx < meta.pad_bits.length() {
+            meta.pad_bits[interval_idx]
+          } else {
+            0
+          }
+          jbw_finish_interval(bw, meta.pad_mode, pv)
+          let eff = if meta.rst_extra_ff_mode == 1 && interval_idx < meta.rst_extra_ff.length() {
+            meta.rst_extra_ff[interval_idx]
+          } else {
+            0
+          }
+          match jbw_write_rst(bw, interval_idx, eff, max_output_bytes) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+          interval_idx = interval_idx + 1
+          mcu_in_interval = 0
         }
-        eobrun = 0
-        ref_bits = []
       }
-      let pv = if meta.pad_mode == 2 && interval_idx < meta.pad_bits.length() {
-        meta.pad_bits[interval_idx]
-      } else {
-        0
-      }
-      jbw_finish_interval(bw, meta.pad_mode, pv)
-      let eff = if meta.rst_extra_ff_mode == 1 && interval_idx < meta.rst_extra_ff.length() {
-        meta.rst_extra_ff[interval_idx]
-      } else {
-        0
-      }
-      match jbw_write_rst(bw, interval_idx, eff, max_output_bytes) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
-      }
-      interval_idx = interval_idx + 1
-      mcu_in_interval = 0
-      prev_dc[0] = 0
-      prev_dc[1] = 0
-      prev_dc[2] = 0
-      prev_dc[3] = 0
     }
   }
-  if scan.ss > 0 && eobrun > 0 {
+  if ss > 0 && eobrun > 0 {
     let sc = scan.comps[0]
-    match flush_prog_eobrun(bw, scan.ac_tables[sc.ac_tbl], eobrun, ref_bits) {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+    if !flush_prog_eobrun(bw, scan.ac_tables[sc.ac_tbl], eobrun, ref_bits, ref_len) {
+      return Err("symbol missing from DHT table")
     }
   }
   let pv = if meta.pad_mode == 2 && interval_idx < meta.pad_bits.length() {

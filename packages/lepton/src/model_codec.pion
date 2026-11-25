@@ -1,5 +1,732 @@
 ///| Block-level DCT coefficient stream compressor and decompressor.
 
+///| Build 64-entry LUTs for `(packed_band, rem4, avg8)` to avoid per-coeff calls.
+///| `band_lut[k] = (ac_band8(k) << 8) | (ac_band16(k) * 8)`.
+fn build_dct_luts() -> (FixedArray[Int], FixedArray[Int], FixedArray[Int]) {
+  let band_lut = FixedArray::make(64, 0)
+  let r4 = FixedArray::make(64, 0)
+  let a8 = FixedArray::make(64, 0)
+  let mut i = 0
+  while i < 64 {
+    if i > 0 {
+      band_lut[i] = (ac_band8(i) << 8) | (ac_band16(i) * 8)
+    }
+    r4[i] = rem_nz_bucket4(i)
+    a8[i] = avg_nz_bucket8(i)
+    i = i + 1
+  }
+  (band_lut, r4, a8)
+}
+
+///| Encode the `abs_v >= 2` tail of a non-zero AC coefficient (kept out-of-line for register allocation).
+fn encode_ac_gt1_tail(
+  re : RangeEncoder,
+  ac_exp : FixedArray[Int],
+  ac_mant : FixedArray[Int],
+  cb8 : Int,
+  abs_v : Int
+) -> Unit {
+  let mut range = re.range
+  let mut low = re.low
+  let rem_v = abs_v - 2
+  let exp = if rem_v == 0 { 0 } else { floor_log2(rem_v + 1) }
+  let exp_base = cb8 * 11
+  let mut e = 0
+  while e < exp && e < 29 {
+    let e_ctx = if e < 10 { e } else { 10 }
+    let pe = ac_exp[exp_base + e_ctx]
+    let be = (range >> 12) * pe.to_int64().to_uint64()
+    low = low + be
+    range = range - be
+    ac_exp[exp_base + e_ctx] = pe - (pe >> 4)
+    while range < 0x01000000UL {
+      range = range << 8
+      re.low = low
+      re_shift_low(re)
+      low = re.low
+    }
+    e = e + 1
+  }
+  if exp < 29 {
+    let e_ctx = if exp < 10 { exp } else { 10 }
+    let pe = ac_exp[exp_base + e_ctx]
+    let be = (range >> 12) * pe.to_int64().to_uint64()
+    range = be
+    ac_exp[exp_base + e_ctx] = pe + ((4096 - pe) >> 4)
+    while range < 0x01000000UL {
+      range = range << 8
+      re.low = low
+      re_shift_low(re)
+      low = re.low
+    }
+  }
+  if exp > 0 {
+    let body = (rem_v + 1) - (1 << exp)
+    let top_bit = (body >> (exp - 1)) & 1
+    let m_ctx = exp_base + (if exp < 10 { exp } else { 10 })
+    let pm = ac_mant[m_ctx]
+    let bm = (range >> 12) * pm.to_int64().to_uint64()
+    if top_bit == 0 {
+      range = bm
+      ac_mant[m_ctx] = pm + ((4096 - pm) >> 4)
+    } else {
+      low = low + bm
+      range = range - bm
+      ac_mant[m_ctx] = pm - (pm >> 4)
+    }
+    while range < 0x01000000UL {
+      range = range << 8
+      re.low = low
+      re_shift_low(re)
+      low = re.low
+    }
+    let mut di = exp - 2
+    while di >= 0 {
+      let half = range >> 1
+      range = half
+      if ((body >> di) & 1) != 0 {
+        low = low + half
+      }
+      if range < 0x01000000UL {
+        range = range << 8
+        re.low = low
+        re_shift_low(re)
+        low = re.low
+      }
+      di = di - 1
+    }
+  }
+  re.range = range
+  re.low = low
+}
+
+///| Encode all AC coefficients of an interior 8x8 block (`bx > 0 && by > 0 && nz > 0`).
+fn encode_ac_block_interior(
+  re : RangeEncoder,
+  model : DctModel,
+  band_lut : FixedArray[Int],
+  r4_lut : FixedArray[Int],
+  blk : FixedArray[Int],
+  base : Int,
+  left_base : Int,
+  top_base : Int,
+  chroma : Int,
+  nz : Int
+) -> Bool {
+  let ac_nz = model.ac_nz
+  let ac_sign = model.ac_sign
+  let ac_gt1 = model.ac_gt1
+  let c_b16_off = chroma * 128
+  let c_b8_off = chroma * 8
+  let mut range = re.range
+  let mut low = re.low
+  let mut rem = nz
+  let mut rem_b4 = r4_lut[rem]
+  let mut k = 1
+  while rem > 0 && k < 64 {
+    let v = blk[base + k]
+    let packed = band_lut[k]
+    if rem != 64 - k {
+      let nb = if (blk[left_base + k] | blk[top_base + k]) != 0 { 1 } else { 0 }
+      let nz_ctx = c_b16_off + (packed & 0xFF) + (rem_b4 << 1) + nb
+      let p = ac_nz[nz_ctx]
+      let bound = (range >> 12) * p.to_int64().to_uint64()
+      if v == 0 {
+        range = bound
+        ac_nz[nz_ctx] = p + ((4096 - p) >> 4)
+      } else {
+        low = low + bound
+        range = range - bound
+        ac_nz[nz_ctx] = p - (p >> 4)
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        re.low = low
+        re_shift_low(re)
+        low = re.low
+      }
+    }
+    if v != 0 {
+      if v < -1073741823 || v > 1073741823 {
+        return false
+      }
+      let cb8 = c_b8_off + (packed >> 8)
+      let ps = ac_sign[cb8]
+      let bs = (range >> 12) * ps.to_int64().to_uint64()
+      let abs_v = if v < 0 {
+        low = low + bs
+        range = range - bs
+        ac_sign[cb8] = ps - (ps >> 4)
+        -v
+      } else {
+        range = bs
+        ac_sign[cb8] = ps + ((4096 - ps) >> 4)
+        v
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        re.low = low
+        re_shift_low(re)
+        low = re.low
+      }
+      let gt1_ctx = cb8 * 4 + rem_b4
+      let pg = ac_gt1[gt1_ctx]
+      let bg = (range >> 12) * pg.to_int64().to_uint64()
+      if abs_v == 1 {
+        range = bg
+        ac_gt1[gt1_ctx] = pg + ((4096 - pg) >> 4)
+      } else {
+        low = low + bg
+        range = range - bg
+        ac_gt1[gt1_ctx] = pg - (pg >> 4)
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        re.low = low
+        re_shift_low(re)
+        low = re.low
+      }
+      if abs_v > 1 {
+        re.range = range
+        re.low = low
+        encode_ac_gt1_tail(re, model.ac_exp, model.ac_mant, cb8, abs_v)
+        range = re.range
+        low = re.low
+      }
+      rem = rem - 1
+      rem_b4 = r4_lut[rem]
+    }
+    k = k + 1
+  }
+  re.range = range
+  re.low = low
+  true
+}
+
+///| Encode all AC coefficients of one 8x8 block (`nz > 0`). Returns `false` on coefficient range overflow.
+fn encode_ac_block(
+  re : RangeEncoder,
+  model : DctModel,
+  band_lut : FixedArray[Int],
+  r4_lut : FixedArray[Int],
+  blk : FixedArray[Int],
+  base : Int,
+  left_base : Int,
+  top_base : Int,
+  has_left : Bool,
+  has_top : Bool,
+  chroma : Int,
+  nz : Int
+) -> Bool {
+  let ac_nz = model.ac_nz
+  let ac_sign = model.ac_sign
+  let ac_gt1 = model.ac_gt1
+  let c_b16_off = chroma * 128
+  let c_b8_off = chroma * 8
+  let interior = has_left && has_top
+  let mut range = re.range
+  let mut low = re.low
+  let mut rem = nz
+  let mut rem_b4 = r4_lut[rem]
+  let mut k = 1
+  while rem > 0 && k < 64 {
+    let v = blk[base + k]
+    let packed = band_lut[k]
+    if rem != 64 - k {
+      let nb = if interior {
+        if (blk[left_base + k] | blk[top_base + k]) != 0 { 1 } else { 0 }
+      } else if (has_left && blk[left_base + k] != 0) || (has_top && blk[top_base + k] != 0) {
+        1
+      } else {
+        0
+      }
+      let nz_ctx = c_b16_off + (packed & 0xFF) + (rem_b4 << 1) + nb
+      let p = ac_nz[nz_ctx]
+      let bound = (range >> 12) * p.to_int64().to_uint64()
+      if v == 0 {
+        range = bound
+        ac_nz[nz_ctx] = p + ((4096 - p) >> 4)
+      } else {
+        low = low + bound
+        range = range - bound
+        ac_nz[nz_ctx] = p - (p >> 4)
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        re.low = low
+        re_shift_low(re)
+        low = re.low
+      }
+    }
+    if v != 0 {
+      if v < -1073741823 || v > 1073741823 {
+        return false
+      }
+      let cb8 = c_b8_off + (packed >> 8)
+      let ps = ac_sign[cb8]
+      let bs = (range >> 12) * ps.to_int64().to_uint64()
+      let abs_v = if v < 0 {
+        low = low + bs
+        range = range - bs
+        ac_sign[cb8] = ps - (ps >> 4)
+        -v
+      } else {
+        range = bs
+        ac_sign[cb8] = ps + ((4096 - ps) >> 4)
+        v
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        re.low = low
+        re_shift_low(re)
+        low = re.low
+      }
+      let gt1_ctx = cb8 * 4 + rem_b4
+      let pg = ac_gt1[gt1_ctx]
+      let bg = (range >> 12) * pg.to_int64().to_uint64()
+      if abs_v == 1 {
+        range = bg
+        ac_gt1[gt1_ctx] = pg + ((4096 - pg) >> 4)
+      } else {
+        low = low + bg
+        range = range - bg
+        ac_gt1[gt1_ctx] = pg - (pg >> 4)
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        re.low = low
+        re_shift_low(re)
+        low = re.low
+      }
+      if abs_v > 1 {
+        re.range = range
+        re.low = low
+        encode_ac_gt1_tail(re, model.ac_exp, model.ac_mant, cb8, abs_v)
+        range = re.range
+        low = re.low
+      }
+      rem = rem - 1
+      rem_b4 = r4_lut[rem]
+    }
+    k = k + 1
+  }
+  re.range = range
+  re.low = low
+  true
+}
+
+///| Decode the `abs_v >= 2` tail of a non-zero AC coefficient; sets `rd.err_code = 2` on overflow.
+fn decode_ac_gt1_tail(
+  rd : RangeDecoder,
+  ac_exp : FixedArray[Int],
+  ac_mant : FixedArray[Int],
+  cb8 : Int
+) -> Int {
+  let data = rd.data
+  let end = rd.end
+  let mut pos = rd.pos
+  let mut range = rd.range
+  let mut code = rd.code
+  let mut eof_reads = rd.eof_reads
+  let exp_base = cb8 * 11
+  let mut exp = 0
+  while exp < 29 {
+    let e_ctx = if exp < 10 { exp } else { 10 }
+    let pe = ac_exp[exp_base + e_ctx]
+    let be = (range >> 12) * pe.to_int64().to_uint64()
+    if code < be {
+      range = be
+      ac_exp[exp_base + e_ctx] = pe + ((4096 - pe) >> 4)
+      while range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      break
+    }
+    code = code - be
+    range = range - be
+    ac_exp[exp_base + e_ctx] = pe - (pe >> 4)
+    while range < 0x01000000UL {
+      range = range << 8
+      let b = if pos < end {
+        let bv = data[pos].to_int().to_int64().to_uint64()
+        pos = pos + 1
+        bv
+      } else {
+        eof_reads = eof_reads + 1
+        0UL
+      }
+      code = (code << 8) | b
+    }
+    exp = exp + 1
+  }
+  let rem_v = if exp == 0 {
+    0
+  } else {
+    let m_ctx = exp_base + (if exp < 10 { exp } else { 10 })
+    let pm = ac_mant[m_ctx]
+    let bm = (range >> 12) * pm.to_int64().to_uint64()
+    let top_bit = if code < bm {
+      range = bm
+      ac_mant[m_ctx] = pm + ((4096 - pm) >> 4)
+      0
+    } else {
+      code = code - bm
+      range = range - bm
+      ac_mant[m_ctx] = pm - (pm >> 4)
+      1
+    }
+    while range < 0x01000000UL {
+      range = range << 8
+      let b = if pos < end {
+        let bv = data[pos].to_int().to_int64().to_uint64()
+        pos = pos + 1
+        bv
+      } else {
+        eof_reads = eof_reads + 1
+        0UL
+      }
+      code = (code << 8) | b
+    }
+    let mut low_bits = 0
+    let mut di = 0
+    let dnb = exp - 1
+    while di < dnb {
+      let half = range >> 1
+      range = half
+      if code < half {
+        low_bits = low_bits << 1
+      } else {
+        code = code - half
+        low_bits = (low_bits << 1) | 1
+      }
+      if range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      di = di + 1
+    }
+    let body = (top_bit << (exp - 1)) | low_bits
+    (1 << exp) + body - 1
+  }
+  rd.pos = pos
+  rd.range = range
+  rd.code = code
+  rd.eof_reads = eof_reads
+  if rem_v > 1073741821 {
+    rd.err_code = 2
+    return 0
+  }
+  rem_v + 2
+}
+
+///| Decode all AC coefficients of an interior 8x8 block (`bx > 0 && by > 0 && nz > 0`).
+fn decode_ac_block_interior(
+  rd : RangeDecoder,
+  model : DctModel,
+  band_lut : FixedArray[Int],
+  r4_lut : FixedArray[Int],
+  blk : FixedArray[Int],
+  base : Int,
+  left_base : Int,
+  top_base : Int,
+  chroma : Int,
+  nz : Int
+) -> Bool {
+  let ac_nz = model.ac_nz
+  let ac_sign = model.ac_sign
+  let ac_gt1 = model.ac_gt1
+  let data = rd.data
+  let end = rd.end
+  let c_b16_off = chroma * 128
+  let c_b8_off = chroma * 8
+  let mut range = rd.range
+  let mut code = rd.code
+  let mut pos = rd.pos
+  let mut eof_reads = rd.eof_reads
+  let mut rem = nz
+  let mut rem_b4 = r4_lut[rem]
+  let mut k = 1
+  while rem > 0 && k < 64 {
+    let packed = band_lut[k]
+    let is_nz = if rem == 64 - k {
+      1
+    } else {
+      let nb = if (blk[left_base + k] | blk[top_base + k]) != 0 { 1 } else { 0 }
+      let nz_ctx = c_b16_off + (packed & 0xFF) + (rem_b4 << 1) + nb
+      let p = ac_nz[nz_ctx]
+      let bound = (range >> 12) * p.to_int64().to_uint64()
+      let bit = if code < bound {
+        range = bound
+        ac_nz[nz_ctx] = p + ((4096 - p) >> 4)
+        0
+      } else {
+        code = code - bound
+        range = range - bound
+        ac_nz[nz_ctx] = p - (p >> 4)
+        1
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      bit
+    }
+    if is_nz != 0 {
+      let cb8 = c_b8_off + (packed >> 8)
+      let ps = ac_sign[cb8]
+      let bs = (range >> 12) * ps.to_int64().to_uint64()
+      let sign = if code < bs {
+        range = bs
+        ac_sign[cb8] = ps + ((4096 - ps) >> 4)
+        0
+      } else {
+        code = code - bs
+        range = range - bs
+        ac_sign[cb8] = ps - (ps >> 4)
+        1
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      let gt1_ctx = cb8 * 4 + rem_b4
+      let pg = ac_gt1[gt1_ctx]
+      let bg = (range >> 12) * pg.to_int64().to_uint64()
+      let is_gt1 = if code < bg {
+        range = bg
+        ac_gt1[gt1_ctx] = pg + ((4096 - pg) >> 4)
+        false
+      } else {
+        code = code - bg
+        range = range - bg
+        ac_gt1[gt1_ctx] = pg - (pg >> 4)
+        true
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      let abs_v = if !is_gt1 {
+        1
+      } else {
+        rd.range = range
+        rd.code = code
+        rd.pos = pos
+        rd.eof_reads = eof_reads
+        let v = decode_ac_gt1_tail(rd, model.ac_exp, model.ac_mant, cb8)
+        range = rd.range
+        code = rd.code
+        pos = rd.pos
+        eof_reads = rd.eof_reads
+        if rd.err_code != 0 {
+          return false
+        }
+        v
+      }
+      blk[base + k] = if sign != 0 { -abs_v } else { abs_v }
+      rem = rem - 1
+      rem_b4 = r4_lut[rem]
+    }
+    k = k + 1
+  }
+  rd.range = range
+  rd.code = code
+  rd.pos = pos
+  rd.eof_reads = eof_reads
+  true
+}
+
+///| Decode all AC coefficients of one 8x8 block (`nz > 0`). Returns `false` on range overflow.
+fn decode_ac_block(
+  rd : RangeDecoder,
+  model : DctModel,
+  band_lut : FixedArray[Int],
+  r4_lut : FixedArray[Int],
+  blk : FixedArray[Int],
+  base : Int,
+  left_base : Int,
+  top_base : Int,
+  has_left : Bool,
+  has_top : Bool,
+  chroma : Int,
+  nz : Int
+) -> Bool {
+  let ac_nz = model.ac_nz
+  let ac_sign = model.ac_sign
+  let ac_gt1 = model.ac_gt1
+  let data = rd.data
+  let end = rd.end
+  let c_b16_off = chroma * 128
+  let c_b8_off = chroma * 8
+  let interior = has_left && has_top
+  let mut range = rd.range
+  let mut code = rd.code
+  let mut pos = rd.pos
+  let mut eof_reads = rd.eof_reads
+  let mut rem = nz
+  let mut rem_b4 = r4_lut[rem]
+  let mut k = 1
+  while rem > 0 && k < 64 {
+    let packed = band_lut[k]
+    let is_nz = if rem == 64 - k {
+      1
+    } else {
+      let nb = if interior {
+        if (blk[left_base + k] | blk[top_base + k]) != 0 { 1 } else { 0 }
+      } else if (has_left && blk[left_base + k] != 0) || (has_top && blk[top_base + k] != 0) {
+        1
+      } else {
+        0
+      }
+      let nz_ctx = c_b16_off + (packed & 0xFF) + (rem_b4 << 1) + nb
+      let p = ac_nz[nz_ctx]
+      let bound = (range >> 12) * p.to_int64().to_uint64()
+      let bit = if code < bound {
+        range = bound
+        ac_nz[nz_ctx] = p + ((4096 - p) >> 4)
+        0
+      } else {
+        code = code - bound
+        range = range - bound
+        ac_nz[nz_ctx] = p - (p >> 4)
+        1
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      bit
+    }
+    if is_nz != 0 {
+      let cb8 = c_b8_off + (packed >> 8)
+      let ps = ac_sign[cb8]
+      let bs = (range >> 12) * ps.to_int64().to_uint64()
+      let sign = if code < bs {
+        range = bs
+        ac_sign[cb8] = ps + ((4096 - ps) >> 4)
+        0
+      } else {
+        code = code - bs
+        range = range - bs
+        ac_sign[cb8] = ps - (ps >> 4)
+        1
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      let gt1_ctx = cb8 * 4 + rem_b4
+      let pg = ac_gt1[gt1_ctx]
+      let bg = (range >> 12) * pg.to_int64().to_uint64()
+      let is_gt1 = if code < bg {
+        range = bg
+        ac_gt1[gt1_ctx] = pg + ((4096 - pg) >> 4)
+        false
+      } else {
+        code = code - bg
+        range = range - bg
+        ac_gt1[gt1_ctx] = pg - (pg >> 4)
+        true
+      }
+      while range < 0x01000000UL {
+        range = range << 8
+        let b = if pos < end {
+          let bv = data[pos].to_int().to_int64().to_uint64()
+          pos = pos + 1
+          bv
+        } else {
+          eof_reads = eof_reads + 1
+          0UL
+        }
+        code = (code << 8) | b
+      }
+      let abs_v = if !is_gt1 {
+        1
+      } else {
+        rd.range = range
+        rd.code = code
+        rd.pos = pos
+        rd.eof_reads = eof_reads
+        let v = decode_ac_gt1_tail(rd, model.ac_exp, model.ac_mant, cb8)
+        range = rd.range
+        code = rd.code
+        pos = rd.pos
+        eof_reads = rd.eof_reads
+        if rd.err_code != 0 {
+          return false
+        }
+        v
+      }
+      blk[base + k] = if sign != 0 { -abs_v } else { abs_v }
+      rem = rem - 1
+      rem_b4 = r4_lut[rem]
+    }
+    k = k + 1
+  }
+  rd.range = range
+  rd.code = code
+  rd.pos = pos
+  rd.eof_reads = eof_reads
+  true
+}
+
 ///| Compress all component 8x8 DCT coefficient arrays into `out`.
 fn compress_dct_blocks(
   img : JpegImage,
@@ -8,43 +735,65 @@ fn compress_dct_blocks(
 ) -> Result[Unit, String] {
   let re = RangeEncoder::new(out)
   let model = DctModel::new()
+  let (band_lut, r4_lut, a8_lut) = build_dct_luts()
   let mut c = 0
   while c < img.components.length() {
     let ci = img.components[c]
     let blk = coeffs[c]
     let bw = ci.stride_w
     let bh = ci.stride_h
+    let row_stride = bw * 64
     let chroma = if c == 0 { 0 } else { 1 }
     let nz_counts = FixedArray::make(bw * bh, 0)
     let dc_errs = FixedArray::make(bw * bh, 0)
 
     let mut by = 0
     while by < bh {
+      let row_idx = by * bw
+      let has_top = by > 0
       let mut bx = 0
       while bx < bw {
-        let idx = by * bw + bx
+        let idx = row_idx + bx
         let base = idx * 64
-        let pred = if bx == 0 && by == 0 {
+        let left_base = base - 64
+        let top_base = base - row_stride
+        let has_left = bx > 0
+        let pred = if !has_left && !has_top {
           0
-        } else if by == 0 {
-          blk[(idx - 1) * 64]
-        } else if bx == 0 {
-          blk[(idx - bw) * 64]
+        } else if !has_top {
+          blk[left_base]
+        } else if !has_left {
+          blk[top_base]
         } else {
-          med_predict(blk[(idx - 1) * 64], blk[(idx - bw) * 64], blk[(idx - bw - 1) * 64])
+          med_predict(blk[left_base], blk[top_base], blk[top_base - 64])
         }
-        let left_err = if bx > 0 { dc_errs[idx - 1] } else { 0 }
-        let top_err = if by > 0 { dc_errs[idx - bw] } else { 0 }
+        let left_err = if has_left { dc_errs[idx - 1] } else { 0 }
+        let top_err = if has_top { dc_errs[idx - bw] } else { 0 }
         let max_err = if left_err > top_err { left_err } else { top_err }
         let diff = blk[base] - pred
         dc_errs[idx] = if diff < 0 { -diff } else { diff }
-        match encode_dc_diff(re, model, chroma, dc_mag_bucket8(max_err), diff) {
-          Ok(_) => ()
-          Err(e) => return Err(e)
+        encode_dc_diff(re, model, chroma, dc_mag_bucket8(max_err), diff)
+        if re.err_code != 0 {
+          return Err("DC residual out of supported range")
         }
 
         let mut nz = 0
         let mut k = 1
+        while k <= 60 {
+          if blk[base + k] != 0 {
+            nz = nz + 1
+          }
+          if blk[base + k + 1] != 0 {
+            nz = nz + 1
+          }
+          if blk[base + k + 2] != 0 {
+            nz = nz + 1
+          }
+          if blk[base + k + 3] != 0 {
+            nz = nz + 1
+          }
+          k = k + 4
+        }
         while k < 64 {
           if blk[base + k] != 0 {
             nz = nz + 1
@@ -52,36 +801,50 @@ fn compress_dct_blocks(
           k = k + 1
         }
         nz_counts[idx] = nz
-        let avg_nz = if bx == 0 && by == 0 {
+        let avg_nz = if !has_left && !has_top {
           0
-        } else if by == 0 {
+        } else if !has_top {
           nz_counts[idx - 1]
-        } else if bx == 0 {
+        } else if !has_left {
           nz_counts[idx - bw]
         } else {
           (nz_counts[idx - 1] + nz_counts[idx - bw] + 1) >> 1
         }
-        encode_nz_count(re, model, chroma, avg_nz_bucket8(avg_nz), nz)
+        encode_nz_count(re, model, chroma, a8_lut[avg_nz], nz)
 
-        let mut rem = nz
-        k = 1
-        while rem > 0 && k < 64 {
-          let v = blk[base + k]
-          if rem != 64 - k {
-            let l_nz = bx > 0 && blk[(idx - 1) * 64 + k] != 0
-            let t_nz = by > 0 && blk[(idx - bw) * 64 + k] != 0
-            let nb = if l_nz || t_nz { 1 } else { 0 }
-            let nz_ctx = ((chroma * 16 + ac_band16(k)) * 4 + rem_nz_bucket4(rem)) * 2 + nb
-            re_encode_bit(re, model.ac_nz, nz_ctx, if v != 0 { 1 } else { 0 })
+        if nz > 0 {
+          let ok = if has_left && has_top {
+            encode_ac_block_interior(
+              re,
+              model,
+              band_lut,
+              r4_lut,
+              blk,
+              base,
+              left_base,
+              top_base,
+              chroma,
+              nz
+            )
+          } else {
+            encode_ac_block(
+              re,
+              model,
+              band_lut,
+              r4_lut,
+              blk,
+              base,
+              left_base,
+              top_base,
+              has_left,
+              has_top,
+              chroma,
+              nz
+            )
           }
-          if v != 0 {
-            match encode_ac_nz_val(re, model, chroma, ac_band8(k), rem_nz_bucket4(rem), v) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
-            }
-            rem = rem - 1
+          if !ok {
+            return Err("AC coefficient out of supported range")
           }
-          k = k + 1
         }
         bx = bx + 1
       }
@@ -105,12 +868,14 @@ fn decompress_dct_blocks(
     Err(e) => return Err(e)
   }
   let model = DctModel::new()
+  let (band_lut, r4_lut, a8_lut) = build_dct_luts()
   let coeffs : Array[FixedArray[Int]] = []
   let mut c = 0
   while c < img.components.length() {
     let ci = img.components[c]
     let bw = ci.stride_w
     let bh = ci.stride_h
+    let row_stride = bw * 64
     let blk = FixedArray::make(bw * bh * 64, 0)
     let chroma = if c == 0 { 0 } else { 1 }
     let nz_counts = FixedArray::make(bw * bh, 0)
@@ -118,68 +883,85 @@ fn decompress_dct_blocks(
 
     let mut by = 0
     while by < bh {
+      let row_idx = by * bw
+      let has_top = by > 0
       let mut bx = 0
       while bx < bw {
         if rd.eof_reads > 0 {
           return Err("truncated range-coded payload")
         }
-        let idx = by * bw + bx
+        let idx = row_idx + bx
         let base = idx * 64
-        let pred = if bx == 0 && by == 0 {
+        let left_base = base - 64
+        let top_base = base - row_stride
+        let has_left = bx > 0
+        let pred = if !has_left && !has_top {
           0
-        } else if by == 0 {
-          blk[(idx - 1) * 64]
-        } else if bx == 0 {
-          blk[(idx - bw) * 64]
+        } else if !has_top {
+          blk[left_base]
+        } else if !has_left {
+          blk[top_base]
         } else {
-          med_predict(blk[(idx - 1) * 64], blk[(idx - bw) * 64], blk[(idx - bw - 1) * 64])
+          med_predict(blk[left_base], blk[top_base], blk[top_base - 64])
         }
-        let left_err = if bx > 0 { dc_errs[idx - 1] } else { 0 }
-        let top_err = if by > 0 { dc_errs[idx - bw] } else { 0 }
+        let left_err = if has_left { dc_errs[idx - 1] } else { 0 }
+        let top_err = if has_top { dc_errs[idx - bw] } else { 0 }
         let max_err = if left_err > top_err { left_err } else { top_err }
-        let diff = match
-        decode_dc_diff(rd, model, chroma, dc_mag_bucket8(max_err)) {
-          Ok(v) => v
-          Err(e) => return Err(e)
+        let diff = decode_dc_diff(rd, model, chroma, dc_mag_bucket8(max_err))
+        if rd.err_code != 0 {
+          return Err("decoded DC residual out of supported range")
         }
         dc_errs[idx] = if diff < 0 { -diff } else { diff }
         blk[base] = pred + diff
 
-        let avg_nz = if bx == 0 && by == 0 {
+        let avg_nz = if !has_left && !has_top {
           0
-        } else if by == 0 {
+        } else if !has_top {
           nz_counts[idx - 1]
-        } else if bx == 0 {
+        } else if !has_left {
           nz_counts[idx - bw]
         } else {
           (nz_counts[idx - 1] + nz_counts[idx - bw] + 1) >> 1
         }
-        let nz = decode_nz_count(rd, model, chroma, avg_nz_bucket8(avg_nz))
+        let nz = decode_nz_count(rd, model, chroma, a8_lut[avg_nz])
         if nz < 0 || nz > 63 {
           return Err("invalid AC non-zero count in lepton stream")
         }
         nz_counts[idx] = nz
 
-        let mut rem = nz
-        let mut k = 1
-        while rem > 0 && k < 64 {
-          let is_nz = if rem == 64 - k {
-            1
+        if nz > 0 {
+          let ok = if has_left && has_top {
+            decode_ac_block_interior(
+              rd,
+              model,
+              band_lut,
+              r4_lut,
+              blk,
+              base,
+              left_base,
+              top_base,
+              chroma,
+              nz
+            )
           } else {
-            let l_nz = bx > 0 && blk[(idx - 1) * 64 + k] != 0
-            let t_nz = by > 0 && blk[(idx - bw) * 64 + k] != 0
-            let nb = if l_nz || t_nz { 1 } else { 0 }
-            let nz_ctx = ((chroma * 16 + ac_band16(k)) * 4 + rem_nz_bucket4(rem)) * 2 + nb
-            rd_decode_bit(rd, model.ac_nz, nz_ctx)
+            decode_ac_block(
+              rd,
+              model,
+              band_lut,
+              r4_lut,
+              blk,
+              base,
+              left_base,
+              top_base,
+              has_left,
+              has_top,
+              chroma,
+              nz
+            )
           }
-          if is_nz != 0 {
-            match decode_ac_nz_val(rd, model, chroma, ac_band8(k), rem_nz_bucket4(rem)) {
-              Ok(v) => blk[base + k] = v
-              Err(e) => return Err(e)
-            }
-            rem = rem - 1
+          if !ok {
+            return Err("decoded AC coefficient out of supported range")
           }
-          k = k + 1
         }
         bx = bx + 1
       }
