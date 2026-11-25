@@ -9,7 +9,7 @@ export PATH="$HOME/.pion/bin:$HOME/.cargo/bin:$PATH"
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PKG_DIR=$(CDPATH= cd -- "$BENCH_DIR/.." && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$PKG_DIR/../.." && pwd)
-OUT_DIR="/private/tmp/fix-http2/bench"
+OUT_DIR="${BENCH_OUT:-${TMPDIR:-/tmp}/fix-http2/bench}"
 BIN_DIR="$OUT_DIR/bin"
 
 mkdir -p "$BIN_DIR"
