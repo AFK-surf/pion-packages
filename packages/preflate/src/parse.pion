@@ -235,6 +235,26 @@ fn parse_dynamic_header(
   Ok((hlit, hdist, hclen))
 }
 
+///| Grow a reusable `FixedArray[Int]` token buffer by doubling, preserving `used` entries.
+fn grow_tok_buf(buf : FixedArray[Int], used : Int) -> FixedArray[Int] {
+  let next_cap = buf.length() * 2
+  let next : FixedArray[Int] = FixedArray::make(next_cap, 0)
+  let mut i = 0
+  let lim4 = used - 4
+  while i <= lim4 {
+    next[i] = buf[i]
+    next[i + 1] = buf[i + 1]
+    next[i + 2] = buf[i + 2]
+    next[i + 3] = buf[i + 3]
+    i = i + 4
+  }
+  while i < used {
+    next[i] = buf[i]
+    i = i + 1
+  }
+  next
+}
+
 ///| Parse and incrementally encode a raw RFC 1951 DEFLATE stream with explicit `plain_limit` and `max_corr_raw`.
 fn analyze_stream_with_caps(
   deflate : Bytes,
@@ -264,6 +284,8 @@ fn analyze_stream_with_caps(
   let dist_lens : FixedArray[Int] = FixedArray::make(32, 0)
   let lit_freqs : FixedArray[Int] = FixedArray::make(286, 0)
   let dist_freqs : FixedArray[Int] = FixedArray::make(30, 0)
+  let mut tok_buf : FixedArray[Int] = FixedArray::make(32768, 0)
+  let mut tok_cap = 32768
 
   let mut bfinal = false
   while !bfinal {
@@ -349,17 +371,234 @@ fn analyze_stream_with_caps(
     }
 
     let block_plain_start = out_len
-    let tokens : Array[Int] = []
+    let mut tok_cnt = 0
     let mut match_count = 0
     let mut all_dist_one = true
     let mut max_obs_dist = 0
     let mut min_obs_len = 259
 
-    while true {
-      let sym = match decode_huff_sym(br, cur_litlen, litlen_root_bits, litlen_root_mask) {
-        Ok(s) => s
-        Err(e) => return Err(e)
+    let le = len_extra
+    let lb = len_base
+    let de = dist_extra
+    let db = dist_base
+    let in_len = br.in_len
+    let mut in_pos = br.in_pos
+    let mut bitbuf = br.bitbuf
+    let mut bitcnt = br.bitcnt
+    let mut done_block = false
+
+    while !done_block {
+      // Fast loop: enough input, output room, plain_limit headroom, and token buffer space.
+      let safe_out = if out_cap < plain_limit { out_cap } else { plain_limit }
+      let fast_out_lim = safe_out - 258
+      let fast_in_lim = in_len - 8
+      while in_pos <= fast_in_lim && out_len <= fast_out_lim && tok_cnt < tok_cap {
+        if bitcnt <= 32 {
+          let w = deflate[in_pos].to_int().to_int64().to_uint64() |
+          (deflate[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+          (deflate[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+          (deflate[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+          bitbuf = bitbuf | (w << bitcnt)
+          in_pos = in_pos + 4
+          bitcnt = bitcnt + 32
+        }
+        let entry = cur_litlen[(bitbuf & 1023UL).to_int()]
+        if entry == 0 {
+          return Err("invalid Huffman code")
+        }
+        let sym = if (entry & 16) == 0 {
+          let bits = entry & 15
+          bitbuf = bitbuf >> bits
+          bitcnt = bitcnt - bits
+          entry >> 5
+        } else {
+          let sub_off = entry >> 5
+          let sub_bits = entry & 15
+          let sub_entry = cur_litlen[sub_off + ((bitbuf >> 10) & ((1UL << sub_bits) - 1UL)).to_int()]
+          if sub_entry == 0 {
+            return Err("invalid Huffman code in subtable")
+          }
+          let total_bits = 10 + (sub_entry & 15)
+          bitbuf = bitbuf >> total_bits
+          bitcnt = bitcnt - total_bits
+          sub_entry >> 5
+        }
+        if sym < 256 {
+          out[out_len] = sym.to_byte()
+          out_len = out_len + 1
+          tok_buf[tok_cnt] = sym
+          tok_cnt = tok_cnt + 1
+        } else if sym == 256 {
+          done_block = true
+          break
+        } else {
+          let lidx = sym - 257
+          if lidx < 0 || lidx >= 29 {
+            return Err("invalid literal/length symbol")
+          }
+          let lxb = le[lidx]
+          let lextra = if lxb == 0 {
+            0
+          } else {
+            let v = (bitbuf & ((1UL << lxb) - 1UL)).to_int()
+            bitbuf = bitbuf >> lxb
+            bitcnt = bitcnt - lxb
+            v
+          }
+          let match_len = lb[lidx] + lextra
+          let is_alt_258 = sym == 284 && lextra == 31
+
+          if bitcnt <= 32 {
+            let w = deflate[in_pos].to_int().to_int64().to_uint64() |
+            (deflate[in_pos + 1].to_int().to_int64().to_uint64() << 8) |
+            (deflate[in_pos + 2].to_int().to_int64().to_uint64() << 16) |
+            (deflate[in_pos + 3].to_int().to_int64().to_uint64() << 24)
+            bitbuf = bitbuf | (w << bitcnt)
+            in_pos = in_pos + 4
+            bitcnt = bitcnt + 32
+          }
+          let dentry = cur_dist[(bitbuf & 511UL).to_int()]
+          if dentry == 0 {
+            return Err("invalid Huffman code")
+          }
+          let dsym = if (dentry & 16) == 0 {
+            let bits = dentry & 15
+            bitbuf = bitbuf >> bits
+            bitcnt = bitcnt - bits
+            dentry >> 5
+          } else {
+            let sub_off = dentry >> 5
+            let sub_bits = dentry & 15
+            let sub_entry = cur_dist[sub_off + ((bitbuf >> 9) & ((1UL << sub_bits) - 1UL)).to_int()]
+            if sub_entry == 0 {
+              return Err("invalid Huffman code in subtable")
+            }
+            let total_bits = 9 + (sub_entry & 15)
+            bitbuf = bitbuf >> total_bits
+            bitcnt = bitcnt - total_bits
+            sub_entry >> 5
+          }
+          if dsym < 0 || dsym >= 30 {
+            return Err("invalid distance symbol")
+          }
+          let dxb = de[dsym]
+          let dextra = if dxb == 0 {
+            0
+          } else {
+            let v = (bitbuf & ((1UL << dxb) - 1UL)).to_int()
+            bitbuf = bitbuf >> dxb
+            bitcnt = bitcnt - dxb
+            v
+          }
+          let dist = db[dsym] + dextra
+          if dist < 1 || dist > out_len || dist > 32768 {
+            return Err("back-reference distance out of window bounds")
+          }
+          let src = out_len - dist
+          if dist == 1 {
+            let b = out[src]
+            let mut k = 0
+            let lim8 = match_len - 8
+            while k <= lim8 {
+              out[out_len + k] = b
+              out[out_len + k + 1] = b
+              out[out_len + k + 2] = b
+              out[out_len + k + 3] = b
+              out[out_len + k + 4] = b
+              out[out_len + k + 5] = b
+              out[out_len + k + 6] = b
+              out[out_len + k + 7] = b
+              k = k + 8
+            }
+            while k < match_len {
+              out[out_len + k] = b
+              k = k + 1
+            }
+          } else if dist >= 8 {
+            let mut k = 0
+            let lim8 = match_len - 8
+            while k <= lim8 {
+              out[out_len + k] = out[src + k]
+              out[out_len + k + 1] = out[src + k + 1]
+              out[out_len + k + 2] = out[src + k + 2]
+              out[out_len + k + 3] = out[src + k + 3]
+              out[out_len + k + 4] = out[src + k + 4]
+              out[out_len + k + 5] = out[src + k + 5]
+              out[out_len + k + 6] = out[src + k + 6]
+              out[out_len + k + 7] = out[src + k + 7]
+              k = k + 8
+            }
+            while k < match_len {
+              out[out_len + k] = out[src + k]
+              k = k + 1
+            }
+          } else {
+            let mut k = 0
+            while k < match_len {
+              out[out_len + k] = out[src + k]
+              k = k + 1
+            }
+          }
+          out_len = out_len + match_len
+          tok_buf[tok_cnt] = pack_match_token(match_len, dist, is_alt_258)
+          tok_cnt = tok_cnt + 1
+          match_count = match_count + 1
+          if dist != 1 {
+            all_dist_one = false
+          }
+          if dist > max_obs_dist {
+            max_obs_dist = dist
+          }
+          if match_len < min_obs_len {
+            min_obs_len = match_len
+          }
+        }
       }
+      if done_block {
+        break
+      }
+
+      // Slow / boundary path: exact EOF, buffer growth, and plain_limit checks.
+      if tok_cnt >= tok_cap {
+        tok_buf = grow_tok_buf(tok_buf, tok_cnt)
+        tok_cap = tok_buf.length()
+      }
+      while bitcnt <= 56 && in_pos < in_len {
+        bitbuf = bitbuf | (deflate[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+        in_pos = in_pos + 1
+        bitcnt = bitcnt + 8
+      }
+      let entry = cur_litlen[(bitbuf & 1023UL).to_int()]
+      if entry == 0 {
+        return Err("invalid Huffman code")
+      }
+      let sym = if (entry & 16) == 0 {
+        let bits = entry & 15
+        if bitcnt < bits {
+          return Err("unexpected EOF in Huffman symbol")
+        }
+        bitbuf = bitbuf >> bits
+        bitcnt = bitcnt - bits
+        entry >> 5
+      } else {
+        if bitcnt <= 10 {
+          return Err("unexpected EOF in Huffman subtable")
+        }
+        let sub_off = entry >> 5
+        let sub_bits = entry & 15
+        let sub_entry = cur_litlen[sub_off + ((bitbuf >> 10) & ((1UL << sub_bits) - 1UL)).to_int()]
+        if sub_entry == 0 {
+          return Err("invalid Huffman code in subtable")
+        }
+        let total_bits = 10 + (sub_entry & 15)
+        if bitcnt < total_bits {
+          return Err("unexpected EOF in Huffman subtable symbol")
+        }
+        bitbuf = bitbuf >> total_bits
+        bitcnt = bitcnt - total_bits
+        sub_entry >> 5
+      }
+
       if sym < 256 {
         if 1 > plain_limit - out_len {
           return Err("decoded plain text exceeded plain_limit")
@@ -370,33 +609,96 @@ fn analyze_stream_with_caps(
         }
         out[out_len] = sym.to_byte()
         out_len = out_len + 1
-        tokens.push(sym)
+        tok_buf[tok_cnt] = sym
+        tok_cnt = tok_cnt + 1
       } else if sym == 256 {
+        done_block = true
         break
       } else {
         let lidx = sym - 257
         if lidx < 0 || lidx >= 29 {
           return Err("invalid literal/length symbol")
         }
-        let lextra = match br_read_bits(br, len_extra[lidx]) {
-          Ok(v) => v
-          Err(e) => return Err(e)
+        let lxb = le[lidx]
+        let lextra = if lxb == 0 {
+          0
+        } else {
+          if bitcnt < lxb {
+            while bitcnt < lxb && in_pos < in_len {
+              bitbuf = bitbuf | (deflate[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+              in_pos = in_pos + 1
+              bitcnt = bitcnt + 8
+            }
+            if bitcnt < lxb {
+              return Err("unexpected EOF while reading bits")
+            }
+          }
+          let v = (bitbuf & ((1UL << lxb) - 1UL)).to_int()
+          bitbuf = bitbuf >> lxb
+          bitcnt = bitcnt - lxb
+          v
         }
-        let match_len = len_base[lidx] + lextra
+        let match_len = lb[lidx] + lextra
         let is_alt_258 = sym == 284 && lextra == 31
 
-        let dsym = match decode_huff_sym(br, cur_dist, dist_root_bits, dist_root_mask) {
-          Ok(s) => s
-          Err(e) => return Err(e)
+        while bitcnt <= 56 && in_pos < in_len {
+          bitbuf = bitbuf | (deflate[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+          in_pos = in_pos + 1
+          bitcnt = bitcnt + 8
+        }
+        let dentry = cur_dist[(bitbuf & 511UL).to_int()]
+        if dentry == 0 {
+          return Err("invalid Huffman code")
+        }
+        let dsym = if (dentry & 16) == 0 {
+          let bits = dentry & 15
+          if bitcnt < bits {
+            return Err("unexpected EOF in Huffman symbol")
+          }
+          bitbuf = bitbuf >> bits
+          bitcnt = bitcnt - bits
+          dentry >> 5
+        } else {
+          if bitcnt <= 9 {
+            return Err("unexpected EOF in Huffman subtable")
+          }
+          let sub_off = dentry >> 5
+          let sub_bits = dentry & 15
+          let sub_entry = cur_dist[sub_off + ((bitbuf >> 9) & ((1UL << sub_bits) - 1UL)).to_int()]
+          if sub_entry == 0 {
+            return Err("invalid Huffman code in subtable")
+          }
+          let total_bits = 9 + (sub_entry & 15)
+          if bitcnt < total_bits {
+            return Err("unexpected EOF in Huffman subtable symbol")
+          }
+          bitbuf = bitbuf >> total_bits
+          bitcnt = bitcnt - total_bits
+          sub_entry >> 5
         }
         if dsym < 0 || dsym >= 30 {
           return Err("invalid distance symbol")
         }
-        let dextra = match br_read_bits(br, dist_extra[dsym]) {
-          Ok(v) => v
-          Err(e) => return Err(e)
+        let dxb = de[dsym]
+        let dextra = if dxb == 0 {
+          0
+        } else {
+          if bitcnt < dxb {
+            while bitcnt < dxb && in_pos < in_len {
+              bitbuf = bitbuf | (deflate[in_pos].to_int().to_int64().to_uint64() << bitcnt)
+              in_pos = in_pos + 1
+              bitcnt = bitcnt + 8
+            }
+            if bitcnt < dxb {
+              return Err("unexpected EOF while reading bits")
+            }
+          }
+          let v = (bitbuf & ((1UL << dxb) - 1UL)).to_int()
+          bitbuf = bitbuf >> dxb
+          bitcnt = bitcnt - dxb
+          v
         }
-        let dist = dist_base[dsym] + dextra
+        let dist = db[dsym] + dextra
         if dist < 1 || dist > out_len || dist > 32768 {
           return Err("back-reference distance out of window bounds")
         }
@@ -411,8 +713,38 @@ fn analyze_stream_with_caps(
         if dist == 1 {
           let b = out[src]
           let mut k = 0
+          let lim8 = match_len - 8
+          while k <= lim8 {
+            out[out_len + k] = b
+            out[out_len + k + 1] = b
+            out[out_len + k + 2] = b
+            out[out_len + k + 3] = b
+            out[out_len + k + 4] = b
+            out[out_len + k + 5] = b
+            out[out_len + k + 6] = b
+            out[out_len + k + 7] = b
+            k = k + 8
+          }
           while k < match_len {
             out[out_len + k] = b
+            k = k + 1
+          }
+        } else if dist >= 8 {
+          let mut k = 0
+          let lim8 = match_len - 8
+          while k <= lim8 {
+            out[out_len + k] = out[src + k]
+            out[out_len + k + 1] = out[src + k + 1]
+            out[out_len + k + 2] = out[src + k + 2]
+            out[out_len + k + 3] = out[src + k + 3]
+            out[out_len + k + 4] = out[src + k + 4]
+            out[out_len + k + 5] = out[src + k + 5]
+            out[out_len + k + 6] = out[src + k + 6]
+            out[out_len + k + 7] = out[src + k + 7]
+            k = k + 8
+          }
+          while k < match_len {
+            out[out_len + k] = out[src + k]
             k = k + 1
           }
         } else {
@@ -423,7 +755,8 @@ fn analyze_stream_with_caps(
           }
         }
         out_len = out_len + match_len
-        tokens.push(pack_match_token(match_len, dist, is_alt_258))
+        tok_buf[tok_cnt] = pack_match_token(match_len, dist, is_alt_258)
+        tok_cnt = tok_cnt + 1
         match_count = match_count + 1
         if dist != 1 {
           all_dist_one = false
@@ -436,6 +769,9 @@ fn analyze_stream_with_caps(
         }
       }
     }
+    br.in_pos = in_pos
+    br.bitbuf = bitbuf
+    br.bitcnt = bitcnt
 
     let (used_preset, used_wbits, used_filtered) = encode_huffman_block(
       corr_w,
@@ -451,7 +787,8 @@ fn analyze_stream_with_caps(
       cl_lens,
       rle_syms,
       rle_extra,
-      tokens,
+      tok_buf,
+      tok_cnt,
       match_count,
       match_count > 0 && all_dist_one,
       max_obs_dist,
