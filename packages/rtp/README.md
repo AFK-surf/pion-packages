@@ -30,8 +30,8 @@
 ### Cryptographic Dependencies & Side-Channel Note
 
 - Reuses `packages/crypto` (`v0.2.0`): `crypto::Sha1`, `crypto::sha1`, `crypto::constant_time_eq`, `crypto::bytes_to_hex`, `crypto::hex_to_bytes`.
-- Because `packages/crypto` `v0.2.0` does not yet expose AES-128, AES-128-CTR, AES-128-GCM, or HMAC-SHA1, `packages/rtp/src/crypto_prim.pion` provides 100% pure-Pion implementations of FIPS 197 AES-128, AES-128-CTR, NIST SP 800-38D AES-128-GCM (with a per-context 4-bit Shoup GHASH table), and RFC 2104 HMAC-SHA1 (built on `crypto::Sha1` with precomputed pads).
-- **Side-channel disclosure**: AES-128 S-box lookups and the 4-bit GHASH Shoup table are pure-software table-driven implementations (no hardware AES-NI / PMULL intrinsics). While MAC/tag comparison is constant-time (`crypto::constant_time_eq`), table-indexed AES/GHASH is subject to local cache-timing side channels against a co-resident attacker sharing the same CPU cache; hardware-backed or bitsliced primitives should be substituted if co-resident cache adversaries are in scope.
+- Because `packages/crypto` `v0.2.0` does not yet expose AES-128, AES-128-CTR, AES-128-GCM, or HMAC-SHA1, `packages/rtp/src/crypto_prim.pion` provides 100% pure-Pion implementations of FIPS 197 AES-128 (T-table accelerated), AES-128-CTR, NIST SP 800-38D AES-128-GCM (with a per-context 8-bit Shoup GHASH table), and RFC 2104 HMAC-SHA1 (built on `crypto::Sha1` with precomputed pads).
+- **Side-channel disclosure**: AES-128 T-table/S-box lookups and the 8-bit GHASH Shoup table are pure-software table-driven implementations (no hardware AES-NI / PMULL intrinsics). While MAC/tag comparison is constant-time (`crypto::constant_time_eq`), table-indexed AES/GHASH is subject to local cache-timing side channels against a co-resident attacker sharing the same CPU cache; hardware-backed or bitsliced primitives should be substituted if co-resident cache adversaries are in scope.
 
 ### `DecodeLimits` Semantics
 
@@ -97,18 +97,18 @@ pionc run --target wasm32 packages/rtp/wasm_smoke
 pionc run --target wasm32 --release packages/rtp/wasm_smoke
 ```
 
-## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=1`, `rounds=5`)
+## Head-to-Head Benchmarks (`Linux x86_64`, `warmup=1`, `rounds=5`)
 
 Run via `sh packages/rtp/bench/run_bench.sh` against Rust **`webrtc-rs`** (`rtp 0.12.0`, `rtcp 0.12.0`, `webrtc-srtp 0.14.0`, `--release`), strictly interleaved with mandatory byte-for-byte stdout SHA-256 verification across all rounds (proving exact wire and cryptographic interoperability):
 
-| Workload | Pion Median (ms) | Rust `webrtc-rs` Median (ms) | Pion Rate / Throughput | Pion Peak RSS | Rust Peak RSS | Speedup vs Rust | Stdout SHA-256 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| RTP Parse + Marshal (1,200 B + 3 RFC 5285 1-byte exts × 50,000) | 82.330 | 32.447 | 1,646.61 ns/op | 1.80 MiB | 2.08 MiB | 0.39x | `1490e46b1e6d14d1…` (exact) |
-| RTCP Compound Parse + Marshal (SR + PLI + NACK × 50,000) | 72.339 | 62.501 | 1,446.79 ns/op | 1.84 MiB | 2.20 MiB | 0.86x | `5727aeb0e46e2972…` (exact) |
-| SRTP `AES128_CM_HMAC_SHA1_80` Protect + Unprotect (5,000 × 1,200 B = 12 MB) | 271.028 | 131.295 | 44.28 MB/s | 1.88 MiB | 2.08 MiB | 0.48x | `3a80d94aed49bb1f…` (exact) |
-| SRTP `AEAD_AES_128_GCM` Protect + Unprotect (5,000 × 1,200 B = 12 MB) | 247.303 | 120.209 | 48.52 MB/s | 1.86 MiB | 2.11 MiB | 0.49x | `9709ef15a59a9dfc…` (exact) |
+| Workload | Pion Median (ms) | Rust `webrtc-rs` Median (ms) | Pion Rate / Throughput | Speedup vs Rust | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| RTP Parse + Marshal (1,200 B + 3 RFC 5285 1-byte exts × 50,000) | 46.576 | 36.008 | 931.53 ns/op | 0.77x | `1490e46b1e6d14d1…` (exact) |
+| RTCP Compound Parse + Marshal (SR + PLI + NACK × 50,000) | 45.377 | 43.829 | 907.54 ns/op | 0.97x | `5727aeb0e46e2972…` (exact) |
+| SRTP `AES128_CM_HMAC_SHA1_80` Protect + Unprotect (5,000 × 1,200 B = 12 MB) | 405.444 | 21.576 | 29.60 MB/s | 0.05x | `3a80d94aed49bb1f…` (exact) |
+| SRTP `AEAD_AES_128_GCM` Protect + Unprotect (5,000 × 1,200 B = 12 MB) | 425.764 | 30.802 | 28.18 MB/s | 0.07x | `9709ef15a59a9dfc…` (exact) |
 
 **Honest runtime & hardware notes**:
-- On RTCP compound parse + marshal, pure Pion reaches **0.86×** of Rust `webrtc-rs/rtcp` while using lower Peak RSS (`1.84 MiB` vs `2.20 MiB`).
-- On RTP 1,200 B parse + marshal, Rust `webrtc-rs/rtp` uses reference-counted zero-copy `bytes::Bytes::slice()` for the 1,172-byte payload, whereas Pion's `parse_rtp` copies the payload into an owned `Bytes` slice (`0.39×`).
-- On SRTP `AES128_CM_HMAC_SHA1_80` (`44.28 MB/s`, `0.48×`) and `AEAD_AES_128_GCM` (`48.52 MB/s`, `0.49×`), Rust `webrtc-srtp` uses hardware AES/PMULL/SHA1 intrinsics on Apple Silicon and runs without replay protection (`None`), whereas `packages/rtp` runs 100% pure-Pion portable scalar code with full send/receive replay protection enabled and still sustains **>44 MB/s** (>350 Mbps).
+- On RTCP compound parse + marshal, pure Pion reaches **0.97×** of Rust `webrtc-rs/rtcp` (down from `123.6 ms` to `45.4 ms`, **2.72×** faster via single-buffer length-prefixed marshaling and pre-sized arrays).
+- On RTP 1,200 B parse + marshal, replacing byte-by-byte COW loops with native `Bytes::slice` + two-pass zero-alloc header assembly + `Bytes::concat` speeds Pion up **2.82×** (`131.2 ms` → `46.6 ms`, `0.18×` → **0.77×** vs Rust `webrtc-rs/rtp`, which uses reference-counted zero-copy `bytes::Bytes::slice()`).
+- On SRTP `AES128_CM_HMAC_SHA1_80` (`29.60 MB/s`, **2.36×** faster than baseline) and `AEAD_AES_128_GCM` (`28.18 MB/s`, **2.80×** faster than baseline), Rust `webrtc-srtp` uses hardware x86_64 AES-NI / PCLMULQDQ / SHA-NI intrinsics and runs without replay protection (`None`), whereas `packages/rtp` runs 100% pure-Pion portable scalar code (T-table AES-128 + 8-bit Shoup GHASH) with full send/receive replay protection enabled.
