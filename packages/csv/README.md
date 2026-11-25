@@ -53,7 +53,7 @@ pub fn example() -> Result[String, csv::CsvError] {
 
 ## Head-to-Head Benchmarks (Pion Native vs Rust `csv =1.4.0 --release` vs Go `encoding/csv`)
 
-Measured on `Darwin arm64` (Apple M5 Max) using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
+Measured on `Linux x86_64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
 
 ### Like-for-Like Comparison Methodology
 
@@ -64,20 +64,20 @@ Measured on `Darwin arm64` (Apple M5 Max) using `scripts/bench_compare.py` (`--w
 
 All rows verified byte-for-byte stdout SHA-256 identical across every implementation and round.
 
-| Corpus (Size) / Mode | Pion (ms / RSS) | Rust `StringRecord` | Rust `ByteRecord` | Go `encoding/csv` | Pion vs Like-for-Like Rust | Stdout SHA-256 (prefix) |
+| Corpus (Size) / Mode | Pion (ms / RSS) | Rust `StringRecord` | Rust `ByteRecord` | Go `encoding/csv` | Pion vs Like-for-Like Rust & Go | Stdout SHA-256 (prefix) |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `mixed_200k.csv` (15 MB, default `from_string`) | 54.2 / 31.3 MiB | 39.1 | 35.0 / 16.6 MiB | 47.1 | 1.55x slower (vs `ByteRecord`) | `238820ffb412645a` |
-| `mixed_1m.csv` (77 MB, default `from_string`) | 236.8 / 149.2 MiB | 162.9 | 139.2 / 75.6 MiB | 203.8 | 1.70x slower (vs `ByteRecord`) | `97221bca6d1004af` |
-| `mixed_1m.csv` (77 MB, `from_bytes` validated) | 303.5 / 149.2 MiB | 160.8 | 137.0 / 75.6 MiB | 200.3 | 1.89x slower (vs `StringRecord`) | `97221bca6d1004af` |
-| `mixed_1m.csv` (77 MB, `Record::fields()` alloc) | **314.2** / 149.2 MiB | 344.5 | 138.9 / 75.6 MiB | 201.2 | **0.91x (Pion 1.10x faster vs `StringRecord`)** | `97221bca6d1004af` |
-| `heavy_quote.csv` (52 MB, dense `""` escapes) | 181.2 / 100.8 MiB | 100.8 | 100.4 / 51.4 MiB | 173.6 | 1.81x slower (vs `ByteRecord`) | `3c55bcf725b2b4d0` |
-| `wide_1000.csv` (58 MB, 1,000 cols × 20k rows) | 255.6 / 112.4 MiB | 120.1 | 119.2 / 57.3 MiB | 268.7 | 2.15x slower (vs `ByteRecord`; 1.05x faster vs Go) | `073eb90b9624881a` |
-| `semicolon.csv` (55 MB, `;` delimiter) | 193.5 / 107.0 MiB | 124.4 | 105.8 / 54.5 MiB | 163.5 | 1.83x slower (vs `ByteRecord`) | `40345eda2400b10b` |
-| `trim_comment.csv` (64 MB, `Trim::All` + `#`) | **168.0** / 124.0 MiB | 298.7 | 202.7 / 63.1 MiB | 119.3 | **0.83x vs `ByteRecord` (1.21x faster), 0.56x vs `StringRecord` (1.78x faster)** | `66276dcc4331b3f9` |
-| `escape.csv` (22 MB, `\` escape, `double_quote=false`) | 147.1 / 44.1 MiB | 54.4 | 47.1 / 23.0 MiB | n/a | 3.12x slower (vs `ByteRecord`) | `9ae0aabfea6d2ca3` |
-| `narrow.csv` (40 MB, `read_all` 2M × 10 fields) | 429.9 / 668.5 MiB | 289.9 | 280.1 / 517.7 MiB | 403.9 / 521.0 MiB | 1.53x slower, 1.29x memory (vs `ByteRecord`) | `0f6b0ef0092b8c05` |
+| `mixed_200k.csv` (15 MB, default `from_string`) | **63.5** / 31.3 MiB | 40.9 | 35.4 / 16.7 MiB | 65.0 | 1.79x vs `ByteRecord` (**1.02x faster vs Go**) | `238820ffb412645a` |
+| `mixed_1m.csv` (77 MB, default `from_string`) | **296.6** / 149.4 MiB | 184.2 | 149.1 / 75.8 MiB | 299.9 | 1.99x vs `ByteRecord` (**1.01x faster vs Go**) | `97221bca6d1004af` |
+| `mixed_1m.csv` (77 MB, `from_bytes` validated) | **294.0** / 149.3 MiB | 162.2 | 141.3 / 75.8 MiB | 252.9 | 1.81x vs `StringRecord` | `97221bca6d1004af` |
+| `mixed_1m.csv` (77 MB, `Record::fields()` alloc) | **327.4** / 149.3 MiB | 319.1 | 147.1 / 75.6 MiB | 322.5 | 1.03x vs `StringRecord` (~parity with Rust & Go) | `97221bca6d1004af` |
+| `heavy_quote.csv` (52 MB, dense `""` escapes) | **208.0** / 101.0 MiB | 108.5 | 108.2 / 51.4 MiB | 194.7 | 1.92x vs `ByteRecord` (1.07x vs Go) | `3c55bcf725b2b4d0` |
+| `wide_1000.csv` (58 MB, 1,000 cols × 20k rows) | **310.4** / 112.6 MiB | 149.9 | 151.2 / 57.2 MiB | 391.2 | 2.05x vs `ByteRecord` (**1.26x faster vs Go**) | `073eb90b9624881a` |
+| `semicolon.csv` (55 MB, `;` delimiter) | **247.4** / 107.0 MiB | 147.4 | 128.1 / 54.5 MiB | 245.0 | 1.93x vs `ByteRecord` (~parity with Go) | `40345eda2400b10b` |
+| `trim_comment.csv` (64 MB, `Trim::All` + `#`) | **210.7** / 124.1 MiB | 276.8 | 202.5 / 63.1 MiB | 188.5 | **1.31x faster vs `StringRecord`**, 1.04x vs `ByteRecord` | `66276dcc4331b3f9` |
+| `escape.csv` (22 MB, `\` escape, `double_quote=false`) | **118.1** / 44.2 MiB | 55.2 | 53.6 / 23.1 MiB | n/a | 2.20x vs `ByteRecord` | `9ae0aabfea6d2ca3` |
+| `narrow.csv` (40 MB, `read_all` 2M × 10 fields) | **523.1** / **471.2 MiB** | 601.4 | 579.8 / 574.6 MiB | 788.9 / 510.5 MiB | **1.11x faster & -103 MiB RSS vs `ByteRecord`**, **1.51x faster vs Go** | `0f6b0ef0092b8c05` |
 
-- **No 16 MiB fast-path cliff**: on `mixed_1m.csv` (77 MB), `CsvConfig::default()` (`242.2 ms`) and `max_record_bytes = 0` (`240.1 ms`) are identical (`1.01x`).
+- **No 16 MiB fast-path cliff**: on `mixed_1m.csv` (77 MB), `CsvConfig::default()` (`348.6 ms`) and `max_record_bytes = 0` (`371.6 ms`) are within run-to-run variance (`0.94x`).
 
 ### Steady-State 2-Round Benchmarks (`sh packages/csv/bench/run_bench.sh`)
 
@@ -87,9 +87,9 @@ Stdout SHA-256 (verified identical): `1ead353719fe54e5aea4d0c4818d61134d51f364ce
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_csv`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`from_string`) | 92.004 | 86.764 | 92.932 | 335.97 | 230.01 | 31.27 MiB | 0.95x |
-| `rust_csv` (`StringRecord`, `=1.4.0 --release`) | **68.669** | 67.640 | 69.604 | **450.14** | **171.67** | 16.66 MiB | **1.27x** |
-| `go_csv` (`encoding/csv`) | 87.099 | 85.064 | 89.837 | 354.90 | 217.75 | 37.59 MiB | 1.00x (baseline) |
+| `pion` (`from_string`) | **95.742** | 86.369 | 97.058 | **322.86** | **239.35** | 31.31 MiB | **1.10x** |
+| `rust_csv` (`StringRecord`, `=1.4.0 --release`) | **71.969** | 64.928 | 96.865 | **429.50** | **179.92** | 16.70 MiB | **1.47x** |
+| `go_csv` (`encoding/csv`) | 105.718 | 94.370 | 113.833 | 292.39 | 264.29 | 34.26 MiB | 1.00x (baseline) |
 
 #### Bench 2 (Write): 200k Structured Records × 2 Steady-State Rounds (400,000 records, `29,001,498 B`)
 
@@ -97,9 +97,9 @@ Stdout SHA-256 (verified identical): `ddc27c6360c7b492919a2ebe9e6421cf6adf7aec87
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_csv`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | **73.909** | 73.064 | 83.390 | **392.39** | **184.77** | 30.00 MiB | **1.26x** |
-| `rust_csv` (`=1.4.0 --release`) | 74.053 | 72.719 | 89.356 | 391.63 | 185.13 | 16.38 MiB | 1.26x |
-| `go_csv` (`encoding/csv`) | 93.478 | 91.407 | 94.448 | 310.25 | 233.69 | 40.31 MiB | 1.00x (baseline) |
+| `pion` | **83.718** | 78.958 | 96.432 | **346.42** | **209.30** | 31.76 MiB | **1.51x** |
+| `rust_csv` (`=1.4.0 --release`) | **70.046** | 67.606 | 80.255 | **414.04** | **175.11** | 18.39 MiB | **1.80x** |
+| `go_csv` (`encoding/csv`) | 126.341 | 102.084 | 147.008 | 229.55 | 315.85 | 39.81 MiB | 1.00x (baseline) |
 
 ## Verification
 
