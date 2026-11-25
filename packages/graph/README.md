@@ -16,12 +16,12 @@ Pure Pion, zero-`World`, zero-dependency, `Send`-safe graph data structures and 
   - `bridges` (tracks `parent_edge` so parallel edges are properly recognized as non-bridges) and `articulation_points` (Tarjan low-link, sorted by `NodeId`).
   - `is_bipartite` (BFS 2-coloring, detects odd cycles and self-loops).
 - **DAG & Compiler CFG/SSA Analysis**:
-  - `toposort` (Kahn's algorithm with zero-allocation binary min-heap for deterministic **lexicographically smallest** topological order) and `toposort_any` (`O(V + E)` FIFO queue). On cycles, both return `Err(HasCycle(node))` where `node` is guaranteed to lie on a directed cycle.
+  - `toposort` (Kahn's algorithm with inlined `FixedArray` 4-ary min-heap and deferred root sift-down for deterministic **lexicographically smallest** topological order) and `toposort_any` (`O(V + E)` FIFO queue). On cycles, both return `Err(HasCycle(node))` where `node` is guaranteed to lie on a directed cycle.
   - `find_cycle` & `is_cyclic` (iterative 3-color DFS returning exact cycle node paths, including self-loops).
   - `dominators` (Cooper-Harvey-Kennedy iterative algorithm using flat `FixedArray[Int]` tables with zero `HashMap`/`HashSet` overhead): `immediate_dominator`, `dominates`, `strict_dominators`, `all_dominators`, `immediately_dominated_by`, and `dominance_frontiers` (full Cytron et al. semantics including back-edges and self-loops targeting the entry root).
   - `transitive_reduction` (`O(V + E)` memory with `O(1)` fast-skips for out-degree `<= 1` / all-sink neighbors and epoch-stamped topological-pruned DFS) and `transitive_closure` (bitset DP with explicit `Int64` size guard).
 - **Shortest Paths, Minimum Spanning Trees & Network Flow**:
-  - `dijkstra` / `dijkstra_i64` / `csr_dijkstra` (zero-allocation binary min-heap, early exit on optional `goal`, rejects negative weights with `Err(NegativeWeight)` and true shortest-path `Int64` overflow with `Err(WeightOverflow)` while ignoring non-improving overflowing candidates).
+  - `dijkstra` / `dijkstra_i64` / `csr_dijkstra` (inlined indexed 4-ary min-heap with `O(V)` fixed memory and in-place decrease-key, early exit on optional `goal`, rejects negative weights with `Err(NegativeWeight)` and true shortest-path `Int64` overflow with `Err(WeightOverflow)` while ignoring non-improving overflowing candidates).
   - `astar` (supports admissible non-consistent heuristics via closed-node re-opening, with negative edge/heuristic and overflow guards).
   - `bellman_ford` & `find_negative_cycle` (fast `Int64` path with exact 128-bit signed fallback so large-weight negative cycles always report `NegativeCycle` / extract the cycle rather than false `WeightOverflow`).
   - `floyd_warshall` (fast single-array `Int64` kernel for bounded non-negative weights, exact 128-bit signed kernel for negative/huge weights, explicit `node_count` size guard).
@@ -50,7 +50,7 @@ node "$HOME/.pion/share/pion/pion_wasm_rt.mjs" /private/tmp/graph-smoke/smoke_re
 
 All 29 unit + red-team regression tests pass, 20/21 audit tests pass (only `p2_neighbor_order_matches_petgraph` intentionally differs because `DiGraph` preserves insertion-order iteration rather than `petgraph`'s LIFO order), and `packages/graph/wasm_smoke` exits `0` across all 4 modes.
 
-## Head-to-Head Benchmarks (`Darwin arm64`, `--warmup 1 --rounds 5`)
+## Head-to-Head Benchmarks (`Linux x86_64`, `--warmup 1 --rounds 5`)
 
 Measured via `sh packages/graph/bench/run_bench.sh` using `scripts/bench_compare.py` (strictly interleaved rounds, mandatory byte-identical stdout SHA-256 verification across all implementations):
 
@@ -61,9 +61,9 @@ Measured via `sh packages/graph/bench/run_bench.sh` using `scripts/bench_compare
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_digraph` | 69.541 | 61.842 | 93.057 | 92.72 | 14.78 MiB | 0.91x |
-| `pion_csr` | 47.174 | 45.962 | 48.540 | 62.90 | 19.03 MiB | **1.34x** |
-| `rust_petgraph` | 63.012 | 56.597 | 73.541 | 84.02 | 10.36 MiB | 1.00x (baseline) |
+| `pion_digraph` | 64.228 | 48.887 | 86.843 | 85.64 | 11.28 MiB | **1.38x** |
+| `pion_csr` | 49.432 | 37.944 | 67.156 | 65.91 | 13.03 MiB | **1.79x** |
+| `rust_petgraph` | 88.427 | 72.632 | 140.735 | 117.90 | 11.28 MiB | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `7d2284ef80a7958750d57f68f5b7c13e778b90566e1aa519f59de9fa21baa83e`._
 
@@ -71,9 +71,9 @@ _SHA-256 verified identical across all implementations and rounds: `7d2284ef80a7
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_digraph` | 79.203 | 69.790 | 80.445 | 99.00 | 50.98 MiB | 0.60x |
-| `pion_csr` | 80.140 | 67.131 | 91.331 | 100.18 | 57.16 MiB | 0.59x |
-| `rust_petgraph` | 47.419 | 44.977 | 58.554 | 59.27 | 34.41 MiB | 1.00x (baseline) |
+| `pion_digraph` | 111.820 | 93.781 | 131.573 | 139.78 | 33.56 MiB | 0.61x |
+| `pion_csr` | 148.297 | 132.550 | 182.901 | 185.37 | 38.49 MiB | 0.46x |
+| `rust_petgraph` | 68.248 | 55.642 | 93.631 | 85.31 | 33.67 MiB | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `765842299691f19a22f0cdf0c8aa82872f1736b55d15c90b19522f0eedae1b3f`._
 
@@ -81,8 +81,8 @@ _SHA-256 verified identical across all implementations and rounds: `765842299691
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 20.565 | 18.085 | 24.096 | 102.83 | 20.88 MiB | **1.27x** |
-| `rust_petgraph` | 26.138 | 25.721 | 28.549 | 130.69 | 12.52 MiB | 1.00x (baseline) |
+| `pion` | 26.644 | 25.200 | 28.428 | 133.22 | 13.06 MiB | **2.04x** |
+| `rust_petgraph` | 54.394 | 51.931 | 59.380 | 271.97 | 11.96 MiB | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `99042b7e421ab0d812b17c519414d5c6b0d1622c526fd32fa3fd30314527198e`._
 
@@ -90,26 +90,28 @@ _SHA-256 verified identical across all implementations and rounds: `99042b7e421a
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_petgraph`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion_digraph` | 24.869 | 22.975 | 26.494 | 82.90 | 5.55 MiB | **1.68x** |
-| `pion_csr` | 21.727 | 21.237 | 22.014 | 72.42 | 7.28 MiB | **1.92x** |
-| `rust_petgraph` | 41.751 | 40.911 | 42.089 | 139.17 | 8.61 MiB | 1.00x (baseline) |
+| `pion_digraph` | 26.801 | 22.174 | 29.223 | 89.34 | 11.28 MiB | **3.02x** |
+| `pion_csr` | 18.251 | 17.110 | 22.872 | 60.84 | 11.28 MiB | **4.43x** |
+| `rust_petgraph` | 80.872 | 71.384 | 98.906 | 269.57 | 11.28 MiB | 1.00x (baseline) |
 
 _SHA-256 verified identical across all implementations and rounds: `8e7d2450047cbab918a4750d47eaac42b7146df5ba268c76f74c387920aabd2f`._
 
 ### Additional Adversarial Benchmarks (`packages/graph/audit/bench_adversarial.sh`, SHA-256 verified)
 
-| Workload | Pion (ms) | Rust `petgraph` (ms) | Speedup | Peak RSS (Pion / Rust) |
-| --- | ---: | ---: | ---: | --- |
-| `A2_dinic_layers` (200 layers × 10) | 14.2 | 25.9 | **1.83x** | 6 / 5 MiB |
-| `A9_floyd_dense` (300 dense) | 24.3 | 31.9 | **1.31x** | 6 / 7 MiB |
-| `A10_tred_chain` (20k chain) | 13.7 | 1255.9 | **91.46x** | **7 / 912 MiB** |
-| `A10b_tred_star` (100k out-star) | 58.3 | 21.0 | 0.36x | **28 / 22 MiB** (down from 1,217 MiB) |
-| `A11_dominators_rand` (50k / 200k) | 52.6 | 63.0 | **1.20x** | 27 / 29 MiB |
+| Workload | Pion (ms) | Rust `petgraph` (ms) | Speedup |
+| --- | ---: | ---: | ---: |
+| `A1_bellman_ford` (20k / 80k) | 22.1 | 24.4 | **1.11x** |
+| `A2_dinic_layers` (200 layers × 10) | 6.6 | 10.8 | **1.64x** |
+| `A9_floyd_dense` (300 dense) | 19.7 | 26.5 | **1.35x** |
+| `A10_tred_chain` (20k chain) | 6.6 | 942.2 | **143.19x** |
+| `A10b_tred_star` (100k out-star) | 24.3 | 15.0 | 0.62x |
+| `A11_dominators_rand` (50k / 200k) | 66.2 | 119.5 | **1.81x** |
+| `A13_prim` (50k / 200k) | 146.6 | 155.3 | **1.06x** |
 
 ### Honest Benchmark Notes & Scope Boundaries
 
-- **Where Pion leads end-to-end**: **W1 Dijkstra CSR (`1.34x`)**, **W3 Kruskal MST (`1.27x`, kernel `1.98x`)**, **W4 CFG Dominators (`1.68x–1.92x`)**, **Dinic Max-Flow (`1.83x`)**, **Floyd-Warshall (`1.31x`)**, and **Transitive Reduction on chains (`91.46x`, `7 MiB` vs `912 MiB`)**.
-- **Where Pion trails end-to-end**: **W2 (Tarjan SCC + Toposort, `0.60x`)** and build-dominated workloads (`B0_build_dense` `0.30x`, `B0_build_rand` `0.24x`). Although the Tarjan SCC kernel itself is **2.4x–5.0x faster** than `petgraph`, `DiGraph::add_edge` currently pays `pionc 0.1.0` runtime overhead from heap-boxing `Result[EdgeId, GraphError]` + `EdgeId` + `NodeId` per call and 8-byte `Array[Int]` slots (yielding ~1.5x RSS vs Rust's 24-byte `Edge` struct). `W2` also calls `toposort` (lex-smallest binary heap) rather than `toposort_any` (`O(V + E)`).
+- **Where Pion leads end-to-end**: **W1 Dijkstra DiGraph (`1.38x`) & CSR (`1.79x`)**, **W3 Kruskal MST (`2.04x`, kernel `3.67x`)**, **W4 CFG Dominators (`3.02x–4.43x`, kernel `5.15x`)**, **Dinic Max-Flow (`1.64x`)**, **Floyd-Warshall (`1.35x`)**, **Bellman-Ford (`1.11x`)**, **Prim MST (`1.06x`)**, and **Transitive Reduction on chains (`143.19x`)**.
+- **Where Pion trails end-to-end**: **W2 (Tarjan SCC + Toposort, `0.61x`, down from `154.6 ms` to `111.8 ms`, Peak RSS `33.56 MiB` vs Rust `33.67 MiB`)** and build-dominated workloads (`B0_build_dense` `0.42x`, `B0_build_rand` `0.33x`). Although the Tarjan SCC kernel itself is **1.68x faster** than `petgraph` (`37.7 ms` vs `63.2 ms` on 100k/400k random graphs), constructing two 100k-node / 400k-edge graphs (`800,000` `DiGraph::add_edge` calls) currently pays `pionc 0.1.0` per-call heap-boxing overhead for `NodeId`, `EdgeId`, and `Result[EdgeId, GraphError]` (~58 ms for construction alone). `W2` also calls `toposort` (lex-smallest 4-ary heap) rather than `toposort_any` (`O(V + E)`).
 - **Compatibility & scope boundaries**:
   - Shortest-path, MST, and flow weights use exact `Int64` arithmetic (with exact 128-bit fallback in `bellman_ford`, `find_negative_cycle`, and `floyd_warshall`) rather than IEEE-754 `Float`.
   - `DiGraph::remove_node` unlinks incident edges newest-first to match `petgraph::Graph` `EdgeId` swap-remove layout (`0 / 10,000` layout mismatches in differential fuzzing).
