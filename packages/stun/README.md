@@ -2,7 +2,7 @@
 
 100% pure Pion implementation of **RFC 8489 STUN**, **RFC 5769 Test Vectors**, **RFC 7983 Demux**, and **RFC 8445 ICE** (Sans-IO connectivity check & nomination state machine) — zero `extern "C"`, zero `World` dependency.
 
-Directly reuses `packages/crypto` (`v0.2.0`) for `Sha1` / `sha1`, `sha256`, `HmacSha256`, and `constant_time_eq`. Because `packages/crypto` does not expose `hmac_sha1`, IEEE CRC-32, or MD5, `packages/stun/src/crypto_helpers.pion` implements RFC 2104 HMAC-SHA1 (on top of `crypto::Sha1` / `crypto::sha1`), a 256-entry LUT IEEE 802.3 CRC-32 (`FINGERPRINT`), and RFC 1321 MD5 (for RFC 5769 §2.4 / RFC 8489 §10.2.2 long-term credential key derivation) in pure Pion.
+Directly reuses `packages/crypto` (`v0.4.2`) for `sha1` (keys > 64 B), `sha256`, `HmacSha256`, and `constant_time_eq`. Because `packages/crypto` does not expose `hmac_sha1`, IEEE CRC-32, or MD5, `packages/stun/src/crypto_helpers.pion` implements RFC 2104 HMAC-SHA1 (single-scratch-buffer 5-round unrolled SHA-1 with zero-copy STUN header length patching), a single-table slice-by-4 IEEE 802.3 CRC-32 (`FINGERPRINT`), and RFC 1321 MD5 (for RFC 5769 §2.4 / RFC 8489 §10.2.2 long-term credential key derivation) in pure Pion.
 
 ## Features
 
@@ -82,13 +82,13 @@ pionc run --target wasm32 packages/stun/wasm_smoke
 pionc run --target wasm32 --release packages/stun/wasm_smoke
 ```
 
-## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=1`, `rounds=5`)
+## Head-to-Head Benchmarks (`Linux x86_64`, `warmup=1`, `rounds=5`)
 
 Run via `sh packages/stun/bench/run_bench.sh` against Rust **`webrtc-rs/stun` `v0.8.0` (`--release`, backed by `ring` ASM SHA-1)** on 100,000 real WebRTC ICE STUN packets (3-way mix: Binding Request with `USERNAME` + `PRIORITY` + `ICE-CONTROLLING` + `USE-CANDIDATE` + `MESSAGE-INTEGRITY` + `FINGERPRINT`; Binding Success Response IPv4 with `XOR-MAPPED-ADDRESS` + `MESSAGE-INTEGRITY` + `FINGERPRINT`; Binding Success Response IPv6 with `XOR-MAPPED-ADDRESS` + `MESSAGE-INTEGRITY` + `FINGERPRINT`).
 
 All 100,000 encoded wire packets and all decoded/verified checksums are verified **100% byte-for-byte identical** via SHA-256:
 
-| Workload | `pion` Median (`ns/op`) | `rust_webrtc_stun` Median (`ns/op`) | `pion` Peak RSS | `rust_webrtc_stun` Peak RSS | `pion` vs `rust_webrtc_stun` | Stdout SHA-256 (Identical) |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Encode + Sign (`MI` + `FP`, 100k pkts) | 331.526 ms (`3315.26 ns/op`) | 198.978 ms (`1989.78 ns/op`) | 1.86 MiB | 2.08 MiB | **0.60x** | `eb1d673bb93fca8f...` |
-| Decode + Verify `FP` + Verify `MI` (100k pkts) | 368.555 ms (`3685.55 ns/op`) | 142.332 ms (`1423.31 ns/op`) | 1.89 MiB | 2.11 MiB | **0.39x** | `2739a0786b801d32...` |
+| Workload | `pion` Median (`ns/op`) | `rust_webrtc_stun` Median (`ns/op`) | `pion` vs `rust_webrtc_stun` | Stdout SHA-256 (Identical) |
+| --- | ---: | ---: | ---: | --- |
+| Encode + Sign (`MI` + `FP`, 100k pkts) | 237.839 ms (`2378.39 ns/op`) | 126.238 ms (`1262.38 ns/op`) | **0.53x** | `eb1d673bb93fca8f...` |
+| Decode + Verify `FP` + Verify `MI` (100k pkts) | 133.658 ms (`1336.58 ns/op`) | 113.300 ms (`1133.00 ns/op`) | **0.85x** | `2739a0786b801d32...` |
