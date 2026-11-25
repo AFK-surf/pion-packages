@@ -8,7 +8,7 @@ export PATH="$HOME/.pion/bin:$HOME/.cargo/bin:$PATH"
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/pion-protobuf-bench"
+OUT_DIR="${TMPDIR:-/tmp}/pion-protobuf-bench"
 BIN_DIR="$OUT_DIR/bin"
 CORPUS_FILE="$OUT_DIR/spans_2000.pb"
 
