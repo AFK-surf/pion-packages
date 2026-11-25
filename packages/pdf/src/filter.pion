@@ -3,49 +3,98 @@
 import "flate"
 
 ///| PackBits (`/RunLengthDecode`, ISO 32000-1 §7.4.5) encoder.
-///| Single pre-allocated output buffer (zero `ensure` checks or reallocations).
+///| Single-pass fused scan+copy with 4-byte unrolled literal/run loops into local `Bytes`.
 pub fn rle_encode(src : Bytes) -> Bytes {
   let n = src.length()
+  if n == 0 {
+    let mut empty = Bytes::new(1)
+    empty[0] = 0x80.to_byte()
+    return empty
+  }
   let max_out = n + n / 128 + 16
   let mut out = Bytes::new(max_out)
   let mut pos = 0
   let mut i = 0
   while i < n {
     let b = src[i]
-    let mut run = 1
-    let run_lim = if n - i < 128 { n - i } else { 128 }
-    while run < run_lim && src[i + run] == b {
-      run = run + 1
-    }
-    if run >= 3 {
+    if i + 2 < n && src[i + 1] == b && src[i + 2] == b {
+      let mut run = 3
+      let run_lim = if n - i < 128 { n - i } else { 128 }
+      while run + 4 <= run_lim &&
+      src[i + run] == b &&
+      src[i + run + 1] == b &&
+      src[i + run + 2] == b &&
+      src[i + run + 3] == b {
+        run = run + 4
+      }
+      while run < run_lim && src[i + run] == b {
+        run = run + 1
+      }
       out[pos] = (257 - run).to_byte()
       out[pos + 1] = b
       pos = pos + 2
       i = i + run
     } else {
       let start = i
-      let mut lit = 0
-      while i < n && lit < 128 {
-        if i + 2 < n && src[i] == src[i + 1] && src[i] == src[i + 2] {
-          break
-        }
-        i = i + 1
-        lit = lit + 1
-      }
-      if lit == 0 {
+      let end = if start + 128 < n { start + 128 } else { n }
+      if start + 1 >= end {
         out[pos] = 0.to_byte()
-        out[pos + 1] = src[i]
+        out[pos + 1] = b
         pos = pos + 2
-        i = i + 1
+        i = end
       } else {
-        out[pos] = (lit - 1).to_byte()
-        pos = pos + 1
-        let mut k = 0
-        while k < lit {
-          out[pos + k] = src[start + k]
-          k = k + 1
+        // Single-pass fused scan + copy: reserve header byte at `hdr_pos` and emit bytes directly.
+        let hdr_pos = pos
+        let b1 = src[start + 1]
+        out[hdr_pos + 1] = b
+        out[hdr_pos + 2] = b1
+        let mut p = hdr_pos + 3
+        let mut prev = b1
+        let mut j = start + 2
+        let mut hit_run = false
+        while j < end {
+          // 4-byte unrolled fast path: if no adjacent pair matches, no 3-run can begin here.
+          while j + 4 <= end {
+            let c0 = src[j]
+            let c1 = src[j + 1]
+            let c2 = src[j + 2]
+            let c3 = src[j + 3]
+            if c0 == prev || c1 == c0 || c2 == c1 || c3 == c2 {
+              break
+            }
+            out[p] = c0
+            out[p + 1] = c1
+            out[p + 2] = c2
+            out[p + 3] = c3
+            prev = c3
+            j = j + 4
+            p = p + 4
+          }
+          if j >= end {
+            break
+          }
+          let cur = src[j]
+          if cur == prev && j + 1 < n && src[j + 1] == cur {
+            // 3-run starts at `j - 1` (`prev`, which was already written to `out[p - 1]`).
+            p = p - 1
+            j = j - 1
+            hit_run = true
+            break
+          }
+          out[p] = cur
+          prev = cur
+          p = p + 1
+          j = j + 1
         }
-        pos = pos + lit
+        // Check whether a 3-run starts at `end - 1` (the last byte of the 128-byte window)
+        if !hit_run && end + 1 < n && prev == src[end] && prev == src[end + 1] {
+          p = p - 1
+          j = end - 1
+        }
+        let lit = j - start
+        out[hdr_pos] = (lit - 1).to_byte()
+        pos = p
+        i = j
       }
     }
   }
@@ -122,13 +171,27 @@ pub fn rle_decode(src : Bytes, max_output_bytes : Int) -> Result[Bytes, PdfError
           ),
         )
       }
-      let base = out.n
+      let buf = out.buf
+      let base = out.cur
       let mut k = 0
+      let lim8 = count - 8
+      while k <= lim8 {
+        buf[base + k] = bv
+        buf[base + k + 1] = bv
+        buf[base + k + 2] = bv
+        buf[base + k + 3] = bv
+        buf[base + k + 4] = bv
+        buf[base + k + 5] = bv
+        buf[base + k + 6] = bv
+        buf[base + k + 7] = bv
+        k = k + 8
+      }
       while k < count {
-        out.buf[base + k] = bv
+        buf[base + k] = bv
         k = k + 1
       }
-      out.n = base + count
+      out.cur = base + count
+      out.n = out.n + count
       out.virtual_n = out.n
     }
   }
@@ -197,12 +260,15 @@ pub fn rgba_to_white_rgb(rgba : Bytes, width : Int, height : Int) -> Bytes {
   let count = pixels64.to_int()
   let avail = rgba.length() / 4
   let max_i = if avail < count { avail } else { count }
-  let mut rgb = Bytes::new(count * 3)
-  let mut p = 0
-  while p < max_i {
-    let s = p * 4
-    let d = p * 3
-    let a = rgba[s + 3].to_int() & 0xFF
+  let total = count * 3
+  let mut rgb = Bytes::new(total)
+  let mut s = 0
+  let mut d = 0
+  let s_end = max_i * 4
+  let mut prev_a = -1
+  let mut prev_inv_w = 0
+  while s < s_end {
+    let a = rgba[s + 3].to_int()
     if a == 255 {
       rgb[d] = rgba[s]
       rgb[d + 1] = rgba[s + 1]
@@ -212,22 +278,25 @@ pub fn rgba_to_white_rgb(rgba : Bytes, width : Int, height : Int) -> Bytes {
       rgb[d + 1] = 0xFF.to_byte()
       rgb[d + 2] = 0xFF.to_byte()
     } else {
-      let inv_w = 255 * (255 - a) + 127
-      let r = rgba[s].to_int() & 0xFF
-      let g = rgba[s + 1].to_int() & 0xFF
-      let b = rgba[s + 2].to_int() & 0xFF
+      if a != prev_a {
+        prev_a = a
+        prev_inv_w = 255 * (255 - a) + 127
+      }
+      let inv_w = prev_inv_w
+      let r = rgba[s].to_int()
+      let g = rgba[s + 1].to_int()
+      let b = rgba[s + 2].to_int()
       rgb[d] = (((r * a + inv_w) * 257) >> 16).to_byte()
       rgb[d + 1] = (((g * a + inv_w) * 257) >> 16).to_byte()
       rgb[d + 2] = (((b * a + inv_w) * 257) >> 16).to_byte()
     }
-    p = p + 1
+    s = s + 4
+    d = d + 3
   }
   // Fill any remaining pixels past short RGBA input with white
-  let mut rem = max_i * 3
-  let total = count * 3
-  while rem < total {
-    rgb[rem] = 0xFF.to_byte()
-    rem = rem + 1
+  while d < total {
+    rgb[d] = 0xFF.to_byte()
+    d = d + 1
   }
   rgb
 }
@@ -248,14 +317,16 @@ pub fn rgba_split_rgb_alpha(rgba : Bytes, width : Int, height : Int) -> (Bytes, 
   let avail = rgba.length() / 4
   let max_i = if avail < count { avail } else { count }
   let mut p = 0
+  let mut s = 0
+  let mut d = 0
   while p < max_i {
-    let s = p * 4
-    let d = p * 3
     rgb[d] = rgba[s]
     rgb[d + 1] = rgba[s + 1]
     rgb[d + 2] = rgba[s + 2]
     alpha[p] = rgba[s + 3]
     p = p + 1
+    s = s + 4
+    d = d + 3
   }
   (rgb, alpha)
 }
