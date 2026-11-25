@@ -96,7 +96,7 @@ stored: def=3965 plain=3960 corr=7 fnv=1642679526
 fixed: def=19 plain=17 corr=7 fnv=1443652498
 dyn_l1: def=198 plain=15600 corr=88 fnv=2315173904
 dyn_l6: def=161 plain=15600 corr=93 fnv=343177715
-dyn_l9: def=152 plain=15600 corr=93 fnv=2198932572
+dyn_l9: def=152 plain=15600 corr=9 fnv=2198932572
 preflate_wasm_smoke:ok bomb=rejected bad_def=rejected bad_corr=rejected
 ```
 
