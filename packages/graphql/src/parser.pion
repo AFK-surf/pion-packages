@@ -1,17 +1,79 @@
 ///| 100% iterative explicit-stack GraphQL (October 2021) AST Parser (Executable + Schema SDL).
 
-struct Parser {
-  lex : Lexer
-  opts : ParseOptions
-  mut cur : Token
-  mut has_peek : Bool
-  mut peek_tok : Token
-  mut node_count : Int
-}
-
 ///| Hard upper bound on AST nesting depth to prevent native SIGSEGV / Wasm32 stack-overflow trap
 ///| during recursive runtime RC teardown of deeply nested AST nodes.
 let hard_max_depth : Int = 500
+
+// Shared immutable empty AST arrays (avoids >100k empty Array heap allocations on large schemas)
+let empty_args : Array[Argument] = []
+
+let empty_directives : Array[Directive] = []
+
+let empty_input_values : Array[InputValueDefinition] = []
+
+let empty_strings : Array[String] = []
+
+let empty_fields : Array[FieldDefinition] = []
+
+let empty_enum_vals : Array[EnumValueDefinition] = []
+
+let empty_var_defs : Array[VariableDefinition] = []
+
+let empty_values : Array[Value] = []
+
+let empty_obj_fields : Array[ObjectField] = []
+
+let empty_op_types : Array[OperationTypeDefinition] = []
+
+let empty_name_cache : FixedArray[String] = FixedArray::make(1, "")
+
+// Shared immutable built-in GraphQL scalar TypeRef singletons
+let type_id : TypeRef = TypeRef::Named("ID")
+
+let type_id_nn : TypeRef = TypeRef::NonNull(type_id)
+
+let type_string : TypeRef = TypeRef::Named("String")
+
+let type_string_nn : TypeRef = TypeRef::NonNull(type_string)
+
+let type_int : TypeRef = TypeRef::Named("Int")
+
+let type_int_nn : TypeRef = TypeRef::NonNull(type_int)
+
+let type_float : TypeRef = TypeRef::Named("Float")
+
+let type_float_nn : TypeRef = TypeRef::NonNull(type_float)
+
+let type_boolean : TypeRef = TypeRef::Named("Boolean")
+
+let type_boolean_nn : TypeRef = TypeRef::NonNull(type_boolean)
+
+enum ValFrame {
+  List(Array[Value])
+  Obj(Array[ObjectField], String)
+}
+
+enum SelFrameKind {
+  Root
+  FieldFrame(Option[String], String, Array[Argument], Array[Directive])
+  InlineFrame(Option[String], Array[Directive])
+}
+
+struct SelFrame {
+  kind : SelFrameKind
+  selections : Array[Selection]
+}
+
+struct Parser {
+  lex : Lexer
+  max_depth : Int
+  max_nodes : Int
+  mut node_count : Int
+  use_intern : Bool
+  name_cache : FixedArray[String]
+  val_stack : Array[ValFrame]
+  sel_stack : Array[SelFrame]
+}
 
 fn Parser::new(src : String, opts : ParseOptions) -> Result[Parser, GraphqlError] {
   let eff_depth = if opts.max_depth > hard_max_depth {
@@ -19,388 +81,506 @@ fn Parser::new(src : String, opts : ParseOptions) -> Result[Parser, GraphqlError
   } else {
     opts.max_depth
   }
-  let eff_opts = ParseOptions::new(eff_depth, opts.max_tokens, opts.max_nodes)
-  let lex = Lexer::new(src, eff_opts.max_tokens)
-  let first = match lex.next_token() {
-    Ok(t) => t
-    Err(e) => return Err(e)
+  let lex = Lexer::new(src, opts.max_tokens)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
+  }
+  let use_intern = src.length() >= 4096
+  let name_cache = if use_intern {
+    FixedArray::make(256, "")
+  } else {
+    empty_name_cache
   }
   Ok(
     Parser::{
       lex: lex,
-      opts: eff_opts,
-      cur: first,
-      has_peek: false,
-      peek_tok: Token::{ kind: TokenKind::Eof, line: 1, col: 1, offset: 0, len: 0 },
+      max_depth: eff_depth,
+      max_nodes: opts.max_nodes,
       node_count: 0,
+      use_intern: use_intern,
+      name_cache: name_cache,
+      val_stack: [],
+      sel_stack: [],
     },
   )
 }
 
-fn Parser::bump_node(self : Parser) -> Result[Unit, GraphqlError] {
-  self.node_count = self.node_count + 1
-  if self.node_count > self.opts.max_nodes {
-    return Err(
-      GraphqlError::new(
-        ErrorKind::LimitExceeded,
-        self.cur.line,
-        self.cur.col,
-        self.cur.offset,
-        "max_nodes limit exceeded",
-      ),
-    )
-  }
-  Ok(())
+fn Parser::cur_col(self : Parser) -> Int {
+  col_from(self.lex.src, self.lex.tok_line_start, self.lex.tok_start)
 }
 
-fn Parser::advance(self : Parser) -> Result[Token, GraphqlError] {
-  let prev = self.cur
-  if self.has_peek {
-    self.cur = self.peek_tok
-    self.has_peek = false
-    return Ok(prev)
-  }
-  match self.lex.next_token() {
-    Ok(next) => {
-      self.cur = next
-      Ok(prev)
-    }
-    Err(e) => Err(e)
-  }
-}
-
-fn Parser::peek(self : Parser) -> Result[Token, GraphqlError] {
-  if !self.has_peek {
-    match self.lex.next_token() {
-      Ok(next) => {
-        self.peek_tok = next
-        self.has_peek = true
-      }
-      Err(e) => return Err(e)
-    }
-  }
-  Ok(self.peek_tok)
-}
-
-fn Parser::err_unexpected(self : Parser, expected : String) -> GraphqlError {
-  let kind = match self.cur.kind {
-    TokenKind::Eof => ErrorKind::UnexpectedEof
-    _ => ErrorKind::UnexpectedToken
-  }
+fn Parser::err_at_cur(
+  self : Parser,
+  kind : ErrorKind,
+  msg : String,
+) -> GraphqlError {
   GraphqlError::new(
     kind,
-    self.cur.line,
-    self.cur.col,
-    self.cur.offset,
-    "expected " + expected,
+    self.lex.tok_line,
+    self.cur_col(),
+    self.lex.tok_start,
+    msg,
   )
 }
 
-fn Parser::expect_name(self : Parser) -> Result[String, GraphqlError] {
-  match self.cur.kind {
-    TokenKind::Name(s) => {
-      match self.advance() {
-        Ok(_) => Ok(s)
-        Err(e) => Err(e)
-      }
-    }
-    _ => Err(self.err_unexpected("Name"))
+fn Parser::err_unexpected(self : Parser, expected : String) -> GraphqlError {
+  let kind = if self.lex.tok_tag == tok_eof {
+    ErrorKind::UnexpectedEof
+  } else {
+    ErrorKind::UnexpectedToken
   }
+  self.err_at_cur(kind, "expected " + expected)
+}
+
+fn Parser::bump_node(self : Parser) -> Bool {
+  self.node_count = self.node_count + 1
+  if self.node_count > self.max_nodes {
+    self.lex.err = Some(
+      self.err_at_cur(ErrorKind::LimitExceeded, "max_nodes limit exceeded"),
+    )
+    return false
+  }
+  true
+}
+
+fn Parser::cur_name(self : Parser) -> String {
+  let lex = self.lex
+  let src = lex.src
+  let s = lex.tok_start
+  let e = lex.tok_end
+  if !self.use_intern {
+    return src.slice(s, e)
+  }
+  let n = e - s
+  let b0 = src.code_unit_at(s)
+  let blast = src.code_unit_at(e - 1)
+  let bmid = src.code_unit_at(s + (n >> 1))
+  let slot = (((b0 * 31 + bmid) * 31 + blast) * 31 + n) & 255
+  let cached = self.name_cache[slot]
+  if cached.length() == n && slice_eq(src, s, e, cached) {
+    return cached
+  }
+  let fresh = src.slice(s, e)
+  self.name_cache[slot] = fresh
+  fresh
+}
+
+fn Parser::cur_slice_eq(self : Parser, lit : String) -> Bool {
+  slice_eq(self.lex.src, self.lex.tok_start, self.lex.tok_end, lit)
+}
+
+fn Parser::expect_name(self : Parser) -> Result[String, GraphqlError] {
+  if self.lex.tok_tag != tok_name {
+    return Err(self.err_unexpected("Name"))
+  }
+  let s = self.cur_name()
+  if !self.lex.advance_raw(true) {
+    return Err(self.lex.take_err())
+  }
+  Ok(s)
 }
 
 fn Parser::expect_keyword(self : Parser, kw : String) -> Result[Unit, GraphqlError] {
-  match self.cur.kind {
-    TokenKind::Name(s) => {
-      if s == kw {
-        match self.advance() {
-          Ok(_) => Ok(())
-          Err(e) => Err(e)
-        }
-      } else {
-        Err(self.err_unexpected("keyword '" + kw + "'"))
-      }
+  if self.lex.tok_tag == tok_name && self.cur_slice_eq(kw) {
+    if !self.lex.advance_raw(true) {
+      return Err(self.lex.take_err())
     }
-    _ => Err(self.err_unexpected("keyword '" + kw + "'"))
+    return Ok(())
   }
+  Err(self.err_unexpected("keyword '" + kw + "'"))
 }
 
 fn Parser::skip_keyword(self : Parser, kw : String) -> Result[Bool, GraphqlError] {
-  match self.cur.kind {
-    TokenKind::Name(s) => {
-      if s == kw {
-        match self.advance() {
-          Ok(_) => Ok(true)
-          Err(e) => Err(e)
-        }
-      } else {
-        Ok(false)
-      }
+  if self.lex.tok_tag == tok_name && self.cur_slice_eq(kw) {
+    if !self.lex.advance_raw(true) {
+      return Err(self.lex.take_err())
     }
-    _ => Ok(false)
+    return Ok(true)
   }
+  Ok(false)
 }
 
-fn Parser::expect_punct(
+fn Parser::expect_tag(
   self : Parser,
-  expected : TokenKind,
+  expected : Int,
   label : String,
 ) -> Result[Unit, GraphqlError] {
-  if token_kind_eq(self.cur.kind, expected) {
-    match self.advance() {
-      Ok(_) => Ok(())
-      Err(e) => Err(e)
+  if self.lex.tok_tag == expected {
+    if !self.lex.advance_raw(true) {
+      return Err(self.lex.take_err())
     }
-  } else {
-    Err(self.err_unexpected(label))
+    return Ok(())
   }
+  Err(self.err_unexpected(label))
 }
 
-fn Parser::skip_punct(self : Parser, expected : TokenKind) -> Result[Bool, GraphqlError] {
-  if token_kind_eq(self.cur.kind, expected) {
-    match self.advance() {
-      Ok(_) => Ok(true)
-      Err(e) => Err(e)
+fn Parser::skip_tag(self : Parser, expected : Int) -> Result[Bool, GraphqlError] {
+  if self.lex.tok_tag == expected {
+    if !self.lex.advance_raw(true) {
+      return Err(self.lex.take_err())
     }
-  } else {
-    Ok(false)
+    return Ok(true)
   }
+  Ok(false)
 }
 
 ///| 100% iterative `TypeRef` parser (`[[String!]!]!`), bounded by `max_depth`.
 fn Parser::parse_type_ref(self : Parser) -> Result[TypeRef, GraphqlError] {
+  let lex = self.lex
   let mut list_depth = 0
-  while true {
-    match self.cur.kind {
-      TokenKind::LBracket => {
-        list_depth = list_depth + 1
-        if list_depth > self.opts.max_depth {
-          return Err(
-            GraphqlError::new(
-              ErrorKind::LimitExceeded,
-              self.cur.line,
-              self.cur.col,
-              self.cur.offset,
-              "max_depth limit exceeded in type",
-            ),
-          )
-        }
-        match self.advance() {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-      }
-      _ => break
+  while lex.tok_tag == tok_lbracket {
+    list_depth = list_depth + 1
+    if list_depth > self.max_depth {
+      return Err(
+        self.err_at_cur(ErrorKind::LimitExceeded, "max_depth limit exceeded in type"),
+      )
+    }
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
   }
-  let name = match self.expect_name() {
-    Ok(n) => n
-    Err(e) => return Err(e)
+  if lex.tok_tag != tok_name {
+    return Err(self.err_unexpected("Name"))
   }
-  match self.bump_node() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !self.bump_node() {
+    return Err(lex.take_err())
   }
-  let mut ty = TypeRef::Named(name)
-  match self.skip_punct(TokenKind::Bang) {
-    Ok(true) => {
-      ty = TypeRef::NonNull(ty)
-      match self.cur.kind {
-        TokenKind::Bang => return Err(self.err_unexpected("no duplicate '!'"))
-        _ => ()
-      }
+  let src = lex.src
+  let s = lex.tok_start
+  let e = lex.tok_end
+  let n = e - s
+  let b0 = src.code_unit_at(s)
+  // Fast path: built-in GraphQL scalar TypeRefs (zero allocation)
+  let mut builtin_id = 0
+  if n == 2 && b0 == 73 && src.code_unit_at(s + 1) == 68 {
+    builtin_id = 1 // ID
+  } else if n == 6 && b0 == 83 && slice_eq(src, s, e, "String") {
+    builtin_id = 2 // String
+  } else if n == 3 && b0 == 73 && slice_eq(src, s, e, "Int") {
+    builtin_id = 3 // Int
+  } else if n == 7 && b0 == 66 && slice_eq(src, s, e, "Boolean") {
+    builtin_id = 4 // Boolean
+  } else if n == 5 && b0 == 70 && slice_eq(src, s, e, "Float") {
+    builtin_id = 5 // Float
+  }
+  let mut ty = if builtin_id == 1 {
+    type_id
+  } else if builtin_id == 2 {
+    type_string
+  } else if builtin_id == 3 {
+    type_int
+  } else if builtin_id == 4 {
+    type_boolean
+  } else if builtin_id == 5 {
+    type_float
+  } else {
+    TypeRef::Named(self.cur_name())
+  }
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
+  }
+  if lex.tok_tag == tok_bang {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
-    Ok(false) => ()
-    Err(e) => return Err(e)
+    if lex.tok_tag == tok_bang {
+      return Err(self.err_unexpected("no duplicate '!'"))
+    }
+    ty = if builtin_id == 1 {
+      type_id_nn
+    } else if builtin_id == 2 {
+      type_string_nn
+    } else if builtin_id == 3 {
+      type_int_nn
+    } else if builtin_id == 4 {
+      type_boolean_nn
+    } else if builtin_id == 5 {
+      type_float_nn
+    } else {
+      TypeRef::NonNull(ty)
+    }
   }
   while list_depth > 0 {
-    match self.expect_punct(TokenKind::RBracket, "']'") {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+    if lex.tok_tag != tok_rbracket {
+      return Err(self.err_unexpected("']'"))
+    }
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
     ty = TypeRef::List(ty)
-    match self.bump_node() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+    if !self.bump_node() {
+      return Err(lex.take_err())
     }
-    match self.skip_punct(TokenKind::Bang) {
-      Ok(true) => {
-        ty = TypeRef::NonNull(ty)
-        match self.cur.kind {
-          TokenKind::Bang => return Err(self.err_unexpected("no duplicate '!'"))
-          _ => ()
-        }
+    if lex.tok_tag == tok_bang {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      Ok(false) => ()
-      Err(e) => return Err(e)
+      if lex.tok_tag == tok_bang {
+        return Err(self.err_unexpected("no duplicate '!'"))
+      }
+      ty = TypeRef::NonNull(ty)
     }
     list_depth = list_depth - 1
   }
   Ok(ty)
 }
 
-enum ValFrame {
-  List(Array[Value])
-  Obj(Array[ObjectField], String)
-}
-
-///| 100% iterative `Value` parser using an explicit heap stack, bounded by `max_depth` & `max_nodes`.
+///| 100% iterative `Value` parser using a reusable explicit heap stack, bounded by `max_depth` & `max_nodes`.
 fn Parser::parse_value_iter(
   self : Parser,
   is_const : Bool,
 ) -> Result[Value, GraphqlError] {
-  let stack : Array[ValFrame] = []
+  let lex = self.lex
+  if !self.bump_node() {
+    return Err(lex.take_err())
+  }
+  // Fast path for scalar / empty-container values (zero stack allocation)
+  let tag0 = lex.tok_tag
+  if tag0 == tok_dollar {
+    if is_const {
+      return Err(
+        self.err_at_cur(
+          ErrorKind::UnexpectedToken,
+          "variable not allowed in constant value",
+        ),
+      )
+    }
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let vname = match self.expect_name() {
+      Ok(n) => n
+      Err(e) => return Err(e)
+    }
+    return Ok(Value::Variable(vname))
+  }
+  if tag0 == tok_int {
+    let s = lex.src.slice(lex.tok_start, lex.tok_end)
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    return Ok(Value::IntValue(s))
+  }
+  if tag0 == tok_float {
+    let s = lex.src.slice(lex.tok_start, lex.tok_end)
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    return Ok(Value::FloatValue(s))
+  }
+  if tag0 == tok_str {
+    let s = lex.tok_string_val()
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    return Ok(Value::StringValue(s, false))
+  }
+  if tag0 == tok_block_str {
+    let s = lex.tok_decoded
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    return Ok(Value::StringValue(s, true))
+  }
+  if tag0 == tok_name {
+    let src = lex.src
+    let st = lex.tok_start
+    let en = lex.tok_end
+    let v = if slice_eq(src, st, en, "true") {
+      Value::BooleanValue(true)
+    } else if slice_eq(src, st, en, "false") {
+      Value::BooleanValue(false)
+    } else if slice_eq(src, st, en, "null") {
+      Value::NullValue
+    } else {
+      Value::EnumValue(self.cur_name())
+    }
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    return Ok(v)
+  }
+
+  // Container path: List or Object
+  let stack = self.val_stack
+  stack.clear()
+  if tag0 == tok_lbracket {
+    if 0 >= self.max_depth {
+      return Err(
+        self.err_at_cur(
+          ErrorKind::LimitExceeded,
+          "max_depth limit exceeded in list value",
+        ),
+      )
+    }
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    if lex.tok_tag == tok_rbracket {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
+      }
+      return Ok(Value::ListValue(empty_values))
+    }
+    stack.push(ValFrame::List([]))
+  } else if tag0 == tok_lbrace {
+    if 0 >= self.max_depth {
+      return Err(
+        self.err_at_cur(
+          ErrorKind::LimitExceeded,
+          "max_depth limit exceeded in object value",
+        ),
+      )
+    }
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    if lex.tok_tag == tok_rbrace {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
+      }
+      return Ok(Value::ObjectValue(empty_obj_fields))
+    }
+    let fname = match self.expect_name() {
+      Ok(n) => n
+      Err(e) => return Err(e)
+    }
+    match self.expect_tag(tok_colon, "':'") {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+    stack.push(ValFrame::Obj([], fname))
+  } else {
+    return Err(self.err_unexpected("Value"))
+  }
+
   let mut need_value = true
   let mut finished_val : Option[Value] = None
 
   while true {
     if need_value {
-      match self.bump_node() {
-        Ok(_) => ()
-        Err(e) => return Err(e)
+      if !self.bump_node() {
+        return Err(lex.take_err())
       }
-      match self.cur.kind {
-        TokenKind::LBracket => {
-          if stack.length() >= self.opts.max_depth {
-            return Err(
-              GraphqlError::new(
-                ErrorKind::LimitExceeded,
-                self.cur.line,
-                self.cur.col,
-                self.cur.offset,
-                "max_depth limit exceeded in list value",
-              ),
-            )
-          }
-          match self.advance() {
-            Ok(_) => ()
-            Err(e) => return Err(e)
-          }
-          match self.cur.kind {
-            TokenKind::RBracket => {
-              match self.advance() {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
-              finished_val = Some(Value::ListValue([]))
-              need_value = false
-            }
-            _ => {
-              stack.push(ValFrame::List([]))
-              need_value = true
-            }
-          }
+      let tag = lex.tok_tag
+      if tag == tok_lbracket {
+        if stack.length() >= self.max_depth {
+          return Err(
+            self.err_at_cur(
+              ErrorKind::LimitExceeded,
+              "max_depth limit exceeded in list value",
+            ),
+          )
         }
-        TokenKind::LBrace => {
-          if stack.length() >= self.opts.max_depth {
-            return Err(
-              GraphqlError::new(
-                ErrorKind::LimitExceeded,
-                self.cur.line,
-                self.cur.col,
-                self.cur.offset,
-                "max_depth limit exceeded in object value",
-              ),
-            )
-          }
-          match self.advance() {
-            Ok(_) => ()
-            Err(e) => return Err(e)
-          }
-          match self.cur.kind {
-            TokenKind::RBrace => {
-              match self.advance() {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
-              finished_val = Some(Value::ObjectValue([]))
-              need_value = false
-            }
-            _ => {
-              let fname = match self.expect_name() {
-                Ok(n) => n
-                Err(e) => return Err(e)
-              }
-              match self.expect_punct(TokenKind::Colon, "':'") {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
-              stack.push(ValFrame::Obj([], fname))
-              need_value = true
-            }
-          }
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
         }
-        TokenKind::Dollar => {
-          if is_const {
-            return Err(
-              GraphqlError::new(
-                ErrorKind::UnexpectedToken,
-                self.cur.line,
-                self.cur.col,
-                self.cur.offset,
-                "variable not allowed in constant value",
-              ),
-            )
+        if lex.tok_tag == tok_rbracket {
+          if !lex.advance_raw(true) {
+            return Err(lex.take_err())
           }
-          match self.advance() {
-            Ok(_) => ()
-            Err(e) => return Err(e)
+          finished_val = Some(Value::ListValue(empty_values))
+          need_value = false
+        } else {
+          stack.push(ValFrame::List([]))
+          need_value = true
+        }
+      } else if tag == tok_lbrace {
+        if stack.length() >= self.max_depth {
+          return Err(
+            self.err_at_cur(
+              ErrorKind::LimitExceeded,
+              "max_depth limit exceeded in object value",
+            ),
+          )
+        }
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
+        }
+        if lex.tok_tag == tok_rbrace {
+          if !lex.advance_raw(true) {
+            return Err(lex.take_err())
           }
-          let vname = match self.expect_name() {
+          finished_val = Some(Value::ObjectValue(empty_obj_fields))
+          need_value = false
+        } else {
+          let fname = match self.expect_name() {
             Ok(n) => n
             Err(e) => return Err(e)
           }
-          finished_val = Some(Value::Variable(vname))
-          need_value = false
-        }
-        TokenKind::Int(s) => {
-          match self.advance() {
+          match self.expect_tag(tok_colon, "':'") {
             Ok(_) => ()
             Err(e) => return Err(e)
           }
-          finished_val = Some(Value::IntValue(s))
-          need_value = false
+          stack.push(ValFrame::Obj([], fname))
+          need_value = true
         }
-        TokenKind::Float(s) => {
-          match self.advance() {
-            Ok(_) => ()
-            Err(e) => return Err(e)
-          }
-          finished_val = Some(Value::FloatValue(s))
-          need_value = false
+      } else if tag == tok_dollar {
+        if is_const {
+          return Err(
+            self.err_at_cur(
+              ErrorKind::UnexpectedToken,
+              "variable not allowed in constant value",
+            ),
+          )
         }
-        TokenKind::Str(s) => {
-          match self.advance() {
-            Ok(_) => ()
-            Err(e) => return Err(e)
-          }
-          finished_val = Some(Value::StringValue(s, false))
-          need_value = false
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
         }
-        TokenKind::BlockStr(s) => {
-          match self.advance() {
-            Ok(_) => ()
-            Err(e) => return Err(e)
-          }
-          finished_val = Some(Value::StringValue(s, true))
-          need_value = false
+        let vname = match self.expect_name() {
+          Ok(n) => n
+          Err(e) => return Err(e)
         }
-        TokenKind::Name(s) => {
-          match self.advance() {
-            Ok(_) => ()
-            Err(e) => return Err(e)
-          }
-          if s == "true" {
-            finished_val = Some(Value::BooleanValue(true))
-          } else if s == "false" {
-            finished_val = Some(Value::BooleanValue(false))
-          } else if s == "null" {
-            finished_val = Some(Value::NullValue)
-          } else {
-            finished_val = Some(Value::EnumValue(s))
-          }
-          need_value = false
+        finished_val = Some(Value::Variable(vname))
+        need_value = false
+      } else if tag == tok_int {
+        let s = lex.src.slice(lex.tok_start, lex.tok_end)
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
         }
-        _ => return Err(self.err_unexpected("Value"))
+        finished_val = Some(Value::IntValue(s))
+        need_value = false
+      } else if tag == tok_float {
+        let s = lex.src.slice(lex.tok_start, lex.tok_end)
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
+        }
+        finished_val = Some(Value::FloatValue(s))
+        need_value = false
+      } else if tag == tok_str {
+        let s = lex.tok_string_val()
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
+        }
+        finished_val = Some(Value::StringValue(s, false))
+        need_value = false
+      } else if tag == tok_block_str {
+        let s = lex.tok_decoded
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
+        }
+        finished_val = Some(Value::StringValue(s, true))
+        need_value = false
+      } else if tag == tok_name {
+        let src = lex.src
+        let st = lex.tok_start
+        let en = lex.tok_end
+        let v = if slice_eq(src, st, en, "true") {
+          Value::BooleanValue(true)
+        } else if slice_eq(src, st, en, "false") {
+          Value::BooleanValue(false)
+        } else if slice_eq(src, st, en, "null") {
+          Value::NullValue
+        } else {
+          Value::EnumValue(self.cur_name())
+        }
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
+        }
+        finished_val = Some(v)
+        need_value = false
+      } else {
+        return Err(self.err_unexpected("Value"))
       }
     } else {
       let v_node = match finished_val {
@@ -416,44 +596,36 @@ fn Parser::parse_value_iter(
       match frame {
         ValFrame::List(items) => {
           items.push(v_node)
-          match self.cur.kind {
-            TokenKind::RBracket => {
-              match self.advance() {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
-              finished_val = Some(Value::ListValue(items))
-              need_value = false
+          if lex.tok_tag == tok_rbracket {
+            if !lex.advance_raw(true) {
+              return Err(lex.take_err())
             }
-            _ => {
-              stack.push(ValFrame::List(items))
-              need_value = true
-            }
+            finished_val = Some(Value::ListValue(items))
+            need_value = false
+          } else {
+            stack.push(ValFrame::List(items))
+            need_value = true
           }
         }
         ValFrame::Obj(fields, cur_name) => {
           fields.push(ObjectField::{ name: cur_name, value: v_node })
-          match self.cur.kind {
-            TokenKind::RBrace => {
-              match self.advance() {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
-              finished_val = Some(Value::ObjectValue(fields))
-              need_value = false
+          if lex.tok_tag == tok_rbrace {
+            if !lex.advance_raw(true) {
+              return Err(lex.take_err())
             }
-            _ => {
-              let next_name = match self.expect_name() {
-                Ok(n) => n
-                Err(e) => return Err(e)
-              }
-              match self.expect_punct(TokenKind::Colon, "':'") {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
-              stack.push(ValFrame::Obj(fields, next_name))
-              need_value = true
+            finished_val = Some(Value::ObjectValue(fields))
+            need_value = false
+          } else {
+            let next_name = match self.expect_name() {
+              Ok(n) => n
+              Err(e) => return Err(e)
             }
+            match self.expect_tag(tok_colon, "':'") {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            stack.push(ValFrame::Obj(fields, next_name))
+            need_value = true
           }
         }
       }
@@ -466,25 +638,23 @@ fn Parser::parse_arguments(
   self : Parser,
   is_const : Bool,
 ) -> Result[Array[Argument], GraphqlError] {
-  match self.cur.kind {
-    TokenKind::LParen => ()
-    _ => return Ok([])
+  let lex = self.lex
+  if lex.tok_tag != tok_lparen {
+    return Ok(empty_args)
   }
-  match self.advance() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
+  }
+  if lex.tok_tag == tok_rparen {
+    return Err(self.err_unexpected("at least one argument"))
   }
   let args : Array[Argument] = []
-  match self.cur.kind {
-    TokenKind::RParen => return Err(self.err_unexpected("at least one argument"))
-    _ => ()
-  }
   while true {
     let name = match self.expect_name() {
       Ok(n) => n
       Err(e) => return Err(e)
     }
-    match self.expect_punct(TokenKind::Colon, "':'") {
+    match self.expect_tag(tok_colon, "':'") {
       Ok(_) => ()
       Err(e) => return Err(e)
     }
@@ -493,14 +663,11 @@ fn Parser::parse_arguments(
       Err(e) => return Err(e)
     }
     args.push(Argument::{ name: name, value: v_node })
-    match self.cur.kind {
-      TokenKind::RParen => {
-        match self.advance() {
-          Ok(_) => break
-          Err(e) => return Err(e)
-        }
+    if lex.tok_tag == tok_rparen {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      _ => ()
+      break
     }
   }
   Ok(args)
@@ -510,248 +677,217 @@ fn Parser::parse_directives(
   self : Parser,
   is_const : Bool,
 ) -> Result[Array[Directive], GraphqlError] {
+  let lex = self.lex
+  if lex.tok_tag != tok_at {
+    return Ok(empty_directives)
+  }
   let dirs : Array[Directive] = []
-  while true {
-    match self.cur.kind {
-      TokenKind::At => {
-        match self.advance() {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-        let name = match self.expect_name() {
-          Ok(n) => n
-          Err(e) => return Err(e)
-        }
-        let args = match self.parse_arguments(is_const) {
-          Ok(a) => a
-          Err(e) => return Err(e)
-        }
-        match self.bump_node() {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-        dirs.push(Directive::{ name: name, arguments: args })
-      }
-      _ => break
+  while lex.tok_tag == tok_at {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
+    let name = match self.expect_name() {
+      Ok(n) => n
+      Err(e) => return Err(e)
+    }
+    let args = match self.parse_arguments(is_const) {
+      Ok(a) => a
+      Err(e) => return Err(e)
+    }
+    if !self.bump_node() {
+      return Err(lex.take_err())
+    }
+    dirs.push(Directive::{ name: name, arguments: args })
   }
   Ok(dirs)
 }
 
-enum SelFrameKind {
-  Root
-  FieldFrame(Option[String], String, Array[Argument], Array[Directive])
-  InlineFrame(Option[String], Array[Directive])
-}
-
-struct SelFrame {
-  kind : SelFrameKind
-  selections : Array[Selection]
-}
-
-///| 100% iterative `SelectionSet` parser using an explicit heap stack, bounded by `max_depth` & `max_nodes`.
+///| 100% iterative `SelectionSet` parser using a reusable explicit heap stack, bounded by `max_depth` & `max_nodes`.
 fn Parser::parse_selection_set_iter(
   self : Parser,
 ) -> Result[SelectionSet, GraphqlError] {
-  match self.expect_punct(TokenKind::LBrace, "'{'") {
+  let lex = self.lex
+  match self.expect_tag(tok_lbrace, "'{'") {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
-  let stack : Array[SelFrame] = [
-    SelFrame::{ kind: SelFrameKind::Root, selections: [] },
-  ]
+  let stack = self.sel_stack
+  stack.clear()
+  stack.push(SelFrame::{ kind: SelFrameKind::Root, selections: [] })
   while stack.length() > 0 {
-    match self.cur.kind {
-      TokenKind::RBrace => {
-        let top_idx = stack.length() - 1
-        let frame = stack[top_idx]
-        if frame.selections.length() == 0 {
-          return Err(self.err_unexpected("at least one selection in SelectionSet"))
-        }
-        match self.advance() {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-        let _ = stack.pop()
-        let ss = SelectionSet::{ selections: frame.selections }
-        match frame.kind {
-          SelFrameKind::Root => return Ok(ss)
-          SelFrameKind::FieldFrame(alias_opt, fname, args, dirs) => {
-            let parent = stack[stack.length() - 1]
-            parent.selections.push(
-              Selection::Field(
-                Field::{
-                  alias: alias_opt,
-                  name: fname,
-                  arguments: args,
-                  directives: dirs,
-                  selection_set: Some(ss),
-                },
-              ),
-            )
-          }
-          SelFrameKind::InlineFrame(type_cond, dirs) => {
-            let parent = stack[stack.length() - 1]
-            parent.selections.push(
-              Selection::InlineFragment(
-                InlineFragment::{
-                  type_condition: type_cond,
-                  directives: dirs,
-                  selection_set: ss,
-                },
-              ),
-            )
-          }
-        }
+    let tag = lex.tok_tag
+    if tag == tok_rbrace {
+      let top_idx = stack.length() - 1
+      let frame = stack[top_idx]
+      if frame.selections.length() == 0 {
+        return Err(self.err_unexpected("at least one selection in SelectionSet"))
       }
-      TokenKind::Spread => {
-        match self.advance() {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-        match self.bump_node() {
-          Ok(_) => ()
-          Err(e) => return Err(e)
-        }
-        // InlineFragment: `... on Type @dirs { ... }` or `... @dirs { ... }` or `... { ... }`
-        // FragmentSpread: `...FragName @dirs`
-        let mut is_inline = false
-        let mut type_cond : Option[String] = None
-        match self.cur.kind {
-          TokenKind::Name(s) => {
-            if s == "on" {
-              is_inline = true
-              match self.advance() {
-                Ok(_) => ()
-                Err(e) => return Err(e)
-              }
-              let tc = match self.expect_name() {
-                Ok(n) => n
-                Err(e) => return Err(e)
-              }
-              type_cond = Some(tc)
-            }
-          }
-          TokenKind::At | TokenKind::LBrace => is_inline = true
-          _ => return Err(self.err_unexpected("fragment name, 'on', '@', or '{'"))
-        }
-        if is_inline {
-          let dirs = match self.parse_directives(false) {
-            Ok(d) => d
-            Err(e) => return Err(e)
-          }
-          if stack.length() >= self.opts.max_depth {
-            return Err(
-              GraphqlError::new(
-                ErrorKind::LimitExceeded,
-                self.cur.line,
-                self.cur.col,
-                self.cur.offset,
-                "max_depth limit exceeded in inline fragment",
-              ),
-            )
-          }
-          match self.expect_punct(TokenKind::LBrace, "'{'") {
-            Ok(_) => ()
-            Err(e) => return Err(e)
-          }
-          stack.push(
-            SelFrame::{
-              kind: SelFrameKind::InlineFrame(type_cond, dirs),
-              selections: [],
-            },
-          )
-        } else {
-          let frag_name = match self.expect_name() {
-            Ok(n) => n
-            Err(e) => return Err(e)
-          }
-          let dirs = match self.parse_directives(false) {
-            Ok(d) => d
-            Err(e) => return Err(e)
-          }
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
+      }
+      let _ = stack.pop()
+      let ss = SelectionSet::{ selections: frame.selections }
+      match frame.kind {
+        SelFrameKind::Root => return Ok(ss)
+        SelFrameKind::FieldFrame(alias_opt, fname, args, dirs) => {
           let parent = stack[stack.length() - 1]
           parent.selections.push(
-            Selection::FragmentSpread(
-              FragmentSpread::{ name: frag_name, directives: dirs },
+            Selection::Field(
+              Field::{
+                alias: alias_opt,
+                name: fname,
+                arguments: args,
+                directives: dirs,
+                selection_set: Some(ss),
+              },
+            ),
+          )
+        }
+        SelFrameKind::InlineFrame(type_cond, dirs) => {
+          let parent = stack[stack.length() - 1]
+          parent.selections.push(
+            Selection::InlineFragment(
+              InlineFragment::{
+                type_condition: type_cond,
+                directives: dirs,
+                selection_set: ss,
+              },
             ),
           )
         }
       }
-      TokenKind::Name(_) => {
-        match self.bump_node() {
-          Ok(_) => ()
-          Err(e) => return Err(e)
+    } else if tag == tok_name {
+      if !self.bump_node() {
+        return Err(lex.take_err())
+      }
+      let first_name = self.cur_name()
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
+      }
+      let mut alias_opt : Option[String] = None
+      let mut field_name = first_name
+      if lex.tok_tag == tok_colon {
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
         }
-        let first_name = match self.expect_name() {
+        alias_opt = Some(first_name)
+        field_name = match self.expect_name() {
           Ok(n) => n
           Err(e) => return Err(e)
         }
-        let mut alias_opt : Option[String] = None
-        let mut field_name = first_name
-        match self.cur.kind {
-          TokenKind::Colon => {
-            match self.advance() {
-              Ok(_) => ()
-              Err(e) => return Err(e)
-            }
-            alias_opt = Some(first_name)
-            field_name = match self.expect_name() {
-              Ok(n) => n
-              Err(e) => return Err(e)
-            }
-          }
-          _ => ()
+      }
+      let args = match self.parse_arguments(false) {
+        Ok(a) => a
+        Err(e) => return Err(e)
+      }
+      let dirs = match self.parse_directives(false) {
+        Ok(d) => d
+        Err(e) => return Err(e)
+      }
+      if lex.tok_tag == tok_lbrace {
+        if stack.length() >= self.max_depth {
+          return Err(
+            self.err_at_cur(
+              ErrorKind::LimitExceeded,
+              "max_depth limit exceeded in selection set",
+            ),
+          )
         }
-        let args = match self.parse_arguments(false) {
-          Ok(a) => a
+        if !lex.advance_raw(true) {
+          return Err(lex.take_err())
+        }
+        stack.push(
+          SelFrame::{
+            kind: SelFrameKind::FieldFrame(alias_opt, field_name, args, dirs),
+            selections: [],
+          },
+        )
+      } else {
+        let parent = stack[stack.length() - 1]
+        parent.selections.push(
+          Selection::Field(
+            Field::{
+              alias: alias_opt,
+              name: field_name,
+              arguments: args,
+              directives: dirs,
+              selection_set: None,
+            },
+          ),
+        )
+      }
+    } else if tag == tok_spread {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
+      }
+      if !self.bump_node() {
+        return Err(lex.take_err())
+      }
+      // InlineFragment: `... on Type @dirs { ... }` or `... @dirs { ... }` or `... { ... }`
+      // FragmentSpread: `...FragName @dirs`
+      let mut is_inline = false
+      let mut type_cond : Option[String] = None
+      let ntag = lex.tok_tag
+      if ntag == tok_name {
+        if self.cur_slice_eq("on") {
+          is_inline = true
+          if !lex.advance_raw(true) {
+            return Err(lex.take_err())
+          }
+          let tc = match self.expect_name() {
+            Ok(n) => n
+            Err(e) => return Err(e)
+          }
+          type_cond = Some(tc)
+        }
+      } else if ntag == tok_at || ntag == tok_lbrace {
+        is_inline = true
+      } else {
+        return Err(self.err_unexpected("fragment name, 'on', '@', or '{'"))
+      }
+      if is_inline {
+        let dirs = match self.parse_directives(false) {
+          Ok(d) => d
+          Err(e) => return Err(e)
+        }
+        if stack.length() >= self.max_depth {
+          return Err(
+            self.err_at_cur(
+              ErrorKind::LimitExceeded,
+              "max_depth limit exceeded in inline fragment",
+            ),
+          )
+        }
+        match self.expect_tag(tok_lbrace, "'{'") {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        stack.push(
+          SelFrame::{
+            kind: SelFrameKind::InlineFrame(type_cond, dirs),
+            selections: [],
+          },
+        )
+      } else {
+        let frag_name = match self.expect_name() {
+          Ok(n) => n
           Err(e) => return Err(e)
         }
         let dirs = match self.parse_directives(false) {
           Ok(d) => d
           Err(e) => return Err(e)
         }
-        match self.cur.kind {
-          TokenKind::LBrace => {
-            if stack.length() >= self.opts.max_depth {
-              return Err(
-                GraphqlError::new(
-                  ErrorKind::LimitExceeded,
-                  self.cur.line,
-                  self.cur.col,
-                  self.cur.offset,
-                  "max_depth limit exceeded in selection set",
-                ),
-              )
-            }
-            match self.advance() {
-              Ok(_) => ()
-              Err(e) => return Err(e)
-            }
-            stack.push(
-              SelFrame::{
-                kind: SelFrameKind::FieldFrame(alias_opt, field_name, args, dirs),
-                selections: [],
-              },
-            )
-          }
-          _ => {
-            let parent = stack[stack.length() - 1]
-            parent.selections.push(
-              Selection::Field(
-                Field::{
-                  alias: alias_opt,
-                  name: field_name,
-                  arguments: args,
-                  directives: dirs,
-                  selection_set: None,
-                },
-              ),
-            )
-          }
-        }
+        let parent = stack[stack.length() - 1]
+        parent.selections.push(
+          Selection::FragmentSpread(
+            FragmentSpread::{ name: frag_name, directives: dirs },
+          ),
+        )
       }
-      _ => return Err(self.err_unexpected("Field, FragmentSpread, InlineFragment, or '}'"))
+    } else {
+      return Err(
+        self.err_unexpected("Field, FragmentSpread, InlineFragment, or '}'"),
+      )
     }
   }
   Err(self.err_unexpected("'}'"))
@@ -760,22 +896,19 @@ fn Parser::parse_selection_set_iter(
 fn Parser::parse_variable_definitions(
   self : Parser,
 ) -> Result[Array[VariableDefinition], GraphqlError] {
-  match self.cur.kind {
-    TokenKind::LParen => ()
-    _ => return Ok([])
+  let lex = self.lex
+  if lex.tok_tag != tok_lparen {
+    return Ok(empty_var_defs)
   }
-  match self.advance() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
   }
-  match self.cur.kind {
-    TokenKind::RParen =>
+  if lex.tok_tag == tok_rparen {
     return Err(self.err_unexpected("at least one variable definition"))
-    _ => ()
   }
   let vars : Array[VariableDefinition] = []
   while true {
-    match self.expect_punct(TokenKind::Dollar, "'$'") {
+    match self.expect_tag(tok_dollar, "'$'") {
       Ok(_) => ()
       Err(e) => return Err(e)
     }
@@ -783,7 +916,7 @@ fn Parser::parse_variable_definitions(
       Ok(n) => n
       Err(e) => return Err(e)
     }
-    match self.expect_punct(TokenKind::Colon, "':'") {
+    match self.expect_tag(tok_colon, "':'") {
       Ok(_) => ()
       Err(e) => return Err(e)
     }
@@ -792,16 +925,15 @@ fn Parser::parse_variable_definitions(
       Err(e) => return Err(e)
     }
     let mut default_val : Option[Value] = None
-    match self.skip_punct(TokenKind::Equals) {
-      Ok(true) => {
-        let v = match self.parse_value_iter(true) {
-          Ok(v_node) => v_node
-          Err(e) => return Err(e)
-        }
-        default_val = Some(v)
+    if lex.tok_tag == tok_equals {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      Ok(false) => ()
-      Err(e) => return Err(e)
+      let v = match self.parse_value_iter(true) {
+        Ok(v_node) => v_node
+        Err(e) => return Err(e)
+      }
+      default_val = Some(v)
     }
     let dirs = match self.parse_directives(true) {
       Ok(d) => d
@@ -815,14 +947,11 @@ fn Parser::parse_variable_definitions(
         directives: dirs,
       },
     )
-    match self.cur.kind {
-      TokenKind::RParen => {
-        match self.advance() {
-          Ok(_) => break
-          Err(e) => return Err(e)
-        }
+    if lex.tok_tag == tok_rparen {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      _ => ()
+      break
     }
   }
   Ok(vars)
@@ -831,48 +960,44 @@ fn Parser::parse_variable_definitions(
 fn Parser::parse_operation_definition(
   self : Parser,
 ) -> Result[OperationDefinition, GraphqlError] {
-  match self.cur.kind {
-    TokenKind::LBrace => {
-      let ss = match self.parse_selection_set_iter() {
-        Ok(s) => s
-        Err(e) => return Err(e)
-      }
-      return Ok(
-        OperationDefinition::{
-          op_type: OperationType::Query,
-          is_shorthand: true,
-          name: None,
-          variable_definitions: [],
-          directives: [],
-          selection_set: ss,
-        },
-      )
+  let lex = self.lex
+  if lex.tok_tag == tok_lbrace {
+    let ss = match self.parse_selection_set_iter() {
+      Ok(s) => s
+      Err(e) => return Err(e)
     }
-    _ => ()
+    return Ok(
+      OperationDefinition::{
+        op_type: OperationType::Query,
+        is_shorthand: true,
+        name: None,
+        variable_definitions: empty_var_defs,
+        directives: empty_directives,
+        selection_set: ss,
+      },
+    )
   }
-  let op_kw = match self.expect_name() {
-    Ok(n) => n
-    Err(e) => return Err(e)
+  if lex.tok_tag != tok_name {
+    return Err(self.err_unexpected("Name"))
   }
-  let op_type = if op_kw == "query" {
+  let op_type = if self.cur_slice_eq("query") {
     OperationType::Query
-  } else if op_kw == "mutation" {
+  } else if self.cur_slice_eq("mutation") {
     OperationType::Mutation
-  } else if op_kw == "subscription" {
+  } else if self.cur_slice_eq("subscription") {
     OperationType::Subscription
   } else {
     return Err(self.err_unexpected("'query', 'mutation', or 'subscription'"))
   }
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
+  }
   let mut name : Option[String] = None
-  match self.cur.kind {
-    TokenKind::Name(n) => {
-      name = Some(n)
-      match self.advance() {
-        Ok(_) => ()
-        Err(e) => return Err(e)
-      }
+  if lex.tok_tag == tok_name {
+    name = Some(self.cur_name())
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
-    _ => ()
   }
   let vars = match self.parse_variable_definitions() {
     Ok(v) => v
@@ -911,13 +1036,7 @@ fn Parser::parse_fragment_definition(
   }
   if name == "on" {
     return Err(
-      GraphqlError::new(
-        ErrorKind::InvalidSyntax,
-        self.cur.line,
-        self.cur.col,
-        self.cur.offset,
-        "fragment name cannot be 'on'",
-      ),
+      self.err_at_cur(ErrorKind::InvalidSyntax, "fragment name cannot be 'on'"),
     )
   }
   match self.expect_keyword("on") {
@@ -949,51 +1068,54 @@ fn Parser::parse_fragment_definition(
 fn Parser::parse_optional_description(
   self : Parser,
 ) -> Result[Option[Description], GraphqlError] {
-  match self.cur.kind {
-    TokenKind::Str(s) => {
-      match self.advance() {
-        Ok(_) => Ok(Some(Description::{ value: s, is_block: false }))
-        Err(e) => Err(e)
-      }
+  let lex = self.lex
+  let tag = lex.tok_tag
+  if tag == tok_str {
+    let s = lex.tok_string_val()
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
-    TokenKind::BlockStr(s) => {
-      match self.advance() {
-        Ok(_) => Ok(Some(Description::{ value: s, is_block: true }))
-        Err(e) => Err(e)
-      }
-    }
-    _ => Ok(None)
+    return Ok(Some(Description::{ value: s, is_block: false }))
   }
+  if tag == tok_block_str {
+    let s = lex.tok_decoded
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    return Ok(Some(Description::{ value: s, is_block: true }))
+  }
+  Ok(None)
 }
 
 fn Parser::parse_operation_type_defs(
   self : Parser,
 ) -> Result[Array[OperationTypeDefinition], GraphqlError] {
-  match self.expect_punct(TokenKind::LBrace, "'{'") {
+  let lex = self.lex
+  match self.expect_tag(tok_lbrace, "'{'") {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
-  match self.cur.kind {
-    TokenKind::RBrace =>
+  if lex.tok_tag == tok_rbrace {
     return Err(self.err_unexpected("at least one operation type definition"))
-    _ => ()
   }
   let out : Array[OperationTypeDefinition] = []
   while true {
-    let kw = match self.expect_name() {
-      Ok(n) => n
-      Err(e) => return Err(e)
+    if lex.tok_tag != tok_name {
+      return Err(self.err_unexpected("Name"))
     }
-    let op_type = if kw == "query" {
+    let op_type = if self.cur_slice_eq("query") {
       OperationType::Query
-    } else if kw == "mutation" {
+    } else if self.cur_slice_eq("mutation") {
       OperationType::Mutation
-    } else if kw == "subscription" {
+    } else if self.cur_slice_eq("subscription") {
       OperationType::Subscription
     } else {
       return Err(self.err_unexpected("'query', 'mutation', or 'subscription'"))
     }
-    match self.expect_punct(TokenKind::Colon, "':'") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    match self.expect_tag(tok_colon, "':'") {
       Ok(_) => ()
       Err(e) => return Err(e)
     }
@@ -1002,14 +1124,11 @@ fn Parser::parse_operation_type_defs(
       Err(e) => return Err(e)
     }
     out.push(OperationTypeDefinition::{ op_type: op_type, named_type: named })
-    match self.cur.kind {
-      TokenKind::RBrace => {
-        match self.advance() {
-          Ok(_) => break
-          Err(e) => return Err(e)
-        }
+    if lex.tok_tag == tok_rbrace {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      _ => ()
+      break
     }
   }
   Ok(out)
@@ -1018,14 +1137,16 @@ fn Parser::parse_operation_type_defs(
 fn Parser::parse_implements_interfaces(
   self : Parser,
 ) -> Result[Array[String], GraphqlError] {
+  let lex = self.lex
   match self.skip_keyword("implements") {
-    Ok(false) => return Ok([])
+    Ok(false) => return Ok(empty_strings)
     Ok(true) => ()
     Err(e) => return Err(e)
   }
-  let _ = match self.skip_punct(TokenKind::Amp) {
-    Ok(b) => b
-    Err(e) => return Err(e)
+  if lex.tok_tag == tok_amp {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
   }
   let ifaces : Array[String] = []
   let first = match self.expect_name() {
@@ -1033,18 +1154,15 @@ fn Parser::parse_implements_interfaces(
     Err(e) => return Err(e)
   }
   ifaces.push(first)
-  while true {
-    match self.skip_punct(TokenKind::Amp) {
-      Ok(true) => {
-        let next = match self.expect_name() {
-          Ok(n) => n
-          Err(e) => return Err(e)
-        }
-        ifaces.push(next)
-      }
-      Ok(false) => break
+  while lex.tok_tag == tok_amp {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let next = match self.expect_name() {
+      Ok(n) => n
       Err(e) => return Err(e)
     }
+    ifaces.push(next)
   }
   Ok(ifaces)
 }
@@ -1052,6 +1170,7 @@ fn Parser::parse_implements_interfaces(
 fn Parser::parse_input_value_def(
   self : Parser,
 ) -> Result[InputValueDefinition, GraphqlError] {
+  let lex = self.lex
   let desc = match self.parse_optional_description() {
     Ok(d) => d
     Err(e) => return Err(e)
@@ -1060,7 +1179,7 @@ fn Parser::parse_input_value_def(
     Ok(n) => n
     Err(e) => return Err(e)
   }
-  match self.expect_punct(TokenKind::Colon, "':'") {
+  match self.expect_tag(tok_colon, "':'") {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
@@ -1069,24 +1188,22 @@ fn Parser::parse_input_value_def(
     Err(e) => return Err(e)
   }
   let mut def_val : Option[Value] = None
-  match self.skip_punct(TokenKind::Equals) {
-    Ok(true) => {
-      let v = match self.parse_value_iter(true) {
-        Ok(v_node) => v_node
-        Err(e) => return Err(e)
-      }
-      def_val = Some(v)
+  if lex.tok_tag == tok_equals {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
-    Ok(false) => ()
-    Err(e) => return Err(e)
+    let v = match self.parse_value_iter(true) {
+      Ok(v_node) => v_node
+      Err(e) => return Err(e)
+    }
+    def_val = Some(v)
   }
   let dirs = match self.parse_directives(true) {
     Ok(d) => d
     Err(e) => return Err(e)
   }
-  match self.bump_node() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !self.bump_node() {
+    return Err(lex.take_err())
   }
   Ok(
     InputValueDefinition::{
@@ -1102,18 +1219,15 @@ fn Parser::parse_input_value_def(
 fn Parser::parse_arguments_def(
   self : Parser,
 ) -> Result[Array[InputValueDefinition], GraphqlError] {
-  match self.cur.kind {
-    TokenKind::LParen => ()
-    _ => return Ok([])
+  let lex = self.lex
+  if lex.tok_tag != tok_lparen {
+    return Ok(empty_input_values)
   }
-  match self.advance() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
   }
-  match self.cur.kind {
-    TokenKind::RParen =>
+  if lex.tok_tag == tok_rparen {
     return Err(self.err_unexpected("at least one argument definition"))
-    _ => ()
   }
   let out : Array[InputValueDefinition] = []
   while true {
@@ -1122,14 +1236,11 @@ fn Parser::parse_arguments_def(
       Err(e) => return Err(e)
     }
     out.push(iv)
-    match self.cur.kind {
-      TokenKind::RParen => {
-        match self.advance() {
-          Ok(_) => break
-          Err(e) => return Err(e)
-        }
+    if lex.tok_tag == tok_rparen {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      _ => ()
+      break
     }
   }
   Ok(out)
@@ -1138,18 +1249,15 @@ fn Parser::parse_arguments_def(
 fn Parser::parse_fields_def(
   self : Parser,
 ) -> Result[Array[FieldDefinition], GraphqlError] {
-  match self.cur.kind {
-    TokenKind::LBrace => ()
-    _ => return Ok([])
+  let lex = self.lex
+  if lex.tok_tag != tok_lbrace {
+    return Ok(empty_fields)
   }
-  match self.advance() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
   }
-  match self.cur.kind {
-    TokenKind::RBrace =>
+  if lex.tok_tag == tok_rbrace {
     return Err(self.err_unexpected("at least one field definition"))
-    _ => ()
   }
   let out : Array[FieldDefinition] = []
   while true {
@@ -1165,7 +1273,7 @@ fn Parser::parse_fields_def(
       Ok(a) => a
       Err(e) => return Err(e)
     }
-    match self.expect_punct(TokenKind::Colon, "':'") {
+    match self.expect_tag(tok_colon, "':'") {
       Ok(_) => ()
       Err(e) => return Err(e)
     }
@@ -1177,9 +1285,8 @@ fn Parser::parse_fields_def(
       Ok(d) => d
       Err(e) => return Err(e)
     }
-    match self.bump_node() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+    if !self.bump_node() {
+      return Err(lex.take_err())
     }
     out.push(
       FieldDefinition::{
@@ -1190,14 +1297,11 @@ fn Parser::parse_fields_def(
         directives: dirs,
       },
     )
-    match self.cur.kind {
-      TokenKind::RBrace => {
-        match self.advance() {
-          Ok(_) => break
-          Err(e) => return Err(e)
-        }
+    if lex.tok_tag == tok_rbrace {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      _ => ()
+      break
     }
   }
   Ok(out)
@@ -1206,14 +1310,17 @@ fn Parser::parse_fields_def(
 fn Parser::parse_union_members(
   self : Parser,
 ) -> Result[Array[String], GraphqlError] {
-  match self.skip_punct(TokenKind::Equals) {
-    Ok(false) => return Ok([])
-    Ok(true) => ()
-    Err(e) => return Err(e)
+  let lex = self.lex
+  if lex.tok_tag != tok_equals {
+    return Ok(empty_strings)
   }
-  let _ = match self.skip_punct(TokenKind::Pipe) {
-    Ok(b) => b
-    Err(e) => return Err(e)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
+  }
+  if lex.tok_tag == tok_pipe {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
   }
   let members : Array[String] = []
   let first = match self.expect_name() {
@@ -1221,18 +1328,15 @@ fn Parser::parse_union_members(
     Err(e) => return Err(e)
   }
   members.push(first)
-  while true {
-    match self.skip_punct(TokenKind::Pipe) {
-      Ok(true) => {
-        let next = match self.expect_name() {
-          Ok(n) => n
-          Err(e) => return Err(e)
-        }
-        members.push(next)
-      }
-      Ok(false) => break
+  while lex.tok_tag == tok_pipe {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let next = match self.expect_name() {
+      Ok(n) => n
       Err(e) => return Err(e)
     }
+    members.push(next)
   }
   Ok(members)
 }
@@ -1240,18 +1344,15 @@ fn Parser::parse_union_members(
 fn Parser::parse_enum_values_def(
   self : Parser,
 ) -> Result[Array[EnumValueDefinition], GraphqlError] {
-  match self.cur.kind {
-    TokenKind::LBrace => ()
-    _ => return Ok([])
+  let lex = self.lex
+  if lex.tok_tag != tok_lbrace {
+    return Ok(empty_enum_vals)
   }
-  match self.advance() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
   }
-  match self.cur.kind {
-    TokenKind::RBrace =>
+  if lex.tok_tag == tok_rbrace {
     return Err(self.err_unexpected("at least one enum value definition"))
-    _ => ()
   }
   let out : Array[EnumValueDefinition] = []
   while true {
@@ -1265,11 +1366,8 @@ fn Parser::parse_enum_values_def(
     }
     if name == "true" || name == "false" || name == "null" {
       return Err(
-        GraphqlError::new(
+        self.err_at_cur(
           ErrorKind::InvalidSyntax,
-          self.cur.line,
-          self.cur.col,
-          self.cur.offset,
           "enum value name cannot be '" + name + "'",
         ),
       )
@@ -1278,21 +1376,17 @@ fn Parser::parse_enum_values_def(
       Ok(d) => d
       Err(e) => return Err(e)
     }
-    match self.bump_node() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+    if !self.bump_node() {
+      return Err(lex.take_err())
     }
     out.push(
       EnumValueDefinition::{ description: desc, name: name, directives: dirs },
     )
-    match self.cur.kind {
-      TokenKind::RBrace => {
-        match self.advance() {
-          Ok(_) => break
-          Err(e) => return Err(e)
-        }
+    if lex.tok_tag == tok_rbrace {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      _ => ()
+      break
     }
   }
   Ok(out)
@@ -1301,18 +1395,15 @@ fn Parser::parse_enum_values_def(
 fn Parser::parse_input_fields_def(
   self : Parser,
 ) -> Result[Array[InputValueDefinition], GraphqlError] {
-  match self.cur.kind {
-    TokenKind::LBrace => ()
-    _ => return Ok([])
+  let lex = self.lex
+  if lex.tok_tag != tok_lbrace {
+    return Ok(empty_input_values)
   }
-  match self.advance() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
   }
-  match self.cur.kind {
-    TokenKind::RBrace =>
+  if lex.tok_tag == tok_rbrace {
     return Err(self.err_unexpected("at least one input field definition"))
-    _ => ()
   }
   let out : Array[InputValueDefinition] = []
   while true {
@@ -1321,14 +1412,11 @@ fn Parser::parse_input_fields_def(
       Err(e) => return Err(e)
     }
     out.push(iv)
-    match self.cur.kind {
-      TokenKind::RBrace => {
-        match self.advance() {
-          Ok(_) => break
-          Err(e) => return Err(e)
-        }
+    if lex.tok_tag == tok_rbrace {
+      if !lex.advance_raw(true) {
+        return Err(lex.take_err())
       }
-      _ => ()
+      break
     }
   }
   Ok(out)
@@ -1360,11 +1448,12 @@ fn Parser::parse_directive_definition(
   self : Parser,
   desc : Option[Description],
 ) -> Result[DirectiveDefinition, GraphqlError] {
+  let lex = self.lex
   match self.expect_keyword("directive") {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
-  match self.expect_punct(TokenKind::At, "'@'") {
+  match self.expect_tag(tok_at, "'@'") {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
@@ -1384,9 +1473,10 @@ fn Parser::parse_directive_definition(
     Ok(_) => ()
     Err(e) => return Err(e)
   }
-  let _ = match self.skip_punct(TokenKind::Pipe) {
-    Ok(b) => b
-    Err(e) => return Err(e)
+  if lex.tok_tag == tok_pipe {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
   }
   let locs : Array[String] = []
   let first = match self.expect_name() {
@@ -1395,39 +1485,30 @@ fn Parser::parse_directive_definition(
   }
   if !is_valid_directive_location(first) {
     return Err(
-      GraphqlError::new(
+      self.err_at_cur(
         ErrorKind::InvalidSyntax,
-        self.cur.line,
-        self.cur.col,
-        self.cur.offset,
         "invalid directive location: " + first,
       ),
     )
   }
   locs.push(first)
-  while true {
-    match self.skip_punct(TokenKind::Pipe) {
-      Ok(true) => {
-        let loc = match self.expect_name() {
-          Ok(n) => n
-          Err(e) => return Err(e)
-        }
-        if !is_valid_directive_location(loc) {
-          return Err(
-            GraphqlError::new(
-              ErrorKind::InvalidSyntax,
-              self.cur.line,
-              self.cur.col,
-              self.cur.offset,
-              "invalid directive location: " + loc,
-            ),
-          )
-        }
-        locs.push(loc)
-      }
-      Ok(false) => break
+  while lex.tok_tag == tok_pipe {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let loc = match self.expect_name() {
+      Ok(n) => n
       Err(e) => return Err(e)
     }
+    if !is_valid_directive_location(loc) {
+      return Err(
+        self.err_at_cur(
+          ErrorKind::InvalidSyntax,
+          "invalid directive location: " + loc,
+        ),
+      )
+    }
+    locs.push(loc)
   }
   Ok(
     DirectiveDefinition::{
@@ -1443,61 +1524,25 @@ fn Parser::parse_directive_definition(
 fn Parser::parse_type_system_extension(
   self : Parser,
 ) -> Result[Definition, GraphqlError] {
+  let lex = self.lex
   match self.expect_keyword("extend") {
     Ok(_) => ()
     Err(e) => return Err(e)
   }
-  let kw = match self.expect_name() {
-    Ok(n) => n
-    Err(e) => return Err(e)
+  if lex.tok_tag != tok_name {
+    return Err(self.err_unexpected("Name"))
   }
-  if kw == "schema" {
-    let dirs = match self.parse_directives(true) {
-      Ok(d) => d
-      Err(e) => return Err(e)
+  let src = lex.src
+  let st = lex.tok_start
+  let en = lex.tok_end
+  let n = en - st
+  let b0 = src.code_unit_at(st)
+  if n == 4 && b0 == 116 && slice_eq(src, st, en, "type") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
-    let ops = match self.cur.kind {
-      TokenKind::LBrace =>
-      match self.parse_operation_type_defs() {
-        Ok(o) => o
-        Err(e) => return Err(e)
-      }
-      _ => []
-    }
-    if dirs.length() == 0 && ops.length() == 0 {
-      return Err(
-        self.err_unexpected("directives or operation types in extend schema"),
-      )
-    }
-    return Ok(
-      Definition::SchemaExtension(
-        SchemaExtension::{ directives: dirs, operation_types: ops },
-      ),
-    )
-  }
-  if kw == "scalar" {
     let name = match self.expect_name() {
-      Ok(n) => n
-      Err(e) => return Err(e)
-    }
-    let dirs = match self.parse_directives(true) {
-      Ok(d) => d
-      Err(e) => return Err(e)
-    }
-    if dirs.length() == 0 {
-      return Err(self.err_unexpected("directives in extend scalar"))
-    }
-    return Ok(
-      Definition::TypeExtension(
-        TypeExtension::Scalar(
-          ScalarTypeExtension::{ name: name, directives: dirs },
-        ),
-      ),
-    )
-  }
-  if kw == "type" {
-    let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let ifaces = match self.parse_implements_interfaces() {
@@ -1528,9 +1573,62 @@ fn Parser::parse_type_system_extension(
       ),
     )
   }
-  if kw == "interface" {
+  if n == 6 && b0 == 115 && slice_eq(src, st, en, "schema") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let dirs = match self.parse_directives(true) {
+      Ok(d) => d
+      Err(e) => return Err(e)
+    }
+    let ops = if lex.tok_tag == tok_lbrace {
+      match self.parse_operation_type_defs() {
+        Ok(o) => o
+        Err(e) => return Err(e)
+      }
+    } else {
+      empty_op_types
+    }
+    if dirs.length() == 0 && ops.length() == 0 {
+      return Err(
+        self.err_unexpected("directives or operation types in extend schema"),
+      )
+    }
+    return Ok(
+      Definition::SchemaExtension(
+        SchemaExtension::{ directives: dirs, operation_types: ops },
+      ),
+    )
+  }
+  if n == 6 && b0 == 115 && slice_eq(src, st, en, "scalar") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
     let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
+      Err(e) => return Err(e)
+    }
+    let dirs = match self.parse_directives(true) {
+      Ok(d) => d
+      Err(e) => return Err(e)
+    }
+    if dirs.length() == 0 {
+      return Err(self.err_unexpected("directives in extend scalar"))
+    }
+    return Ok(
+      Definition::TypeExtension(
+        TypeExtension::Scalar(
+          ScalarTypeExtension::{ name: name, directives: dirs },
+        ),
+      ),
+    )
+  }
+  if n == 9 && b0 == 105 && slice_eq(src, st, en, "interface") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let name = match self.expect_name() {
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let ifaces = match self.parse_implements_interfaces() {
@@ -1563,9 +1661,12 @@ fn Parser::parse_type_system_extension(
       ),
     )
   }
-  if kw == "union" {
+  if n == 5 && b0 == 117 && slice_eq(src, st, en, "union") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
     let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let dirs = match self.parse_directives(true) {
@@ -1587,9 +1688,12 @@ fn Parser::parse_type_system_extension(
       ),
     )
   }
-  if kw == "enum" {
+  if n == 4 && b0 == 101 && slice_eq(src, st, en, "enum") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
     let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let dirs = match self.parse_directives(true) {
@@ -1611,9 +1715,12 @@ fn Parser::parse_type_system_extension(
       ),
     )
   }
-  if kw == "input" {
+  if n == 5 && b0 == 105 && slice_eq(src, st, en, "input") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
     let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let dirs = match self.parse_directives(true) {
@@ -1639,23 +1746,24 @@ fn Parser::parse_type_system_extension(
       ),
     )
   }
+  // Advance past unknown keyword to match prior error position
+  if !lex.advance_raw(true) {
+    return Err(lex.take_err())
+  }
   Err(self.err_unexpected("schema, scalar, type, interface, union, enum, or input after extend"))
 }
 
 fn Parser::parse_definition(self : Parser) -> Result[Definition, GraphqlError] {
-  match self.bump_node() {
-    Ok(_) => ()
-    Err(e) => return Err(e)
+  let lex = self.lex
+  if !self.bump_node() {
+    return Err(lex.take_err())
   }
-  match self.cur.kind {
-    TokenKind::LBrace => {
-      let op = match self.parse_operation_definition() {
-        Ok(o) => o
-        Err(e) => return Err(e)
-      }
-      return Ok(Definition::Operation(op))
+  if lex.tok_tag == tok_lbrace {
+    let op = match self.parse_operation_definition() {
+      Ok(o) => o
+      Err(e) => return Err(e)
     }
-    _ => ()
+    return Ok(Definition::Operation(op))
   }
   let desc = match self.parse_optional_description() {
     Ok(d) => d
@@ -1665,91 +1773,21 @@ fn Parser::parse_definition(self : Parser) -> Result[Definition, GraphqlError] {
     Some(_) => true
     None => false
   }
-  let kw = match self.cur.kind {
-    TokenKind::Name(s) => s
-    _ => return Err(self.err_unexpected("definition keyword"))
+  if lex.tok_tag != tok_name {
+    return Err(self.err_unexpected("definition keyword"))
   }
-  if kw == "query" || kw == "mutation" || kw == "subscription" {
-    if has_desc {
-      return Err(self.err_unexpected("no description on executable operation"))
-    }
-    let op = match self.parse_operation_definition() {
-      Ok(o) => o
-      Err(e) => return Err(e)
-    }
-    return Ok(Definition::Operation(op))
-  }
-  if kw == "fragment" {
-    if has_desc {
-      return Err(self.err_unexpected("no description on fragment definition"))
-    }
-    let frag = match self.parse_fragment_definition() {
-      Ok(f) => f
-      Err(e) => return Err(e)
-    }
-    return Ok(Definition::Fragment(frag))
-  }
-  if kw == "extend" {
-    if has_desc {
-      return Err(self.err_unexpected("no description on type system extension"))
-    }
-    return self.parse_type_system_extension()
-  }
-  if kw == "schema" {
-    match self.advance() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
-    }
-    let dirs = match self.parse_directives(true) {
-      Ok(d) => d
-      Err(e) => return Err(e)
-    }
-    let ops = match self.parse_operation_type_defs() {
-      Ok(o) => o
-      Err(e) => return Err(e)
-    }
-    return Ok(
-      Definition::Schema(
-        SchemaDefinition::{
-          description: desc,
-          directives: dirs,
-          operation_types: ops,
-        },
-      ),
-    )
-  }
-  if kw == "scalar" {
-    match self.advance() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+  let src = lex.src
+  let st = lex.tok_start
+  let en = lex.tok_end
+  let n = en - st
+  let b0 = src.code_unit_at(st)
+
+  if b0 == 116 && n == 4 && slice_eq(src, st, en, "type") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
     let name = match self.expect_name() {
-      Ok(n) => n
-      Err(e) => return Err(e)
-    }
-    let dirs = match self.parse_directives(true) {
-      Ok(d) => d
-      Err(e) => return Err(e)
-    }
-    return Ok(
-      Definition::TypeDef(
-        TypeDefinition::Scalar(
-          ScalarTypeDefinition::{
-            description: desc,
-            name: name,
-            directives: dirs,
-          },
-        ),
-      ),
-    )
-  }
-  if kw == "type" {
-    match self.advance() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
-    }
-    let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let ifaces = match self.parse_implements_interfaces() {
@@ -1778,13 +1816,125 @@ fn Parser::parse_definition(self : Parser) -> Result[Definition, GraphqlError] {
       ),
     )
   }
-  if kw == "interface" {
-    match self.advance() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
+  if b0 == 105 && n == 5 && slice_eq(src, st, en, "input") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
     }
     let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
+      Err(e) => return Err(e)
+    }
+    let dirs = match self.parse_directives(true) {
+      Ok(d) => d
+      Err(e) => return Err(e)
+    }
+    let fields = match self.parse_input_fields_def() {
+      Ok(f) => f
+      Err(e) => return Err(e)
+    }
+    return Ok(
+      Definition::TypeDef(
+        TypeDefinition::InputObject(
+          InputObjectTypeDefinition::{
+            description: desc,
+            name: name,
+            directives: dirs,
+            fields: fields,
+          },
+        ),
+      ),
+    )
+  }
+  if b0 == 101 && n == 6 && slice_eq(src, st, en, "extend") {
+    if has_desc {
+      return Err(self.err_unexpected("no description on type system extension"))
+    }
+    return self.parse_type_system_extension()
+  }
+  if b0 == 113 && n == 5 && slice_eq(src, st, en, "query") {
+    if has_desc {
+      return Err(self.err_unexpected("no description on executable operation"))
+    }
+    let op = match self.parse_operation_definition() {
+      Ok(o) => o
+      Err(e) => return Err(e)
+    }
+    return Ok(Definition::Operation(op))
+  }
+  if b0 == 102 && n == 8 && slice_eq(src, st, en, "fragment") {
+    if has_desc {
+      return Err(self.err_unexpected("no description on fragment definition"))
+    }
+    let frag = match self.parse_fragment_definition() {
+      Ok(f) => f
+      Err(e) => return Err(e)
+    }
+    return Ok(Definition::Fragment(frag))
+  }
+  if b0 == 117 && n == 5 && slice_eq(src, st, en, "union") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let name = match self.expect_name() {
+      Ok(nm) => nm
+      Err(e) => return Err(e)
+    }
+    let dirs = match self.parse_directives(true) {
+      Ok(d) => d
+      Err(e) => return Err(e)
+    }
+    let members = match self.parse_union_members() {
+      Ok(m) => m
+      Err(e) => return Err(e)
+    }
+    return Ok(
+      Definition::TypeDef(
+        TypeDefinition::Union(
+          UnionTypeDefinition::{
+            description: desc,
+            name: name,
+            directives: dirs,
+            members: members,
+          },
+        ),
+      ),
+    )
+  }
+  if b0 == 101 && n == 4 && slice_eq(src, st, en, "enum") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let name = match self.expect_name() {
+      Ok(nm) => nm
+      Err(e) => return Err(e)
+    }
+    let dirs = match self.parse_directives(true) {
+      Ok(d) => d
+      Err(e) => return Err(e)
+    }
+    let vals = match self.parse_enum_values_def() {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    return Ok(
+      Definition::TypeDef(
+        TypeDefinition::Enum(
+          EnumTypeDefinition::{
+            description: desc,
+            name: name,
+            directives: dirs,
+            values: vals,
+          },
+        ),
+      ),
+    )
+  }
+  if b0 == 105 && n == 9 && slice_eq(src, st, en, "interface") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let name = match self.expect_name() {
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let ifaces = match self.parse_implements_interfaces() {
@@ -1813,97 +1963,64 @@ fn Parser::parse_definition(self : Parser) -> Result[Definition, GraphqlError] {
       ),
     )
   }
-  if kw == "union" {
-    match self.advance() {
-      Ok(_) => ()
+  if (b0 == 109 && n == 8 && slice_eq(src, st, en, "mutation")) ||
+  (b0 == 115 && n == 12 && slice_eq(src, st, en, "subscription")) {
+    if has_desc {
+      return Err(self.err_unexpected("no description on executable operation"))
+    }
+    let op = match self.parse_operation_definition() {
+      Ok(o) => o
       Err(e) => return Err(e)
     }
+    return Ok(Definition::Operation(op))
+  }
+  if b0 == 115 && n == 6 && slice_eq(src, st, en, "schema") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
+    let dirs = match self.parse_directives(true) {
+      Ok(d) => d
+      Err(e) => return Err(e)
+    }
+    let ops = match self.parse_operation_type_defs() {
+      Ok(o) => o
+      Err(e) => return Err(e)
+    }
+    return Ok(
+      Definition::Schema(
+        SchemaDefinition::{
+          description: desc,
+          directives: dirs,
+          operation_types: ops,
+        },
+      ),
+    )
+  }
+  if b0 == 115 && n == 6 && slice_eq(src, st, en, "scalar") {
+    if !lex.advance_raw(true) {
+      return Err(lex.take_err())
+    }
     let name = match self.expect_name() {
-      Ok(n) => n
+      Ok(nm) => nm
       Err(e) => return Err(e)
     }
     let dirs = match self.parse_directives(true) {
       Ok(d) => d
       Err(e) => return Err(e)
     }
-    let members = match self.parse_union_members() {
-      Ok(m) => m
-      Err(e) => return Err(e)
-    }
     return Ok(
       Definition::TypeDef(
-        TypeDefinition::Union(
-          UnionTypeDefinition::{
+        TypeDefinition::Scalar(
+          ScalarTypeDefinition::{
             description: desc,
             name: name,
             directives: dirs,
-            members: members,
           },
         ),
       ),
     )
   }
-  if kw == "enum" {
-    match self.advance() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
-    }
-    let name = match self.expect_name() {
-      Ok(n) => n
-      Err(e) => return Err(e)
-    }
-    let dirs = match self.parse_directives(true) {
-      Ok(d) => d
-      Err(e) => return Err(e)
-    }
-    let vals = match self.parse_enum_values_def() {
-      Ok(v) => v
-      Err(e) => return Err(e)
-    }
-    return Ok(
-      Definition::TypeDef(
-        TypeDefinition::Enum(
-          EnumTypeDefinition::{
-            description: desc,
-            name: name,
-            directives: dirs,
-            values: vals,
-          },
-        ),
-      ),
-    )
-  }
-  if kw == "input" {
-    match self.advance() {
-      Ok(_) => ()
-      Err(e) => return Err(e)
-    }
-    let name = match self.expect_name() {
-      Ok(n) => n
-      Err(e) => return Err(e)
-    }
-    let dirs = match self.parse_directives(true) {
-      Ok(d) => d
-      Err(e) => return Err(e)
-    }
-    let fields = match self.parse_input_fields_def() {
-      Ok(f) => f
-      Err(e) => return Err(e)
-    }
-    return Ok(
-      Definition::TypeDef(
-        TypeDefinition::InputObject(
-          InputObjectTypeDefinition::{
-            description: desc,
-            name: name,
-            directives: dirs,
-            fields: fields,
-          },
-        ),
-      ),
-    )
-  }
-  if kw == "directive" {
+  if b0 == 100 && n == 9 && slice_eq(src, st, en, "directive") {
     let dd = match self.parse_directive_definition(desc) {
       Ok(d) => d
       Err(e) => return Err(e)
@@ -1921,31 +2038,17 @@ fn parse_impl(
     Ok(x) => x
     Err(e) => return Err(e)
   }
-  match p.cur.kind {
-    TokenKind::Eof =>
-    return Err(
-      GraphqlError::new(
-        ErrorKind::UnexpectedEof,
-        p.cur.line,
-        p.cur.col,
-        p.cur.offset,
-        "empty GraphQL document",
-      ),
-    )
-    _ => ()
+  if p.lex.tok_tag == tok_eof {
+    return Err(p.err_at_cur(ErrorKind::UnexpectedEof, "empty GraphQL document"))
   }
-  let defs : Array[Definition] = []
-  while true {
-    match p.cur.kind {
-      TokenKind::Eof => break
-      _ => {
-        let def = match p.parse_definition() {
-          Ok(d) => d
-          Err(e) => return Err(e)
-        }
-        defs.push(def)
-      }
+  let est_defs = if src.length() > 1024 { src.length() / 160 } else { 4 }
+  let defs : Array[Definition] = Array::with_capacity(est_defs)
+  while p.lex.tok_tag != tok_eof {
+    let def = match p.parse_definition() {
+      Ok(d) => d
+      Err(e) => return Err(e)
     }
+    defs.push(def)
   }
   Ok(Document::{ definitions: defs })
 }
@@ -1969,9 +2072,10 @@ fn parse_value_impl(src : String) -> Result[Value, GraphqlError] {
     Ok(v) => v
     Err(e) => return Err(e)
   }
-  match p.cur.kind {
-    TokenKind::Eof => Ok(v_node)
-    _ => Err(p.err_unexpected("EOF"))
+  if p.lex.tok_tag == tok_eof {
+    Ok(v_node)
+  } else {
+    Err(p.err_unexpected("EOF"))
   }
 }
 
@@ -1984,8 +2088,9 @@ fn parse_type_impl(src : String) -> Result[TypeRef, GraphqlError] {
     Ok(t) => t
     Err(e) => return Err(e)
   }
-  match p.cur.kind {
-    TokenKind::Eof => Ok(ty)
-    _ => Err(p.err_unexpected("EOF"))
+  if p.lex.tok_tag == tok_eof {
+    Ok(ty)
+  } else {
+    Err(p.err_unexpected("EOF"))
   }
 }

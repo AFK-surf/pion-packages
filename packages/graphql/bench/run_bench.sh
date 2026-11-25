@@ -1,12 +1,12 @@
 #!/bin/sh
 # Head-to-head steady-state benchmark runner for packages/graphql:
 # Pion Native (`packages/graphql` --release) vs Rust `apollo-parser =0.8.4` (--release) vs Node.js `graphql@16.10.0`.
-# All build artifacts and temporary inputs live in /private/tmp to keep git worktree clean.
+# All build artifacts and temporary inputs live in ${TMPDIR:-/tmp} to keep git worktree clean.
 set -eu
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/pion-graphql-bench"
+OUT_DIR="${TMPDIR:-/tmp}/pion-graphql-bench"
 BIN_DIR="$OUT_DIR/bin"
 NODE_PKG="$OUT_DIR/node_pkg"
 SDL_FILE="$OUT_DIR/schema.graphql"

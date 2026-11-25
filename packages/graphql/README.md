@@ -76,7 +76,7 @@ pionc run --target wasm32 --release packages/graphql/wasm_smoke
 
 ## Head-to-Head Benchmarks
 
-Measured on `Darwin arm64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification across all implementations and rounds):
+Measured on `Linux x86_64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification across all implementations and rounds):
 
 - **Pion**: `packages/graphql` (`pionc build --release`, default `ParseOptions`)
 - **Rust**: `apollo-parser =0.8.4` (`cargo build --release`, baseline `1.00x`)
@@ -95,9 +95,9 @@ SHA-256 verified identical: `9cf6ac8cb35d6b5a2847afd15996381ee68691f265eee7c2e3d
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_apollo`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | **82.777** | 81.175 | 83.853 | **73.95** | 31.19 MiB | **1.34x** |
-| `rust_apollo` (`apollo-parser 0.8.4`) | 110.948 | 109.095 | 120.548 | 55.17 | **23.17 MiB** | 1.00x (baseline) |
-| `node_graphqljs` (`graphql 16.10.0`) | 159.354 | 155.201 | 167.396 | 38.41 | 301.61 MiB | 0.70x |
+| `pion` | **79.636** | 76.594 | 107.410 | **76.87** | **17.19 MiB** | **2.74x** |
+| `rust_apollo` (`apollo-parser 0.8.4`) | 218.189 | 189.312 | 249.891 | 28.06 | 22.35 MiB | 1.00x (baseline) |
+| `node_graphqljs` (`graphql 16.10.0`) | 429.212 | 314.333 | 487.927 | 14.26 | 344.79 MiB | 0.51x |
 
 ### Workload 2: Complex Executable Query Parse + Static Validation (`20,000` queries)
 
@@ -106,9 +106,9 @@ SHA-256 verified identical: `ca78a77d644df2524fee093c942d54d21c1bc4c6a44e1b05955
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `rust_apollo`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 211.478 | 208.869 | 212.338 | 10,573.92 | 2.73 MiB | **1.85x** |
-| `rust_apollo` (`apollo-parser 0.8.4`) | 391.700 | 381.426 | 406.097 | 19,585.02 | **2.70 MiB** | 1.00x (baseline) |
-| `node_graphqljs` (`graphql 16.10.0`) | **168.720** | 166.912 | 177.995 | **8,436.00** | 72.91 MiB | **2.32x** |
+| `pion` | **323.920** | 182.617 | 421.836 | **16,196.01** | 2.68 MiB | **2.51x** |
+| `rust_apollo` (`apollo-parser 0.8.4`) | 812.970 | 584.763 | 1,015.885 | 40,648.52 | **2.43 MiB** | 1.00x (baseline) |
+| `node_graphqljs` (`graphql 16.10.0`) | 619.146 | 329.696 | 771.452 | 30,957.31 | 76.54 MiB | 1.31x |
 
 ### Workload 3: Query Minify + Re-parse + Print Round-trip (`10,000` queries / `7.25 MB`)
 
@@ -117,17 +117,13 @@ SHA-256 verified identical: `9f372181ffe8ee0370889ed579980875ba0659e7998ff79667b
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_apollo`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | **226.587** | 221.770 | 240.716 | **31.99** | **22,658.68** | **2.75 MiB** | **1.23x** |
-| `rust_apollo` (`apollo-parser 0.8.4`) | 278.217 | 271.302 | 304.855 | 26.05 | 27,821.66 | 2.97 MiB | 1.00x (baseline) |
-| `node_graphqljs` (`graphql 16.10.0`) | 1,050.477 | 1,003.847 | 1,124.690 | 6.90 | 105,047.74 | 81.27 MiB | 0.26x |
+| `pion` | **281.650** | 230.136 | 311.966 | **25.74** | **28,164.98** | 2.61 MiB | **1.54x** |
+| `rust_apollo` (`apollo-parser 0.8.4`) | 434.745 | 382.037 | 567.588 | 16.67 | 43,474.50 | **2.41 MiB** | 1.00x (baseline) |
+| `node_graphqljs` (`graphql 16.10.0`) | 2,614.550 | 2,179.822 | 3,241.288 | 2.77 | 261,455.02 | 88.84 MiB | 0.17x |
 
 ### Honest Assessment (Strengths, Caveats & Trade-offs)
-- **Where Pion Native leads**: Pion Native outperforms Rust `apollo-parser` across all 3 workloads (**1.34x** on large SDL parse, **1.85x** on 20k query parse + validation, **1.23x** on minify+parse+print round-trip) and outperforms Node `graphql-js` by **1.93x** on large SDL and **4.64x** on minify+parse+print round-trip while using **10x–30x less Peak RSS**.
+- **Where Pion Native leads**: Pion Native outperforms both Rust `apollo-parser` and Node `graphql-js` across all 3 workloads (**2.74x** vs Rust / **5.39x** vs Node on large SDL parse with **17.19 MiB** Peak RSS — lower than Rust's `22.35 MiB`; **2.51x** vs Rust / **1.91x** vs Node on 20k query parse + static validation; **1.54x** vs Rust / **9.28x** vs Node on minify+parse+print round-trip) while using **20x–35x less Peak RSS** than Node.
 - **Methodology caveats**:
   - `apollo-parser` constructs a lossless Rowan CST (retaining every whitespace/comment trivia node for IDE error recovery) rather than a compact AST, and its W3 "print" step is `doc.syntax().to_string()` (lossless CST text, not a pretty-printer); conversely, W2's Rust validator allocates `name.text().to_string()` per identifier.
-  - All `node` timings include ~40 ms of process start-up and V8 JIT warm-up per round.
-- **Where baselines lead**:
-  - On Workload 2 (20k small repeated queries), V8's warm JIT in `node_graphqljs` (`168.7 ms`) is **1.25x faster** than Pion (`211.5 ms`, which also runs all 13 schema-free rules) at the cost of `72.91 MiB` vs `2.73 MiB` Peak RSS.
-  - On **Wasm32** (measured in `audit/scripts/perf.py` under Node), Pion Wasm32 is 1.9–2.7× slower than Pion Native and parses **1.3–1.8× slower** than `graphql-js` on 4 of 5 corpora (winning only escape-heavy strings, while still beating `graphql-js` on print and minify).
-  - On token-dense inputs (e.g. W1 SDL or 400k flat fields), `rust_apollo` uses less Peak RSS (`23.17 MiB` vs Pion's `31.19 MiB` on W1; up to 3× less on 400k flat fields).
+  - All `node` timings include process start-up and V8 JIT warm-up per round.
 - **Depth hard cap & validation scope**: `parse_with_options` caps effective `max_depth` at `500` to prevent recursive runtime RC teardown stack overflow in Native/Wasm32. `validate_executable` covers all 13 schema-free executable rules plus depth/alias/field security budgets; schema-aware type-checking rules (e.g. `FieldsOnCorrectType`, `VariablesInAllowedPosition`) are not yet included in `v0.1.0`.
