@@ -26,6 +26,7 @@ pub struct PackReader {
   entries : Array[PackEntryMeta]
   resolved : Array[RawObject]
   oid_to_idx : Map[String, Int]
+  mut oid_index_built : Bool
   limits : GitLimits
 }
 
@@ -145,9 +146,7 @@ pub fn PackReader::open(
   // Verify trailing 20-byte SHA-1 checksum
   let body_end = n - 20
   let expected_csum = data.slice(body_end, n)
-  let hasher = crypto::Sha1::new()
-  hasher.update_slice(data, 0, body_end)
-  let actual_csum = hasher.finalize()
+  let actual_csum = git_sha1_slice(data, 0, body_end)
   if !bytes_eq(expected_csum, actual_csum) {
     return Err(GitError::ChecksumMismatch("packfile trailer SHA-1 mismatch"))
   }
@@ -165,10 +164,24 @@ pub fn PackReader::open(
   }
   let mut total_bytes : Int64 = 0L
 
-  // Pass 1: sequential scan & inflate
+  // Pass 1: sequential scan, inflate, and inline resolution of direct objects + OFS_DELTA.
+  // Only REF_DELTA (and any OFS_DELTA depending on an unresolved REF_DELTA) are deferred to Pass 2.
   let entries : Array[PackEntryMeta] = Array::new()
-  let raw_payloads : Array[Bytes] = Array::new()
+  let empty_bytes = Bytes::new(0)
+  let dummy = RawObject::{
+    kind: ObjectKind::Blob,
+    payload: empty_bytes,
+    oid: Oid::zero(HashKind::Sha1),
+  }
+  let resolved : Array[RawObject] = Array::make(count, dummy)
+  let done : FixedArray[Bool] = FixedArray::make(count, false)
+  let depths : FixedArray[Int] = FixedArray::make(count, 0)
+  let mut deferred_payloads : Array[Bytes] = Array::new()
+  let mut deferred_inited = false
+  let mut remaining = count
+
   let scratch = PackInflateScratch::new()
+  let sha1 = GitSha1::new()
   let mut pos = 12
   let mut idx = 0
   while idx < count {
@@ -207,6 +220,7 @@ pub fn PackReader::open(
       return Err(GitError::LimitExceeded("packfile exceeds max_pack_total_bytes"))
     }
 
+    let mut base_off_ofs : Int64 = -1L
     let kind = if ptype == 1 {
       PackEntryKind::Commit
     } else if ptype == 2 {
@@ -225,6 +239,7 @@ pub fn PackReader::open(
       if base_off < 12L || base_off >= entry_off.to_int64() {
         return Err(GitError::InvalidPack("OFS_DELTA base offset out of range"))
       }
+      base_off_ofs = base_off
       PackEntryKind::OfsDelta(base_off)
     } else if ptype == 7 {
       if pos + 20 > body_end {
@@ -260,7 +275,6 @@ pub fn PackReader::open(
     if next_pos > body_end {
       return Err(GitError::Truncated("pack entry extends into checksum trailer"))
     }
-    total_bytes = total_bytes + size64
     let crc = flate::crc32_update_slice(0U, data, entry_off, next_pos)
     entries.push(
       PackEntryMeta::{
@@ -271,7 +285,92 @@ pub fn PackReader::open(
         kind: kind,
       },
     )
-    raw_payloads.push(inflated)
+
+    if ptype >= 1 && ptype <= 4 {
+      total_bytes = total_bytes + size64
+      let obj_kind = if ptype == 1 {
+        ObjectKind::Commit
+      } else if ptype == 2 {
+        ObjectKind::Tree
+      } else if ptype == 3 {
+        ObjectKind::Blob
+      } else {
+        ObjectKind::Tag
+      }
+      let oid = sha1.hash_git_object(obj_kind, inflated)
+      resolved[idx] = RawObject::{ kind: obj_kind, payload: inflated, oid: oid }
+      done[idx] = true
+      depths[idx] = 0
+      remaining = remaining - 1
+    } else if ptype == 6 {
+      let base_idx = find_entry_by_offset(entries, base_off_ofs)
+      if base_idx >= 0 && done[base_idx] {
+        let new_depth = depths[base_idx] + 1
+        if new_depth > limits.max_delta_depth {
+          return Err(GitError::LimitExceeded("delta chain depth exceeds max_delta_depth"))
+        }
+        if inflated.length() < 4 {
+          return Err(GitError::InvalidDelta("delta shorter than minimum size (4 bytes)"))
+        }
+        let (base_sz, target_sz, dpos) = match decode_delta_header(inflated) {
+          Ok(h) => h
+          Err(e) => return Err(e)
+        }
+        if base_sz < 0 || target_sz < 0 {
+          return Err(GitError::InvalidDelta("negative delta header size"))
+        }
+        let base_obj = resolved[base_idx]
+        if base_obj.payload.length() != base_sz {
+          return Err(
+            GitError::InvalidDelta(
+              "delta base size mismatch: expected " +
+              base_sz.to_string() +
+              ", got " +
+              base_obj.payload.length().to_string(),
+            ),
+          )
+        }
+        if target_sz > limits.max_delta_result_bytes {
+          return Err(GitError::LimitExceeded("delta target size exceeds max_delta_result_bytes"))
+        }
+        if total_bytes + size64 + target_sz.to_int64() > total_budget {
+          return Err(
+            GitError::LimitExceeded("packfile resolved objects exceed max_pack_total_bytes"),
+          )
+        }
+        let target_payload = match apply_delta_inner(
+          base_obj.payload,
+          inflated,
+          base_sz,
+          target_sz,
+          dpos,
+        ) {
+          Ok(p) => p
+          Err(e) => return Err(e)
+        }
+        total_bytes = total_bytes + target_payload.length().to_int64()
+        let oid = sha1.hash_git_object(base_obj.kind, target_payload)
+        resolved[idx] = RawObject::{ kind: base_obj.kind, payload: target_payload, oid: oid }
+        done[idx] = true
+        depths[idx] = new_depth
+        remaining = remaining - 1
+      } else {
+        total_bytes = total_bytes + size64
+        if !deferred_inited {
+          deferred_payloads = Array::make(count, empty_bytes)
+          deferred_inited = true
+        }
+        deferred_payloads[idx] = inflated
+      }
+    } else {
+      total_bytes = total_bytes + size64
+      if !deferred_inited {
+        deferred_payloads = Array::make(count, empty_bytes)
+        deferred_inited = true
+      }
+      deferred_payloads[idx] = inflated
+    }
+
     pos = next_pos
     idx = idx + 1
   }
@@ -280,114 +379,114 @@ pub fn PackReader::open(
     return Err(GitError::InvalidPack("trailing bytes before packfile checksum"))
   }
 
-  // Pass 2: resolve base objects, OFS_DELTA, and REF_DELTA chains
-  let dummy = RawObject::{
-    kind: ObjectKind::Blob,
-    payload: Bytes::new(0),
-    oid: Oid::zero(HashKind::Sha1),
-  }
-  let resolved : Array[RawObject] = Array::make(count, dummy)
-  let done : FixedArray[Bool] = FixedArray::make(count, false)
-  let depths : FixedArray[Int] = FixedArray::make(count, 0)
   let oid_to_idx : Map[String, Int] = Map::new()
-  let mut remaining = count
+  let mut oid_index_built = false
 
-  // 2a: direct non-delta objects
-  let mut i = 0
-  while i < count {
-    let e = entries[i]
-    let obj_kind_opt : Option[ObjectKind] = match e.kind {
-      PackEntryKind::Commit => Some(ObjectKind::Commit)
-      PackEntryKind::Tree => Some(ObjectKind::Tree)
-      PackEntryKind::Blob => Some(ObjectKind::Blob)
-      PackEntryKind::Tag => Some(ObjectKind::Tag)
-      _ => None
-    }
-    match obj_kind_opt {
-      Some(k) => {
-        let payload = raw_payloads[i]
-        raw_payloads[i] = Bytes::new(0)
-        let oid = hash_object_sha1(k, payload)
-        resolved[i] = RawObject::{ kind: k, payload: payload, oid: oid }
-        done[i] = true
-        depths[i] = 0
-        oid_to_idx.set(oid.to_hex(), i)
-        remaining = remaining - 1
+  // Pass 2 (cold path): only needed when pack has REF_DELTA or unresolved OFS_DELTA.
+  if remaining > 0 {
+    let mut i = 0
+    while i < count {
+      if done[i] {
+        oid_to_idx.set(resolved[i].oid.to_hex(), i)
       }
-      None => ()
+      i = i + 1
     }
-    i = i + 1
-  }
+    oid_index_built = true
 
-  // 2b: iteratively resolve OFS_DELTA & REF_DELTA chains until fixed point
-  while remaining > 0 {
-    let mut progressed = false
-    let mut j = 0
-    while j < count {
-      if !done[j] {
-        let base_idx = match entries[j].kind {
-          PackEntryKind::OfsDelta(base_off) => find_entry_by_offset(entries, base_off)
-          PackEntryKind::RefDelta(base_oid) =>
-          match oid_to_idx.get(base_oid.to_hex()) {
-            Some(bi) => bi
-            None => -1
+    while remaining > 0 {
+      let mut progressed = false
+      let mut j = 0
+      while j < count {
+        if !done[j] {
+          let base_idx = match entries[j].kind {
+            PackEntryKind::OfsDelta(base_off) => find_entry_by_offset(entries, base_off)
+            PackEntryKind::RefDelta(base_oid) =>
+            match oid_to_idx.get(base_oid.to_hex()) {
+              Some(bi) => bi
+              None => -1
+            }
+            _ => -1
           }
-          _ => -1
+          if base_idx >= 0 && done[base_idx] {
+            let new_depth = depths[base_idx] + 1
+            if new_depth > limits.max_delta_depth {
+              return Err(GitError::LimitExceeded("delta chain depth exceeds max_delta_depth"))
+            }
+            let base_obj = resolved[base_idx]
+            let delta_bytes = deferred_payloads[j]
+            if delta_bytes.length() < 4 {
+              return Err(GitError::InvalidDelta("delta shorter than minimum size (4 bytes)"))
+            }
+            let (base_sz, target_sz, dpos) = match decode_delta_header(delta_bytes) {
+              Ok(h) => h
+              Err(e) => return Err(e)
+            }
+            if base_sz < 0 || target_sz < 0 {
+              return Err(GitError::InvalidDelta("negative delta header size"))
+            }
+            if base_obj.payload.length() != base_sz {
+              return Err(
+                GitError::InvalidDelta(
+                  "delta base size mismatch: expected " +
+                  base_sz.to_string() +
+                  ", got " +
+                  base_obj.payload.length().to_string(),
+                ),
+              )
+            }
+            if target_sz > limits.max_delta_result_bytes {
+              return Err(
+                GitError::LimitExceeded("delta target size exceeds max_delta_result_bytes"),
+              )
+            }
+            if total_bytes + target_sz.to_int64() > total_budget {
+              return Err(
+                GitError::LimitExceeded("packfile resolved objects exceed max_pack_total_bytes"),
+              )
+            }
+            let target_payload = match apply_delta_inner(
+              base_obj.payload,
+              delta_bytes,
+              base_sz,
+              target_sz,
+              dpos,
+            ) {
+              Ok(p) => p
+              Err(e) => return Err(e)
+            }
+            total_bytes = total_bytes - delta_bytes.length().to_int64() + target_payload.length().to_int64()
+            deferred_payloads[j] = empty_bytes
+            let oid = sha1.hash_git_object(base_obj.kind, target_payload)
+            resolved[j] = RawObject::{
+              kind: base_obj.kind,
+              payload: target_payload,
+              oid: oid,
+            }
+            done[j] = true
+            depths[j] = new_depth
+            oid_to_idx.set(oid.to_hex(), j)
+            remaining = remaining - 1
+            progressed = true
+          }
         }
-        if base_idx >= 0 && done[base_idx] {
-          let new_depth = depths[base_idx] + 1
-          if new_depth > limits.max_delta_depth {
-            return Err(GitError::LimitExceeded("delta chain depth exceeds max_delta_depth"))
-          }
-          let base_obj = resolved[base_idx]
-          let delta_bytes = raw_payloads[j]
-          let (_, target_sz, _) = match decode_delta_header(delta_bytes) {
-            Ok(h) => h
-            Err(e) => return Err(e)
-          }
-          if target_sz < 0 {
-            return Err(GitError::InvalidDelta("negative delta target size"))
-          }
-          if total_bytes + target_sz.to_int64() > total_budget {
-            return Err(GitError::LimitExceeded("packfile resolved objects exceed max_pack_total_bytes"))
-          }
-          let target_payload = match apply_delta(base_obj.payload, delta_bytes, limits) {
-            Ok(p) => p
-            Err(e) => return Err(e)
-          }
-          total_bytes = total_bytes - delta_bytes.length().to_int64() + target_payload.length().to_int64()
-          raw_payloads[j] = Bytes::new(0)
-          let oid = hash_object_sha1(base_obj.kind, target_payload)
-          resolved[j] = RawObject::{
-            kind: base_obj.kind,
-            payload: target_payload,
-            oid: oid,
-          }
-          done[j] = true
-          depths[j] = new_depth
-          oid_to_idx.set(oid.to_hex(), j)
-          remaining = remaining - 1
-          progressed = true
-        }
+        j = j + 1
       }
-      j = j + 1
-    }
-    if !progressed {
-      // Distinguish cycle vs missing external base
-      let mut k = 0
-      while k < count {
-        if !done[k] {
-          match entries[k].kind {
-            PackEntryKind::OfsDelta(_) =>
-            return Err(GitError::CycleDetected("unresolvable or cyclic OFS_DELTA"))
-            PackEntryKind::RefDelta(bo) =>
-            return Err(GitError::ObjectNotFound("missing REF_DELTA base: " + bo.to_hex()))
-            _ => ()
+      if !progressed {
+        let mut k = 0
+        while k < count {
+          if !done[k] {
+            match entries[k].kind {
+              PackEntryKind::OfsDelta(_) =>
+              return Err(GitError::CycleDetected("unresolvable or cyclic OFS_DELTA"))
+              PackEntryKind::RefDelta(bo) =>
+              return Err(GitError::ObjectNotFound("missing REF_DELTA base: " + bo.to_hex()))
+              _ => ()
+            }
           }
+          k = k + 1
         }
-        k = k + 1
+        return Err(GitError::CycleDetected("cyclic delta chain"))
       }
-      return Err(GitError::CycleDetected("cyclic delta chain"))
     }
   }
 
@@ -398,6 +497,7 @@ pub fn PackReader::open(
       entries: entries,
       resolved: resolved,
       oid_to_idx: oid_to_idx,
+      oid_index_built: oid_index_built,
       limits: limits,
     },
   )
@@ -423,6 +523,15 @@ pub fn PackReader::resolve_object(
   self : PackReader,
   oid : Oid,
 ) -> Result[RawObject, GitError] {
+  if !self.oid_index_built {
+    let mut i = 0
+    let count = self.resolved.length()
+    while i < count {
+      self.oid_to_idx.set(self.resolved[i].oid.to_hex(), i)
+      i = i + 1
+    }
+    self.oid_index_built = true
+  }
   match self.oid_to_idx.get(oid.to_hex()) {
     Some(i) => Ok(self.resolved[i])
     None => Err(GitError::ObjectNotFound("object not in pack: " + oid.to_hex()))
@@ -568,7 +677,401 @@ pub fn PackWriter::finish(self : PackWriter) -> Result[(Bytes, Oid), GitError] {
   }
 
   let body = bb.to_bytes()
-  let csum_bytes = crypto::sha1(body)
+  let csum_bytes = git_sha1_slice(body, 0, body.length())
   let csum_oid = Oid::{ kind: HashKind::Sha1, bytes: csum_bytes }
   Ok((body.concat(csum_bytes), csum_oid))
+}
+
+// ============================================================================
+// PackStream (Streaming low-RSS Packfile v2 unpacker with bounded delta cache)
+// ============================================================================
+
+///| Streaming single-pass Git Packfile v2 unpacker with a bounded delta-base cache.
+///| Ideal for unpacking large packfiles without retaining every resolved object in memory.
+pub struct PackStream {
+  data : Bytes
+  body_end : Int
+  count : Int
+  checksum : Oid
+  limits : GitLimits
+  total_budget : Int64
+  mut pos : Int
+  mut idx : Int
+  mut total_bytes : Int64
+  scratch : PackInflateScratch
+  sha1 : GitSha1
+  empty_bytes : Bytes
+  offsets : FixedArray[Int64]
+  data_pos : FixedArray[Int]
+  ptypes : FixedArray[Int]
+  sizes : FixedArray[Int]
+  base_idx : FixedArray[Int]
+  depths : FixedArray[Int]
+  cache_slot : FixedArray[Int]
+  cache_payloads : Array[Bytes]
+  cache_kinds : FixedArray[Int]
+  cache_entry_idx : FixedArray[Int]
+  mut cache_head : Int
+  mut cache_tail : Int
+  mut cache_bytes : Int
+  cache_cap_bytes : Int
+}
+
+///| Binary search `offsets[0..hi)` for `target`.
+fn find_offset_in_arr(offsets : FixedArray[Int64], hi : Int, target : Int64) -> Int {
+  let mut lo = 0
+  let mut r = hi
+  while lo < r {
+    let mid = lo + ((r - lo) >> 1)
+    let off = offsets[mid]
+    if off == target {
+      return mid
+    } else if off < target {
+      lo = mid + 1
+    } else {
+      r = mid
+    }
+  }
+  -1
+}
+
+///| Open a packfile for streaming single-pass unpacking with trailing SHA-1 verification.
+pub fn PackStream::open(
+  data : Bytes,
+  limits : GitLimits,
+) -> Result[PackStream, GitError] {
+  match limits.validate() {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let n = data.length()
+  if n < 32 {
+    return Err(GitError::Truncated("packfile shorter than 32 bytes"))
+  }
+  if data[0].to_int() != 80 ||
+  data[1].to_int() != 65 ||
+  data[2].to_int() != 67 ||
+  data[3].to_int() != 75 {
+    return Err(GitError::InvalidPack("invalid PACK magic"))
+  }
+  let version = read_u32_be(data, 4).to_int()
+  if version != 2 && version != 3 {
+    return Err(GitError::UnsupportedVersion(version))
+  }
+  let count_u = read_u32_be(data, 8)
+  if count_u > 0x7FFFFFFFU {
+    return Err(GitError::LimitExceeded("packfile object count overflow"))
+  }
+  let count = count_u.to_int()
+  if count > limits.max_pack_entries {
+    return Err(GitError::LimitExceeded("packfile exceeds max_pack_entries"))
+  }
+
+  let body_end = n - 20
+  let expected_csum = data.slice(body_end, n)
+  let actual_csum = git_sha1_slice(data, 0, body_end)
+  if !bytes_eq(expected_csum, actual_csum) {
+    return Err(GitError::ChecksumMismatch("packfile trailer SHA-1 mismatch"))
+  }
+  let checksum = Oid::{ kind: HashKind::Sha1, bytes: expected_csum }
+
+  let mut total_budget = limits.max_pack_total_bytes
+  if total_budget >= 268435456L {
+    let scaled = n.to_int64() * 16L
+    let cap = 1073741824L
+    let scaled_capped = if scaled > cap { cap } else { scaled }
+    if scaled_capped > total_budget {
+      total_budget = scaled_capped
+    }
+  }
+
+  let empty_bytes = Bytes::new(0)
+  Ok(
+    PackStream::{
+      data: data,
+      body_end: body_end,
+      count: count,
+      checksum: checksum,
+      limits: limits,
+      total_budget: total_budget,
+      pos: 12,
+      idx: 0,
+      total_bytes: 0L,
+      scratch: PackInflateScratch::new(),
+      sha1: GitSha1::new(),
+      empty_bytes: empty_bytes,
+      offsets: FixedArray::make(count, 0L),
+      data_pos: FixedArray::make(count, 0),
+      ptypes: FixedArray::make(count, 0),
+      sizes: FixedArray::make(count, 0),
+      base_idx: FixedArray::make(count, -1),
+      depths: FixedArray::make(count, 0),
+      cache_slot: FixedArray::make(count, -1),
+      cache_payloads: Array::make(2048, empty_bytes),
+      cache_kinds: FixedArray::make(2048, 0),
+      cache_entry_idx: FixedArray::make(2048, -1),
+      cache_head: 0,
+      cache_tail: 0,
+      cache_bytes: 0,
+      cache_cap_bytes: 4194304,
+    },
+  )
+}
+
+///|
+pub fn PackStream::len(self : PackStream) -> Int {
+  self.count
+}
+
+///|
+pub fn PackStream::checksum(self : PackStream) -> Oid {
+  self.checksum
+}
+
+///|
+fn PackStream::cache_put(
+  self : PackStream,
+  entry_i : Int,
+  kind_code : Int,
+  payload : Bytes,
+) -> Unit {
+  let plen = payload.length()
+  if plen > 4194304 {
+    return
+  }
+  while self.cache_head != self.cache_tail &&
+  (self.cache_bytes + plen > self.cache_cap_bytes || ((self.cache_tail + 1) & 2047) == self.cache_head) {
+    let h = self.cache_head
+    let old_i = self.cache_entry_idx[h]
+    if old_i >= 0 {
+      self.cache_slot[old_i] = -1
+    }
+    self.cache_bytes = self.cache_bytes - self.cache_payloads[h].length()
+    self.cache_payloads[h] = self.empty_bytes
+    self.cache_entry_idx[h] = -1
+    self.cache_head = (h + 1) & 2047
+  }
+  let t = self.cache_tail
+  self.cache_payloads[t] = payload
+  self.cache_kinds[t] = kind_code
+  self.cache_entry_idx[t] = entry_i
+  self.cache_slot[entry_i] = t
+  self.cache_bytes = self.cache_bytes + plen
+  self.cache_tail = (t + 1) & 2047
+}
+
+///|
+fn pack_kind_from_code(c : Int) -> ObjectKind {
+  if c == 1 {
+    ObjectKind::Commit
+  } else if c == 2 {
+    ObjectKind::Tree
+  } else if c == 3 {
+    ObjectKind::Blob
+  } else {
+    ObjectKind::Tag
+  }
+}
+
+///| Reconstruct an evicted earlier entry (for rare delta-base cache misses).
+fn PackStream::get_or_reconstruct(
+  self : PackStream,
+  entry_i : Int,
+  depth : Int,
+) -> Result[(Int, Bytes), GitError] {
+  let slot = self.cache_slot[entry_i]
+  if slot >= 0 {
+    return Ok((self.cache_kinds[slot], self.cache_payloads[slot]))
+  }
+  if depth > self.limits.max_delta_depth {
+    return Err(GitError::LimitExceeded("delta chain depth exceeds max_delta_depth"))
+  }
+  let pt = self.ptypes[entry_i]
+  let sz = self.sizes[entry_i]
+  let dpos = self.data_pos[entry_i]
+  let max_b = if pt == 6 { self.limits.max_delta_result_bytes } else { self.limits.max_object_bytes }
+  let (inflated, _) = match zlib_inflate_at(self.data, dpos, sz, max_b, self.scratch) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  if pt >= 1 && pt <= 4 {
+    self.cache_put(entry_i, pt, inflated)
+    return Ok((pt, inflated))
+  }
+  let bi = self.base_idx[entry_i]
+  if bi < 0 {
+    return Err(GitError::CycleDetected("unresolvable delta base in stream"))
+  }
+  let (base_kind, base_bytes) = match self.get_or_reconstruct(bi, depth + 1) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  let (base_sz, target_sz, delta_off) = match decode_delta_header(inflated) {
+    Ok(h) => h
+    Err(e) => return Err(e)
+  }
+  if base_bytes.length() != base_sz {
+    return Err(GitError::InvalidDelta("delta base size mismatch"))
+  }
+  let target = match apply_delta_inner(base_bytes, inflated, base_sz, target_sz, delta_off) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  self.cache_put(entry_i, base_kind, target)
+  Ok((base_kind, target))
+}
+
+///| Decode and return the next resolved object in the packfile stream (`Ok(None)` at EOF).
+pub fn PackStream::next(self : PackStream) -> Result[Option[RawObject], GitError] {
+  if self.idx >= self.count {
+    if self.pos != self.body_end {
+      return Err(GitError::InvalidPack("trailing bytes before packfile checksum"))
+    }
+    return Ok(None)
+  }
+  let data = self.data
+  let body_end = self.body_end
+  let mut pos = self.pos
+  if pos >= body_end {
+    return Err(GitError::Truncated("unexpected EOF before pack entry"))
+  }
+  let entry_off = pos
+  let b0 = data[pos].to_int()
+  pos = pos + 1
+  let ptype = (b0 >> 4) & 7
+  let mut size64 : Int64 = (b0 & 0x0F).to_int64()
+  let mut shift = 4
+  let mut cur_b = b0
+  while (cur_b & 0x80) != 0 {
+    if pos >= body_end {
+      return Err(GitError::Truncated("truncated pack entry size varint"))
+    }
+    if shift >= 60 {
+      return Err(GitError::LimitExceeded("pack entry size overflow"))
+    }
+    cur_b = data[pos].to_int()
+    pos = pos + 1
+    size64 = size64 | ((cur_b & 0x7F).to_int64() << shift)
+    shift = shift + 7
+  }
+  let max_bytes = if ptype == 6 || ptype == 7 {
+    self.limits.max_delta_result_bytes
+  } else {
+    self.limits.max_object_bytes
+  }
+  if size64 < 0L || size64 > max_bytes.to_int64() {
+    return Err(GitError::LimitExceeded("pack entry exceeds size limit"))
+  }
+  let size = size64.to_int()
+  if self.total_bytes + size64 > self.total_budget {
+    return Err(GitError::LimitExceeded("packfile exceeds max_pack_total_bytes"))
+  }
+
+  let idx = self.idx
+  let mut bi = -1
+  if ptype == 6 {
+    let (neg_off, np) = match read_ofs_varint(data, pos, body_end) {
+      Ok(p) => p
+      Err(e) => return Err(e)
+    }
+    pos = np
+    let base_off = entry_off.to_int64() - neg_off
+    if base_off < 12L || base_off >= entry_off.to_int64() {
+      return Err(GitError::InvalidPack("OFS_DELTA base offset out of range"))
+    }
+    bi = find_offset_in_arr(self.offsets, idx, base_off)
+    if bi < 0 {
+      return Err(GitError::CycleDetected("unresolvable or cyclic OFS_DELTA"))
+    }
+  } else if ptype == 7 {
+    return Err(GitError::InvalidPack("REF_DELTA not supported in streaming PackStream; use PackReader::open"))
+  } else if ptype < 1 || ptype > 4 {
+    return Err(GitError::InvalidPack("invalid pack entry type: " + ptype.to_string()))
+  }
+
+  let rem_budget64 = self.total_budget - self.total_bytes
+  let inflate_cap = if rem_budget64 < max_bytes.to_int64() {
+    rem_budget64.to_int()
+  } else {
+    max_bytes
+  }
+  let (inflated, next_pos) = match zlib_inflate_at(data, pos, size, inflate_cap, self.scratch) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  if inflated.length() != size {
+    return Err(
+      GitError::InvalidPack(
+        "pack entry size mismatch: header=" +
+        size.to_string() +
+        ", inflated=" +
+        inflated.length().to_string(),
+      ),
+    )
+  }
+  if next_pos > body_end {
+    return Err(GitError::Truncated("pack entry extends into checksum trailer"))
+  }
+
+  self.offsets[idx] = entry_off.to_int64()
+  self.data_pos[idx] = pos
+  self.ptypes[idx] = ptype
+  self.sizes[idx] = size
+  self.base_idx[idx] = bi
+  self.pos = next_pos
+  self.idx = idx + 1
+
+  if ptype >= 1 && ptype <= 4 {
+    self.total_bytes = self.total_bytes + size64
+    self.depths[idx] = 0
+    let obj_kind = pack_kind_from_code(ptype)
+    let oid = self.sha1.hash_git_object(obj_kind, inflated)
+    self.cache_put(idx, ptype, inflated)
+    return Ok(Some(RawObject::{ kind: obj_kind, payload: inflated, oid: oid }))
+  }
+
+  let new_depth = self.depths[bi] + 1
+  if new_depth > self.limits.max_delta_depth {
+    return Err(GitError::LimitExceeded("delta chain depth exceeds max_delta_depth"))
+  }
+  self.depths[idx] = new_depth
+  if inflated.length() < 4 {
+    return Err(GitError::InvalidDelta("delta shorter than minimum size (4 bytes)"))
+  }
+  let (base_sz, target_sz, dpos) = match decode_delta_header(inflated) {
+    Ok(h) => h
+    Err(e) => return Err(e)
+  }
+  if base_sz < 0 || target_sz < 0 {
+    return Err(GitError::InvalidDelta("negative delta header size"))
+  }
+  if target_sz > self.limits.max_delta_result_bytes {
+    return Err(GitError::LimitExceeded("delta target size exceeds max_delta_result_bytes"))
+  }
+  if self.total_bytes + size64 + target_sz.to_int64() > self.total_budget {
+    return Err(GitError::LimitExceeded("packfile resolved objects exceed max_pack_total_bytes"))
+  }
+  let (base_kind_code, base_bytes) = match self.get_or_reconstruct(bi, 0) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  if base_bytes.length() != base_sz {
+    return Err(
+      GitError::InvalidDelta(
+        "delta base size mismatch: expected " +
+        base_sz.to_string() +
+        ", got " +
+        base_bytes.length().to_string(),
+      ),
+    )
+  }
+  let target_payload = match apply_delta_inner(base_bytes, inflated, base_sz, target_sz, dpos) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  self.total_bytes = self.total_bytes + target_payload.length().to_int64()
+  let obj_kind = pack_kind_from_code(base_kind_code)
+  let oid = self.sha1.hash_git_object(obj_kind, target_payload)
+  self.cache_put(idx, base_kind_code, target_payload)
+  Ok(Some(RawObject::{ kind: obj_kind, payload: target_payload, oid: oid }))
 }
