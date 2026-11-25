@@ -487,6 +487,140 @@ fn is_multiret_expr(e : Expr) -> Bool {
   }
 }
 
+///| Compile an expression into a register, returning a local's register directly (zero `OP_MOVE`) when possible.
+///| Caller must restore `self.free_reg` after consuming the returned register.
+fn FuncCompiler::compile_expr_reg(self : FuncCompiler, e : Expr) -> Result[Int, LuaError] {
+  match e {
+    Expr::Ident(name, _) => {
+      let lreg = self.resolve_local(name)
+      if lreg >= 0 {
+        return Ok(lreg)
+      }
+    }
+    _ => ()
+  }
+  let r = self.alloc_reg()
+  match self.compile_expr_to(e, r) {
+    Ok(_) => Ok(r)
+    Err(err) => Err(err)
+  }
+}
+
+///| Returns true when compiling `e` directly into an existing local register `dst < free_reg` cannot clobber `dst + 1..`.
+fn is_safe_direct_dst(e : Expr) -> Bool {
+  match e {
+    Expr::Nil(_)
+    | Expr::Bool(_, _)
+    | Expr::Int(_, _)
+    | Expr::Float(_, _)
+    | Expr::Str(_, _)
+    | Expr::Ident(_, _)
+    | Expr::Unary(_, _, _)
+    | Expr::Binary(_, _, _, _) => true
+    _ => false
+  }
+}
+
+///| Compile a boolean condition and emit a conditional `OP_JMP` taken when `cond` is FALSE.
+///| Returns the PC of the emitted `OP_JMP` instruction to patch.
+fn FuncCompiler::compile_cond_jump(
+  self : FuncCompiler,
+  cond : Expr,
+  close_a : Int,
+  line : Int,
+) -> Result[Int, LuaError] {
+  let saved = self.free_reg
+  match cond {
+    Expr::Binary(op, lhs, rhs, bline) => {
+      match op {
+        BinOp::Lt | BinOp::Le => {
+          match rhs {
+            Expr::Int(iv, _) => {
+              if iv >= -32768L && iv <= 32767L {
+                let r_lhs = match self.compile_expr_reg(lhs) {
+                  Ok(r) => r
+                  Err(e) => return Err(e)
+                }
+                let opc = match op {
+                  BinOp::Lt => OP_LTI
+                  _ => OP_LEI
+                }
+                let _ = self.emit(enc_abc(opc, 0, r_lhs, iv.to_int() + IMM16_BIAS), bline)
+                let jmp = self.emit_jmp(close_a, bline)
+                self.free_reg = saved
+                return Ok(jmp)
+              }
+            }
+            _ => ()
+          }
+          let r_lhs = match self.compile_expr_reg(lhs) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let r_rhs = match self.compile_expr_reg(rhs) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let opc = match op {
+            BinOp::Lt => OP_LT
+            _ => OP_LE
+          }
+          let _ = self.emit(enc_abc(opc, 0, r_lhs, r_rhs), bline)
+          let jmp = self.emit_jmp(close_a, bline)
+          self.free_reg = saved
+          return Ok(jmp)
+        }
+        BinOp::Gt | BinOp::Ge => {
+          let r_lhs = match self.compile_expr_reg(lhs) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let r_rhs = match self.compile_expr_reg(rhs) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let opc = match op {
+            BinOp::Gt => OP_LT
+            _ => OP_LE
+          }
+          let _ = self.emit(enc_abc(opc, 0, r_rhs, r_lhs), bline)
+          let jmp = self.emit_jmp(close_a, bline)
+          self.free_reg = saved
+          return Ok(jmp)
+        }
+        BinOp::Eq | BinOp::Ne => {
+          let r_lhs = match self.compile_expr_reg(lhs) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let r_rhs = match self.compile_expr_reg(rhs) {
+            Ok(r) => r
+            Err(e) => return Err(e)
+          }
+          let expected = match op {
+            BinOp::Eq => 0
+            _ => 1
+          }
+          let _ = self.emit(enc_abc(OP_EQ, expected, r_lhs, r_rhs), bline)
+          let jmp = self.emit_jmp(close_a, bline)
+          self.free_reg = saved
+          return Ok(jmp)
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  let creg = match self.compile_expr_reg(cond) {
+    Ok(r) => r
+    Err(e) => return Err(e)
+  }
+  let _ = self.emit(enc_abc(OP_TEST, creg, 0, 1), line)
+  let jmp = self.emit_jmp(close_a, line)
+  self.free_reg = saved
+  Ok(jmp)
+}
+
 ///| Extracted iterative suffix chain compiler (keeps `compile_expr_inner` stack frame tiny for Wasm32).
 fn FuncCompiler::compile_suffix_chain(
   self : FuncCompiler,
@@ -515,6 +649,36 @@ fn FuncCompiler::compile_suffix_chain(
         cur = obj
       }
       _ => break
+    }
+  }
+  // Fast path for single `t[k]` or `t.f` without extra `OP_MOVE`
+  if steps.length() == 1 {
+    match steps[0] {
+      SuffixStep::Index(idx, line) => {
+        let saved = self.free_reg
+        let oreg = match self.compile_expr_reg(cur) {
+          Ok(r) => r
+          Err(err) => return Err(err)
+        }
+        let ireg = match self.compile_expr_reg(idx) {
+          Ok(r) => r
+          Err(err) => return Err(err)
+        }
+        let _ = self.emit(enc_abc(OP_GETTABLE, dst, oreg, ireg), line)
+        self.free_reg = saved
+        return Ok(())
+      }
+      SuffixStep::Field(field, line) => {
+        let saved = self.free_reg
+        let oreg = match self.compile_expr_reg(cur) {
+          Ok(r) => r
+          Err(err) => return Err(err)
+        }
+        self.emit_getfield(dst, oreg, field, line)
+        self.free_reg = saved
+        return Ok(())
+      }
+      _ => ()
     }
   }
   let saved = self.free_reg
@@ -639,6 +803,87 @@ fn FuncCompiler::compile_binary_chain(self : FuncCompiler, e : Expr, dst : Int) 
         cur = lhs
       }
       _ => break
+    }
+  }
+  // Fast path for single binary arithmetic/bitwise op: avoid `OP_MOVE` for local operands and emit `OP_ADDI`/`OP_SUBI`!
+  if ops.length() == 1 {
+    let op = ops[0]
+    let rhs = rhss[0]
+    let line = lines_b[0]
+    match op {
+      BinOp::Add | BinOp::Sub => {
+        match rhs {
+          Expr::Int(iv, _) => {
+            if iv >= -32768L && iv <= 32767L {
+              let saved = self.free_reg
+              let r_lhs = match self.compile_expr_reg(cur) {
+                Ok(r) => r
+                Err(err) => return Err(err)
+              }
+              let opc = match op {
+                BinOp::Add => OP_ADDI
+                _ => OP_SUBI
+              }
+              let _ = self.emit(enc_abc(opc, dst, r_lhs, iv.to_int() + IMM16_BIAS), line)
+              self.free_reg = saved
+              return Ok(())
+            }
+          }
+          _ => ()
+        }
+        let saved = self.free_reg
+        let r_lhs = match self.compile_expr_reg(cur) {
+          Ok(r) => r
+          Err(err) => return Err(err)
+        }
+        let r_rhs = match self.compile_expr_reg(rhs) {
+          Ok(r) => r
+          Err(err) => return Err(err)
+        }
+        let opc = match op {
+          BinOp::Add => OP_ADD
+          _ => OP_SUB
+        }
+        let _ = self.emit(enc_abc(opc, dst, r_lhs, r_rhs), line)
+        self.free_reg = saved
+        return Ok(())
+      }
+      BinOp::Mul
+      | BinOp::Div
+      | BinOp::IDiv
+      | BinOp::Mod
+      | BinOp::Pow
+      | BinOp::BAnd
+      | BinOp::BOr
+      | BinOp::BXor
+      | BinOp::Shl
+      | BinOp::Shr => {
+        let saved = self.free_reg
+        let r_lhs = match self.compile_expr_reg(cur) {
+          Ok(r) => r
+          Err(err) => return Err(err)
+        }
+        let r_rhs = match self.compile_expr_reg(rhs) {
+          Ok(r) => r
+          Err(err) => return Err(err)
+        }
+        let opc = match op {
+          BinOp::Mul => OP_MUL
+          BinOp::Div => OP_DIV
+          BinOp::IDiv => OP_IDIV
+          BinOp::Mod => OP_MOD
+          BinOp::Pow => OP_POW
+          BinOp::BAnd => OP_BAND
+          BinOp::BOr => OP_BOR
+          BinOp::BXor => OP_BXOR
+          BinOp::Shl => OP_SHL
+          _ => OP_SHR
+        }
+        let _ = self.emit(enc_abc(opc, dst, r_lhs, r_rhs), line)
+        self.free_reg = saved
+        return Ok(())
+      }
+      _ => ()
     }
   }
   let saved = self.free_reg
@@ -867,6 +1112,14 @@ fn FuncCompiler::compile_expr_inner(
       while i < n {
         let f = fields[i]
         match f.key {
+          Some(Expr::Str(ks, _)) => {
+            let vreg = match self.compile_expr_reg(f.val_expr) {
+              Ok(r) => r
+              Err(err) => return Err(err)
+            }
+            self.emit_setfield(tbl_reg, ks, vreg, line)
+            self.free_reg = tbl_reg + 1 + array_batch
+          }
           Some(kexpr) => {
             let kreg = self.alloc_reg()
             match self.compile_expr_to(kexpr, kreg) {
@@ -1153,6 +1406,57 @@ fn FuncCompiler::compile_stmt(self : FuncCompiler, st : Stmt) -> Result[Unit, Lu
     Stmt::Assign(lhs, rhs, line) => {
       let saved = self.free_reg
       let n = lhs.length()
+      // Fast paths for single-target assignment (`x = expr`, `t[k] = v`, `t.f = v`)
+      if n == 1 && rhs.length() == 1 {
+        match lhs[0] {
+          Expr::Ident(name, l) => {
+            let lidx = self.resolve_local_idx(name)
+            if lidx >= 0 {
+              if self.locals[lidx].is_const {
+                return Err(LuaError::new(LuaErrorKind::SyntaxError, "attempt to assign to const variable '" + name + "'", l))
+              }
+              if is_safe_direct_dst(rhs[0]) {
+                let lreg = self.locals[lidx].reg
+                match self.compile_expr_to(rhs[0], lreg) {
+                  Ok(_) => return Ok(())
+                  Err(e) => return Err(e)
+                }
+              }
+            }
+          }
+          Expr::Index(obj, idx, l) => {
+            let oreg = match self.compile_expr_reg(obj) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            let kreg = match self.compile_expr_reg(idx) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            let vreg = match self.compile_expr_reg(rhs[0]) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            let _ = self.emit(enc_abc(OP_SETTABLE, oreg, kreg, vreg), l)
+            self.free_reg = saved
+            return Ok(())
+          }
+          Expr::Field(obj, field, l) => {
+            let oreg = match self.compile_expr_reg(obj) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            let vreg = match self.compile_expr_reg(rhs[0]) {
+              Ok(r) => r
+              Err(e) => return Err(e)
+            }
+            self.emit_setfield(oreg, field, vreg, l)
+            self.free_reg = saved
+            return Ok(())
+          }
+          _ => ()
+        }
+      }
       // Evaluate any table/index subexpressions of LHS first, then RHS into temp regs, then assign right-to-left
       let obj_regs : Array[Int] = []
       let key_regs : Array[Int] = []
@@ -1254,15 +1558,10 @@ fn FuncCompiler::compile_stmt(self : FuncCompiler, st : Stmt) -> Result[Unit, Lu
       let mut i = 0
       while i < branches.length() {
         let br = branches[i]
-        let saved = self.free_reg
-        let creg = self.alloc_reg()
-        match self.compile_expr_to(br.cond, creg) {
-          Ok(_) => ()
+        let false_jmp = match self.compile_cond_jump(br.cond, 0, br.line) {
+          Ok(j) => j
           Err(e) => return Err(e)
         }
-        let _ = self.emit(enc_abc(OP_TEST, creg, 0, 1), br.line)
-        let false_jmp = self.emit_jmp(0, br.line)
-        self.free_reg = saved
 
         self.enter_scope()
         match self.compile_stmts(br.body) {
@@ -1298,15 +1597,10 @@ fn FuncCompiler::compile_stmt(self : FuncCompiler, st : Stmt) -> Result[Unit, Lu
     }
     Stmt::While(cond, body, line) => {
       let loop_start = self.code.length()
-      let saved = self.free_reg
-      let creg = self.alloc_reg()
-      match self.compile_expr_to(cond, creg) {
-        Ok(_) => ()
+      let exit_jmp = match self.compile_cond_jump(cond, 0, line) {
+        Ok(j) => j
         Err(e) => return Err(e)
       }
-      let _ = self.emit(enc_abc(OP_TEST, creg, 0, 1), line)
-      let exit_jmp = self.emit_jmp(0, line)
-      self.free_reg = saved
 
       self.enter_scope()
       self.loops.push(LoopCtx::{ depth: self.scope_depth, base_reg: self.free_reg, break_jumps: [] })
@@ -1343,14 +1637,6 @@ fn FuncCompiler::compile_stmt(self : FuncCompiler, st : Stmt) -> Result[Unit, Lu
         Some(lc) => lc
         None => LoopCtx::{ depth: 0, base_reg: 0, break_jumps: [] }
       }
-      // `until` condition sees locals declared inside `repeat`!
-      let saved = self.free_reg
-      let creg = self.alloc_reg()
-      match self.compile_expr_to(cond, creg) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
-      }
-      self.free_reg = saved
       // Check if any locals in repeat scope were captured
       let mut close_reg = -1
       let mut li = self.locals.length() - 1
@@ -1360,8 +1646,10 @@ fn FuncCompiler::compile_stmt(self : FuncCompiler, st : Stmt) -> Result[Unit, Lu
         }
         li = li - 1
       }
-      let _ = self.emit(enc_abc(OP_TEST, creg, 0, 1), line)
-      let back_jmp = self.emit_jmp(if close_reg >= 0 { close_reg + 1 } else { 0 }, line)
+      let back_jmp = match self.compile_cond_jump(cond, if close_reg >= 0 { close_reg + 1 } else { 0 }, line) {
+        Ok(j) => j
+        Err(e) => return Err(e)
+      }
       self.patch_jmp(back_jmp, loop_start)
       self.leave_scope(line)
       let after_pc = self.code.length()
@@ -1555,6 +1843,13 @@ fn FuncCompiler::compile_stmt(self : FuncCompiler, st : Stmt) -> Result[Unit, Lu
       // Tail-call optimization: `return f(...)` or `return obj:m(...)` (not parenthesized!)
       if n == 1 {
         match exprs[0] {
+          Expr::Ident(name, _) => {
+            let lreg = self.resolve_local(name)
+            if lreg >= 0 {
+              let _ = self.emit(enc_abc(OP_RETURN, lreg, 2, 0), line)
+              return Ok(())
+            }
+          }
           Expr::Call(callee, args, cl) => {
             let base = self.free_reg
             self.reserve_reg(base)

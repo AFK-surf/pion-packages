@@ -6,13 +6,13 @@ set -eu
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/w14-lua-bench"
+OUT_DIR="${TMPDIR:-/tmp}/w14-lua-bench"
 BIN_DIR="$OUT_DIR/bin"
 
 mkdir -p "$BIN_DIR"
 
 echo "==> Building Pion Native benchmark (--release)"
-PION_CACHE_DIR="/private/tmp/w14-lua-bench-cache" pionc build --release -o "$BIN_DIR/pion_lua" "$BENCH_DIR/pion_bench"
+PION_CACHE_DIR="${PION_CACHE_DIR:-${TMPDIR:-/tmp}/w14-lua-bench-cache}" pionc build --release -o "$BIN_DIR/pion_lua" "$BENCH_DIR/pion_bench"
 
 echo "==> Building Go gopher-lua benchmark (-mod=readonly)"
 (cd "$BENCH_DIR/go_bench" && go build -mod=readonly -o "$BIN_DIR/go_lua" .)
