@@ -438,63 +438,392 @@ fn vp8l_decode_pix_header(
   )
 }
 
-///| Decode VP8L pixel image (both top-level and sub-images for transforms / meta-Huffman).
-fn vp8l_decode_pix(
-  br : BitReader,
-  w : Int,
-  h : Int,
-  min_bytes : Int,
-  top_level : Bool,
-) -> Result[Bytes, WebpError] {
-  let hdr = match vp8l_decode_pix_header(br, w, h, top_level) {
-    Ok(v) => v
-    Err(e) => return Err(e)
+///| Outlined cold secondary Huffman table lookup (9-bit primary LUT, FixedArray[Int]).
+///| Returns `(sym << 8) | total_blen` on success, or `-1` on invalid code.
+fn vp8l_huff_sub(ftbl : FixedArray[Int], base_off : Int, entry : Int, bits : UInt64) -> Int {
+  if entry >= 0 {
+    return -1
   }
-  vp8l_decode_pix_rgba_body(br, w, h, min_bytes, hdr)
+  let desc = -entry
+  let sub_bits = desc & 0xF
+  let sub_off = desc >> 4
+  let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+  let se = ftbl[base_off + sub_off + sub_idx]
+  if se <= 0 {
+    return -1
+  }
+  se
 }
 
-///| Decode 4-byte-per-pixel RGBA stream given parsed `Vp8lPixHeader`.
-fn vp8l_decode_pix_rgba_body(
-  br : BitReader,
+///| Mutable state shared between fast main loop and safe EOF tail loop.
+struct Vp8lDecState {
+  mut p : Int
+  mut cached_p : Int
+  mut x : Int
+  mut y : Int
+  mut bpos : Int
+  mut bits : UInt64
+  mut nbits : Int
+  mut err_code : Int
+}
+
+///| Convert packed `0xAARRGGBB` `FixedArray[UInt]` to tightly packed RGBA8888 `Bytes`.
+fn vp8l_u32_to_rgba_bytes(pix : FixedArray[UInt]) -> Bytes {
+  let npix = pix.length()
+  let mut out = Bytes::new(npix * 4)
+  let mut i = 0
+  let mut d = 0
+  let n2 = npix & -2
+  while i < n2 {
+    let v0 = pix[i].to_int()
+    out[d] = (v0 >> 16).to_byte()
+    out[d + 1] = (v0 >> 8).to_byte()
+    out[d + 2] = v0.to_byte()
+    out[d + 3] = (v0 >> 24).to_byte()
+    let v1 = pix[i + 1].to_int()
+    out[d + 4] = (v1 >> 16).to_byte()
+    out[d + 5] = (v1 >> 8).to_byte()
+    out[d + 6] = v1.to_byte()
+    out[d + 7] = (v1 >> 24).to_byte()
+    i = i + 2
+    d = d + 8
+  }
+  if i < npix {
+    let v = pix[i].to_int()
+    out[d] = (v >> 16).to_byte()
+    out[d + 1] = (v >> 8).to_byte()
+    out[d + 2] = v.to_byte()
+    out[d + 3] = (v >> 24).to_byte()
+  }
+  out
+}
+
+///| Fast main pixel decode loop (zero EOF checks while `bpos <= end - 12`), writing packed `0xAARRGGBB`.
+fn vp8l_decode_pix_u32_fast(
+  data : Bytes,
+  fast_end : Int,
   w : Int,
-  h : Int,
-  min_bytes : Int,
+  npix : Int,
   hdr : Vp8lPixHeader,
-) -> Result[Bytes, WebpError] {
-  let cc_shift = hdr.cc_shift
+  ftbl : FixedArray[Int],
+  cc_entries : FixedArray[UInt],
+  pix : FixedArray[UInt],
+  st : Vp8lDecState,
+) -> Unit {
+  let cc_shift_u = hdr.cc_shift.to_uint()
   let cc_size = hdr.cc_size
-  let cc_entries = FixedArray::make(cc_size, 0UL)
   let h_bits = hdr.h_bits
   let h_pix = hdr.h_pix
   let grp_offs = hdr.grp_offs
-  let all_tables = hdr.all_tables
-
-  // 3. Decode pixel stream (flat `all_tables` + single error exit + 64-bit bit buffer)
-  let pix_len = 4 * w * h
-  let alloc_len = if min_bytes > pix_len { min_bytes } else { pix_len }
-  let mut pix = Bytes::new(alloc_len)
+  let dist_tbl = vp8l_dist_map_tbl
   let h_mask = if h_bits != 0 { (1 << h_bits) - 1 } else { 0 }
   let tiles_per_row = if h_bits != 0 { vp8l_ntiles(w, h_bits) } else { 0 }
-  let mut p = 0
-  let mut cached_p = 0
-  let mut x = 0
-  let mut y = 0
+  let cc_mult_u : UInt = 0x1e35a7bdU
+
+  let mut p = st.p
+  let mut cached_p = st.cached_p
+  let mut x = st.x
+  let mut y = st.y
+  let mut bpos = st.bpos
+  let mut bits : UInt64 = st.bits
+  let mut nbits = st.nbits
+  let mut err_code = 0
+
   let mut g_off = grp_offs[0]
   let mut r_off = grp_offs[1]
   let mut b_off = grp_offs[2]
   let mut a_off = grp_offs[3]
   let mut d_off = grp_offs[4]
   let mut lookup_hg = h_mask != 0
-  let cc_mult : UInt64 = 0x1e35a7bdUL
+
+  while p < npix && bpos <= fast_end {
+    if lookup_hg {
+      let hi = 4 * (tiles_per_row * (y >> h_bits) + (x >> h_bits))
+      let gbase = ((h_pix[hi].to_int() << 8) | h_pix[hi + 1].to_int()) * 5
+      g_off = grp_offs[gbase]
+      r_off = grp_offs[gbase + 1]
+      b_off = grp_offs[gbase + 2]
+      a_off = grp_offs[gbase + 3]
+      d_off = grp_offs[gbase + 4]
+    }
+
+    if nbits < 32 {
+      let w32 : UInt64 = (data[bpos].to_int() |
+        (data[bpos + 1].to_int() << 8) |
+        (data[bpos + 2].to_int() << 16) |
+        (data[bpos + 3].to_int() << 24)).to_int64().to_uint64() &
+      0xFFFFFFFFUL
+      bits = bits | (w32 << nbits)
+      bpos = bpos + 4
+      nbits = nbits + 32
+    }
+
+    let mut green = 0
+    if g_off < 0 {
+      green = -g_off - 1
+    } else {
+      let mut e = ftbl[g_off + (bits & 511UL).to_int()]
+      if e <= 0 {
+        e = vp8l_huff_sub(ftbl, g_off, e, bits)
+        if e < 0 {
+          err_code = 2
+          break
+        }
+      }
+      let blen = e & 0xF
+      bits = bits >> blen
+      nbits = nbits - blen
+      green = e >> 8
+    }
+
+    if green < vp8l_n_literal_codes {
+      if nbits < 30 {
+        let w32 : UInt64 = (data[bpos].to_int() |
+          (data[bpos + 1].to_int() << 8) |
+          (data[bpos + 2].to_int() << 16) |
+          (data[bpos + 3].to_int() << 24)).to_int64().to_uint64() &
+        0xFFFFFFFFUL
+        bits = bits | (w32 << nbits)
+        bpos = bpos + 4
+        nbits = nbits + 32
+      }
+
+      let mut red = 0
+      if r_off < 0 {
+        red = -r_off - 1
+      } else {
+        let mut e = ftbl[r_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, r_off, e, bits)
+          if e < 0 {
+            err_code = 2
+            break
+          }
+        }
+        let blen = e & 0xF
+        bits = bits >> blen
+        nbits = nbits - blen
+        red = e >> 8
+      }
+
+      let mut blue = 0
+      if b_off < 0 {
+        blue = -b_off - 1
+      } else {
+        let mut e = ftbl[b_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, b_off, e, bits)
+          if e < 0 {
+            err_code = 2
+            break
+          }
+        }
+        let blen = e & 0xF
+        bits = bits >> blen
+        nbits = nbits - blen
+        blue = e >> 8
+      }
+
+      let mut alpha = 0
+      if a_off < 0 {
+        alpha = -a_off - 1
+      } else {
+        if nbits < 15 {
+          let w32 : UInt64 = (data[bpos].to_int() |
+            (data[bpos + 1].to_int() << 8) |
+            (data[bpos + 2].to_int() << 16) |
+            (data[bpos + 3].to_int() << 24)).to_int64().to_uint64() &
+          0xFFFFFFFFUL
+          bits = bits | (w32 << nbits)
+          bpos = bpos + 4
+          nbits = nbits + 32
+        }
+        let mut e = ftbl[a_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, a_off, e, bits)
+          if e < 0 {
+            err_code = 2
+            break
+          }
+        }
+        let blen = e & 0xF
+        bits = bits >> blen
+        nbits = nbits - blen
+        alpha = e >> 8
+      }
+
+      pix[p] = ((alpha << 24) | (red << 16) | (green << 8) | blue).to_uint()
+      p = p + 1
+      if h_mask != 0 {
+        x = x + 1
+        if x == w {
+          x = 0
+          y = y + 1
+        }
+        lookup_hg = (x & h_mask) == 0
+      }
+    } else if green < vp8l_n_literal_codes + vp8l_n_length_codes {
+      let len_sym = green - vp8l_n_literal_codes
+      let mut length = len_sym + 1
+      if len_sym >= 4 {
+        let extra_bits = (len_sym - 2) >> 1
+        let extra = (bits & ((1UL << extra_bits) - 1UL)).to_int()
+        bits = bits >> extra_bits
+        nbits = nbits - extra_bits
+        length = ((2 + (len_sym & 1)) << extra_bits) + extra + 1
+      }
+      if nbits < 32 {
+        let w32 : UInt64 = (data[bpos].to_int() |
+          (data[bpos + 1].to_int() << 8) |
+          (data[bpos + 2].to_int() << 16) |
+          (data[bpos + 3].to_int() << 24)).to_int64().to_uint64() &
+        0xFFFFFFFFUL
+        bits = bits | (w32 << nbits)
+        bpos = bpos + 4
+        nbits = nbits + 32
+      }
+      let mut dist_sym = 0
+      if d_off < 0 {
+        dist_sym = -d_off - 1
+      } else {
+        let mut e = ftbl[d_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, d_off, e, bits)
+          if e < 0 {
+            err_code = 2
+            break
+          }
+        }
+        let blen = e & 0xF
+        bits = bits >> blen
+        nbits = nbits - blen
+        dist_sym = e >> 8
+      }
+      let mut dist_code = dist_sym + 1
+      if dist_sym >= 4 {
+        let extra_bits = (dist_sym - 2) >> 1
+        if nbits < extra_bits {
+          let w32 : UInt64 = (data[bpos].to_int() |
+            (data[bpos + 1].to_int() << 8) |
+            (data[bpos + 2].to_int() << 16) |
+            (data[bpos + 3].to_int() << 24)).to_int64().to_uint64() &
+          0xFFFFFFFFUL
+          bits = bits | (w32 << nbits)
+          bpos = bpos + 4
+          nbits = nbits + 32
+        }
+        let extra = (bits & ((1UL << extra_bits) - 1UL)).to_int()
+        bits = bits >> extra_bits
+        nbits = nbits - extra_bits
+        dist_code = ((2 + (dist_sym & 1)) << extra_bits) + extra + 1
+      }
+      let dist = if dist_code > 120 {
+        dist_code - 120
+      } else {
+        let dc = dist_tbl[dist_code - 1]
+        let d = (dc >> 4) * w + (8 - (dc & 0xF))
+        if d >= 1 { d } else { 1 }
+      }
+      let p_end = p + length
+      let mut q = p - dist
+      if p_end > npix || q < 0 || p_end < p {
+        err_code = 3
+        break
+      }
+      if dist == 1 {
+        let v = pix[q]
+        while p < p_end {
+          pix[p] = v
+          p = p + 1
+        }
+      } else {
+        while p < p_end {
+          pix[p] = pix[q]
+          p = p + 1
+          q = q + 1
+        }
+      }
+      if h_mask != 0 {
+        x = x + length
+        while x >= w {
+          x = x - w
+          y = y + 1
+        }
+        lookup_hg = true
+      }
+    } else {
+      while cached_p < p {
+        let argb = pix[cached_p]
+        cc_entries[((argb * cc_mult_u) >> cc_shift_u).to_int()] = argb
+        cached_p = cached_p + 1
+      }
+      let cidx = green - (vp8l_n_literal_codes + vp8l_n_length_codes)
+      if cidx >= cc_size {
+        err_code = 4
+        break
+      }
+      pix[p] = cc_entries[cidx]
+      p = p + 1
+      if h_mask != 0 {
+        x = x + 1
+        if x == w {
+          x = 0
+          y = y + 1
+        }
+        lookup_hg = (x & h_mask) == 0
+      }
+    }
+  }
+
+  st.p = p
+  st.cached_p = cached_p
+  st.x = x
+  st.y = y
+  st.bpos = bpos
+  st.bits = bits
+  st.nbits = nbits
+  st.err_code = err_code
+}
+
+///| Safe EOF tail pixel decode loop (last <= 11 bytes, full EOF checks), writing packed `0xAARRGGBB`.
+fn vp8l_decode_pix_u32_tail(
+  data : Bytes,
+  end : Int,
+  w : Int,
+  npix : Int,
+  hdr : Vp8lPixHeader,
+  ftbl : FixedArray[Int],
+  cc_entries : FixedArray[UInt],
+  pix : FixedArray[UInt],
+  st : Vp8lDecState,
+) -> Unit {
+  let cc_shift_u = hdr.cc_shift.to_uint()
+  let cc_size = hdr.cc_size
+  let h_bits = hdr.h_bits
+  let h_pix = hdr.h_pix
+  let grp_offs = hdr.grp_offs
+  let dist_tbl = vp8l_dist_map_tbl
+  let h_mask = if h_bits != 0 { (1 << h_bits) - 1 } else { 0 }
+  let tiles_per_row = if h_bits != 0 { vp8l_ntiles(w, h_bits) } else { 0 }
+  let cc_mult_u : UInt = 0x1e35a7bdU
+
+  let mut p = st.p
+  let mut cached_p = st.cached_p
+  let mut x = st.x
+  let mut y = st.y
+  let mut bpos = st.bpos
+  let mut bits : UInt64 = st.bits
+  let mut nbits = st.nbits
   let mut err_code = 0
 
-  let data = br.data
-  let end = br.end
-  let mut bpos = br.pos
-  let mut bits : UInt64 = br.bits
-  let mut nbits = br.nbits
+  let mut g_off = grp_offs[0]
+  let mut r_off = grp_offs[1]
+  let mut b_off = grp_offs[2]
+  let mut a_off = grp_offs[3]
+  let mut d_off = grp_offs[4]
+  let mut lookup_hg = h_mask != 0
 
-  while p < pix_len {
+  while p < npix {
     if lookup_hg {
       let hi = 4 * (tiles_per_row * (y >> h_bits) + (x >> h_bits))
       let gbase = ((h_pix[hi].to_int() << 8) | h_pix[hi + 1].to_int()) * 5
@@ -528,42 +857,26 @@ fn vp8l_decode_pix_rgba_body(
     if g_off < 0 {
       green = -g_off - 1
     } else {
-      let entry = all_tables[g_off + (bits & 255UL).to_int()]
-      if entry > 0 {
-        let blen = (entry & 0xFF) - 1
-        if nbits < blen {
-          err_code = 1
-          break
-        }
-        bits = bits >> blen
-        nbits = nbits - blen
-        green = entry >> 8
-      } else if entry < 0 {
-        let desc = -entry
-        let sub_bits = desc & 0xF
-        let sub_off = desc >> 4
-        let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
-        let se = all_tables[g_off + sub_off + sub_idx]
-        if se <= 0 {
+      let mut e = ftbl[g_off + (bits & 511UL).to_int()]
+      if e <= 0 {
+        e = vp8l_huff_sub(ftbl, g_off, e, bits)
+        if e < 0 {
           err_code = 2
           break
         }
-        let blen = 8 + (se & 0xFF) - 1
-        if nbits < blen {
-          err_code = 1
-          break
-        }
-        bits = bits >> blen
-        nbits = nbits - blen
-        green = se >> 8
-      } else {
-        err_code = 2
+      }
+      let blen = e & 0xF
+      if nbits < blen {
+        err_code = 1
         break
       }
+      bits = bits >> blen
+      nbits = nbits - blen
+      green = e >> 8
     }
 
     if green < vp8l_n_literal_codes {
-      if nbits < 32 {
+      if nbits < 30 {
         if bpos + 4 <= end {
           let w32 : UInt64 = (data[bpos].to_int() |
             (data[bpos + 1].to_int() << 8) |
@@ -586,141 +899,96 @@ fn vp8l_decode_pix_rgba_body(
       if r_off < 0 {
         red = -r_off - 1
       } else {
-        let entry = all_tables[r_off + (bits & 255UL).to_int()]
-        if entry > 0 {
-          let blen = (entry & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          red = entry >> 8
-        } else if entry < 0 {
-          let desc = -entry
-          let sub_bits = desc & 0xF
-          let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
-          let se = all_tables[r_off + sub_off + sub_idx]
-          if se <= 0 {
+        let mut e = ftbl[r_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, r_off, e, bits)
+          if e < 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          red = se >> 8
-        } else {
-          err_code = 2
+        }
+        let blen = e & 0xF
+        if nbits < blen {
+          err_code = 1
           break
         }
+        bits = bits >> blen
+        nbits = nbits - blen
+        red = e >> 8
       }
 
       let mut blue = 0
       if b_off < 0 {
         blue = -b_off - 1
       } else {
-        if nbits < 15 && bpos < end {
-          while nbits <= 56 && bpos < end {
-            bits = bits | (data[bpos].to_int().to_int64().to_uint64() << nbits)
-            bpos = bpos + 1
-            nbits = nbits + 8
-          }
-        }
-        let entry = all_tables[b_off + (bits & 255UL).to_int()]
-        if entry > 0 {
-          let blen = (entry & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          blue = entry >> 8
-        } else if entry < 0 {
-          let desc = -entry
-          let sub_bits = desc & 0xF
-          let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
-          let se = all_tables[b_off + sub_off + sub_idx]
-          if se <= 0 {
+        let mut e = ftbl[b_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, b_off, e, bits)
+          if e < 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          blue = se >> 8
-        } else {
-          err_code = 2
+        }
+        let blen = e & 0xF
+        if nbits < blen {
+          err_code = 1
           break
         }
+        bits = bits >> blen
+        nbits = nbits - blen
+        blue = e >> 8
       }
 
       let mut alpha = 0
       if a_off < 0 {
         alpha = -a_off - 1
       } else {
-        if nbits < 15 && bpos < end {
-          while nbits <= 56 && bpos < end {
-            bits = bits | (data[bpos].to_int().to_int64().to_uint64() << nbits)
-            bpos = bpos + 1
-            nbits = nbits + 8
+        if nbits < 15 {
+          if bpos + 4 <= end {
+            let w32 : UInt64 = (data[bpos].to_int() |
+              (data[bpos + 1].to_int() << 8) |
+              (data[bpos + 2].to_int() << 16) |
+              (data[bpos + 3].to_int() << 24)).to_int64().to_uint64() &
+            0xFFFFFFFFUL
+            bits = bits | (w32 << nbits)
+            bpos = bpos + 4
+            nbits = nbits + 32
+          } else {
+            while nbits <= 56 && bpos < end {
+              bits = bits | (data[bpos].to_int().to_int64().to_uint64() << nbits)
+              bpos = bpos + 1
+              nbits = nbits + 8
+            }
           }
         }
-        let entry = all_tables[a_off + (bits & 255UL).to_int()]
-        if entry > 0 {
-          let blen = (entry & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          alpha = entry >> 8
-        } else if entry < 0 {
-          let desc = -entry
-          let sub_bits = desc & 0xF
-          let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
-          let se = all_tables[a_off + sub_off + sub_idx]
-          if se <= 0 {
+        let mut e = ftbl[a_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, a_off, e, bits)
+          if e < 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          alpha = se >> 8
-        } else {
-          err_code = 2
+        }
+        let blen = e & 0xF
+        if nbits < blen {
+          err_code = 1
           break
         }
+        bits = bits >> blen
+        nbits = nbits - blen
+        alpha = e >> 8
       }
 
-      pix[p] = red.to_byte()
-      pix[p + 1] = green.to_byte()
-      pix[p + 2] = blue.to_byte()
-      pix[p + 3] = alpha.to_byte()
-      p = p + 4
-      x = x + 1
-      if x == w {
-        x = 0
-        y = y + 1
+      pix[p] = ((alpha << 24) | (red << 16) | (green << 8) | blue).to_uint()
+      p = p + 1
+      if h_mask != 0 {
+        x = x + 1
+        if x == w {
+          x = 0
+          y = y + 1
+        }
+        lookup_hg = (x & h_mask) == 0
       }
-      lookup_hg = h_mask != 0 && (x & h_mask) == 0
     } else if green < vp8l_n_literal_codes + vp8l_n_length_codes {
       let len_sym = green - vp8l_n_literal_codes
       let mut length = len_sym + 1
@@ -764,38 +1032,22 @@ fn vp8l_decode_pix_rgba_body(
       if d_off < 0 {
         dist_sym = -d_off - 1
       } else {
-        let entry = all_tables[d_off + (bits & 255UL).to_int()]
-        if entry > 0 {
-          let blen = (entry & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          dist_sym = entry >> 8
-        } else if entry < 0 {
-          let desc = -entry
-          let sub_bits = desc & 0xF
-          let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
-          let se = all_tables[d_off + sub_off + sub_idx]
-          if se <= 0 {
+        let mut e = ftbl[d_off + (bits & 511UL).to_int()]
+        if e <= 0 {
+          e = vp8l_huff_sub(ftbl, d_off, e, bits)
+          if e < 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
-          if nbits < blen {
-            err_code = 1
-            break
-          }
-          bits = bits >> blen
-          nbits = nbits - blen
-          dist_sym = se >> 8
-        } else {
-          err_code = 2
+        }
+        let blen = e & 0xF
+        if nbits < blen {
+          err_code = 1
           break
         }
+        bits = bits >> blen
+        nbits = nbits - blen
+        dist_sym = e >> 8
       }
       let mut dist_code = dist_sym + 1
       if dist_sym >= 4 {
@@ -816,89 +1068,155 @@ fn vp8l_decode_pix_rgba_body(
         nbits = nbits - extra_bits
         dist_code = ((2 + (dist_sym & 1)) << extra_bits) + extra + 1
       }
-      let dist = vp8l_distance_map(w, dist_code)
-      let p_end = p + 4 * length
-      let mut q = p - 4 * dist
-      if p_end > pix_len || q < 0 || p_end < p {
+      let dist = if dist_code > 120 {
+        dist_code - 120
+      } else {
+        let dc = dist_tbl[dist_code - 1]
+        let d = (dc >> 4) * w + (8 - (dc & 0xF))
+        if d >= 1 { d } else { 1 }
+      }
+      let p_end = p + length
+      let mut q = p - dist
+      if p_end > npix || q < 0 || p_end < p {
         err_code = 3
         break
       }
       if dist == 1 {
-        let b0 = pix[q]
-        let b1 = pix[q + 1]
-        let b2 = pix[q + 2]
-        let b3 = pix[q + 3]
+        let v = pix[q]
         while p < p_end {
-          pix[p] = b0
-          pix[p + 1] = b1
-          pix[p + 2] = b2
-          pix[p + 3] = b3
-          p = p + 4
+          pix[p] = v
+          p = p + 1
         }
       } else {
         while p < p_end {
           pix[p] = pix[q]
-          pix[p + 1] = pix[q + 1]
-          pix[p + 2] = pix[q + 2]
-          pix[p + 3] = pix[q + 3]
-          p = p + 4
-          q = q + 4
+          p = p + 1
+          q = q + 1
         }
       }
-      x = x + length
-      while x >= w {
-        x = x - w
-        y = y + 1
+      if h_mask != 0 {
+        x = x + length
+        while x >= w {
+          x = x - w
+          y = y + 1
+        }
+        lookup_hg = true
       }
-      lookup_hg = h_mask != 0
     } else {
-      // Color cache lookup: lazily insert all previously decoded pixels.
       while cached_p < p {
-        let argb : UInt64 = (pix[cached_p + 3].to_int().to_int64().to_uint64() << 24) |
-        (pix[cached_p].to_int().to_int64().to_uint64() << 16) |
-        (pix[cached_p + 1].to_int().to_int64().to_uint64() << 8) |
-        pix[cached_p + 2].to_int().to_int64().to_uint64()
-        let key = (((argb * cc_mult) & 0xFFFFFFFFUL) >> cc_shift).to_int()
-        cc_entries[key] = argb
-        cached_p = cached_p + 4
+        let argb = pix[cached_p]
+        cc_entries[((argb * cc_mult_u) >> cc_shift_u).to_int()] = argb
+        cached_p = cached_p + 1
       }
       let cidx = green - (vp8l_n_literal_codes + vp8l_n_length_codes)
       if cidx >= cc_size {
         err_code = 4
         break
       }
-      let argb = cc_entries[cidx]
-      pix[p] = ((argb >> 16) & 0xFFUL).to_int().to_byte()
-      pix[p + 1] = ((argb >> 8) & 0xFFUL).to_int().to_byte()
-      pix[p + 2] = (argb & 0xFFUL).to_int().to_byte()
-      pix[p + 3] = ((argb >> 24) & 0xFFUL).to_int().to_byte()
-      p = p + 4
-      x = x + 1
-      if x == w {
-        x = 0
-        y = y + 1
+      pix[p] = cc_entries[cidx]
+      p = p + 1
+      if h_mask != 0 {
+        x = x + 1
+        if x == w {
+          x = 0
+          y = y + 1
+        }
+        lookup_hg = (x & h_mask) == 0
       }
-      lookup_hg = h_mask != 0 && (x & h_mask) == 0
     }
   }
 
-  if err_code == 1 {
+  st.p = p
+  st.cached_p = cached_p
+  st.x = x
+  st.y = y
+  st.bpos = bpos
+  st.bits = bits
+  st.nbits = nbits
+  st.err_code = err_code
+}
+
+///| Decode VP8L pixel stream into packed `0xAARRGGBB` `FixedArray[UInt]` using split fast/tail loops.
+fn vp8l_decode_pix_u32_body(
+  br : BitReader,
+  w : Int,
+  h : Int,
+  min_pixels : Int,
+  hdr : Vp8lPixHeader,
+) -> Result[FixedArray[UInt], WebpError] {
+  let npix = w * h
+  let alloc_pix = if min_pixels > npix { min_pixels } else { npix }
+  let pix = FixedArray::make(alloc_pix, 0U)
+  let cc_entries = FixedArray::make(hdr.cc_size, 0U)
+  let tlen = hdr.all_tables.length()
+  let ftbl = FixedArray::make(tlen, 0)
+  let mut ti = 0
+  while ti < tlen {
+    ftbl[ti] = hdr.all_tables[ti]
+    ti = ti + 1
+  }
+  let st = Vp8lDecState::{
+    p: 0,
+    cached_p: 0,
+    x: 0,
+    y: 0,
+    bpos: br.pos,
+    bits: br.bits,
+    nbits: br.nbits,
+    err_code: 0,
+  }
+  let fast_end = br.end - 12
+  if st.bpos <= fast_end {
+    vp8l_decode_pix_u32_fast(br.data, fast_end, w, npix, hdr, ftbl, cc_entries, pix, st)
+  }
+  if st.err_code == 0 && st.p < npix {
+    vp8l_decode_pix_u32_tail(br.data, br.end, w, npix, hdr, ftbl, cc_entries, pix, st)
+  }
+  if st.err_code == 1 {
     return Err(WebpError::UnexpectedEof("VP8L pixel stream truncated"))
   }
-  if err_code == 2 {
+  if st.err_code == 2 {
     return Err(WebpError::InvalidHuffman("invalid VP8L Huffman code"))
   }
-  if err_code == 3 {
+  if st.err_code == 3 {
     return Err(WebpError::InvalidLz77("LZ77 backwards reference out of bounds"))
   }
-  if err_code == 4 {
+  if st.err_code == 4 {
     return Err(WebpError::InvalidBitstream("VP8L color cache index out of range"))
   }
-
-  br.pos = bpos
-  br.bits = bits
-  br.nbits = nbits
+  br.pos = st.bpos
+  br.bits = st.bits
+  br.nbits = st.nbits
   Ok(pix)
+}
+
+///| Decode VP8L pixel image into packed `0xAARRGGBB` `FixedArray[UInt]`.
+fn vp8l_decode_pix_u32(
+  br : BitReader,
+  w : Int,
+  h : Int,
+  min_pixels : Int,
+  top_level : Bool,
+) -> Result[FixedArray[UInt], WebpError] {
+  let hdr = match vp8l_decode_pix_header(br, w, h, top_level) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  vp8l_decode_pix_u32_body(br, w, h, min_pixels, hdr)
+}
+
+///| Decode VP8L sub-image (transforms / meta-Huffman) into RGBA8888 `Bytes`.
+fn vp8l_decode_pix(
+  br : BitReader,
+  w : Int,
+  h : Int,
+  min_bytes : Int,
+  top_level : Bool,
+) -> Result[Bytes, WebpError] {
+  match vp8l_decode_pix_u32(br, w, h, (min_bytes + 3) >> 2, top_level) {
+    Ok(px) => Ok(vp8l_u32_to_rgba_bytes(px))
+    Err(e) => Err(e)
+  }
 }
 
 fn vp8l_decode_transform(
@@ -1002,23 +1320,184 @@ fn vp8l_to_i8(b : Int) -> Int {
   if b >= 128 { b - 256 } else { b }
 }
 
-fn vp8l_inverse_predictor(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
+///| SWAR 4-channel mod-256 addition on packed `0xAARRGGBB` pixels.
+fn vp8l_add_argb(a : UInt, b : UInt) -> UInt {
+  let lo = ((a & 0x00FF00FFU) + (b & 0x00FF00FFU)) & 0x00FF00FFU
+  let hi = ((a & 0xFF00FF00U) + (b & 0xFF00FF00U)) & 0xFF00FF00U
+  lo | hi
+}
+
+///| SWAR 4-channel exact floor average `(a + b) >> 1` on packed `0xAARRGGBB` pixels.
+fn vp8l_avg2_argb(a : UInt, b : UInt) -> UInt {
+  (a & b) + (((a ^ b) & 0xFEFEFEFEU) >> 1U)
+}
+
+///| Outlined per-tile Mode 11 (Select) inverse predictor on `FixedArray[UInt]` (small stack frame).
+fn vp8l_inv_pred_u32_mode11(pix : FixedArray[UInt], p0 : Int, top0 : Int, count : Int) -> Unit {
+  let mut p = p0
+  let mut top = top0
+  let p_end = p0 + count
+  let lv0 = pix[p - 1]
+  let mut l0 = ((lv0 >> 16U) & 0xFFU).to_int()
+  let mut l1 = ((lv0 >> 8U) & 0xFFU).to_int()
+  let mut l2 = (lv0 & 0xFFU).to_int()
+  let mut l3 = (lv0 >> 24U).to_int()
+  let cv0 = pix[top - 1]
+  let mut c0 = ((cv0 >> 16U) & 0xFFU).to_int()
+  let mut c1 = ((cv0 >> 8U) & 0xFFU).to_int()
+  let mut c2 = (cv0 & 0xFFU).to_int()
+  let mut c3 = (cv0 >> 24U).to_int()
+  while p < p_end {
+    let tv = pix[top]
+    let t0 = ((tv >> 16U) & 0xFFU).to_int()
+    let t1 = ((tv >> 8U) & 0xFFU).to_int()
+    let t2 = (tv & 0xFFU).to_int()
+    let t3 = (tv >> 24U).to_int()
+    let pl = (if c0 >= t0 { c0 - t0 } else { t0 - c0 }) +
+    (if c1 >= t1 { c1 - t1 } else { t1 - c1 }) +
+    (if c2 >= t2 { c2 - t2 } else { t2 - c2 }) +
+    (if c3 >= t3 { c3 - t3 } else { t3 - c3 })
+    let pt = (if c0 >= l0 { c0 - l0 } else { l0 - c0 }) +
+    (if c1 >= l1 { c1 - l1 } else { l1 - c1 }) +
+    (if c2 >= l2 { c2 - l2 } else { l2 - c2 }) +
+    (if c3 >= l3 { c3 - l3 } else { l3 - c3 })
+    let pv = pix[p]
+    let pr0 = ((pv >> 16U) & 0xFFU).to_int()
+    let pr1 = ((pv >> 8U) & 0xFFU).to_int()
+    let pr2 = (pv & 0xFFU).to_int()
+    let pr3 = (pv >> 24U).to_int()
+    if pl < pt {
+      l0 = (pr0 + l0) & 0xFF
+      l1 = (pr1 + l1) & 0xFF
+      l2 = (pr2 + l2) & 0xFF
+      l3 = (pr3 + l3) & 0xFF
+    } else {
+      l0 = (pr0 + t0) & 0xFF
+      l1 = (pr1 + t1) & 0xFF
+      l2 = (pr2 + t2) & 0xFF
+      l3 = (pr3 + t3) & 0xFF
+    }
+    pix[p] = ((l3 << 24) | (l0 << 16) | (l1 << 8) | l2).to_uint()
+    c0 = t0
+    c1 = t1
+    c2 = t2
+    c3 = t3
+    p = p + 1
+    top = top + 1
+  }
+}
+
+///| Outlined per-tile Mode 12 (ClampAddSubFull) inverse predictor on `FixedArray[UInt]`.
+fn vp8l_inv_pred_u32_mode12(pix : FixedArray[UInt], p0 : Int, top0 : Int, count : Int) -> Unit {
+  let mut p = p0
+  let mut top = top0
+  let p_end = p0 + count
+  let lv0 = pix[p - 1].to_int()
+  let mut l0 = (lv0 >> 16) & 0xFF
+  let mut l1 = (lv0 >> 8) & 0xFF
+  let mut l2 = lv0 & 0xFF
+  let mut l3 = (lv0 >> 24) & 0xFF
+  let cv0 = pix[top - 1].to_int()
+  let mut c0 = (cv0 >> 16) & 0xFF
+  let mut c1 = (cv0 >> 8) & 0xFF
+  let mut c2 = cv0 & 0xFF
+  let mut c3 = (cv0 >> 24) & 0xFF
+  while p < p_end {
+    let tv = pix[top].to_int()
+    let t0 = (tv >> 16) & 0xFF
+    let t1 = (tv >> 8) & 0xFF
+    let t2 = tv & 0xFF
+    let t3 = (tv >> 24) & 0xFF
+    let mut pr0 = l0 + t0 - c0
+    if (pr0 & -256) != 0 { pr0 = if pr0 < 0 { 0 } else { 255 } }
+    let mut pr1 = l1 + t1 - c1
+    if (pr1 & -256) != 0 { pr1 = if pr1 < 0 { 0 } else { 255 } }
+    let mut pr2 = l2 + t2 - c2
+    if (pr2 & -256) != 0 { pr2 = if pr2 < 0 { 0 } else { 255 } }
+    let mut pr3 = l3 + t3 - c3
+    if (pr3 & -256) != 0 { pr3 = if pr3 < 0 { 0 } else { 255 } }
+    let pv = pix[p].to_int()
+    l0 = ((pv >> 16) + pr0) & 0xFF
+    l1 = ((pv >> 8) + pr1) & 0xFF
+    l2 = (pv + pr2) & 0xFF
+    l3 = ((pv >> 24) + pr3) & 0xFF
+    pix[p] = ((l3 << 24) | (l0 << 16) | (l1 << 8) | l2).to_uint()
+    c0 = t0
+    c1 = t1
+    c2 = t2
+    c3 = t3
+    p = p + 1
+    top = top + 1
+  }
+}
+
+///| Outlined per-tile Mode 13 (ClampAddSubHalf) inverse predictor on `FixedArray[UInt]` (division-free).
+fn vp8l_inv_pred_u32_mode13(pix : FixedArray[UInt], p0 : Int, top0 : Int, count : Int) -> Unit {
+  let mut p = p0
+  let mut top = top0
+  let p_end = p0 + count
+  let lv0 = pix[p - 1]
+  let mut l0 = ((lv0 >> 16U) & 0xFFU).to_int()
+  let mut l1 = ((lv0 >> 8U) & 0xFFU).to_int()
+  let mut l2 = (lv0 & 0xFFU).to_int()
+  let mut l3 = (lv0 >> 24U).to_int()
+  let cv0 = pix[top - 1]
+  let mut c0 = ((cv0 >> 16U) & 0xFFU).to_int()
+  let mut c1 = ((cv0 >> 8U) & 0xFFU).to_int()
+  let mut c2 = (cv0 & 0xFFU).to_int()
+  let mut c3 = (cv0 >> 24U).to_int()
+  while p < p_end {
+    let tv = pix[top]
+    let t0 = ((tv >> 16U) & 0xFFU).to_int()
+    let t1 = ((tv >> 8U) & 0xFFU).to_int()
+    let t2 = (tv & 0xFFU).to_int()
+    let t3 = (tv >> 24U).to_int()
+    let a0 = (l0 + t0) >> 1
+    let d0 = a0 - c0
+    let mut pr0 = a0 + ((d0 + ((d0 >> 31) & 1)) >> 1)
+    if (pr0 & -256) != 0 { pr0 = if pr0 < 0 { 0 } else { 255 } }
+    let a1 = (l1 + t1) >> 1
+    let d1 = a1 - c1
+    let mut pr1 = a1 + ((d1 + ((d1 >> 31) & 1)) >> 1)
+    if (pr1 & -256) != 0 { pr1 = if pr1 < 0 { 0 } else { 255 } }
+    let a2 = (l2 + t2) >> 1
+    let d2 = a2 - c2
+    let mut pr2 = a2 + ((d2 + ((d2 >> 31) & 1)) >> 1)
+    if (pr2 & -256) != 0 { pr2 = if pr2 < 0 { 0 } else { 255 } }
+    let a3 = (l3 + t3) >> 1
+    let d3 = a3 - c3
+    let mut pr3 = a3 + ((d3 + ((d3 >> 31) & 1)) >> 1)
+    if (pr3 & -256) != 0 { pr3 = if pr3 < 0 { 0 } else { 255 } }
+    let pv = pix[p]
+    l0 = ((((pv >> 16U) & 0xFFU).to_int()) + pr0) & 0xFF
+    l1 = ((((pv >> 8U) & 0xFFU).to_int()) + pr1) & 0xFF
+    l2 = (((pv & 0xFFU).to_int()) + pr2) & 0xFF
+    l3 = ((pv >> 24U).to_int() + pr3) & 0xFF
+    pix[p] = ((l3 << 24) | (l0 << 16) | (l1 << 8) | l2).to_uint()
+    c0 = t0
+    c1 = t1
+    c2 = t2
+    c3 = t3
+    p = p + 1
+    top = top + 1
+  }
+}
+
+///| SWAR inverse Predictor transform on packed `0xAARRGGBB` `FixedArray[UInt]` (zero COW, 4-lane parallel).
+fn vp8l_inverse_predictor_u32(t : Vp8lTransform, pix : FixedArray[UInt], h : Int) -> FixedArray[UInt] {
   let w = t.old_width
   if w == 0 || h == 0 {
-    return pix_in
+    return pix
   }
-  let mut pix = pix_in
-  // Pixel (0,0): mode 0 (opaque black)
-  pix[3] = ((pix[3].to_int() + 0xFF) & 0xFF).to_byte()
-  let mut p = 4
-  let mask = (1 << t.bits) - 1
+  // Pixel (0,0): mode 0 (opaque black: +0xFF000000)
+  pix[0] = pix[0] + 0xFF000000U
+  let mut p = 1
   let mut x = 1
+  let mut l = pix[0]
   while x < w {
-    pix[p] = ((pix[p].to_int() + pix[p - 4].to_int()) & 0xFF).to_byte()
-    pix[p + 1] = ((pix[p + 1].to_int() + pix[p - 3].to_int()) & 0xFF).to_byte()
-    pix[p + 2] = ((pix[p + 2].to_int() + pix[p - 2].to_int()) & 0xFF).to_byte()
-    pix[p + 3] = ((pix[p + 3].to_int() + pix[p - 1].to_int()) & 0xFF).to_byte()
-    p = p + 4
+    l = vp8l_add_argb(pix[p], l)
+    pix[p] = l
+    p = p + 1
     x = x + 1
   }
   let mut top = 0
@@ -1028,12 +1507,9 @@ fn vp8l_inverse_predictor(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
   let mut y = 1
   while y < h {
     // First column: mode 2 (T)
-    pix[p] = ((pix[p].to_int() + pix[top].to_int()) & 0xFF).to_byte()
-    pix[p + 1] = ((pix[p + 1].to_int() + pix[top + 1].to_int()) & 0xFF).to_byte()
-    pix[p + 2] = ((pix[p + 2].to_int() + pix[top + 2].to_int()) & 0xFF).to_byte()
-    pix[p + 3] = ((pix[p + 3].to_int() + pix[top + 3].to_int()) & 0xFF).to_byte()
-    p = p + 4
-    top = top + 4
+    pix[p] = vp8l_add_argb(pix[p], pix[top])
+    p = p + 1
+    top = top + 1
 
     let mut q = 4 * (y >> t.bits) * tiles_per_row
     x = 1
@@ -1046,174 +1522,116 @@ fn vp8l_inverse_predictor(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
       q = q + 4
       if mode == 0 {
         while x < tile_end {
-          pix[p + 3] = ((pix[p + 3].to_int() + 0xFF) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          pix[p] = pix[p] + 0xFF000000U
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 1 {
-        let mut l0 = pix[p - 4].to_int()
-        let mut l1 = pix[p - 3].to_int()
-        let mut l2 = pix[p - 2].to_int()
-        let mut l3 = pix[p - 1].to_int()
+        let mut lv = pix[p - 1]
         while x < tile_end {
-          l0 = (pix[p].to_int() + l0) & 0xFF
-          l1 = (pix[p + 1].to_int() + l1) & 0xFF
-          l2 = (pix[p + 2].to_int() + l2) & 0xFF
-          l3 = (pix[p + 3].to_int() + l3) & 0xFF
-          pix[p] = l0.to_byte()
-          pix[p + 1] = l1.to_byte()
-          pix[p + 2] = l2.to_byte()
-          pix[p + 3] = l3.to_byte()
-          p = p + 4
-          top = top + 4
+          lv = vp8l_add_argb(pix[p], lv)
+          pix[p] = lv
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 2 {
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + pix[top].to_int()) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + pix[top + 1].to_int()) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + pix[top + 2].to_int()) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + pix[top + 3].to_int()) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          pix[p] = vp8l_add_argb(pix[p], pix[top])
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 3 {
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + pix[top + 4].to_int()) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + pix[top + 5].to_int()) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + pix[top + 6].to_int()) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + pix[top + 7].to_int()) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          pix[p] = vp8l_add_argb(pix[p], pix[top + 1])
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 4 {
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + pix[top - 4].to_int()) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + pix[top - 3].to_int()) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + pix[top - 2].to_int()) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + pix[top - 1].to_int()) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          pix[p] = vp8l_add_argb(pix[p], pix[top - 1])
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 5 {
+        let mut lv = pix[p - 1]
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + ((((pix[p - 4].to_int() + pix[top + 4].to_int()) >> 1) + pix[top].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + ((((pix[p - 3].to_int() + pix[top + 5].to_int()) >> 1) + pix[top + 1].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + ((((pix[p - 2].to_int() + pix[top + 6].to_int()) >> 1) + pix[top + 2].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + ((((pix[p - 1].to_int() + pix[top + 7].to_int()) >> 1) + pix[top + 3].to_int()) >> 1)) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          lv = vp8l_add_argb(pix[p], vp8l_avg2_argb(vp8l_avg2_argb(lv, pix[top + 1]), pix[top]))
+          pix[p] = lv
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 6 {
+        let mut lv = pix[p - 1]
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + ((pix[p - 4].to_int() + pix[top - 4].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + ((pix[p - 3].to_int() + pix[top - 3].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + ((pix[p - 2].to_int() + pix[top - 2].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + ((pix[p - 1].to_int() + pix[top - 1].to_int()) >> 1)) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          lv = vp8l_add_argb(pix[p], vp8l_avg2_argb(lv, pix[top - 1]))
+          pix[p] = lv
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 7 {
+        let mut lv = pix[p - 1]
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + ((pix[p - 4].to_int() + pix[top].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + ((pix[p - 3].to_int() + pix[top + 1].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + ((pix[p - 2].to_int() + pix[top + 2].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + ((pix[p - 1].to_int() + pix[top + 3].to_int()) >> 1)) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          lv = vp8l_add_argb(pix[p], vp8l_avg2_argb(lv, pix[top]))
+          pix[p] = lv
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 8 {
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + ((pix[top - 4].to_int() + pix[top].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + ((pix[top - 3].to_int() + pix[top + 1].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + ((pix[top - 2].to_int() + pix[top + 2].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + ((pix[top - 1].to_int() + pix[top + 3].to_int()) >> 1)) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          pix[p] = vp8l_add_argb(pix[p], vp8l_avg2_argb(pix[top - 1], pix[top]))
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 9 {
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + ((pix[top].to_int() + pix[top + 4].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + ((pix[top + 1].to_int() + pix[top + 5].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + ((pix[top + 2].to_int() + pix[top + 6].to_int()) >> 1)) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + ((pix[top + 3].to_int() + pix[top + 7].to_int()) >> 1)) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          pix[p] = vp8l_add_argb(pix[p], vp8l_avg2_argb(pix[top], pix[top + 1]))
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 10 {
+        let mut lv = pix[p - 1]
         while x < tile_end {
-          pix[p] = ((pix[p].to_int() + ((((pix[p - 4].to_int() + pix[top - 4].to_int()) >> 1) + ((pix[top].to_int() + pix[top + 4].to_int()) >> 1)) >> 1)) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + ((((pix[p - 3].to_int() + pix[top - 3].to_int()) >> 1) + ((pix[top + 1].to_int() + pix[top + 5].to_int()) >> 1)) >> 1)) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + ((((pix[p - 2].to_int() + pix[top - 2].to_int()) >> 1) + ((pix[top + 2].to_int() + pix[top + 6].to_int()) >> 1)) >> 1)) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + ((((pix[p - 1].to_int() + pix[top - 1].to_int()) >> 1) + ((pix[top + 3].to_int() + pix[top + 7].to_int()) >> 1)) >> 1)) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
+          lv = vp8l_add_argb(
+            pix[p],
+            vp8l_avg2_argb(vp8l_avg2_argb(lv, pix[top - 1]), vp8l_avg2_argb(pix[top], pix[top + 1])),
+          )
+          pix[p] = lv
+          p = p + 1
+          top = top + 1
           x = x + 1
         }
       } else if mode == 11 {
-        while x < tile_end {
-          let l0 = pix[p - 4].to_int()
-          let l1 = pix[p - 3].to_int()
-          let l2 = pix[p - 2].to_int()
-          let l3 = pix[p - 1].to_int()
-          let c0 = pix[top - 4].to_int()
-          let c1 = pix[top - 3].to_int()
-          let c2 = pix[top - 2].to_int()
-          let c3 = pix[top - 1].to_int()
-          let t0 = pix[top].to_int()
-          let t1 = pix[top + 1].to_int()
-          let t2 = pix[top + 2].to_int()
-          let t3 = pix[top + 3].to_int()
-          let pl = vp8l_abs(c0 - t0) + vp8l_abs(c1 - t1) + vp8l_abs(c2 - t2) + vp8l_abs(c3 - t3)
-          let pt = vp8l_abs(c0 - l0) + vp8l_abs(c1 - l1) + vp8l_abs(c2 - l2) + vp8l_abs(c3 - l3)
-          if pl < pt {
-            pix[p] = ((pix[p].to_int() + l0) & 0xFF).to_byte()
-            pix[p + 1] = ((pix[p + 1].to_int() + l1) & 0xFF).to_byte()
-            pix[p + 2] = ((pix[p + 2].to_int() + l2) & 0xFF).to_byte()
-            pix[p + 3] = ((pix[p + 3].to_int() + l3) & 0xFF).to_byte()
-          } else {
-            pix[p] = ((pix[p].to_int() + t0) & 0xFF).to_byte()
-            pix[p + 1] = ((pix[p + 1].to_int() + t1) & 0xFF).to_byte()
-            pix[p + 2] = ((pix[p + 2].to_int() + t2) & 0xFF).to_byte()
-            pix[p + 3] = ((pix[p + 3].to_int() + t3) & 0xFF).to_byte()
-          }
-          p = p + 4
-          top = top + 4
-          x = x + 1
-        }
+        let cnt = tile_end - x
+        vp8l_inv_pred_u32_mode11(pix, p, top, cnt)
+        p = p + cnt
+        top = top + cnt
+        x = tile_end
       } else if mode == 12 {
-        while x < tile_end {
-          pix[p] = ((pix[p].to_int() + vp8l_clamp_add_sub_full(pix[p - 4].to_int(), pix[top].to_int(), pix[top - 4].to_int())) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + vp8l_clamp_add_sub_full(pix[p - 3].to_int(), pix[top + 1].to_int(), pix[top - 3].to_int())) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + vp8l_clamp_add_sub_full(pix[p - 2].to_int(), pix[top + 2].to_int(), pix[top - 2].to_int())) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + vp8l_clamp_add_sub_full(pix[p - 1].to_int(), pix[top + 3].to_int(), pix[top - 1].to_int())) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
-          x = x + 1
-        }
+        let cnt = tile_end - x
+        vp8l_inv_pred_u32_mode12(pix, p, top, cnt)
+        p = p + cnt
+        top = top + cnt
+        x = tile_end
       } else if mode == 13 {
-        while x < tile_end {
-          pix[p] = ((pix[p].to_int() + vp8l_clamp_add_sub_half((pix[p - 4].to_int() + pix[top].to_int()) >> 1, pix[top - 4].to_int())) & 0xFF).to_byte()
-          pix[p + 1] = ((pix[p + 1].to_int() + vp8l_clamp_add_sub_half((pix[p - 3].to_int() + pix[top + 1].to_int()) >> 1, pix[top - 3].to_int())) & 0xFF).to_byte()
-          pix[p + 2] = ((pix[p + 2].to_int() + vp8l_clamp_add_sub_half((pix[p - 2].to_int() + pix[top + 2].to_int()) >> 1, pix[top - 2].to_int())) & 0xFF).to_byte()
-          pix[p + 3] = ((pix[p + 3].to_int() + vp8l_clamp_add_sub_half((pix[p - 1].to_int() + pix[top + 3].to_int()) >> 1, pix[top - 1].to_int())) & 0xFF).to_byte()
-          p = p + 4
-          top = top + 4
-          x = x + 1
-        }
+        let cnt = tile_end - x
+        vp8l_inv_pred_u32_mode13(pix, p, top, cnt)
+        p = p + cnt
+        top = top + cnt
+        x = tile_end
       } else {
         let skip = tile_end - x
-        p = p + skip * 4
-        top = top + skip * 4
+        p = p + skip
+        top = top + skip
         x = tile_end
       }
       tile_end = tile_end + tile_w
@@ -1223,8 +1641,8 @@ fn vp8l_inverse_predictor(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
   pix
 }
 
-fn vp8l_inverse_cross_color(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
-  let mut pix = pix_in
+///| Inverse CrossColor transform on packed `0xAARRGGBB` `FixedArray[UInt]`.
+fn vp8l_inverse_cross_color_u32(t : Vp8lTransform, pix : FixedArray[UInt], h : Int) -> FixedArray[UInt] {
   let w = t.old_width
   let tile_w = 1 << t.bits
   let tiles_per_row = vp8l_ntiles(w, t.bits)
@@ -1247,14 +1665,14 @@ fn vp8l_inverse_cross_color(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes
       let g2r = if g2r_u >= 128 { g2r_u - 256 } else { g2r_u }
       q = q + 4
       while x < tile_end {
-        let g_u = pix[p + 1].to_int()
+        let v = pix[p].to_int()
+        let g_u = (v >> 8) & 0xFF
         let g_s = if g_u >= 128 { g_u - 256 } else { g_u }
-        let red = (pix[p].to_int() + ((g2r * g_s) >> 5)) & 0xFF
+        let red = (((v >> 16) & 0xFF) + ((g2r * g_s) >> 5)) & 0xFF
         let r_s = if red >= 128 { red - 256 } else { red }
-        let blue = (pix[p + 2].to_int() + ((g2b * g_s) >> 5) + ((r2b * r_s) >> 5)) & 0xFF
-        pix[p] = red.to_byte()
-        pix[p + 2] = blue.to_byte()
-        p = p + 4
+        let blue = ((v & 0xFF) + ((g2b * g_s) >> 5) + ((r2b * r_s) >> 5)) & 0xFF
+        pix[p] = ((v & -16711936) | (red << 16) | blue).to_uint()
+        p = p + 1
         x = x + 1
       }
     }
@@ -1263,32 +1681,112 @@ fn vp8l_inverse_cross_color(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes
   pix
 }
 
-fn vp8l_inverse_subtract_green(pix_in : Bytes) -> Bytes {
-  let mut pix = pix_in
+///| Fused final-stage inverse CrossColor + RGBA8888 Bytes output (eliminates one full image pass).
+fn vp8l_inverse_cross_color_to_rgba_bytes(t : Vp8lTransform, pix : FixedArray[UInt], h : Int) -> Bytes {
+  let w = t.old_width
+  let mut out = Bytes::new(4 * w * h)
+  let tile_w = 1 << t.bits
+  let tiles_per_row = vp8l_ntiles(w, t.bits)
+  let tpix = t.pix
+  let mut p = 0
+  let mut d = 0
+  let mut y = 0
+  while y < h {
+    let mut q = 4 * (y >> t.bits) * tiles_per_row
+    let mut x = 0
+    while x < w {
+      let mut tile_end = x + tile_w
+      if tile_end > w {
+        tile_end = w
+      }
+      let r2b_u = tpix[q].to_int()
+      let g2b_u = tpix[q + 1].to_int()
+      let g2r_u = tpix[q + 2].to_int()
+      let r2b = if r2b_u >= 128 { r2b_u - 256 } else { r2b_u }
+      let g2b = if g2b_u >= 128 { g2b_u - 256 } else { g2b_u }
+      let g2r = if g2r_u >= 128 { g2r_u - 256 } else { g2r_u }
+      q = q + 4
+      while x < tile_end {
+        let v = pix[p].to_int()
+        let g_u = (v >> 8) & 0xFF
+        let g_s = if g_u >= 128 { g_u - 256 } else { g_u }
+        let red = (((v >> 16) & 0xFF) + ((g2r * g_s) >> 5)) & 0xFF
+        let r_s = if red >= 128 { red - 256 } else { red }
+        let blue = ((v & 0xFF) + ((g2b * g_s) >> 5) + ((r2b * r_s) >> 5)) & 0xFF
+        out[d] = red.to_byte()
+        out[d + 1] = g_u.to_byte()
+        out[d + 2] = blue.to_byte()
+        out[d + 3] = ((v >> 24) & 0xFF).to_byte()
+        p = p + 1
+        d = d + 4
+        x = x + 1
+      }
+    }
+    y = y + 1
+  }
+  out
+}
+
+///| Fused final-stage inverse SubtractGreen + RGBA8888 Bytes output (eliminates one full image pass).
+fn vp8l_inverse_subtract_green_to_rgba_bytes(pix : FixedArray[UInt]) -> Bytes {
+  let npix = pix.length()
+  let mut out = Bytes::new(npix * 4)
+  let mut i = 0
+  let mut d = 0
+  while i < npix {
+    let v = pix[i].to_int()
+    let g = (v >> 8) & 0xFF
+    out[d] = ((v >> 16) + g).to_byte()
+    out[d + 1] = g.to_byte()
+    out[d + 2] = (v + g).to_byte()
+    out[d + 3] = (v >> 24).to_byte()
+    i = i + 1
+    d = d + 4
+  }
+  out
+}
+
+///| SWAR inverse SubtractGreen transform on packed `0xAARRGGBB` `FixedArray[UInt]`.
+fn vp8l_inverse_subtract_green_u32(pix : FixedArray[UInt]) -> FixedArray[UInt] {
   let n = pix.length()
   let mut p = 0
-  while p < n {
-    let g = pix[p + 1].to_int()
-    pix[p] = ((pix[p].to_int() + g) & 0xFF).to_byte()
-    pix[p + 2] = ((pix[p + 2].to_int() + g) & 0xFF).to_byte()
-    p = p + 4
+  let n2 = n & -2
+  while p < n2 {
+    let v0 = pix[p]
+    let g0 = (v0 >> 8U) & 0xFFU
+    pix[p] = (v0 & 0xFF00FF00U) | (((v0 & 0x00FF00FFU) + ((g0 << 16U) | g0)) & 0x00FF00FFU)
+    let v1 = pix[p + 1]
+    let g1 = (v1 >> 8U) & 0xFFU
+    pix[p + 1] = (v1 & 0xFF00FF00U) | (((v1 & 0x00FF00FFU) + ((g1 << 16U) | g1)) & 0x00FF00FFU)
+    p = p + 2
+  }
+  if p < n {
+    let v = pix[p]
+    let g = (v >> 8U) & 0xFFU
+    pix[p] = (v & 0xFF00FF00U) | (((v & 0x00FF00FFU) + ((g << 16U) | g)) & 0x00FF00FFU)
   }
   pix
 }
 
-fn vp8l_inverse_color_indexing(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
+///| Inverse ColorIndexing transform on packed `0xAARRGGBB` `FixedArray[UInt]`.
+fn vp8l_inverse_color_indexing_u32(t : Vp8lTransform, pix : FixedArray[UInt], h : Int) -> FixedArray[UInt] {
   let pal = t.pix
+  let pal_u = FixedArray::make(256, 0U)
+  let mut pi = 0
+  while pi < 256 {
+    let b = 4 * pi
+    pal_u[pi] = ((pal[b + 3].to_int() << 24) |
+      (pal[b].to_int() << 16) |
+      (pal[b + 1].to_int() << 8) |
+      pal[b + 2].to_int()).to_uint()
+    pi = pi + 1
+  }
   if t.bits == 0 {
-    let mut pix = pix_in
     let n = pix.length()
     let mut p = 0
     while p < n {
-      let i = 4 * pix[p + 1].to_int()
-      pix[p] = pal[i]
-      pix[p + 1] = pal[i + 1]
-      pix[p + 2] = pal[i + 2]
-      pix[p + 3] = pal[i + 3]
-      p = p + 4
+      pix[p] = pal_u[((pix[p] >> 8U) & 0xFFU).to_int()]
+      p = p + 1
     }
     return pix
   }
@@ -1308,7 +1806,7 @@ fn vp8l_inverse_color_indexing(t : Vp8lTransform, pix_in : Bytes, h : Int) -> By
   }
   let bpp = 8 >> t.bits
   let w = t.old_width
-  let mut dst = Bytes::new(4 * w * h)
+  let dst = FixedArray::make(w * h, 0U)
   let mut d = 0
   let mut p = 0
   let mut v = 0
@@ -1317,15 +1815,11 @@ fn vp8l_inverse_color_indexing(t : Vp8lTransform, pix_in : Bytes, h : Int) -> By
     let mut x = 0
     while x < w {
       if (x & x_mask) == 0 {
-        v = pix_in[p + 1].to_int()
-        p = p + 4
+        v = ((pix[p] >> 8U) & 0xFFU).to_int()
+        p = p + 1
       }
-      let i = 4 * (v & v_mask)
-      dst[d] = pal[i]
-      dst[d + 1] = pal[i + 1]
-      dst[d + 2] = pal[i + 2]
-      dst[d + 3] = pal[i + 3]
-      d = d + 4
+      dst[d] = pal_u[v & v_mask]
+      d = d + 1
       v = v >> bpp
       x = x + 1
     }
@@ -1418,27 +1912,41 @@ fn vp8l_decode_internal(
     w = new_w
   }
 
-  let mut pix = match vp8l_decode_pix(br, w, h, 0, true) {
+  let mut pix = match vp8l_decode_pix_u32(br, w, h, 0, true) {
     Ok(px) => px
     Err(e) => return Err(e)
   }
 
   let mut ti = transforms.length() - 1
-  while ti >= 0 {
+  while ti > 0 {
     let tr = transforms[ti]
     if tr.kind == vp8l_transform_predictor {
-      pix = vp8l_inverse_predictor(tr, pix, h)
+      pix = vp8l_inverse_predictor_u32(tr, pix, h)
     } else if tr.kind == vp8l_transform_cross_color {
-      pix = vp8l_inverse_cross_color(tr, pix, h)
+      pix = vp8l_inverse_cross_color_u32(tr, pix, h)
     } else if tr.kind == vp8l_transform_subtract_green {
-      pix = vp8l_inverse_subtract_green(pix)
+      pix = vp8l_inverse_subtract_green_u32(pix)
     } else {
-      pix = vp8l_inverse_color_indexing(tr, pix, h)
+      pix = vp8l_inverse_color_indexing_u32(tr, pix, h)
     }
     ti = ti - 1
   }
+  if ti == 0 {
+    let tr = transforms[0]
+    if tr.kind == vp8l_transform_cross_color {
+      return Ok((orig_w, h, has_alpha, vp8l_inverse_cross_color_to_rgba_bytes(tr, pix, h)))
+    }
+    if tr.kind == vp8l_transform_subtract_green {
+      return Ok((orig_w, h, has_alpha, vp8l_inverse_subtract_green_to_rgba_bytes(pix)))
+    }
+    if tr.kind == vp8l_transform_predictor {
+      pix = vp8l_inverse_predictor_u32(tr, pix, h)
+    } else {
+      pix = vp8l_inverse_color_indexing_u32(tr, pix, h)
+    }
+  }
 
-  Ok((orig_w, h, has_alpha, pix))
+  Ok((orig_w, h, has_alpha, vp8l_u32_to_rgba_bytes(pix)))
 }
 
 ///| Decode 1-byte-per-pixel green channel stream directly for VP8L-compressed ALPH.
@@ -1449,7 +1957,7 @@ fn vp8l_decode_pix_green_body(
   h : Int,
   hdr : Vp8lPixHeader,
   all_rba_zero : Bool,
-) -> Result[Bytes, WebpError] {
+) -> Result[FixedArray[Byte], WebpError] {
   let cc_shift_u = hdr.cc_shift.to_uint()
   let cc_size = hdr.cc_size
   let cc_entries = FixedArray::make(cc_size, 0)
@@ -1457,9 +1965,10 @@ fn vp8l_decode_pix_green_body(
   let h_pix = hdr.h_pix
   let grp_offs = hdr.grp_offs
   let all_tables = hdr.all_tables
+  let dist_tbl = vp8l_dist_map_tbl
 
   let pix_len = w * h
-  let mut pix = Bytes::new(pix_len)
+  let pix = FixedArray::make(pix_len, 0.to_byte())
   let h_mask = if h_bits != 0 { (1 << h_bits) - 1 } else { 0 }
   let tiles_per_row = if h_bits != 0 { vp8l_ntiles(w, h_bits) } else { 0 }
   let mut p = 0
@@ -1521,9 +2030,9 @@ fn vp8l_decode_pix_green_body(
       if g_off < 0 {
         green = -g_off - 1
       } else {
-        let entry = ftbl[g_off + (bits & 255UL).to_int()]
+        let entry = ftbl[g_off + (bits & 511UL).to_int()]
         if entry > 0 {
-          let blen = (entry & 0xFF) - 1
+          let blen = entry & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -1535,13 +2044,13 @@ fn vp8l_decode_pix_green_body(
           let desc = -entry
           let sub_bits = desc & 0xF
           let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+          let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
           let se = ftbl[g_off + sub_off + sub_idx]
           if se <= 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
+          let blen = se & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -1609,9 +2118,9 @@ fn vp8l_decode_pix_green_body(
         if d_off < 0 {
           dist_sym = -d_off - 1
         } else {
-          let entry = ftbl[d_off + (bits & 255UL).to_int()]
+          let entry = ftbl[d_off + (bits & 511UL).to_int()]
           if entry > 0 {
-            let blen = (entry & 0xFF) - 1
+            let blen = entry & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1623,13 +2132,13 @@ fn vp8l_decode_pix_green_body(
             let desc = -entry
             let sub_bits = desc & 0xF
             let sub_off = desc >> 4
-            let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+            let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
             let se = ftbl[d_off + sub_off + sub_idx]
             if se <= 0 {
               err_code = 2
               break
             }
-            let blen = 8 + (se & 0xFF) - 1
+            let blen = se & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1748,9 +2257,9 @@ fn vp8l_decode_pix_green_body(
       if g_off < 0 {
         green = -g_off - 1
       } else {
-        let entry = all_tables[g_off + (bits & 255UL).to_int()]
+        let entry = all_tables[g_off + (bits & 511UL).to_int()]
         if entry > 0 {
-          let blen = (entry & 0xFF) - 1
+          let blen = entry & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -1762,13 +2271,13 @@ fn vp8l_decode_pix_green_body(
           let desc = -entry
           let sub_bits = desc & 0xF
           let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+          let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
           let se = all_tables[g_off + sub_off + sub_idx]
           if se <= 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
+          let blen = se & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -1792,9 +2301,9 @@ fn vp8l_decode_pix_green_body(
               nbits = nbits + 8
             }
           }
-          let entry = all_tables[r_off + (bits & 255UL).to_int()]
+          let entry = all_tables[r_off + (bits & 511UL).to_int()]
           if entry > 0 {
-            let blen = (entry & 0xFF) - 1
+            let blen = entry & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1805,13 +2314,13 @@ fn vp8l_decode_pix_green_body(
             let desc = -entry
             let sub_bits = desc & 0xF
             let sub_off = desc >> 4
-            let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+            let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
             let se = all_tables[r_off + sub_off + sub_idx]
             if se <= 0 {
               err_code = 2
               break
             }
-            let blen = 8 + (se & 0xFF) - 1
+            let blen = se & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1831,9 +2340,9 @@ fn vp8l_decode_pix_green_body(
               nbits = nbits + 8
             }
           }
-          let entry = all_tables[b_off + (bits & 255UL).to_int()]
+          let entry = all_tables[b_off + (bits & 511UL).to_int()]
           if entry > 0 {
-            let blen = (entry & 0xFF) - 1
+            let blen = entry & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1844,13 +2353,13 @@ fn vp8l_decode_pix_green_body(
             let desc = -entry
             let sub_bits = desc & 0xF
             let sub_off = desc >> 4
-            let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+            let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
             let se = all_tables[b_off + sub_off + sub_idx]
             if se <= 0 {
               err_code = 2
               break
             }
-            let blen = 8 + (se & 0xFF) - 1
+            let blen = se & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1870,9 +2379,9 @@ fn vp8l_decode_pix_green_body(
               nbits = nbits + 8
             }
           }
-          let entry = all_tables[a_off + (bits & 255UL).to_int()]
+          let entry = all_tables[a_off + (bits & 511UL).to_int()]
           if entry > 0 {
-            let blen = (entry & 0xFF) - 1
+            let blen = entry & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1883,13 +2392,13 @@ fn vp8l_decode_pix_green_body(
             let desc = -entry
             let sub_bits = desc & 0xF
             let sub_off = desc >> 4
-            let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+            let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
             let se = all_tables[a_off + sub_off + sub_idx]
             if se <= 0 {
               err_code = 2
               break
             }
-            let blen = 8 + (se & 0xFF) - 1
+            let blen = se & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1953,9 +2462,9 @@ fn vp8l_decode_pix_green_body(
         if d_off < 0 {
           dist_sym = -d_off - 1
         } else {
-          let entry = all_tables[d_off + (bits & 255UL).to_int()]
+          let entry = all_tables[d_off + (bits & 511UL).to_int()]
           if entry > 0 {
-            let blen = (entry & 0xFF) - 1
+            let blen = entry & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -1967,13 +2476,13 @@ fn vp8l_decode_pix_green_body(
             let desc = -entry
             let sub_bits = desc & 0xF
             let sub_off = desc >> 4
-            let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+            let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
             let se = all_tables[d_off + sub_off + sub_idx]
             if se <= 0 {
               err_code = 2
               break
             }
-            let blen = 8 + (se & 0xFF) - 1
+            let blen = se & 0xF
             if nbits < blen {
               err_code = 1
               break
@@ -2076,12 +2585,11 @@ fn vp8l_decode_pix_green_body(
 }
 
 ///| 1-byte green-only inverse Predictor transform (exact when R/B/A residuals are all 0).
-fn vp8l_inverse_predictor_green(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
+fn vp8l_inverse_predictor_green(t : Vp8lTransform, pix : FixedArray[Byte], h : Int) -> FixedArray[Byte] {
   let w = t.old_width
   if w == 0 || h == 0 {
-    return pix_in
+    return pix
   }
-  let mut pix = pix_in
   let mut p = 1
   let mut x = 1
   let mut l = pix[0].to_int()
@@ -2228,10 +2736,9 @@ fn vp8l_inverse_predictor_green(t : Vp8lTransform, pix_in : Bytes, h : Int) -> B
 }
 
 ///| 1-byte green-only inverse ColorIndexing transform.
-fn vp8l_inverse_color_indexing_green(t : Vp8lTransform, pix_in : Bytes, h : Int) -> Bytes {
+fn vp8l_inverse_color_indexing_green(t : Vp8lTransform, pix : FixedArray[Byte], h : Int) -> FixedArray[Byte] {
   let pal = t.pix
   if t.bits == 0 {
-    let mut pix = pix_in
     let n = pix.length()
     let mut p = 0
     while p < n {
@@ -2256,7 +2763,7 @@ fn vp8l_inverse_color_indexing_green(t : Vp8lTransform, pix_in : Bytes, h : Int)
   }
   let bpp = 8 >> t.bits
   let w = t.old_width
-  let mut dst = Bytes::new(w * h)
+  let dst = FixedArray::make(w * h, 0.to_byte())
   let mut d = 0
   let mut p = 0
   let mut v = 0
@@ -2265,7 +2772,7 @@ fn vp8l_inverse_color_indexing_green(t : Vp8lTransform, pix_in : Bytes, h : Int)
     let mut x = 0
     while x < w {
       if (x & x_mask) == 0 {
-        v = pix_in[p].to_int()
+        v = pix[p].to_int()
         p = p + 1
       }
       dst[d] = pal[4 * (v & v_mask) + 1]
@@ -2285,7 +2792,7 @@ fn vp8l_decode_pix_ga_body(
   w : Int,
   h : Int,
   hdr : Vp8lPixHeader,
-) -> Result[(Bytes, Bytes), WebpError] {
+) -> Result[(FixedArray[Byte], FixedArray[Byte]), WebpError] {
   let cc_shift_u = hdr.cc_shift.to_uint()
   let cc_size = hdr.cc_size
   let cc_entries = FixedArray::make(cc_size, 0)
@@ -2300,10 +2807,11 @@ fn vp8l_decode_pix_ga_body(
     ftbl[ti] = all_tables[ti]
     ti = ti + 1
   }
+  let dist_tbl = vp8l_dist_map_tbl
 
   let pix_len = w * h
-  let mut pix = Bytes::new(pix_len)
-  let mut pix_a = Bytes::new(pix_len)
+  let pix = FixedArray::make(pix_len, 0.to_byte())
+  let pix_a = FixedArray::make(pix_len, 0.to_byte())
   let h_mask = if h_bits != 0 { (1 << h_bits) - 1 } else { 0 }
   let tiles_per_row = if h_bits != 0 { vp8l_ntiles(w, h_bits) } else { 0 }
   let mut p = 0
@@ -2355,9 +2863,9 @@ fn vp8l_decode_pix_ga_body(
     if g_off < 0 {
       green = -g_off - 1
     } else {
-      let entry = ftbl[g_off + (bits & 255UL).to_int()]
+      let entry = ftbl[g_off + (bits & 511UL).to_int()]
       if entry > 0 {
-        let blen = (entry & 0xFF) - 1
+        let blen = entry & 0xF
         if nbits < blen {
           err_code = 1
           break
@@ -2369,13 +2877,13 @@ fn vp8l_decode_pix_ga_body(
         let desc = -entry
         let sub_bits = desc & 0xF
         let sub_off = desc >> 4
-        let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+        let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
         let se = ftbl[g_off + sub_off + sub_idx]
         if se <= 0 {
           err_code = 2
           break
         }
-        let blen = 8 + (se & 0xFF) - 1
+        let blen = se & 0xF
         if nbits < blen {
           err_code = 1
           break
@@ -2401,9 +2909,9 @@ fn vp8l_decode_pix_ga_body(
             nbits = nbits + 8
           }
         }
-        let entry = ftbl[a_off + (bits & 255UL).to_int()]
+        let entry = ftbl[a_off + (bits & 511UL).to_int()]
         if entry > 0 {
-          let blen = (entry & 0xFF) - 1
+          let blen = entry & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -2415,13 +2923,13 @@ fn vp8l_decode_pix_ga_body(
           let desc = -entry
           let sub_bits = desc & 0xF
           let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+          let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
           let se = ftbl[a_off + sub_off + sub_idx]
           if se <= 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
+          let blen = se & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -2488,9 +2996,9 @@ fn vp8l_decode_pix_ga_body(
       if d_off < 0 {
         dist_sym = -d_off - 1
       } else {
-        let entry = ftbl[d_off + (bits & 255UL).to_int()]
+        let entry = ftbl[d_off + (bits & 511UL).to_int()]
         if entry > 0 {
-          let blen = (entry & 0xFF) - 1
+          let blen = entry & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -2502,13 +3010,13 @@ fn vp8l_decode_pix_ga_body(
           let desc = -entry
           let sub_bits = desc & 0xF
           let sub_off = desc >> 4
-          let sub_idx = ((bits >> 8) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
+          let sub_idx = ((bits >> 9) & ((1 << sub_bits) - 1).to_int64().to_uint64()).to_int()
           let se = ftbl[d_off + sub_off + sub_idx]
           if se <= 0 {
             err_code = 2
             break
           }
-          let blen = 8 + (se & 0xFF) - 1
+          let blen = se & 0xF
           if nbits < blen {
             err_code = 1
             break
@@ -2620,13 +3128,11 @@ fn vp8l_decode_pix_ga_body(
 }
 
 ///| 2-plane (G + A) inverse Predictor transform (exact when R=0, B=0).
-fn vp8l_inverse_predictor_ga(t : Vp8lTransform, pix_in : Bytes, pix_a_in : Bytes, h : Int) -> Bytes {
+fn vp8l_inverse_predictor_ga(t : Vp8lTransform, pix : FixedArray[Byte], pix_a : FixedArray[Byte], h : Int) -> FixedArray[Byte] {
   let w = t.old_width
   if w == 0 || h == 0 {
-    return pix_in
+    return pix
   }
-  let mut pix = pix_in
-  let mut pix_a = pix_a_in
   pix_a[0] = ((pix_a[0].to_int() + 0xFF) & 0xFF).to_byte()
   let mut p = 1
   let mut x = 1
@@ -2811,7 +3317,7 @@ fn vp8l_decode_alpha_internal(
   limits : DecodeLimits,
   width : Int,
   height : Int,
-) -> Result[Bytes, WebpError] {
+) -> Result[FixedArray[Byte], WebpError] {
   match check_dimensions(width, height, limits) {
     Ok(()) => ()
     Err(e) => return Err(e)
@@ -2940,7 +3446,7 @@ fn vp8l_decode_alpha_internal(
     return Ok(pix)
   }
 
-  let mut pix = match vp8l_decode_pix_rgba_body(br, w, h, 0, hdr) {
+  let mut pix = match vp8l_decode_pix_u32_body(br, w, h, 0, hdr) {
     Ok(px) => px
     Err(e) => return Err(e)
   }
@@ -2948,21 +3454,21 @@ fn vp8l_decode_alpha_internal(
   while ti >= 0 {
     let tr = transforms[ti]
     if tr.kind == vp8l_transform_predictor {
-      pix = vp8l_inverse_predictor(tr, pix, h)
+      pix = vp8l_inverse_predictor_u32(tr, pix, h)
     } else if tr.kind == vp8l_transform_cross_color {
-      pix = vp8l_inverse_cross_color(tr, pix, h)
+      pix = vp8l_inverse_cross_color_u32(tr, pix, h)
     } else if tr.kind == vp8l_transform_subtract_green {
-      pix = vp8l_inverse_subtract_green(pix)
+      pix = vp8l_inverse_subtract_green_u32(pix)
     } else {
-      pix = vp8l_inverse_color_indexing(tr, pix, h)
+      pix = vp8l_inverse_color_indexing_u32(tr, pix, h)
     }
     ti = ti - 1
   }
   let total = orig_w * h
-  let mut buf = Bytes::new(total)
+  let buf = FixedArray::make(total, 0.to_byte())
   let mut i = 0
   while i < total {
-    buf[i] = pix[4 * i + 1]
+    buf[i] = ((pix[i] >> 8U) & 0xFFU).to_int().to_byte()
     i = i + 1
   }
   Ok(buf)
