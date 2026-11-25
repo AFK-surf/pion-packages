@@ -3388,16 +3388,16 @@ stdout 71 B，SHA-256 `abefb692fc74ff2a266a1de00f9d1a7501eb6685efcbb651262f0a406
 
 ### `bigint` (`v0.1.0`)
 
-Measured on `Linux x86_64` with `pionc 0.1.0 (amd64_sysv, abi pionc-v0.22, self-hosted)` (`--release`), `go1.24.4`, and `moon 0.1.20261119` (`--target native --release`) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification).
+Measured on `Linux x86_64` (shared build host) with `pionc 0.1.0 (amd64_sysv, abi pionc-v0.22, self-hosted)` (`--release`), `go1.24.4`, and `moon 0.1.20261119` (`--target native --release`) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification).
 
 #### 1. `pidigits` (`N = 2500`, 4,142 B stdout)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs `go_big`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `pion_imm` (immutable `BigInt`) | 259.899 | 218.039 | 347.633 | 103959.47 | **1.37x** |
-| `pion_buf` (`BigIntBuf`) | 286.732 | 208.346 | 310.620 | 114692.68 | **1.24x** |
-| `go_big` (`math/big`) | 354.967 | 328.373 | 404.019 | 141986.94 | 1.00x (baseline) |
-| `moonbit` (`core/bigint`) | 201.231 | 150.660 | 252.427 | 80492.19 | 1.76x |
+| `pion_buf` (`BigIntBuf`) | 410.386 | 365.872 | 905.533 | 164154.22 | **2.58x** |
+| `pion_imm` (immutable `BigInt`) | 479.667 | 391.374 | 731.743 | 191866.76 | **2.21x** |
+| `moonbit` (`core/bigint`) | 511.851 | 227.424 | 553.491 | 204740.29 | 2.07x |
+| `go_big` (`math/big`) | 1058.243 | 631.957 | 1536.305 | 423297.29 | 1.00x (baseline) |
 
 stdout SHA-256 `32d5af36b0c5eb370536b97699a5f9d67e4c49d937bf45f02caee5cbaa7b3c19` (all implementations and rounds identical).
 
@@ -3405,10 +3405,10 @@ stdout SHA-256 `32d5af36b0c5eb370536b97699a5f9d67e4c49d937bf45f02caee5cbaa7b3c19
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs `go_big`) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `pion` (`BigInt`) | 12.657 | 12.300 | 15.167 | 6328.34 | 0.77x |
-| `go_big` (`math/big`) | 9.790 | 8.153 | 11.238 | 4895.26 | 1.00x (baseline) |
-| `moonbit` (`core/bigint`) | 9.950 | 8.054 | 11.244 | 4974.85 | 0.98x |
+| `pion` (`BigInt`) | 40.453 | 21.625 | 63.483 | 20226.26 | 0.59x |
+| `go_big` (`math/big`) | 23.911 | 18.596 | 81.969 | 11955.37 | 1.00x (baseline) |
+| `moonbit` (`core/bigint`) | 23.984 | 13.758 | 71.886 | 11992.11 | 1.00x |
 
 stdout SHA-256 `e2c4f488962288ba67041c075c1befc355efe0e27f24b879722b5cdb2dac9b7d` (all implementations and rounds identical).
 
-如实说明：`pidigits N=2500` 中不可变 `BigInt`（`259.9 ms`）与 `BigIntBuf`（`286.7 ms`，min `208.3 ms`）均快于 Go `math/big`（`355.0 ms`，1.24×–1.37×），略慢于 MoonBit `core/bigint`（`201.2 ms`）；512×384 位乘除循环（`12.66 ms`）落后 Go（`9.79 ms`，0.77×）与 MoonBit（`9.95 ms`，0.79×），主要来自纯 schoolbook + QBE 32-bit limb 除法循环未展开。
+如实说明：本次在共享高负载机器上实测，绝对耗时存在一定抖动；`pidigits N=2500` 中加入 O(1) `rem_est >= q` 短路后，`pion_buf` 与 `pion_imm` 均显著快于 Go `math/big`（2.21×–2.58×），与 MoonBit `core/bigint` 处于同一梯队（MoonBit 单轮 min 最低为 `227.4 ms`），`pion_buf` 与 `pion_imm` 之间在噪声范围内互有胜负；512×384 位乘除循环（`40.45 ms`，min `21.63 ms`）落后 Go（`23.91 ms`，0.59×）与 MoonBit（`23.98 ms`，min `13.76 ms`），主要来自纯 schoolbook + QBE 32-bit limb 除法循环未展开。
