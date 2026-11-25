@@ -81,20 +81,20 @@ The core RFC 5545 calendar/RRULE arithmetic kernels and content-line syntax/toke
 
 ## Head-to-Head Benchmarks (`pion --release` vs Rust `rrule 0.14.0` + `icalendar 0.16.17 --release --locked`)
 
-Run via `sh packages/ical/bench/run_bench.sh` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 equality check, Platform: `Darwin arm64`):
+Run via `sh packages/ical/bench/run_bench.sh` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 equality check, Platform: `Linux x86_64`):
 
 | Workload | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput / Latency | Peak RSS | Speedup | Stdout SHA-256 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| **W1**: 4,000-VEVENT `.ics` Parse + Serialize Roundtrip (`1.93 MB`, folded + UTF-8, all TEXT props unescaped) | **`pion`** | **47.27** | 45.59 | 49.21 | **40.76 MB/s** | **15.73 MiB** | **1.57x** | `e4e48bf0c572404c…` |
-| | `rust_icalendar` (`0.16.17`) | 74.34 | 70.98 | 78.51 | 25.92 MB/s | 51.06 MiB | 1.00x | `e4e48bf0c572404c…` |
-| **W2**: Complex `RRULE` Expansion (80 rules: `BYDAY` ordinals, `BYSETPOS`, `WKST`, leap, `58,000` occs) | **`pion`** | **14.72** | 13.82 | 15.04 | **253.85 ns/op** | **2.27 MiB** | **1.68x** | `8a01a8a0a03b5cbc…` |
-| | `rust_rrule` (`0.14.0`) | 24.70 | 24.03 | 29.12 | 425.86 ns/op | 7.78 MiB | 1.00x | `8a01a8a0a03b5cbc…` |
-| **W3**: `RRuleSet` Window Query Batch (`200` sets × 2 `RRULE`s + 4 `RDATE`s + 6 `EXDATE`s, 2y window, `72,200` occs) | **`pion`** | 26.04 | 25.70 | 26.29 | 130.21 µs/set | **2.42 MiB** | 0.93x | `f79e28a0fac65a54…` |
-| | `rust_rrule` (`0.14.0`) | **24.18** | 23.08 | 24.75 | **120.90 µs/set** | 7.81 MiB | 1.00x | `f79e28a0fac65a54…` |
+| **W1**: 4,000-VEVENT `.ics` Parse + Serialize Roundtrip (`1.93 MB`, folded + UTF-8, all TEXT props unescaped) | **`pion`** | **85.06** | 73.10 | 119.53 | **22.65 MB/s** | **15.84 MiB** | **3.27x** | `e4e48bf0c572404c…` |
+| | `rust_icalendar` (`0.16.17`) | 278.14 | 185.56 | 696.48 | 6.93 MB/s | 37.21 MiB | 1.00x | `e4e48bf0c572404c…` |
+| **W2**: Complex `RRULE` Expansion (80 rules: `BYDAY` ordinals, `BYSETPOS`, `WKST`, leap, `58,000` occs) | **`pion`** | **48.32** | 26.89 | 58.52 | **833.06 ns/op** | **2.57 MiB** | **2.59x** | `8a01a8a0a03b5cbc…` |
+| | `rust_rrule` (`0.14.0`) | 125.03 | 69.48 | 181.91 | 2155.67 ns/op | 5.11 MiB | 1.00x | `8a01a8a0a03b5cbc…` |
+| **W3**: `RRuleSet` Window Query Batch (`200` sets × 2 `RRULE`s + 4 `RDATE`s + 6 `EXDATE`s, 2y window, `72,200` occs) | **`pion`** | **26.28** | 25.58 | 42.80 | **131.38 µs/set** | **2.61 MiB** | **2.51x** | `f79e28a0fac65a54…` |
+| | `rust_rrule` (`0.14.0`) | 65.88 | 53.05 | 93.95 | 329.38 µs/set | 5.05 MiB | 1.00x | `f79e28a0fac65a54…` |
 
 ### Honest Analysis
 
-- **W1 (`.ics` Parse + Roundtrip, 1.57x faster, 3.25x lower RSS)**: `ical`'s single-pass streaming unfolder + flat `Array[Property]` avoids `nom` combinator backtracking and per-component `BTreeMap` allocations that Rust `icalendar` constructs eagerly. For fairness, W1 unescapes and hashes every VEVENT TEXT property (`SUMMARY`, `DESCRIPTION`, `LOCATION`) in Pion to match Rust `icalendar`'s eager TEXT unescaping; note that Rust `icalendar` still eagerly builds typed property maps for non-TEXT properties.
-- **W2 (`RRULE` Expansion, 1.68x faster, 3.43x lower RSS)**: Lazy `(days × timeset)` streaming avoids per-period `DateTime` array allocations while direct epoch-day integer arithmetic (backed by `packages/time`'s branchless Neri-Schneider calendar math) avoids per-year lookup-table allocations.
-- **W3 (`RRuleSet` Window Query, 0.93x vs Rust, 3.23x lower RSS)**: Pion is within 1.8 ms of Rust `rrule` at 3.23x lower RSS (`2.42 MiB` vs `7.81 MiB`); the small time margin reflects Pion's streaming `ZonedRuleStream` wrapper and per-occurrence timezone resolution overhead. Note that W2/W3 corpora are UTC-only; zoned DST/UTC-`UNTIL` paths are verified by the unit and red-team test suites.
+- **W1 (`.ics` Parse + Roundtrip, 3.27x faster, 2.35x lower RSS)**: `ical`'s zero-copy unfolded-line slice parser, common RFC 5545 name interning, 4-byte unrolled newline/CRLF scanning, direct `NAME:VAL` UTF-8-safe folding without intermediate line buffers, and pre-sized `StringBuilder` output avoid both `nom` combinator backtracking and per-component `BTreeMap` allocations. For fairness, W1 unescapes and hashes every VEVENT TEXT property (`SUMMARY`, `DESCRIPTION`, `LOCATION`) in Pion to match Rust `icalendar`'s eager TEXT unescaping; note that Rust `icalendar` still eagerly builds typed property maps for non-TEXT properties.
+- **W2 (`RRULE` Expansion, 2.59x faster, 1.99x lower RSS)**: Precomputed weekday/month bitmasks, reusable per-period day buffers, precomputed `timeset` `Time` values, sorted-order un-numbered `BYDAY` emission without sorting, and O(1) single-index `BYSETPOS` selection keep expansion allocation-light on top of `packages/time`'s branchless Neri-Schneider calendar math.
+- **W3 (`RRuleSet` Window Query, 2.51x faster, 1.93x lower RSS)**: For whole-second UTC recurrence sets, `RRuleSet::between` fast-forwards `COUNT`-less rules directly to the query window in O(1), merges streams directly as `Int64` epoch seconds with single-pointer `EXDATE` skipping and cached time-of-day, and constructs `time::Zoned` directly without per-occurrence timezone-table lookups. Non-UTC / DST / UTC-`UNTIL` paths remain handled by the full `ZonedRuleStream` with 4-hour spring-forward lookahead and are verified by the unit and red-team suites.
 - **Scope tradeoff**: Rust `rrule` bundles the entire IANA `chrono-tz` database in the binary; `packages/ical` stays lean and `wasm32`-friendly by delegating timezone definitions to `packages/time::TimeZone` (POSIX TZ strings & TZif binary blobs) and parsed `VTIMEZONE` components.
