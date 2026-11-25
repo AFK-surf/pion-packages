@@ -2,26 +2,60 @@
 ///| and O(n) incremental Sans-IO streaming pipeline `StreamDecoder` with bounded buffer compaction.
 
 ///| Find `\r\n` starting at `pos` within `data[0 .. end]`, strictly rejecting lone `\r` or `\n`.
-///| Returns `Ok(index_of_cr)`, `Err(Incomplete)` if more bytes are needed, or `Err(InvalidCrlf(pos))`.
-fn find_crlf_strict(data : Bytes, pos : Int, end : Int) -> Result[Int, RespError] {
+///| Zero-allocation return encoding:
+///|   >= 0       : index of `\r`
+///|   -1         : Incomplete
+///|   <= -2      : InvalidCrlf at offset `-(ret + 2)`
+fn find_crlf_strict_idx(data : Bytes, pos : Int, end : Int) -> Int {
   let mut i = pos
   while i < end {
     let c = data[i].to_int()
     if c == 13 {
       if i + 1 >= end {
-        return Err(RespError::Incomplete)
+        return -1
       }
       if data[i + 1].to_int() == 10 {
-        return Ok(i)
+        return i
       }
-      return Err(RespError::InvalidCrlf(i))
+      return -2 - i
     }
     if c == 10 {
-      return Err(RespError::InvalidCrlf(i))
+      return -2 - i
     }
     i = i + 1
   }
-  Err(RespError::Incomplete)
+  -1
+}
+
+///| Fast `Bytes` range to `String` conversion with zero-allocation shortcuts for common Redis strings.
+fn bytes_to_string_fast(data : Bytes, start : Int, len : Int) -> String {
+  if len == 0 {
+    return ""
+  }
+  if len == 2 && data[start].to_int() == 79 && data[start + 1].to_int() == 75 {
+    return "OK"
+  }
+  if len == 4 &&
+  data[start].to_int() == 80 &&
+  data[start + 1].to_int() == 79 &&
+  data[start + 2].to_int() == 78 &&
+  data[start + 3].to_int() == 71 {
+    return "PONG"
+  }
+  data.slice(start, start + len).to_string()
+}
+
+///| Find `\r\n` starting at `pos` within `data[0 .. end]`, strictly rejecting lone `\r` or `\n`.
+///| Returns `Ok(index_of_cr)`, `Err(Incomplete)` if more bytes are needed, or `Err(InvalidCrlf(pos))`.
+fn find_crlf_strict(data : Bytes, pos : Int, end : Int) -> Result[Int, RespError] {
+  let r = find_crlf_strict_idx(data, pos, end)
+  if r >= 0 {
+    Ok(r)
+  } else if r == -1 {
+    Err(RespError::Incomplete)
+  } else {
+    Err(RespError::InvalidCrlf(-2 - r))
+  }
 }
 
 ///| Overflow check before `acc * 10 +/- d` when parsing signed 64-bit decimal integers.
@@ -973,6 +1007,12 @@ pub fn StreamDecoder::feed(self : StreamDecoder, chunk : Bytes) -> Result[Unit, 
     self.write_pos = 0
     self.parse_pos = 0
     self.inline_scan = 0
+    // Fast path for medium/large chunks on empty buffer: single native memcpy (no memset, no byte loop).
+    if clen >= 256 {
+      self.buf = chunk.slice(0, clen)
+      self.write_pos = clen
+      return Ok(())
+    }
   }
   // If tail space is insufficient, first compact if that makes room
   if clen > self.buf.length() - self.write_pos {
@@ -1225,10 +1265,12 @@ fn StreamDecoder::step_frame(self : StreamDecoder) -> Result[Option[RespFrame], 
       return self.fail(RespError::InvalidPrefix(prefix, pos))
     }
 
-    let cr = match find_crlf_strict(data, pos + 1, end) {
-      Ok(v) => v
-      Err(Incomplete) => return Ok(None)
-      Err(e) => return self.fail(e)
+    let cr = find_crlf_strict_idx(data, pos + 1, end)
+    if cr < 0 {
+      if cr == -1 {
+        return Ok(None)
+      }
+      return self.fail(RespError::InvalidCrlf(-2 - cr))
     }
 
     let mut frame_opt : Option[RespFrame] = None
@@ -1236,10 +1278,10 @@ fn StreamDecoder::step_frame(self : StreamDecoder) -> Result[Option[RespFrame], 
     let next_after_line = cr + 2
 
     if prefix == 43 { // '+' SimpleString
-      frame_opt = Some(RespFrame::SimpleString(slice_bytes(data, line_start, cr - line_start).to_string()))
+      frame_opt = Some(RespFrame::SimpleString(bytes_to_string_fast(data, line_start, cr - line_start)))
       self.parse_pos = next_after_line
     } else if prefix == 45 { // '-' SimpleError
-      frame_opt = Some(RespFrame::SimpleError(slice_bytes(data, line_start, cr - line_start).to_string()))
+      frame_opt = Some(RespFrame::SimpleError(bytes_to_string_fast(data, line_start, cr - line_start)))
       self.parse_pos = next_after_line
     } else if prefix == 58 { // ':' Integer
       let iv = match parse_int64_slice(data, line_start, cr, pos) {
@@ -1448,10 +1490,500 @@ pub fn StreamDecoder::next_frame(self : StreamDecoder) -> Result[Option[RespFram
   }
 }
 
+///| Precomputed exact powers of 10 (`10^0 .. 10^15`) for zero-allocation Clinger fast-path Double parsing.
+let pow10_table : FixedArray[Double] = [
+  1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0,
+  1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0,
+  100000000000000.0, 1000000000000000.0,
+]
+
+///| Fast-path scalar frame decoder at `data[pos .. end]` pushing directly into `out`.
+///| Returns `next_pos >= 0` on fast-path hit, or `-1` to fall back to the general incremental decoder.
+///| Zero `Option` / `Result` / tuple heap boxing.
+fn push_scalar_fast(
+  data : Bytes,
+  pos : Int,
+  end : Int,
+  max_bulk_len : Int,
+  out : Array[RespFrame],
+) -> Int {
+  if pos >= end {
+    return -1
+  }
+  let prefix = data[pos].to_int()
+  if prefix == 36 { // '$' BulkString
+    let mut p = pos + 1
+    if p >= end {
+      return -1
+    }
+    let b0 = data[p].to_int()
+    if b0 >= 48 && b0 <= 57 {
+      let mut blen = b0 - 48
+      p = p + 1
+      let mut digits = 1
+      while p < end {
+        let c = data[p].to_int()
+        if c >= 48 && c <= 57 {
+          if digits >= 9 {
+            return -1
+          }
+          blen = blen * 10 + (c - 48)
+          digits = digits + 1
+          p = p + 1
+        } else if c == 13 {
+          if p + 1 >= end || data[p + 1].to_int() != 10 {
+            return -1
+          }
+          let body_start = p + 2
+          if blen > max_bulk_len {
+            return -1
+          }
+          let avail = end - body_start
+          if avail < 2 || blen > avail - 2 {
+            return -1
+          }
+          let body_end = body_start + blen
+          if data[body_end].to_int() != 13 || data[body_end + 1].to_int() != 10 {
+            return -1
+          }
+          out.push(
+            RespFrame::BulkString(
+              if blen == 0 { Bytes::new(0) } else { data.slice(body_start, body_end) },
+            ),
+          )
+          return body_end + 2
+        } else {
+          return -1
+        }
+      }
+      return -1
+    }
+    if b0 == 45 { // possible "$-1\r\n"
+      if p + 3 < end &&
+      data[p + 1].to_int() == 49 &&
+      data[p + 2].to_int() == 13 &&
+      data[p + 3].to_int() == 10 {
+        out.push(RespFrame::NullBulk)
+        return p + 4
+      }
+    }
+    return -1
+  }
+  if prefix == 58 { // ':' Integer
+    let mut p = pos + 1
+    if p >= end {
+      return -1
+    }
+    let mut neg = false
+    let f = data[p].to_int()
+    if f == 45 {
+      neg = true
+      p = p + 1
+    } else if f == 43 {
+      p = p + 1
+    }
+    let dstart = p
+    let mut acc : Int64 = 0L
+    while p < end {
+      let c = data[p].to_int()
+      if c >= 48 && c <= 57 {
+        if p - dstart >= 18 {
+          return -1
+        }
+        acc = acc * 10L + (c - 48).to_int64()
+        p = p + 1
+      } else if c == 13 {
+        if p == dstart || p + 1 >= end || data[p + 1].to_int() != 10 {
+          return -1
+        }
+        out.push(RespFrame::Integer(if neg { 0L - acc } else { acc }))
+        return p + 2
+      } else {
+        return -1
+      }
+    }
+    return -1
+  }
+  if prefix == 43 { // '+' SimpleString
+    let cr = find_crlf_strict_idx(data, pos + 1, end)
+    if cr < 0 {
+      return -1
+    }
+    out.push(RespFrame::SimpleString(bytes_to_string_fast(data, pos + 1, cr - pos - 1)))
+    return cr + 2
+  }
+  if prefix == 44 { // ',' Double (Clinger exact fast path for <= 15 significant digits without exponent)
+    let mut p = pos + 1
+    if p >= end {
+      return -1
+    }
+    let mut neg = false
+    let f = data[p].to_int()
+    if f == 45 {
+      neg = true
+      p = p + 1
+    } else if f == 43 {
+      p = p + 1
+    }
+    let int_start = p
+    let mut mant : Int64 = 0L
+    let mut sig = 0
+    while p < end {
+      let c = data[p].to_int()
+      if c >= 48 && c <= 57 {
+        let d = (c - 48).to_int64()
+        if sig > 0 || d != 0L {
+          sig = sig + 1
+          if sig > 15 {
+            return -1
+          }
+          mant = mant * 10L + d
+        }
+        p = p + 1
+      } else {
+        break
+      }
+    }
+    if p == int_start || p >= end {
+      return -1
+    }
+    let mut frac_digits = 0
+    if data[p].to_int() == 46 { // '.'
+      p = p + 1
+      let frac_start = p
+      while p < end {
+        let c = data[p].to_int()
+        if c >= 48 && c <= 57 {
+          let d = (c - 48).to_int64()
+          if sig > 0 || d != 0L {
+            sig = sig + 1
+            if sig > 15 {
+              return -1
+            }
+            mant = mant * 10L + d
+          }
+          frac_digits = frac_digits + 1
+          if frac_digits > 15 {
+            return -1
+          }
+          p = p + 1
+        } else {
+          break
+        }
+      }
+      if p == frac_start || p >= end {
+        return -1
+      }
+    }
+    if data[p].to_int() == 13 && p + 1 < end && data[p + 1].to_int() == 10 {
+      let p10 = pow10_table
+      let mut dv = mant.to_double()
+      if frac_digits > 0 {
+        dv = dv / p10[frac_digits]
+      }
+      if neg {
+        dv = if mant == 0L { Double::from_bits(-9223372036854775807L - 1L) } else { 0.0 - dv }
+      }
+      out.push(RespFrame::Double(dv))
+      return p + 2
+    }
+    return -1
+  }
+  if prefix == 95 { // '_' Null
+    if pos + 2 < end && data[pos + 1].to_int() == 13 && data[pos + 2].to_int() == 10 {
+      out.push(RespFrame::Null)
+      return pos + 3
+    }
+    return -1
+  }
+  if prefix == 35 { // '#' Boolean
+    if pos + 3 < end && data[pos + 2].to_int() == 13 && data[pos + 3].to_int() == 10 {
+      let bc = data[pos + 1].to_int()
+      if bc == 116 {
+        out.push(RespFrame::Boolean(true))
+        return pos + 4
+      }
+      if bc == 102 {
+        out.push(RespFrame::Boolean(false))
+        return pos + 4
+      }
+    }
+    return -1
+  }
+  if prefix == 45 { // '-' SimpleError
+    let cr = find_crlf_strict_idx(data, pos + 1, end)
+    if cr < 0 {
+      return -1
+    }
+    out.push(RespFrame::SimpleError(bytes_to_string_fast(data, pos + 1, cr - pos - 1)))
+    return cr + 2
+  }
+  -1
+}
+
+///| Fast top-level drain loop for complete scalar frames and flat Arrays/Sets/Pushes/Maps without
+///| `Result`/`Option`/`DecodeContainer` boxing. Falls back cleanly to `step_frame()` on any
+///| incomplete, nested, streamed, inline, BigNumber/Verbatim, or erroneous frame.
+fn StreamDecoder::drain_fast(self : StreamDecoder, out : Array[RespFrame]) -> Unit {
+  if self.in_inline || self.in_sbulk || self.stack.length() != 0 {
+    return ()
+  }
+  match self.sticky_err {
+    Some(_) => return ()
+    None => ()
+  }
+  let limits = self.limits
+  if limits.max_total_nodes < 1 {
+    return ()
+  }
+  let data = self.buf
+  let end = self.write_pos
+  let max_bulk = limits.max_bulk_len
+  let max_coll = limits.max_collection_len
+  let max_nodes = limits.max_total_nodes
+  let max_depth = limits.max_depth
+  let mut pos = self.read_pos
+  let kv : Array[RespFrame] = []
+
+  while pos < end {
+    let prefix = data[pos].to_int()
+    // Flat sequence fast path: '*' Array (kind 0), '~' Set (kind 1), '>' Push (kind 2)
+    if prefix == 42 || prefix == 126 || prefix == 62 {
+      let kind = if prefix == 42 { 0 } else if prefix == 126 { 1 } else { 2 }
+      let mut p = pos + 1
+      if p >= end {
+        break
+      }
+      let b0 = data[p].to_int()
+      if prefix == 42 && b0 == 45 { // possible "*-1\r\n"
+        if p + 3 < end &&
+        data[p + 1].to_int() == 49 &&
+        data[p + 2].to_int() == 13 &&
+        data[p + 3].to_int() == 10 {
+          out.push(RespFrame::NullArray)
+          pos = p + 4
+          continue
+        }
+        break
+      }
+      if b0 < 48 || b0 > 57 {
+        break
+      }
+      let mut clen = b0 - 48
+      p = p + 1
+      let mut digits = 1
+      let mut ok_hdr = false
+      while p < end {
+        let c = data[p].to_int()
+        if c >= 48 && c <= 57 {
+          if digits >= 9 {
+            break
+          }
+          clen = clen * 10 + (c - 48)
+          digits = digits + 1
+          p = p + 1
+        } else if c == 13 {
+          if p + 1 < end && data[p + 1].to_int() == 10 {
+            p = p + 2
+            ok_hdr = true
+          }
+          break
+        } else {
+          break
+        }
+      }
+      if !ok_hdr {
+        break
+      }
+      if clen == 0 {
+        out.push(
+          if kind == 0 {
+            RespFrame::Array([])
+          } else if kind == 1 {
+            RespFrame::Set([])
+          } else {
+            RespFrame::Push([])
+          },
+        )
+        pos = p
+        continue
+      }
+      if clen > max_coll || max_depth < 1 || clen >= max_nodes {
+        break
+      }
+      let items : Array[RespFrame] = []
+      let mut ei = 0
+      let mut all_ok = true
+      while ei < clen {
+        let np = push_scalar_fast(data, p, end, max_bulk, items)
+        if np >= 0 {
+          p = np
+          ei = ei + 1
+        } else {
+          all_ok = false
+          break
+        }
+      }
+      if all_ok {
+        out.push(
+          if kind == 0 {
+            RespFrame::Array(items)
+          } else if kind == 1 {
+            RespFrame::Set(items)
+          } else {
+            RespFrame::Push(items)
+          },
+        )
+        pos = p
+        continue
+      }
+      if items.length() > 0 {
+        self.read_pos = pos
+        self.parse_pos = p
+        self.total_nodes = 1 + items.length()
+        self.stack.push(DecodeContainer::{
+          kind: kind,
+          streamed: false,
+          remaining: clen,
+          items: items,
+          pairs: [],
+          pending_key: None,
+        })
+        return ()
+      }
+      break
+    }
+
+    if prefix == 37 { // '%' Map fast path
+      let mut p = pos + 1
+      if p >= end {
+        break
+      }
+      let b0 = data[p].to_int()
+      if b0 < 48 || b0 > 57 {
+        break
+      }
+      let mut clen = b0 - 48
+      p = p + 1
+      let mut digits = 1
+      let mut ok_hdr = false
+      while p < end {
+        let c = data[p].to_int()
+        if c >= 48 && c <= 57 {
+          if digits >= 9 {
+            break
+          }
+          clen = clen * 10 + (c - 48)
+          digits = digits + 1
+          p = p + 1
+        } else if c == 13 {
+          if p + 1 < end && data[p + 1].to_int() == 10 {
+            p = p + 2
+            ok_hdr = true
+          }
+          break
+        } else {
+          break
+        }
+      }
+      if !ok_hdr {
+        break
+      }
+      if clen == 0 {
+        out.push(RespFrame::Map([]))
+        pos = p
+        continue
+      }
+      if clen > max_coll || max_depth < 1 || clen > (max_nodes - 1) / 2 {
+        break
+      }
+      let pairs : Array[(RespFrame, RespFrame)] = []
+      let mut ei = 0
+      let mut all_ok = true
+      while ei < clen {
+        let np1 = push_scalar_fast(data, p, end, max_bulk, kv)
+        if np1 < 0 {
+          all_ok = false
+          break
+        }
+        p = np1
+        let np2 = push_scalar_fast(data, p, end, max_bulk, kv)
+        if np2 < 0 {
+          let k = match kv.pop() {
+            Some(f) => f
+            None => {
+              all_ok = false
+              break
+            }
+          }
+          self.read_pos = pos
+          self.parse_pos = p
+          self.total_nodes = 1 + pairs.length() * 2 + 1
+          self.stack.push(DecodeContainer::{
+            kind: 3,
+            streamed: false,
+            remaining: clen,
+            items: [],
+            pairs: pairs,
+            pending_key: Some(k),
+          })
+          return ()
+        }
+        p = np2
+        let v_opt = kv.pop()
+        let k_opt = kv.pop()
+        match (k_opt, v_opt) {
+          (Some(k), Some(v)) => pairs.push((k, v))
+          _ => {
+            all_ok = false
+            break
+          }
+        }
+        ei = ei + 1
+      }
+      if all_ok {
+        out.push(RespFrame::Map(pairs))
+        pos = p
+        continue
+      }
+      if pairs.length() > 0 {
+        self.read_pos = pos
+        self.parse_pos = p
+        self.total_nodes = 1 + pairs.length() * 2
+        self.stack.push(DecodeContainer::{
+          kind: 3,
+          streamed: false,
+          remaining: clen,
+          items: [],
+          pairs: pairs,
+          pending_key: None,
+        })
+        return ()
+      }
+      break
+    }
+
+    let np = push_scalar_fast(data, pos, end, max_bulk, out)
+    if np >= 0 {
+      pos = np
+    } else {
+      break
+    }
+  }
+
+  self.read_pos = pos
+  self.parse_pos = pos
+  self.inline_scan = pos
+}
+
 ///| Drain all currently complete frames from the buffer.
 pub fn StreamDecoder::drain_frames(self : StreamDecoder) -> Result[Array[RespFrame], RespError] {
   let out : Array[RespFrame] = []
   while self.read_pos < self.write_pos {
+    self.drain_fast(out)
+    if self.read_pos >= self.write_pos {
+      break
+    }
     match self.step_frame() {
       Ok(Some(frame)) => out.push(frame)
       Ok(None) => break
