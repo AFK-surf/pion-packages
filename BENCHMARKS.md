@@ -3385,3 +3385,30 @@ stdout 71 B，SHA-256 `abefb692fc74ff2a266a1de00f9d1a7501eb6685efcbb651262f0a406
 如实说明：解压落后纯安全 Rust `ruzstd 0.7.3`（0.70×），与 C `libzstd 1.5.7` 差约 2.3–2.4 倍；L3 压缩落后 `libzstd`（0.52× / 0.37×），且压缩器只用 Predefined / RLE 序列编码与 Direct Huffman 权重，各级压缩率均低于 `zstd -1`（红队 INFO I-5）。峰值 RSS 解压时低于 `ruzstd`、与 `libzstd` 持平。本次复测在高负载共享机器上进行，绝对耗时高于包 README 记录（包 README 为 0.60× / 0.33× / 0.47× / 0.22×），比值随机器负载浮动。
 
 红队（独立，`RT-zstd`，首轮 `SIGN-OFF` 于 `2f0490f`）：0 P0 / 0 P1 / 0 P2。`STRICT=1 sh packages/zstd/audit/run_audit.sh` `OPEN findings: none`、exit 0：包单测 8 / 8、对照用例 16 / 16 × 4 模；1,159 / 1,159 合法流逐字节一致；222 / 222 RFC 畸形帧；7,000 / 7,000 变异 fuzz 与独立参考模型一致；960 / 960 压缩帧被 `libzstd` / `ruzstd` / `zstd -d` 互通解出；xxHash64 对 `twox-hash 2.1.5` 0 偏差；27 / 27 DoS 炸弹 native 与 Wasm32 `--release` 一致且在预算内（最坏为默认 64 MiB 输出上限下的 RLE / 匹配 / 多帧炸弹，约 0.4–0.5 s、116 MiB 后 `LimitExceeded`，自定义 64 KiB 上限下 ≤ 0.01 s、≤ 4 MiB）；25 / 25 注入缺陷被门禁捕获。
+
+### `bigint` (`v0.1.0`)
+
+Measured on `Linux x86_64` with `pionc 0.1.0 (amd64_sysv, abi pionc-v0.22, self-hosted)` (`--release`), `go1.24.4`, and `moon 0.1.20261119` (`--target native --release`) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification).
+
+#### 1. `pidigits` (`N = 2500`, 4,142 B stdout)
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs `go_big`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion_imm` (immutable `BigInt`) | 259.899 | 218.039 | 347.633 | 103959.47 | **1.37x** |
+| `pion_buf` (`BigIntBuf`) | 286.732 | 208.346 | 310.620 | 114692.68 | **1.24x** |
+| `go_big` (`math/big`) | 354.967 | 328.373 | 404.019 | 141986.94 | 1.00x (baseline) |
+| `moonbit` (`core/bigint`) | 201.231 | 150.660 | 252.427 | 80492.19 | 1.76x |
+
+stdout SHA-256 `32d5af36b0c5eb370536b97699a5f9d67e4c49d937bf45f02caee5cbaa7b3c19` (all implementations and rounds identical).
+
+#### 2. Multi-Limb Multiply + Knuth `div_rem` (2,000 rounds, 512×384-bit, 159 B stdout)
+
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs `go_big`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` (`BigInt`) | 12.657 | 12.300 | 15.167 | 6328.34 | 0.77x |
+| `go_big` (`math/big`) | 9.790 | 8.153 | 11.238 | 4895.26 | 1.00x (baseline) |
+| `moonbit` (`core/bigint`) | 9.950 | 8.054 | 11.244 | 4974.85 | 0.98x |
+
+stdout SHA-256 `e2c4f488962288ba67041c075c1befc355efe0e27f24b879722b5cdb2dac9b7d` (all implementations and rounds identical).
+
+如实说明：`pidigits N=2500` 中不可变 `BigInt`（`259.9 ms`）与 `BigIntBuf`（`286.7 ms`，min `208.3 ms`）均快于 Go `math/big`（`355.0 ms`，1.24×–1.37×），略慢于 MoonBit `core/bigint`（`201.2 ms`）；512×384 位乘除循环（`12.66 ms`）落后 Go（`9.79 ms`，0.77×）与 MoonBit（`9.95 ms`，0.79×），主要来自纯 schoolbook + QBE 32-bit limb 除法循环未展开。

@@ -51,6 +51,8 @@ PACKAGE_META = {
              ["avro", "schema", "serialization", "binary", "fingerprint", "container", "kafka", "序列化"]),
     "base64": ("crypto-auth", "RFC 4648 Base64, Base64URL, Base32, Base32hex and hex codecs with strict decoding",
                ["base64", "base64url", "base32", "hex", "base16", "encoding", "rfc4648", "编码"]),
+    "bigint": ("core-utils", "Arbitrary-precision signed integers (Knuth Alg D, bitwise, gcd, pow, radix 2..36, BigIntBuf)",
+               ["bigint", "bignum", "arbitrary-precision", "integer", "knuth", "gcd", "pidigits", "大整数"]),
     "brotli": ("compression-archive", "RFC 7932 Brotli decompressor with static dictionary and decompression-bomb limits",
                ["brotli", "decompress", "rfc7932", "compression", "br", "content-encoding", "解压"]),
     "bson": ("data-formats", "BSON 1.1 codec with ObjectId, Decimal128 and MongoDB Extended JSON v2",
