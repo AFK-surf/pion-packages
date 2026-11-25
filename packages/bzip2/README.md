@@ -52,9 +52,11 @@ pionc run --target wasm32 --release packages/bzip2/wasm_smoke
 
 ## Head-to-Head Benchmarks (`Linux x86_64`, `warmup=1`, `rounds=5`)
 
-Run via `sh packages/bzip2/bench/run_bench.sh` on Intel Xeon Platinum 8581C (`Linux x86_64`, `pionc 0.1.0 --release` vs Rust `bzip2 0.6.1` / `libbz2-rs-sys 0.2.7 --release`). Compressed (`786,432 B -> 34,946 B`, `sha256:d4cb2a2a092f2c02...`) and decompressed (`34,946 B -> 786,432 B`, `sha256:ea091dc1e46ec9ab...`) outputs are verified **byte-for-byte identical** across both implementations:
+Run via `sh packages/bzip2/bench/run_bench.sh` (`Linux x86_64`, `pionc 0.1.0 --release` vs Rust `bzip2 0.6.1` / `libbz2-rs-sys 0.2.7 --release`; Peak RSS measured via `wait4` `ru_maxrss`). Compressed (`786,432 B -> 34,946 B`, `sha256:d4cb2a2a092f2c02...`) and decompressed (`34,946 B -> 786,432 B`, `sha256:ea091dc1e46ec9ab...`) outputs are verified **byte-for-byte identical** across both implementations:
 
 | Workload | `pion_bzip2` Median (Min / P95, Throughput, Peak RSS) | `rust_bzip2` Median (Min / P95, Throughput, Peak RSS) | `pion_bzip2` vs `rust_bzip2` |
 | --- | ---: | ---: | ---: |
-| Compress L6: Structured JSON Logs (768 KiB × 3 = 2.25 MiB) | 656.495 ms (518.935 / 1252.113 ms, 3.59 MB/s, 15.34 MiB) | 269.012 ms (259.422 / 386.063 ms, 8.77 MB/s, 7.77 MiB) | **0.41x** |
-| Decompress L6: Structured JSON Logs (768 KiB × 10 = 7.50 MiB) | 267.268 ms (220.058 / 348.702 ms, 29.42 MB/s, 8.79 MiB) | 182.432 ms (150.926 / 224.205 ms, 43.11 MB/s, 6.46 MiB) | **0.68x** |
+| Compress L6: Structured JSON Logs (768 KiB × 3 = 2.25 MiB) | 836.282 ms (633.556 / 1021.851 ms, 2.82 MB/s, 8.14 MiB) | 592.553 ms (410.610 / 662.591 ms, 3.98 MB/s, 7.70 MiB) | **0.71x** |
+| Decompress L6: Structured JSON Logs (768 KiB × 10 = 7.50 MiB) | 554.498 ms (415.449 / 765.553 ms, 14.18 MB/s, 7.68 MiB) | 496.719 ms (479.837 / 1044.651 ms, 15.83 MB/s, 6.45 MiB) | **0.90x** |
+
+In a 3-way strictly interleaved comparison on the same host against the pre-optimization baseline (`9f6e1634`), Compress L6 improved **3.03×** (median `3447.715 ms` → `1136.808 ms`, Peak RSS `14.95 MiB` → `8.14 MiB`, **-45.6%**) and Decompress L6 improved **1.33×** (median `631.721 ms` → `475.514 ms`, reaching **1.20×** `rust_bzip2`, Peak RSS `8.71 MiB` → `7.68 MiB`, **-11.8%**).
