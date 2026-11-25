@@ -63,7 +63,7 @@ Run with:
 sh packages/hcl/bench/run_bench.sh
 ```
 
-Measured on `Darwin arm64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification across all rounds and implementations):
+Measured on `Linux x86_64` via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification across all rounds and implementations; Peak RSS measured via `os.wait4` `ru_maxrss`):
 
 ### W1: Large Terraform Infra Config (`1,111` top-level / `2,111` total blocks) Parse + AST Walk (`15x`)
 
@@ -72,8 +72,8 @@ SHA-256: `e436af329e7f4df18a33834d963893262b40bfbdefe75b17231a2a508bb06e5f`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_hcl`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 590.412 | 556.260 | 636.540 | 39360769.47 | 24.05 MiB | 0.71x |
-| `go_hcl` | 420.075 | 402.781 | 431.032 | 28004966.67 | 59.62 MiB | 1.00x (baseline) |
+| `pion` | 1270.113 | 1131.125 | 1345.538 | 84674205.67 | 12.67 MiB | **2.28x** |
+| `go_hcl` | 2893.458 | 1631.132 | 3076.134 | 192897205.60 | 54.01 MiB | 1.00x (baseline) |
 
 ### W2: Batch Parse + `EvalContext` Full Expressions / `for` / Templates / Built-ins (`1,000x`)
 
@@ -82,8 +82,8 @@ SHA-256: `93ab6ab3ed8ffd56375ac5bbd2ac59a08af2db8f8e0bfbda4ae50e6034cc2b8b`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_hcl`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 42.036 | 41.320 | 42.280 | 42036.46 | 3.00 MiB | **3.08x** |
-| `go_hcl` | 129.594 | 126.871 | 131.298 | 129593.58 | 15.12 MiB | 1.00x (baseline) |
+| `pion` | 125.589 | 98.045 | 142.936 | 125588.68 | 11.09 MiB | **8.20x** |
+| `go_hcl` | 1030.191 | 553.079 | 1173.567 | 1030191.07 | 14.29 MiB | 1.00x (baseline) |
 
 ### W3: Batch Canonical Formatting `format_hcl` vs `hclwrite.Format` (`3,000x`)
 
@@ -92,14 +92,14 @@ SHA-256: `7a4ec307b3a987955ac58fb6a748b43c0242950e35c5a4b48480c14a7de98224`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `go_hcl`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 123.722 | 122.713 | 126.061 | 41240.79 | 2.56 MiB | **1.37x** |
-| `go_hcl` | 169.535 | 165.330 | 172.597 | 56511.75 | 18.41 MiB | 1.00x (baseline) |
+| `pion` | 223.281 | 196.334 | 327.539 | 74426.99 | 11.09 MiB | **7.00x** |
+| `go_hcl` | 1562.187 | 933.728 | 2221.126 | 520729.01 | 35.43 MiB | 1.00x (baseline) |
 
 ### Objective Performance & Tradeoff Notes
 
-- **Expression & Template Evaluation (W2, 3.08x faster, 5.0x lower RSS)**: `packages/hcl` evaluates a flat `Array[ExprNode]` arena directly over `HclValue`, combining an exact small-integer fast path with pure-Pion arbitrary-precision `BigDec` arithmetic and a streaming `max_output_bytes`-budgeted JSON encoder, avoiding `go-cty`'s reflection/type-descriptor boxing while preserving `go-cty` precision and safety budgets.
-- **Canonical Formatting (W3, 1.37x faster, 7.2x lower RSS)**: Even with a full syntax validation pass (`parse_file_impl`) and full multi-line value group breaking + trailing comment alignment, `format_hcl` outperforms `hclwrite.Format` on realistic Terraform configurations with 7.2x lower peak RSS.
-- **Large Config Parsing (W1, 0.71x speed, 2.5x lower RSS)**: After upgrading `ExprNode::LitNumber` to carry full `HclValue` (supporting exact `BigDec` literals) and adding full bracket-newline tracking, single-pass parsing on 2,111-block files is currently ~0.71x of Go's `hclsyntax.ParseConfig` while maintaining 2.5x lower peak RSS (24.05 MiB vs 59.62 MiB).
+- **Large Config Parsing (W1, 2.28x faster, 4.3x lower RSS)**: The parser streams tokens directly from `StreamLexer` through a 4-slot `FixedArray` ring buffer with a 256-byte character-class LUT, `FixedArray` mode stack, single-token plain-string fast path, zero-copy unescaped string/heredoc slicing, contiguous integer binary-operator precedence tags, lazy traversal/duplicate-attribute structures, and pre-sized AST node arena — eliminating intermediate `Array[Token]` and per-token `Span`/`Pos` materialization.
+- **Expression & Template Evaluation (W2, 8.20x faster, 1.3x lower RSS)**: `packages/hcl` evaluates a flat `Array[ExprNode]` arena directly over `HclValue`, combining an exact small-integer fast path with pure-Pion arbitrary-precision `BigDec` arithmetic and a streaming `max_output_bytes`-budgeted JSON encoder, avoiding `go-cty`'s reflection/type-descriptor boxing while preserving `go-cty` precision and safety budgets.
+- **Canonical Formatting (W3, 7.00x faster, 3.2x lower RSS)**: Even with a full syntax validation pass (`parse_file_impl`) and full multi-line value group breaking + trailing comment alignment, `format_hcl` writes formatted lines directly into a pre-sized `StringBuilder` with single-pass indent/alignment caching, outperforming `hclwrite.Format` by 7.0x with 3.2x lower peak RSS.
 - **Safety & Cross-Runtime Guarantees**: All recursion paths clamp `max_depth` to a stack-safe ceiling (`160`) to prevent native stack overflow (`SIGSEGV`) and Wasm32 `RangeError`; all number-to-integer conversions are range-checked to avoid Wasm32 `f64→i32/i64` traps; `max_output_bytes` bounds templates, `join`, `format`, `jsonencode`, and `eval_body_to_json` incrementally.
 
 ## Formal Verification (Lean 4)
