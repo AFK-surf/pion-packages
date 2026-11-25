@@ -85,13 +85,13 @@ pionc build --target wasm32 -o /tmp/toml_wasm_smoke.wasm packages/toml/wasm_smok
 
 Steady-state parsing of a realistic 150.5 KB TOML v1.0.0 workspace & service configuration corpus (50 iterations = 7.53 MB total input) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against **Rust `toml 1.2.2`** (`--release`, LTO) and **Go `BurntSushi/toml`**:
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `203 B` (`sha256:96cf0bf395d107be...`) | Input: `7526500 B` | Ops: `50`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `203 B` (`sha256:96cf0bf395d107be...`) | Input: `7526500 B` | Ops: `50`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_toml 1.2.2) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 100.995 | 86.022 | 113.517 | 74.52 | 2019898.34 | 3.50 MiB | 0.93x |
-| `rust_toml` | 93.422 | 91.795 | 98.200 | 80.56 | 1868440.00 | 6.92 MiB | 1.00x (baseline) |
-| `go_burntsushi` | 262.027 | 257.532 | 369.302 | 28.72 | 5240550.00 | 15.62 MiB | 0.36x |
+| `pion` | 74.700 | 66.758 | 79.409 | 100.76 | 1493995.74 | 3.09 MiB | 1.50x |
+| `rust_toml` | 112.117 | 101.698 | 127.087 | 67.13 | 2242343.62 | 5.47 MiB | 1.00x (baseline) |
+| `go_burntsushi` | 596.625 | 580.939 | 608.081 | 12.62 | 11932499.48 | 11.78 MiB | 0.19x |
 
 Reproduce:
 
