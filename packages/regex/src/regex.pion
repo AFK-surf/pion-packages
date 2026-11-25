@@ -144,6 +144,10 @@ pub fn Regex::is_match(self : Regex, text : String) -> Bool {
   self.is_match_at(text, 0)
 }
 
+fn prefix_budget_exceeded(scanned : Int64, span_len : Int) -> Bool {
+  scanned > span_len.to_int64() + 64L
+}
+
 ///| Returns true if the regex matches anywhere in `text` starting at byte offset `start`.
 pub fn Regex::is_match_at(self : Regex, text : String, start : Int) -> Bool {
   let n = text.length()
@@ -158,7 +162,8 @@ pub fn Regex::is_match_at(self : Regex, text : String, start : Int) -> Bool {
       Prefilter::ExactLiteral(bs) => return find_bytes_at(text, start, bs) >= 0
       Prefilter::PrefixBytes(bs) | Prefilter::LeadingLookPrefix(bs) => {
         let mut pos = start
-        let empty : Array[Int] = Array::new()
+        let mut scanned : Int64 = 0L
+        let span_len = n - start
         while pos <= n {
           let cand = find_bytes_at(text, pos, bs)
           if cand < 0 {
@@ -169,11 +174,23 @@ pub fn Regex::is_match_at(self : Regex, text : String, start : Int) -> Bool {
             return true
           }
           if r == -2 {
-            if pikevm_search(self.fwd_nfa, self.pike_cache, text, cand, n, true, false, empty) {
-              return true
-            }
+            let empty : Array[Int] = Array::new()
+            return pikevm_search(self.fwd_nfa, self.pike_cache, text, cand, n, false, false, empty)
           }
-          pos = cand + 1
+          scanned = scanned + self.fwd_dfa.last_scan_bytes.to_int64()
+          let next_pos = cand + 1
+          if prefix_budget_exceeded(scanned, span_len) {
+            if next_pos > n {
+              return false
+            }
+            let ur = self.fwd_dfa.is_match_tri(text, next_pos, n, false)
+            if ur >= 0 {
+              return ur == 1
+            }
+            let empty : Array[Int] = Array::new()
+            return pikevm_search(self.fwd_nfa, self.pike_cache, text, next_pos, n, false, false, empty)
+          }
+          pos = next_pos
         }
         return false
       }
@@ -235,7 +252,8 @@ pub fn Regex::find_span_at(
       }
       Prefilter::PrefixBytes(bs) | Prefilter::LeadingLookPrefix(bs) => {
         let mut pos = start
-        let slots : Array[Int] = Array::new()
+        let mut scanned : Int64 = 0L
+        let span_len = n - start
         while pos <= n {
           let cand = find_bytes_at(text, pos, bs)
           if cand < 0 {
@@ -246,11 +264,38 @@ pub fn Regex::find_span_at(
             return Option::Some((cand, m_end))
           }
           if m_end == -2 {
-            if pikevm_search(self.fwd_nfa, self.pike_cache, text, cand, n, true, true, slots) {
+            let slots : Array[Int] = Array::new()
+            if pikevm_search(self.fwd_nfa, self.pike_cache, text, cand, n, false, true, slots) {
               return Option::Some((slots[0], slots[1]))
             }
+            return Option::None
           }
-          pos = cand + 1
+          scanned = scanned + self.fwd_dfa.last_scan_bytes.to_int64()
+          let next_pos = cand + 1
+          if prefix_budget_exceeded(scanned, span_len) {
+            if next_pos > n {
+              return Option::None
+            }
+            let u_end = self.fwd_dfa.find_end(text, next_pos, n, false)
+            if u_end == -1 {
+              return Option::None
+            }
+            if u_end >= 0 {
+              let m_start = self.rev_dfa.find_start_rev(text, next_pos, u_end)
+              if m_start >= 0 {
+                return Option::Some((m_start, u_end))
+              }
+              if m_start == -1 {
+                return Option::Some((next_pos, u_end))
+              }
+            }
+            let slots : Array[Int] = Array::new()
+            if pikevm_search(self.fwd_nfa, self.pike_cache, text, next_pos, n, false, true, slots) {
+              return Option::Some((slots[0], slots[1]))
+            }
+            return Option::None
+          }
+          pos = next_pos
         }
         return Option::None
       }
@@ -465,12 +510,26 @@ pub fn Regex::replace_all(self : Regex, text : String, rep : String) -> String {
   self.replacen(text, 0, rep)
 }
 
-///| Replaces at most `limit` matches (`limit == 0` replaces all) (P1-1).
-pub fn Regex::replacen(
+fn rep_has_dollar(rep : String) -> Bool {
+  let n = rep.length()
+  let mut i = 0
+  while i < n {
+    if rep.code_unit_at(i) == 36 {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Shared replacement loop with `need_captures` flag so empty-match suppression,
+///| UTF-8 advancement, `limit` counting and no-match passthrough share one implementation.
+fn Regex::replacen_impl(
   self : Regex,
   text : String,
   limit : Int,
   rep : String,
+  need_captures : Bool,
 ) -> String {
   let n = text.length()
   let mut pos = 0
@@ -483,44 +542,71 @@ pub fn Regex::replacen(
     if limit > 0 && count >= limit {
       break
     }
-    match self.captures_at(text, pos) {
-      None => break
-      Some(caps) => {
-        let s = caps.slots[0]
-        let e = caps.slots[1]
-        if s == e && s == last_match_end {
-          if pos >= n {
-            break
-          }
-          pos = pos + utf8_char_len_at(text, pos)
-          continue
-        }
-        any = true
-        if s > last_end {
-          sb.write_string(text.slice(last_end, s))
-        }
-        caps.expand_into(rep, sb)
-        last_end = e
-        last_match_end = e
-        count = count + 1
-        if s == e {
-          if e >= n {
-            break
-          }
-          pos = e + utf8_char_len_at(text, e)
-        } else {
-          pos = e
+    let mut s = 0
+    let mut e = 0
+    let mut caps_opt : Option[Captures] = Option::None
+    if need_captures {
+      match self.captures_at(text, pos) {
+        None => break
+        Some(caps) => {
+          s = caps.slots[0]
+          e = caps.slots[1]
+          caps_opt = Option::Some(caps)
         }
       }
+    } else {
+      match self.find_span_at(text, pos) {
+        None => break
+        Some((ms, me)) => {
+          s = ms
+          e = me
+        }
+      }
+    }
+    if s == e && s == last_match_end {
+      if pos >= n {
+        break
+      }
+      pos = pos + utf8_char_len_at(text, pos)
+      continue
+    }
+    any = true
+    if s > last_end {
+      sb.write_substring(text, last_end, s)
+    }
+    match caps_opt {
+      Some(caps) => caps.expand_into(rep, sb)
+      None => sb.write_string(rep)
+    }
+    last_end = e
+    last_match_end = e
+    count = count + 1
+    if s == e {
+      if e >= n {
+        break
+      }
+      pos = e + utf8_char_len_at(text, e)
+    } else {
+      pos = e
     }
   }
   if !any {
     return text
   }
   if last_end < n {
-    sb.write_string(text.slice(last_end, n))
+    sb.write_substring(text, last_end, n)
   }
   sb.to_string()
+}
+
+///| Replaces at most `limit` matches (`limit == 0` replaces all) (P1-1).
+pub fn Regex::replacen(
+  self : Regex,
+  text : String,
+  limit : Int,
+  rep : String,
+) -> String {
+  self.replacen_impl(text, limit, rep, rep_has_dollar(rep))
 }
 
 ///| Splits `text` by all matches of this regex.

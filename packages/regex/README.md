@@ -15,11 +15,12 @@ Pure Pion, zero-C-dependency, zero-`World`, Native + `wasm32` compatible linear-
   - **Unicode 16.0.0 support** (matching `regex-syntax 0.8.12`): compact prefix-shared `Sparse` UTF-8 byte-automaton tries, full UCD 16.0.0 General Categories (`L`/`Lu`/`Ll`/`Lt`/`Lm`/`Lo`/`LC`, `M`/`Mn`/`Mc`/`Me`, `N`/`Nd`/`Nl`/`No`, `P`/`Pc`..`Po`, `S`/`Sm`..`So`, `Z`/`Zs`..`Zp`, `C`/`Cc`..`Cn`), major Scripts (`Latin`, `Greek`, `Cyrillic`, `Han`, `Hiragana`, `Katakana`, `Arabic`, `Hebrew`, `Hangul`, `Common`, `Inherited`, `Devanagari`, `Thai`, `ASCII`), full UCD 16.0.0 Simple Case Folding (`(?i)`), and compile-time rejection of `(?-u)` patterns that can match invalid UTF-8 bytes on `String` haystacks.
   - Strict compile-time limits: `nest_limit` (covering both `(` and `[`, default `250`, returning `NestLimitExceeded`) and `size_limit` (`CompiledTooBig`).
 - **Multi-tier linear-time execution architecture**:
-  - **Prefilter**: exact-literal fast path, required literal-prefix & leading-look-prefix byte scan (`\bword\b`), and 256-entry `FirstBytes` skip table.
-  - **ByteClassSet**: `O(N + 256)` byte equivalence-class compression (`stride <= 256`).
-  - **Hybrid Lazy DFA**: on-demand memory-bounded (~16 MiB cap) forward & reverse Lazy DFA with priority-ordered break-on-match (including conditional `(?m)$` and ASCII `\b`/`\B`, cleanly falling back to PikeVM on non-ASCII bytes under Unicode `\b`/`\B`), plus hybrid `RegexSet` splitting non-`\b` and `\b` rules so non-`\b` rules always stay on the single-pass DFA fast path.
+  - **Prefilter**: exact-literal fast path, required literal-prefix & leading-look-prefix byte scan (`\bword\b`), multi-literal **Packed-Pair** 2-byte bitmap prefilter (8 KB L1-resident bitmap for 2–16 fixed-offset ASCII alternation branches, strictly leftmost-first & linear-time), and 256-entry `FirstBytes` skip table.
+  - **ByteClassSet**: `O(N + 256)` byte equivalence-class compression (`num_classes <= 256`) with power-of-2 physical `row_stride` (`sid = st >> stride_shift`, zero per-byte `idiv`).
+  - **Hybrid Lazy DFA**: on-demand memory-bounded (~16 MiB cap) forward & reverse Lazy DFA with `SPECIAL_BIT` two-tier hot loop (zero calls / zero table reloads on non-special transitions), `cache_gen`-guarded cache flush safety, priority-ordered break-on-match (including conditional `(?m)$` and ASCII `\b`/`\B`, cleanly falling back to PikeVM on non-ASCII bytes under Unicode `\b`/`\B`), plus hybrid `RegexSet` splitting non-`\b` and `\b` rules so non-`\b` rules always stay on the single-pass DFA fast path.
   - **One-Pass DFA**: compiles unambiguous capture-group NFAs into a single-pass table-driven DFA with 64-bit capture slot masks (zero allocations per match).
   - **Thompson / Cox PikeVM**: flat parallel-array `O(N × M)` fallback with reusable generation-stamped `PikeVmCache` (zero per-call state-array allocations) and compact `Sparse` UTF-8 trie states.
+  - **Zero-slice replacement**: shared `replacen` loop with no-`$` literal fast path (`find_span_at` + `StringBuilder::write_substring`) and bulk-copy `Captures::expand_into`.
 - **Rich API**: `is_match`, `is_match_at`, `find`, `find_at`, `find_span_at`, `find_spans_into`, `find_iter`, `captures`, `captures_at`, `captures_slots_at`, `captures_iter`, `replace`, `replace_all`, `replacen` (`$0`, `$1`, `${1}`, `$name`, `${name}`, `${}`, `$$`), `split`, `splitn` (all following Rust/Go abutting empty-match skipping), and multi-pattern `RegexSet`.
 - **Dual target**: Native + `wasm32` (`packages/regex/wasm_smoke` and `packages/regex/audit/release_probe` verified across all 4 build modes: Native/Wasm32 × debug/`--release`, 100% byte-identical transcripts across 28,783 differential cases).
 
@@ -97,6 +98,18 @@ _SHA-256 verified identical across all implementations and rounds: `a7e10eb653fd
 | `go_regexp` | 26.023 | 24.664 | 27.858 | 104090.00 | 5.50 MiB | 0.38x |
 
 _SHA-256 verified identical across all implementations and rounds: `9f98f5bc3836fb96f47a290a7ceca716b26d89b668b1d60d532d91301c7a0e8d`._
+
+### 5. `v0.2.0` vs `v0.1.0` Same-Machine Interleaved Benchmark (`Linux x86_64`, `--warmup 1 --rounds 5`)
+
+| Workload | `v0.1.0` Median (ms) | `v0.2.0` Median (ms) | `v0.2.0` Min (ms) | Speedup (Median / Min) | Peak RSS (`v0.1.0` → `v0.2.0`) | Stdout SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| CLBG `regex-redux` (5.08 MB FASTA) | 2094.017 | 1445.109 | 480.044 | **1.45×** (**3.04×** min) | 23.18 → 19.71 MiB | `dd7aecb6cd9a7fdc…` |
+| `find_iter` (26.89 MB logs) | 230.724 | 168.402 | 137.152 | **1.37×** | 7.47 → 7.45 MiB | `16f877f2f550dcee…` |
+| `captures_iter` (13.45 MB logs) | 489.904 | 335.777 | 229.077 | **1.46×** (**2.05×** min) | 7.48 → 7.38 MiB | `8c769e6c2061bea1…` |
+| `regex_set` (100k ops, 16 rules) | 285.763 | 90.805 | 84.846 | **3.15×** | 9.50 → 9.46 MiB | `a7e10eb653fdc30d…` |
+| `redos` (250 ops, linear-time) | 27.849 | 29.220 | 19.769 | 0.95× (1.01× min) | 2.95 → 2.93 MiB | `9f98f5bc3836fb96…` |
+
+3-way vs Rust `regex 1.11.1` / Go `regexp` on the same `Linux x86_64` host (`v0.2.0`): `find_iter` `0.66×` Rust (**26.6× vs Go**), `captures_iter` `0.52×` Rust (**9.0× vs Go**), `regex_set` `0.75×` Rust (**2.2× vs Go**), `redos` `0.81×` Rust (**4.4× vs Go**).
 
 ## Adversarial & Stress Benchmarks (`audit/stress/run_stress.py`, Pion `--release` vs Rust `regex =1.11.1`)
 

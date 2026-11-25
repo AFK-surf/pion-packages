@@ -15,15 +15,39 @@ pub enum DfaMode {
   SetAll // RegexSet: collect all matching pattern IDs
 }
 
+let dfa_special_bit : Int = 1073741824 // 0x40000000
+let dfa_state_mask : Int = 1073741823 // 0x3FFFFFFF
+
+fn dfa_next_pow2_shift(n : Int) -> (Int, Int) {
+  let mut p = 1
+  let mut sh = 0
+  while p < n {
+    p = p << 1
+    sh = sh + 1
+  }
+  (p, sh)
+}
+
 ///| On-demand Lazy DFA cache attached to an `Nfa`.
 pub struct LazyDfa {
   nfa : Nfa
   mode : DfaMode
-  stride : Int
+  num_classes : Int // real equivalence class count (nfa.rep_bytes.length())
+  row_stride : Int // physical row width = next_pow2(num_classes)
+  stride_shift : Int // 1 << stride_shift == row_stride
   nl_cls : Int // byte class of '\n' (10)
+  has_mid_prefilter : Bool
+  mut max_states : Int
+  mut max_trans_ints : Int
+  mut cache_gen : Int
+  mut cache_resets : Int
+  mut accel_start_off : Int
+  mut last_scan_bytes : Int
+  mut total_scan_bytes : Int64
   // Cache state:
   // row 0 = unused; rows 1.. = valid states
-  // trans[sid * stride + cls]: 0 = uncomputed, -1 = dead, > 0 = next_sid * stride
+  // trans[(sid << stride_shift) + cls]:
+  //   0 = uncomputed, -1 = dead, > 0 = (next_sid << stride_shift) [| dfa_special_bit]
   trans : Array[Int]
   sets : Array[Array[Int]] // sid -> NFA state list
   state_prev_word : Array[Bool] // sid -> whether previous byte was ASCII word
@@ -38,7 +62,7 @@ pub struct LazyDfa {
   match_pids_word : Array[Array[Int]] // for SetAll: next-is-word pids
   match_pids_nonword : Array[Array[Int]] // for SetAll: next-is-nonword pids
   mut total_set_ints : Int
-  // Start state offsets (sid * stride), -1 = dead, 0 = not initialized
+  // Start state offsets (sid << stride_shift), -1 = dead, 0 = not initialized
   // Indexed by (ctx * 2 + prev_word_bit), where ctx: 0=mid, 1=nl, 2=start_text
   starts_anch : Array[Int]
   starts_unanch : Array[Int]
@@ -63,11 +87,31 @@ pub struct LazyDfa {
 ///| Create a new Lazy DFA wrapper for `nfa` (cache allocated lazily on first use).
 pub fn LazyDfa::new(nfa : Nfa, mode : DfaMode) -> LazyDfa {
   let nl_cls = nfa.byte_classes[10]
+  let num_classes = nfa.rep_bytes.length()
+  let (row_stride, stride_shift) = dfa_next_pow2_shift(num_classes)
+  let has_mid_prefilter = dfa_is_leftmost(mode) &&
+  !nfa.anchored_start &&
+  !nfa.has_line_anchor &&
+  !nfa.has_word_boundary &&
+  match nfa.prefilter {
+    Prefilter::FirstBytes(_) | Prefilter::PackedPair(_) => true
+    _ => false
+  }
   LazyDfa::{
     nfa,
     mode,
-    stride: nfa.stride,
+    num_classes,
+    row_stride,
+    stride_shift,
     nl_cls,
+    has_mid_prefilter,
+    max_states: 8192,
+    max_trans_ints: 4000000,
+    cache_gen: 0,
+    cache_resets: 0,
+    accel_start_off: -1,
+    last_scan_bytes: 0,
+    total_scan_bytes: 0L,
     trans: Array::new(),
     sets: Array::new(),
     state_prev_word: Array::new(),
@@ -676,7 +720,7 @@ fn LazyDfa::insert(
   self.match_pids_nonword.push(pids_nonword)
   self.total_set_ints = self.total_set_ints + set.length()
   let mut c = 0
-  while c < self.stride {
+  while c < self.row_stride {
     self.trans.push(0)
     c = c + 1
   }
@@ -695,6 +739,9 @@ fn LazyDfa::insert(
 }
 
 fn LazyDfa::reset_cache(self : LazyDfa) -> Unit {
+  self.cache_gen = self.cache_gen + 1
+  self.cache_resets = self.cache_resets + 1
+  self.accel_start_off = -1
   self.trans.clear()
   self.sets.clear()
   self.state_prev_word.clear()
@@ -723,7 +770,7 @@ fn LazyDfa::reset_cache(self : LazyDfa) -> Unit {
   self.match_pids_word.push([])
   self.match_pids_nonword.push([])
   let mut i = 0
-  while i < self.stride {
+  while i < self.row_stride {
     self.trans.push(0)
     i = i + 1
   }
@@ -788,15 +835,15 @@ fn LazyDfa::get_or_insert_closure(
   let h = dfa_hash_set(set)
   let existing = self.lookup(set, h)
   if existing >= 0 {
-    return existing * self.stride
+    return existing << self.stride_shift
   }
-  if self.sets.length() >= 8192 ||
+  if self.sets.length() >= self.max_states ||
   self.total_set_ints + set.length() > 2000000 ||
-  self.trans.length() + self.stride > 2000000 {
+  self.trans.length() + self.row_stride > self.max_trans_ints {
     self.reset_cache()
     let after = self.lookup(set, h)
     if after >= 0 {
-      return after * self.stride
+      return after << self.stride_shift
     }
     let fresh = self.insert(
       set,
@@ -813,7 +860,7 @@ fn LazyDfa::get_or_insert_closure(
       pids_word,
       pids_nonword,
     )
-    return fresh * self.stride
+    return fresh << self.stride_shift
   }
   let nid = self.insert(
     set,
@@ -830,7 +877,7 @@ fn LazyDfa::get_or_insert_closure(
     pids_word,
     pids_nonword,
   )
-  nid * self.stride
+  nid << self.stride_shift
 }
 
 fn LazyDfa::get_start(
@@ -856,14 +903,46 @@ fn LazyDfa::get_start(
     self.starts_anch[idx]
   } else {
     if self.starts_unanch[idx] == 0 {
-      self.starts_unanch[idx] = self.get_or_insert_closure(
+      let off = self.get_or_insert_closure(
         [self.nfa.start_unanchored],
         at_start_text,
         at_start_line,
         wbit == 1,
       )
+      self.starts_unanch[idx] = off
+      if idx == 0 && self.has_mid_prefilter {
+        self.accel_start_off = off
+      }
     }
     self.starts_unanch[idx]
+  }
+}
+
+fn LazyDfa::ensure_accel_start(self : LazyDfa) -> Int {
+  if !self.has_mid_prefilter {
+    return -1
+  }
+  if self.accel_start_off > 0 {
+    return self.accel_start_off
+  }
+  let off = self.get_start(false, false, false, false)
+  self.accel_start_off = off
+  off
+}
+
+fn LazyDfa::encode_trans_target(self : LazyDfa, next_off : Int) -> Int {
+  if next_off <= 0 {
+    return next_off
+  }
+  let sid = next_off >> self.stride_shift
+  if self.has_match[sid] ||
+  self.match_at_nl[sid] ||
+  self.match_at_word[sid] ||
+  self.match_at_nonword[sid] ||
+  (self.has_mid_prefilter && next_off == self.accel_start_off) {
+    next_off | dfa_special_bit
+  } else {
+    next_off
   }
 }
 
@@ -884,8 +963,7 @@ fn dfa_step_consuming(st : NfaState, rb : Int, seeds : Array[Int]) -> Unit {
 
 ///| Compute a missing transition `(cur_off, cls)` on demand.
 fn LazyDfa::step_lazy(self : LazyDfa, cur_off : Int, cls : Int) -> Int {
-  let stride = self.stride
-  let cur_id = cur_off / stride
+  let cur_id = cur_off >> self.stride_shift
   let cur_set = self.sets[cur_id]
   let rb = self.nfa.rep_bytes[cls]
   let states = self.nfa.states
@@ -927,10 +1005,10 @@ fn LazyDfa::step_lazy(self : LazyDfa, cur_off : Int, cls : Int) -> Int {
     i = i + 1
   }
 
-  let before_sets_len = self.sets.length()
+  let gen_before = self.cache_gen
   let next_off = self.get_or_insert_closure(seeds, false, is_nl, next_is_word)
-  if self.sets.length() >= before_sets_len {
-    self.trans[cur_off + cls] = next_off
+  if self.cache_gen == gen_before {
+    self.trans[cur_off + cls] = self.encode_trans_target(next_off)
   }
   next_off
 }
@@ -944,6 +1022,7 @@ pub fn LazyDfa::find_end(
   end_pos : Int,
   anchored : Bool,
 ) -> Int {
+  self.last_scan_bytes = 0
   let has_uwb = self.nfa.has_unicode_word_boundary
   let has_wb = self.nfa.has_word_boundary
   if has_uwb && start_pos > 0 && text.code_unit_at(start_pos - 1) >= 128 {
@@ -952,87 +1031,196 @@ pub fn LazyDfa::find_end(
   let at_start_text = start_pos == 0
   let at_start_line = at_start_text || text.code_unit_at(start_pos - 1) == 10
   let prev_word = !at_start_text && is_ascii_word_byte(text.code_unit_at(start_pos - 1))
+  let use_mid_pf = !anchored && self.has_mid_prefilter
+  if use_mid_pf {
+    let _ = self.ensure_accel_start()
+  }
   let mut st = self.get_start(anchored, at_start_text, at_start_line, prev_word)
   if st < 0 {
     return -1
   }
-  let stride = self.stride
+  // Read-only: if `get_start` triggered reset_cache, `accel_start_off` is -1; never re-insert while holding active `st`.
+  let mut start_unanch_mid = if use_mid_pf { self.accel_start_off } else { -1 }
+  let mut cur_gen = self.cache_gen
+  let stride_shift = self.stride_shift
   let byte_classes = self.nfa.byte_classes
   let has_line = self.nfa.has_line_anchor
   let mut trans = self.trans
   let mut hm = self.has_match
-  let mut mnl = self.match_at_nl
-  let mut mword = self.match_at_word
-  let mut mnonword = self.match_at_nonword
   let mut last_match = -1
-
-  let start_unanch_mid = if !anchored && !has_line && !has_wb {
-    match self.nfa.prefilter {
-      Prefilter::FirstBytes(_) => self.get_start(false, false, false, false)
-      _ => -1
-    }
-  } else {
-    -1
-  }
-
   let mut pos = start_pos
-  while pos < end_pos {
-    let b = text.code_unit_at(pos)
-    if has_uwb && b >= 128 {
-      return -2
-    }
-    let sid = st / stride
-    if hm[sid] {
-      last_match = pos
-    } else if has_line && mnl[sid] && b == 10 {
-      last_match = pos
-    } else if has_wb {
-      if is_ascii_word_byte(b) {
-        if mword[sid] {
-          last_match = pos
-        }
-      } else if mnonword[sid] || (b == 10 && mnl[sid]) {
+
+  if !has_line && !has_wb && !has_uwb {
+    let mut pf_last_hit = -1
+    while pos < end_pos {
+      let sid = st >> stride_shift
+      if hm[sid] {
         last_match = pos
       }
-    }
-    if st == start_unanch_mid && last_match < 0 {
-      match self.nfa.prefilter {
-        Prefilter::FirstBytes(tbl) => {
-          while pos < end_pos && tbl[text.code_unit_at(pos)] == 0 {
-            pos = pos + 1
+      if use_mid_pf && st == start_unanch_mid && last_match < 0 {
+        match self.nfa.prefilter {
+          Prefilter::PackedPair(pp) => {
+            let min_scan = pos + pp.min_off
+            let hit = if pf_last_hit >= min_scan {
+              pf_last_hit
+            } else {
+              let h = packed_pair_find(pp, text, min_scan, end_pos)
+              pf_last_hit = h
+              h
+            }
+            if hit < 0 {
+              pos = end_pos
+              break
+            }
+            let cand = hit - pp.max_off
+            if cand > pos {
+              pos = cand
+            }
           }
-          if pos >= end_pos {
+          Prefilter::FirstBytes(tbl) => {
+            while pos < end_pos && tbl[text.code_unit_at(pos)] == 0 {
+              pos = pos + 1
+            }
+            if pos >= end_pos {
+              break
+            }
+          }
+          _ => ()
+        }
+      }
+      // Inner hot loop: zero function calls, zero trans/hm reloads, zero idiv.
+      while pos < end_pos {
+        let cls = byte_classes[text.code_unit_at(pos)]
+        let nxt = trans[st + cls]
+        if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+          break
+        }
+        st = nxt
+        pos = pos + 1
+      }
+      if pos >= end_pos {
+        break
+      }
+      let cls = byte_classes[text.code_unit_at(pos)]
+      let nxt = trans[st + cls]
+      if nxt > 0 {
+        st = nxt & dfa_state_mask
+      } else if nxt < 0 {
+        let scanned = pos - start_pos + 1
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+        return last_match
+      } else {
+        st = self.step_lazy(st, cls)
+        if st < 0 {
+          let scanned = pos - start_pos + 1
+          self.last_scan_bytes = scanned
+          self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+          return last_match
+        }
+        trans = self.trans
+        hm = self.has_match
+        if self.cache_gen != cur_gen {
+          cur_gen = self.cache_gen
+          // Read-only update: NEVER call ensure_accel_start() while holding active `st`.
+          start_unanch_mid = if use_mid_pf { self.accel_start_off } else { -1 }
+        }
+      }
+      pos = pos + 1
+    }
+  } else {
+    let mut mnl = self.match_at_nl
+    let mut mword = self.match_at_word
+    let mut mnonword = self.match_at_nonword
+    while pos < end_pos {
+      let b = text.code_unit_at(pos)
+      if has_uwb && b >= 128 {
+        let scanned = pos - start_pos
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+        return -2
+      }
+      let sid = st >> stride_shift
+      if hm[sid] {
+        last_match = pos
+      } else if has_line && mnl[sid] && b == 10 {
+        last_match = pos
+      } else if has_wb {
+        if is_ascii_word_byte(b) {
+          if mword[sid] {
+            last_match = pos
+          }
+        } else if mnonword[sid] || (b == 10 && mnl[sid]) {
+          last_match = pos
+        }
+      }
+      if !has_uwb {
+        while pos < end_pos {
+          let cls = byte_classes[text.code_unit_at(pos)]
+          let nxt = trans[st + cls]
+          if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
             break
           }
+          st = nxt
+          pos = pos + 1
         }
-        _ => ()
+      } else {
+        while pos < end_pos {
+          let cb = text.code_unit_at(pos)
+          if cb >= 128 {
+            let scanned = pos - start_pos
+            self.last_scan_bytes = scanned
+            self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+            return -2
+          }
+          let cls = byte_classes[cb]
+          let nxt = trans[st + cls]
+          if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+            break
+          }
+          st = nxt
+          pos = pos + 1
+        }
       }
-    }
-    let cls = byte_classes[text.code_unit_at(pos)]
-    let nxt = trans[st + cls]
-    if nxt > 0 {
-      st = nxt
-    } else if nxt < 0 {
-      return last_match
-    } else {
-      st = self.step_lazy(st, cls)
-      if st < 0 {
+      if pos >= end_pos {
+        break
+      }
+      let cls = byte_classes[text.code_unit_at(pos)]
+      let nxt = trans[st + cls]
+      if nxt > 0 {
+        st = nxt & dfa_state_mask
+      } else if nxt < 0 {
+        let scanned = pos - start_pos + 1
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
         return last_match
+      } else {
+        st = self.step_lazy(st, cls)
+        if st < 0 {
+          let scanned = pos - start_pos + 1
+          self.last_scan_bytes = scanned
+          self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+          return last_match
+        }
+        trans = self.trans
+        hm = self.has_match
+        mnl = self.match_at_nl
+        mword = self.match_at_word
+        mnonword = self.match_at_nonword
       }
-      trans = self.trans
-      hm = self.has_match
-      mnl = self.match_at_nl
-      mword = self.match_at_word
-      mnonword = self.match_at_nonword
+      pos = pos + 1
     }
-    pos = pos + 1
   }
+
+  let scanned = pos - start_pos
+  self.last_scan_bytes = scanned
+  self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
 
   // Check EOI / boundary match at end_pos
   if has_uwb && end_pos < text.length() && text.code_unit_at(end_pos) >= 128 {
     return -2
   }
-  let sid = st / stride
+  let sid = st >> stride_shift
   if hm[sid] {
     last_match = end_pos
   } else if end_pos == text.length() {
@@ -1041,6 +1229,9 @@ pub fn LazyDfa::find_end(
     }
   } else {
     let eb = text.code_unit_at(end_pos)
+    let mnl = self.match_at_nl
+    let mword = self.match_at_word
+    let mnonword = self.match_at_nonword
     if (has_line && eb == 10 && mnl[sid]) ||
     (has_wb &&
       ((is_ascii_word_byte(eb) && mword[sid]) ||
@@ -1059,6 +1250,7 @@ pub fn LazyDfa::is_match_tri(
   end_pos : Int,
   anchored : Bool,
 ) -> Int {
+  self.last_scan_bytes = 0
   let has_uwb = self.nfa.has_unicode_word_boundary
   let has_wb = self.nfa.has_word_boundary
   if has_uwb && start_pos > 0 && text.code_unit_at(start_pos - 1) >= 128 {
@@ -1067,65 +1259,212 @@ pub fn LazyDfa::is_match_tri(
   let at_start_text = start_pos == 0
   let at_start_line = at_start_text || text.code_unit_at(start_pos - 1) == 10
   let prev_word = !at_start_text && is_ascii_word_byte(text.code_unit_at(start_pos - 1))
+  let use_mid_pf = !anchored && self.has_mid_prefilter
+  if use_mid_pf {
+    let _ = self.ensure_accel_start()
+  }
   let mut st = self.get_start(anchored, at_start_text, at_start_line, prev_word)
   if st < 0 {
     return 0
   }
-  let stride = self.stride
+  // Read-only: if `get_start` triggered reset_cache, `accel_start_off` is -1; never re-insert while holding active `st`.
+  let mut start_unanch_mid = if use_mid_pf { self.accel_start_off } else { -1 }
+  let mut cur_gen = self.cache_gen
+  let stride_shift = self.stride_shift
   let byte_classes = self.nfa.byte_classes
   let has_line = self.nfa.has_line_anchor
   let mut trans = self.trans
   let mut hm = self.has_match
-  let mut mnl = self.match_at_nl
-  let mut mword = self.match_at_word
-  let mut mnonword = self.match_at_nonword
-
   let mut pos = start_pos
-  while pos < end_pos {
-    let b = text.code_unit_at(pos)
-    if has_uwb && b >= 128 {
-      return -2
-    }
-    let sid = st / stride
-    if hm[sid] {
-      return 1
-    }
-    if has_line && mnl[sid] && b == 10 {
-      return 1
-    }
-    if has_wb {
-      if is_ascii_word_byte(b) {
-        if mword[sid] {
-          return 1
-        }
-      } else if mnonword[sid] || (b == 10 && mnl[sid]) {
+
+  if !has_line && !has_wb && !has_uwb {
+    let mut pf_last_hit = -1
+    while pos < end_pos {
+      let sid = st >> stride_shift
+      if hm[sid] {
+        let scanned = pos - start_pos
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
         return 1
       }
-    }
-    let cls = byte_classes[b]
-    let nxt = trans[st + cls]
-    if nxt > 0 {
-      st = nxt
-    } else if nxt < 0 {
-      return 0
-    } else {
-      st = self.step_lazy(st, cls)
-      if st < 0 {
-        return 0
+      if use_mid_pf && st == start_unanch_mid {
+        match self.nfa.prefilter {
+          Prefilter::PackedPair(pp) => {
+            let min_scan = pos + pp.min_off
+            let hit = if pf_last_hit >= min_scan {
+              pf_last_hit
+            } else {
+              let h = packed_pair_find(pp, text, min_scan, end_pos)
+              pf_last_hit = h
+              h
+            }
+            if hit < 0 {
+              let scanned = end_pos - start_pos
+              self.last_scan_bytes = scanned
+              self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+              return 0
+            }
+            let cand = hit - pp.max_off
+            if cand > pos {
+              pos = cand
+            }
+          }
+          Prefilter::FirstBytes(tbl) => {
+            while pos < end_pos && tbl[text.code_unit_at(pos)] == 0 {
+              pos = pos + 1
+            }
+            if pos >= end_pos {
+              break
+            }
+          }
+          _ => ()
+        }
       }
-      trans = self.trans
-      hm = self.has_match
-      mnl = self.match_at_nl
-      mword = self.match_at_word
-      mnonword = self.match_at_nonword
+      while pos < end_pos {
+        let cls = byte_classes[text.code_unit_at(pos)]
+        let nxt = trans[st + cls]
+        if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+          break
+        }
+        st = nxt
+        pos = pos + 1
+      }
+      if pos >= end_pos {
+        break
+      }
+      let cls = byte_classes[text.code_unit_at(pos)]
+      let nxt = trans[st + cls]
+      if nxt > 0 {
+        st = nxt & dfa_state_mask
+      } else if nxt < 0 {
+        let scanned = pos - start_pos + 1
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+        return 0
+      } else {
+        st = self.step_lazy(st, cls)
+        if st < 0 {
+          let scanned = pos - start_pos + 1
+          self.last_scan_bytes = scanned
+          self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+          return 0
+        }
+        trans = self.trans
+        hm = self.has_match
+        if self.cache_gen != cur_gen {
+          cur_gen = self.cache_gen
+          // Read-only update: NEVER call ensure_accel_start() while holding active `st`.
+          start_unanch_mid = if use_mid_pf { self.accel_start_off } else { -1 }
+        }
+      }
+      pos = pos + 1
     }
-    pos = pos + 1
+  } else {
+    let mut mnl = self.match_at_nl
+    let mut mword = self.match_at_word
+    let mut mnonword = self.match_at_nonword
+    while pos < end_pos {
+      let b = text.code_unit_at(pos)
+      if has_uwb && b >= 128 {
+        let scanned = pos - start_pos
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+        return -2
+      }
+      let sid = st >> stride_shift
+      if hm[sid] {
+        let scanned = pos - start_pos
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+        return 1
+      }
+      if has_line && mnl[sid] && b == 10 {
+        let scanned = pos - start_pos
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+        return 1
+      }
+      if has_wb {
+        if is_ascii_word_byte(b) {
+          if mword[sid] {
+            let scanned = pos - start_pos
+            self.last_scan_bytes = scanned
+            self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+            return 1
+          }
+        } else if mnonword[sid] || (b == 10 && mnl[sid]) {
+          let scanned = pos - start_pos
+          self.last_scan_bytes = scanned
+          self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+          return 1
+        }
+      }
+      if !has_uwb {
+        while pos < end_pos {
+          let cls = byte_classes[text.code_unit_at(pos)]
+          let nxt = trans[st + cls]
+          if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+            break
+          }
+          st = nxt
+          pos = pos + 1
+        }
+      } else {
+        while pos < end_pos {
+          let cb = text.code_unit_at(pos)
+          if cb >= 128 {
+            let scanned = pos - start_pos
+            self.last_scan_bytes = scanned
+            self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+            return -2
+          }
+          let cls = byte_classes[cb]
+          let nxt = trans[st + cls]
+          if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+            break
+          }
+          st = nxt
+          pos = pos + 1
+        }
+      }
+      if pos >= end_pos {
+        break
+      }
+      let cls = byte_classes[text.code_unit_at(pos)]
+      let nxt = trans[st + cls]
+      if nxt > 0 {
+        st = nxt & dfa_state_mask
+      } else if nxt < 0 {
+        let scanned = pos - start_pos + 1
+        self.last_scan_bytes = scanned
+        self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+        return 0
+      } else {
+        st = self.step_lazy(st, cls)
+        if st < 0 {
+          let scanned = pos - start_pos + 1
+          self.last_scan_bytes = scanned
+          self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
+          return 0
+        }
+        trans = self.trans
+        hm = self.has_match
+        mnl = self.match_at_nl
+        mword = self.match_at_word
+        mnonword = self.match_at_nonword
+      }
+      pos = pos + 1
+    }
   }
+
+  let scanned = pos - start_pos
+  self.last_scan_bytes = scanned
+  self.total_scan_bytes = self.total_scan_bytes + scanned.to_int64()
 
   if has_uwb && end_pos < text.length() && text.code_unit_at(end_pos) >= 128 {
     return -2
   }
-  let sid = st / stride
+  let sid = st >> stride_shift
   if hm[sid] {
     return 1
   }
@@ -1136,6 +1475,9 @@ pub fn LazyDfa::is_match_tri(
     return 0
   }
   let eb = text.code_unit_at(end_pos)
+  let mnl = self.match_at_nl
+  let mword = self.match_at_word
+  let mnonword = self.match_at_nonword
   if (has_line && eb == 10 && mnl[sid]) ||
   (has_wb &&
     ((is_ascii_word_byte(eb) && mword[sid]) ||
@@ -1167,60 +1509,124 @@ pub fn LazyDfa::find_start_rev(
   if st < 0 {
     return -1
   }
-  let stride = self.stride
+  let stride_shift = self.stride_shift
   let byte_classes = self.nfa.byte_classes
   let has_line = self.nfa.has_line_anchor
   let mut trans = self.trans
   let mut hm = self.has_match
-  let mut mnl = self.match_at_nl
-  let mut mword = self.match_at_word
-  let mut mnonword = self.match_at_nonword
   let mut best_start = -1
-
   let mut pos = match_end
-  while pos > min_start {
-    let b = text.code_unit_at(pos - 1)
-    if has_uwb && b >= 128 {
-      return -2
-    }
-    let sid = st / stride
-    if hm[sid] {
-      best_start = pos
-    } else if has_line && mnl[sid] && b == 10 {
-      best_start = pos
-    } else if has_wb {
-      if is_ascii_word_byte(b) {
-        if mword[sid] {
-          best_start = pos
-        }
-      } else if mnonword[sid] || (b == 10 && mnl[sid]) {
+
+  if !has_line && !has_wb && !has_uwb {
+    while pos > min_start {
+      let sid = st >> stride_shift
+      if hm[sid] {
         best_start = pos
       }
-    }
-    let cls = byte_classes[b]
-    let nxt = trans[st + cls]
-    if nxt > 0 {
-      st = nxt
-    } else if nxt < 0 {
-      return best_start
-    } else {
-      st = self.step_lazy(st, cls)
-      if st < 0 {
-        return best_start
+      while pos > min_start {
+        let cls = byte_classes[text.code_unit_at(pos - 1)]
+        let nxt = trans[st + cls]
+        if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+          break
+        }
+        st = nxt
+        pos = pos - 1
       }
-      trans = self.trans
-      hm = self.has_match
-      mnl = self.match_at_nl
-      mword = self.match_at_word
-      mnonword = self.match_at_nonword
+      if pos <= min_start {
+        break
+      }
+      let cls = byte_classes[text.code_unit_at(pos - 1)]
+      let nxt = trans[st + cls]
+      if nxt > 0 {
+        st = nxt & dfa_state_mask
+      } else if nxt < 0 {
+        return best_start
+      } else {
+        st = self.step_lazy(st, cls)
+        if st < 0 {
+          return best_start
+        }
+        trans = self.trans
+        hm = self.has_match
+      }
+      pos = pos - 1
     }
-    pos = pos - 1
+  } else {
+    let mut mnl = self.match_at_nl
+    let mut mword = self.match_at_word
+    let mut mnonword = self.match_at_nonword
+    while pos > min_start {
+      let b = text.code_unit_at(pos - 1)
+      if has_uwb && b >= 128 {
+        return -2
+      }
+      let sid = st >> stride_shift
+      if hm[sid] {
+        best_start = pos
+      } else if has_line && mnl[sid] && b == 10 {
+        best_start = pos
+      } else if has_wb {
+        if is_ascii_word_byte(b) {
+          if mword[sid] {
+            best_start = pos
+          }
+        } else if mnonword[sid] || (b == 10 && mnl[sid]) {
+          best_start = pos
+        }
+      }
+      if !has_uwb {
+        while pos > min_start {
+          let cls = byte_classes[text.code_unit_at(pos - 1)]
+          let nxt = trans[st + cls]
+          if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+            break
+          }
+          st = nxt
+          pos = pos - 1
+        }
+      } else {
+        while pos > min_start {
+          let cb = text.code_unit_at(pos - 1)
+          if cb >= 128 {
+            return -2
+          }
+          let cls = byte_classes[cb]
+          let nxt = trans[st + cls]
+          if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+            break
+          }
+          st = nxt
+          pos = pos - 1
+        }
+      }
+      if pos <= min_start {
+        break
+      }
+      let cls = byte_classes[text.code_unit_at(pos - 1)]
+      let nxt = trans[st + cls]
+      if nxt > 0 {
+        st = nxt & dfa_state_mask
+      } else if nxt < 0 {
+        return best_start
+      } else {
+        st = self.step_lazy(st, cls)
+        if st < 0 {
+          return best_start
+        }
+        trans = self.trans
+        hm = self.has_match
+        mnl = self.match_at_nl
+        mword = self.match_at_word
+        mnonword = self.match_at_nonword
+      }
+      pos = pos - 1
+    }
   }
 
   if has_uwb && min_start > 0 && text.code_unit_at(min_start - 1) >= 128 {
     return -2
   }
-  let sid = st / stride
+  let sid = st >> stride_shift
   if hm[sid] {
     best_start = min_start
   } else if min_start == 0 {
@@ -1229,6 +1635,9 @@ pub fn LazyDfa::find_start_rev(
     }
   } else {
     let pb = text.code_unit_at(min_start - 1)
+    let mnl = self.match_at_nl
+    let mword = self.match_at_word
+    let mnonword = self.match_at_nonword
     if (has_line && pb == 10 && mnl[sid]) ||
     (has_wb &&
       ((is_ascii_word_byte(pb) && mword[sid]) ||
@@ -1271,7 +1680,7 @@ pub fn LazyDfa::set_matches_into(
   let hgen = self.set_gen
   let hit = self.set_hit_gen
   let mut hits_found = 0
-  let stride = self.stride
+  let stride_shift = self.stride_shift
   let byte_classes = self.nfa.byte_classes
   let has_line = self.nfa.has_line_anchor
   let mut trans = self.trans
@@ -1287,7 +1696,7 @@ pub fn LazyDfa::set_matches_into(
     if has_uwb && b >= 128 {
       return false
     }
-    let sid = st / stride
+    let sid = st >> stride_shift
     if hm[sid] {
       let pids = self.match_pids[sid]
       let mut k = 0
@@ -1351,10 +1760,38 @@ pub fn LazyDfa::set_matches_into(
         }
       }
     }
-    let cls = byte_classes[b]
+    if !has_uwb {
+      while pos < end_pos {
+        let cls = byte_classes[text.code_unit_at(pos)]
+        let nxt = trans[st + cls]
+        if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+          break
+        }
+        st = nxt
+        pos = pos + 1
+      }
+    } else {
+      while pos < end_pos {
+        let cb = text.code_unit_at(pos)
+        if cb >= 128 {
+          return false
+        }
+        let cls = byte_classes[cb]
+        let nxt = trans[st + cls]
+        if nxt <= 0 || (nxt & dfa_special_bit) != 0 {
+          break
+        }
+        st = nxt
+        pos = pos + 1
+      }
+    }
+    if pos >= end_pos {
+      break
+    }
+    let cls = byte_classes[text.code_unit_at(pos)]
     let nxt = trans[st + cls]
     if nxt > 0 {
-      st = nxt
+      st = nxt & dfa_state_mask
     } else if nxt < 0 {
       break
     } else {
@@ -1372,7 +1809,7 @@ pub fn LazyDfa::set_matches_into(
   }
 
   if st > 0 && pos == end_pos {
-    let sid = st / stride
+    let sid = st >> stride_shift
     if hm[sid] {
       let pids = self.match_pids[sid]
       let mut k = 0
