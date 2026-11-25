@@ -12,35 +12,43 @@ enum End {
   Cut
 }
 
+let exit_ok_unit : Exit[Unit] = Exit::Succeeded(())
+let exit_interrupted_unit : Exit[Unit] = Exit::Interrupted
+let noop_cb : (Resume) -> Unit = fn(_r : Resume) -> Unit { () }
+let noop_unit_k : (Exit[Unit]) -> Unit = fn(_ex : Exit[Unit]) -> Unit { () }
+let noop_w : () -> Unit = fn() -> Unit { () }
+
+// Task.flags bit layout:
+//   bits 0..2 (mask 7): state_kind (0=Idle, 1=Callback, 2=Paused, 3=Sleeping)
+//   bit 3 (8):          interrupted
+//   bit 4 (16):         queued
+//   bit 5 (32):         owner_report
+
 /// A task: the code of one fiber, run by the scheduler between suspensions.
 struct Task {
   id : Int
   rt : Runtime
   name : String
-  /// Parked: what resumes it (None while it runs, and once it ended).
-  mut state : Option[(Resume) -> Unit]
-  mut end : End
-  /// Asked to stop: the next suspension (outside a shield) cancels it.
-  mut interrupted : Bool
-  /// Inside `uninterruptible` (finalizers, acquisition): not cut.
+  /// Packed flags: state_kind (0..2), interrupted (3), queued (4), owner_report (5).
+  mut flags : Int
   mut shield : Int
-  mut queued : Bool
+  mut cb : (Resume) -> Unit
+  mut unit_k : (Exit[Unit]) -> Unit
+  mut sleep_at : Int64
+  /// Packed (sleep_seq << 32) | (sleep_tid & 0xffffffff).
+  mut sleep_key : Int64
+  mut end : End
   /// When it became ready: a frame's turn runs it at that moment, in its place among timers due by then.
   mut since : Int64
-  /// Where it was made ready among what was set (the timers' `seq`).
-  mut seq : Int
-  /// The host's event it was made ready in between frames (-seq if its own).
-  mut event : Int
-  watchers : Map[Int, () -> Unit]
-}
-
-struct Timer {
-  at : Int64
-  seq : Int
-  mut fire : () -> Unit
-  mut live : Bool
-  later : Bool
-  who : String
+  /// Packed (event << 32) | (seq & 0xffffffff) for tasks made ready between frames.
+  mut later_meta : Int64
+  /// Direct owning scope (owned iff owner_slot >= 0; eliminates per-fiber scope watcher closure & Option/Map alloc).
+  mut owner : ScopeState
+  mut owner_slot : Int
+  /// Inline single-slot watcher + lazy overflow map (0/1 watchers = zero Map/Option alloc).
+  mut first_w_id : Int
+  mut first_w : () -> Unit
+  mut extra_watchers : Option[Map[Int, () -> Unit]]
 }
 
 /// Strict lexicographic ordering `(at, seq)` for `TimerHeap`.
@@ -104,57 +112,66 @@ pub fn heap_sift_down_pick(
   best
 }
 
-fn Timer::before(self : Timer, other : Timer) -> Bool {
-  timer_before(self.at, self.seq, other.at, other.seq)
-}
-
-/// A binary min-heap of timers: by time, then by when they were set.
+/// A binary min-heap of timers stored as Structure-of-Arrays (flat primitive arrays, zero RC/Option traffic).
 struct TimerHeap {
-  mut items : Array[Timer]
+  mut ats : Array[Int64]
+  mut seqs : Array[Int]
+  mut tids : Array[Int]
+  mut len : Int
 }
 
 fn TimerHeap::new() -> TimerHeap {
-  TimerHeap::{ items: [] }
+  TimerHeap::{ ats: [], seqs: [], tids: [], len: 0 }
 }
 
-fn TimerHeap::push(self : TimerHeap, t : Timer) -> Unit {
-  self.items.push(t)
-  let mut i = self.items.length() - 1
+fn TimerHeap::push(self : TimerHeap, at : Int64, seq : Int, tid : Int) -> Unit {
+  let ats = self.ats
+  let seqs = self.seqs
+  let tids = self.tids
+  let mut i = self.len
+  if i < ats.length() {
+    ats[i] = at
+    seqs[i] = seq
+    tids[i] = tid
+  } else {
+    ats.push(at)
+    seqs.push(seq)
+    tids.push(tid)
+  }
+  self.len = i + 1
   while i > 0 {
     let p = heap_parent(i)
-    let cur = self.items[i]
-    let par = self.items[p]
-    if heap_sift_up_should_swap(cur.at, cur.seq, par.at, par.seq) {
-      self.items[i] = par
-      self.items[p] = cur
+    let pat = ats[p]
+    let pseq = seqs[p]
+    if heap_sift_up_should_swap(at, seq, pat, pseq) {
+      ats[i] = pat
+      seqs[i] = pseq
+      tids[i] = tids[p]
       i = p
     } else {
       break
     }
   }
+  ats[i] = at
+  seqs[i] = seq
+  tids[i] = tid
 }
 
-fn TimerHeap::peek(self : TimerHeap) -> Option[Timer] {
-  if self.items.length() == 0 {
-    None
-  } else {
-    Some(self.items[0])
-  }
-}
-
-fn TimerHeap::pop(self : TimerHeap) -> Option[Timer] {
-  let n = self.items.length()
+fn TimerHeap::pop_tid(self : TimerHeap) -> Int {
+  let n = self.len
   if n == 0 {
-    return None
+    return -2147483648
   }
-  let top = self.items[0]
-  let last = match self.items.pop() {
-    Some(x) => x
-    None => return None
-  }
-  if n > 1 {
-    self.items[0] = last
-    let m = n - 1
+  let ats = self.ats
+  let seqs = self.seqs
+  let tids = self.tids
+  let top_tid = tids[0]
+  let m = n - 1
+  self.len = m
+  if m > 0 {
+    let last_at = ats[m]
+    let last_seq = seqs[m]
+    let last_tid = tids[m]
     let mut i = 0
     while true {
       let l = heap_left(i)
@@ -163,33 +180,43 @@ fn TimerHeap::pop(self : TimerHeap) -> Option[Timer] {
       }
       let r = heap_right(i)
       let has_r = r < m
-      let cur = self.items[i]
-      let left = self.items[l]
+      let l_at = ats[l]
+      let l_seq = seqs[l]
       let mut r_at = 0L
       let mut r_seq = 0
       if has_r {
-        let right = self.items[r]
-        r_at = right.at
-        r_seq = right.seq
+        r_at = ats[r]
+        r_seq = seqs[r]
       }
-      let pick = heap_sift_down_pick(cur.at, cur.seq, left.at, left.seq, has_r, r_at, r_seq)
+      let pick = heap_sift_down_pick(last_at, last_seq, l_at, l_seq, has_r, r_at, r_seq)
       if pick == 0 {
         break
       }
-      let s = if pick == 1 { l } else { r }
-      self.items[i] = self.items[s]
-      self.items[s] = cur
-      i = s
+      if pick == 1 {
+        ats[i] = l_at
+        seqs[i] = l_seq
+        tids[i] = tids[l]
+        i = l
+      } else {
+        ats[i] = r_at
+        seqs[i] = r_seq
+        tids[i] = tids[r]
+        i = r
+      }
     }
+    ats[i] = last_at
+    seqs[i] = last_seq
+    tids[i] = last_tid
   }
-  Some(top)
+  top_tid
 }
 
 struct CurrentBox {
-  mut task : Option[Task]
+  stack : Array[Task]
+  mut depth : Int
 }
 
-let current_box : CurrentBox = CurrentBox::{ task: None }
+let current_box : CurrentBox = CurrentBox::{ stack: [], depth: 0 }
 
 /// Cooperative fiber, timer, frame, and outside-work runtime.
 pub struct Runtime {
@@ -199,6 +226,16 @@ pub struct Runtime {
   mut later : Array[Task]
   mut later_head : Int
   timers : TimerHeap
+  timer_live : Array[Bool]
+  timer_later : Array[Bool]
+  timer_seq : Array[Int]
+  timer_task : Array[Task]
+  timer_free : Array[Int]
+  mut timer_free_len : Int
+  cb_live : Array[Bool]
+  cb_later : Array[Bool]
+  cb_fire : Array[() -> Unit]
+  timer_who : Map[Int, String]
   pub mut seq : Int
   shuffle : Bool
   sched : Rng
@@ -241,6 +278,16 @@ fn Runtime::make(seed : Int, shuffle : Bool, start : Int64, clock : Option[() ->
     later: [],
     later_head: 0,
     timers: TimerHeap::new(),
+    timer_live: [],
+    timer_later: [],
+    timer_seq: [],
+    timer_task: [],
+    timer_free: [],
+    timer_free_len: 0,
+    cb_live: [],
+    cb_later: [],
+    cb_fire: [],
+    timer_who: Map::new(),
     seq: 0,
     shuffle,
     sched: Rng::new(seed),
@@ -361,9 +408,10 @@ pub fn Runtime::trace_text(self : Runtime) -> String {
 }
 
 fn current_task() -> Task {
-  match current_box.task {
-    Some(t) => t
-    None => halt_saying("effect: not inside a task", "effect/runtime.pion:current_task")
+  if current_box.depth > 0 {
+    current_box.stack[current_box.depth - 1]
+  } else {
+    halt_saying("effect: not inside a task", "effect/runtime.pion:current_task")
   }
 }
 
@@ -382,31 +430,91 @@ pub fn trace(s : String) -> Unit {
   current_task().rt.trace(s)
 }
 
+fn Task::is_interrupted_flag(self : Task) -> Bool {
+  (self.flags & 8) != 0
+}
+
+fn Task::set_interrupted_flag(self : Task) -> Unit {
+  self.flags = self.flags | 8
+}
+
+fn Task::is_queued(self : Task) -> Bool {
+  (self.flags & 16) != 0
+}
+
+fn Task::set_queued(self : Task, v : Bool) -> Unit {
+  if v {
+    self.flags = self.flags | 16
+  } else {
+    self.flags = self.flags & -17
+  }
+}
+
+fn Task::set_owner_report(self : Task, v : Bool) -> Unit {
+  if v {
+    self.flags = self.flags | 32
+  } else {
+    self.flags = self.flags & -33
+  }
+}
+
+fn Task::set_state_kind(self : Task, k : Int) -> Unit {
+  self.flags = (self.flags & -8) | k
+}
+
+fn Task::set_callback(self : Task, f : (Resume) -> Unit) -> Unit {
+  self.flags = (self.flags & -8) | 1
+  self.cb = f
+}
+
+fn Task::clear_state(self : Task) -> Unit {
+  self.flags = self.flags & -8
+  self.cb = noop_cb
+  self.unit_k = noop_unit_k
+}
+
+fn Task::later_seq(self : Task) -> Int {
+  (self.later_meta & 4294967295L).to_int()
+}
+
+fn Task::later_event(self : Task) -> Int {
+  (self.later_meta >> 32).to_int()
+}
+
+fn Runtime::alloc_task(self : Runtime, name : String) -> Task {
+  self.ids = self.ids + 1
+  Task::{
+    id: self.ids,
+    rt: self,
+    name,
+    flags: 0,
+    shield: 0,
+    cb: noop_cb,
+    unit_k: noop_unit_k,
+    sleep_at: 0L,
+    sleep_key: 0L,
+    end: End::NotYet,
+    since: 0.to_int64(),
+    later_meta: 0L,
+    owner: self.root_state,
+    owner_slot: -1,
+    first_w_id: 0,
+    first_w: noop_w,
+    extra_watchers: None,
+  }
+}
+
 fn Runtime::start(
   self : Runtime,
   name : String,
   body : ((Exit[Unit]) -> Unit) -> Unit,
 ) -> Task {
-  self.ids = self.ids + 1
-  let t = Task::{
-    id: self.ids,
-    rt: self,
-    name,
-    state: None,
-    end: End::NotYet,
-    interrupted: false,
-    shield: 0,
-    queued: false,
-    since: 0.to_int64(),
-    seq: 0,
-    event: 0,
-    watchers: Map::new(),
-  }
-  t.state = Some(fn(r : Resume) -> Unit {
+  let t = self.alloc_task(name)
+  t.set_callback(fn(r : Resume) -> Unit {
     match r {
       Resume::Stop => {
         t.end = End::Cut
-        t.state = None
+        t.clear_state()
         t.finish()
       }
       Resume::Go => {
@@ -421,7 +529,7 @@ fn Runtime::start(
             Exit::Failed(e) => t.end = End::Raised(e)
             Exit::Interrupted => t.end = End::Cut
           }
-          t.state = None
+          t.clear_state()
           t.finish()
         })
       }
@@ -433,58 +541,129 @@ fn Runtime::start(
 }
 
 fn Runtime::make_ready(self : Runtime, t : Task) -> Unit {
-  t.queued = true
-  t.since = if self.turning { self.time } else { self.now() }
+  t.flags = t.flags | 16
+  if self.turning {
+    t.since = self.time
+    self.ready.push_back(t)
+    return
+  }
+  t.since = self.now()
   let has_clock = match self.clock {
     Some(_) => true
     None => false
   }
-  if !has_clock && !self.turning {
+  if !has_clock {
     self.seq = self.seq + 1
-    t.seq = self.seq
+    let s = self.seq
     let e = (self.outside_event)()
-    t.event = if e >= 0 { e } else { -self.seq }
+    let ev = if e >= 0 { e } else { -s }
+    t.later_meta = (ev.to_int64() << 32) | (s.to_int64() & 4294967295L)
     self.later.push(t)
   } else {
     self.ready.push_back(t)
   }
-  if !self.turning {
-    (self.waker)()
-  }
+  (self.waker)()
 }
 
 fn Task::finish(self : Task) -> Unit {
   self.rt.live_tasks = self.rt.live_tasks - 1
-  if self.watchers.length() == 0 {
-    return
-  }
-  let ks = self.watchers.keys()
-  let ws : Array[() -> Unit] = []
-  for k in ks {
-    match self.watchers.get(k) {
-      Some(w) => ws.push(w)
-      None => ()
+  if self.owner_slot >= 0 {
+    let st = self.owner
+    st.remove_child(self)
+    if st.all_notify {
+      let ok = match self.end {
+        End::Done => true
+        _ => false
+      }
+      if !ok {
+        st.all_failed = true
+        st.all_notify = false
+        match st.all_parent {
+          Some(p) => {
+            st.all_parent = None
+            p.wake()
+          }
+          None => ()
+        }
+      } else if st.children_len == 0 {
+        st.all_notify = false
+        match st.all_parent {
+          Some(p) => {
+            st.all_parent = None
+            p.wake()
+          }
+          None => ()
+        }
+      }
     }
-    self.watchers.remove(k)
+    if (self.flags & 32) != 0 {
+      match self.end {
+        End::Raised(e) => self.rt.report(e)
+        _ => ()
+      }
+    }
   }
-  for w in ws {
+  if self.first_w_id != 0 {
+    let w = self.first_w
+    self.first_w_id = 0
+    self.first_w = noop_w
     w()
+  }
+  match self.extra_watchers {
+    Some(m) => {
+      if m.length() > 0 {
+        let ks = m.keys()
+        let ws : Array[() -> Unit] = []
+        for k in ks {
+          match m.get(k) {
+            Some(w) => ws.push(w)
+            None => ()
+          }
+          m.remove(k)
+        }
+        for w in ws {
+          w()
+        }
+      }
+    }
+    None => ()
   }
 }
 
 fn Task::watch(self : Task, f : () -> Unit) -> Int {
   self.rt.ids = self.rt.ids + 1
   let id = self.rt.ids
-  self.watchers.set(id, f)
+  if self.first_w_id == 0 {
+    self.first_w_id = id
+    self.first_w = f
+    return id
+  }
+  match self.extra_watchers {
+    Some(m) => m.set(id, f)
+    None => {
+      let m : Map[Int, () -> Unit] = Map::new()
+      m.set(id, f)
+      self.extra_watchers = Some(m)
+    }
+  }
   id
 }
 
+fn Task::unwatch(self : Task, id : Int) -> Unit {
+  if self.first_w_id == id {
+    self.first_w_id = 0
+    self.first_w = noop_w
+    return
+  }
+  match self.extra_watchers {
+    Some(m) => m.remove(id)
+    None => ()
+  }
+}
+
 fn Task::wake(self : Task) -> Unit {
-  if !self.queued {
-    match self.state {
-      Some(_) => self.rt.make_ready(self)
-      None => ()
-    }
+  if (self.flags & 16) == 0 && (self.flags & 7) != 0 {
+    self.rt.make_ready(self)
   }
 }
 
@@ -497,7 +676,7 @@ fn Task::is_ended(self : Task) -> Bool {
 
 fn Task::interrupt(self : Task) -> Unit {
   if !self.is_ended() {
-    self.interrupted = true
+    self.flags = self.flags | 8
     if self.shield == 0 {
       self.wake()
     }
@@ -507,11 +686,11 @@ fn Task::interrupt(self : Task) -> Unit {
 /// Parks the running task until something wakes it; interrupted (outside a shield), calls `on_cancel`.
 fn park_k(on_go : () -> Unit, on_cancel : () -> Unit) -> Unit {
   let t = current_task()
-  if t.interrupted && t.shield == 0 {
+  if (t.flags & 8) != 0 && t.shield == 0 {
     on_cancel()
     return
   }
-  t.state = Some(fn(r : Resume) -> Unit {
+  t.set_callback(fn(r : Resume) -> Unit {
     match r {
       Resume::Go => on_go()
       Resume::Stop => on_cancel()
@@ -521,39 +700,79 @@ fn park_k(on_go : () -> Unit, on_cancel : () -> Unit) -> Unit {
 
 fn Task::await_end_k(self : Task, k : (Exit[Unit]) -> Unit) -> Unit {
   if self.is_ended() {
-    k(Exit::Succeeded(()))
+    k(exit_ok_unit)
     return
   }
   let me = current_task()
+  if (me.flags & 8) != 0 && me.shield == 0 {
+    k(exit_interrupted_unit)
+    return
+  }
   let id = self.watch(fn() -> Unit { me.wake() })
-  park_k(
-    fn() -> Unit {
-      self.watchers.remove(id)
-      self.await_end_k(k)
-    },
-    fn() -> Unit {
-      self.watchers.remove(id)
-      k(Exit::Interrupted)
-    },
-  )
+  me.set_callback(fn(r : Resume) -> Unit {
+    self.unwatch(id)
+    match r {
+      Resume::Go => self.await_end_k(k)
+      Resume::Stop => k(exit_interrupted_unit)
+    }
+  })
 }
 
 /// Lets the other ready tasks run first.
 pub fn pause_k(k : (Exit[Unit]) -> Unit) -> Unit {
   let t = current_task()
-  if t.interrupted && t.shield == 0 {
-    k(Exit::Interrupted)
+  if (t.flags & 8) != 0 && t.shield == 0 {
+    k(exit_interrupted_unit)
     return
   }
-  t.state = Some(fn(r : Resume) -> Unit {
-    match r {
-      Resume::Go => k(Exit::Succeeded(()))
-      Resume::Stop => k(Exit::Interrupted)
-    }
-  })
-  t.queued = true
+  t.flags = (t.flags & -8) | 18
+  t.unit_k = k
   t.since = t.rt.time
   t.rt.ready.push_back(t)
+}
+
+fn Runtime::push_free_tid(self : Runtime, tid : Int) -> Unit {
+  let n = self.timer_free_len
+  if n < self.timer_free.length() {
+    self.timer_free[n] = tid
+  } else {
+    self.timer_free.push(tid)
+  }
+  self.timer_free_len = n + 1
+}
+
+fn Runtime::alloc_task_timer_slot(self : Runtime, seq : Int, later : Bool, task : Task, who : String) -> Int {
+  let tid = if self.timer_free_len > 0 {
+    let n = self.timer_free_len - 1
+    self.timer_free_len = n
+    let id = self.timer_free[n]
+    self.timer_live[id] = true
+    self.timer_later[id] = later
+    self.timer_seq[id] = seq
+    self.timer_task[id] = task
+    id
+  } else {
+    let id = self.timer_live.length()
+    self.timer_live.push(true)
+    self.timer_later.push(later)
+    self.timer_seq.push(seq)
+    self.timer_task.push(task)
+    id
+  }
+  if who.length() > 0 {
+    self.timer_who.set(tid, who)
+  }
+  tid
+}
+
+fn Runtime::cancel_timer(self : Runtime, tid : Int, seq : Int) -> Unit {
+  if tid >= 0 && tid < self.timer_live.length() && self.timer_live[tid] && self.timer_seq[tid] == seq {
+    self.timer_live[tid] = false
+    if self.timer_who.length() > 0 {
+      self.timer_who.remove(tid)
+    }
+    self.dropped()
+  }
 }
 
 fn Runtime::add_timer(
@@ -562,14 +781,39 @@ fn Runtime::add_timer(
   fire : () -> Unit,
   later : Bool,
   who : String,
-) -> Timer {
+) -> Int {
   self.seq = self.seq + 1
-  let t = Timer::{ at, seq: self.seq, fire, live: true, later, who }
-  self.timers.push(t)
+  let seq = self.seq
+  let fid = self.cb_live.length()
+  self.cb_live.push(true)
+  self.cb_later.push(later)
+  self.cb_fire.push(fire)
+  let tid = -(fid + 1)
+  if who.length() > 0 {
+    self.timer_who.set(tid, who)
+  }
+  self.timers.push(at, seq, tid)
   if !self.turning {
     (self.timer_waker)(at)
   }
-  t
+  tid
+}
+
+fn Runtime::add_task_timer(
+  self : Runtime,
+  at : Int64,
+  task : Task,
+  later : Bool,
+  who : String,
+) -> Int {
+  self.seq = self.seq + 1
+  let seq = self.seq
+  let tid = self.alloc_task_timer_slot(seq, later, task, who)
+  self.timers.push(at, seq, tid)
+  if !self.turning {
+    (self.timer_waker)(at)
+  }
+  tid
 }
 
 /// Calls `f` (sync code) `ms` from now on the runtime's clock.
@@ -582,29 +826,6 @@ pub fn Runtime::after_with(self : Runtime, ms : Int, f : () -> Unit, later : Boo
   let _ = self.add_timer(self.now() + ms.to_int64(), f, later, who)
 }
 
-fn sleep_loop(rt : Runtime, at : Int64, timer : Timer, k : (Exit[Unit]) -> Unit) -> Unit {
-  if rt.now() >= at {
-    if timer.live {
-      timer.live = false
-      timer.fire = fn() -> Unit { () }
-      rt.dropped()
-    }
-    k(Exit::Succeeded(()))
-    return
-  }
-  park_k(
-    fn() -> Unit { sleep_loop(rt, at, timer, k) },
-    fn() -> Unit {
-      if timer.live {
-        timer.live = false
-        timer.fire = fn() -> Unit { () }
-        rt.dropped()
-      }
-      k(Exit::Interrupted)
-    },
-  )
-}
-
 /// Waits `ms` on the runtime's clock.
 pub fn sleep_k(ms : Int, k : (Exit[Unit]) -> Unit) -> Unit {
   sleep_later_k(ms, false, k)
@@ -615,8 +836,22 @@ pub fn sleep_later_k(ms : Int, later : Bool, k : (Exit[Unit]) -> Unit) -> Unit {
   let t = current_task()
   let rt = t.rt
   let at = rt.now() + ms.to_int64()
-  let timer = rt.add_timer(at, fn() -> Unit { t.wake() }, later, t.name)
-  sleep_loop(rt, at, timer, k)
+  let tid = rt.add_task_timer(at, t, later, t.name)
+  let seq = rt.seq
+  if ms <= 0 {
+    rt.cancel_timer(tid, seq)
+    k(exit_ok_unit)
+    return
+  }
+  if (t.flags & 8) != 0 && t.shield == 0 {
+    rt.cancel_timer(tid, seq)
+    k(exit_interrupted_unit)
+    return
+  }
+  t.flags = (t.flags & -8) | 3
+  t.sleep_at = at
+  t.sleep_key = (seq.to_int64() << 32) | (tid.to_int64() & 4294967295L)
+  t.unit_k = k
 }
 
 fn Runtime::pick(self : Runtime) -> Option[Task] {
@@ -677,32 +912,91 @@ fn Runtime::run_ready_now(self : Runtime) -> Unit {
 }
 
 fn Runtime::step_task(self : Runtime, t : Task) -> Unit {
-  t.queued = false
-  let k = match t.state {
-    Some(f) => f
-    None => return
+  let f = t.flags
+  let kind = f & 7
+  if kind == 0 {
+    t.flags = f & -17
+    return
   }
-  t.state = None
-  let prev = current_box.task
-  current_box.task = Some(t)
+  t.flags = f & -24
+  let d = current_box.depth
+  if d < current_box.stack.length() {
+    current_box.stack[d] = t
+  } else {
+    current_box.stack.push(t)
+  }
+  current_box.depth = d + 1
   self.steps = self.steps + 1
-  let r = if t.interrupted && t.shield == 0 { Resume::Stop } else { Resume::Go }
-  k(r)
-  current_box.task = prev
+  let cut = (f & 8) != 0 && t.shield == 0
+  if kind == 1 {
+    let cb = t.cb
+    t.cb = noop_cb
+    cb(if cut { Resume::Stop } else { Resume::Go })
+  } else if kind == 2 {
+    let uk = t.unit_k
+    t.unit_k = noop_unit_k
+    if cut {
+      uk(exit_interrupted_unit)
+    } else {
+      uk(exit_ok_unit)
+    }
+  } else {
+    let uk = t.unit_k
+    let at = t.sleep_at
+    let sk = t.sleep_key
+    let tid = (sk & 4294967295L).to_int()
+    let seq = (sk >> 32).to_int()
+    if cut {
+      t.unit_k = noop_unit_k
+      self.cancel_timer(tid, seq)
+      uk(exit_interrupted_unit)
+    } else if self.now() >= at {
+      t.unit_k = noop_unit_k
+      self.cancel_timer(tid, seq)
+      uk(exit_ok_unit)
+    } else {
+      t.flags = (t.flags & -8) | 3
+    }
+  }
+  current_box.depth = d
+}
+
+fn Runtime::is_timer_live(self : Runtime, tid : Int) -> Bool {
+  if tid >= 0 {
+    self.timer_live[tid]
+  } else {
+    self.cb_live[-tid - 1]
+  }
+}
+
+fn Runtime::is_timer_later(self : Runtime, tid : Int) -> Bool {
+  if tid >= 0 {
+    self.timer_later[tid]
+  } else {
+    self.cb_later[-tid - 1]
+  }
 }
 
 fn Runtime::dropped(self : Runtime) -> Unit {
   self.dead = self.dead + 1
-  if self.dead >= 32 && self.dead * 2 > self.timers.items.length() {
-    let live : Array[Timer] = []
-    for t in self.timers.items {
-      if t.live {
-        live.push(t)
+  if self.dead >= 32 && self.dead * 2 > self.timers.len {
+    let n = self.timers.len
+    let live_ats : Array[Int64] = []
+    let live_seqs : Array[Int] = []
+    let live_tids : Array[Int] = []
+    for i in 0..<n {
+      let tid = self.timers.tids[i]
+      if self.is_timer_live(tid) {
+        live_ats.push(self.timers.ats[i])
+        live_seqs.push(self.timers.seqs[i])
+        live_tids.push(tid)
+      } else if tid >= 0 {
+        self.push_free_tid(tid)
       }
     }
-    self.timers.items = []
-    for t in live {
-      self.timers.push(t)
+    self.timers.len = 0
+    for i in 0..<live_ats.length() {
+      self.timers.push(live_ats[i], live_seqs[i], live_tids[i])
     }
     self.dead = 0
   }
@@ -714,25 +1008,44 @@ pub fn Runtime::run_ready(self : Runtime) -> Int {
     self.ready.push_back(self.later[i])
   }
   self.clear_later()
-  self.run_tasks()
+  let n = self.run_tasks()
+  if current_box.depth == 0 && current_box.stack.length() > 0 {
+    current_box.stack.clear()
+  }
+  n
 }
 
 fn Runtime::run_tasks(self : Runtime) -> Int {
   let outer = self.turning
   self.turning = true
   let mut n = 0
-  while true {
-    match self.pick() {
-      None => break
-      Some(t) => {
-        self.step_task(t)
-        n = n + 1
-        if n > 10000000 {
-          self.turning = outer
-          halt_saying(
-            "effect: tasks kept each other ready without end (" + t.name + ")",
-            "effect/runtime.pion:run_tasks",
-          )
+  if !self.shuffle {
+    while self.ready.len > 0 {
+      let t = self.ready.pop_front_raw()
+      self.step_task(t)
+      n = n + 1
+      if n > 10000000 {
+        self.turning = outer
+        halt_saying(
+          "effect: tasks kept each other ready without end (" + t.name + ")",
+          "effect/runtime.pion:run_tasks",
+        )
+      }
+    }
+  } else {
+    while true {
+      match self.pick() {
+        None => break
+        Some(t) => {
+          self.step_task(t)
+          n = n + 1
+          if n > 10000000 {
+            self.turning = outer
+            halt_saying(
+              "effect: tasks kept each other ready without end (" + t.name + ")",
+              "effect/runtime.pion:run_tasks",
+            )
+          }
         }
       }
     }
@@ -744,15 +1057,22 @@ fn Runtime::run_tasks(self : Runtime) -> Int {
 /// The next non-`later` live timer due, when and who set it.
 pub fn Runtime::next_due(self : Runtime) -> Option[(Int64, String)] {
   let mut best : Option[(Int64, String)] = None
-  for t in self.timers.items {
-    if t.live && !t.later {
+  let n = self.timers.len
+  for i in 0..<n {
+    let tid = self.timers.tids[i]
+    if self.is_timer_live(tid) && !self.is_timer_later(tid) {
+      let tat = self.timers.ats[i]
+      let who = match self.timer_who.get(tid) {
+        Some(w) => w
+        None => ""
+      }
       match best {
         Some((at, _)) => {
-          if t.at < at {
-            best = Some((t.at, t.who))
+          if tat < at {
+            best = Some((tat, who))
           }
         }
-        None => best = Some((t.at, t.who))
+        None => best = Some((tat, who))
       }
     }
   }
@@ -761,32 +1081,34 @@ pub fn Runtime::next_due(self : Runtime) -> Option[(Int64, String)] {
 
 /// When the next timer is due, if one is set.
 pub fn Runtime::next_timer(self : Runtime) -> Option[Int64] {
-  while true {
-    match self.timers.peek() {
-      Some(t) => {
-        if !t.live {
-          let _ = self.timers.pop()
-          self.dead = self.dead - 1
-        } else {
-          return Some(t.at)
-        }
+  while self.timers.len > 0 {
+    let tid = self.timers.tids[0]
+    if !self.is_timer_live(tid) {
+      let _ = self.timers.pop_tid()
+      self.dead = self.dead - 1
+      if tid >= 0 {
+        self.push_free_tid(tid)
       }
-      None => return None
+    } else {
+      return Some(self.timers.ats[0])
     }
   }
   None
 }
 
-fn Runtime::later_due(self : Runtime) -> Option[Int] {
+fn Runtime::later_due_idx(self : Runtime) -> Int {
   for i in self.later_head..<self.later.length() {
     if self.later[i].since <= self.time {
-      return Some(i)
+      return i
     }
   }
-  None
+  -1
 }
 
 fn Runtime::next_instant(self : Runtime) -> Option[Int64] {
+  if self.later_len() == 0 {
+    return self.next_timer()
+  }
   match (self.next_timer(), self.ready_later()) {
     (Some(a), Some(b)) => Some(if a < b { a } else { b })
     (Some(a), None) => Some(a)
@@ -795,95 +1117,156 @@ fn Runtime::next_instant(self : Runtime) -> Option[Int64] {
   }
 }
 
+fn Runtime::fire_timer_tid(self : Runtime, tid : Int) -> Unit {
+  if tid >= 0 {
+    if self.timer_live[tid] {
+      self.timer_live[tid] = false
+      self.steps = self.steps + 1
+      let task = self.timer_task[tid]
+      if self.timer_who.length() > 0 {
+        self.timer_who.remove(tid)
+      }
+      self.push_free_tid(tid)
+      task.wake()
+    } else {
+      self.dead = self.dead - 1
+      self.push_free_tid(tid)
+    }
+  } else {
+    let fid = -tid - 1
+    if self.cb_live[fid] {
+      self.cb_live[fid] = false
+      self.steps = self.steps + 1
+      let f = self.cb_fire[fid]
+      self.cb_fire[fid] = noop_w
+      if self.timer_who.length() > 0 {
+        self.timer_who.remove(tid)
+      }
+      f()
+    } else {
+      self.dead = self.dead - 1
+    }
+  }
+}
+
 fn Runtime::fire_until(self : Runtime, until : Int64) -> Unit {
   let outer = self.turning
   self.turning = true
   let _ = self.run_tasks()
+  let has_clock = match self.clock {
+    Some(_) => true
+    None => false
+  }
   while true {
     let at = match self.next_instant() {
       Some(a) => if a <= until { a } else { break }
       None => break
     }
-    let has_clock = match self.clock {
-      Some(_) => true
-      None => false
-    }
     if !has_clock && at > self.time {
       self.time = at
     }
-    while true {
-      let task = self.later_due()
-      let fire_timer = match self.timers.peek() {
-        Some(t) =>
-        t.at <= at &&
-        match task {
-          Some(i) => t.seq < self.later[i].seq
-          None => true
-        }
-        None => false
+    if self.later_len() == 0 {
+      while self.timers.len > 0 && self.timers.ats[0] <= at {
+        let tid = self.timers.pop_tid()
+        self.fire_timer_tid(tid)
       }
+      let _ = self.run_tasks()
+      continue
+    }
+    while true {
+      let task_i = self.later_due_idx()
+      let fire_timer = self.timers.len > 0 &&
+      self.timers.ats[0] <= at &&
+      (task_i < 0 || self.timers.seqs[0] < self.later[task_i].later_seq())
       if fire_timer {
-        match self.timers.pop() {
-          Some(t) => {
-            if t.live {
-              t.live = false
-              self.steps = self.steps + 1
-              (t.fire)()
-            } else {
-              self.dead = self.dead - 1
-            }
-          }
-          None => break
+        let tid = self.timers.pop_tid()
+        if tid == -2147483648 {
+          break
         }
-      } else {
-        match task {
-          Some(i) => {
-            let event = self.later[i].event
-            let before : Option[Int] = match self.timers.peek() {
-              Some(t) => if t.at <= at { Some(t.seq) } else { None }
-              None => None
-            }
-            let mut end = i
-            while end < self.later.length() &&
-            self.later[end].event == event &&
-            self.later[end].since <= self.time &&
-            match before {
-              Some(b) => self.later[end].seq < b
-              None => true
-            } {
-              self.ready.push_back(self.later[end])
-              end = end + 1
-            }
-            if i == self.later_head {
-              self.later_head = end
-              if self.later_head >= self.later.length() {
-                self.clear_later()
-              } else if self.later_head >= 1024 && self.later_head * 2 >= self.later.length() {
-                let rem : Array[Task] = []
-                for idx in self.later_head..<self.later.length() {
-                  rem.push(self.later[idx])
-                }
-                self.later = rem
-                self.later_head = 0
+        self.fire_timer_tid(tid)
+      } else if task_i >= 0 {
+        let i = task_i
+        let event = self.later[i].later_event()
+        let has_before = self.timers.len > 0 && self.timers.ats[0] <= at
+        let before_seq = if has_before { self.timers.seqs[0] } else { 0 }
+        let mut end = i
+        while end < self.later.length() &&
+        self.later[end].later_event() == event &&
+        self.later[end].since <= self.time &&
+        (!has_before || self.later[end].later_seq() < before_seq) {
+          end = end + 1
+        }
+        let count = end - i
+        if count == 1 && !self.shuffle && self.ready.len == 0 {
+          let single = self.later[i]
+          if i == self.later_head {
+            self.later_head = end
+            if self.later_head >= self.later.length() {
+              self.clear_later()
+            } else if self.later_head >= 1024 && self.later_head * 2 >= self.later.length() {
+              let rem : Array[Task] = []
+              for idx in self.later_head..<self.later.length() {
+                rem.push(self.later[idx])
               }
-            } else {
-              let n = end - i
-              let mut k = i
-              while k < self.later.length() - n {
-                self.later[k] = self.later[k + n]
-                k = k + 1
-              }
-              for _ in 0..<n {
-                let _ = self.later.pop()
-              }
+              self.later = rem
+              self.later_head = 0
             }
+          } else {
+            let mut k = i
+            while k < self.later.length() - 1 {
+              self.later[k] = self.later[k + 1]
+              k = k + 1
+            }
+            let _ = self.later.pop()
+          }
+          self.step_task(single)
+          if self.ready.len > 0 {
             let _ = self.run_tasks()
           }
-          None => break
+        } else {
+          for idx in i..<end {
+            self.ready.push_back(self.later[idx])
+          }
+          if i == self.later_head {
+            self.later_head = end
+            if self.later_head >= self.later.length() {
+              self.clear_later()
+            } else if self.later_head >= 1024 && self.later_head * 2 >= self.later.length() {
+              let rem : Array[Task] = []
+              for idx in self.later_head..<self.later.length() {
+                rem.push(self.later[idx])
+              }
+              self.later = rem
+              self.later_head = 0
+            }
+          } else {
+            let n = end - i
+            let mut k = i
+            while k < self.later.length() - n {
+              self.later[k] = self.later[k + n]
+              k = k + 1
+            }
+            for _ in 0..<n {
+              let _ = self.later.pop()
+            }
+          }
+          let _ = self.run_tasks()
         }
+      } else {
+        break
       }
     }
     let _ = self.run_tasks()
+  }
+  if self.timers.len == 0 && self.timer_live.length() > 0 {
+    self.timer_live.clear()
+    self.timer_later.clear()
+    self.timer_seq.clear()
+    self.timer_task.clear()
+    self.timer_free_len = 0
+  }
+  if current_box.depth == 0 && current_box.stack.length() > 0 {
+    current_box.stack.clear()
   }
   self.turning = outer
 }
@@ -942,8 +1325,8 @@ pub fn next_frame_k(k : (Exit[Unit]) -> Unit) -> Unit {
 /// What it still holds: (live_tasks, ready+later, live_timers, root_children, root_finalizers, frame_waiters).
 pub fn Runtime::holding(self : Runtime) -> (Int, Int, Int, Int, Int, Int) {
   let mut live_timers = 0
-  for t in self.timers.items {
-    if t.live {
+  for i in 0..<self.timers.len {
+    if self.is_timer_live(self.timers.tids[i]) {
       live_timers = live_timers + 1
     }
   }
@@ -951,15 +1334,15 @@ pub fn Runtime::holding(self : Runtime) -> (Int, Int, Int, Int, Int, Int) {
     self.live_tasks,
     self.ready.length() + self.later_len(),
     live_timers,
-    self.root_state.children.length(),
-    self.root_state.finalizers.length(),
+    self.root_state.children_len,
+    self.root_state.finalizers_len(),
     self.frame_waiters.count(),
   )
 }
 
 /// Timers in the heap, live or given up.
 pub fn Runtime::timer_slots(self : Runtime) -> Int {
-  self.timers.items.length()
+  self.timers.len
 }
 
 /// Whether a fiber waits for the next frame (`next_frame_k`).
@@ -974,17 +1357,17 @@ pub fn Runtime::idle(self : Runtime) -> Bool {
 
 /// Starts `f` as a fiber of the root scope.
 pub fn Runtime::fork[X](self : Runtime, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
-  self.root().fork(f)
+  fork_in_scope(self, self.root_state, f, "", self.root_state.report)
 }
 
 /// Starts `f` as a named fiber of the root scope.
 pub fn Runtime::fork_named[X](self : Runtime, name : String, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
-  self.root().fork_named(name, f)
+  fork_in_scope(self, self.root_state, f, name, self.root_state.report)
 }
 
 /// Starts `f` as a quiet fiber of the root scope (failures never reported to `on_defect`).
 pub fn Runtime::fork_quiet[X](self : Runtime, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
-  self.root().fork_quiet(f)
+  fork_in_scope(self, self.root_state, f, "", false)
 }
 
 /// Starts `f` as a named quiet fiber of the root scope.
@@ -993,7 +1376,7 @@ pub fn Runtime::fork_quiet_named[X](
   name : String,
   f : ((Exit[X]) -> Unit) -> Unit,
 ) -> Fiber[X] {
-  self.root().fork_quiet_named(name, f)
+  fork_in_scope(self, self.root_state, f, name, false)
 }
 
 /// Starts `f` as a named background daemon fiber of the root scope.
