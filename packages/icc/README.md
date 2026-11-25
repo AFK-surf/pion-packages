@@ -16,7 +16,7 @@ Pure Pion ICC.1:2022 (v2 / v4) color profile parser, JPEG/WebP ICC container ext
 - **High-Speed ICC → sRGB Transform Engine (`Transform::to_srgb`)**:
   - Supports Matrix-TRC `RGB ` profiles (Display P3, AdobeRGB 1998, sRGB IEC61966-2.1, ProPhoto / ROMM RGB, Rec.2020, etc.) and `GRAY` (`kTRC`) profiles; cleanly returns `Err(IccError::UnsupportedProfile(_))` for CMYK/Lab/CLUT (`A2B0`/`A2B1`) profiles.
   - Exact ICC.1:2022 PCS D50 → sRGB D65 colorimetry (without double-applying `chad`).
-  - Zero mutable module globals: precomputed sRGB EOTF/OETF tables are stored as immutable 7-bit ASCII `String` constants; integer Q14 input LUTs, hoisted Q14 3×3 integer matrix multiply, and tight O(1) identity fast path (`eps = 0.00015`, exact 256-level integer LUT verification).
+  - Zero mutable module globals: precomputed sRGB EOTF/OETF tables stored as immutable 7-bit ASCII `String` constants; IEEE-754 bit-level `f64_pow_unit_fast` + stride-4 cubic LUT interpolation for smooth `Gamma`/`Parametric(3)` curves; O(1) shared TRC alias detection; bulk pixel loops use 3-lane packed `Int64` SWAR pre-multiplied LUTs + padded zero-clamp 8193-entry sRGB OETF (zero multiplies, zero clamps, zero stack spills in the hot loop); tight O(1) identity fast path (`eps = 0.00015`, exact 256-level integer LUT verification).
   - Pixel APIs: `transform_rgb_pixel`, `transform_gray_pixel`, `transform_rgb_in_place` (validates length % 3 == 0), and `transform_rgba_in_place` (validates length % 4 == 0, strictly preserves Alpha bytes).
 
 ## Usage
@@ -55,7 +55,7 @@ sh packages/icc/bench/run_bench.sh
 
 `packages/icc/wasm_smoke` builds cleanly and produces identical output across `native debug`, `native --release`, `wasm32 debug`, and `wasm32 --release`:
 
-- Output: `icc_wasm_smoke: OK pixels=216 fnv64=10050272235678599435`
+- Output: `icc_wasm_smoke: OK pixels=216 fnv64=10137988538645260462`
 
 ### Differential Accuracy vs Exact ICC Reference, Rust `qcms 0.3.0` & `moxcms 0.9.2`
 
@@ -72,25 +72,25 @@ Verified via `packages/icc/audit/diff/compare.py grid` on 40,033 RGB pixels (4×
 
 ### Fair Head-to-Head Benchmarks vs Precached Rust `qcms 0.3.0` & `moxcms 0.9.2`
 
-Measured on `Darwin arm64` (`sh packages/icc/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, byte-identical stdout SHA-256 verified using saturated non-neutral probes and whole-frame RGB digests). `rust_qcms_pre` enables `precache_output_transform()` (Firefox production configuration):
+Measured on `Linux x86_64` (`sh packages/icc/bench/run_bench.sh`, `scripts/bench_compare.py`, `warmup=1`, `rounds=5`, strictly interleaved, byte-identical stdout SHA-256 verified using saturated non-neutral probes and whole-frame RGB digests). `rust_qcms_pre` enables `precache_output_transform()` (Firefox production configuration; uses SSE2 SIMD on `x86_64`):
 
 #### Scenario A: Parse + `Transform::to_srgb` + Saturated Probe `(200, 70, 40)` (20,000 iterations each)
 
 | Profile | `pion_icc` (ns/op) | `rust_qcms_pre` (ns/op) | `rust_moxcms` (ns/op) | Pion vs `rust_qcms_pre` | Pion vs `rust_moxcms` |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Display-P3 v4 (`para3`) | **2,029.50** | 3,487.01 | 57,237.73 | **1.72x** | **28.20x** |
-| sRGB v2 (`curv[1024]`) | 3,986.23 | **3,605.62** | 53,073.18 | 0.90x | **13.31x** |
-| AdobeRGB v2 (`curv` gamma) | **4,362.45** | 4,966.35 | 56,012.38 | **1.14x** | **12.84x** |
-| Rec.2020 v4 (`para3` 709 TRC) | 4,575.26 | **3,003.07** | 52,421.42 | 0.66x | **11.46x** |
+| Display-P3 v4 (`para3`) | **1,634.34** | 5,487.50 | 340,806.11 | **3.36x** | **208.53x** |
+| sRGB v2 (`curv[1024]`) | **3,140.68** | 7,518.82 | 350,292.43 | **2.39x** | **111.53x** |
+| AdobeRGB v2 (`curv` gamma) | **2,810.38** | 7,861.68 | 341,268.15 | **2.80x** | **121.43x** |
+| Rec.2020 v4 (`para3` 709 TRC) | **3,111.57** | 4,549.18 | 326,929.16 | **1.46x** | **105.07x** |
 
 #### Scenario B: 1920×1080 RGBA8 Display-P3 → sRGB (20 frames = 41.47M pixels, 165.89 MB)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | MP/s | ns/px | Peak RSS | Speedup (vs `rust_qcms_pre`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_moxcms` (`0.9.2 --release`, NEON) | 64.225 | 57.084 | 91.237 | 2582.91 | 645.7 | 1.55 | 18.34 MiB | 1.80x |
-| `rust_qcms_pre` (`0.3.0 --release`, precached scalar) | 115.722 | 104.948 | 129.177 | 1433.51 | 358.4 | 2.79 | 10.17 MiB | 1.00x (baseline) |
-| `pion_icc` (`--release`, pure scalar) | 138.488 | 122.736 | 154.235 | 1197.85 | 299.5 | 3.34 | 18.00 MiB | 0.84x |
+| `rust_moxcms` (`0.9.2 --release`, SIMD) | 63.310 | 62.814 | 84.110 | 2620.26 | 655.1 | 1.53 | 18.69 MiB | 1.06x |
+| `rust_qcms_pre` (`0.3.0 --release`, SSE2) | 66.986 | 61.059 | 88.295 | 2476.47 | 619.1 | 1.62 | 10.66 MiB | 1.00x (baseline) |
+| `pion_icc` (`--release`, pure scalar SWAR) | 140.715 | 118.857 | 160.945 | 1178.89 | 294.7 | 3.39 | 17.89 MiB | 0.48x |
 
 Notes:
-- On Scenario A, `pion_icc` is **11.5–28.2× faster than `rust_moxcms`** across all 4 profiles, **1.72× faster** than precached `qcms` on Display-P3, **1.14× faster** on AdobeRGB, near parity (**0.90×**) on `sRGB curv[1024]`, and **0.66×** on Rec.2020 `para3`.
-- On Scenario B, pure-scalar `pion_icc` achieves **299.5 MP/s** (**6.92 ms / 1080p frame**, **0.84×** vs precached scalar `rust_qcms_pre`), while `rust_moxcms` leads via hand-written ARM64 NEON SIMD intrinsics. 1-frame 1080p accuracy gate verifies `max_err <= 2 LSB` (`99.9995% <= 1 LSB` vs `rust_qcms_pre`, `99.9981% <= 1 LSB` vs `rust_moxcms`, alpha 100% preserved).
+- On Scenario A, `pion_icc` leads precached `rust_qcms_pre` across all 4 profiles (**1.46–3.36×**) and leads `rust_moxcms` by **105–209×**.
+- On Scenario B, pure-scalar SWAR `pion_icc` achieves **294.7 MP/s** median (**348.9 MP/s** peak, **2.66×** faster than baseline scalar `pion_icc`), while `rust_qcms_pre` (SSE2) and `rust_moxcms` (SIMD) use x86_64 vector intrinsics. 1-frame 1080p accuracy gate verifies `max_err <= 2 LSB` (**max 1 LSB, 100.0000% ≤ 1 LSB** vs `rust_qcms_pre`; **max 2 LSB, 99.9967% ≤ 1 LSB** vs `rust_moxcms`, alpha 100% preserved).
