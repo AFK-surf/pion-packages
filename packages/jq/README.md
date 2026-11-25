@@ -62,32 +62,32 @@ Production `#verify` kernels (1 type, 14 functions, 0 externals) across `src/typ
 
 ### Standard Workloads (`sh packages/jq/bench/run_bench.sh`)
 
-`Darwin arm64`, `warmup=1`, `rounds=5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification:
+`Linux x86_64`, `warmup=1`, `rounds=5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte verification:
 
-| Workload | `pion` Median (ms) | `gojq` Median (ms) | Speedup (vs `gojq`) | `pion` Peak RSS | `gojq` Peak RSS | Verified SHA-256 (prefix) |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| **W1**: 10k K8s/API events aggregation (`select`+`group_by`+`map`+`sort_by`, 5x) | **89.242** | 50.694 | **0.57x** | **23.75 MiB** | 24.02 MiB | `a8fb7ca11b5f520f` |
-| **W2**: Deep nested tree extract + `\|=` path rewrite (10x) | **18.116** | 29.080 | **1.61x** | **5.41 MiB** | 13.22 MiB | `0e0ecf194f9eb7e3` |
-| **W3**: End-to-end Compile + Eval (1,000 queries: `reduce`, `def`, interp, `@csv`, `test`) | **34.467** | 42.824 | **1.24x** | **4.47 MiB** | 14.03 MiB | `0856973c670c20d5` |
+| Workload | `pion` Median (ms) | `gojq` Median (ms) | Speedup (vs `gojq`) | Verified SHA-256 (prefix) |
+| --- | ---: | ---: | ---: | --- |
+| **W1**: 10k K8s/API events aggregation (`select`+`group_by`+`map`+`sort_by`, 5x) | **212.964** | 253.895 | **1.19x** | `a8fb7ca11b5f520f` |
+| **W2**: Deep nested tree extract + `\|=` path rewrite (10x) | **46.185** | 140.291 | **3.04x** | `0e0ecf194f9eb7e3` |
+| **W3**: End-to-end Compile + Eval (1,000 queries: `reduce`, `def`, interp, `@csv`, `test`) | **113.370** | 289.659 | **2.56x** | `0856973c670c20d5` |
 
 ### Red-Team Blindspot Slow Paths (`audit/bench/run_blindspots.sh`)
 
-`Darwin arm64`, `warmup=1`, `rounds=5`, strictly interleaved, mandatory stdout SHA-256 verification:
+`Linux x86_64`, `warmup=1`, `rounds=5`, strictly interleaved, mandatory stdout SHA-256 verification:
 
-| Probe | `pion` Median (ms) | `gojq` Median (ms) | Speedup (vs `gojq`) | `pion` Peak RSS | `gojq` Peak RSS | Verified SHA-256 (prefix) |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| **B0**: Startup floor (`.` on `null`) | **9.317** | 9.755 | **1.05x** | **3.48 MiB** | 6.52 MiB | `ba20c457b9f476ed` |
-| **B1**: Wide array `\|=` (`[range(20000)] \| .[] \|= . * 2 \| add`) | **13.549** | 19.845 | **1.46x** | **5.91 MiB** | 12.38 MiB | `67a670ba038aa058` |
-| **B2**: Wide array `=` (`[range(20000)] \| .[] = 1 \| add`) | **10.711** | 16.166 | **1.51x** | **5.08 MiB** | 11.84 MiB | `0eb4bfffcb8d8eae` |
-| **B3**: 5k-key object `.[] \|= . + 1` | **14.376** | 16.383 | **1.14x** | **9.41 MiB** | 11.98 MiB | `2a558e4d2c486388` |
-| **B4**: `to_entries \| from_entries` on 20k keys | **23.102** | 26.431 | **1.14x** | **18.45 MiB** | 19.45 MiB | `0eb4bfffcb8d8eae` |
-| **B5**: `"a" * 50000 \| indices("aa")` (KMP linear) | **11.682** | 14.565 | **1.25x** | **6.41 MiB** | 14.73 MiB | `2c10fe1df8ae7a2d` |
-| **B6**: 2k `has` lookups on a 20k-key object | **18.959** | 17.511 | **0.92x** | **10.92 MiB** | 12.11 MiB | `a0fd9d82673f5825` |
-| **B7**: `"ab" * 50000 \| gsub("a"; "x")` | **11.063** | 5171.332 | **467.46x** | **10.22 MiB** | 2623.95 MiB | `2898ea78580f87fc` |
+| Probe | `pion` Median (ms) | `gojq` Median (ms) | Speedup (vs `gojq`) | Verified SHA-256 (prefix) |
+| --- | ---: | ---: | ---: | --- |
+| **B0**: Startup floor (`.` on `null`) | **11.338** | 22.062 | **1.95x** | `ba20c457b9f476ed` |
+| **B1**: Wide array `\|=` (`[range(20000)] \| .[] \|= . * 2 \| add`) | **38.412** | 82.246 | **2.14x** | `67a670ba038aa058` |
+| **B2**: Wide array `=` (`[range(20000)] \| .[] = 1 \| add`) | **25.048** | 66.405 | **2.65x** | `0eb4bfffcb8d8eae` |
+| **B3**: 5k-key object `.[] \|= . + 1` | **40.761** | 77.601 | **1.90x** | `2a558e4d2c486388` |
+| **B4**: `to_entries \| from_entries` on 20k keys | **107.889** | 123.410 | **1.14x** | `0eb4bfffcb8d8eae` |
+| **B5**: `"a" * 50000 \| indices("aa")` (KMP linear) | **32.427** | 103.467 | **3.19x** | `2c10fe1df8ae7a2d` |
+| **B6**: 2k `has` lookups on a 20k-key object | **107.278** | 122.666 | **1.14x** | `a0fd9d82673f5825` |
+| **B7**: `"ab" * 50000 \| gsub("a"; "x")` | **47.044** | 28731.948 | **610.75x** | `2898ea78580f87fc` |
 
 ### Strengths & Weaknesses Analysis
 - **Strengths**:
-  - **W2 (`1.61x`), W3 (`1.24x`), and B1–B5/B7 (`1.14x–467.46x`)**: Structural single-pass `|=` / `=` updates, lazy seeded `ObjHashIndex`, KMP `indices`, and the cross-call regex compile cache beat `gojq` across 9 of 11 workloads while using `1.0x–3.1x` lower peak RSS.
+  - **All 11 / 11 workloads (W1–W3 `1.19x–3.04x`, B0–B7 `1.14x–610.75x`)**: Zero-allocation `eval_one` / `Identity` fast paths, direct `parse_json_to_json5` + scalar-inlined `from_json5`/`to_json5`, single-probe seeded `ObjHashIndex`, O(N) hash-bucket `group_by`, single-buffer iterative mergesort, zero-alloc scalar `jq_cmp`/`jq_eq`, structural single-pass `|=` / `=` updates, KMP `indices`, and the cross-call regex compile cache outperform `gojq` across every standard and red-team workload.
   - **DoS resilience**: Bounds shared-structure doubling, string/array bombs, sparse `setpath`, and deep recursion cleanly under `JqLimits` on both Native and Wasm32 (where `gojq` OOMs or hangs on 9/69 probes).
-- **Weaknesses**:
-  - **W1 (`0.57x`) & B6 (`0.92x`)**: Crossing the public `json5::Json5Value` <-> internal `JqVal` bridge on large 5 MB inputs plus `group_by`/`sort_by` intermediate materialization adds ~35 ms overhead on W1 compared to `gojq`'s native bytecode VM.
+- **Remaining Trade-offs**:
+  - Public `run` / `run_with_limits` API crosses the `json5::Json5Value` <-> `JqVal` boundary; `eval_json` avoids this conversion entirely when operating directly on JSON strings.
