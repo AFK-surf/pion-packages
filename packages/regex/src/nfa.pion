@@ -20,12 +20,22 @@ pub struct NfaState {
   pub mut out2 : Int // -1 if none (only for Split)
 }
 
+///| Multi-literal 2-byte Packed-Pair prefilter (strictly leftmost-first & O(N)).
+pub struct PackedPairPrefilter {
+  pub pair_bits : Array[Int] // 2048 32-bit words (65536 bits = 8 KB)
+  pub lits : Array[Array[Int]] // 2..=16 fixed-offset literals (each len 2..=8)
+  pub min_off : Int
+  pub max_off : Int
+  pub min_len : Int
+}
+
 ///| Fast prefilter extracted from HIR for accelerating unanchored search.
 pub enum Prefilter {
   NoPrefilter
   ExactLiteral(Array[Int]) // entire regex is an unanchored literal
   PrefixBytes(Array[Int]) // required literal prefix (>= 1 byte), no leading look
   LeadingLookPrefix(Array[Int]) // required literal prefix after leading zero-width look (e.g. `\bword\b`)
+  PackedPair(PackedPairPrefilter) // 2..=16 fixed-offset ASCII literals with 16-bit pair bitmap
   FirstBytes(Array[Int]) // 256-entry lookup table (1 = possible first byte, 0 = skip)
 }
 
@@ -703,8 +713,422 @@ fn hir_is_anchored_start(hir : Hir) -> Bool {
   }
 }
 
-///| Extract a fast prefilter from HIR (exact literal, literal prefix, or first-byte set).
-fn extract_prefilter(hir : Hir, anchored_start : Bool) -> Prefilter {
+///| Scan `text` from `start_scan` for the earliest position where any literal in `pf` matches.
+///| Returns the hit position `scan >= start_scan`, or `-1` if no literal can occur before `end_pos`.
+pub fn packed_pair_find(
+  pf : PackedPairPrefilter,
+  text : String,
+  start_scan : Int,
+  end_pos : Int,
+) -> Int {
+  let limit = end_pos - pf.min_len
+  if start_scan > limit {
+    return -1
+  }
+  let bits = pf.pair_bits
+  let lits = pf.lits
+  let nlits = lits.length()
+  let mut scan = start_scan
+  let mut b0 = text.code_unit_at(scan)
+  while scan <= limit {
+    let b1 = text.code_unit_at(scan + 1)
+    let pair = (b0 << 8) | b1
+    if (bits[pair >> 5] & (1 << (pair & 31))) != 0 {
+      let mut i = 0
+      while i < nlits {
+        let lit = lits[i]
+        let m = lit.length()
+        if scan + m <= end_pos &&
+        lit[0] == b0 &&
+        lit[1] == b1 &&
+        text.code_unit_at(scan + m - 1) == lit[m - 1] {
+          let mut k = 2
+          let mut ok = true
+          while k < m - 1 {
+            if text.code_unit_at(scan + k) != lit[k] {
+              ok = false
+              break
+            }
+            k = k + 1
+          }
+          if ok {
+            return scan
+          }
+        }
+        i = i + 1
+      }
+    }
+    b0 = b1
+    scan = scan + 1
+  }
+  -1
+}
+
+///| Return true iff `hir` contains only ASCII literals/classes and no lookarounds.
+fn hir_is_pure_ascii_no_look(hir : Hir) -> Bool {
+  match hir {
+    Hir::Empty => true
+    Hir::Look(_) => false
+    Hir::Literal(bs) => {
+      let mut i = 0
+      while i < bs.length() {
+        let b = bs[i]
+        if b < 0 || b >= 128 {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    Hir::Class(ranges, _) => {
+      if ranges.length() == 0 {
+        return false
+      }
+      let mut i = 0
+      while i < ranges.length() {
+        if ranges[i].lo < 0 || ranges[i].hi >= 128 {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    Hir::Capture(_, inner) => hir_is_pure_ascii_no_look(inner)
+    Hir::Repeat(inner, _, _, _) => hir_is_pure_ascii_no_look(inner)
+    Hir::Concat(items) => {
+      let mut i = 0
+      while i < items.length() {
+        if !hir_is_pure_ascii_no_look(items[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    Hir::Alt(branches) => {
+      let mut i = 0
+      while i < branches.length() {
+        if !hir_is_pure_ascii_no_look(branches[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+  }
+}
+
+fn collect_top_alt_branches(hir : Hir, out : Array[Hir]) -> Unit {
+  match hir {
+    Hir::Capture(_, inner) => collect_top_alt_branches(inner, out)
+    Hir::Alt(branches) => {
+      let mut i = 0
+      while i < branches.length() {
+        collect_top_alt_branches(branches[i], out)
+        i = i + 1
+      }
+    }
+    _ => out.push(hir)
+  }
+}
+
+fn flatten_concat_items(hir : Hir, out : Array[Hir]) -> Unit {
+  match hir {
+    Hir::Empty => ()
+    Hir::Capture(_, inner) => flatten_concat_items(inner, out)
+    Hir::Concat(items) => {
+      let mut i = 0
+      while i < items.length() {
+        flatten_concat_items(items[i], out)
+        i = i + 1
+      }
+    }
+    _ => out.push(hir)
+  }
+}
+
+fn class_small_ascii_bytes(ranges : Array[CharRange], max_count : Int) -> Option[Array[Int]] {
+  let mut total = 0
+  let mut i = 0
+  while i < ranges.length() {
+    let r = ranges[i]
+    if r.lo < 0 || r.hi >= 128 || r.hi < r.lo {
+      return Option::None
+    }
+    total = total + (r.hi - r.lo + 1)
+    if total > max_count {
+      return Option::None
+    }
+    i = i + 1
+  }
+  if total == 0 {
+    return Option::None
+  }
+  let out : Array[Int] = Array::new()
+  i = 0
+  while i < ranges.length() {
+    let mut b = ranges[i].lo
+    let hi = ranges[i].hi
+    while b <= hi {
+      out.push(b)
+      b = b + 1
+    }
+    i = i + 1
+  }
+  Option::Some(out)
+}
+
+fn slice_bytes_cap(bs : Array[Int], max_len : Int) -> Array[Int] {
+  let n = if bs.length() > max_len { max_len } else { bs.length() }
+  let out : Array[Int] = Array::new()
+  let mut i = 0
+  while i < n {
+    out.push(bs[i])
+    i = i + 1
+  }
+  out
+}
+
+///| Extract fixed-offset literal(s) (length >= 2) for one branch into `(out_lits, out_offs)`.
+///| Returns `false` if this branch cannot yield guaranteed fixed-offset literal(s) (e.g. `a+bc`, empty).
+fn extract_branch_fixed_lits(
+  branch : Hir,
+  base_off : Int,
+  out_lits : Array[Array[Int]],
+  out_offs : Array[Int],
+) -> Bool {
+  let items : Array[Hir] = Array::new()
+  flatten_concat_items(branch, items)
+  if items.length() == 0 {
+    return false
+  }
+  // If the first item at base_off is an Alt (e.g. `(?:ERROR|WARN) ...`), expand its sub-branches.
+  match items[0] {
+    Hir::Alt(sub_branches) => {
+      if sub_branches.length() == 0 || sub_branches.length() > 8 {
+        return false
+      }
+      let mut i = 0
+      while i < sub_branches.length() {
+        if !extract_branch_fixed_lits(sub_branches[i], base_off, out_lits, out_offs) {
+          return false
+        }
+        if out_lits.length() > 16 {
+          return false
+        }
+        i = i + 1
+      }
+      return true
+    }
+    _ => ()
+  }
+
+  let mut cur_off = base_off
+  let mut best_lit : Array[Int] = Array::new()
+  let mut best_off = 0
+  let mut cur_lit : Array[Int] = Array::new()
+  let mut cur_lit_off = base_off
+
+  // Also track adjacent (1-byte literal + small ASCII class) or (small ASCII class + 1-byte literal)
+  let mut has_pair_expand = false
+  let mut expand_lit_first = true
+  let mut expand_byte = 0
+  let mut expand_class : Array[Int] = Array::new()
+  let mut expand_off = 0
+
+  let mut prev_was_small_class = false
+  let mut prev_class_bytes : Array[Int] = Array::new()
+  let mut prev_class_off = 0
+  let mut prev_was_one_lit = false
+  let mut prev_lit_byte = 0
+  let mut prev_lit_off = 0
+
+  let mut i = 0
+  while i < items.length() {
+    match items[i] {
+      Hir::Literal(bs) => {
+        if bs.length() > 0 {
+          if cur_lit.length() == 0 {
+            cur_lit_off = cur_off
+          }
+          let mut k = 0
+          while k < bs.length() {
+            cur_lit.push(bs[k])
+            k = k + 1
+          }
+          if !has_pair_expand && prev_was_small_class && cur_lit.length() == 1 && prev_class_off <= 16 {
+            has_pair_expand = true
+            expand_lit_first = false
+            expand_byte = bs[0]
+            expand_class = prev_class_bytes
+            expand_off = prev_class_off
+          }
+          prev_was_small_class = false
+          if cur_lit.length() == 1 {
+            prev_was_one_lit = true
+            prev_lit_byte = cur_lit[0]
+            prev_lit_off = cur_lit_off
+          } else {
+            prev_was_one_lit = false
+          }
+          cur_off = cur_off + bs.length()
+        }
+      }
+      Hir::Class(ranges, _) => {
+        if cur_lit.length() > best_lit.length() && cur_lit_off <= 16 {
+          best_lit = cur_lit
+          best_off = cur_lit_off
+        }
+        cur_lit = Array::new()
+        let small = class_small_ascii_bytes(ranges, 4)
+        match small {
+          Some(cbytes) => {
+            if !has_pair_expand && prev_was_one_lit && prev_lit_off <= 16 {
+              has_pair_expand = true
+              expand_lit_first = true
+              expand_byte = prev_lit_byte
+              expand_class = cbytes
+              expand_off = prev_lit_off
+            }
+            prev_was_small_class = true
+            prev_class_bytes = cbytes
+            prev_class_off = cur_off
+          }
+          None => {
+            prev_was_small_class = false
+          }
+        }
+        prev_was_one_lit = false
+        cur_off = cur_off + 1
+      }
+      Hir::Repeat(inner, min, max, _) => {
+        if cur_lit.length() > best_lit.length() && cur_lit_off <= 16 {
+          best_lit = cur_lit
+          best_off = cur_lit_off
+        }
+        cur_lit = Array::new()
+        prev_was_small_class = false
+        prev_was_one_lit = false
+        if min == max && min > 0 {
+          match inner {
+            Hir::Class(_, _) => cur_off = cur_off + min
+            Hir::Literal(bs) => cur_off = cur_off + min * bs.length()
+            _ => break
+          }
+        } else {
+          break
+        }
+      }
+      _ => {
+        // Variable-length or unsupported node: stop advancing fixed offset
+        break
+      }
+    }
+    i = i + 1
+  }
+  if cur_lit.length() > best_lit.length() && cur_lit_off <= 16 {
+    best_lit = cur_lit
+    best_off = cur_lit_off
+  }
+  if best_lit.length() >= 2 && best_off <= 16 {
+    if out_lits.length() + 1 > 16 {
+      return false
+    }
+    out_lits.push(slice_bytes_cap(best_lit, 8))
+    out_offs.push(best_off)
+    return true
+  }
+  if has_pair_expand && expand_off <= 16 && out_lits.length() + expand_class.length() <= 16 {
+    let mut k = 0
+    while k < expand_class.length() {
+      let pair = if expand_lit_first {
+        [expand_byte, expand_class[k]]
+      } else {
+        [expand_class[k], expand_byte]
+      }
+      out_lits.push(pair)
+      out_offs.push(expand_off)
+      k = k + 1
+    }
+    return true
+  }
+  false
+}
+
+fn extract_packed_pair(
+  hir : Hir,
+  anchored_start : Bool,
+  has_line : Bool,
+  has_wb : Bool,
+  has_ci : Bool,
+) -> Option[PackedPairPrefilter] {
+  if anchored_start || has_line || has_wb || has_ci {
+    return Option::None
+  }
+  if !hir_is_pure_ascii_no_look(hir) {
+    return Option::None
+  }
+  let branches : Array[Hir] = Array::new()
+  collect_top_alt_branches(hir, branches)
+  if branches.length() < 2 || branches.length() > 16 {
+    return Option::None
+  }
+  let lits : Array[Array[Int]] = Array::new()
+  let offs : Array[Int] = Array::new()
+  let mut i = 0
+  while i < branches.length() {
+    if !extract_branch_fixed_lits(branches[i], 0, lits, offs) {
+      return Option::None
+    }
+    i = i + 1
+  }
+  if lits.length() < 2 || lits.length() > 16 {
+    return Option::None
+  }
+  let pair_bits : Array[Int] = Array::new()
+  i = 0
+  while i < 2048 {
+    pair_bits.push(0)
+    i = i + 1
+  }
+  let mut min_off = offs[0]
+  let mut max_off = offs[0]
+  let mut min_len = lits[0].length()
+  i = 0
+  while i < lits.length() {
+    let lit = lits[i]
+    let off = offs[i]
+    if off < min_off {
+      min_off = off
+    }
+    if off > max_off {
+      max_off = off
+    }
+    if lit.length() < min_len {
+      min_len = lit.length()
+    }
+    let pair = (lit[0] << 8) | lit[1]
+    let widx = pair >> 5
+    pair_bits[widx] = pair_bits[widx] | (1 << (pair & 31))
+    i = i + 1
+  }
+  Option::Some(PackedPairPrefilter::{
+    pair_bits,
+    lits,
+    min_off,
+    max_off,
+    min_len,
+  })
+}
+
+///| Extract a fast prefilter from HIR (exact literal, literal prefix, packed-pair, or first-byte set).
+fn extract_prefilter(
+  hir : Hir,
+  anchored_start : Bool,
+  has_line : Bool,
+  has_wb : Bool,
+  has_ci : Bool,
+) -> Prefilter {
   if anchored_start {
     return Prefilter::NoPrefilter
   }
@@ -726,6 +1150,11 @@ fn extract_prefilter(hir : Hir, anchored_start : Bool) -> Prefilter {
   let look_prefix : Array[Int] = Array::new()
   if collect_leading_look_prefix(hir, look_prefix) && look_prefix.length() >= 2 {
     return Prefilter::LeadingLookPrefix(look_prefix)
+  }
+  // Multi-literal Packed-Pair prefilter (strictly leftmost-first, pure ASCII, no look, no (?i))
+  match extract_packed_pair(hir, anchored_start, has_line, has_wb, has_ci) {
+    Some(pp) => return Prefilter::PackedPair(pp)
+    None => ()
   }
   // First-byte set extraction (only useful if <= 128 of 256 bytes can start a match)
   let first : Array[Int] = Array::new()
@@ -949,7 +1378,13 @@ pub fn compile_forward_nfa(
     b.has_line_anchor,
     b.has_word_boundary,
   )
-  let prefilter = extract_prefilter(parsed.hir, anchored_start)
+  let prefilter = extract_prefilter(
+    parsed.hir,
+    anchored_start,
+    b.has_line_anchor,
+    b.has_word_boundary,
+    parsed.has_case_insensitive,
+  )
   Ok(Nfa::{
     states: b.states,
     start_anchored,
