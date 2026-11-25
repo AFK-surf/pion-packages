@@ -61,12 +61,12 @@ match b.encode() {
 
 ## Verification
 
-- **Compliance & Adversarial Test Suite**: `pionc test --json packages/wasm` — **14 / 14 passing** (covering LEB128 u32/u64/i32/i64/s33, all 12 sections + Custom/`name`, streaming `Parser`, all instruction families including SIMD `0xFD`, 36 Node.js v24 V8 `WebAssembly.validate` cross-verified valid/invalid vectors, complex recursive/loop/indirect-call modules, `ValidateLimits` DoS bombs, and red-team P0/P1/P2 regressions).
+- **Compliance & Adversarial Test Suite**: `pionc test --json packages/wasm` — **15 / 15 passing** (covering LEB128 u32/u64/i32/i64/s33, all 12 sections + Custom/`name`, streaming `Parser`, all instruction families including SIMD `0xFD`, 36 Node.js v24 V8 `WebAssembly.validate` cross-verified valid/invalid vectors, complex recursive/loop/indirect-call modules, `ValidateLimits` DoS bombs, and red-team P0/P1/P2 regressions).
 - **Red-Team Audit (`packages/wasm/audit`)**:
   - `pionc test --json --only-pkg packages/wasm/audit` — **63 / 63 PASS** (27/27 red-team defect tests + 36/36 control tests, 0 FAIL).
-  - `sh packages/wasm/audit/run_audit.sh` — **20,335 modules** (335 hand-written + 20,000 fuzz) three-way differential against Rust `wasmparser 0.221.3 (WASM2)` and Node v24 V8: **0 `ACCEPTS_INVALID`, 0 `ACCEPTS_NON_WASM2`, 0 `REJECTS_VALID`, 0 aborts**; **5,565 / 5,565 (100%)** WASM2-valid fuzz modules disassemble via `print_wat` to valid WAT verified `EQ` by `wat::parse_str` + `wasmprinter` (**0 `PARSE_FAIL`, 0 `SEM_DIFF`**); Native vs Wasm32 4-mode **0 diffs, 0 traps**.
-  - DoS probes: 100,000 exports validate in **90 ms** (down from 7,291 ms, **81×** faster); `locals_50k_x2000funcs` in **12 ms / 2.0 MiB** (faster than `wasmparser`'s 16 ms / 2.7 MiB).
-- **Dual-Target Wasm32 Smoke (`packages/wasm/wasm_smoke`)**: All 4 build modes (Native debug/release + Wasm32 debug/release) exit `0` with byte-identical stdout (`sha256:317ffbc8f75a2ad22c2fe64217674c198a7b9d3a4a20efa7cd432856e77514e5`).
+  - `STRICT=1 sh packages/wasm/audit/run_audit.sh` — **20,335 modules** (335 hand-written + 20,000 fuzz) three-way differential against Rust `wasmparser 0.221.3 (WASM2)` and Node v24 V8: **0 `ACCEPTS_INVALID`, 0 `ACCEPTS_NON_WASM2`, 0 `REJECTS_VALID`, 0 aborts**; **5,565 / 5,565 (100%)** WASM2-valid fuzz modules disassemble via `print_wat` to valid WAT verified `EQ` by `wat::parse_str` + `wasmprinter` (**0 `PARSE_FAIL`, 0 `SEM_DIFF`**); Native vs Wasm32 4-mode **0 diffs, 0 traps**.
+  - DoS probes: `straight_line_900k_instrs` in **10 ms** (`0.9x` Rust `wasmparser`'s 12 ms); `funcs_200k_tiny` in **31 ms / 11.4 MiB** (`0.7x` `wasmparser`'s 42 ms / 17.1 MiB); `locals_50k_x2000funcs` in **11 ms** (`1.0x` `wasmparser`).
+- **Dual-Target Wasm32 Smoke (`packages/wasm/wasm_smoke`)**: All 4 build modes (Native debug/release + Wasm32 debug `409,519 B` / release `401,175 B`) exit `0` with byte-identical stdout (`sha256:317ffbc8f75a2ad22c2fe64217674c198a7b9d3a4a20efa7cd432856e77514e5`).
 - **Formatting & Typecheck**: `sh scripts/verify.sh packages/wasm` passes with 0 diagnostics and a clean worktree.
 
 ## Formal Verification (Lean 4)
@@ -79,47 +79,47 @@ The core WebAssembly 2.0 type codec, canonical section ordering, polymorphic sta
 
 ## Head-to-Head Benchmarks
 
-Measured on `Darwin arm64` via `sh packages/wasm/bench/run_bench.sh` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) on a real **395,839 B (387 KiB)** compiler-generated `.wasm` corpus (`wasm_smoke` compiled with `pionc --target wasm32 --release`), comparing:
-- **`pion`**: `packages/wasm` (`pionc 0.1.0 --release`, single-pass streaming `validate_bytes` + 50-level capped zero-alloc `print_wat`)
+Measured on `Linux x86_64` via `sh packages/wasm/bench/run_bench.sh` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) on a real **401,175 B (392 KiB)** compiler-generated `.wasm` corpus (`wasm_smoke` compiled with `pionc --target wasm32 --release`), comparing:
+- **`pion`**: `packages/wasm` (`pionc 0.1.0 --release`, zero-`Result`-boxing `ByteReader`/`ValState` raw primitives, table-driven numeric/memory opcode dispatch, cached top control frame, reused flat locals & `CtrlFrame` pool, single-pass streaming `validate_bytes`, pre-allocated `decode_expr` + `ByteWriter` reuse, and 50-level capped zero-alloc `print_wat`)
 - **`rust_wasmparser` / `rust_wasmtools`**: Rust (`wasmparser 0.221.3`, `wasm-encoder 0.221.3`, `wasmprinter 0.221.3`, `--release --locked`)
 
-### W1. Full Binary Decode + Instruction Traversal (20 × 395,839 B = 7,916,780 B)
+### W1. Full Binary Decode + Instruction Traversal (20 × 401,175 B = 8,023,500 B)
 
-_SHA-256 verified identical across all implementations and rounds: `6b66e630579352fa769e377b3a245b568e7e56e941fa2c6c3042a8c0308edf7c`._
+_SHA-256 verified identical across all implementations and rounds: `929b78dd2a3576b3a3123b4422ac83693069c0489a477e7838559a5f2149e44f`._
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_wasmparser`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 127.484 | 127.245 | 127.900 | 62.10 | 6374222.95 | 10.36 MiB | 0.25x |
-| `rust_wasmparser` | 31.710 | 30.928 | 32.015 | 249.66 | 1585485.45 | 2.66 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_wasmparser`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 91.758 | 62.879 | 109.392 | 87.44 | 4587903.95 | 0.66x (min 0.91x) |
+| `rust_wasmparser` | 60.182 | 57.441 | 76.737 | 133.32 | 3009077.85 | 1.00x (baseline) |
 
-### W2. Full WebAssembly Spec Validation (20 × 395,839 B = 7,916,780 B)
+### W2. Full WebAssembly Spec Validation (20 × 401,175 B = 8,023,500 B)
 
-_SHA-256 verified identical across all implementations and rounds: `287af374249e47090d6b0852050f1282b3514eb61a076e5bc4b17a60db1ad8f5`._
+_SHA-256 verified identical across all implementations and rounds: `eb39b84fe2a0d6b85a52e783bb843cca287918a5d22b8a0b810cb081ab164b44`._
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_wasmparser`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 105.034 | 104.840 | 106.352 | 75.37 | 5251722.90 | **3.06 MiB** | 0.28x |
-| `rust_wasmparser` | 29.676 | 29.273 | 29.852 | 266.77 | 1483795.85 | 3.77 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_wasmparser`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **54.803** | **41.726** | 111.011 | **146.41** | 2740155.65 | **1.09x** |
+| `rust_wasmparser` | 59.629 | 44.378 | 83.210 | 134.56 | 2981451.60 | 1.00x (baseline) |
 
-### W3. Decode → Re-encode + WAT Disassembly (5 × 395,839 B = 1,979,195 B)
+### W3. Decode → Re-encode + WAT Disassembly (5 × 401,175 B = 2,005,875 B)
 
-_SHA-256 verified identical across all implementations and rounds: `8963bf896344fc386c8e339173be862d377e30a538dff7d43b5525750dcfd924`._
+_SHA-256 verified identical across all implementations and rounds: `f5e8458c37e1d5f6851650bf8986008b687c851277be5cade3246903f205db59`._
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_wasmtools`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | **86.426** | 85.767 | 88.055 | **22.90** | 17285250.00 | 41.30 MiB | **1.24x** |
-| `rust_wasmtools` | 107.445 | 106.149 | 107.714 | 18.42 | 21489025.00 | 20.50 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs `rust_wasmtools`) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | **139.996** | **108.634** | **153.895** | **14.33** | 27999139.80 | **2.38x** |
+| `rust_wasmtools` | 333.410 | 200.889 | 433.426 | 6.02 | 66682006.40 | 1.00x (baseline) |
 
-### Before / After Optimization Summary
+### Before / After Optimization Summary (Same-Machine Fixed 396,823 B Corpus)
 
-| Workload | Before (295 KiB corpus) | After (396 KiB corpus) | Delta |
+| Workload | Before (`f66e02f5`) | After (Zero-Boxing + Tables + Flat Locals) | Speedup vs Before |
 | --- | --- | --- | --- |
-| W1 Decode | 54.57 MB/s · 8.12 MiB · 0.28x | 62.10 MB/s · 10.36 MiB · 0.25x | +14% throughput |
-| W2 Validate | 28.80 MB/s · 8.69 MiB · 0.16x | **75.37 MB/s · 3.06 MiB · 0.28x** | **2.62x throughput, -65% RSS (below Rust 3.77 MiB)** |
-| W3 Roundtrip + WAT | 7.06 MB/s · 93.00 MiB · 0.45x | **22.90 MB/s · 41.30 MiB · 1.24x** | **3.24x throughput (1.24x Rust), -56% RSS** |
+| W1 Decode | 201.98–300.31 ms (`0.21x–0.26x` Rust) | **58.14–91.12 ms (`0.70x–0.91x` Rust)** | **3.3×–3.5× faster** |
+| W2 Validate | 153.67–240.22 ms (`0.19x–0.23x` Rust) | **37.71–54.80 ms (`1.00x–1.09x` Rust)** | **3.7×–4.1× faster (beats Rust)** |
+| W3 Roundtrip + WAT | 495.63 ms (`1.01x` Rust) | **140.00–320.84 ms (`1.56x–2.38x` Rust)** | **1.5×–2.4× faster** |
 
 ### Analysis
 
-- **W1 (Decode, 62.1 MB/s, 0.25× Rust)**: `decode_module` materializes the full `Module` and `Array[Instr]` AST for every instruction in each round, whereas `wasmparser::Parser` streams zero-copy `Operator` values without allocating an AST.
-- **W2 (Validate, 75.4 MB/s, 0.28× Rust, 3.06 MiB RSS)**: `validate_bytes` now runs a **single-pass streaming validator** directly over raw bytes with zero `Instr` AST allocation, RLE `LocalTable`, pre-converted type tables, and a reused `ValState` — boosting throughput **2.62×** and cutting Peak RSS to **3.06 MiB** (lower than Rust `wasmparser`'s 3.77 MiB).
-- **W3 (Roundtrip + WAT, 22.9 MB/s, 1.24× Rust)**: Capping `write_indent` at 50 levels (matching `wasmprinter`) and writing integers/hex/bytes directly to `StringBuilder` without per-instruction temporary `String`/`Bytes` allocations cut W3 RSS from **93.00 MiB → 41.30 MiB** (even on a 34% larger corpus) and accelerated W3 to **1.24×** of Rust `wasm-encoder` + `wasmprinter`.
+- **W1 (Decode, 87.4 MB/s, 0.66× median / 0.91× min Rust)**: Eliminating per-byte/per-LEB128 `Result` boxing in `ByteReader`, replacing the 128-arm numeric opcode `match` with an O(1) `decode_num_instr_table` lookup, pre-allocating `instrs` via `Array::with_capacity`, and splitting `decode_expr` into compact helpers accelerated `decode_module` **3.3×–3.5×**. The remaining gap vs `wasmparser::Parser` is structural: `decode_module` heap-materializes every payload-bearing `Instr` enum variant into `Array[Instr]` (`pion_alloc_uninit` + `pion_arr_push_owned`), whereas `wasmparser::Parser` streams stack-only `Operator` values without building an AST.
+- **W2 (Validate, 146.4 MB/s, 1.09× Rust)**: Replacing per-instruction `Result`-boxed `ValState`/`ByteReader` calls with error-slot `*_raw` primitives, caching `top_height`/`top_unreachable`, reusing `CtrlFrame` slots and a flat `local_types` buffer (`<= 256` locals, RLE `LocalTable` fallback for DoS bombs), and dispatching `0x45..0xC4` / `0x28..0x3E` via compact lookup tables eliminated 5–7 heap allocations per instruction, accelerating validation **3.7×–4.1×** to **1.09×** of Rust `wasmparser`.
+- **W3 (Roundtrip + WAT, 14.3 MB/s, 2.38× Rust)**: Eliminating per-instruction `Result` boxing in `encode_instr_raw`, reusing a single `ByteWriter` across function bodies, and adding single-byte LEB128 fast paths in `ByteWriter` pushed W3 to **2.38×** of Rust `wasm-encoder` + `wasmprinter`.
