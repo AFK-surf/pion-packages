@@ -112,7 +112,8 @@ pub fn write_ocf(
   }
   let block_cap = if options.block_size <= 0 { 1000 } else { options.block_size }
   let limits = AvroLimits::default()
-  let out = BinWriter::new(4096)
+  let total = records.length()
+  let out = BinWriter::new(if total > 0 { 65536 } else { 4096 })
 
   // 1. Magic: Obj\x01
   bw_write_byte(out, 0x4F)
@@ -145,8 +146,9 @@ pub fn write_ocf(
   // 3. 16-byte sync marker
   bw_write_bytes_raw(out, options.sync_marker)
 
-  // 4. Data blocks
-  let total = records.length()
+  // 4. Data blocks (reuse a single block BinWriter across all blocks)
+  let blk = BinWriter::new(if total > 0 { 65536 } else { 256 })
+  let root = resolve_node_fast(schema, schema.root)
   let mut idx = 0
   while idx < total {
     let mut end_idx = idx + block_cap
@@ -154,12 +156,12 @@ pub fn write_ocf(
       end_idx = total
     }
     let count = end_idx - idx
-    let blk = BinWriter::new(4096)
+    bw_reset(blk)
     let mut j = idx
     while j < end_idx {
-      match encode_datum_into(blk, schema, schema.root, records[j], limits, 0) {
-        Ok(_) => ()
-        Err(e) => return Err(e)
+      encode_datum_rec(blk, schema, root, records[j], limits, 0)
+      if blk.has_err {
+        return Err(blk.err)
       }
       j = j + 1
     }
@@ -327,19 +329,19 @@ pub fn OcfReader::open_resolved(
   ocf_open_impl(data, Some(reader_schema), limits)
 }
 
-///| Decode and return the next data block of records, or `Ok(None)` at EOF.
-///| When `accumulate_elements` is true, `limits.max_elements` is enforced across the entire file.
-fn ocf_next_block_impl(
+///| Decode the next data block directly into `out_records`, returning `Ok(true)` if a block was read or `Ok(false)` at EOF.
+fn ocf_decode_next_block_into(
   self : OcfReader,
+  out_records : Array[AvroValue],
   accumulate_elements : Bool,
-) -> Result[Option[Array[AvroValue]], AvroError] {
+) -> Result[Bool, AvroError] {
   if self.pos >= self.end {
-    return Ok(None)
+    return Ok(false)
   }
   let r = BinReader::new(self.data, self.pos, self.end, self.limits)
-  let count64 = match br_read_i64(r) {
-    Ok(v) => v
-    Err(e) => return Err(e)
+  let count64 = br_read_i64_raw(r)
+  if r.has_err {
+    return Err(r.err)
   }
   if count64 <= 0L {
     return Err(AvroError::InvalidOcf("OCF block object count must be positive"))
@@ -353,9 +355,9 @@ fn ocf_next_block_impl(
     return Err(AvroError::LimitExceeded("OCF total records exceed limit"))
   }
   let count = count64.to_int()
-  let byte_size64 = match br_read_i64(r) {
-    Ok(v) => v
-    Err(e) => return Err(e)
+  let byte_size64 = br_read_i64_raw(r)
+  if r.has_err {
+    return Err(r.err)
   }
   if byte_size64 < 0L || byte_size64 > self.limits.max_bytes.to_int64() {
     return Err(AvroError::LimitExceeded("OCF block byte size invalid or exceeds max_bytes"))
@@ -394,23 +396,32 @@ fn ocf_next_block_impl(
     blk_reader.elements = self.total_elements
   }
 
-  let block_records : Array[AvroValue] = []
-  let mut i = 0
-  while i < count {
-    let rec = match self.resolver_opt {
-      None =>
-      match decode_datum_from(blk_reader, self.writer_schema, self.writer_schema.root) {
-        Ok(v) => v
-        Err(e) => return Err(e)
-      }
-      Some(res) =>
-      match exec_resolve(blk_reader, res, res.root_plan) {
-        Ok(v) => v
-        Err(e) => return Err(e)
+  match self.resolver_opt {
+    None => {
+      let root = resolve_node_fast(self.writer_schema, self.writer_schema.root)
+      let mut i = 0
+      while i < count {
+        let rec = decode_datum_rec(blk_reader, self.writer_schema, root, 0)
+        if blk_reader.has_err {
+          return Err(blk_reader.err)
+        }
+        out_records.push(rec)
+        i = i + 1
       }
     }
-    block_records.push(rec)
-    i = i + 1
+    Some(res) => {
+      let scratch = make_root_scratch(res)
+      let root_plan = res.root_plan
+      let mut i = 0
+      while i < count {
+        let rec = exec_resolve_rec(blk_reader, res, root_plan, 0, scratch)
+        if blk_reader.has_err {
+          return Err(blk_reader.err)
+        }
+        out_records.push(rec)
+        i = i + 1
+      }
+    }
   }
   if blk_reader.pos != blk_reader.end {
     return Err(AvroError::TrailingBytes(blk_reader.end - blk_reader.pos))
@@ -419,12 +430,20 @@ fn ocf_next_block_impl(
     self.total_elements = blk_reader.elements
   }
   self.total_records = self.total_records + count
-  Ok(Some(block_records))
+  Ok(true)
 }
 
 ///| Read and decode the next block of records from this streaming `OcfReader`, or `Ok(None)` at EOF.
 pub fn OcfReader::next_block(self : OcfReader) -> Result[Option[Array[AvroValue]], AvroError] {
-  ocf_next_block_impl(self, false)
+  if self.pos >= self.end {
+    return Ok(None)
+  }
+  let block_records : Array[AvroValue] = []
+  match ocf_decode_next_block_into(self, block_records, false) {
+    Ok(false) => Ok(None)
+    Ok(true) => Ok(Some(block_records))
+    Err(e) => Err(e)
+  }
 }
 
 fn read_ocf_impl(
@@ -438,15 +457,9 @@ fn read_ocf_impl(
   }
   let records : Array[AvroValue] = []
   while true {
-    match ocf_next_block_impl(reader, true) {
-      Ok(None) => break
-      Ok(Some(blk)) => {
-        let mut i = 0
-        while i < blk.length() {
-          records.push(blk[i])
-          i = i + 1
-        }
-      }
+    match ocf_decode_next_block_into(reader, records, true) {
+      Ok(false) => break
+      Ok(true) => ()
       Err(e) => return Err(e)
     }
   }
