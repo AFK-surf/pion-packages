@@ -40,14 +40,14 @@ sh scripts/verify.sh packages/svg
 sh packages/svg/audit/run_audit.sh
 ```
 
-- **29 / 29** unit, compliance, edge-case, and DoS tests passing (`sh scripts/verify.sh packages/svg`).
-- **Red-team audit (`run_audit.sh`)**: **100% ALL GREEN (exit 0)** — P0 0 FAIL, P1 0 FAIL, P2 0 FAIL, controls 25/25 PASS, 9/9 4-mode byte parity.
-- **4-mode `wasm_smoke`** (Native debug, Native release, Wasm32 debug, Wasm32 release): all exit `0` with identical stdout SHA-256:
+- **30 / 30** unit, compliance, edge-case, and DoS tests passing (`sh scripts/verify.sh packages/svg`).
+- **Red-team audit (`run_audit.sh`)**: **P1 38/38 PASS, P2 69/69 PASS, controls 25/25 PASS, 9/9 4-mode byte parity, 56/56 DoS probes PASS**.
+- **4-mode `wasm_smoke`** (Native debug, Native release, Wasm32 debug `277,144 B`, Wasm32 release `276,755 B`): all exit `0` with identical stdout SHA-256:
   `bc1fc7dd7b0a24143a3574d34c9ba1b21824065d92441bd5b72a093c173ad711`
 
 ## Benchmarks
 
-Run on `Darwin arm64` (`--warmup 1 --rounds 5`, strictly interleaved via `scripts/bench_compare.py`, all artifacts in `/private/tmp/fix-svg-bench`):
+Run on `Linux x86_64` (`--warmup 1 --rounds 7`, strictly interleaved via `scripts/bench_compare.py`):
 
 ```sh
 sh packages/svg/bench/run_bench.sh
@@ -60,14 +60,14 @@ Input: `3,836,510 B` (`50,000` paths)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `rust_svgtypes_same_algo`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (streaming `parse_path_to_cubics`) | 65.902 | 63.304 | 66.447 | 58.22 | 1318.05 | 9.08 MiB | 0.47x |
-| `rust_svgtypes_same_algo` (`svgtypes 0.15.3` + same F.6.5/bbox) | 31.062 | 30.415 | 32.041 | 123.51 | 621.25 | 5.59 MiB | 1.00x (baseline) |
+| `pion` (streaming `parse_path_to_cubics`) | 69.850 | 56.021 | 122.411 | 54.92 | 1397.00 | 9.21 MiB | 0.90x |
+| `rust_svgtypes_same_algo` (`svgtypes 0.15.3` + same F.6.5/bbox) | 62.776 | 44.145 | 75.392 | 61.11 | 1255.52 | 6.51 MiB | 1.00x (baseline) |
 
 - **W1b (Idiomatic upstream Rust reference: `svgtypes 0.15.3 SimplifyingPathParser` + `kurbo 0.11.3 BezPath::bounding_box`; SHA-256: `5b88be8cef2210a526ea79f4f52312e81542cd1fddd3aefeaa692cbb07ee576b`)**
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Relative (`pion` vs `kurbo`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_svgtypes_kurbo` (`svgtypes` + `kurbo`) | 43.426 | 43.088 | 43.678 | 88.35 | 868.53 | 5.66 MiB | `pion` is 0.66x |
+| `rust_svgtypes_kurbo` (`svgtypes` + `kurbo`) | 98.563 | 90.911 | 131.398 | 38.92 | 1971.27 | 6.45 MiB | `pion` is 1.41x |
 
 _(Note: `kurbo`'s `SimplifyingPathParser` uses an internal arc approximation tolerance of `0.1`, so its rounded bbox checksum differs slightly from W3C F.6.5 90°-split; W1a provides exact byte-for-byte SHA-256 parity and W1b provides the idiomatic upstream Rust library comparison.)_
 
@@ -76,8 +76,8 @@ Input: `1,742,279 B` (`2,000` icons) | Verified stdout SHA-256: `f54a394e192f804
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 34.072 | 32.353 | 35.093 | 51.14 | 17035.73 | 5.92 MiB | 0.55x |
-| `rust_roxmltree_svgtypes` (`roxmltree 0.20.0` + `svgtypes 0.15.3`) | 18.748 | 16.930 | 18.875 | 92.93 | 9374.06 | 3.95 MiB | 1.00x (baseline) |
+| `pion` | 37.020 | 32.707 | 42.074 | 47.06 | 18510.25 | 5.86 MiB | 0.54x |
+| `rust_roxmltree_svgtypes` (`roxmltree 0.20.0` + `svgtypes 0.15.3`) | 19.937 | 18.961 | 21.804 | 87.39 | 9968.59 | 4.49 MiB | 1.00x (baseline) |
 
 ### W3: 2,000 SVG Icons Optimization
 Input: `1,742,279 B` (`2,000` icons, `1,720,290 B` icon payload)
@@ -86,19 +86,19 @@ Input: `1,742,279 B` (`2,000` icons, `1,720,290 B` icon payload)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Output Size | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 30.566 | 28.605 | 31.156 | 57.00 | 15282.88 | 5.95 MiB | 1,146,400 B (-33.4%) | 0.65x |
-| `rust_roxmltree_svgtypes` (`roxmltree` + `svgtypes` + same passes) | 19.720 | 18.994 | 20.260 | 88.35 | 9859.79 | 3.89 MiB | 1,146,400 B (-33.4%) | 1.00x (baseline) |
+| `pion` | 24.371 | 22.954 | 26.651 | 71.49 | 12185.45 | 6.11 MiB | 1,146,400 B (-33.4%) | 0.96x |
+| `rust_roxmltree_svgtypes` (`roxmltree` + `svgtypes` + same passes) | 23.290 | 20.137 | 52.635 | 74.81 | 11644.85 | 4.11 MiB | 1,146,400 B (-33.4%) | 1.00x (baseline) |
 
 - **W3b (Non-equivalent reference: Node `svgo@3.3.2` default ~30-plugin preset on same 2,000 icons; SHA-256: `0775ffca382b0d6de636e768d708c52b9556bddf285cb8c4cf2c40ed078157b6`)**
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Output Size |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `node_svgo` (`svgo@3.3.2`, Node v24.22.2; includes ~100 ms Node + `import('svgo')` startup) | 671.579 | 655.134 | 705.187 | 2.59 | 335789.65 | 176.77 MiB | 885,794 B (-48.5%) |
+| `node_svgo` (`svgo@3.3.2`, Node v24.22.1; includes ~213 ms Node + `import('svgo')` startup) | 2618.113 | 2235.121 | 2756.117 | 0.67 | 1309056.50 | 183.98 MiB | 885,794 B (-48.5%) |
 
 ### Honest Performance Summary
-- Against Rust `--release` running the exact same algorithm (SHA-256 verified), pure-Pion achieves **0.47x** on W1a (`65.9 ms` vs `31.1 ms`), **0.55x** on W2 (`34.1 ms` vs `18.7 ms`, where Pion also performs style cascade resolution), and **0.65x** on W3a (`30.6 ms` vs `19.7 ms`), with low peak RSS (`5.9–9.1 MiB`), while providing 0-ULP IEEE-754 number parsing, Payne-Hanek deterministic trigonometry, and full XML 1.0 well-formedness.
-- Against idiomatic upstream Rust (`svgtypes::SimplifyingPathParser` + `kurbo::BezPath::bounding_box`, W1b), pure-Pion (`65.9 ms`) is **0.66x** (`43.4 ms`).
-- W3b (`node_svgo@3.3.2`) is reported as a **non-equivalent reference** (no speedup headline claimed): `svgo`'s default ~30-plugin preset achieves deeper size reduction (`-48.5%` vs `-33.4%`) via additional passes (`removeUselessDefs`, `convertStyleToAttrs`, relative/absolute path conversion), and its wall-clock time (`671.6 ms`) includes ~100 ms of Node + ESM import startup cost (~571 ms steady-state optimization, `176.8 MiB` RSS).
+- Against Rust `--release` running the exact same algorithm (SHA-256 verified), pure-Pion achieves **0.90x** on W1a (`69.9 ms` vs `62.8 ms`), **0.54x** on W2 (`37.0 ms` vs `19.9 ms`, where Pion also performs full CSS style cascade resolution), and **0.96x** on W3a (`24.4 ms` vs `23.3 ms`), with low peak RSS (`5.9–9.2 MiB`), while providing 0-ULP IEEE-754 number parsing, Payne-Hanek deterministic trigonometry (4-mode Native/Wasm32 bit-exact), and full XML 1.0 well-formedness.
+- Against idiomatic upstream Rust (`svgtypes::SimplifyingPathParser` + `kurbo::BezPath::bounding_box`, W1b), pure-Pion (`69.9 ms`) is **1.41x faster** (`98.6 ms`).
+- W3b (`node_svgo@3.3.2`) is reported as a **non-equivalent reference** (no speedup headline claimed): `svgo`'s default ~30-plugin preset achieves deeper size reduction (`-48.5%` vs `-33.4%`) via additional passes (`removeUselessDefs`, `convertStyleToAttrs`, relative/absolute path conversion), and its wall-clock time (`2618 ms`) includes ~213 ms of Node + ESM import startup cost (`184.0 MiB` RSS).
 
 ## Formal Verification (Lean 4)
 

@@ -8,7 +8,7 @@ export PATH="$HOME/.pion/bin:$HOME/.cargo/bin:$PATH"
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/fix-svg-bench"
+OUT_DIR="${TMPDIR:-/tmp}/fix-svg-bench"
 BIN_DIR="$OUT_DIR/bin"
 NODE_DIR="$OUT_DIR/node_pkg"
 PATHS_FILE="$OUT_DIR/paths_50k.txt"
