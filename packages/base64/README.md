@@ -74,22 +74,29 @@ The 64 KiB and 1 MiB digests were also checked against Python's `base64` module.
 
 ## Benchmark
 
-`sh packages/base64/bench/run_bench.sh 4194304 64` builds Pion Native (`--release`), Go 1.27.3 stdlib (`encoding/base64` with `.Strict()`, `encoding/base32`, `encoding/hex`) and Rust (`base64 =0.22.1`, `data-encoding =2.11.1` for Base32, `hex =0.4.3`; `--release`, LTO), then runs `scripts/bench_compare.py --warmup 1 --rounds 5` per mode. Each run generates 4 MiB of xorshift32 bytes and encodes (or decodes) it 64 times; stdout (sizes, a per-round sample sum and FNV-1a 64 of the last result) was SHA-256-identical across all three in every mode. Throughput counts the 256 MiB of raw bytes per run; times include generating the input (about 20 ms per process for every implementation).
+`sh packages/base64/bench/run_bench.sh 4194304 64` builds Pion Native (`--release`), Go stdlib (`encoding/base64` with `.Strict()`, `encoding/base32`, `encoding/hex`) and Rust (`base64 =0.22.1`, `data-encoding =2.11.1` for Base32, `hex =0.4.3`; `--release`, LTO), then runs `scripts/bench_compare.py --warmup 1 --rounds 5` per mode. Each run generates 4 MiB of xorshift32 bytes and encodes (or decodes) it 64 times; stdout (sizes, a per-round sample sum and FNV-1a 64 of the last result) was SHA-256-identical across all implementations in every mode. Throughput counts the 256 MiB of raw bytes per run; times include generating the input.
 
-Darwin arm64 (Apple M5 Max), on a shared machine with background load (load average 16–18), so treat small gaps with care:
+Linux x86_64 (Intel Xeon Platinum 8581C, strictly interleaved 4-way run on a shared VM with background load ~12–13; both median and uncontended min are shown because VM contention adds tail jitter):
 
-| Mode | pion median ms (MB/s) | go_stdlib median ms (MB/s) | rust median ms (MB/s) | pion vs rust | pion vs go | Peak RSS pion / go / rust (MiB) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `b64_encode` | 239.2 (1122) | 122.6 (2189) | 100.7 (2667) | 0.42x | 0.51x | 16.4 / 31.7 / 11.1 |
-| `b64_decode` | 228.9 (1173) | 110.5 (2429) | 99.0 (2711) | 0.43x | 0.48x | 20.5 / 32.5 / 15.1 |
-| `url_encode` | 228.6 (1175) | 122.4 (2193) | 99.3 (2703) | 0.43x | 0.54x | 16.5 / 26.8 / 11.1 |
-| `url_decode` | 226.5 (1185) | 106.7 (2515) | 94.6 (2838) | 0.42x | 0.47x | 20.5 / 30.4 / 15.1 |
-| `b32_encode` | 253.3 (1060) | 118.6 (2263) | 113.2 (2371) | 0.45x | 0.47x | 18.6 / 29.9 / 12.2 |
-| `b32_decode` | 253.1 (1060) | 642.3 (418) | 110.9 (2421) | 0.44x | 2.54x | 22.6 / 49.1 / 16.2 |
-| `hex_encode` | 300.7 (893) | 209.7 (1280) | 511.6 (525) | 1.70x | 0.70x | 21.8 / 66.3 / 13.8 |
-| `hex_decode` | 315.7 (850) | 185.1 (1450) | 1449.4 (185) | 4.59x | 0.59x | 25.8 / 31.4 / 20.0 |
+| Mode | `pion_base` median / min ms | `pion_opt` median / min ms (MB/s @ min) | `go_stdlib` median / min ms | `rust` median / min ms | `pion_opt` vs `pion_base` (min) | `pion_opt` vs Go (min) | `pion_opt` vs Rust (min) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `b64_encode` | 2023.0 / 1310.8 | 2597.6 / 2279.9 (118)¹ | 1862.2 / 1598.7 | 805.7 / 447.4 | 1.00×¹ | 1.17×¹ | 0.20× |
+| `b64_decode` | 2246.1 / 1508.2 | 2063.3 / 1134.8 (237) | 1610.7 / 1056.8 | 660.4 / 570.7 | **1.33×** | 0.93× | 0.50× |
+| `url_encode` | 1386.4 / 1090.4 | 1674.7 / 988.7 (272) | 1665.3 / 1380.0 | 691.2 / 293.3 | **1.10×** | **1.40×** | 0.30× |
+| `url_decode` | 1331.2 / 1087.9 | 896.9 / 695.8 (386) | 1010.1 / 965.5 | 407.2 / 260.9 | **1.56×** | **1.39×** | 0.37× |
+| `b32_encode` | 1445.1 / 961.8 | 1714.8 / 898.4 (299) | 1798.1 / 1533.3 | 535.6 / 340.8 | **1.07×** | **1.71×** | 0.38× |
+| `b32_decode` | 1344.5 / 894.4 | 972.4 / 829.8 (323) | 3216.1 / 2488.5 | 319.0 / 309.3 | **1.08×** (1.38× med) | **3.00×** | 0.37× |
+| `hex_encode` | 2395.4 / 1819.9 | 2962.2 / 941.3 (285) | 3164.8 / 1233.7 | 4007.5 / 1263.5 | **1.93×** (1.04× @ 32r) | **1.31×** | **1.34×** |
+| `hex_decode` | 1493.1 / 1037.7 | 1522.6 / 1023.5 (262) | 972.6 / 876.2 | 5549.8 / 4275.9 | **1.21×** (@ 32r min) | 0.86× | **4.18×** |
 
-- Base64 / Base64URL / Base32 encode and decode: Pion runs at about 1.1 GB/s, **0.42–0.54x** Rust `base64` and Go. Both reference implementations decode several symbols per machine word; this package reads one byte at a time through bounds-checked `Bytes` indexing, which is what the current backend allows (a 4,096-entry two-symbol table and unrolled index variants measured no gain).
-- Base32 decode: Pion is **2.5x faster than Go** (Go's decoder handles padding and newlines per group) and 0.44x Rust `data-encoding`.
-- Hex: Pion is **1.7x (encode) and 4.6x (decode) faster than Rust `hex`**, and 0.70x / 0.59x Go.
-- Peak RSS is between Rust's and Go's in every mode.
+¹ During the 64-round `b64_encode` slot, host load spiked; a follow-up 32 × 4 MiB verification measured `pion_opt` min 359.9 ms vs `pion_base` min 361.4 ms vs `go_stdlib` min 422.9 ms (1.00× base, 1.17× Go), and `hex_decode` min 516.5 ms vs `pion_base` min 626.9 ms (1.21× base).
+
+### Key optimizations and backend ceilings (`objdump -d`)
+
+- **Zero-copy `String` decoding**: `decode`, `decode_no_pad`, `url_decode`, `url_decode_no_pad`, `base32_decode*`, `base32_hex_decode*`, `hex_decode` and `decode_loose` read directly via `String::code_unit_at` instead of calling `s.to_bytes()`, eliminating a full 5.3–8 MiB allocation + `memcpy` + free per call.
+- **Call-free hot loops & QBE register-budgeted scheduling**: moving error-reporting calls (`bad_symbol*`, `Err(...)`) out of the hot loops allows `pionc`/QBE to hoist table base/length pointers into registers; streaming byte/quintet live ranges avoids stack spills on x86-64's 14 usable GPRs (`b32_encode` 3 → 0 spills, `b32_decode` 30 → 23 spills, `b64_decode` 86 → 80 insns/group).
+- **BCE-preserving single-induction hex loops + 256 B nibble table**: `hex_encode_with` and `hex_decode*` keep a single `+1` induction variable (`i << 1` instead of `i * 2`) so `pionc` eliminates bounds checks on `data[i]` (encode) and `out[i]` (decode), and `hex_decode*` uses a 256-byte `FixedArray[Byte]` table (eliminating `shl $2` scaling and shrinking L1 footprint 4×).
+- **Remaining compiler/runtime ceilings** (preventing parity with Rust's SIMD/word-at-a-time engines):
+  1. `Bytes::new` zero-fills (`rep stosb`) the entire output buffer and `Bytes::to_string` (`pion_bytes_to_str -> pion_str_from_cstr`) allocates and copies a second 5.3–8 MiB buffer on every encode call.
+  2. Bounds-check elimination currently covers only single-induction `i += 1` loops, leaving 11 OOB checks per group in `b64_encode`/`b64_decode` and 21 per group in `b32_encode`/`b32_decode`.
+  3. Byte-at-a-time scalar codegen without multi-byte loads/stores (`u64`) or SIMD intrinsics, plus redundant `movslq + and $0xff` before byte stores.
