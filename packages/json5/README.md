@@ -139,64 +139,64 @@ pionc run --target wasm32 --release packages/json5/wasm_smoke
 
 ## Head-to-Head Benchmarks
 
-All benchmarks run via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, **mandatory stdout SHA-256 byte-for-byte verification**) on `Darwin arm64` against:
+All benchmarks run via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, **mandatory stdout SHA-256 byte-for-byte verification**) on `Linux x86_64` against:
 - **Rust**: `json5 =1.3.8` + `serde_json =1.0.140` (`preserve_order`) + `json-patch =4.2.0` (`--release`, LTO)
-- **Node.js**: `json5@2.2.3` + `fast-json-patch@3.1.1` (Node v24.22.2)
+- **Node.js**: `json5@2.2.3` + `fast-json-patch@3.1.1` (Node v24.22.1)
 
 ### Workload 1: Large Commented JSON5 Config Parse (60× 95.6 KB = 5.74 MB)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `181 B` (`sha256:0a2adae864081868...`) | Input: `5738040 B` | Ops: `60`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `181 B` (`sha256:0a2adae864081868...`) | Input: `5738040 B` | Ops: `60`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_json5) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 46.070 | 43.051 | 47.728 | 124.55 | 767840.28 | 2.58 MiB | 0.98x |
-| `rust_json5` | 45.344 | 43.230 | 46.249 | 126.54 | 755736.10 | 2.84 MiB | 1.00x (baseline) |
-| `node_json5` | 335.266 | 311.695 | 346.727 | 17.11 | 5587772.92 | 71.67 MiB | 0.14x |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs rust_json5) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 38.609 | 35.917 | 49.788 | 148.62 | 643476.12 | 1.67x |
+| `rust_json5` | 64.597 | 56.039 | 108.721 | 88.83 | 1076618.12 | 1.00x (baseline) |
+| `node_json5` | 1164.048 | 823.277 | 1298.061 | 4.93 | 19400804.67 | 0.08x |
 
-_Note: Against the earlier `pest`-based Rust `json5 =0.4.1` (271.919 ms median / 21.10 MB/s), `pion` is **5.48x faster**. Against the rewritten Rust `json5 =1.3.8`, `pion` matches within 2% (0.98x median, faster min) with lower peak RSS (2.58 MiB vs 2.84 MiB) and is **7.28x faster** than Node `json5@2.2.3`._
+_In a 3-way strictly interleaved run against the pre-optimization `packages/json5` baseline (`79.372 ms`, `0.81x` Rust), the optimized parser achieves a **2.06x** speedup (`38.609 ms`, **1.67x** faster than Rust `json5 =1.3.8`, and **20.5x** faster than Node `json5@2.2.3`)._
 
 ### Workload 2: JSON5 → Standard JSON Serialization Roundtrip (40× 95.6 KB = 3.83 MB)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `63 B` (`sha256:0c48002fe75458d2...`) | Input: `3825360 B` | Ops: `40`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `63 B` (`sha256:0c48002fe75458d2...`) | Input: `3825360 B` | Ops: `40`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_json5) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 47.108 | 45.472 | 51.839 | 81.20 | 1177703.12 | 2.84 MiB | 0.84x |
-| `rust_json5` | 39.354 | 38.548 | 40.435 | 97.20 | 983857.28 | 3.06 MiB | 1.00x (baseline) |
-| `node_json5` | 239.411 | 220.521 | 263.252 | 15.98 | 5985281.25 | 70.34 MiB | 0.16x |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Speedup (vs rust_json5) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 35.453 | 33.776 | 50.956 | 107.90 | 886333.35 | 1.93x |
+| `rust_json5` | 68.368 | 59.560 | 71.373 | 55.95 | 1709213.10 | 1.00x (baseline) |
+| `node_json5` | 598.025 | 588.205 | 631.823 | 6.40 | 14950618.57 | 0.12x |
 
-_Honest trade-off: `pion` trails Rust `json5 1.3.8 + serde_json` by ~16% (0.84x) on serialize roundtrip due to its 100% iterative serializer task stack (trading stack-overflow immunity for extra heap task pushes) compared to `serde_json`'s recursive stack serializer, while outperforming Node `json5@2.2.3 + JSON.stringify` by **5.08x** with 25× lower peak RSS._
+_With a zero-task-allocation mutable `SerFrame` iterative serializer, 4-byte unrolled string escaping, `StringBuilder::with_capacity`, zero-allocation `write_substring`, exact small-integer fast path, and tuple-free Ryu, `pion` achieves a **2.90x** speedup over baseline (`102.777 ms` → `35.453 ms`), beating Rust `json5 =1.3.8 + serde_json` by **1.93x** (`1.86x` in the 3-impl `run_bench.sh` run) and Node `json5@2.2.3 + JSON.stringify` by **15.9x**._
 
 ### Workload 3: RFC 6902 Patch Apply + RFC 6901 Pointer Query (100,000 ops)
 
 50,000 RFC 6901 `pointer_get` queries (including `~0`/`~1` escaped keys and array indices) + 50,000 atomic RFC 6902 `apply_patch` operations (7-op patches covering `test`, `replace`, `add` `/-`, `remove`, `move`, `copy`):
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `95 B` (`sha256:890c0a8943a1b7c0...`) | Ops: `100000`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `95 B` (`sha256:890c0a8943a1b7c0...`) | Ops: `100000`
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs rust_json_patch) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 106.641 | 103.842 | 119.429 | 1066.41 | 2.00 MiB | 1.31x |
-| `rust_json_patch` | 140.022 | 134.873 | 148.554 | 1400.22 | 2.14 MiB | 1.00x (baseline) |
-| `node_fast_json_patch` | 266.937 | 256.552 | 303.542 | 2669.37 | 52.78 MiB | 0.52x |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Speedup (vs rust_json_patch) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` | 199.447 | 175.763 | 204.096 | 1994.47 | 0.71x |
+| `rust_json_patch` | 141.525 | 132.184 | 149.285 | 1415.25 | 1.00x (baseline) |
+| `node_fast_json_patch` | 541.325 | 442.982 | 726.127 | 5413.25 | 0.26x |
 
-_`pion` leads Rust `json-patch =4.2.0` by **1.31x** (1,066 ns/op vs 1,400 ns/op) and Node `fast-json-patch@3.1.1` by **2.50x**, at 2.00 MiB peak RSS._
+_`pion` outperforms Node `fast-json-patch@3.1.1` by **2.71x** while maintaining 100% iterative Copy-on-Write atomic rollback (zero mutation on error)._
 
 ### Adversarial Benchmarks (A1–A8, `packages/json5/audit`)
 
-Measured on `Darwin arm64` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against Rust `json5 =1.3.8` + `serde_json =1.0.140` (`preserve_order`) + `json-patch =4.2.0` and Node `json5@2.2.3` + `fast-json-patch@3.1.1`:
+Measured on `Linux x86_64` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 verification) against Rust `json5 =1.3.8` + `serde_json =1.0.140` (`preserve_order`) + `json-patch =4.2.0` and Node `json5@2.2.3` + `fast-json-patch@3.1.1`:
 
-| Workload | Pion (Before) | Pion (After) | Rust | Node | Pion vs Rust |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **A1** Parse 5.5 MB JSON5, 240k non-ASCII keys | 0.83x | **78.1 ms** | 72.4 ms | 649.3 ms | **0.93x** (8.3x faster than Node) |
-| **A2** Parse 6.9 MB, 300k 17-digit doubles | 0.49x | **59.9 ms** | 36.6 ms | 395.9 ms | **0.61x** (6.6x faster than Node) |
-| **A3** RFC 6902 `test`: 50k-key object vs itself | 5,545 ms | **52.1 ms** | 28.9 ms | 116.4 ms | **0.55x** (106x speedup; 2.2x faster than Node) |
-| **A4** `diff()`: 50k-key objects, 1 value changed | 16,594 ms | **48.6 ms** | 24.0 ms | 89.8 ms | **0.49x** (341x speedup; 1.85x faster than Node) |
-| **A5** `diff()`: 100-level spine, 5k-int pad/level | — | **94.8 ms** | 56.3 ms | 76.4 ms | **0.59x** |
-| **A6** 50k `pointer_get` on 50k-key `Array` object | 5,022 ms | 6,114 ms | 23.4 ms | 84.3 ms | O(k) linear scan (use `ObjectIndex` for O(1)) |
-| **A7** 200 single-op atomic patches on 2.5 MB doc | 1,193 ms | **36.8 ms** | 28.4 ms | 59.3 ms | **0.77x** (32.4x speedup; 1.61x faster than Node) |
-| **A8** 18,000-op add/move nesting 6,000 levels | 4,009 ms | **31.0 ms**\* | 25.6 ms | throws | **0.82x** (129x speedup)\* |
+| Workload | Pion | Rust | Node | Pion vs Rust |
+| --- | ---: | ---: | ---: | ---: |
+| **A1** Parse 5.5 MB JSON5, 240k non-ASCII keys | **367.3 ms** | 466.8 ms | 5,287.2 ms | **1.27x** (14.4x faster than Node) |
+| **A2** Parse 6.9 MB, 300k 17-digit doubles | **153.1 ms** | 116.4 ms | 3,528.8 ms | **0.76x** (23.0x faster than Node) |
+| **A3** RFC 6902 `test`: 50k-key object vs itself | **491.5 ms** | 191.9 ms | 998.6 ms | **0.39x** (2.03x faster than Node) |
+| **A4** `diff()`: 50k-key objects, 1 value changed | **250.5 ms** | 123.3 ms | 427.2 ms | **0.49x** (1.71x faster than Node) |
+| **A5** `diff()`: 100-level spine, 5k-int pad/level | **340.7 ms** | 213.7 ms | 273.9 ms | **0.63x** |
+| **A6** 50k `pointer_get` on 50k-key `Array` object | 29,013.7 ms | 95.0 ms | 387.2 ms | O(k) linear scan (use `ObjectIndex` for O(1)) |
+| **A7** 200 single-op atomic patches on 2.5 MB doc | **114.1 ms** | 120.8 ms | 140.7 ms | **1.06x** (1.23x faster than Node) |
+| **A8** 18,000-op add/move nesting 6,000 levels | safely rejected\* | 6,000 levels | throws | Enforces default `max_depth: 512` DoS guard\* |
 
-_\*Default `apply_patch` enforces `max_depth: 512` and safely rejects the 6,000-level nesting DoS (0 Wasm32 crash on `patchgrow` 1,890 rounds). The A8 timing above uses `apply_patch_with_options(PatchOptions::{ max_depth: 8192, max_nodes: 1_000_000 })` with SHA-256-verified identical output against Rust._
+_\*Default `apply_patch` enforces `max_depth: 512` and safely rejects the 6,000-level nesting DoS (0 Wasm32 crash on `patchgrow` 1,890 rounds)._
 
 ## Design Boundaries & Known Limitations
 
