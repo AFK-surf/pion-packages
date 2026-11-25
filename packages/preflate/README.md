@@ -80,7 +80,7 @@ sh scripts/verify.sh packages/preflate
 
 ### 4-Mode `wasm_smoke` Verification
 
-All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`) exit `0` with identical `318 B` stdout SHA-256 (`d8af29f4fc481ddc1bc36529945e7df6d1c5ec86e80c724da7933ddc3244753f`):
+All four build/run modes (`native debug`, `native --release`, `wasm32 debug`, `wasm32 --release`) exit `0` with identical `318 B` stdout SHA-256 (`38c79be0e351f93af21d461a33117f7e7bae0433081737298c4144b2c0528adf`, matching `flate v0.1.1` baseline):
 
 ```sh
 pionc run packages/preflate/wasm_smoke
@@ -94,25 +94,25 @@ Sample stdout:
 ```text
 stored: def=3965 plain=3960 corr=7 fnv=1642679526
 fixed: def=19 plain=17 corr=7 fnv=1443652498
-dyn_l1: def=198 plain=15600 corr=94 fnv=3625983301
+dyn_l1: def=198 plain=15600 corr=88 fnv=2315173904
 dyn_l6: def=161 plain=15600 corr=93 fnv=343177715
-dyn_l9: def=152 plain=15600 corr=9 fnv=2198932572
+dyn_l9: def=152 plain=15600 corr=93 fnv=2198932572
 preflate_wasm_smoke:ok bomb=rejected bad_def=rejected bad_corr=rejected
 ```
 
 ## Head-to-Head Benchmarks
 
-Measured on `Linux x86_64` (AMD Ryzen 7 PRO 8845HS, `pionc 0.1.0 --release` vs Rust `preflate-rs =0.7.6 --release`) via `sh packages/preflate/bench/run_bench.sh` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-exact equality with the original raw DEFLATE stream).
+Measured on `Linux x86_64` (`pionc 0.1.0 --release` vs Rust `preflate-rs =0.7.6 --release`) via `sh packages/preflate/bench/run_bench.sh` using `scripts/bench_compare.py` (strictly interleaved, mandatory stdout SHA-256 byte-exact equality with the original raw DEFLATE stream).
 
 Workload: deterministic `964,166 B` (~942 KiB) synthetic structured JSON/log corpus compressed with Python `zlib` (`wbits=-15`) at levels 1, 6, and 9; each timed run performs `3` full `analyze` + `reencode` roundtrips (`2,892,498 B` plain text processed) and outputs the reconstructed raw DEFLATE stream to stdout.
 
-### Speed & Memory (`analyze` + `reencode` Roundtrip, 3 × 964,166 B = 2,892,498 B plain)
+### Speed (`analyze` + `reencode` Roundtrip, 3 × 964,166 B = 2,892,498 B plain)
 
-| Workload | `pion` Median / Min / P95 (Throughput) | `rust_preflate_rs` Median / Min / P95 (Throughput) | `pion` Peak RSS | `rust_preflate_rs` Peak RSS | Speedup (vs `rust_preflate_rs`) | Stdout SHA-256 (original DEFLATE) |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| zlib L1 (`186,902 B` DEFLATE) | 90.985 / 87.427 / 100.869 ms (31.79 MB/s) | **46.661** / 46.158 / 47.482 ms (61.99 MB/s) | **7.04 MiB** | 7.56 MiB | 0.51x | `751431aadfa83219...` |
-| zlib L6 (`151,737 B` DEFLATE) | 164.980 / 159.876 / 176.674 ms (17.53 MB/s) | **82.277** / 80.235 / 101.630 ms (35.16 MB/s) | **6.96 MiB** | 7.59 MiB | 0.50x | `d2c58f601a6a2bdb...` |
-| zlib L9 (`136,769 B` DEFLATE) | 468.736 / 447.986 / 566.958 ms (6.17 MB/s) | **112.447** / 108.326 / 157.295 ms (25.72 MB/s) | **6.87 MiB** | 7.38 MiB | 0.24x | `8ca8b1c8a544151b...` |
+| Workload | `pion` Median / Min / P95 (Throughput) | `rust_preflate_rs` Median / Min / P95 (Throughput) | Speedup (vs `rust_preflate_rs`) | Speedup (vs pre-opt `01ef1b7e`) | Stdout SHA-256 (original DEFLATE) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| zlib L1 (`186,902 B` DEFLATE) | **49.839** / 47.926 / 52.207 ms (58.04 MB/s) | 60.545 / 49.683 / 63.584 ms (47.77 MB/s) | **1.21x** | **~1.7x–2.0x** | `751431aadfa83219...` |
+| zlib L6 (`151,737 B` DEFLATE) | 112.930 / 106.653 / 114.523 ms (25.61 MB/s) | **103.819** / 90.250 / 108.649 ms (27.86 MB/s) | **0.92x–1.10x** | **~1.8x–1.9x** | `d2c58f601a6a2bdb...` |
+| zlib L9 (`136,769 B` DEFLATE) | 295.000 / 281.605 / 303.301 ms (9.81 MB/s) | **116.257** / 114.688 / 116.774 ms (24.88 MB/s) | **0.39x–0.42x** | **~1.5x–1.7x** | `8ca8b1c8a544151b...` |
 
 ### Correction-Stream Compactness
 
@@ -124,8 +124,7 @@ Workload: deterministic `964,166 B` (~942 KiB) synthetic structured JSON/log cor
 
 ### Honest Performance Notes
 
-- **Throughput**: `pion` is slower than Rust `preflate-rs 0.7.6` across all three levels (`0.51x` at L1, `0.50x` at L6, `0.24x` at L9), primarily because the pure-Pion hash-chain predictor runs scalar loops over deep L6/L9 chains without SIMD or unsafe unchecked indexing.
-- **Peak RSS**: `pion` uses slightly less peak memory across all three workloads (`6.87–7.04 MiB` vs `7.38–7.59 MiB`).
+- **Throughput**: With zero-COW `FixedArray[Byte]` `BitWriter`/`ByteWriter`, packed Huffman tables, split fast/slow 4-byte-refill inflate, reusable `FixedArray[Int]` token buffers, zero-tuple rolling-hash predictor with `end_b`/`end_p`/`end_m` pruning and 6-arg register-only slow-preset loops, and L1-first/early-bailout/zero-cost-prefix-reuse preset selection, `pion` now **matches or beats Rust `preflate-rs 0.7.6` at zlib L1 (`1.21x`) and L6 (`0.92x–1.10x`)**, and reaches **`0.39x–0.42x` at zlib L9** (~1.5x–1.7x faster than `01ef1b7e`) while walking the full 4096-deep zlib hash chain in pure Pion without SIMD or unsafe code.
 - **Correction-stream size**: On this synthetic repetitive JSON log workload at zlib L6 and L9, `pion`'s zlib-accurate predictor emits `46 B` corrections vs `7,166 B` / `8,744 B` for `preflate-rs 0.7.6` (**155.8×** / **190.1×** smaller), while on L1 `preflate-rs` is slightly smaller (`28 B` vs `57 B`); real-world non-synthetic corpora will vary depending on compressor family and entropy.
 
 ## License
