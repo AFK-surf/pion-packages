@@ -21,6 +21,10 @@ pub struct Reader {
   mut entries_read : Int
   mut eof : Bool
   mut sticky_err : Option[TarError]
+  mut last_uname : String
+  mut last_gname : String
+  empty_sparse : Array[SparseEntry]
+  empty_bytes : Bytes
 }
 
 ///| Create a new `Reader` with default security limits.
@@ -30,6 +34,7 @@ pub fn Reader::new(data : Bytes) -> Reader {
 
 ///| Create a new `Reader` with explicit resource limits.
 pub fn Reader::with_limits(data : Bytes, limits : Limits) -> Reader {
+  let empty_sp : Array[SparseEntry] = []
   Reader::{
     data: data,
     total_len: data.length().to_int64(),
@@ -40,7 +45,7 @@ pub fn Reader::with_limits(data : Bytes, limits : Limits) -> Reader {
     cur_logical_size: 0L,
     cur_pad: 0L,
     cur_is_sparse: false,
-    cur_sparse_datas: [],
+    cur_sparse_datas: empty_sp,
     cur_data_read: true,
     cur_logical_pos: 0L,
     cur_sparse_idx: 0,
@@ -48,6 +53,10 @@ pub fn Reader::with_limits(data : Bytes, limits : Limits) -> Reader {
     entries_read: 0,
     eof: false,
     sticky_err: Option::None,
+    last_uname: "",
+    last_gname: "",
+    empty_sparse: empty_sp,
+    empty_bytes: Bytes::new(0),
   }
 }
 
@@ -118,7 +127,8 @@ fn kv_set_indexed(
   }
 }
 
-///| Parse a PAX extended header payload from `data[start..end]` in O(n) time.
+///| Parse a PAX extended header payload directly from `data[start..end]` (`Bytes`) in O(n) time.
+///| Uses zero-`Map` linear deduplication for `<= 16` records and switches lazily to `Map` for large headers.
 fn parse_pax_payload(
   data : Bytes,
   start : Int,
@@ -131,8 +141,8 @@ fn parse_pax_payload(
   }
   let pax_str = data.slice(start, end).to_string()
   let records : Array[(String, String)] = []
-  let idx_map : Map[String, Int] = Map::new()
-  let sparse_tokens : Array[String] = []
+  let mut idx_map : Option[Map[String, Int]] = Option::None
+  let mut sparse_tokens : Option[Array[String]] = Option::None
   let mut pos = 0
   let mut rec_count = 0
   while pos < raw_len {
@@ -146,31 +156,91 @@ fn parse_pax_payload(
     }
     pos = next_pos
     if k == "GNU.sparse.offset" || k == "GNU.sparse.numbytes" {
-      let is_even = (sparse_tokens.length() % 2) == 0
+      let toks = match sparse_tokens {
+        Some(a) => a
+        None => {
+          let a : Array[String] = []
+          sparse_tokens = Option::Some(a)
+          a
+        }
+      }
+      let is_even = (toks.length() % 2) == 0
       if (is_even && k != "GNU.sparse.offset") ||
       (!is_even && k != "GNU.sparse.numbytes") ||
       str_contains_comma(v) {
         return Err(TarError::InvalidHeader("malformed GNU.sparse 0.0 record"))
       }
-      if sparse_tokens.length() / 2 >= limits.max_sparse_holes {
+      if toks.length() / 2 >= limits.max_sparse_holes {
         return Err(TarError::LimitExceeded("sparse entries exceed max_sparse_holes"))
       }
-      sparse_tokens.push(v)
+      toks.push(v)
     } else {
-      kv_set_indexed(records, idx_map, k, v)
+      match idx_map {
+        Some(m) => kv_set_indexed(records, m, k, v)
+        None => {
+          let rn = records.length()
+          let mut found = false
+          let mut ri = 0
+          while ri < rn {
+            let (rk, _) = records[ri]
+            if rk == k {
+              records[ri] = (k, v)
+              found = true
+              break
+            }
+            ri = ri + 1
+          }
+          if !found {
+            records.push((k, v))
+            if rn + 1 >= 16 {
+              let m : Map[String, Int] = Map::new()
+              let mut mi = 0
+              while mi < records.length() {
+                let (mk, _) = records[mi]
+                m.set(mk, mi)
+                mi = mi + 1
+              }
+              idx_map = Option::Some(m)
+            }
+          }
+        }
+      }
     }
   }
-  if sparse_tokens.length() > 0 {
-    let sb = StringBuilder::new()
-    let mut i = 0
-    while i < sparse_tokens.length() {
-      if i > 0 {
-        sb.write_string(",")
+  match sparse_tokens {
+    Some(toks) =>
+    if toks.length() > 0 {
+      let sb = StringBuilder::new()
+      let mut i = 0
+      while i < toks.length() {
+        if i > 0 {
+          sb.write_string(",")
+        }
+        sb.write_string(toks[i])
+        i = i + 1
       }
-      sb.write_string(sparse_tokens[i])
-      i = i + 1
+      let sv = sb.to_string()
+      match idx_map {
+        Some(m) => kv_set_indexed(records, m, "GNU.sparse.map", sv)
+        None => {
+          let mut found = false
+          let mut ri = 0
+          while ri < records.length() {
+            let (rk, _) = records[ri]
+            if rk == "GNU.sparse.map" {
+              records[ri] = ("GNU.sparse.map", sv)
+              found = true
+              break
+            }
+            ri = ri + 1
+          }
+          if !found {
+            records.push(("GNU.sparse.map", sv))
+          }
+        }
+      }
     }
-    kv_set_indexed(records, idx_map, "GNU.sparse.map", sb.to_string())
+    None => ()
   }
   Ok(records)
 }
@@ -394,11 +464,58 @@ fn parse_old_gnu_sparse_map(
   Ok((real_size, spd, ext_consumed))
 }
 
+///| Parse a NUL-terminated C-string with last-value cache (zero allocation on repeated `uname`/`gname`).
+fn parse_c_string_cached(data : Bytes, start : Int, len : Int, cached : String) -> (String, Bool) {
+  if len <= 0 || data[start].to_int() == 0 {
+    return ("", false)
+  }
+  let limit = start + len
+  let mut end = start + 1
+  while end < limit {
+    if data[end].to_int() == 0 {
+      break
+    }
+    end = end + 1
+  }
+  let slen = end - start
+  if slen == cached.length() {
+    let mut i = 0
+    let mut eq = true
+    while i < slen {
+      if data[start + i].to_int() != cached.code_unit_at(i) {
+        eq = false
+        break
+      }
+      i = i + 1
+    }
+    if eq {
+      return (cached, false)
+    }
+  }
+  (data.slice(start, end).to_string(), true)
+}
+
+///| Fast numeric field parser: single-loop octal fast path with exact fallback to `#verify parse_numeric_slice`.
+fn parse_num_fast(data : Bytes, start : Int, end : Int) -> Result[Int64, TarError] {
+  let v = parse_octal_fast(data, start, end)
+  if v >= 0L {
+    return Ok(v)
+  }
+  parse_numeric_slice(data, start, end)
+}
+
+///| Internal result of reading a single 512-byte raw header block.
+enum RawHeaderResult {
+  Eof
+  Meta(Byte, Int64)
+  Entry(Header, Int)
+}
+
 ///| Read and parse a single 512-byte raw header block at `self.pos`.
-fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
+fn read_raw_header(self : Reader, skip_name : Bool) -> Result[RawHeaderResult, TarError] {
   if self.pos >= self.total_len {
     self.eof = true
-    return Ok(Option::None)
+    return Ok(RawHeaderResult::Eof)
   }
   if self.total_len - self.pos < 512L {
     return Err(TarError::UnexpectedEof)
@@ -408,7 +525,7 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
   if is_zero_block(self.data, off) {
     if self.pos >= self.total_len {
       self.eof = true
-      return Ok(Option::None)
+      return Ok(RawHeaderResult::Eof)
     }
     if self.total_len - self.pos < 512L {
       return Err(TarError::UnexpectedEof)
@@ -417,7 +534,7 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
     self.pos = self.pos + 512L
     if is_zero_block(self.data, off2) {
       self.eof = true
-      return Ok(Option::None)
+      return Ok(RawHeaderResult::Eof)
     }
     return Err(TarError::InvalidHeader("non-zero block after zero block"))
   }
@@ -428,28 +545,63 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
   }
 
   let typeflag = self.data[off + 156]
-  let mut name = parse_c_string(self.data, off + 0, 100)
+  let mode = match parse_num_fast(self.data, off + 100, off + 108) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let uid = match parse_num_fast(self.data, off + 108, off + 116) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let gid = match parse_num_fast(self.data, off + 116, off + 124) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let size = match parse_num_fast(self.data, off + 124, off + 136) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let mtime_sec = match parse_num_fast(self.data, off + 136, off + 148) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+
+  // Fast path for meta-headers ('x', 'L', 'K'): validate remaining numeric fields without String/Header allocs.
+  if typeflag == type_x_header() ||
+  typeflag == type_gnu_long_name() ||
+  typeflag == type_gnu_long_link() {
+    match raw_fmt {
+      V7 => ()
+      _ => {
+        match parse_num_fast(self.data, off + 329, off + 337) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        match parse_num_fast(self.data, off + 337, off + 345) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+        match raw_fmt {
+          Star => {
+            match parse_num_fast(self.data, off + 476, off + 488) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+            match parse_num_fast(self.data, off + 488, off + 500) {
+              Ok(_) => ()
+              Err(e) => return Err(e)
+            }
+          }
+          _ => ()
+        }
+      }
+    }
+    return Ok(RawHeaderResult::Meta(typeflag, size))
+  }
+
+  let do_skip_name = skip_name && typeflag != type_x_global_header()
+  let mut name = if do_skip_name { "" } else { parse_c_string(self.data, off + 0, 100) }
   let linkname = parse_c_string(self.data, off + 157, 100)
-  let mode = match parse_numeric_slice(self.data, off + 100, off + 108) {
-    Ok(v) => v
-    Err(e) => return Err(e)
-  }
-  let uid = match parse_numeric_slice(self.data, off + 108, off + 116) {
-    Ok(v) => v
-    Err(e) => return Err(e)
-  }
-  let gid = match parse_numeric_slice(self.data, off + 116, off + 124) {
-    Ok(v) => v
-    Err(e) => return Err(e)
-  }
-  let size = match parse_numeric_slice(self.data, off + 124, off + 136) {
-    Ok(v) => v
-    Err(e) => return Err(e)
-  }
-  let mtime_sec = match parse_numeric_slice(self.data, off + 136, off + 148) {
-    Ok(v) => v
-    Err(e) => return Err(e)
-  }
   let mod_time = Timestamp::unix(mtime_sec, 0L)
 
   let mut uname = ""
@@ -463,20 +615,30 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
   match raw_fmt {
     V7 => ()
     _ => {
-      uname = parse_c_string(self.data, off + 265, 32)
-      gname = parse_c_string(self.data, off + 297, 32)
-      devmajor = match parse_numeric_slice(self.data, off + 329, off + 337) {
+      let (un, un_upd) = parse_c_string_cached(self.data, off + 265, 32, self.last_uname)
+      if un_upd {
+        self.last_uname = un
+      }
+      uname = un
+      let (gn, gn_upd) = parse_c_string_cached(self.data, off + 297, 32, self.last_gname)
+      if gn_upd {
+        self.last_gname = gn
+      }
+      gname = gn
+      devmajor = match parse_num_fast(self.data, off + 329, off + 337) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
-      devminor = match parse_numeric_slice(self.data, off + 337, off + 345) {
+      devminor = match parse_num_fast(self.data, off + 337, off + 345) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
       let mut prefix = ""
       match raw_fmt {
         Ustar => {
-          prefix = parse_c_string(self.data, off + 345, 155)
+          if !do_skip_name {
+            prefix = parse_c_string(self.data, off + 345, 155)
+          }
           let strict_ok = !has_non_ascii &&
           self.data[off + 107].to_int() == 0 &&
           self.data[off + 115].to_int() == 0 &&
@@ -490,12 +652,14 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
           }
         }
         Star => {
-          prefix = parse_c_string(self.data, off + 345, 131)
-          let at = match parse_numeric_slice(self.data, off + 476, off + 488) {
+          if !do_skip_name {
+            prefix = parse_c_string(self.data, off + 345, 131)
+          }
+          let at = match parse_num_fast(self.data, off + 476, off + 488) {
             Ok(v) => v
             Err(e) => return Err(e)
           }
-          let ct = match parse_numeric_slice(self.data, off + 488, off + 500) {
+          let ct = match parse_num_fast(self.data, off + 488, off + 500) {
             Ok(v) => v
             Err(e) => return Err(e)
           }
@@ -505,13 +669,13 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
         Gnu => {
           let mut gnu_time_ok = true
           if self.data[off + 345].to_int() != 0 {
-            match parse_numeric_slice(self.data, off + 345, off + 357) {
+            match parse_num_fast(self.data, off + 345, off + 357) {
               Ok(at) => access_time = Timestamp::unix(at, 0L)
               Err(_) => gnu_time_ok = false
             }
           }
           if gnu_time_ok && self.data[off + 357].to_int() != 0 {
-            match parse_numeric_slice(self.data, off + 357, off + 369) {
+            match parse_num_fast(self.data, off + 357, off + 369) {
               Ok(ct) => change_time = Timestamp::unix(ct, 0L)
               Err(_) => gnu_time_ok = false
             }
@@ -519,9 +683,11 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
           if !gnu_time_ok {
             access_time = Timestamp::zero()
             change_time = Timestamp::zero()
-            let pfx_cand = parse_c_string(self.data, off + 345, 155)
-            if is_ascii(pfx_cand) {
-              prefix = pfx_cand
+            if !do_skip_name {
+              let pfx_cand = parse_c_string(self.data, off + 345, 155)
+              if is_ascii(pfx_cand) {
+                prefix = pfx_cand
+              }
             }
             fmt = TarFormat::Unknown
           }
@@ -553,7 +719,7 @@ fn read_raw_header(self : Reader) -> Result[Option[(Header, Int)], TarError] {
     pax_records: [],
     format: fmt,
   }
-  Ok(Option::Some((hdr, off)))
+  Ok(RawHeaderResult::Entry(hdr, off))
 }
 
 ///| Convert a `TarFormat` bitmask (`1=USTAR`, `2=PAX`, `4=GNU`) back to `TarFormat`.
@@ -605,22 +771,93 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
 
   let mut meta_fmt_mask = 7 // 1=USTAR, 2=PAX, 4=GNU
   let mut has_pax = false
-  let mut pax_records : Array[(String, String)] = []
+  let mut has_pax_path = false
+  let mut pax_records : Option[Array[(String, String)]] = Option::None
   let mut has_gnu_long_name = false
   let mut gnu_long_name = ""
   let mut has_gnu_long_link = false
   let mut gnu_long_link = ""
 
   while true {
-    let (raw_hdr, hdr_off) = match read_raw_header(self) {
-      Ok(Some(pair)) => pair
-      Ok(None) => return Ok(Option::None)
+    let skip_name = (has_gnu_long_name && gnu_long_name.length() > 0) || has_pax_path
+    let (raw_hdr, hdr_off) = match read_raw_header(self, skip_name) {
+      Ok(RawHeaderResult::Eof) => return Ok(Option::None)
+      Ok(RawHeaderResult::Meta(mtf, msize)) => {
+        if mtf == type_x_header() {
+          meta_fmt_mask = meta_fmt_mask & 2
+          if msize < 0L {
+            return Err(reader_fail(self, TarError::InvalidHeader("negative PAX header size")))
+          }
+          if msize > self.limits.max_pax_bytes.to_int64() {
+            return Err(reader_fail(self, TarError::LimitExceeded("PAX header exceeds max_pax_bytes")))
+          }
+          if msize > self.total_len - self.pos {
+            return Err(reader_fail(self, TarError::UnexpectedEof))
+          }
+          let data_end = self.pos + msize
+          let pax_start = self.pos.to_int()
+          let pax_end = data_end.to_int()
+          self.pos = data_end
+          let pad = block_padding(msize)
+          if self.total_len - self.pos < pad {
+            self.pos = self.total_len
+          } else {
+            self.pos = self.pos + pad
+          }
+          let parsed = match parse_pax_payload(self.data, pax_start, pax_end, self.limits) {
+            Ok(r) => r
+            Err(e) => return Err(reader_fail(self, e))
+          }
+          has_pax = true
+          has_pax_path = false
+          let mut pi = 0
+          while pi < parsed.length() {
+            let (pk, pv) = parsed[pi]
+            if pk == "path" && pv.length() > 0 {
+              has_pax_path = true
+              break
+            }
+            pi = pi + 1
+          }
+          pax_records = Option::Some(parsed)
+          continue
+        }
+        // GNU 'L' / 'K' meta headers
+        meta_fmt_mask = meta_fmt_mask & 4
+        if msize < 0L {
+          return Err(reader_fail(self, TarError::InvalidHeader("negative GNU long header size")))
+        }
+        if msize > self.limits.max_pax_bytes.to_int64() {
+          return Err(reader_fail(self, TarError::LimitExceeded("GNU long header exceeds max_pax_bytes")))
+        }
+        if msize > self.total_len - self.pos {
+          return Err(reader_fail(self, TarError::UnexpectedEof))
+        }
+        let data_end = self.pos + msize
+        let s = parse_c_string(self.data, self.pos.to_int(), msize.to_int())
+        self.pos = data_end
+        let pad = block_padding(msize)
+        if self.total_len - self.pos < pad {
+          self.pos = self.total_len
+        } else {
+          self.pos = self.pos + pad
+        }
+        if mtf == type_gnu_long_name() {
+          has_gnu_long_name = true
+          gnu_long_name = s
+        } else {
+          has_gnu_long_link = true
+          gnu_long_link = s
+        }
+        continue
+      }
+      Ok(RawHeaderResult::Entry(h, o)) => (h, o)
       Err(e) => return Err(reader_fail(self, e))
     }
 
     let tf = raw_hdr.typeflag
-    // Handle PAX 'x' / 'g' meta headers
-    if tf == type_x_header() || tf == type_x_global_header() {
+    // Handle PAX global 'g' meta header
+    if tf == type_x_global_header() {
       meta_fmt_mask = meta_fmt_mask & 2
       if raw_hdr.size < 0L {
         return Err(reader_fail(self, TarError::InvalidHeader("negative PAX header size")))
@@ -645,81 +882,47 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
         Ok(r) => r
         Err(e) => return Err(reader_fail(self, e))
       }
-      if tf == type_x_global_header() {
-        self.entries_read = self.entries_read + 1
-        if self.entries_read > self.limits.max_entries {
-          return Err(reader_fail(self, TarError::LimitExceeded("archive exceeds max_entries")))
+      self.entries_read = self.entries_read + 1
+      if self.entries_read > self.limits.max_entries {
+        return Err(reader_fail(self, TarError::LimitExceeded("archive exceeds max_entries")))
+      }
+      let mut g_name = raw_hdr.name
+      let g_xattrs : Array[(String, String)] = []
+      let mut pi = 0
+      while pi < parsed.length() {
+        let (pk, pv) = parsed[pi]
+        if pk == "path" && pv.length() > 0 {
+          g_name = pv
+        } else if str_starts_with(pk, "SCHILY.xattr.") {
+          // Keys in `parsed` are already deduplicated by `parse_pax_payload`.
+          g_xattrs.push((pk.slice(13, pk.length()), pv))
         }
-        let mut g_name = raw_hdr.name
-        let g_xattrs : Array[(String, String)] = []
-        let mut pi = 0
-        while pi < parsed.length() {
-          let (pk, pv) = parsed[pi]
-          if pk == "path" && pv.length() > 0 {
-            g_name = pv
-          } else if str_starts_with(pk, "SCHILY.xattr.") {
-            // Keys in `parsed` are already deduplicated by `parse_pax_payload`.
-            g_xattrs.push((pk.slice(13, pk.length()), pv))
-          }
-          pi = pi + 1
-        }
-        self.cur_data_start = self.pos
-        self.cur_data_len = 0L
-        self.cur_logical_size = 0L
-        self.cur_pad = 0L
+        pi = pi + 1
+      }
+      self.cur_data_start = self.pos
+      self.cur_data_len = 0L
+      self.cur_logical_size = 0L
+      self.cur_pad = 0L
+      if self.cur_is_sparse {
         self.cur_is_sparse = false
-        self.cur_sparse_datas = []
-        self.cur_data_read = true
-        self.cur_logical_pos = 0L
-        self.cur_sparse_idx = 0
-        self.cur_sparse_phys = self.pos
-        return Ok(
-          Option::Some(
-            Header::{
-              ..Header::new(g_name, 0L),
-              typeflag: type_x_global_header(),
-              mode: 0L,
-              xattrs: g_xattrs,
-              pax_records: parsed,
-              format: format_from_mask(meta_fmt_mask),
-            },
-          ),
-        )
+        self.cur_sparse_datas = self.empty_sparse
       }
-      has_pax = true
-      pax_records = parsed
-      continue
-    }
-
-    // Handle GNU 'L' / 'K' meta headers
-    if tf == type_gnu_long_name() || tf == type_gnu_long_link() {
-      meta_fmt_mask = meta_fmt_mask & 4
-      if raw_hdr.size < 0L {
-        return Err(reader_fail(self, TarError::InvalidHeader("negative GNU long header size")))
-      }
-      if raw_hdr.size > self.limits.max_pax_bytes.to_int64() {
-        return Err(reader_fail(self, TarError::LimitExceeded("GNU long header exceeds max_pax_bytes")))
-      }
-      if raw_hdr.size > self.total_len - self.pos {
-        return Err(reader_fail(self, TarError::UnexpectedEof))
-      }
-      let data_end = self.pos + raw_hdr.size
-      let s = parse_c_string(self.data, self.pos.to_int(), raw_hdr.size.to_int())
-      self.pos = data_end
-      let pad = block_padding(raw_hdr.size)
-      if self.total_len - self.pos < pad {
-        self.pos = self.total_len
-      } else {
-        self.pos = self.pos + pad
-      }
-      if tf == type_gnu_long_name() {
-        has_gnu_long_name = true
-        gnu_long_name = s
-      } else {
-        has_gnu_long_link = true
-        gnu_long_link = s
-      }
-      continue
+      self.cur_data_read = true
+      self.cur_logical_pos = 0L
+      self.cur_sparse_idx = 0
+      self.cur_sparse_phys = self.pos
+      return Ok(
+        Option::Some(
+          Header::{
+            ..Header::new(g_name, 0L),
+            typeflag: type_x_global_header(),
+            mode: 0L,
+            xattrs: g_xattrs,
+            pax_records: parsed,
+            format: format_from_mask(meta_fmt_mask),
+          },
+        ),
+      )
     }
 
     // Regular or special file header
@@ -749,8 +952,10 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
       self.cur_data_len = phys_size
       self.cur_logical_size = raw_hdr.size
       self.cur_pad = block_padding(phys_size)
-      self.cur_is_sparse = false
-      self.cur_sparse_datas = []
+      if self.cur_is_sparse {
+        self.cur_is_sparse = false
+        self.cur_sparse_datas = self.empty_sparse
+      }
       self.cur_data_read = false
       self.cur_logical_pos = 0L
       self.cur_sparse_idx = 0
@@ -789,68 +994,71 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     let mut sp_realsize = ""
 
     // Merge PAX records in a single O(n) pass
-    if has_pax {
-      let mut pi = 0
-      while pi < pax_records.length() {
-        let (pk, pv) = pax_records[pi]
-        if pv.length() > 0 {
-          if pk == "path" {
-            name = pv
-          } else if pk == "linkpath" {
-            linkname = pv
-          } else if pk == "uname" {
-            uname = pv
-          } else if pk == "gname" {
-            gname = pv
-          } else if pk == "uid" {
-            uid = match parse_int64_dec(pv) {
-              Ok(v) => v
-              Err(e) => return Err(reader_fail(self, e))
+    match pax_records {
+      Some(precs) => {
+        let mut pi = 0
+        while pi < precs.length() {
+          let (pk, pv) = precs[pi]
+          if pv.length() > 0 {
+            if pk == "path" {
+              name = pv
+            } else if pk == "linkpath" {
+              linkname = pv
+            } else if pk == "uname" {
+              uname = pv
+            } else if pk == "gname" {
+              gname = pv
+            } else if pk == "uid" {
+              uid = match parse_int64_dec(pv) {
+                Ok(v) => v
+                Err(e) => return Err(reader_fail(self, e))
+              }
+            } else if pk == "gid" {
+              gid = match parse_int64_dec(pv) {
+                Ok(v) => v
+                Err(e) => return Err(reader_fail(self, e))
+              }
+            } else if pk == "size" {
+              size = match parse_int64_dec(pv) {
+                Ok(v) => v
+                Err(e) => return Err(reader_fail(self, e))
+              }
+            } else if pk == "mtime" {
+              mod_time = match parse_pax_time(pv) {
+                Ok(t) => t
+                Err(e) => return Err(reader_fail(self, e))
+              }
+            } else if pk == "atime" {
+              access_time = match parse_pax_time(pv) {
+                Ok(t) => t
+                Err(e) => return Err(reader_fail(self, e))
+              }
+            } else if pk == "ctime" {
+              change_time = match parse_pax_time(pv) {
+                Ok(t) => t
+                Err(e) => return Err(reader_fail(self, e))
+              }
+            } else if str_starts_with(pk, "SCHILY.xattr.") {
+              // Keys in `pax_records` are already unique.
+              xattrs.push((pk.slice(13, pk.length()), pv))
+            } else if pk == "GNU.sparse.major" {
+              sp_major = pv
+            } else if pk == "GNU.sparse.minor" {
+              sp_minor = pv
+            } else if pk == "GNU.sparse.map" {
+              sp_map = pv
+            } else if pk == "GNU.sparse.name" {
+              sp_name = pv
+            } else if pk == "GNU.sparse.size" {
+              sp_size = pv
+            } else if pk == "GNU.sparse.realsize" {
+              sp_realsize = pv
             }
-          } else if pk == "gid" {
-            gid = match parse_int64_dec(pv) {
-              Ok(v) => v
-              Err(e) => return Err(reader_fail(self, e))
-            }
-          } else if pk == "size" {
-            size = match parse_int64_dec(pv) {
-              Ok(v) => v
-              Err(e) => return Err(reader_fail(self, e))
-            }
-          } else if pk == "mtime" {
-            mod_time = match parse_pax_time(pv) {
-              Ok(t) => t
-              Err(e) => return Err(reader_fail(self, e))
-            }
-          } else if pk == "atime" {
-            access_time = match parse_pax_time(pv) {
-              Ok(t) => t
-              Err(e) => return Err(reader_fail(self, e))
-            }
-          } else if pk == "ctime" {
-            change_time = match parse_pax_time(pv) {
-              Ok(t) => t
-              Err(e) => return Err(reader_fail(self, e))
-            }
-          } else if str_starts_with(pk, "SCHILY.xattr.") {
-            // Keys in `pax_records` are already unique.
-            xattrs.push((pk.slice(13, pk.length()), pv))
-          } else if pk == "GNU.sparse.major" {
-            sp_major = pv
-          } else if pk == "GNU.sparse.minor" {
-            sp_minor = pv
-          } else if pk == "GNU.sparse.map" {
-            sp_map = pv
-          } else if pk == "GNU.sparse.name" {
-            sp_name = pv
-          } else if pk == "GNU.sparse.size" {
-            sp_size = pv
-          } else if pk == "GNU.sparse.realsize" {
-            sp_realsize = pv
           }
+          pi = pi + 1
         }
-        pi = pi + 1
       }
+      None => ()
     }
 
     // Apply GNU LongName/LongLink only when non-empty (matches Go `if gnuLongName != ""`)
@@ -880,7 +1088,7 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     let pad = block_padding(phys_size)
     let mut logical_size = size
     let mut is_sparse = false
-    let mut sparse_datas : Array[SparseEntry] = []
+    let mut sparse_datas = self.empty_sparse
 
     // Handle sparse files
     if final_tf == type_gnu_sparse() {
@@ -947,7 +1155,11 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
           is_sparse = true
           sparse_datas = spd
         } else {
-          let spd = match parse_gnu_sparse_map_0x1(pax_records, self.limits) {
+          let precs = match pax_records {
+            Some(r) => r
+            None => []
+          }
+          let spd = match parse_gnu_sparse_map_0x1(precs, self.limits) {
             Ok(s) => s
             Err(e) => return Err(reader_fail(self, e))
           }
@@ -975,6 +1187,10 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
     self.cur_sparse_idx = 0
     self.cur_sparse_phys = data_start
 
+    let final_pax = match pax_records {
+      Some(r) => r
+      None => []
+    }
     let final_hdr = Header::{
       typeflag: final_tf,
       name: name,
@@ -991,7 +1207,7 @@ pub fn Reader::next(self : Reader) -> Result[Option[Header], TarError] {
       devmajor: raw_hdr.devmajor,
       devminor: raw_hdr.devminor,
       xattrs: xattrs,
-      pax_records: if has_pax { pax_records } else { [] },
+      pax_records: final_pax,
       format: format_from_mask(fmt_mask),
     }
     return Ok(Option::Some(final_hdr))
@@ -1007,7 +1223,7 @@ pub fn Reader::read_chunk(self : Reader, max_bytes : Int) -> Result[Bytes, TarEr
     None => ()
   }
   if max_bytes <= 0 || self.cur_data_read {
-    return Ok(Bytes::new(0))
+    return Ok(self.empty_bytes)
   }
   if self.cur_data_len < 0L || self.cur_data_len > self.total_len - self.cur_data_start {
     return Err(reader_fail(self, TarError::UnexpectedEof))
@@ -1017,7 +1233,7 @@ pub fn Reader::read_chunk(self : Reader, max_bytes : Int) -> Result[Bytes, TarEr
   if rem <= 0L {
     self.pos = data_end
     self.cur_data_read = true
-    return Ok(Bytes::new(0))
+    return Ok(self.empty_bytes)
   }
   let want64 = if rem < max_bytes.to_int64() { rem } else { max_bytes.to_int64() }
   let want = want64.to_int()
@@ -1092,7 +1308,7 @@ pub fn Reader::read_data(self : Reader) -> Result[Bytes, TarError] {
     None => ()
   }
   if self.cur_data_read {
-    return Ok(Bytes::new(0))
+    return Ok(self.empty_bytes)
   }
   if self.cur_data_len < 0L || self.cur_data_len > self.total_len - self.cur_data_start {
     return Err(reader_fail(self, TarError::UnexpectedEof))
@@ -1103,7 +1319,7 @@ pub fn Reader::read_data(self : Reader) -> Result[Bytes, TarError] {
 
   if !self.cur_is_sparse {
     if self.cur_data_len == 0L {
-      return Ok(Bytes::new(0))
+      return Ok(self.empty_bytes)
     }
     return Ok(self.data.slice(self.cur_data_start.to_int(), data_end.to_int()))
   }

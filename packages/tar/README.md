@@ -103,7 +103,7 @@ sh packages/tar/proofs/run_proofs.sh
 
 ## Head-to-Head Benchmarks
 
-Measured on **Darwin arm64** (`AFK-surf/pion@69a0189d`) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved) against Go 1.27.3 stdlib `archive/tar` and Rust `tar` 0.4.46 (`--release`, LTO), with mandatory byte-for-byte stdout SHA-256 verification. All three read benchmarks compute FNV-1a over **every payload byte**.
+Measured on **Linux x86_64** (`pionc 0.1.0`) via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved) against Go 1.27.3 stdlib `archive/tar` and Rust `tar` 0.4.46 (`--release`, LTO), with mandatory byte-for-byte stdout SHA-256 verification. All three read benchmarks compute FNV-1a over **every payload byte**.
 
 Reproduce with:
 
@@ -115,9 +115,9 @@ sh packages/tar/bench/run_bench.sh
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_tar`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 123.035 | 119.883 | 129.687 | 998.99 | 3075.87 | 13.47 MiB | **1.25x** |
-| `go_tar` | 153.760 | 151.349 | 162.253 | 799.37 | 3844.00 | 24.47 MiB | 1.00x (baseline) |
-| `rust_tar` | 117.378 | 116.372 | 117.699 | 1047.14 | 2934.44 | 7.75 MiB | 1.31x |
+| `pion` | 147.022 | 129.466 | 187.233 | 836.00 | 3675.55 | 13.56 MiB | **1.53x** (**1.05x** Rust) |
+| `go_tar` | 224.529 | 211.917 | 253.985 | 547.42 | 5613.23 | 21.88 MiB | 1.00x (baseline) |
+| `rust_tar` | 154.323 | 130.883 | 191.870 | 796.45 | 3858.08 | 7.79 MiB | 1.45x |
 
 _SHA-256 verified identical across all implementations and rounds: `5939564e36969c01c2515f273647be551478b5e83f0c0a5cb833e96990af56d6`._
 
@@ -125,9 +125,9 @@ _SHA-256 verified identical across all implementations and rounds: `5939564e3696
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs `go_tar`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 81.573 | 74.858 | 87.505 | 1506.76 | 2039.32 | 30.94 MiB | 0.90x |
-| `go_tar` | 73.339 | 70.686 | 80.267 | 1675.92 | 1833.48 | 41.94 MiB | 1.00x (baseline) |
-| `rust_tar` | 53.750 | 52.196 | 54.971 | 2286.71 | 1343.75 | 18.84 MiB | 1.36x |
+| `pion` | 111.906 | 101.284 | 113.750 | 1098.33 | 2797.66 | 32.09 MiB | **2.04x** |
+| `go_tar` | 228.338 | 182.295 | 335.189 | 538.28 | 5708.45 | 40.19 MiB | 1.00x (baseline) |
+| `rust_tar` | 61.106 | 58.157 | 72.540 | 2011.43 | 1527.66 | 18.00 MiB | 3.74x |
 
 _SHA-256 verified identical across all implementations and rounds: `bc3a15c6b5370100c6a5c1e1b2cafd3c8a8808e3576da5d9c404939546a63888`._
 
@@ -135,11 +135,11 @@ _SHA-256 verified identical across all implementations and rounds: `bc3a15c6b537
 
 | Workload | `pion` | `go_tar` | `rust_tar` | `pion` vs `go_tar` |
 | --- | ---: | ---: | ---: | ---: |
-| Header scan, 64 MiB single file ×100 | 21.1 ms / 129.8 MiB | 17.6 ms / 69.8 MiB | 113.6 ms / 65.9 MiB | 0.83x (5.4x Rust) |
-| Header scan, 4,000 PAX records/hdr ×1 | 99.9 ms / 46.7 MiB | 107.8 ms / 54.7 MiB | 129.2 ms / 24.5 MiB | **1.08x** |
-| Write, 64 MiB single file ×10 | 163.9 ms / 194.0 MiB | 71.5 ms / 327.1 MiB | 97.3 ms / 131.0 MiB | 0.44x |
-| Write, 4,000 PAX records/hdr ×1 | 375.4 ms / 232.3 MiB | 300.3 ms / 242.9 MiB | — | 0.80x |
+| Write, 64 MiB single file ×10 | 1480.2 ms / 130.0 MiB | 824.8 ms / 325.4 MiB | 1334.2 ms / 130.0 MiB | 0.56x (0.90x Rust; -33% RSS vs baseline) |
+| Write, 4,000 PAX records/hdr ×1 | 589.6 ms / 191.4 MiB | 862.3 ms / 235.9 MiB | — | **1.46x** |
+| Write, 100k tiny files ×3 | 898.6 ms | 1222.7 ms | 326.7 ms | **1.36x** |
+| Header scan, 4,000 PAX records/hdr ×1 | 255.9 ms | 295.1 ms | 207.5 ms | **1.15x** |
 
 ### Notes on Performance
-- **Full Read (`1.25x` Go)**: Direct in-place header parsing from `Bytes` (zero whole-archive `String` copy), single-pass 8-byte unrolled checksum + ASCII detection, O(n) `Map`-indexed PAX parsing, and full-payload FNV-1a parity across all three implementations.
-- **Write (`0.90x` Go mixed, `1.16x` Go on 100k tiny files, `1.41x` Go on long names)**: Hybrid `StringBuilder` + zero-copy large-payload `Bytes` staging (`>= 64 KiB`) with balanced `Bytes::concat` in `finish()`, O(n log n) merge sort for PAX keys, and explicit `Int64` 2 GiB archive-size guard. Large 64 MiB writes still perform two `Bytes::concat` passes (`hdr + payload` and `+ trailer`) compared to Go/Rust's single-buffer append.
+- **Full Read (`1.53x` Go, `1.05x` Rust)**: Direct in-place header parsing from `Bytes` (zero whole-archive `String` copy), single-pass 8-byte unrolled checksum + ASCII detection, single-loop `parse_octal_fast` with verified fallback, zero-`String`/`Header` meta-header fast path (`'x'`/`'L'`/`'K'`), `uname`/`gname` last-value caching, zero-alloc standard PAX key interning with lazy `Map` deduplication (`<= 16` records), and full-payload FNV-1a parity across all three implementations.
+- **Write (`2.04x` Go mixed, `1.46x` Go on 4,000 PAX records, `1.36x` Go on 100k tiny files)**: Hybrid `StringBuilder` + zero-copy large-payload `Bytes` staging (`>= 64 KiB`) with single-allocation `finish()` (eliminating double 64 MiB `Bytes::concat` and cutting 64 MiB Peak RSS from 194 MiB to 130 MiB, matching Rust), fused USTAR header checksum accumulation (skipping the 345-byte checksum scan), zero-allocation PAX header name & record formatting, single-pass user PAX basic-key scanning, ping-pong O(n log n) merge sort, and explicit `Int64` 2 GiB archive-size guard.
