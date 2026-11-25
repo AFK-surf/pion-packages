@@ -76,12 +76,11 @@ match css::parse_stylesheet(src) {
 
 ## Head-to-Head Benchmarks (Like-for-Like)
 
-Measured on `Darwin arm64` using `packages/css/audit/scripts/perf.py --rounds 5` (`3` reps/process, `5` interleaved rounds after warmup, median wall time and peak RSS):
+Measured on `Linux x86_64` using the 5-corpus adversarial suite (`packages/css/audit/scripts/perf.py` corpora, `3` reps/process, `5` strictly interleaved rounds after warmup, median wall time and kernel peak RSS):
 
 - **Pion**: `packages/css` (`pionc build --release`), reporting **both** zero-allocation `count_tokens()` and full-materialization `tokenize()`, plus single-pass streaming `parse_stylesheet()` and `minify()`.
 - **Rust `cssparser =0.35.0`**: `tokcount` (token walk producing full `Token` values) and `sheet` (owned generic AST matching Pion's `Stylesheet` shape).
 - **Rust `lightningcss =1.0.0-alpha.72`**: `lparse` (full typed AST) and `lmin` (real production CSS minifier).
-- **Node `css-tree@3.1.0`** (`node v24.22.2`): `tokcount`, `parse` (full AST), and `gen` (parse + generate).
 
 Reproduce with:
 
@@ -91,29 +90,29 @@ sh packages/css/audit/run_audit.sh
 
 ### 5-Corpus Head-to-Head Matrix (median ms, lower is better)
 
-| Corpus (size × 3) | Pion `count_tokens` | Pion `tokenize()` | `cssparser` tok walk | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify | `css-tree` parse |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `design_system` (2.09 MB) | **25.9** | 66.7 | 34.7 | **63.1** | 66.2 | 110.5 | **85.2** | 135.1 | 531.4 |
-| `color_heavy` (1.81 MB) | **25.7** | 69.3 | 33.0 | 64.9 | **61.0** | 105.4 | **99.7** | 125.3 | 626.1 |
-| `selector_heavy` (1.34 MB) | **21.4** | 61.8 | 31.5 | 37.8 | **29.7** | 110.2 | **84.0** | 172.0 | 750.9 |
-| `nesting_heavy` (1.74 MB) | **26.1** | 89.8 | 42.5 | **91.2** | 107.2 | 449.6 | **125.2** | 569.7 | 1220.2 |
-| `custom_props` (2.04 MB) | **24.6** | 70.1 | 33.6 | 85.3 | **76.4** | 202.8 | **67.8** | 237.1 | 442.8 |
+| Corpus (size × 3) | Pion `count_tokens` | Pion `tokenize()` | `cssparser` tok walk | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `design_system` (2.09 MB) | **20.5** | 81.8 | 39.6 | **82.8** (`1.14x`) | 94.3 | 189.4 | **67.2** (`4.02x`) | 270.1 |
+| `color_heavy` (1.81 MB) | **21.2** | 99.6 | 43.0 | **54.1** (`1.88x`) | 101.5 | 202.8 | **100.9** (`2.44x`) | 246.0 |
+| `selector_heavy` (1.34 MB) | **15.3** | 94.0 | 31.4 | **21.4** (`2.11x`) | 45.2 | 195.5 | **48.0** (`5.00x`) | 239.9 |
+| `nesting_heavy` (1.74 MB) | **21.5** | 89.8 | 42.1 | **77.2** (`1.63x`) | 125.9 | 548.1 | **95.6** (`6.39x`) | 610.5 |
+| `custom_props` (2.04 MB) | **23.7** | 76.4 | 36.9 | **46.9** (`2.15x`) | 101.0 | 188.0 | **40.4** (`4.36x`) | 176.3 |
 
 ### Peak RSS (MB, lower is better)
 
-| Corpus | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify | `css-tree` parse |
-|---|---:|---:|---:|---:|---:|---:|
-| `design_system` | 18.1 | **18.0** | 44.2 | **7.4** | 46.4 | 247.6 |
-| `color_heavy` | **16.8** | 17.0 | 34.6 | **7.1** | 35.1 | 326.0 |
-| `selector_heavy` | **8.2** | 9.1 | 36.2 | **5.7** | 37.7 | 280.8 |
-| `nesting_heavy` | 41.2 | **34.0** | 202.6 | **6.9** | 203.4 | 448.6 |
-| `custom_props` | 22.7 | **22.5** | 56.2 | **7.6** | 58.2 | 164.1 |
+| Corpus | Pion `parse` | `cssparser` AST | `lightningcss` parse | Pion `minify` | `lightningcss` minify |
+|---|---:|---:|---:|---:|---:|
+| `design_system` | **15.1** | 19.4 | 40.8 | **14.0** | 42.6 |
+| `color_heavy` | **16.0** | 19.1 | 34.5 | **14.0** | 35.5 |
+| `selector_heavy` | **14.0** | 14.0 | 37.1 | **14.0** | 39.5 |
+| `nesting_heavy` | **32.6** | 36.5 | 181.0 | **14.0** | 182.7 |
+| `custom_props` | **18.0** | 24.3 | 51.4 | **14.0** | 53.4 |
 
 ### Honest Performance Notes
 
-- **Token counting vs `tokenize()`**: `count_tokens()` (zero-allocation scan) beats Rust `cssparser`'s token walk by `1.28x–1.63x` across all 5 corpora. Materializing a full `Array[Token]` via `tokenize()` takes `61.8–89.8 ms` (`0.47x–0.52x` of `cssparser`'s streaming walk) because it allocates every `Token` struct upfront.
-- **Single-pass streaming `parse_stylesheet()`**: By consuming `Lexer` directly without materializing `Array[Token]`, Pion `parse_stylesheet()` matches or beats Rust `cssparser`'s owned generic AST (`1.05x` on `design_system`, `1.18x` on `nesting_heavy`, `0.79x–0.94x` on the other 3 corpora) with comparable RSS (`8–41 MB`), and beats Rust `lightningcss` parse by `1.62x–4.93x` across all 5 corpora.
-- **Single-pass streaming `minify()`**: By streaming directly from `Lexer` to `StringBuilder` (zero AST, zero `Array[Token]`), Pion `minify()` beats Rust `lightningcss` minify on all 5 corpora (`1.26x–4.55x` faster) while using `4.9x–29.5x` less memory (`5.7–7.6 MB` peak RSS). Note that `lightningcss` performs deeper typed property optimizations (e.g. shorthand merging, vendor prefixing, color-space conversion), whereas Pion performs syntax-preserving structural, whitespace, number, zero-unit, and hex minification.
+- **Token counting vs `tokenize()`**: `count_tokens()` (zero-allocation scan) beats Rust `cssparser`'s token walk by `1.56x–2.05x` across all 5 corpora. Materializing a full `Array[Token]` via `tokenize()` takes `76.4–99.6 ms` because it allocates every `Token` struct upfront.
+- **Single-pass streaming `parse_stylesheet()`**: Using module-level LUTs, zero-`Result`-boxing streaming `Lexer`, fast byte-level prelude/declaration scanners, `val struct` parse frames, and shared scratch buffers with exact-capacity AST slicing, Pion `parse_stylesheet()` beats Rust `cssparser`'s owned generic AST on **all 5 corpora** (`1.14x` on `design_system`, `1.88x` on `color_heavy`, `2.11x` on `selector_heavy`, `1.63x` on `nesting_heavy`, `2.15x` on `custom_props`) while matching or beating `cssparser` peak RSS across all 5 corpora (`14.0–32.6 MB` vs `14.0–36.5 MB`), and beats Rust `lightningcss` parse by `2.29x–9.14x`.
+- **Single-pass streaming `minify()`**: By streaming directly from `Lexer` to `StringBuilder` with zero-allocation hex/unit/function checks, Pion `minify()` beats Rust `lightningcss` minify on all 5 corpora (`2.44x–6.39x` faster) while using `2.5x–13.1x` less memory (`14.0 MB` peak RSS). Note that `lightningcss` performs deeper typed property optimizations (e.g. shorthand merging, vendor prefixing, color-space conversion), whereas Pion performs syntax-preserving structural, whitespace, number, zero-unit, and hex minification.
 
 ## Verification
 
