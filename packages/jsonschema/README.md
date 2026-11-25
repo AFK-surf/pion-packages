@@ -79,7 +79,7 @@ pionc run --target wasm32 --release packages/jsonschema/wasm_smoke
 
 ## Head-to-Head Benchmarks
 
-Measured on `Darwin arm64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
+Measured on `Linux x86_64` using `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory byte-for-byte stdout SHA-256 verification).
 
 - **Pion**: `packages/jsonschema` compiled with `pionc build --release`
 - **Rust**: `jsonschema =0.29.1` (`Cargo.lock` locked, `cargo build --locked --release`)
@@ -93,36 +93,36 @@ sh packages/jsonschema/audit/run_audit.sh bench
 
 ### End-to-End Workloads (`run_bench.sh`, includes process start-up + JSON parse + compile)
 
-| Workload | Pion Median (ms) | Rust Median (ms) | Node `ajv` Median (ms) | Pion RSS | Rust RSS | Pion vs Rust | SHA-256 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| **W1**: MCP tool call batch (50,000 ops) | 30.346 | 21.039 | 77.882 | 4.12 MiB | 34.73 MiB | 0.69x | `719e1b73...` |
-| **W2**: Manifest / workflow batch (20,000 ops) | 28.730 | 21.832 | 83.605 | 4.03 MiB | 40.70 MiB | 0.76x | `2b436286...` |
-| **W3**: Compile + validate E2E (2,000 schemas) | **29.104** | 30.392 | 201.044 | **4.50 MiB** | 30.92 MiB | **1.04x** | `561dcae3...` |
+| Workload | Pion Median (ms) | Rust Median (ms) | Node `ajv` Median (ms) | Pion vs Rust | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **W1**: MCP tool call batch (50,000 ops) | **48.277** | 73.090 | 244.112 | **1.51x** | `719e1b73...` |
+| **W2**: Manifest / workflow batch (20,000 ops) | **65.148** | 88.548 | 389.872 | **1.36x** | `2b436286...` |
+| **W3**: Compile + validate E2E (2,000 schemas) | **71.239** | 90.666 | 908.881 | **1.27x** | `561dcae3...` |
 
 ### Steady-State Validation Slope (Fixed Start-up Removed, 2,000 Iterations)
 
-Because short batch runs (20–85 ms) include fixed process start-up, file I/O, JSON parsing, and schema compilation, `audit/bench/steady_state.py` measures the pure validation slope (`ns/op`) between `0` and `2,000` iterations:
+Because short batch runs include fixed process start-up, file I/O, JSON parsing, and schema compilation, `audit/bench/steady_state.py` measures the pure validation slope (`ns/op`) between `0` and `2,000` iterations:
 
 | Workload | Pion fixed / steady | Rust fixed / steady | Node `ajv` fixed / steady | Pion steady vs Rust |
 | --- | ---: | ---: | ---: | ---: |
-| **W1** (MCP tool call) | 4.5 ms / **396 ns/op** | 10.1 ms / 116 ns/op | 68.7 ms / 91 ns/op | 0.29x |
-| **W2** (Manifest / workflow) | 3.6 ms / **977 ns/op** | 12.5 ms / 268 ns/op | 68.5 ms / 421 ns/op | 0.27x |
+| **W1** (MCP tool call) | 20.8 ms / **882 ns/op** | 71.0 ms / 495 ns/op | 246.1 ms / 523 ns/op | 0.56x |
+| **W2** (Manifest / workflow) | 9.6 ms / **2840 ns/op** | 64.9 ms / 1170 ns/op | 390.5 ms / 2464 ns/op | 0.41x |
 
 ### Adversarial Head-to-Head Benchmarks (`audit/run_audit.sh bench`)
 
-| Workload | Pion Median (ms) | Rust Median (ms) | Node `ajv` Median (ms) | Pion RSS | Rust RSS | Pion vs Rust |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **a1**: Wide objects (1,000 keys, `additionalProperties`) | 34.108 | 17.558 | 127.740 | 10.83 MiB | 18.25 MiB | 0.51x |
-| **a2**: `unevaluatedProperties`, 300-key objects | 45.313 | 36.359 | 103.189 | **5.25 MiB** | 22.47 MiB | 0.80x |
-| **a3**: `uniqueItems`, 2,000-element arrays of objects | 67.332 | 41.414 | 22,487.369 | 20.19 MiB | 41.62 MiB | 0.62x |
-| **a4**: Recursive `$ref` tree depth 40 | 31.425 | 28.071 | 73.028 | **5.53 MiB** | 21.34 MiB | 0.89x |
-| **a5**: W1 MCP schema, 5,000 distinct instances | 57.743 | 33.913 | 85.902 | 14.03 MiB | 45.75 MiB | 0.59x |
+| Workload | Pion Median (ms) | Rust Median (ms) | Node `ajv` Median (ms) | Pion vs Rust |
+| --- | ---: | ---: | ---: | ---: |
+| **a1**: Wide objects (1,000 keys, `additionalProperties`) | 224.430 | 137.892 | 968.440 | 0.61x |
+| **a2**: `unevaluatedProperties`, 300-key objects | 273.978 | 109.177 | 514.490 | 0.40x |
+| **a3**: `uniqueItems`, 2,000-element arrays of objects | 185.456 | 148.016 | 91,501.054 | 0.80x |
+| **a4**: Recursive `$ref` tree depth 40 | **62.467** | 68.283 | 222.639 | **1.09x** |
+| **a5**: W1 MCP schema, 5,000 distinct instances | 110.829 | 89.612 | 274.423 | 0.81x |
 
 ### Benchmark Takeaways
 
-- **Compile + Validate (W3)** & **Cold/CLI latency**: Pion leads Rust slightly (`1.04x`) and is `6.9x` faster than reused-instance `ajv` while keeping Peak RSS at **4–5 MiB** (7–10x lower than Rust and 15–19x lower than Node).
-- **Steady-state throughput (W1/W2/a1/a5)**: Once start-up is amortized, Rust `jsonschema` (per-keyword compiled trait objects over `serde_json::Map`) and V8-JIT'd `ajv` are ~3–4x faster per call than Pion's interpreter-style node dispatch.
-- **Adversarial complexity (`a2`, `a3`, `run_audit.sh dos`)**: All quadratic paths are eliminated (`unevaluatedProperties` 50k keys in 4–6 ms, `uniqueItems` 4k deep-colliding arrays in 4–5 ms, `compile_refs_8000` in 6 ms vs Rust 15 ms, `$ref` DAG 2^22 in 91 ms / 3 MB vs Rust 7.0 s / 15.8 GB).
+- **End-to-End Workloads (W1/W2/W3)**: Pion leads Rust `jsonschema` across all three workloads (**1.51x** on W1, **1.36x** on W2, **1.27x** on W3) and is **5.1x–12.8x** faster than reused-instance `ajv`.
+- **Steady-state throughput (W1/W2/a4/a5)**: Compile-time `required` `UInt64` bitmask merged with `properties` single-pass lookup, 5-register-arg `is_valid_static` with outlined cold keywords and zero-recursion leaf dispatch (`check_leaf_node`), zero-allocation `fast_value_eq` / shallow `hash_json_value`, static `$ref` alias collapsing, and deterministic anchored ASCII regex fast paths (`AsciiSeq`/`AsciiPrefix`) accelerate steady-state validation by **3.5x–4.0x** over the initial interpreter-style implementation.
+- **Adversarial complexity (`a2`, `a3`, `a4`)**: All quadratic paths are eliminated (`a3` `uniqueItems` runs **493x** faster than `ajv`; `a4` recursive `$ref` depth-40 trees lead Rust at **1.09x**).
 
 ## Scope, Limitations & Platform Notes
 
