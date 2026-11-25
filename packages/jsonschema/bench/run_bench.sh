@@ -6,7 +6,11 @@ set -eu
 
 BENCH_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
-OUT_DIR="/private/tmp/w10-jsonschema/bench"
+if [ -d /private/tmp ]; then
+  OUT_DIR="${BENCH_OUT:-/private/tmp/w10-jsonschema/bench}"
+else
+  OUT_DIR="${BENCH_OUT:-/tmp/w10-jsonschema/bench}"
+fi
 BIN_DIR="$OUT_DIR/bin"
 NODE_PKG="$OUT_DIR/node_pkg"
 
