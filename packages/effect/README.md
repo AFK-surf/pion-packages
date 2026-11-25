@@ -28,15 +28,15 @@ sh scripts/verify.sh packages/effect
 sh packages/effect/bench/run_bench.sh
 ```
 
-## Head-to-Head Benchmarks (Darwin arm64, `--warmup 1 --rounds 5`, SHA-256 Verified)
+## Head-to-Head Benchmarks (Linux x86_64, `--warmup 1 --rounds 5`, SHA-256 Verified)
 
 | Workload | `pion` (Median / Peak RSS) | `go` (Median / Peak RSS) | `node` (Median / Peak RSS) | `pion` vs `go` |
 | --- | ---: | ---: | ---: | ---: |
-| W1: Bounded Queue Ping-Pong (50k msgs, cap=16) | 18.318 ms / 1.83 MiB | 17.479 ms / 4.59 MiB | 57.203 ms / 48.62 MiB | 0.95x |
-| W2: Virtual-Clock Timer Scheduling (20k fibers/timers) | 47.402 ms / 28.23 MiB | 18.574 ms / 5.95 MiB | 58.455 ms / 49.86 MiB | 0.39x |
-| W3: Structured Fan-Out & Join (2,500 × 4 = 10k fibers) | 19.481 ms / 1.84 MiB | 18.090 ms / 5.42 MiB | 51.110 ms / 45.16 MiB | 0.93x |
+| W1: Bounded Queue Ping-Pong (50k msgs, cap=16) | 6.038 ms / 2.05 MiB | 4.771 ms / 1.86 MiB | 56.569 ms / 55.86 MiB | 0.79x |
+| W2: Virtual-Clock Timer Scheduling (20k fibers/timers) | 35.448 ms / 9.91 MiB | 9.520 ms / 3.36 MiB | 63.760 ms / 57.27 MiB | 0.27x |
+| W3: Structured Fan-Out & Join (2,500 × 4 = 10k fibers) | 9.449 ms / 1.84 MiB | 10.673 ms / 2.49 MiB | 64.142 ms / 50.10 MiB | 1.13x |
 
-_Note on W2: Pion spawns 20,000 full structured fibers (`Task` + `Fiber` + `sleep_k` timer + scope watcher) concurrently, while the Go and Node.js baselines push bare `{at, seq, idx}` structs into a min-heap._
+_Note on W2: Pion spawns 20,000 full structured fibers (`Task` + `Fiber` + `sleep_k` timer + owning `ScopeState`) concurrently, while the Go and Node.js baselines push bare `{at, seq, idx}` structs into a min-heap._
 
 ## Formal Verification (Lean 4)
 

@@ -1,14 +1,63 @@
 // Structured concurrency scopes and finalizers.
 
 struct ScopeState {
-  children : Map[Int, Task]
-  finalizers : Array[((Exit[Unit]) -> Unit) -> Unit]
+  children : Array[Task]
+  mut children_len : Int
+  mut finalizers : Option[Array[((Exit[Unit]) -> Unit) -> Unit]]
   mut closed : Bool
   report : Bool
+  mut all_notify : Bool
+  mut all_failed : Bool
+  mut all_parent : Option[Task]
 }
 
 fn ScopeState::new(report : Bool) -> ScopeState {
-  ScopeState::{ children: Map::new(), finalizers: [], closed: false, report }
+  ScopeState::{
+    children: [],
+    children_len: 0,
+    finalizers: None,
+    closed: false,
+    report,
+    all_notify: false,
+    all_failed: false,
+    all_parent: None,
+  }
+}
+
+fn ScopeState::finalizers_len(self : ScopeState) -> Int {
+  match self.finalizers {
+    None => 0
+    Some(a) => a.length()
+  }
+}
+
+fn ScopeState::add_child(self : ScopeState, t : Task) -> Unit {
+  let idx = self.children_len
+  t.owner_slot = idx
+  if idx < self.children.length() {
+    self.children[idx] = t
+  } else {
+    self.children.push(t)
+  }
+  self.children_len = idx + 1
+}
+
+fn ScopeState::remove_child(self : ScopeState, t : Task) -> Unit {
+  let idx = t.owner_slot
+  let n = self.children_len
+  if idx >= 0 && idx < n {
+    let last_idx = n - 1
+    if idx != last_idx {
+      let last = self.children[last_idx]
+      self.children[idx] = last
+      last.owner_slot = idx
+    }
+    self.children_len = last_idx
+    if last_idx == 0 {
+      self.children.clear()
+    }
+    t.owner_slot = -1
+  }
 }
 
 /// A scope: what is opened in it (fibers, finalizers, child scopes) ends when it closes.
@@ -39,7 +88,7 @@ pub fn EffectScope::is_closed(self : EffectScope) -> Bool {
 
 /// How many fibers of it are still running.
 pub fn EffectScope::running(self : EffectScope) -> Int {
-  self.st.children.length()
+  self.st.children_len
 }
 
 /// Starts `f` as a fiber of the scope.
@@ -98,40 +147,61 @@ pub fn EffectScope::fork_daemon(
   })
 }
 
+fn fork_in_scope[X](
+  rt : Runtime,
+  st : ScopeState,
+  f : ((Exit[X]) -> Unit) -> Unit,
+  name : String,
+  report : Bool,
+) -> Fiber[X] {
+  let cell : FiberCell[X] = FiberCell::{ item: None }
+  let t = rt.alloc_task(name)
+  t.set_callback(fn(r : Resume) -> Unit {
+    match r {
+      Resume::Stop => {
+        t.end = End::Cut
+        t.clear_state()
+        t.finish()
+      }
+      Resume::Go => {
+        f(fn(ex : Exit[X]) -> Unit {
+          match ex {
+            Exit::Succeeded(x) => {
+              cell.item = Some(x)
+              match t.end {
+                End::NotYet => t.end = End::Done
+                _ => ()
+              }
+            }
+            Exit::Failed(e) => t.end = End::Raised(e)
+            Exit::Interrupted => t.end = End::Cut
+          }
+          t.clear_state()
+          t.finish()
+        })
+      }
+    }
+  })
+  rt.live_tasks = rt.live_tasks + 1
+  if st.closed {
+    rt.make_ready(t)
+    t.interrupt()
+  } else {
+    t.owner = st
+    t.set_owner_report(report)
+    st.add_child(t)
+    rt.make_ready(t)
+  }
+  Fiber::{ task: t, cell }
+}
+
 fn EffectScope::fork_with[X](
   self : EffectScope,
   f : ((Exit[X]) -> Unit) -> Unit,
   name : String,
   report : Bool,
 ) -> Fiber[X] {
-  let cell : FiberCell[X] = FiberCell::{ item: None }
-  let t = self.rt.start(name, fn(done : (Exit[Unit]) -> Unit) -> Unit {
-    f(fn(ex : Exit[X]) -> Unit {
-      match ex {
-        Exit::Succeeded(x) => {
-          cell.item = Some(x)
-          done(Exit::Succeeded(()))
-        }
-        Exit::Failed(e) => done(Exit::Failed(e))
-        Exit::Interrupted => done(Exit::Interrupted)
-      }
-    })
-  })
-  if self.st.closed {
-    t.interrupt()
-  } else {
-    self.st.children.set(t.id, t)
-    let _ = t.watch(fn() -> Unit {
-      self.st.children.remove(t.id)
-      if report {
-        match t.end {
-          End::Raised(e) => self.rt.report(e)
-          _ => ()
-        }
-      }
-    })
-  }
-  Fiber::{ task: t, cell }
+  fork_in_scope(self.rt, self.st, f, name, report)
 }
 
 /// Runs `f` when the scope closes; on a closed scope, soon.
@@ -139,7 +209,10 @@ pub fn EffectScope::add_finalizer(self : EffectScope, f : ((Exit[Unit]) -> Unit)
   if self.st.closed {
     let _ = self.rt.start("finalizer", f)
   } else {
-    self.st.finalizers.push(f)
+    match self.st.finalizers {
+      Some(a) => a.push(f)
+      None => self.st.finalizers = Some([f])
+    }
   }
 }
 
@@ -178,16 +251,20 @@ fn await_all_kids(kids : Array[Task], idx : Int, done : () -> Unit) -> Unit {
 }
 
 fn run_finalizers_lifo(self : EffectScope, done : () -> Unit) -> Unit {
-  match self.st.finalizers.pop() {
+  match self.st.finalizers {
     None => done()
-    Some(f) => {
-      f(fn(ex : Exit[Unit]) -> Unit {
-        match ex {
-          Exit::Failed(e) => self.rt.report(e)
-          _ => ()
-        }
-        run_finalizers_lifo(self, done)
-      })
+    Some(a) =>
+    match a.pop() {
+      None => done()
+      Some(f) => {
+        f(fn(ex : Exit[Unit]) -> Unit {
+          match ex {
+            Exit::Failed(e) => self.rt.report(e)
+            _ => ()
+          }
+          run_finalizers_lifo(self, done)
+        })
+      }
     }
   }
 }
@@ -195,22 +272,23 @@ fn run_finalizers_lifo(self : EffectScope, done : () -> Unit) -> Unit {
 /// Closes it: its fibers are interrupted and waited for, then its finalizers run, last first; all uninterruptibly.
 pub fn EffectScope::close_k(self : EffectScope, k : (Exit[Unit]) -> Unit) -> Unit {
   if self.st.closed {
-    k(Exit::Succeeded(()))
+    k(exit_ok_unit)
     return
   }
   self.st.closed = true
+  if self.st.children_len == 0 && self.st.finalizers_len() == 0 {
+    k(exit_ok_unit)
+    return
+  }
   let t = current_task()
   t.shield = t.shield + 1
-  let ks = self.st.children.keys()
   let kids : Array[Task] = []
-  for cid in ks {
-    if cid == t.id {
-      t.interrupted = true
+  for i in 0..<self.st.children_len {
+    let child = self.st.children[i]
+    if child.id == t.id {
+      t.set_interrupted_flag()
     } else {
-      match self.st.children.get(cid) {
-        Some(child) => kids.push(child)
-        None => ()
-      }
+      kids.push(child)
     }
   }
   for child in kids {
@@ -219,7 +297,7 @@ pub fn EffectScope::close_k(self : EffectScope, k : (Exit[Unit]) -> Unit) -> Uni
   await_all_kids(kids, 0, fn() -> Unit {
     run_finalizers_lifo(self, fn() -> Unit {
       t.shield = t.shield - 1
-      k(Exit::Succeeded(()))
+      k(exit_ok_unit)
     })
   })
 }
