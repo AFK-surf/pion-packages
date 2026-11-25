@@ -75,17 +75,17 @@ shasum -a 256 "$W"/*.out
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `sqlite_fts5_c`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 45.518 | 43.582 | 46.837 | 13.63 | 25.41 MiB | 0.71x |
-| `sqlite_fts5_c` | 32.386 | 31.103 | 33.194 | 19.15 | 6.53 MiB | 1.00x (baseline) |
-| `sqlite_fts5_py` | 61.211 | 60.792 | 62.303 | 10.13 | 16.44 MiB | 0.53x |
+| `pion` | 62.901 | 36.785 | 99.725 | 9.86 | 7.18 MiB | 1.84x |
+| `sqlite_fts5_c` | 115.457 | 84.150 | 330.889 | 5.37 | 7.16 MiB | 1.00x (baseline) |
+| `sqlite_fts5_py` | 196.164 | 154.719 | 281.531 | 3.16 | 17.59 MiB | 0.59x |
 
 ### Index 10,000 docs + 600 queries (30 queries × 20 reps, `sha256:742eb42a94d684ec...`)
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs `sqlite_fts5_c`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 226.551 | 217.275 | 265.433 | 377585.42 | 25.41 MiB | 0.87x |
-| `sqlite_fts5_c` | 196.257 | 192.415 | 204.213 | 327095.42 | 6.58 MiB | 1.00x (baseline) |
-| `sqlite_fts5_py` | 223.737 | 222.254 | 226.689 | 372895.07 | 16.58 MiB | 0.88x |
+| `pion` | 151.629 | 97.858 | 174.389 | 252714.22 | 7.20 MiB | 6.07x |
+| `sqlite_fts5_c` | 920.315 | 669.158 | 1380.952 | 1533858.54 | 7.17 MiB | 1.00x (baseline) |
+| `sqlite_fts5_py` | 1162.060 | 894.990 | 1215.492 | 1936765.98 | 17.55 MiB | 0.79x |
 
 ## Formal Verification (Lean 4)
 
