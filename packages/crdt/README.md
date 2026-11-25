@@ -57,34 +57,32 @@ Reference implementations:
 - Rust [`y-octo`](https://github.com/y-crdt/y-octo) `0.4.0` (`y-crdt/y-octo@58c9ffc`, `--release`, `lto=thin`)
 - Node.js `y-octo-wasm` (`y-crdt/y-octo@58c9ffc`, `wasm32-unknown-unknown --release`, `DocSession { gc: true, undo: "disabled" }`)
 
-Measured via `SECTIONS="size bench" ROUNDS=5 sh packages/crdt/audit/run_audit.sh` on `Linux x86_64` (Intel Xeon Platinum 8581C @ 2.30 GHz, 8 vCPU), `pionc 0.1.0`, `rustc 1.96.0`, `node v24.22.1` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, **stdout SHA-256 byte-for-byte identical across all 5 implementations and all rounds**; baseline `rust_yrs`):
+Measured via `SECTIONS="size bench" ROUNDS=5 sh packages/crdt/audit/run_audit.sh` on `Linux x86_64` (AMD Ryzen 7 PRO 8845HS, 16 vCPU), `pionc 0.1.0`, `rustc 1.100.0`, `node v24.22.1` (`scripts/bench_compare.py --warmup 1 --rounds 5`, strictly interleaved, **stdout SHA-256 byte-for-byte identical across all 5 implementations and all rounds**; baseline `rust_yrs`):
 
 | Workload | `pion` | `rust_y_octo` | `node_y_octo_wasm` | `rust_yrs` | `node_yjs` | Pion vs `yrs` / `y-octo` / `y-octo-wasm` / `yjs` | SHA-256 (prefix 16) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `text_w1` (`text 20000×3`) | 247.4 ms (7.12 MiB) | 227.3 ms (5.24 MiB) | 897.5 ms (76.70 MiB) | 3358.9 ms (5.60 MiB) | 2846.7 ms (111.35 MiB) | **13.58x** / 0.92x / **3.63x** / **11.51x** | `06f26a6a9a6d6752` |
-| `append_50k` | 33.3 ms (2.48 MiB) | 43.7 ms (2.60 MiB) | 3167.1 ms (76.05 MiB) | 48.4 ms (2.52 MiB) | 407.4 ms (80.14 MiB) | **1.45x** / **1.31x** / **95.13x** / **12.24x** | `ac3b61ee14122a58` |
-| `append_100k` | 78.0 ms (2.95 MiB) | 98.1 ms (2.72 MiB) | 12408.6 ms (76.06 MiB) | 91.2 ms (2.59 MiB) | 663.3 ms (88.51 MiB) | **1.17x** / **1.26x** / **159.17x** / **8.51x** | `17d38ef5a096dced` |
-| `append_200k` | 139.8 ms (3.85 MiB) | 189.9 ms (2.88 MiB) | 54698.8 ms (76.16 MiB) | 154.5 ms (2.89 MiB) | 1196.5 ms (108.71 MiB) | **1.11x** / **1.36x** / **391.28x** / **8.56x** | `dd403bae8f48744b` |
-| `tombstone_50k` | 7013.2 ms (20.43 MiB) | 1527.5 ms (11.84 MiB) | 5843.5 ms (82.95 MiB) | 5995.2 ms (13.95 MiB) | 3876.9 ms (148.54 MiB) | 0.85x / 0.22x / 0.83x / 0.55x | `4ebe0a8e06b70de2` |
-| `trace_automerge` (259,778 edits) | 1857.7 ms (44.05 MiB) | 1470.6 ms (18.46 MiB) | 3528.9 ms (145.53 MiB) | 9639.7 ms (18.27 MiB) | 9269.2 ms (165.86 MiB) | **5.19x** / 0.79x / **1.90x** / **4.99x** | `fbcf04458973cd1c` |
-| `remote_apply` (×20) | 314.3 ms (8.70 MiB) | 211.0 ms (7.46 MiB) | 446.4 ms (74.68 MiB) | 160.7 ms (6.04 MiB) | 968.6 ms (125.46 MiB) | 0.51x / 0.67x / **1.42x** / **3.08x** | `f13556fd49d149ba` |
+| `text_w1` (`text 20000×3`) | 117.7 ms (7.25 MiB) | 95.9 ms (5.30 MiB) | 571.1 ms (74.21 MiB) | 2963.8 ms (5.79 MiB) | 1622.2 ms (109.20 MiB) | **25.17x** / 0.81x / **4.85x** / **13.78x** | `06f26a6a9a6d6752` |
+| `append_50k` | 6.9 ms (2.80 MiB) | 18.0 ms (2.78 MiB) | 1996.9 ms (74.14 MiB) | 19.2 ms (2.70 MiB) | 234.1 ms (78.86 MiB) | **2.77x** / **2.60x** / **288.44x** / **33.81x** | `ac3b61ee14122a58` |
+| `append_100k` | 11.0 ms (3.24 MiB) | 35.4 ms (2.90 MiB) | 7812.2 ms (74.25 MiB) | 33.6 ms (2.75 MiB) | 381.1 ms (88.43 MiB) | **3.06x** / **3.23x** / **711.17x** / **34.69x** | `17d38ef5a096dced` |
+| `append_200k` | 21.9 ms (4.11 MiB) | 91.9 ms (3.07 MiB) | 33933.6 ms (72.66 MiB) | 66.7 ms (2.92 MiB) | 907.0 ms (107.07 MiB) | **3.05x** / **4.20x** / **1552.45x** / **41.50x** | `dd403bae8f48744b` |
+| `tombstone_50k` | 208.0 ms (20.98 MiB) | 840.0 ms (11.96 MiB) | 4403.7 ms (79.55 MiB) | 14296.3 ms (13.88 MiB) | 2935.8 ms (146.89 MiB) | **68.73x** / **4.04x** / **21.17x** / **14.11x** | `4ebe0a8e06b70de2` |
+| `trace_automerge` (259,778 edits) | 261.8 ms (44.03 MiB) | 284.4 ms (18.64 MiB) | 1931.1 ms (145.90 MiB) | 6172.6 ms (18.53 MiB) | 5666.4 ms (166.83 MiB) | **23.58x** / **1.09x** / **7.38x** / **21.65x** | `fbcf04458973cd1c` |
+| `remote_apply` (×20) | 110.9 ms (7.08 MiB) | 127.6 ms (7.51 MiB) | 237.6 ms (71.46 MiB) | 85.0 ms (6.16 MiB) | 664.8 ms (121.35 MiB) | 0.77x / **1.15x** / **2.14x** / **5.99x** | `f13556fd49d149ba` |
 
-- Single-digit percentage differences (within ±10%) on a shared Linux VM fall within measurement noise and are not bolded.
-- Historical progression: `append_200k` was O(n²) in v0.1.0 on Apple M5 Max (1944.3 ms / 66.8 MiB); v0.2.0 runs it in 80.8 ms / 3.64 MiB on Apple M5 Max (**24.1x faster**) and 139.8 ms / 3.85 MiB on this Linux x86_64 host.
+- Single-digit percentage differences (within ±10%) on a shared Linux host fall within measurement noise and are not bolded.
+- Historical progression: `tombstone_50k` eliminated O(N²) split/marker degradation (51.2s → 208 ms, **4.04x faster than `rust_y_octo`** and **68.73x faster than `rust_yrs`**); `trace_automerge` improved **5.29x** on the same host (1237.9 ms → 234.2 ms paired, **1.09x vs `rust_y_octo`**); `remote_apply` improved **2.42x** on the same host (252.3 ms → 104.1 ms paired, **1.15x vs `rust_y_octo`**).
 - `automerge-paper` `encodeStateAsUpdate` size (5-way): `pion` **223,411 B**, `rust_yrs` **223,411 B**, `node_yjs` **223,414 B**, `rust_y_octo` **260,509 B**, `node_y_octo_wasm` **260,509 B** (v0.1.0: 990,662 B).
 - **Lagging items**:
   - **Latency**:
-    - `text_w1` trails `rust_y_octo` (0.92x, 247.4 vs 227.3 ms);
-    - `tombstone_50k` trails all 4 references: `rust_y_octo` (0.22x), `node_yjs` (0.55x), `node_y_octo_wasm` (0.83x), and `rust_yrs` (0.85x);
-    - `trace_automerge` trails `rust_y_octo` (0.79x, 1857.7 vs 1470.6 ms);
-    - `remote_apply` trails `rust_yrs` (0.51x, 314.3 vs 160.7 ms) and `rust_y_octo` (0.67x, 314.3 vs 211.0 ms).
+    - `text_w1` trails `rust_y_octo` (0.81x, 117.7 vs 95.9 ms);
+    - `remote_apply` trails `rust_yrs` (0.77x, 110.9 vs 85.0 ms), while leading `rust_y_octo` (1.15x), `node_y_octo_wasm` (2.14x), and `node_yjs` (5.99x).
   - **Peak RSS** (vs `rust_yrs` / `rust_y_octo`):
-    - `text_w1`: 7.12 vs 5.60 / 5.24 MiB;
-    - `append_100k`: 2.95 vs 2.59 / 2.72 MiB;
-    - `append_200k`: 3.85 vs 2.89 / 2.88 MiB;
-    - `tombstone_50k`: 20.43 vs 13.95 / 11.84 MiB;
-    - `trace_automerge`: 44.05 vs 18.27 / 18.46 MiB;
-    - `remote_apply`: 8.70 vs 6.04 / 7.46 MiB.
+    - `text_w1`: 7.25 vs 5.79 / 5.30 MiB;
+    - `append_100k`: 3.24 vs 2.75 / 2.90 MiB;
+    - `append_200k`: 4.11 vs 2.92 / 3.07 MiB;
+    - `tombstone_50k`: 20.98 vs 13.88 / 11.96 MiB;
+    - `trace_automerge`: 44.03 vs 18.53 / 18.64 MiB;
+    - `remote_apply`: 7.08 vs 6.16 MiB (`rust_yrs`), beating `rust_y_octo` (7.51 MiB).
 - **Driver semantics & `y-octo-wasm` `append` O(N²) root cause**:
   - `rust_yrs` is driven with one `transact_mut()` per edit (`OffsetKind::Utf16`); batched single-transaction replay was not measured.
   - In the main 5-way table, `node_y_octo_wasm` is driven one call per edit (matching the other 4 implementations). In `y-crdt/y-octo@58c9ffc`, every `DocSession::text_insert` commits via `commit_store` (`y-octo/src/doc/transaction/mod.rs`) and encodes a V1 delta from `before_state`; because adjacent same-client single-char inserts merge into one long string item in the store, encoding each delta runs `DocStore::write_structs_since` (`y-octo/src/doc/store.rs`) → `WireStruct::from_node` → `WireStruct::split_at` → `WireContent::split_in_place` (`y-octo/src/doc/codec/wire_struct.rs`) → `utf16_split_in_place` / `Utf16Slices::boundary` (`y-octo/src/doc/common/algorithm.rs`), linearly scanning from the start of the merged string to split at offset `i`, producing O(N²) scaling across `append_50k` (3167.1 ms) → `append_100k` (12408.6 ms) → `append_200k` (54698.8 ms) (a `y-octo` core behavior that also reproduces on native `Doc` with a subscriber attached).
