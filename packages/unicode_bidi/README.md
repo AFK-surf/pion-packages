@@ -13,18 +13,18 @@ Pure-Pion implementation of the **Unicode Bidirectional Algorithm (UAX #9, Unico
   - **W1–W7**: weak type resolution
   - **N0–N2**: BD16 paired bracket algorithm (63-entry bracket stack cap, returning an empty pair list on overflow per UAX #9 rev 50) and neutral resolution
   - **I1–I2**: implicit level resolution (clamped to `0..=126` invariant)
-  - **L1–L4**: trailing whitespace/separator reset, O(line) local-buffer `reorder_line` / `reorder_line_with_mirroring`, UTF-8 boundary byte-copy RTL reversal, and RTL glyph mirroring
-- Compact 1-byte `Bytes` internal working buffers and reusable `BidiScratch` across paragraphs.
+  - **L1–L4**: trailing whitespace/separator reset, O(line) `visual_runs` / `reordered_levels` / `reorder_line` / `reorder_line_with_mirroring`, zero-allocation backward UTF-8 RTL reversal, and RTL glyph mirroring
+- Compact 1-byte `FixedArray[Byte]` internal working buffers (zero COW overhead), hoisted table references with inline ASCII fast paths, flat BD13 run-sequence chains, and reusable `BidiScratch` across paragraphs.
 - Explicit `Limits` / `Result[BidiInfo, BidiError]` API (`new_with_limits`) plus total `BidiInfo::new` and convenience `bidi_line_levels` / `bidi_visual_order` helpers.
 - Verified on Unicode 16.0.0 `BidiCharacterTest` (`91,707/91,707`) and `BidiTest` (`770,241/770,241`), red-team audit (`18/18`), and Native + Wasm32 (`debug` / `--release`).
 
-## Head-to-Head Benchmarks (`Darwin arm64`, Pion Native `--release` vs Rust `unicode-bidi 0.3.18 --release`)
+## Head-to-Head Benchmarks (`Linux x86_64`, Pion Native `--release` vs Rust `unicode-bidi 0.3.18 --release`)
 
-Run `sh packages/unicode_bidi/bench/run_bench.sh` (`--warmup 1 --rounds 5`, SHA-256 verified identical across all rounds):
+Run `sh packages/unicode_bidi/bench/run_bench.sh` (`--warmup 1 --rounds 5`, strictly interleaved, SHA-256 verified identical across all rounds):
 
 | Benchmark | Pion Median (ms) | Rust Median (ms) | Pion Throughput (MB/s) | Rust Throughput (MB/s) | Speedup vs Rust |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Pure LTR fast path (`40k ops`, `3.98 MB`) | 63.711 | 68.927 | 62.43 | 57.71 | **1.08×** |
-| Mixed Arabic/Hebrew/English (`10k ops`, `900 KB`) | 46.083 | 38.388 | 19.54 | 23.46 | **0.83×** |
-| Deep nested isolates & brackets (`5k ops`, `383 KB`) | 30.637 | 27.972 | 12.52 | 13.71 | **0.91×** |
-| Per-line `visual_runs` + `reorder_line` (`10k ops`, `900 KB`) | 69.079 | 48.495 | 13.04 | 18.57 | **0.70×** |
+| Pure LTR fast path (`40k ops`, `3.95 MB`) | 223.448 | 610.910 | 17.69 | 6.47 | **2.73×** |
+| Mixed Arabic/Hebrew/English (`10k ops`, `900 KB`) | 164.294 | 244.927 | 5.48 | 3.68 | **1.49×** |
+| Deep nested isolates & brackets (`5k ops`, `383 KB`) | 118.067 | 124.999 | 3.25 | 3.07 | **1.06×** |
+| Per-line `visual_runs` + `reorder_line` (`10k ops`, `900 KB`) | 270.247 | 390.638 | 3.33 | 2.31 | **1.45×** |
