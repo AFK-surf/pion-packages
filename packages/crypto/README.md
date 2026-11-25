@@ -111,6 +111,22 @@ Measured on `Darwin arm64` with `scripts/bench_compare.py --warmup 1 --rounds 5`
 - The v0.3.0 rows (AES-256-GCM, P-256 ECDH, P-256 pubkey validation) are sized so Go's side runs ≥ 45 ms of real work (process start-up ≈ 3 ms, < 7% of the Go median), so their ratios reflect steady-state throughput. They are Pion's weakest rows: the constant-time bitsliced software AES-256-GCM reaches **64.5 MB/s** (**0.03×** of Go's ARMv8 AES+PMULL path at ≈ 2.35 GB/s; **0.02×** on 256 B packets), P-256 ECDH runs at **701 µs/op (0.05×** of Go's ARM64-assembly `crypto/ecdh` at 35 µs/op), and P-256 public-key validation at **20.7 µs/op (0.10×)**. The earlier 64–400-iteration rows (0.10×–0.65×) were dominated by process start-up and overstated these ratios (see [`audit_v030/REPORT.md`](audit_v030/REPORT.md) P2-1).
 - The older v0.2.0 rows keep their original sizes; the shortest of them (X25519, Go ≈ 28 ms) still include ≈ 3 ms of process start-up per side, so the ratio is approximate.
 
+### Scalar Optimization Results (`Linux x86_64`)
+
+Measured on `Linux x86_64` with `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved against Go stdlib / `golang.org/x/crypto`, stdout SHA-256 verified byte-for-byte identical across all 14 benchmarks and 4-mode `wasm_smoke`):
+
+| Workload | Baseline vs Go | Optimized vs Go | Relative Gain | Key Optimization |
+| --- | ---: | ---: | ---: | --- |
+| NIST P-256 ES256 (50 sign + 50 verify) | 0.03x | 0.15x | **5.00x** | `val struct Fp` zero-alloc Montgomery CIOS + 4-table fixed-base comb + `p-2` addition chain |
+| NIST P-256 ECDH (2,000 key exchanges) | 0.03x | 0.11x–0.12x | **3.67x–4.35x** | `val struct Fp` + Jacobian 3M+5S doubling + multiplication-free P-256 reduction |
+| NIST P-256 Pubkey Validate (40,000 ops) | 0.09x | 0.29x–0.44x | **3.22x–4.88x** | Module-cached `P256Ctx`, direct `Fp` parsing, `(p+1)/4` 253S+7M addition chain |
+| ChaCha20-Poly1305 (4 MiB seal + open) | 0.44x | 0.88x | **2.00x** | Inlined quarter-round rotates & byte XOR, register-hoisted Poly1305 loop |
+| Ed25519 (200 sign + 200 strict verify) | 0.16x | 0.28x | **1.75x** | Lazily-initialized constant-time 4-table fixed-base comb (`B, 2^64 B, 2^128 B, 2^192 B`) |
+| AES-256-GCM (1,000 × 64 KiB seal + open) | 0.12x | 0.17x | **1.42x–1.60x** | Inlined `aes_delta_swap` & GHASH Karatsuba (zero tuple boxing), reused `q` scratch |
+| AES-256-GCM Small (150,000 × 256 B) | 0.06x | 0.09x | **1.50x–1.63x** | Transpose-based `aes_pack_round_key`, reused key-schedule scratch, zero tuple boxing |
+
+- **Hardware instruction ceiling (`objdump -d`)**: On `Linux x86_64`, `go_crypto_bench` executes `sha256rnds2` / `sha256msg1` / `sha256msg2` (SHA-NI) for SHA-256 and `aesenc` / `pclmulqdq` (AES-NI + CLMUL) for AES-GCM, whereas pure-Pion QBE emits 0 hardware crypto/SIMD instructions (`sha256_compress_w` is already 8-way unrolled with hoisted `sha256_k` and zero helper calls). All constant-time QBE SSA gates (`audit/ct_ssa_check.py`, `audit_v030/ct_ssa_check_v030.py`, `audit_v040/ct_ssa_check_v040.py`) pass with zero secret-dependent branches or table lookups.
+
 ## Formal Verification (Lean 4)
 
 15 production cryptographic kernels (`Fe`, `fe_cmov`, `fe_cswap_pair`, `fe_add`, `fe_sub`, `fe_mul`, `fe_sq`, `ct_eq_nibble`, `ct_diff_acc`, `x25519_clamp_low_byte`, `x25519_clamp_high_byte`, `cc_rotl32`, `poly1305_clamp_r`, `poly1305_final_reduce`, `hkdf_sha256_blocks`, `hex_nibble_val`; `types=1, funs=15, externals=0`) are annotated with `#verify` and formally verified in Lean 4 under `proofs/` (**19** `0-sorry` theorems: **7 A-grade** algebraic/cryptographic core theorems + **12 B-grade** primitive/constant-time helper theorems, strict standard-axiom whitelist, 36-case value-comparing native-vs-Lean differential cross-check including boundary extremes and shift-trap checks):
