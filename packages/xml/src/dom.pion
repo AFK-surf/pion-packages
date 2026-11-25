@@ -81,21 +81,16 @@ fn resolve_ns_prefix(
   -1
 }
 
-///| Intern a slice from `cur_src` into `strings` when parsing inside an entity frame;
-///| zero-copy `(s, e)` when parsing from the main document `doc_src`.
-fn maybe_intern(
+///| Intern a slice from `cur_src` into `strings` and return its negative pool index `-(idx + 1)`.
+fn intern_slice(
   cur_src : String,
-  in_entity : Bool,
   strings : Array[String],
   s : Int,
   e : Int,
-) -> (Int, Int) {
-  if !in_entity {
-    return (s, e)
-  }
+) -> Int {
   let idx = strings.length()
   strings.push(cur_src.slice(s, e))
-  (-(idx + 1), 0)
+  -(idx + 1)
 }
 
 ///| Update previous sibling's `next_sibling` link in `nodes`.
@@ -173,6 +168,1101 @@ fn update_text_node_span(
   }
 }
 
+///| Cold helper state passed by reference to out-of-line cold handlers so the hot loop stays register-resident.
+struct DomCold {
+  src : String
+  opts : ParseOptions
+  nodes : Array[NodeData]
+  attrs : Array[AttrData]
+  namespaces : Array[NsData]
+  strings : Array[String]
+  entities : EntityTable
+  budget : EntityBudget
+  active_ns : Array[Int]
+  mut ns_map_active : Bool
+  ns_map : Map[String, Int]
+  ns_prev_stack : Array[(String, Int)]
+  input_stack : Array[InputFrame]
+  mut cur_src : String
+  mut len : Int
+  mut cur_entity_idx : Int
+  mut cur_base_depth : Int
+  mut cur_default_ns : Int
+  mut cached_ns_idx : Int
+  mut root_elem_id : Int
+  mut saw_doctype : Bool
+  mut text_run_active : Bool
+  mut text_run_sb : StringBuilder
+  mut last_err : Option[XmlError]
+}
+
+///| Flush an open merged text/CDATA run into `strings` and update `cur_lc`.
+fn DomCold::flush_text_run(self : DomCold, cur_lc : Int) -> Unit {
+  let pool_idx = self.strings.length()
+  self.strings.push(self.text_run_sb.to_string())
+  update_text_node_span(self.nodes, cur_lc, -(pool_idx + 1), 0)
+  self.text_run_active = false
+  self.text_run_sb = StringBuilder::new()
+}
+
+///| Initialize `text_run_sb` from the previous text node `cur_lc` if not already active.
+fn DomCold::ensure_text_run(self : DomCold, cur_lc : Int) -> Unit {
+  if !self.text_run_active {
+    self.text_run_active = true
+    self.text_run_sb = StringBuilder::new()
+    let prev_n = self.nodes[cur_lc]
+    if prev_n.s1_start < 0 {
+      let pidx = -(prev_n.s1_start + 1)
+      self.text_run_sb.write_string(self.strings[pidx])
+      if pidx == self.strings.length() - 1 {
+        let _ = self.strings.pop()
+      } else {
+        self.strings[pidx] = ""
+      }
+    } else {
+      self.text_run_sb.write_substring(self.src, prev_n.s1_start, prev_n.s1_end)
+    }
+  }
+}
+
+///| Pop active namespace bindings back to `prev_ns_len`.
+fn DomCold::pop_ns_scope(self : DomCold, prev_ns_len : Int) -> Unit {
+  while self.active_ns.length() > prev_ns_len {
+    let _ = self.active_ns.pop()
+    if self.ns_map_active {
+      match self.ns_prev_stack.pop() {
+        Some((ps, prev_i)) => {
+          if ps.length() > 0 {
+            if prev_i == -1 {
+              self.ns_map.remove(ps)
+            } else {
+              self.ns_map.set(ps, prev_i)
+            }
+          }
+        }
+        None => ()
+      }
+    }
+    self.cached_ns_idx = -1
+  }
+}
+
+///| Cold helper: handle prolog/epilog (`depth == 0`).
+///| Returns `Ok((handled, next_pos, new_fc, new_lc))`.
+fn DomCold::handle_prolog_epilog(
+  self : DomCold,
+  start_pos : Int,
+  cur_fc : Int,
+  cur_lc : Int,
+) -> Result[(Bool, Int, Int, Int), XmlError] {
+  let cur_src = self.cur_src
+  let len = self.len
+  let mut pos = start_pos
+  if cur_src.code_unit_at(pos) <= 0x20 {
+    pos = skip_ws(cur_src, pos, len)
+    if pos >= len {
+      return Ok((true, pos, cur_fc, cur_lc))
+    }
+  }
+  if cur_src.code_unit_at(pos) != 0x3C {
+    return Err(
+      make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "unexpected text outside root element"),
+    )
+  }
+  if pos + 1 >= len {
+    return Err(make_err(cur_src, pos, XmlErrorKind::UnexpectedEof, "unexpected EOF after '<'"))
+  }
+  let b1 = cur_src.code_unit_at(pos + 1)
+  if b1 == 0x21 {
+    if pos + 4 <= len && cur_src.code_unit_at(pos + 2) == 0x2D && cur_src.code_unit_at(pos + 3) == 0x2D {
+      match scan_comment(cur_src, pos + 4, len) {
+        Ok((cs, ce, has_cr, ni)) => {
+          if self.nodes.length() >= self.opts.limits.max_nodes {
+            return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
+          }
+          let mut vs = cs
+          let mut ve = ce
+          if has_cr {
+            let idx = self.strings.length()
+            self.strings.push(normalize_eol(cur_src, cs, ce))
+            vs = -(idx + 1)
+            ve = 0
+          }
+          let cid = self.nodes.length()
+          self.nodes.push(
+            NodeData::{
+              kind_ns: pack_kind_ns(node_kind_comment, -1),
+              parent: 0,
+              prev_sibling: cur_lc,
+              next_sibling: -1,
+              first_child: -1,
+              last_child: -1,
+              s1_start: vs,
+              s1_end: ve,
+              s2_start: 0,
+              s2_end: 0,
+              attrs_start: 0,
+              attrs_end: 0,
+              ns_start: 0,
+              ns_end: 0,
+            },
+          )
+          let mut nfc = cur_fc
+          if cur_lc >= 0 {
+            set_next_sibling(self.nodes, cur_lc, cid)
+          } else {
+            nfc = cid
+          }
+          return Ok((true, ni, nfc, cid))
+        }
+        Err(e) => return Err(e)
+      }
+    } else if pos + 9 <= len && raw_slice_eq_str(cur_src, pos, pos + 9, "<!DOCTYPE") {
+      if self.root_elem_id >= 0 {
+        return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "DOCTYPE not allowed after root element"))
+      }
+      if self.saw_doctype {
+        return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "multiple DOCTYPE declarations"))
+      }
+      if !self.opts.allow_dtd {
+        return Err(make_err(cur_src, pos, XmlErrorKind::DtdDetected, "DTD is disabled by default"))
+      }
+      self.saw_doctype = true
+      match parse_doctype(cur_src, pos + 9, len, self.entities) {
+        Ok((_, _, ni)) => return Ok((true, ni, cur_fc, cur_lc))
+        Err(e) => return Err(e)
+      }
+    } else if pos + 9 <= len && raw_slice_eq_str(cur_src, pos, pos + 9, "<![CDATA[") {
+      return Err(make_err(cur_src, pos, XmlErrorKind::InvalidCData, "CDATA not allowed outside root element"))
+    } else {
+      return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "invalid markup in prolog/epilog"))
+    }
+  } else if b1 == 0x3F {
+    match scan_pi(cur_src, pos + 2, len) {
+      Ok((ts, te, vs_raw, ve_raw, has_val, has_cr, ni)) => {
+        if self.nodes.length() >= self.opts.limits.max_nodes {
+          return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
+        }
+        let mut vs = 0
+        let mut ve = 0
+        if has_val {
+          if has_cr {
+            let idx = self.strings.length()
+            self.strings.push(normalize_eol(cur_src, vs_raw, ve_raw))
+            vs = -(idx + 1)
+            ve = 0
+          } else {
+            vs = vs_raw
+            ve = ve_raw
+          }
+        }
+        let cid = self.nodes.length()
+        self.nodes.push(
+          NodeData::{
+            kind_ns: pack_kind_ns(node_kind_pi, if has_val { 1 } else { 0 }),
+            parent: 0,
+            prev_sibling: cur_lc,
+            next_sibling: -1,
+            first_child: -1,
+            last_child: -1,
+            s1_start: ts,
+            s1_end: te,
+            s2_start: vs,
+            s2_end: ve,
+            attrs_start: 0,
+            attrs_end: 0,
+            ns_start: 0,
+            ns_end: 0,
+          },
+        )
+        let mut nfc = cur_fc
+        if cur_lc >= 0 {
+          set_next_sibling(self.nodes, cur_lc, cid)
+        } else {
+          nfc = cid
+        }
+        return Ok((true, ni, nfc, cid))
+      }
+      Err(e) => return Err(e)
+    }
+  } else if b1 == 0x2F {
+    return Err(make_err(cur_src, pos, XmlErrorKind::MismatchedTag, "unexpected end tag at root level"))
+  } else if self.root_elem_id >= 0 {
+    return Err(make_err(cur_src, pos, XmlErrorKind::MultipleRootNodes, "multiple root elements"))
+  }
+  Ok((false, pos, cur_fc, cur_lc))
+}
+
+///| Cold helper: handle Comment, CDATA, or PI inside an element.
+///| Returns `Ok((next_pos, new_fc, new_lc))`.
+fn DomCold::handle_bang_or_pi(
+  self : DomCold,
+  pos : Int,
+  b1 : Int,
+  cur_parent : Int,
+  cur_fc : Int,
+  cur_lc : Int,
+) -> Result[(Int, Int, Int), XmlError] {
+  let cur_src = self.cur_src
+  let len = self.len
+  let in_entity = self.cur_entity_idx >= 0
+  let max_nodes = self.opts.limits.max_nodes
+  let mut nfc = cur_fc
+  let mut nlc = cur_lc
+  if b1 == 0x21 {
+    if pos + 4 <= len && cur_src.code_unit_at(pos + 2) == 0x2D && cur_src.code_unit_at(pos + 3) == 0x2D {
+      if self.text_run_active {
+        self.flush_text_run(nlc)
+      }
+      let sc = scan_comment_fast(cur_src, pos + 4, len)
+      if sc.next < 0 {
+        return match scan_comment(cur_src, pos + 4, len) {
+          Ok(_) => Err(make_err(cur_src, pos, XmlErrorKind::InvalidComment, "invalid comment"))
+          Err(e) => Err(e)
+        }
+      }
+      if self.nodes.length() >= max_nodes {
+        return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
+      }
+      let mut vs = sc.start
+      let mut ve = sc.end
+      if sc.has_cr {
+        let idx = self.strings.length()
+        self.strings.push(normalize_eol(cur_src, sc.start, sc.end))
+        vs = -(idx + 1)
+        ve = 0
+      } else if in_entity {
+        vs = intern_slice(cur_src, self.strings, sc.start, sc.end)
+        ve = 0
+      }
+      let cid = self.nodes.length()
+      self.nodes.push(
+        NodeData::{
+          kind_ns: pack_kind_ns(node_kind_comment, -1),
+          parent: cur_parent,
+          prev_sibling: nlc,
+          next_sibling: -1,
+          first_child: -1,
+          last_child: -1,
+          s1_start: vs,
+          s1_end: ve,
+          s2_start: 0,
+          s2_end: 0,
+          attrs_start: 0,
+          attrs_end: 0,
+          ns_start: 0,
+          ns_end: 0,
+        },
+      )
+      if nlc >= 0 {
+        set_next_sibling(self.nodes, nlc, cid)
+      } else {
+        nfc = cid
+      }
+      nlc = cid
+      return Ok((sc.next, nfc, nlc))
+    } else if pos + 9 <= len && cur_src.code_unit_at(pos + 2) == 0x5B && raw_slice_eq_str(cur_src, pos, pos + 9, "<![CDATA[") {
+      let sc = scan_cdata_fast(cur_src, pos + 9, len)
+      if sc.next < 0 {
+        return match scan_cdata(cur_src, pos + 9, len) {
+          Ok(_) => Err(make_err(cur_src, pos, XmlErrorKind::InvalidCData, "invalid CDATA"))
+          Err(e) => Err(e)
+        }
+      }
+      if sc.end > sc.start {
+        if nlc >= 0 && unpack_kind(self.nodes[nlc].kind_ns) == node_kind_text {
+          self.ensure_text_run(nlc)
+          if sc.has_cr {
+            self.text_run_sb.write_string(normalize_eol(cur_src, sc.start, sc.end))
+          } else {
+            self.text_run_sb.write_substring(cur_src, sc.start, sc.end)
+          }
+        } else {
+          if self.nodes.length() >= max_nodes {
+            return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
+          }
+          let mut vs = sc.start
+          let mut ve = sc.end
+          if sc.has_cr {
+            let idx = self.strings.length()
+            self.strings.push(normalize_eol(cur_src, sc.start, sc.end))
+            vs = -(idx + 1)
+            ve = 0
+          } else if in_entity {
+            vs = intern_slice(cur_src, self.strings, sc.start, sc.end)
+            ve = 0
+          }
+          let cid = self.nodes.length()
+          self.nodes.push(
+            NodeData::{
+              kind_ns: pack_kind_ns(node_kind_text, -1),
+              parent: cur_parent,
+              prev_sibling: nlc,
+              next_sibling: -1,
+              first_child: -1,
+              last_child: -1,
+              s1_start: vs,
+              s1_end: ve,
+              s2_start: 0,
+              s2_end: 0,
+              attrs_start: 0,
+              attrs_end: 0,
+              ns_start: 0,
+              ns_end: 0,
+            },
+          )
+          if nlc >= 0 {
+            set_next_sibling(self.nodes, nlc, cid)
+          } else {
+            nfc = cid
+          }
+          nlc = cid
+        }
+      }
+      return Ok((sc.next, nfc, nlc))
+    } else {
+      return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "unexpected '<!' inside element"))
+    }
+  }
+  // PI inside element
+  if self.text_run_active {
+    self.flush_text_run(nlc)
+  }
+  match scan_pi(cur_src, pos + 2, len) {
+    Ok((ts, te, vs_raw, ve_raw, has_val, has_cr, ni)) => {
+      if self.nodes.length() >= max_nodes {
+        return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
+      }
+      let its = if in_entity { intern_slice(cur_src, self.strings, ts, te) } else { ts }
+      let ite = if in_entity { 0 } else { te }
+      let mut vs = 0
+      let mut ve = 0
+      if has_val {
+        if has_cr {
+          let idx = self.strings.length()
+          self.strings.push(normalize_eol(cur_src, vs_raw, ve_raw))
+          vs = -(idx + 1)
+          ve = 0
+        } else if in_entity {
+          vs = intern_slice(cur_src, self.strings, vs_raw, ve_raw)
+          ve = 0
+        } else {
+          vs = vs_raw
+          ve = ve_raw
+        }
+      }
+      let cid = self.nodes.length()
+      self.nodes.push(
+        NodeData::{
+          kind_ns: pack_kind_ns(node_kind_pi, if has_val { 1 } else { 0 }),
+          parent: cur_parent,
+          prev_sibling: nlc,
+          next_sibling: -1,
+          first_child: -1,
+          last_child: -1,
+          s1_start: its,
+          s1_end: ite,
+          s2_start: vs,
+          s2_end: ve,
+          attrs_start: 0,
+          attrs_end: 0,
+          ns_start: 0,
+          ns_end: 0,
+        },
+      )
+      if nlc >= 0 {
+        set_next_sibling(self.nodes, nlc, cid)
+      } else {
+        nfc = cid
+      }
+      nlc = cid
+      Ok((ni, nfc, nlc))
+    }
+    Err(e) => Err(e)
+  }
+}
+
+///| Cold helper: slow end tag validation (`</name ...>`). Returns `Ok(pos_after_gt)`.
+fn DomCold::validate_end_tag_slow(
+  self : DomCold,
+  name_start : Int,
+  open_node : NodeData,
+) -> Result[Int, XmlError] {
+  let cur_src = self.cur_src
+  let len = self.len
+  let qn = scan_qname(cur_src, name_start, len)
+  let name_end = qn.end
+  let colon_pos = qn.colon
+  if name_end < 0 {
+    return Err(make_err(cur_src, name_start, XmlErrorKind::InvalidName, "invalid end tag name"))
+  }
+  let after_ws = skip_ws(cur_src, name_end, len)
+  if after_ws >= len || cur_src.code_unit_at(after_ws) != 0x3E {
+    return Err(make_err(cur_src, after_ws, XmlErrorKind::InvalidSyntax, "expected '>' closing end tag"))
+  }
+  let open_has_prefix = open_node.s2_start < 0 || open_node.s2_end > open_node.s2_start
+  let end_has_prefix = colon_pos >= 0
+  let end_ls = if end_has_prefix { colon_pos + 1 } else { name_start }
+  let local_eq = if open_node.s1_start < 0 {
+    raw_slice_eq_str(cur_src, end_ls, name_end, self.strings[-(open_node.s1_start + 1)])
+  } else {
+    str_slice_eq(self.src, open_node.s1_start, open_node.s1_end, cur_src, end_ls, name_end)
+  }
+  let prefix_eq = if !open_has_prefix {
+    true
+  } else if open_node.s2_start < 0 {
+    raw_slice_eq_str(cur_src, name_start, colon_pos, self.strings[-(open_node.s2_start + 1)])
+  } else {
+    str_slice_eq(self.src, open_node.s2_start, open_node.s2_end, cur_src, name_start, colon_pos)
+  }
+  if open_has_prefix != end_has_prefix || !local_eq || !prefix_eq {
+    return Err(make_err(cur_src, name_start, XmlErrorKind::MismatchedTag, "mismatched end tag"))
+  }
+  Ok(after_ws + 1)
+}
+
+///| Cold helper: handle `xmlns` or `xmlns:prefix` attribute declaration.
+fn DomCold::handle_xmlns_attr(
+  self : DomCold,
+  aname_start : Int,
+  aname_end : Int,
+  acolon : Int,
+  aval_start : Int,
+  vs : Int,
+  ve : Int,
+  ns_start : Int,
+) -> Result[Unit, XmlError] {
+  let cur_src = self.cur_src
+  let in_entity = self.cur_entity_idx >= 0
+  let aval_span = TextSpan::{ start: vs, end: ve }
+  if acolon < 0 {
+    let mut k = ns_start
+    while k < self.namespaces.length() {
+      if !self.namespaces[k].has_prefix {
+        return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate xmlns attribute"))
+      }
+      k = k + 1
+    }
+    if span_eq_str(self.src, self.strings, aval_span, xml_ns_uri) ||
+    span_eq_str(self.src, self.strings, aval_span, xmlns_ns_uri) {
+      return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "cannot bind default namespace to reserved URI"))
+    }
+    let ns_idx = self.namespaces.length()
+    self.namespaces.push(
+      NsData::{
+        prefix_span: TextSpan::empty(),
+        uri_span: aval_span,
+        has_prefix: false,
+      },
+    )
+    if self.ns_map_active {
+      self.ns_prev_stack.push(("", -1))
+    }
+    self.active_ns.push(ns_idx)
+    self.cur_default_ns = if span_len(self.strings, aval_span) == 0 { -1 } else { ns_idx }
+    return Ok(())
+  }
+  let ps_i = if in_entity { intern_slice(cur_src, self.strings, acolon + 1, aname_end) } else { acolon + 1 }
+  let pe_i = if in_entity { 0 } else { aname_end }
+  let pspan = TextSpan::{ start: ps_i, end: pe_i }
+  if !self.ns_map_active && self.active_ns.length() >= 8 {
+    self.ns_map_active = true
+    let mut m = 0
+    while m < self.active_ns.length() {
+      let existing_idx = self.active_ns[m]
+      let existing_ns = self.namespaces[existing_idx]
+      if existing_ns.has_prefix {
+        let eps = span_to_string(self.src, self.strings, existing_ns.prefix_span)
+        let old_i = match self.ns_map.get(eps) {
+          Some(v) => v
+          None => -1
+        }
+        self.ns_prev_stack.push((eps, old_i))
+        self.ns_map.set(eps, existing_idx)
+      } else {
+        self.ns_prev_stack.push(("", -1))
+      }
+      m = m + 1
+    }
+  }
+  if self.ns_map_active {
+    let pstr = cur_src.slice(acolon + 1, aname_end)
+    match self.ns_map.get(pstr) {
+      Some(prev_i) => {
+        if prev_i >= ns_start {
+          return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate xmlns prefix declaration"))
+        }
+      }
+      None => ()
+    }
+  } else {
+    let mut k = ns_start
+    while k < self.namespaces.length() {
+      if self.namespaces[k].has_prefix &&
+      span_eq_span(self.src, self.strings, self.namespaces[k].prefix_span, pspan) {
+        return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate xmlns prefix declaration"))
+      }
+      k = k + 1
+    }
+  }
+  if span_len(self.strings, aval_span) == 0 {
+    return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "prefixed namespace URI cannot be empty"))
+  }
+  if span_eq_str(self.src, self.strings, pspan, "xmlns") {
+    return Err(make_err(cur_src, aname_start, XmlErrorKind::InvalidNamespace, "cannot declare prefix 'xmlns'"))
+  }
+  if span_eq_str(self.src, self.strings, pspan, "xml") {
+    if !span_eq_str(self.src, self.strings, aval_span, xml_ns_uri) {
+      return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "prefix 'xml' can only be bound to XML namespace"))
+    }
+  } else {
+    if span_eq_str(self.src, self.strings, aval_span, xml_ns_uri) {
+      return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "only prefix 'xml' may bind to XML namespace"))
+    }
+  }
+  if span_eq_str(self.src, self.strings, aval_span, xmlns_ns_uri) {
+    return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "no prefix may bind to xmlns namespace"))
+  }
+  let ns_idx = self.namespaces.length()
+  self.namespaces.push(
+    NsData::{
+      prefix_span: pspan,
+      uri_span: aval_span,
+      has_prefix: true,
+    },
+  )
+  if self.ns_map_active {
+    let pstr = cur_src.slice(acolon + 1, aname_end)
+    let old_i = match self.ns_map.get(pstr) {
+      Some(v) => v
+      None => -1
+    }
+    self.ns_prev_stack.push((pstr, old_i))
+    self.ns_map.set(pstr, ns_idx)
+  }
+  self.active_ns.push(ns_idx)
+  self.cached_ns_idx = -1
+  Ok(())
+}
+
+///| Cold helper: resolve namespaces and check duplicates for prefixed attributes.
+fn DomCold::resolve_prefixed_attrs(
+  self : DomCold,
+  attrs_start : Int,
+  attrs_end : Int,
+  err_pos : Int,
+) -> Result[Unit, XmlError] {
+  let mut ai = attrs_start
+  while ai < attrs_end {
+    let cur_a = self.attrs[ai]
+    if cur_a.ns_idx == -3 {
+      let ans_idx = if cur_a.prefix_start < 0 {
+        let pstr = self.strings[-(cur_a.prefix_start + 1)]
+        resolve_ns_prefix(
+          self.src,
+          pstr,
+          self.strings,
+          self.namespaces,
+          self.active_ns,
+          self.ns_map_active,
+          self.ns_map,
+          0,
+          pstr.length(),
+        )
+      } else {
+        resolve_ns_prefix(
+          self.src,
+          self.src,
+          self.strings,
+          self.namespaces,
+          self.active_ns,
+          self.ns_map_active,
+          self.ns_map,
+          cur_a.prefix_start,
+          cur_a.prefix_end,
+        )
+      }
+      if ans_idx == -1 {
+        return Err(
+          make_err(self.cur_src, err_pos, XmlErrorKind::UnboundNamespacePrefix, "unbound namespace prefix on attribute"),
+        )
+      }
+      self.attrs[ai] = AttrData::{
+        local_start: cur_a.local_start,
+        local_end: cur_a.local_end,
+        prefix_start: cur_a.prefix_start,
+        prefix_end: cur_a.prefix_end,
+        val_start: cur_a.val_start,
+        val_end: cur_a.val_end,
+        ns_idx: ans_idx,
+      }
+      let cur_lspan = TextSpan::{ start: cur_a.local_start, end: cur_a.local_end }
+      let mut aj = attrs_start
+      while aj < ai {
+        let prev_a = self.attrs[aj]
+        if prev_a.ns_idx != -1 &&
+        span_eq_span(
+          self.src,
+          self.strings,
+          TextSpan::{ start: prev_a.local_start, end: prev_a.local_end },
+          cur_lspan,
+        ) {
+          let same_ns = if prev_a.ns_idx == ans_idx {
+            true
+          } else if prev_a.ns_idx >= 0 && ans_idx >= 0 {
+            span_eq_span(
+              self.src,
+              self.strings,
+              self.namespaces[prev_a.ns_idx].uri_span,
+              self.namespaces[ans_idx].uri_span,
+            )
+          } else {
+            false
+          }
+          if same_ns {
+            return Err(
+              make_err(self.cur_src, err_pos, XmlErrorKind::DuplicateAttribute, "duplicate attribute"),
+            )
+          }
+        }
+        aj = aj + 1
+      }
+    }
+    ai = ai + 1
+  }
+  Ok(())
+}
+
+///| Cold helper: push a custom DTD entity frame onto `input_stack`.
+fn DomCold::push_custom_entity(
+  self : DomCold,
+  err_pos : Int,
+  custom_ent_idx : Int,
+  custom_ent_after : Int,
+  depth : Int,
+) -> Result[Unit, XmlError] {
+  let ent = self.entities.defs[custom_ent_idx]
+  if ent.is_external {
+    return Err(
+      make_err(self.cur_src, err_pos, XmlErrorKind::ExternalEntityNotAllowed, "external entity reference is not allowed"),
+    )
+  }
+  if self.cur_entity_idx == custom_ent_idx {
+    return Err(make_err(self.cur_src, err_pos, XmlErrorKind::EntityLoop, "circular entity reference"))
+  }
+  let mut ek = 0
+  while ek < self.input_stack.length() {
+    if self.input_stack[ek].entity_idx == custom_ent_idx {
+      return Err(make_err(self.cur_src, err_pos, XmlErrorKind::EntityLoop, "circular entity reference"))
+    }
+    ek = ek + 1
+  }
+  self.budget.expansions = self.budget.expansions + 1
+  self.budget.bytes = self.budget.bytes + ent.value.length()
+  if self.budget.expansions > self.budget.max_expansions || self.budget.bytes > self.budget.max_bytes {
+    return Err(
+      make_err(self.cur_src, err_pos, XmlErrorKind::LimitExceeded, "entity expansion limit exceeded"),
+    )
+  }
+  self.input_stack.push(
+    InputFrame::{
+      src: self.cur_src,
+      pos: custom_ent_after,
+      len: self.len,
+      entity_idx: self.cur_entity_idx,
+      base_depth: self.cur_base_depth,
+    },
+  )
+  self.cur_src = ent.value
+  self.len = ent.value.length()
+  self.cur_entity_idx = custom_ent_idx
+  self.cur_base_depth = depth
+  self.cached_ns_idx = -1
+  Ok(())
+}
+
+///| Helper: parse attributes of a start or empty tag starting at `start_i` (after tag name),
+///| push into `self.attrs` / `self.namespaces`, and resolve any prefixed attributes.
+///| Zero `Result` boxing: returns `next_pos >= 0` for `<tag ...>`, `-(next_pos + 2)` (`<= -2`) for `<tag .../>`,
+///| or `-1` on error (error stored in `self.last_err`).
+fn DomCold::parse_tag_attrs(
+  self : DomCold,
+  start_i : Int,
+  ns_start : Int,
+  attrs_start : Int,
+  tag_pos : Int,
+  lut : FixedArray[Int],
+) -> Int {
+  let src = self.src
+  let cur_src = self.cur_src
+  let len = self.len
+  let attrs = self.attrs
+  let strings = self.strings
+  let entities = self.entities
+  let in_entity = self.cur_entity_idx >= 0
+  let no_custom_entities = entities.is_empty()
+  let max_attributes = self.opts.limits.max_attributes
+  let mut i = start_i
+  let mut is_empty = false
+  let mut tag_closed = false
+  let mut attr_count = 0
+  let mut has_prefixed_attr = false
+  let mut seen_unprefixed_attrs : Option[Map[String, Bool]] = None
+
+  while i < len {
+    let ws_before = i
+    let b_ws = cur_src.code_unit_at(i)
+    if b_ws == 0x20 {
+      i = i + 1
+      if i < len && cur_src.code_unit_at(i) <= 0x20 {
+        i = skip_ws(cur_src, i, len)
+      }
+    } else if b_ws <= 0x20 {
+      i = skip_ws(cur_src, i, len)
+    }
+    if i >= len {
+      self.last_err = Some(make_err(cur_src, i, XmlErrorKind::UnexpectedEof, "unterminated start tag"))
+      return -1
+    }
+    let cb = cur_src.code_unit_at(i)
+    if cb == 0x3E {
+      i = i + 1
+      tag_closed = true
+      break
+    }
+    if cb == 0x2F {
+      if i + 1 >= len || cur_src.code_unit_at(i + 1) != 0x3E {
+        self.last_err = Some(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected '>' after '/' in empty tag"))
+        return -1
+      }
+      is_empty = true
+      i = i + 2
+      tag_closed = true
+      break
+    }
+    if i == ws_before {
+      self.last_err = Some(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected whitespace before attribute"))
+      return -1
+    }
+    attr_count = attr_count + 1
+    if attr_count > max_attributes {
+      self.last_err = Some(make_err(cur_src, i, XmlErrorKind::LimitExceeded, "max_attributes limit exceeded"))
+      return -1
+    }
+    let aname_start = i
+    // Inline fast ASCII QName scan for attribute name (lut[128..255] == 0)
+    let mut aname_end = aname_start
+    let mut acolon = -1
+    if (lut[cb] & mask_ncname_start) != 0 {
+      aname_end = aname_start + 1
+      while aname_end < len {
+        if (lut[cur_src.code_unit_at(aname_end)] & mask_ncname_char) != 0 {
+          aname_end = aname_end + 1
+        } else {
+          break
+        }
+      }
+      if aname_end < len {
+        let ab = cur_src.code_unit_at(aname_end)
+        if ab == 0x3A {
+          acolon = aname_end
+          aname_end = aname_end + 1
+          if aname_end < len && (lut[cur_src.code_unit_at(aname_end)] & mask_ncname_start) != 0 {
+            aname_end = aname_end + 1
+            while aname_end < len {
+              if (lut[cur_src.code_unit_at(aname_end)] & mask_ncname_char) != 0 {
+                aname_end = aname_end + 1
+              } else {
+                break
+              }
+            }
+            if aname_end < len && (cur_src.code_unit_at(aname_end) >= 0x80 || cur_src.code_unit_at(aname_end) == 0x3A) {
+              let qn = scan_qname(cur_src, aname_start, len)
+              aname_end = qn.end
+              acolon = qn.colon
+            }
+          } else {
+            let qn = scan_qname(cur_src, aname_start, len)
+            aname_end = qn.end
+            acolon = qn.colon
+          }
+        } else if ab >= 0x80 {
+          let qn = scan_qname(cur_src, aname_start, len)
+          aname_end = qn.end
+          acolon = qn.colon
+        }
+      }
+    } else {
+      let qn = scan_qname(cur_src, aname_start, len)
+      aname_end = qn.end
+      acolon = qn.colon
+    }
+    if aname_end < 0 {
+      self.last_err = Some(make_err(cur_src, aname_start, XmlErrorKind::InvalidName, "invalid attribute name"))
+      return -1
+    }
+    i = aname_end
+    if i < len && cur_src.code_unit_at(i) <= 0x20 {
+      i = skip_ws(cur_src, i, len)
+    }
+    if i >= len || cur_src.code_unit_at(i) != 0x3D {
+      self.last_err = Some(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected '=' after attribute name"))
+      return -1
+    }
+    i = i + 1
+    if i < len && cur_src.code_unit_at(i) <= 0x20 {
+      i = skip_ws(cur_src, i, len)
+    }
+    if i >= len {
+      self.last_err = Some(make_err(cur_src, i, XmlErrorKind::UnexpectedEof, "expected attribute value quote"))
+      return -1
+    }
+    let quote = cur_src.code_unit_at(i)
+    if quote != 0x22 && quote != 0x27 {
+      self.last_err = Some(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "attribute value must be quoted"))
+      return -1
+    }
+    i = i + 1
+    let aval_start = i
+    let fast_mask = if quote == 0x22 { mask_attr_dq_fast } else { mask_attr_sq_fast }
+    let mut needs_unescape = false
+    let mut vs = 0
+    let mut ve = 0
+    let mut aval_done = false
+    while i < len {
+      while i <= len - 4 {
+        let m0 = lut[cur_src.code_unit_at(i)]
+        let m1 = lut[cur_src.code_unit_at(i + 1)]
+        let m2 = lut[cur_src.code_unit_at(i + 2)]
+        let m3 = lut[cur_src.code_unit_at(i + 3)]
+        if ((m0 & m1 & m2 & m3) & fast_mask) != 0 {
+          i = i + 4
+        } else {
+          break
+        }
+      }
+      while i < len {
+        if (lut[cur_src.code_unit_at(i)] & fast_mask) != 0 {
+          i = i + 1
+        } else {
+          break
+        }
+      }
+      if i >= len {
+        break
+      }
+      let ab = cur_src.code_unit_at(i)
+      if ab == quote {
+        break
+      }
+      if ab < 0x80 {
+        if ab == 0x26 || ab == 0x09 || ab == 0x0A || ab == 0x0D {
+          if no_custom_entities {
+            match scan_and_unescape_attr_no_dtd(cur_src, aval_start, i, len, quote, in_entity) {
+              Ok((s, next_i)) => {
+                let idx = strings.length()
+                strings.push(s)
+                vs = -(idx + 1)
+                ve = 0
+                i = next_i
+                aval_done = true
+                break
+              }
+              Err(e) => {
+                self.last_err = Some(e)
+                return -1
+              }
+            }
+          }
+          needs_unescape = true
+          i = i + 1
+        } else if ab == 0x3C {
+          self.last_err = Some(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "'<' not allowed in attribute value"))
+          return -1
+        } else {
+          self.last_err = Some(make_err(cur_src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in attribute value"))
+          return -1
+        }
+      } else {
+        let dec = decode_utf8_packed(cur_src, i, len)
+        if dec < 0 || !is_xml_char(dec >> 3) {
+          self.last_err = Some(make_err(cur_src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in attribute value"))
+          return -1
+        }
+        i = i + (dec & 7)
+      }
+    }
+    if !aval_done {
+      if i >= len || cur_src.code_unit_at(i) != quote {
+        self.last_err = Some(make_err(cur_src, aval_start, XmlErrorKind::UnexpectedEof, "unterminated attribute value"))
+        return -1
+      }
+      let aval_end = i
+      i = i + 1
+      if needs_unescape {
+        match unescape_span(
+          cur_src,
+          aval_start,
+          aval_end,
+          true,
+          entities,
+          self.budget,
+          self.cur_entity_idx,
+          self.input_stack,
+        ) {
+          Ok(s) => {
+            let idx = strings.length()
+            strings.push(s)
+            vs = -(idx + 1)
+            ve = 0
+          }
+          Err(e) => {
+            self.last_err = Some(e)
+            return -1
+          }
+        }
+      } else if in_entity {
+        vs = intern_slice(cur_src, strings, aval_start, aval_end)
+        ve = 0
+      } else {
+        vs = aval_start
+        ve = aval_end
+      }
+    }
+
+    if cb == 0x78 &&
+    ((acolon < 0 && aname_end - aname_start == 5 && raw_slice_eq_str(cur_src, aname_start, aname_end, "xmlns")) ||
+      (acolon >= 0 && acolon - aname_start == 5 && raw_slice_eq_str(cur_src, aname_start, acolon, "xmlns"))) {
+      match self.handle_xmlns_attr(aname_start, aname_end, acolon, aval_start, vs, ve, ns_start) {
+        Ok(()) => ()
+        Err(e) => {
+          self.last_err = Some(e)
+          return -1
+        }
+      }
+    } else if acolon < 0 {
+      let cur_alen = attrs.length()
+      if cur_alen > attrs_start {
+        match seen_unprefixed_attrs {
+          None => {
+            if cur_alen - attrs_start >= 16 {
+              let m : Map[String, Bool] = Map::new()
+              let mut aj = attrs_start
+              while aj < cur_alen {
+                let pa = attrs[aj]
+                if pa.ns_idx == -1 {
+                  m.set(
+                    span_to_string(src, strings, TextSpan::{ start: pa.local_start, end: pa.local_end }),
+                    true,
+                  )
+                }
+                aj = aj + 1
+              }
+              let astr = cur_src.slice(aname_start, aname_end)
+              match m.get(astr) {
+                Some(_) => {
+                  self.last_err = Some(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate attribute"))
+                  return -1
+                }
+                None => m.set(astr, true)
+              }
+              seen_unprefixed_attrs = Some(m)
+            } else {
+              let alen = aname_end - aname_start
+              let mut aj = attrs_start
+              while aj < cur_alen {
+                let prev_a = attrs[aj]
+                if prev_a.ns_idx == -1 {
+                  let is_dup = if prev_a.local_start < 0 {
+                    let pstr = strings[-(prev_a.local_start + 1)]
+                    pstr.length() == alen && raw_slice_eq_str(cur_src, aname_start, aname_end, pstr)
+                  } else {
+                    prev_a.local_end - prev_a.local_start == alen &&
+                    src.code_unit_at(prev_a.local_start) == cb &&
+                    (if !in_entity {
+                      raw_slice_eq(src, prev_a.local_start, prev_a.local_end, aname_start, aname_end)
+                    } else {
+                      str_slice_eq(src, prev_a.local_start, prev_a.local_end, cur_src, aname_start, aname_end)
+                    })
+                  }
+                  if is_dup {
+                    self.last_err = Some(
+                      make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate attribute"),
+                    )
+                    return -1
+                  }
+                }
+                aj = aj + 1
+              }
+            }
+          }
+          Some(m) => {
+            let astr = cur_src.slice(aname_start, aname_end)
+            match m.get(astr) {
+              Some(_) => {
+                self.last_err = Some(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate attribute"))
+                return -1
+              }
+              None => m.set(astr, true)
+            }
+          }
+        }
+      }
+      let ls_i = if in_entity { intern_slice(cur_src, strings, aname_start, aname_end) } else { aname_start }
+      let le_i = if in_entity { 0 } else { aname_end }
+      attrs.push(
+        AttrData::{
+          local_start: ls_i,
+          local_end: le_i,
+          prefix_start: 0,
+          prefix_end: 0,
+          val_start: vs,
+          val_end: ve,
+          ns_idx: -1,
+        },
+      )
+    } else {
+      has_prefixed_attr = true
+      let ls_i = if in_entity { intern_slice(cur_src, strings, acolon + 1, aname_end) } else { acolon + 1 }
+      let le_i = if in_entity { 0 } else { aname_end }
+      let ps_i = if in_entity { intern_slice(cur_src, strings, aname_start, acolon) } else { aname_start }
+      let pe_i = if in_entity { 0 } else { acolon }
+      attrs.push(
+        AttrData::{
+          local_start: ls_i,
+          local_end: le_i,
+          prefix_start: ps_i,
+          prefix_end: pe_i,
+          val_start: vs,
+          val_end: ve,
+          ns_idx: -3,
+        },
+      )
+    }
+  }
+
+  if !tag_closed {
+    self.last_err = Some(make_err(cur_src, i, XmlErrorKind::UnexpectedEof, "unterminated start tag"))
+    return -1
+  }
+
+  if has_prefixed_attr {
+    match self.resolve_prefixed_attrs(attrs_start, attrs.length(), tag_pos) {
+      Ok(()) => ()
+      Err(e) => {
+        self.last_err = Some(e)
+        return -1
+      }
+    }
+  }
+
+  if is_empty {
+    -(i + 2)
+  } else {
+    i
+  }
+}
+
 ///| Parse an XML 1.0 document with default security options (DTD disabled, bounded limits).
 pub fn Document::parse(src : String) -> Result[Document, XmlError] {
   Document::parse_with_options(src, ParseOptions::default())
@@ -200,7 +1290,6 @@ pub fn Document::parse_with_options(
   let namespaces : Array[NsData] = Array::with_capacity(16)
   let strings : Array[String] = []
   let entities = EntityTable::new()
-  let budget = EntityBudget::new(opts.limits)
 
   // Node 0: Document Root
   nodes.push(
@@ -237,54 +1326,68 @@ pub fn Document::parse_with_options(
     }
   }
 
-  // Explicit stacks (zero recursion!). Top of stack is kept in registers (`cur_parent`, `cur_fc`, `cur_lc`, `depth`).
+  let cold = DomCold::{
+    src: src,
+    opts: opts,
+    nodes: nodes,
+    attrs: attrs,
+    namespaces: namespaces,
+    strings: strings,
+    entities: entities,
+    budget: EntityBudget::new(opts.limits),
+    active_ns: [],
+    ns_map_active: false,
+    ns_map: Map::new(),
+    ns_prev_stack: [],
+    input_stack: [],
+    cur_src: src,
+    len: main_len,
+    cur_entity_idx: -1,
+    cur_base_depth: 0,
+    cur_default_ns: -1,
+    cached_ns_idx: -1,
+    root_elem_id: -1,
+    saw_doctype: false,
+    text_run_active: false,
+    text_run_sb: StringBuilder::new(),
+    last_err: None,
+  }
+
+  // Hot registers
   let lut = xml_lut
-  let elem_stack : Array[Int] = []
-  let first_child_stack : Array[Int] = []
-  let last_child_stack : Array[Int] = []
+  let first_child_stack : Array[Int] = Array::with_capacity(64)
+  let last_child_stack : Array[Int] = Array::with_capacity(64)
   let ns_scope_stack : Array[Int] = []
   let default_ns_stack : Array[Int] = []
-  let active_ns : Array[Int] = []
-  let mut ns_map_active = false
-  let ns_map : Map[String, Int] = Map::new()
-  let ns_prev_stack : Array[(String, Int)] = []
-  let input_stack : Array[InputFrame] = []
   let mut cur_src = src
   let mut len = main_len
-  let mut cur_entity_idx = -1
-  let mut cur_base_depth = 0
   let mut depth = 0
   let mut cur_parent = 0
   let mut cur_fc = -1
   let mut cur_lc = -1
-  let mut cur_default_ns = -1
   let mut cached_ns_p_start = 0
   let mut cached_ns_p_end = 0
-  let mut cached_ns_idx = -1
-  let mut root_elem_id = -1
-  let mut saw_doctype = false
-  let mut text_run_active = false
-  let mut text_run_sb = StringBuilder::new()
   let max_depth = opts.limits.max_depth
   let max_nodes = opts.limits.max_nodes
-  let max_attributes = opts.limits.max_attributes
 
   while true {
     if pos >= len {
-      if cur_entity_idx >= 0 {
-        if depth != cur_base_depth {
+      if cold.cur_entity_idx >= 0 {
+        if depth != cold.cur_base_depth {
           return Err(
             make_err(cur_src, pos, XmlErrorKind::UnclosedTag, "unbalanced markup inside entity replacement text"),
           )
         }
-        match input_stack.pop() {
+        match cold.input_stack.pop() {
           Some(prev) => {
             cur_src = prev.src
+            cold.cur_src = prev.src
             pos = prev.pos
             len = prev.len
-            cur_entity_idx = prev.entity_idx
-            cur_base_depth = prev.base_depth
-            cached_ns_idx = -1
+            cold.len = prev.len
+            cold.cur_entity_idx = prev.entity_idx
+            cold.cur_base_depth = prev.base_depth
+            cold.cached_ns_idx = -1
             continue
           }
           None => break
@@ -293,156 +1396,30 @@ pub fn Document::parse_with_options(
       break
     }
 
-    let in_entity = cur_entity_idx >= 0
+    let in_entity = cold.cur_entity_idx >= 0
 
     if depth == 0 {
-      // Prolog or Epilog: only whitespace, comments, PIs, (and 1 DOCTYPE + 1 root element in prolog)
-      if cur_src.code_unit_at(pos) <= 0x20 {
-        pos = skip_ws(cur_src, pos, len)
-        if pos >= len {
-          continue
-        }
-      }
-      if cur_src.code_unit_at(pos) != 0x3C {
-        return Err(
-          make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "unexpected text outside root element"),
-        )
-      }
-      if pos + 1 >= len {
-        return Err(make_err(cur_src, pos, XmlErrorKind::UnexpectedEof, "unexpected EOF after '<'"))
-      }
-      let b1 = cur_src.code_unit_at(pos + 1)
-      if b1 == 0x21 {
-        if pos + 4 <= len && cur_src.code_unit_at(pos + 2) == 0x2D && cur_src.code_unit_at(pos + 3) == 0x2D {
-          match scan_comment(cur_src, pos + 4, len) {
-            Ok((cs, ce, has_cr, ni)) => {
-              if nodes.length() >= max_nodes {
-                return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
-              }
-              let mut vs = cs
-              let mut ve = ce
-              if has_cr {
-                let idx = strings.length()
-                strings.push(normalize_eol(cur_src, cs, ce))
-                vs = -(idx + 1)
-                ve = 0
-              }
-              let cid = nodes.length()
-              nodes.push(
-                NodeData::{
-                  kind_ns: pack_kind_ns(node_kind_comment, -1),
-                  parent: 0,
-                  prev_sibling: cur_lc,
-                  next_sibling: -1,
-                  first_child: -1,
-                  last_child: -1,
-                  s1_start: vs,
-                  s1_end: ve,
-                  s2_start: 0,
-                  s2_end: 0,
-                  attrs_start: 0,
-                  attrs_end: 0,
-                  ns_start: 0,
-                  ns_end: 0,
-                },
-              )
-              if cur_lc >= 0 {
-                set_next_sibling(nodes, cur_lc, cid)
-              } else {
-                cur_fc = cid
-              }
-              cur_lc = cid
-              pos = ni
-              continue
-            }
-            Err(e) => return Err(e)
-          }
-        } else if pos + 9 <= len && raw_slice_eq_str(cur_src, pos, pos + 9, "<!DOCTYPE") {
-          if root_elem_id >= 0 {
-            return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "DOCTYPE not allowed after root element"))
-          }
-          if saw_doctype {
-            return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "multiple DOCTYPE declarations"))
-          }
-          if !opts.allow_dtd {
-            return Err(make_err(cur_src, pos, XmlErrorKind::DtdDetected, "DTD is disabled by default"))
-          }
-          saw_doctype = true
-          match parse_doctype(cur_src, pos + 9, len, entities) {
-            Ok((_, _, ni)) => {
-              pos = ni
-              continue
-            }
-            Err(e) => return Err(e)
-          }
-        } else if pos + 9 <= len && raw_slice_eq_str(cur_src, pos, pos + 9, "<![CDATA[") {
-          return Err(make_err(cur_src, pos, XmlErrorKind::InvalidCData, "CDATA not allowed outside root element"))
-        } else {
-          return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "invalid markup in prolog/epilog"))
-        }
-      } else if b1 == 0x3F {
-        match scan_pi(cur_src, pos + 2, len) {
-          Ok((ts, te, vs_raw, ve_raw, has_val, has_cr, ni)) => {
-            if nodes.length() >= max_nodes {
-              return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
-            }
-            let mut vs = 0
-            let mut ve = 0
-            if has_val {
-              if has_cr {
-                let idx = strings.length()
-                strings.push(normalize_eol(cur_src, vs_raw, ve_raw))
-                vs = -(idx + 1)
-                ve = 0
-              } else {
-                vs = vs_raw
-                ve = ve_raw
-              }
-            }
-            let cid = nodes.length()
-            nodes.push(
-              NodeData::{
-                kind_ns: pack_kind_ns(node_kind_pi, if has_val { 1 } else { 0 }),
-                parent: 0,
-                prev_sibling: cur_lc,
-                next_sibling: -1,
-                first_child: -1,
-                last_child: -1,
-                s1_start: ts,
-                s1_end: te,
-                s2_start: vs,
-                s2_end: ve,
-                attrs_start: 0,
-                attrs_end: 0,
-                ns_start: 0,
-                ns_end: 0,
-              },
-            )
-            if cur_lc >= 0 {
-              set_next_sibling(nodes, cur_lc, cid)
-            } else {
-              cur_fc = cid
-            }
-            cur_lc = cid
-            pos = ni
+      match cold.handle_prolog_epilog(pos, cur_fc, cur_lc) {
+        Ok((handled, ni, nfc, nlc)) => {
+          pos = ni
+          cur_fc = nfc
+          cur_lc = nlc
+          if handled {
             continue
           }
-          Err(e) => return Err(e)
         }
-      } else if b1 == 0x2F {
-        return Err(make_err(cur_src, pos, XmlErrorKind::MismatchedTag, "unexpected end tag at root level"))
-      } else if root_elem_id >= 0 {
-        return Err(make_err(cur_src, pos, XmlErrorKind::MultipleRootNodes, "multiple root elements"))
+        Err(e) => return Err(e)
       }
     }
 
     // Inside element (or starting root element at '<')
     if cur_src.code_unit_at(pos) != 0x3C {
-      // Fast text scan until '<' (or custom DTD entity reference when DTD entities exist)
       let has_custom_entities = !entities.is_empty()
       let text_start = pos
       let mut i = pos
       let mut needs_unescape = false
+      let mut unescaped_direct = ""
+      let mut did_direct_unescape = false
       let mut custom_ent_idx = -1
       let mut custom_ent_after = -1
       while i < len {
@@ -457,6 +1434,13 @@ pub fn Document::parse_with_options(
             break
           }
         }
+        while i < len {
+          if (lut[cur_src.code_unit_at(i)] & mask_text_fast) != 0 {
+            i = i + 1
+          } else {
+            break
+          }
+        }
         if i >= len {
           break
         }
@@ -465,11 +1449,19 @@ pub fn Document::parse_with_options(
           break
         }
         if b < 0x80 {
-          let m = lut[b]
-          if (m & mask_text_fast) != 0 {
-            i = i + 1
-          } else if b == 0x26 {
-            if has_custom_entities && i + 1 < len && cur_src.code_unit_at(i + 1) != 0x23 {
+          if b == 0x26 {
+            if !has_custom_entities {
+              match scan_and_unescape_text_no_dtd(cur_src, text_start, i, len, in_entity) {
+                Ok((s, end_i)) => {
+                  unescaped_direct = s
+                  did_direct_unescape = true
+                  i = end_i
+                  break
+                }
+                Err(e) => return Err(e)
+              }
+            }
+            if i + 1 < len && cur_src.code_unit_at(i + 1) != 0x23 {
               let mut semi = i + 1
               while semi < len && cur_src.code_unit_at(semi) != 0x3B {
                 semi = semi + 1
@@ -490,6 +1482,17 @@ pub fn Document::parse_with_options(
             i = i + 1
           } else if b == 0x0D {
             if !in_entity {
+              if !has_custom_entities {
+                match scan_and_unescape_text_no_dtd(cur_src, text_start, i, len, false) {
+                  Ok((s, end_i)) => {
+                    unescaped_direct = s
+                    did_direct_unescape = true
+                    i = end_i
+                    break
+                  }
+                  Err(e) => return Err(e)
+                }
+              }
               needs_unescape = true
             }
             i = i + 1
@@ -504,11 +1507,11 @@ pub fn Document::parse_with_options(
             return Err(make_err(cur_src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in text"))
           }
         } else {
-          let (cp, blen) = decode_utf8(cur_src, i, len)
-          if cp < 0 || !is_xml_char(cp) {
+          let dec = decode_utf8_packed(cur_src, i, len)
+          if dec < 0 || !is_xml_char(dec >> 3) {
             return Err(make_err(cur_src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in text"))
           }
-          i = i + blen
+          i = i + (dec & 7)
         }
       }
 
@@ -516,77 +1519,50 @@ pub fn Document::parse_with_options(
         let mut ts = text_start
         let mut te = i
         let mut chunk_non_empty = true
-        if needs_unescape {
-          match unescape_span(
-            cur_src,
-            text_start,
-            i,
-            false,
-            entities,
-            budget,
-            cur_entity_idx,
-            input_stack,
-          ) {
-            Ok(s) => {
-              if s.length() == 0 {
-                chunk_non_empty = false
-              } else if cur_lc >= 0 && unpack_kind(nodes[cur_lc].kind_ns) == node_kind_text {
-                if !text_run_active {
-                  text_run_active = true
-                  text_run_sb = StringBuilder::new()
-                  let prev_n = nodes[cur_lc]
-                  if prev_n.s1_start < 0 {
-                    let pidx = -(prev_n.s1_start + 1)
-                    text_run_sb.write_string(strings[pidx])
-                    if pidx == strings.length() - 1 {
-                      let _ = strings.pop()
-                    } else {
-                      strings[pidx] = ""
-                    }
-                  } else {
-                    text_run_sb.write_substring(src, prev_n.s1_start, prev_n.s1_end)
-                  }
-                }
-                text_run_sb.write_string(s)
-                chunk_non_empty = false
-              } else {
-                let idx = strings.length()
-                strings.push(s)
-                ts = -(idx + 1)
-                te = 0
-              }
+        if did_direct_unescape || needs_unescape {
+          let s = if did_direct_unescape {
+            unescaped_direct
+          } else {
+            match unescape_span(
+              cur_src,
+              text_start,
+              i,
+              false,
+              entities,
+              cold.budget,
+              cold.cur_entity_idx,
+              cold.input_stack,
+            ) {
+              Ok(v) => v
+              Err(e) => return Err(e)
             }
-            Err(e) => return Err(e)
+          }
+          if s.length() == 0 {
+            chunk_non_empty = false
+          } else if cur_lc >= 0 && unpack_kind(nodes[cur_lc].kind_ns) == node_kind_text {
+            cold.ensure_text_run(cur_lc)
+            cold.text_run_sb.write_string(s)
+            chunk_non_empty = false
+          } else {
+            let idx = strings.length()
+            strings.push(s)
+            ts = -(idx + 1)
+            te = 0
           }
         }
         if chunk_non_empty {
           if cur_lc >= 0 && unpack_kind(nodes[cur_lc].kind_ns) == node_kind_text {
-            if !text_run_active {
-              text_run_active = true
-              text_run_sb = StringBuilder::new()
-              let prev_n = nodes[cur_lc]
-              if prev_n.s1_start < 0 {
-                let pidx = -(prev_n.s1_start + 1)
-                text_run_sb.write_string(strings[pidx])
-                if pidx == strings.length() - 1 {
-                  let _ = strings.pop()
-                } else {
-                  strings[pidx] = ""
-                }
-              } else {
-                text_run_sb.write_substring(src, prev_n.s1_start, prev_n.s1_end)
-              }
-            }
+            cold.ensure_text_run(cur_lc)
             if ts < 0 {
               let nidx = -(ts + 1)
-              text_run_sb.write_string(strings[nidx])
+              cold.text_run_sb.write_string(strings[nidx])
               if nidx == strings.length() - 1 {
                 let _ = strings.pop()
               } else {
                 strings[nidx] = ""
               }
             } else {
-              text_run_sb.write_substring(cur_src, ts, te)
+              cold.text_run_sb.write_substring(cur_src, ts, te)
             }
           } else {
             if nodes.length() >= max_nodes {
@@ -594,11 +1570,8 @@ pub fn Document::parse_with_options(
                 make_err(cur_src, text_start, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"),
               )
             }
-            let (final_ts, final_te) = if ts >= 0 && in_entity {
-              maybe_intern(cur_src, true, strings, ts, te)
-            } else {
-              (ts, te)
-            }
+            let final_ts = if ts >= 0 && in_entity { intern_slice(cur_src, strings, ts, te) } else { ts }
+            let final_te = if ts >= 0 && in_entity { 0 } else { te }
             let cid = nodes.length()
             nodes.push(
               NodeData::{
@@ -629,45 +1602,15 @@ pub fn Document::parse_with_options(
       }
 
       if custom_ent_idx >= 0 {
-        let ent = entities.defs[custom_ent_idx]
-        if ent.is_external {
-          return Err(
-            make_err(cur_src, i, XmlErrorKind::ExternalEntityNotAllowed, "external entity reference is not allowed"),
-          )
-        }
-        if cur_entity_idx == custom_ent_idx {
-          return Err(make_err(cur_src, i, XmlErrorKind::EntityLoop, "circular entity reference"))
-        }
-        let mut ek = 0
-        while ek < input_stack.length() {
-          if input_stack[ek].entity_idx == custom_ent_idx {
-            return Err(make_err(cur_src, i, XmlErrorKind::EntityLoop, "circular entity reference"))
+        match cold.push_custom_entity(i, custom_ent_idx, custom_ent_after, depth) {
+          Ok(()) => {
+            cur_src = cold.cur_src
+            len = cold.len
+            pos = 0
+            continue
           }
-          ek = ek + 1
+          Err(e) => return Err(e)
         }
-        budget.expansions = budget.expansions + 1
-        budget.bytes = budget.bytes + ent.value.length()
-        if budget.expansions > budget.max_expansions || budget.bytes > budget.max_bytes {
-          return Err(
-            make_err(cur_src, i, XmlErrorKind::LimitExceeded, "entity expansion limit exceeded"),
-          )
-        }
-        input_stack.push(
-          InputFrame::{
-            src: cur_src,
-            pos: custom_ent_after,
-            len: len,
-            entity_idx: cur_entity_idx,
-            base_depth: cur_base_depth,
-          },
-        )
-        cur_src = ent.value
-        pos = 0
-        len = ent.value.length()
-        cur_entity_idx = custom_ent_idx
-        cur_base_depth = depth
-        cached_ns_idx = -1
-        continue
       }
 
       pos = i
@@ -684,22 +1627,17 @@ pub fn Document::parse_with_options(
       if depth == 0 {
         return Err(make_err(cur_src, pos, XmlErrorKind::MismatchedTag, "unexpected end tag"))
       }
-      if in_entity && depth <= cur_base_depth {
+      if in_entity && depth <= cold.cur_base_depth {
         return Err(make_err(cur_src, pos, XmlErrorKind::MismatchedTag, "unbalanced end tag inside entity"))
       }
-      // Flush any open merged text run before closing element
-      if text_run_active {
-        let pool_idx = strings.length()
-        strings.push(text_run_sb.to_string())
-        update_text_node_span(nodes, cur_lc, -(pool_idx + 1), 0)
-        text_run_active = false
-        text_run_sb = StringBuilder::new()
+      if cold.text_run_active {
+        cold.flush_text_run(cur_lc)
       }
       let open_id = cur_parent
       let open_node = nodes[open_id]
       let name_start = pos + 2
       let mut fast_ok = false
-      let mut fast_end = 0
+      let mut next_pos = 0
       if !in_entity && open_node.s1_start >= 0 && open_node.s2_start >= 0 {
         let p_len = open_node.s2_end - open_node.s2_start
         let l_len = open_node.s1_end - open_node.s1_start
@@ -734,299 +1672,43 @@ pub fn Document::parse_with_options(
             )
           }
         }
-        fast_end = expected_end
+        next_pos = expected_end + 1
       }
-      if fast_ok {
-        finalize_children(nodes, open_id, cur_fc, cur_lc)
-        depth = depth - 1
-        cur_parent = match elem_stack.pop() {
-          Some(v) => v
-          None => 0
+      if !fast_ok {
+        match cold.validate_end_tag_slow(name_start, open_node) {
+          Ok(np) => next_pos = np
+          Err(e) => return Err(e)
         }
-        cur_fc = match first_child_stack.pop() {
-          Some(v) => v
-          None => -1
-        }
-        cur_lc = match last_child_stack.pop() {
-          Some(v) => v
-          None => -1
-        }
+      }
+      finalize_children(nodes, open_id, cur_fc, cur_lc)
+      let nsl = ns_scope_stack.length()
+      if nsl > 0 && ns_scope_stack[nsl - 1] == depth {
+        let _ = ns_scope_stack.pop()
         let prev_ns_len = match ns_scope_stack.pop() {
           Some(v) => v
           None => 0
         }
-        while active_ns.length() > prev_ns_len {
-          let _ = active_ns.pop()
-          if ns_map_active {
-            match ns_prev_stack.pop() {
-              Some((ps, prev_i)) => {
-                if ps.length() > 0 {
-                  if prev_i == -1 {
-                    ns_map.remove(ps)
-                  } else {
-                    ns_map.set(ps, prev_i)
-                  }
-                }
-              }
-              None => ()
-            }
-          }
-          cached_ns_idx = -1
+        if cold.active_ns.length() > prev_ns_len {
+          cold.pop_ns_scope(prev_ns_len)
         }
-        cur_default_ns = match default_ns_stack.pop() {
+        cold.cur_default_ns = match default_ns_stack.pop() {
           Some(v) => v
           None => -1
         }
-        pos = fast_end + 1
-        continue
       }
-      let (name_end, colon_pos) = scan_qname(cur_src, name_start, len)
-      if name_end < 0 {
-        return Err(make_err(cur_src, name_start, XmlErrorKind::InvalidName, "invalid end tag name"))
-      }
-      let after_ws = skip_ws(cur_src, name_end, len)
-      if after_ws >= len || cur_src.code_unit_at(after_ws) != 0x3E {
-        return Err(make_err(cur_src, after_ws, XmlErrorKind::InvalidSyntax, "expected '>' closing end tag"))
-      }
-      let open_has_prefix = open_node.s2_start < 0 || open_node.s2_end > open_node.s2_start
-      let end_has_prefix = colon_pos >= 0
-      let end_ls = if end_has_prefix { colon_pos + 1 } else { name_start }
-      let local_eq = if open_node.s1_start < 0 {
-        raw_slice_eq_str(cur_src, end_ls, name_end, strings[-(open_node.s1_start + 1)])
-      } else {
-        str_slice_eq(src, open_node.s1_start, open_node.s1_end, cur_src, end_ls, name_end)
-      }
-      let prefix_eq = if !open_has_prefix {
-        true
-      } else if open_node.s2_start < 0 {
-        raw_slice_eq_str(cur_src, name_start, colon_pos, strings[-(open_node.s2_start + 1)])
-      } else {
-        str_slice_eq(src, open_node.s2_start, open_node.s2_end, cur_src, name_start, colon_pos)
-      }
-      if open_has_prefix != end_has_prefix || !local_eq || !prefix_eq {
-        return Err(make_err(cur_src, name_start, XmlErrorKind::MismatchedTag, "mismatched end tag"))
-      }
-      finalize_children(nodes, open_id, cur_fc, cur_lc)
       depth = depth - 1
-      cur_parent = match elem_stack.pop() {
-        Some(v) => v
-        None => 0
-      }
-      cur_fc = match first_child_stack.pop() {
-        Some(v) => v
-        None => -1
-      }
-      cur_lc = match last_child_stack.pop() {
-        Some(v) => v
-        None => -1
-      }
-      let prev_ns_len = match ns_scope_stack.pop() {
-        Some(v) => v
-        None => 0
-      }
-      while active_ns.length() > prev_ns_len {
-        let _ = active_ns.pop()
-        if ns_map_active {
-          match ns_prev_stack.pop() {
-            Some((ps, prev_i)) => {
-              if ps.length() > 0 {
-                if prev_i == -1 {
-                  ns_map.remove(ps)
-                } else {
-                  ns_map.set(ps, prev_i)
-                }
-              }
-            }
-            None => ()
-          }
-        }
-        cached_ns_idx = -1
-      }
-      cur_default_ns = match default_ns_stack.pop() {
-        Some(v) => v
-        None => -1
-      }
-      pos = after_ws + 1
+      cur_parent = open_node.parent
+      cur_fc = first_child_stack[depth]
+      cur_lc = last_child_stack[depth]
+      pos = next_pos
       continue
-    } else if b1 == 0x21 {
-      // Comment or CDATA inside element
-      if pos + 4 <= len && cur_src.code_unit_at(pos + 2) == 0x2D && cur_src.code_unit_at(pos + 3) == 0x2D {
-        if text_run_active {
-          let pool_idx = strings.length()
-          strings.push(text_run_sb.to_string())
-          update_text_node_span(nodes, cur_lc, -(pool_idx + 1), 0)
-          text_run_active = false
-          text_run_sb = StringBuilder::new()
-        }
-        match scan_comment(cur_src, pos + 4, len) {
-          Ok((cs, ce, has_cr, ni)) => {
-            if nodes.length() >= max_nodes {
-              return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
-            }
-            let (vs, ve) = if has_cr {
-              let idx = strings.length()
-              strings.push(normalize_eol(cur_src, cs, ce))
-              (-(idx + 1), 0)
-            } else {
-              maybe_intern(cur_src, in_entity, strings, cs, ce)
-            }
-            let cid = nodes.length()
-            nodes.push(
-              NodeData::{
-                kind_ns: pack_kind_ns(node_kind_comment, -1),
-                parent: cur_parent,
-                prev_sibling: cur_lc,
-                next_sibling: -1,
-                first_child: -1,
-                last_child: -1,
-                s1_start: vs,
-                s1_end: ve,
-                s2_start: 0,
-                s2_end: 0,
-                attrs_start: 0,
-                attrs_end: 0,
-                ns_start: 0,
-                ns_end: 0,
-              },
-            )
-            if cur_lc >= 0 {
-              set_next_sibling(nodes, cur_lc, cid)
-            } else {
-              cur_fc = cid
-            }
-            cur_lc = cid
-            pos = ni
-            continue
-          }
-          Err(e) => return Err(e)
-        }
-      } else if pos + 9 <= len && cur_src.code_unit_at(pos + 2) == 0x5B && raw_slice_eq_str(cur_src, pos, pos + 9, "<![CDATA[") {
-        match scan_cdata(cur_src, pos + 9, len) {
-          Ok((cs, ce, has_cr, ni)) => {
-            if ce > cs {
-              if cur_lc >= 0 && unpack_kind(nodes[cur_lc].kind_ns) == node_kind_text {
-                if !text_run_active {
-                  text_run_active = true
-                  text_run_sb = StringBuilder::new()
-                  let prev_n = nodes[cur_lc]
-                  if prev_n.s1_start < 0 {
-                    let pidx = -(prev_n.s1_start + 1)
-                    text_run_sb.write_string(strings[pidx])
-                    if pidx == strings.length() - 1 {
-                      let _ = strings.pop()
-                    } else {
-                      strings[pidx] = ""
-                    }
-                  } else {
-                    text_run_sb.write_substring(src, prev_n.s1_start, prev_n.s1_end)
-                  }
-                }
-                if has_cr {
-                  text_run_sb.write_string(normalize_eol(cur_src, cs, ce))
-                } else {
-                  text_run_sb.write_substring(cur_src, cs, ce)
-                }
-              } else {
-                if nodes.length() >= max_nodes {
-                  return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
-                }
-                let (vs, ve) = if has_cr {
-                  let idx = strings.length()
-                  strings.push(normalize_eol(cur_src, cs, ce))
-                  (-(idx + 1), 0)
-                } else {
-                  maybe_intern(cur_src, in_entity, strings, cs, ce)
-                }
-                let cid = nodes.length()
-                nodes.push(
-                  NodeData::{
-                    kind_ns: pack_kind_ns(node_kind_text, -1),
-                    parent: cur_parent,
-                    prev_sibling: cur_lc,
-                    next_sibling: -1,
-                    first_child: -1,
-                    last_child: -1,
-                    s1_start: vs,
-                    s1_end: ve,
-                    s2_start: 0,
-                    s2_end: 0,
-                    attrs_start: 0,
-                    attrs_end: 0,
-                    ns_start: 0,
-                    ns_end: 0,
-                  },
-                )
-                if cur_lc >= 0 {
-                  set_next_sibling(nodes, cur_lc, cid)
-                } else {
-                  cur_fc = cid
-                }
-                cur_lc = cid
-              }
-            }
-            pos = ni
-            continue
-          }
-          Err(e) => return Err(e)
-        }
-      } else {
-        return Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "unexpected '<!' inside element"))
-      }
-    } else if b1 == 0x3F {
-      // PI inside element
-      if text_run_active {
-        let pool_idx = strings.length()
-        strings.push(text_run_sb.to_string())
-        update_text_node_span(nodes, cur_lc, -(pool_idx + 1), 0)
-        text_run_active = false
-        text_run_sb = StringBuilder::new()
-      }
-      match scan_pi(cur_src, pos + 2, len) {
-        Ok((ts, te, vs_raw, ve_raw, has_val, has_cr, ni)) => {
-          if nodes.length() >= max_nodes {
-            return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
-          }
-          let (its, ite) = maybe_intern(cur_src, in_entity, strings, ts, te)
-          let mut vs = 0
-          let mut ve = 0
-          if has_val {
-            if has_cr {
-              let idx = strings.length()
-              strings.push(normalize_eol(cur_src, vs_raw, ve_raw))
-              vs = -(idx + 1)
-              ve = 0
-            } else {
-              let (ivs, ive) = maybe_intern(cur_src, in_entity, strings, vs_raw, ve_raw)
-              vs = ivs
-              ve = ive
-            }
-          }
-          let cid = nodes.length()
-          nodes.push(
-            NodeData::{
-              kind_ns: pack_kind_ns(node_kind_pi, if has_val { 1 } else { 0 }),
-              parent: cur_parent,
-              prev_sibling: cur_lc,
-              next_sibling: -1,
-              first_child: -1,
-              last_child: -1,
-              s1_start: its,
-              s1_end: ite,
-              s2_start: vs,
-              s2_end: ve,
-              attrs_start: 0,
-              attrs_end: 0,
-              ns_start: 0,
-              ns_end: 0,
-            },
-          )
-          if cur_lc >= 0 {
-            set_next_sibling(nodes, cur_lc, cid)
-          } else {
-            cur_fc = cid
-          }
-          cur_lc = cid
+    }
+    if b1 == 0x21 || b1 == 0x3F {
+      match cold.handle_bang_or_pi(pos, b1, cur_parent, cur_fc, cur_lc) {
+        Ok((ni, nfc, nlc)) => {
           pos = ni
+          cur_fc = nfc
+          cur_lc = nlc
           continue
         }
         Err(e) => return Err(e)
@@ -1034,12 +1716,8 @@ pub fn Document::parse_with_options(
     }
 
     // Flush any open merged text run before starting child element
-    if text_run_active {
-      let pool_idx = strings.length()
-      strings.push(text_run_sb.to_string())
-      update_text_node_span(nodes, cur_lc, -(pool_idx + 1), 0)
-      text_run_active = false
-      text_run_sb = StringBuilder::new()
+    if cold.text_run_active {
+      cold.flush_text_run(cur_lc)
     }
 
     // Start or Empty element tag `<name ...>` / `<name .../>`
@@ -1050,14 +1728,13 @@ pub fn Document::parse_with_options(
       return Err(make_err(cur_src, pos, XmlErrorKind::LimitExceeded, "max_nodes limit exceeded"))
     }
     let tag_start = pos + 1
-    // Inline fast ASCII QName scan for tag name
+    // Inline fast ASCII QName scan for tag name (lut[128..255] == 0)
     let mut tag_end = tag_start
     let mut tag_colon = -1
-    if tag_start < len && b1 < 0x80 && (lut[b1] & mask_ncname_start) != 0 {
+    if (lut[b1] & mask_ncname_start) != 0 {
       tag_end = tag_start + 1
       while tag_end < len {
-        let tb = cur_src.code_unit_at(tag_end)
-        if tb < 0x80 && (lut[tb] & mask_ncname_char) != 0 {
+        if (lut[cur_src.code_unit_at(tag_end)] & mask_ncname_char) != 0 {
           tag_end = tag_end + 1
         } else {
           break
@@ -1068,36 +1745,35 @@ pub fn Document::parse_with_options(
         if tb == 0x3A {
           tag_colon = tag_end
           tag_end = tag_end + 1
-          if tag_end < len && cur_src.code_unit_at(tag_end) < 0x80 && (lut[cur_src.code_unit_at(tag_end)] & mask_ncname_start) != 0 {
+          if tag_end < len && (lut[cur_src.code_unit_at(tag_end)] & mask_ncname_start) != 0 {
             tag_end = tag_end + 1
             while tag_end < len {
-              let tb2 = cur_src.code_unit_at(tag_end)
-              if tb2 < 0x80 && (lut[tb2] & mask_ncname_char) != 0 {
+              if (lut[cur_src.code_unit_at(tag_end)] & mask_ncname_char) != 0 {
                 tag_end = tag_end + 1
               } else {
                 break
               }
             }
             if tag_end < len && (cur_src.code_unit_at(tag_end) >= 0x80 || cur_src.code_unit_at(tag_end) == 0x3A) {
-              let (te2, tc2) = scan_qname(cur_src, tag_start, len)
-              tag_end = te2
-              tag_colon = tc2
+              let qn = scan_qname(cur_src, tag_start, len)
+              tag_end = qn.end
+              tag_colon = qn.colon
             }
           } else {
-            let (te2, tc2) = scan_qname(cur_src, tag_start, len)
-            tag_end = te2
-            tag_colon = tc2
+            let qn = scan_qname(cur_src, tag_start, len)
+            tag_end = qn.end
+            tag_colon = qn.colon
           }
         } else if tb >= 0x80 {
-          let (te2, tc2) = scan_qname(cur_src, tag_start, len)
-          tag_end = te2
-          tag_colon = tc2
+          let qn = scan_qname(cur_src, tag_start, len)
+          tag_end = qn.end
+          tag_colon = qn.colon
         }
       }
     } else {
-      let (te2, tc2) = scan_qname(cur_src, tag_start, len)
-      tag_end = te2
-      tag_colon = tc2
+      let qn = scan_qname(cur_src, tag_start, len)
+      tag_end = qn.end
+      tag_colon = qn.colon
     }
     if tag_end < 0 {
       return Err(make_err(cur_src, tag_start, XmlErrorKind::InvalidName, "invalid element tag name"))
@@ -1119,435 +1795,53 @@ pub fn Document::parse_with_options(
     // Parse attributes and xmlns declarations directly into `attrs` / `namespaces`
     let mut i = tag_end
     let ns_start = namespaces.length()
-    let prev_active_ns_len = active_ns.length()
-    let prev_default_ns = cur_default_ns
+    let prev_active_ns_len = cold.active_ns.length()
+    let prev_default_ns = cold.cur_default_ns
     let attrs_start = attrs.length()
     let mut is_empty = false
-    let mut tag_closed = false
-    let mut attr_count = 0
-    let mut has_prefixed_attr = false
-    let mut seen_unprefixed_attrs : Map[String, Bool] = Map::new()
-    let mut use_attr_dedup_map = false
 
     // Fast path for zero-attribute tags (`<tag>` or `<tag/>`)
-    let mut scan_attrs = true
-    if i < len {
-      let nb = cur_src.code_unit_at(i)
-      if nb == 0x3E {
-        i = i + 1
-        scan_attrs = false
-        tag_closed = true
-      } else if nb == 0x2F {
-        if i + 1 >= len || cur_src.code_unit_at(i + 1) != 0x3E {
-          return Err(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected '>' after '/' in empty tag"))
+    if i < len && cur_src.code_unit_at(i) == 0x3E {
+      i = i + 1
+    } else if i < len && cur_src.code_unit_at(i) == 0x2F {
+      if i + 1 >= len || cur_src.code_unit_at(i + 1) != 0x3E {
+        return Err(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected '>' after '/' in empty tag"))
+      }
+      is_empty = true
+      i = i + 2
+    } else {
+      let res_i = cold.parse_tag_attrs(i, ns_start, attrs_start, pos, lut)
+      if res_i == -1 {
+        return match cold.last_err {
+          Some(e) => Err(e)
+          None => Err(make_err(cur_src, pos, XmlErrorKind::InvalidSyntax, "attribute error"))
         }
+      }
+      if res_i < 0 {
         is_empty = true
-        i = i + 2
-        scan_attrs = false
-        tag_closed = true
+        i = -(res_i + 2)
+      } else {
+        i = res_i
       }
     }
 
-    while scan_attrs && i < len {
-      let ws_before = i
-      let b_ws = cur_src.code_unit_at(i)
-      if b_ws == 0x20 {
-        i = i + 1
-        if i < len && cur_src.code_unit_at(i) <= 0x20 {
-          i = skip_ws(cur_src, i, len)
-        }
-      } else if b_ws <= 0x20 {
-        i = skip_ws(cur_src, i, len)
-      }
-      if i >= len {
-        return Err(make_err(cur_src, i, XmlErrorKind::UnexpectedEof, "unterminated start tag"))
-      }
-      let cb = cur_src.code_unit_at(i)
-      if cb == 0x3E {
-        i = i + 1
-        tag_closed = true
-        break
-      }
-      if cb == 0x2F {
-        if i + 1 >= len || cur_src.code_unit_at(i + 1) != 0x3E {
-          return Err(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected '>' after '/' in empty tag"))
-        }
-        is_empty = true
-        i = i + 2
-        tag_closed = true
-        break
-      }
-      if i == ws_before {
-        return Err(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected whitespace before attribute"))
-      }
-      attr_count = attr_count + 1
-      if attr_count > max_attributes {
-        return Err(make_err(cur_src, i, XmlErrorKind::LimitExceeded, "max_attributes limit exceeded"))
-      }
-      let aname_start = i
-      // Inline fast ASCII QName scan for attribute name
-      let mut aname_end = aname_start
-      let mut acolon = -1
-      if cb < 0x80 && (lut[cb] & mask_ncname_start) != 0 {
-        aname_end = aname_start + 1
-        while aname_end < len {
-          let ab = cur_src.code_unit_at(aname_end)
-          if ab < 0x80 && (lut[ab] & mask_ncname_char) != 0 {
-            aname_end = aname_end + 1
-          } else {
-            break
-          }
-        }
-        if aname_end < len {
-          let ab = cur_src.code_unit_at(aname_end)
-          if ab == 0x3A {
-            acolon = aname_end
-            aname_end = aname_end + 1
-            if aname_end < len && cur_src.code_unit_at(aname_end) < 0x80 && (lut[cur_src.code_unit_at(aname_end)] & mask_ncname_start) != 0 {
-              aname_end = aname_end + 1
-              while aname_end < len {
-                let ab2 = cur_src.code_unit_at(aname_end)
-                if ab2 < 0x80 && (lut[ab2] & mask_ncname_char) != 0 {
-                  aname_end = aname_end + 1
-                } else {
-                  break
-                }
-              }
-              if aname_end < len && (cur_src.code_unit_at(aname_end) >= 0x80 || cur_src.code_unit_at(aname_end) == 0x3A) {
-                let (ae2, ac2) = scan_qname(cur_src, aname_start, len)
-                aname_end = ae2
-                acolon = ac2
-              }
-            } else {
-              let (ae2, ac2) = scan_qname(cur_src, aname_start, len)
-              aname_end = ae2
-              acolon = ac2
-            }
-          } else if ab >= 0x80 {
-            let (ae2, ac2) = scan_qname(cur_src, aname_start, len)
-            aname_end = ae2
-            acolon = ac2
-          }
-        }
-      } else {
-        let (ae2, ac2) = scan_qname(cur_src, aname_start, len)
-        aname_end = ae2
-        acolon = ac2
-      }
-      if aname_end < 0 {
-        return Err(make_err(cur_src, aname_start, XmlErrorKind::InvalidName, "invalid attribute name"))
-      }
-      i = aname_end
-      if i < len && cur_src.code_unit_at(i) <= 0x20 {
-        i = skip_ws(cur_src, i, len)
-      }
-      if i >= len || cur_src.code_unit_at(i) != 0x3D {
-        return Err(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "expected '=' after attribute name"))
-      }
-      i = i + 1
-      if i < len && cur_src.code_unit_at(i) <= 0x20 {
-        i = skip_ws(cur_src, i, len)
-      }
-      if i >= len {
-        return Err(make_err(cur_src, i, XmlErrorKind::UnexpectedEof, "expected attribute value quote"))
-      }
-      let quote = cur_src.code_unit_at(i)
-      if quote != 0x22 && quote != 0x27 {
-        return Err(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "attribute value must be quoted"))
-      }
-      i = i + 1
-      let aval_start = i
-      let fast_mask = if quote == 0x22 { mask_attr_dq_fast } else { mask_attr_sq_fast }
-      let mut needs_unescape = false
-      while i < len {
-        while i <= len - 4 {
-          let m0 = lut[cur_src.code_unit_at(i)]
-          let m1 = lut[cur_src.code_unit_at(i + 1)]
-          let m2 = lut[cur_src.code_unit_at(i + 2)]
-          let m3 = lut[cur_src.code_unit_at(i + 3)]
-          if ((m0 & m1 & m2 & m3) & fast_mask) != 0 {
-            i = i + 4
-          } else {
-            break
-          }
-        }
-        if i >= len {
-          break
-        }
-        let ab = cur_src.code_unit_at(i)
-        if ab == quote {
-          break
-        }
-        if ab < 0x80 {
-          if (lut[ab] & fast_mask) != 0 {
-            i = i + 1
-          } else if ab == 0x26 || ab == 0x09 || ab == 0x0A || ab == 0x0D {
-            needs_unescape = true
-            i = i + 1
-          } else if ab == 0x3C {
-            return Err(make_err(cur_src, i, XmlErrorKind::InvalidSyntax, "'<' not allowed in attribute value"))
-          } else {
-            return Err(make_err(cur_src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in attribute value"))
-          }
-        } else {
-          let (cp, blen) = decode_utf8(cur_src, i, len)
-          if cp < 0 || !is_xml_char(cp) {
-            return Err(make_err(cur_src, i, XmlErrorKind::InvalidChar, "illegal XML 1.0 character in attribute value"))
-          }
-          i = i + blen
-        }
-      }
-      if i >= len || cur_src.code_unit_at(i) != quote {
-        return Err(make_err(cur_src, aval_start, XmlErrorKind::UnexpectedEof, "unterminated attribute value"))
-      }
-      let aval_end = i
-      i = i + 1
-
-      let (vs, ve) = if needs_unescape {
-        match unescape_span(
-          cur_src,
-          aval_start,
-          aval_end,
-          true,
-          entities,
-          budget,
-          cur_entity_idx,
-          input_stack,
-        ) {
-          Ok(s) => {
-            let idx = strings.length()
-            strings.push(s)
-            (-(idx + 1), 0)
-          }
-          Err(e) => return Err(e)
-        }
-      } else {
-        maybe_intern(cur_src, in_entity, strings, aval_start, aval_end)
-      }
-
-      let a_has_prefix = acolon >= 0
-      let is_default_xmlns = !a_has_prefix &&
-      aname_end - aname_start == 5 &&
-      cb == 0x78 &&
-      raw_slice_eq_str(cur_src, aname_start, aname_end, "xmlns")
-      let is_prefixed_xmlns = a_has_prefix &&
-      acolon - aname_start == 5 &&
-      cb == 0x78 &&
-      raw_slice_eq_str(cur_src, aname_start, acolon, "xmlns")
-
-      if is_default_xmlns {
-        let aval_span = TextSpan::{ start: vs, end: ve }
-        let mut k = ns_start
-        while k < namespaces.length() {
-          if !namespaces[k].has_prefix {
-            return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate xmlns attribute"))
-          }
-          k = k + 1
-        }
-        if span_eq_str(src, strings, aval_span, xml_ns_uri) ||
-        span_eq_str(src, strings, aval_span, xmlns_ns_uri) {
-          return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "cannot bind default namespace to reserved URI"))
-        }
-        let ns_idx = namespaces.length()
-        namespaces.push(
-          NsData::{
-            prefix_span: TextSpan::empty(),
-            uri_span: aval_span,
-            has_prefix: false,
-          },
-        )
-        if ns_map_active {
-          ns_prev_stack.push(("", -1))
-        }
-        active_ns.push(ns_idx)
-        cur_default_ns = if span_len(strings, aval_span) == 0 { -1 } else { ns_idx }
-      } else if is_prefixed_xmlns {
-        let aval_span = TextSpan::{ start: vs, end: ve }
-        let (ps_i, pe_i) = maybe_intern(cur_src, in_entity, strings, acolon + 1, aname_end)
-        let pspan = TextSpan::{ start: ps_i, end: pe_i }
-        if !ns_map_active && active_ns.length() >= 8 {
-          // Promote to O(1) prefix map
-          ns_map_active = true
-          let mut m = 0
-          while m < active_ns.length() {
-            let existing_idx = active_ns[m]
-            let existing_ns = namespaces[existing_idx]
-            if existing_ns.has_prefix {
-              let eps = span_to_string(src, strings, existing_ns.prefix_span)
-              let old_i = match ns_map.get(eps) {
-                Some(v) => v
-                None => -1
-              }
-              ns_prev_stack.push((eps, old_i))
-              ns_map.set(eps, existing_idx)
-            } else {
-              ns_prev_stack.push(("", -1))
-            }
-            m = m + 1
-          }
-        }
-        if ns_map_active {
-          let pstr = cur_src.slice(acolon + 1, aname_end)
-          match ns_map.get(pstr) {
-            Some(prev_i) => {
-              if prev_i >= ns_start {
-                return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate xmlns prefix declaration"))
-              }
-            }
-            None => ()
-          }
-        } else {
-          let mut k = ns_start
-          while k < namespaces.length() {
-            if namespaces[k].has_prefix &&
-            span_eq_span(src, strings, namespaces[k].prefix_span, pspan) {
-              return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate xmlns prefix declaration"))
-            }
-            k = k + 1
-          }
-        }
-        if span_len(strings, aval_span) == 0 {
-          return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "prefixed namespace URI cannot be empty"))
-        }
-        if span_eq_str(src, strings, pspan, "xmlns") {
-          return Err(make_err(cur_src, aname_start, XmlErrorKind::InvalidNamespace, "cannot declare prefix 'xmlns'"))
-        }
-        if span_eq_str(src, strings, pspan, "xml") {
-          if !span_eq_str(src, strings, aval_span, xml_ns_uri) {
-            return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "prefix 'xml' can only be bound to XML namespace"))
-          }
-        } else {
-          if span_eq_str(src, strings, aval_span, xml_ns_uri) {
-            return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "only prefix 'xml' may bind to XML namespace"))
-          }
-        }
-        if span_eq_str(src, strings, aval_span, xmlns_ns_uri) {
-          return Err(make_err(cur_src, aval_start, XmlErrorKind::InvalidNamespace, "no prefix may bind to xmlns namespace"))
-        }
-        let ns_idx = namespaces.length()
-        namespaces.push(
-          NsData::{
-            prefix_span: pspan,
-            uri_span: aval_span,
-            has_prefix: true,
-          },
-        )
-        if ns_map_active {
-          let pstr = cur_src.slice(acolon + 1, aname_end)
-          let old_i = match ns_map.get(pstr) {
-            Some(v) => v
-            None => -1
-          }
-          ns_prev_stack.push((pstr, old_i))
-          ns_map.set(pstr, ns_idx)
-        }
-        active_ns.push(ns_idx)
-        cached_ns_idx = -1
-      } else if !a_has_prefix {
-        let cur_alen = attrs.length()
-        if !use_attr_dedup_map {
-          if cur_alen - attrs_start >= 16 {
-            use_attr_dedup_map = true
-            seen_unprefixed_attrs = Map::new()
-            let mut aj = attrs_start
-            while aj < cur_alen {
-              let pa = attrs[aj]
-              if pa.ns_idx == -1 {
-                seen_unprefixed_attrs.set(
-                  span_to_string(src, strings, TextSpan::{ start: pa.local_start, end: pa.local_end }),
-                  true,
-                )
-              }
-              aj = aj + 1
-            }
-            let astr = cur_src.slice(aname_start, aname_end)
-            match seen_unprefixed_attrs.get(astr) {
-              Some(_) =>
-              return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate attribute"))
-              None => seen_unprefixed_attrs.set(astr, true)
-            }
-          } else {
-            let alen = aname_end - aname_start
-            let mut aj = attrs_start
-            while aj < cur_alen {
-              let prev_a = attrs[aj]
-              if prev_a.ns_idx == -1 {
-                let is_dup = if prev_a.local_start < 0 {
-                  let pstr = strings[-(prev_a.local_start + 1)]
-                  pstr.length() == alen && raw_slice_eq_str(cur_src, aname_start, aname_end, pstr)
-                } else {
-                  prev_a.local_end - prev_a.local_start == alen &&
-                  src.code_unit_at(prev_a.local_start) == cb &&
-                  str_slice_eq(src, prev_a.local_start, prev_a.local_end, cur_src, aname_start, aname_end)
-                }
-                if is_dup {
-                  return Err(
-                    make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate attribute"),
-                  )
-                }
-              }
-              aj = aj + 1
-            }
-          }
-        } else {
-          let astr = cur_src.slice(aname_start, aname_end)
-          match seen_unprefixed_attrs.get(astr) {
-            Some(_) =>
-            return Err(make_err(cur_src, aname_start, XmlErrorKind::DuplicateAttribute, "duplicate attribute"))
-            None => seen_unprefixed_attrs.set(astr, true)
-          }
-        }
-        let (ls_i, le_i) = maybe_intern(cur_src, in_entity, strings, aname_start, aname_end)
-        attrs.push(
-          AttrData::{
-            local_start: ls_i,
-            local_end: le_i,
-            prefix_start: 0,
-            prefix_end: 0,
-            val_start: vs,
-            val_end: ve,
-            ns_idx: -1,
-          },
-        )
-      } else {
-        has_prefixed_attr = true
-        let (ls_i, le_i) = maybe_intern(cur_src, in_entity, strings, acolon + 1, aname_end)
-        let (ps_i, pe_i) = maybe_intern(cur_src, in_entity, strings, aname_start, acolon)
-        attrs.push(
-          AttrData::{
-            local_start: ls_i,
-            local_end: le_i,
-            prefix_start: ps_i,
-            prefix_end: pe_i,
-            val_start: vs,
-            val_end: ve,
-            ns_idx: -3,
-          },
-        )
-      }
-    }
-
-    if !tag_closed {
-      return Err(make_err(cur_src, i, XmlErrorKind::UnexpectedEof, "unterminated start tag"))
-    }
-
-    // Resolve element namespace (O(1) for unprefixed, 1-entry cache, and O(1) prefix map when >8 active!)
+    // Resolve element namespace
     let elem_ns_idx = if tag_has_prefix {
       if !in_entity &&
-      cached_ns_idx >= 0 &&
+      cold.cached_ns_idx >= 0 &&
       cached_ns_p_end - cached_ns_p_start == tag_p_end - tag_p_start &&
       src.code_unit_at(cached_ns_p_start) == b1 &&
       raw_slice_eq(src, cached_ns_p_start, cached_ns_p_end, tag_p_start, tag_p_end) {
-        cached_ns_idx
+        cold.cached_ns_idx
       } else {
         let r = resolve_ns_prefix(
           src,
           cur_src,
           strings,
           namespaces,
-          active_ns,
-          ns_map_active,
-          ns_map,
+          cold.active_ns,
+          cold.ns_map_active,
+          cold.ns_map,
           tag_p_start,
           tag_p_end,
         )
@@ -1559,103 +1853,25 @@ pub fn Document::parse_with_options(
         if !in_entity {
           cached_ns_p_start = tag_p_start
           cached_ns_p_end = tag_p_end
-          cached_ns_idx = r
+          cold.cached_ns_idx = r
         }
         r
       }
     } else {
-      cur_default_ns
+      cold.cur_default_ns
     }
 
     let attrs_end = attrs.length()
-    if has_prefixed_attr {
-      let mut ai = attrs_start
-      while ai < attrs_end {
-        let cur_a = attrs[ai]
-        if cur_a.ns_idx == -3 {
-          let ans_idx = if cur_a.prefix_start < 0 {
-            let pstr = strings[-(cur_a.prefix_start + 1)]
-            resolve_ns_prefix(
-              src,
-              pstr,
-              strings,
-              namespaces,
-              active_ns,
-              ns_map_active,
-              ns_map,
-              0,
-              pstr.length(),
-            )
-          } else {
-            resolve_ns_prefix(
-              src,
-              src,
-              strings,
-              namespaces,
-              active_ns,
-              ns_map_active,
-              ns_map,
-              cur_a.prefix_start,
-              cur_a.prefix_end,
-            )
-          }
-          if ans_idx == -1 {
-            return Err(
-              make_err(cur_src, pos, XmlErrorKind::UnboundNamespacePrefix, "unbound namespace prefix on attribute"),
-            )
-          }
-          attrs[ai] = AttrData::{
-            local_start: cur_a.local_start,
-            local_end: cur_a.local_end,
-            prefix_start: cur_a.prefix_start,
-            prefix_end: cur_a.prefix_end,
-            val_start: cur_a.val_start,
-            val_end: cur_a.val_end,
-            ns_idx: ans_idx,
-          }
-          let cur_lspan = TextSpan::{ start: cur_a.local_start, end: cur_a.local_end }
-          let mut aj = attrs_start
-          while aj < ai {
-            let prev_a = attrs[aj]
-            if prev_a.ns_idx != -1 &&
-            span_eq_span(
-              src,
-              strings,
-              TextSpan::{ start: prev_a.local_start, end: prev_a.local_end },
-              cur_lspan,
-            ) {
-              let same_ns = if prev_a.ns_idx == ans_idx {
-                true
-              } else if prev_a.ns_idx >= 0 && ans_idx >= 0 {
-                span_eq_span(
-                  src,
-                  strings,
-                  namespaces[prev_a.ns_idx].uri_span,
-                  namespaces[ans_idx].uri_span,
-                )
-              } else {
-                false
-              }
-              if same_ns {
-                return Err(
-                  make_err(cur_src, pos, XmlErrorKind::DuplicateAttribute, "duplicate attribute"),
-                )
-              }
-            }
-            aj = aj + 1
-          }
-        }
-        ai = ai + 1
-      }
-    }
     let ns_end = namespaces.length()
 
-    let (final_l_start, final_l_end) = maybe_intern(cur_src, in_entity, strings, tag_l_start, tag_l_end)
-    let (final_p_start, final_p_end) = if tag_has_prefix {
-      maybe_intern(cur_src, in_entity, strings, tag_p_start, tag_p_end)
+    let final_l_start = if in_entity { intern_slice(cur_src, strings, tag_l_start, tag_l_end) } else { tag_l_start }
+    let final_l_end = if in_entity { 0 } else { tag_l_end }
+    let final_p_start = if tag_has_prefix {
+      if in_entity { intern_slice(cur_src, strings, tag_p_start, tag_p_end) } else { tag_p_start }
     } else {
-      (0, 0)
+      0
     }
+    let final_p_end = if tag_has_prefix && !in_entity { tag_p_end } else { 0 }
 
     let elem_id = nodes.length()
     nodes.push(
@@ -1682,36 +1898,30 @@ pub fn Document::parse_with_options(
       cur_fc = elem_id
     }
     cur_lc = elem_id
-    if root_elem_id < 0 {
-      root_elem_id = elem_id
+    if cold.root_elem_id < 0 {
+      cold.root_elem_id = elem_id
     }
     if is_empty {
-      while active_ns.length() > prev_active_ns_len {
-        let _ = active_ns.pop()
-        if ns_map_active {
-          match ns_prev_stack.pop() {
-            Some((ps, prev_i)) => {
-              if ps.length() > 0 {
-                if prev_i == -1 {
-                  ns_map.remove(ps)
-                } else {
-                  ns_map.set(ps, prev_i)
-                }
-              }
-            }
-            None => ()
-          }
+      if ns_end > ns_start {
+        if cold.active_ns.length() > prev_active_ns_len {
+          cold.pop_ns_scope(prev_active_ns_len)
         }
-        cached_ns_idx = -1
+        cold.cur_default_ns = prev_default_ns
       }
-      cur_default_ns = prev_default_ns
     } else {
-      elem_stack.push(cur_parent)
-      first_child_stack.push(cur_fc)
-      last_child_stack.push(cur_lc)
-      ns_scope_stack.push(prev_active_ns_len)
-      default_ns_stack.push(prev_default_ns)
+      if depth < first_child_stack.length() {
+        first_child_stack[depth] = cur_fc
+        last_child_stack[depth] = cur_lc
+      } else {
+        first_child_stack.push(cur_fc)
+        last_child_stack.push(cur_lc)
+      }
       depth = depth + 1
+      if ns_end > ns_start {
+        ns_scope_stack.push(prev_active_ns_len)
+        ns_scope_stack.push(depth)
+        default_ns_stack.push(prev_default_ns)
+      }
       cur_parent = elem_id
       cur_fc = -1
       cur_lc = -1
@@ -1722,7 +1932,7 @@ pub fn Document::parse_with_options(
   if depth > 0 {
     return Err(make_err(src, main_len, XmlErrorKind::UnclosedTag, "unclosed element tag"))
   }
-  if root_elem_id < 0 {
+  if cold.root_elem_id < 0 {
     return Err(make_err(src, main_len, XmlErrorKind::NoRootNode, "document has no root element"))
   }
   finalize_children(nodes, 0, cur_fc, cur_lc)
@@ -1733,7 +1943,7 @@ pub fn Document::parse_with_options(
       nodes: nodes,
       attrs: attrs,
       namespaces: namespaces,
-      root_elem_id: root_elem_id,
+      root_elem_id: cold.root_elem_id,
     },
   )
 }
@@ -2113,33 +2323,38 @@ pub fn Node::has_attribute(self : Node, name : String) -> Bool {
 
 ///|
 pub fn Node::attributes(self : Node) -> Array[Attribute] {
-  let nd = self.doc.nodes[self.id]
-  let out : Array[Attribute] = Array::with_capacity(nd.attrs_end - nd.attrs_start)
-  let mut i = nd.attrs_start
-  while i < nd.attrs_end {
-    let a = self.doc.attrs[i]
-    let local = span_to_string(
-      self.doc.src,
-      self.doc.strings,
-      TextSpan::{ start: a.local_start, end: a.local_end },
-    )
+  let doc = self.doc
+  let nd = doc.nodes[self.id]
+  let start = nd.attrs_start
+  let end = nd.attrs_end
+  if start >= end {
+    return []
+  }
+  let src = doc.src
+  let strings = doc.strings
+  let attrs = doc.attrs
+  let out : Array[Attribute] = Array::with_capacity(end - start)
+  let mut i = start
+  while i < end {
+    let a = attrs[i]
+    let local = if a.local_start < 0 {
+      strings[-(a.local_start + 1)]
+    } else {
+      src.slice(a.local_start, a.local_end)
+    }
     let prefix = if a.prefix_start >= 0 && a.prefix_start == a.prefix_end {
       None
+    } else if a.prefix_start < 0 {
+      Some(strings[-(a.prefix_start + 1)])
     } else {
-      Some(
-        span_to_string(
-          self.doc.src,
-          self.doc.strings,
-          TextSpan::{ start: a.prefix_start, end: a.prefix_end },
-        ),
-      )
+      Some(src.slice(a.prefix_start, a.prefix_end))
     }
-    let ns_uri = doc_ns_uri(self.doc, a.ns_idx)
-    let value = span_to_string(
-      self.doc.src,
-      self.doc.strings,
-      TextSpan::{ start: a.val_start, end: a.val_end },
-    )
+    let ns_uri = if a.ns_idx == -1 { None } else { doc_ns_uri(doc, a.ns_idx) }
+    let value = if a.val_start < 0 {
+      strings[-(a.val_start + 1)]
+    } else {
+      src.slice(a.val_start, a.val_end)
+    }
     out.push(Attribute::{ local: local, ns_uri: ns_uri, prefix: prefix, value: value })
     i = i + 1
   }
@@ -2213,28 +2428,23 @@ pub fn Node::text_len(self : Node) -> Int {
 
 ///|
 pub fn Node::text(self : Node) -> Option[String] {
-  let nd = self.doc.nodes[self.id]
+  let doc = self.doc
+  let nd = doc.nodes[self.id]
   let k = unpack_kind(nd.kind_ns)
   if k == node_kind_text || k == node_kind_comment {
-    return Some(
-      span_to_string(
-        self.doc.src,
-        self.doc.strings,
-        TextSpan::{ start: nd.s1_start, end: nd.s1_end },
-      ),
-    )
+    if nd.s1_start < 0 {
+      return Some(doc.strings[-(nd.s1_start + 1)])
+    }
+    return Some(doc.src.slice(nd.s1_start, nd.s1_end))
   }
   if k == node_kind_element {
     let fc = nd.first_child
-    if fc >= 0 && unpack_kind(self.doc.nodes[fc].kind_ns) == node_kind_text {
-      let fnd = self.doc.nodes[fc]
-      return Some(
-        span_to_string(
-          self.doc.src,
-          self.doc.strings,
-          TextSpan::{ start: fnd.s1_start, end: fnd.s1_end },
-        ),
-      )
+    if fc >= 0 && unpack_kind(doc.nodes[fc].kind_ns) == node_kind_text {
+      let fnd = doc.nodes[fc]
+      if fnd.s1_start < 0 {
+        return Some(doc.strings[-(fnd.s1_start + 1)])
+      }
+      return Some(doc.src.slice(fnd.s1_start, fnd.s1_end))
     }
   }
   None
@@ -2352,12 +2562,24 @@ pub fn Node::children(self : Node) -> Array[Node] {
 
 ///| Iterative pre-order descendants (including `self`), zero recursion.
 pub fn Node::descendants(self : Node) -> Array[Node] {
-  let out : Array[Node] = []
+  let doc = self.doc
   let root_id = self.id
+  if root_id == 0 {
+    let n = doc.nodes.length()
+    let out : Array[Node] = Array::with_capacity(n)
+    let mut i = 0
+    while i < n {
+      out.push(Node::{ doc: doc, id: i })
+      i = i + 1
+    }
+    return out
+  }
+  let nodes = doc.nodes
+  let out : Array[Node] = Array::with_capacity(16)
   let mut cur = root_id
   while cur >= 0 {
-    out.push(Node::{ doc: self.doc, id: cur })
-    let nd = self.doc.nodes[cur]
+    out.push(Node::{ doc: doc, id: cur })
+    let nd = nodes[cur]
     if nd.first_child >= 0 {
       cur = nd.first_child
     } else if cur == root_id {
@@ -2368,11 +2590,11 @@ pub fn Node::descendants(self : Node) -> Array[Node] {
       let mut p = nd.parent
       let mut next = -1
       while p >= 0 && p != root_id {
-        if self.doc.nodes[p].next_sibling >= 0 {
-          next = self.doc.nodes[p].next_sibling
+        if nodes[p].next_sibling >= 0 {
+          next = nodes[p].next_sibling
           break
         }
-        p = self.doc.nodes[p].parent
+        p = nodes[p].parent
       }
       cur = next
     }
