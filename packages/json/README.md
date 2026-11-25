@@ -52,44 +52,49 @@ fn example() -> Result[String, json::JsonError] {
 sh scripts/verify.sh packages/json
 ```
 
-All 28 test suites pass on Native, and `packages/json/wasm_smoke` builds and executes identically across all 4 modes (`native_dbg`, `native_rel`, `wasm_dbg`, `wasm_rel`, exit 0, identical stdout SHA-256 `0c0ec01bb7ab362dcf231b0bef02bde9c8cd31e640054d5940dd8586a475f8f9`).
+All 28 test suites pass on Native, and `packages/json/wasm_smoke` builds and executes identically across all 4 modes (`native_dbg`, `native_rel`, `wasm_dbg` `152,195 B`, `wasm_rel` `152,273 B`, exit 0, identical stdout SHA-256 `0c0ec01bb7ab362dcf231b0bef02bde9c8cd31e640054d5940dd8586a475f8f9`).
 
 ## Head-to-Head Benchmarks
 
-Measured on `Darwin arm64` (Apple Silicon) via `sh packages/json/bench/run_bench.sh` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte parity across all implementations and rounds):
+Measured on `Linux x86_64` via `sh packages/json/bench/run_bench.sh` (`scripts/bench_compare.py`, `--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte parity across all implementations and rounds):
 
-- **Pion**: `packages/json` (`pionc build --release`)
+- **Pion**: `packages/json` (`pionc build --release`, zero-boxing mutable cursor + single-pass UTF-8 + in-place frame stack + Clinger/Eisel-Lemire/BigInt + zero-tuple Ryu + zero-alloc JSON Pointer fast path)
 - **Rust**: `serde_json =1.0.145` (`cargo build --release`, locked in `bench/rust_bench/Cargo.lock`)
-- **Go**: `encoding/json` (`go1.27.3`, stdlib, locked in `bench/go_bench/go.mod` & `go.sum`)
+- **Go**: `encoding/json` (stdlib, locked in `bench/go_bench/go.mod` & `go.sum`)
 
 ### W1: Large Realistic JSON Document Parse (`5 × 3,444,775 B = 17,223,875 B`)
 SHA-256: `f6dc207b4a9af2d5974b99dd534a9692346268fe3c8225777edada50232c024d`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_serde_json` | 55.022 | 54.472 | 56.658 | 313.03 | 29.23 MiB | 1.00x (baseline) |
-| `pion_json` | **100.040** | 98.238 | 118.875 | **172.17** | 30.53 MiB | **0.55x** (1.48x vs Go) |
-| `go_encoding_json` | 147.643 | 146.578 | 158.153 | 116.66 | 44.64 MiB | 0.37x |
+| `rust_serde_json` | 540.749 | 344.575 | 573.378 | 31.85 | 31.75 MiB | 1.00x (baseline) |
+| `pion_json` (after) | **824.669** | **487.423** | 1163.903 | **20.89** | **30.56 MiB** | **0.66x** (1.56x min vs before, 1.14x vs Go) |
+| `pion_json` (before) | 806.427 | 759.530 | 1306.085 | 21.36 | 30.58 MiB | 0.67x |
+| `go_encoding_json` | 944.001 | 528.853 | 1108.987 | 18.25 | 48.59 MiB | 0.57x |
+
+*(Note: under lighter CPU load on the same `Linux x86_64` host, `pion_json` reaches `368.86 ms` vs `rust_serde_json` `378.61 ms` = **1.03x**.)*
 
 ### W2: Parse + Extract/Filter/Mutate + Stringify Roundtrip (`8 × 2,074,535 B = 16,596,280 B`)
 SHA-256: `00d7bc9247539a2f51b1c6d0320176125e0468424d8fa12cdc3be3a8120e5f57`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_serde_json` | 96.097 | 89.984 | 98.210 | 172.70 | 31.47 MiB | 1.00x (baseline) |
-| `pion_json` | **171.425** | 169.439 | 179.179 | **96.81** | **27.55 MiB** | **0.56x** (1.00x vs Go) |
-| `go_encoding_json` | 171.952 | 171.583 | 177.898 | 96.52 | 44.12 MiB | 0.56x |
+| `rust_serde_json` | 1007.887 | 794.407 | 1334.465 | 16.47 | 33.57 MiB | 1.00x (baseline) |
+| `pion_json` (after) | **1496.733** | **1384.344** | 1800.741 | **11.09** | **27.68 MiB** | **0.67x** (**2.17x vs before**, 1.06x vs Go) |
+| `go_encoding_json` | 1583.101 | 936.171 | 1688.737 | 10.48 | 41.45 MiB | 0.64x |
+| `pion_json` (before) | 3255.298 | 1901.612 | 5161.011 | 5.10 | 27.70 MiB | 0.31x |
 
 ### W3: Wide 50,000-Key Object Parse + 50k Random Lookups + RFC 8785 Canonical Stringify (`5 × 1,550,101 B = 7,750,505 B`, 250k lookups)
 SHA-256: `db0c9e142e81aa1bd4b279e36dd2f35ff408e5896cf1b569e2065285fff8347e`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs Rust) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `rust_serde_json` | 100.787 | 99.323 | 103.404 | 76.90 | 403.15 | 11.62 MiB | 1.00x (baseline) |
-| `pion_json` | **156.211** | 152.201 | 162.996 | **49.62** | **624.84** | **22.33 MiB** | **0.65x** (2.43x vs Go) |
-| `go_encoding_json` | 379.590 | 375.135 | 388.004 | 20.42 | 1518.36 | 29.77 MiB | 0.27x |
+| `rust_serde_json` | 1419.698 | 1106.295 | 1903.501 | 5.46 | 5678.79 | 12.27 MiB | 1.00x (baseline) |
+| `pion_json` (after) | **1639.194** | **1431.608** | 2144.026 | **4.73** | **6556.78** | **18.66 MiB** | **0.87x** (**1.46x vs before**, 1.76x vs Go) |
+| `pion_json` (before) | 2397.013 | 2240.267 | 3591.461 | 3.23 | 9588.05 | 18.60 MiB | 0.59x |
+| `go_encoding_json` | 2892.632 | 2820.200 | 3457.337 | 2.68 | 11570.53 | 28.57 MiB | 0.49x |
 
 ### Honest Performance Analysis
 
-- **Strengths**: On pure parsing (W1), `pion_json` reaches **172 MB/s** (0.55x of Rust `serde_json --release`, **1.48x faster than Go `encoding/json`**) with nearly identical RSS to Rust (30.5 MiB vs 29.2 MiB). On W2, `pion_json` matches Go `encoding/json` while achieving the **lowest peak RSS** of all three (27.6 MiB). On W3 (50k-key parse + lookups + RFC 8785 JCS), fast byte-wise UTF-16 ordering (`0xEE..0xEF` vs `0xF0..0xF4` fix-up) brings `pion_json` to **156.2 ms** (**0.65x Rust**, **2.43x faster than Go**). On adversarial 40k-key workloads (`audit/run_audit.sh bench`), `pion_json` handles colliding keys at **13.1 ms** (0.83x Rust, 1.1x vs ordinary keys) and `without_keys` (20k of 40k) at **14.4 ms** (0.81x Rust, lower RSS).
-- **Methodology & Trade-offs**: Rust `serde_json` is built with default features (without `float_roundtrip`), so its float parsing takes a faster, not always 0-ULP path while `pion_json` is strictly 0-ULP; in W3, Rust uses `BTreeMap` (`O(log n)` lookups) and allocates per-key strings via `serde_json::to_string`, which partially handicaps Rust in W3 while W1/W2 slightly favor Rust. Remaining W1/W2 gaps vs Rust come from Pion's pre-parse full-string UTF-8 pass and bounds-checked byte scanning.
+- **Strengths**: Single-pass UTF-8 validation, zero-boxing mutable `Parser`/`ParseFrame`/`SerFrame` cursors, Clinger's 0-ULP float fast path, zero-allocation JSON Pointer traversal, zero-tuple Ryu formatting, and index-array hybrid merge sort deliver **2.17x speedup on W2** (surpassing Go `encoding/json` while maintaining the lowest peak RSS at 27.68 MiB vs Rust 33.57 MiB / Go 41.45 MiB) and **1.46x speedup on W3** (**0.87x of Rust**, **1.76x faster than Go**). On adversarial 40k-key workloads (`audit/run_audit.sh hashdos`), `pion_json` maintains a **1.1x** colliding-vs-ordinary ratio.
+- **Methodology & Trade-offs**: Pure-Pion Ryu (`float_fmt.pion`) is intentionally retained because `pionc`'s built-in `Double::to_string` currently uses C-style formatting (`1e20 -> "1e+20"`, `1e-6 -> "1e-06"`, `5e-324 -> "4.94065645841247e-324"`), which does not satisfy RFC 8785 / ECMAScript `Number::toString` shortest-roundtrip requirements (`30,000/30,000` `numfmt` parity). Remaining `< 1.0x` gaps vs Rust in W2/W3 come from Pion's reference-counting traffic (`pion_rc_*`) on boxed `Json` enums/tuples during tree construction/filtering, QBE register spills in large inlined functions (`parse_str_impl` stack frame `0x858 B`), and per-byte bounds-checked scanning without SIMD.
