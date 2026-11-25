@@ -40,7 +40,21 @@ pub fn box_metrics(b : LayoutBox) -> Metrics
 - **Red-Team Audit (`packages/texmath/audit`, v0.2.0)**: 168/168 red-team tests, 60/60 layout formulas with 0 mismatches, 108/127 KaTeX screenshotter formulas (0 valid rejections), 31 DoS probes with 0 SIGSEGV / 0 OOM (`def_arg_growth`: 0.08 s / 5.8 MiB). Reproduce with `sh packages/texmath/audit/run_audit.sh`.
 - **Wasm32**: `pionc build --target wasm32 packages/texmath/wasm_smoke -o /tmp/texmath_smoke.wasm`
 
-### v0.2.0 Head-to-Head (after red-team remediation)
+### v0.2.1 Head-to-Head (after Wasm32 + Native performance & size optimization)
+
+Measured on Linux x86_64 (`Node.js v24.22.1`, `KaTeX v0.19.1`) with `bench/corpus.txt` × 20 = 10,000 ops, `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved), stdout SHA-256 identical across all implementations:
+
+| Implementation | Median (ms) | Min (ms) | Peak RSS | `.wasm` Size (`--release`) | Speedup (vs `node-katex`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `node-katex` (v0.19.1) | 872.20 | 739.42 | 76.91 MiB | — | 1.00x (baseline) |
+| `pion-texmath` Native (baseline) | 422.86 | 312.97 | 11.25 MiB | — | 2.06x |
+| `pion-texmath` Native (optimized) | **182.05** | **153.59** | **11.25 MiB** | — | **4.79x** |
+| `pion-texmath` Wasm32 (baseline) | 929.22 | 870.79 | 298.05 MiB | 650.7 KB (`wasm_smoke`: 850.8 KB) | 0.94x |
+| `pion-texmath` Wasm32 (optimized) | **521.01** | **436.24** | **88.84 MiB** | **411.1 KB** (`wasm_smoke`: **455.7 KB**) | **1.67x** |
+
+Key optimizations: compact packed byte-table symbol lookup & O(1) U+1D400–U+1D7FF decoder (`symbols.pion`), compact base-85 sorted binary-search font metrics (`metrics_data.pion`), zero-intermediate-DOM direct `StringBuilder` MathML serializer (`mathml.pion`), zero-allocation static ASCII tokens (`lexer.pion`), lazy macro scopes (`macros.pion`), and hot/cold parser dispatch (`parser.pion`) — cutting `.wasm` full-library size by **46.4%**, Wasm32 peak RSS by **70.2%**, and lifting Wasm32 to **1.67x** and Native to **4.79x** of Node.js KaTeX.
+
+### v0.2.0 Head-to-Head (historical, after red-team remediation)
 
 Measured on Apple M5 Max (Darwin arm64) with `bench/corpus.txt` × 20, `scripts/bench_compare.py` strictly interleaved, stdout SHA-256 identical across implementations:
 
