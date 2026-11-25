@@ -118,7 +118,7 @@ pionc run --target wasm32 packages/xml/wasm_smoke
 
 ## Head-to-Head Benchmark
 
-Benchmarked via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte identity) on `Darwin arm64` against **Rust `roxmltree 0.21.2`** and **Rust `quick-xml 0.42.0`** (`--release`, thin LTO, `codegen-units = 1`).
+Benchmarked via `scripts/bench_compare.py` (`--warmup 1 --rounds 5`, strictly interleaved, mandatory stdout SHA-256 byte-for-byte identity) on `Linux x86_64` against **Rust `roxmltree 0.21.2`** and **Rust `quick-xml 0.42.0`** (`--release`, thin LTO, `codegen-units = 1`).
 
 Corpus: deterministic 645 KB realistic mixed XML document combining SVG vector groups with namespaces, Maven/Plist metadata blocks, and Atom/RSS entries with entities, CDATA, comments, and PIs (10 steady-state rounds = **6.45 MB** total input for Bench 1 & 2; 5 steady-state rounds × 3,000 structured records = **3.59 MB** output for Bench 3).
 
@@ -128,56 +128,60 @@ We report **both** traversal modes transparently:
 - **Zero-allocation indexed accessors** (`Document::node_kind_at`, `attrs_range_at`, `attr_value_len_raw`, `text_len_at` — measured by `packages/xml/bench/run_bench.sh`): `sha256:70c1e12cbd0a7d36...`
 - **Public `Node` API** (`descendants()`, `attributes()`, `text()`, which allocate owned `Array`s and `String`s — measured by `packages/xml/audit/perf/run_bench.sh`): `sha256:a32405fd1eeb4911...`
 
-| Mode & Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_roxmltree 0.21.2`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (indexed accessors) | 36.190 | 32.133 | 39.675 | 178.23 | 7.02 MiB | 0.81x |
-| `rust_roxmltree` (Bench 1) | 29.203 | 26.365 | 32.190 | 220.87 | 4.98 MiB | 1.00x (baseline) |
-| `pion` (**public `Node` API**) | 45.700 | 44.895 | 46.569 | 141.14 | 7.44 MiB | **0.58x** |
-| `rust_roxmltree` (audit) | 26.553 | 24.651 | 27.078 | 242.91 | 5.02 MiB | 1.00x (baseline) |
+| Mode & Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_roxmltree 0.21.2`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` (indexed accessors) | 42.621 | 38.627 | 45.382 | 151.33 | 0.74x |
+| `rust_roxmltree` (Bench 1) | 31.583 | 30.574 | 38.295 | 204.22 | 1.00x (baseline) |
+| `pion` (**public `Node` API**) | 105.980 | 89.308 | 115.373 | 60.86 | 0.41x |
+| `rust_roxmltree` (audit) | 43.880 | 35.206 | 58.781 | 146.99 | 1.00x (baseline) |
 
 ### Bench 2: Streaming Pull Parse (6.45 MB)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `155 B` (`sha256:520e5cb9a1c90edb...`)
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `155 B` (`sha256:520e5cb9a1c90edb...`)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_quick_xml 0.42.0`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (with Namespaces 1.0) | 39.901 | 36.755 | 42.520 | 161.65 | 3.16 MiB | 0.67x |
-| `rust_quick_xml` (`check_end_names`) | 26.698 | 23.925 | 27.632 | 241.59 | 2.56 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_quick_xml 0.42.0`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` (with Namespaces 1.0) | 27.440 | 27.108 | 34.607 | 235.06 | 0.49x |
+| `rust_quick_xml` (`check_end_names`) | 13.530 | 12.931 | 13.772 | 476.71 | 1.00x (baseline) |
 
 ### Bench 3: Structured XML Serialization (3.59 MB)
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `211 B` (`sha256:e5290d6c8b4ff356...`)
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` (strictly interleaved) | Stdout: `211 B` (`sha256:e5290d6c8b4ff356...`)
 
-| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Peak RSS | Speedup (vs `rust_quick_xml 0.42.0`) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` (strict atomic + NS checks) | 39.435 | 35.746 | 53.078 | 90.98 | 3.12 MiB | 0.87x |
-| `rust_quick_xml` | 34.481 | 31.013 | 41.056 | 104.05 | 2.75 MiB | 1.00x (baseline) |
+| Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | Speedup (vs `rust_quick_xml 0.42.0`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `pion` (strict atomic + NS checks) | 38.709 | 37.084 | 53.958 | 92.68 | 0.86x |
+| `rust_quick_xml` | 33.202 | 28.571 | 80.331 | 108.06 | 1.00x (baseline) |
 
 ### Adversarial & Pathological Workloads (`packages/xml/audit/run_audit.sh`)
 
-All workloads verified SHA-256 identical against Rust `roxmltree 0.21.2` / `quick-xml 0.42.0` (`--warmup 1 --rounds 5`):
+All workloads verified SHA-256 identical against Rust `roxmltree 0.21.2` / `quick-xml 0.42.0` (`--warmup 1 --rounds 5`, `Linux x86_64`):
 
-| Workload | `pion` Median | `pion` RSS | Rust Median | Rust RSS | `pion` vs Rust |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Alternating Text/CDATA × 20,000 (DOM) | 10.65 ms | 2.77 MiB | 10.28 ms | 3.42 MiB | **0.96x** |
-| 1,000 prefixes, 200k elements cycling prefixes (DOM) | 31.66 ms | 37.08 MiB | 162.31 ms | 17.47 MiB | **5.13x (pion wins)** |
-| 2,000-deep scopes, leaf uses outermost prefix (DOM) | 12.99 ms | 3.64 MiB | 1,679.98 ms | 8.56 MiB | **129.32x (pion wins)** |
-| 200 elements × 1,000 attributes (DOM) | 23.58 ms | 21.45 MiB | 161.26 ms | 17.86 MiB | **6.84x (pion wins)** |
-| 200 elements × 1,000 attributes (Reader) | 24.83 ms | 5.86 MiB | 20.78 ms | 4.23 MiB | **0.84x** |
-| 20,000 internal entities + 20,000 refs (DOM, `allow_dtd`) | 15.41 ms | 7.72 MiB | 407.33 ms | 4.19 MiB | **26.43x (pion wins)** |
-| 16 MiB single text node (DOM) | 20.08 ms | 33.77 MiB | 28.46 ms | 17.95 MiB | **1.42x (pion wins)** |
-| 16 MiB dense entity/char refs (DOM) | 74.63 ms | 36.00 MiB | 56.91 ms | 38.02 MiB | 0.76x |
-| 16 MiB dense entity/char refs (Reader) | 73.97 ms | 35.88 MiB | 45.82 ms | 18.56 MiB | 0.62x |
-| 100k sibling elements (DOM) | 16.17 ms | 19.12 MiB | 11.29 ms | 9.16 MiB | 0.70x |
-| 50,000-deep nesting (DOM, limits raised) | 15.46 ms | 13.70 MiB | 11.15 ms | 6.75 MiB | 0.72x |
+| Workload | `pion` Median | Rust Median | `pion` vs Rust |
+| --- | ---: | ---: | ---: |
+| Alternating Text/CDATA × 20,000 (DOM) | 5.10 ms | 3.58 ms | 0.70x |
+| 1,000 prefixes, 200k elements cycling prefixes (DOM) | 42.91 ms | 251.40 ms | **5.86x (pion wins)** |
+| 2,000-deep scopes, leaf uses outermost prefix (DOM) | 3.33 ms | 2,043.08 ms | **614.05x (pion wins)** |
+| 200 elements × 1,000 attributes (DOM) | 33.46 ms | 237.28 ms | **7.09x (pion wins)** |
+| 200 elements × 1,000 attributes (Reader) | 20.96 ms | 14.03 ms | 0.67x |
+| 20,000 internal entities + 20,000 refs (DOM, `allow_dtd`) | 14.25 ms | 747.57 ms | **52.45x (pion wins)** |
+| 16 MiB single text node (DOM) | 35.95 ms | 31.34 ms | 0.87x |
+| 16 MiB dense entity/char refs (DOM) | 77.33 ms | 79.34 ms | **1.03x (pion wins)** |
+| 16 MiB dense entity/char refs (Reader) | 84.43 ms | 63.73 ms | 0.75x |
+| 100k sibling elements (DOM) | 18.35 ms | 9.00 ms | 0.49x |
+| 50,000-deep nesting (DOM, limits raised) | 10.99 ms | 6.99 ms | 0.64x |
 
 ### Performance Notes
 
-- **Optimizations applied**: 256-byte `FixedArray[Int]` classification LUT (`P53-C` zero-OOB BCE), 4×-unrolled `while i <= len - 4` window-BCE loops across text/attribute/CDATA/comment/PI/writer paths, compact 14-int flat `NodeData` with deferred `first_child`/`last_child` stacks, single-`StringBuilder` linear text/CDATA run merging, lazy O(1) `Map` promotion for >8 active namespace prefixes, wide attribute lists (`>=8` Reader / `>=16` DOM), and O(1) `EntityTable` (`Map[String, Int]`), zero-stack entity unescaping when no DTD entities exist, and zero-copy `TextSpan` slices with `StringBuilder::write_substring`.
+- **Optimizations applied**:
+  - Hoisted 256-byte `FixedArray[Int]` classification LUT (`xml_lut`) across all hot loops (`chars.pion`, `prolog.pion`, `entities.pion`, `reader.pion`, `writer.pion`, `dom.pion`) with `mask_comment_fast` / `mask_pi_fast` bitmasks and 4×-unrolled window-BCE loops + 1-byte tail loops.
+  - Zero-allocation packed UTF-8 decoder (`decode_utf8_packed` returning `(cp << 3) | blen`), `val struct QNameScan` / `SpanScan` scanners, zero-`Result`-boxing internal helpers (`parse_char_ref_fast`, `DomCold::parse_tag_attrs`, `Writer::validate_element_fast`, `validate_text_for_write_fast`, `validate_attr_for_write_lut`), and elimination of per-element `Map::new()` / `maybe_intern` tuple allocations.
+  - Cold-path outlining out of `Document::parse_with_options` (`DomCold` helpers) and `Reader::next_event` (`next_event_outside_root`, `parse_tag_with_attrs`, `handle_bang_or_pi`, `handle_end_tag_slow`, `validate_prefixed_attrs`), plus depth-indexed reusable stacks (eliminating `Array::pop` `Option` boxing) and sparse namespace scope tracking.
+  - Single-pass text/attribute entity scanning & unescaping (`scan_and_unescape_text_no_dtd`, `scan_and_unescape_attr_no_dtd`) with inline predefined entity matching, plus fused single-pass `Writer` validation & escaping (`validate_xml_name_colon_lut`, `write_escaped_text_from`) and O(n) pre-order `Node::descendants()` fast path.
 - **Honest gap analysis**:
-  - **Bench 1 (`0.81x` indexed / `0.58x` public `Node` API vs `roxmltree 0.21.2`)**: the indexed-accessor gap and RSS delta (`7.02 MiB` vs `4.98 MiB`) come from 64-bit `Int` indices in `NodeData` (vs Rust's 32-bit `NonZeroU32`) and whole-struct `val struct` updates; the public `Node` API additionally allocates owned `Array`s and `String`s on traversal (`descendants()` / `attributes()` / `text()`).
-  - **Bench 2 (`0.67x` vs `quick-xml 0.42.0`)**: `quick-xml` returns zero-copy borrowed `&[u8]` slices with `memchr` SIMD scanning and does not perform Namespaces 1.0 validation in its base `Reader`, whereas `xml::Reader::next_event` enforces full Namespaces 1.0 and materializes owned `String` payloads.
-  - **Bench 3 (`0.87x` vs `quick-xml 0.42.0`)**: includes full pre-write validation (atomic errors, duplicate attribute & Namespaces 1.0 well-formedness checks) while keeping 4×-unrolled LUT escaping.
+  - **Bench 1 (`0.74x` indexed / `0.41x` public `Node` API vs `roxmltree 0.21.2`)**: the indexed-accessor gap comes from 64-bit `Int` indices in 14-int `NodeData` (vs Rust's 32-bit `NonZeroU32`) and whole-struct `val struct` updates; the public `Node` API additionally allocates owned `Array`s and `String`s on traversal (`descendants()` / `attributes()` / `text()`).
+  - **Bench 2 (`0.49x` vs `quick-xml 0.42.0`)**: `quick-xml` returns zero-copy borrowed `&[u8]` slices with `memchr` SIMD scanning and does not perform Namespaces 1.0 validation in its base `Reader`, whereas `xml::Reader::next_event` enforces full Namespaces 1.0 and materializes owned `String` payloads and `RawAttribute` arrays.
+  - **Bench 3 (`0.86x` vs `quick-xml 0.42.0`)**: includes full atomic pre-write validation (duplicate attribute & Namespaces 1.0 well-formedness checks) while keeping 4×-unrolled LUT escaping.
 
 Reproduce:
 
