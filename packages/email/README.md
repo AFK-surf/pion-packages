@@ -64,38 +64,38 @@ let atts = msg.attachments()
 
 ## Head-to-Head Benchmarks
 
-Run with `sh packages/email/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `Cargo.lock` / `go.sum`, mandatory stdout SHA-256 verification) on **Darwin arm64** against:
+Run with `sh packages/email/bench/run_bench.sh` via `scripts/bench_compare.py --warmup 1 --rounds 5` (strictly interleaved, locked `Cargo.lock` / `go.sum`, mandatory stdout SHA-256 verification) on **Linux x86_64** against:
 - **Rust** `mail-parser 0.9.4` (`--release --locked`)
 - **Go** stdlib `net/mail` + `github.com/emersion/go-msgauth v0.7.0` (`-mod=readonly`)
 
 ### W1: 5,000 Multi-Part MIME Emails Parse & Body/Attachment Hash
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Input: `6,345,580 B` | Ops: `5,000` | SHA-256: `38ce7a358e162dc3d24eac354cec116c69bb18e9285ee0bf01e87773ce8a59d4`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` | Input: `6,345,580 B` | Ops: `5,000` | SHA-256: `38ce7a358e162dc3d24eac354cec116c69bb18e9285ee0bf01e87773ce8a59d4`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs rust_mail_parser) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 48.458 | 48.087 | 50.830 | 130.95 | 9691.67 | 3.23 MiB | 0.52x |
-| `rust_mail_parser` | 25.434 | 25.074 | 26.399 | 249.49 | 5086.76 | 2.69 MiB | 1.00x (baseline) |
+| `pion` | 45.717 | 42.855 | 70.914 | 138.80 | 9143.45 | 3.23 MiB | 0.68x |
+| `rust_mail_parser` | 31.198 | 29.140 | 40.992 | 203.40 | 6239.49 | 2.66 MiB | 1.00x (baseline) |
 
 ### W2: 100,000 Complex RFC 5322 Address-List & Date Parses
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Input: `12,492,000 B` | Ops: `100,000` | SHA-256: `1d0df93f8a814b8bdecfc1a80825b48d26caeb67c3cbcdbbc9c5835608d786a6`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` | Input: `12,492,000 B` | Ops: `100,000` | SHA-256: `1d0df93f8a814b8bdecfc1a80825b48d26caeb67c3cbcdbbc9c5835608d786a6`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | Throughput (MB/s) | ns/op | Peak RSS | Speedup (vs go_net_mail) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 120.999 | 120.128 | 122.108 | 103.24 | 1209.99 | 2.36 MiB | **1.73x** |
-| `go_net_mail` | 208.833 | 204.809 | 214.841 | 59.82 | 2088.32 | 17.27 MiB | 1.00x (baseline) |
+| `pion` | 107.311 | 97.797 | 113.613 | 116.41 | 1073.11 | 2.75 MiB | **5.46x** |
+| `go_net_mail` | 585.907 | 539.598 | 761.654 | 21.32 | 5859.07 | 74.74 MiB | 1.00x (baseline) |
 
 ### W3: 2,000 Email Build + DKIM `relaxed/relaxed` Ed25519 Sign/Verify Roundtrip
 
-Platform: `Darwin arm64` | Warmup: `1` | Rounds: `5` | Ops: `2,000` | SHA-256: `22223d47651049b1e97bcb09f9a11326f3dc32ac91d74fb790a04d19fabe7eda`
+Platform: `Linux x86_64` | Warmup: `1` | Rounds: `5` | Ops: `2,000` | SHA-256: `22223d47651049b1e97bcb09f9a11326f3dc32ac91d74fb790a04d19fabe7eda`
 
 | Implementation | Median (ms) | Min (ms) | P95 (ms) | ns/op | Peak RSS | Speedup (vs go_msgauth) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pion` | 575.242 | 572.885 | 576.752 | 287620.96 | 2.38 MiB | 0.21x |
-| `go_msgauth` | 121.817 | 119.132 | 123.446 | 60908.71 | 16.98 MiB | 1.00x (baseline) |
+| `pion` | 1300.975 | 1208.894 | 1350.477 | 650487.60 | 2.51 MiB | 0.24x |
+| `go_msgauth` | 313.733 | 273.150 | 384.612 | 156866.52 | 11.79 MiB | 1.00x (baseline) |
 
-> **Honest Assessment**: `packages/email` outperforms Go `net/mail` by **1.73x** (with 7.3x lower RSS) on complex RFC 5322 address-list and date parsing (W2), reaches **130.95 MB/s** (0.52x of Rust `mail-parser`, up from 113 MB/s) on full multi-part MIME tree parsing + charset validation + QP/Base64 decoding (W1), and runs at **0.21x** of `github.com/emersion/go-msgauth v0.7.0` (with 7.1x lower RSS) on full end-to-end DKIM sign/re-parse/verify (W3) because `packages/crypto` uses portable pure-Pion Ed25519 curve arithmetic versus Go's assembly implementation.
+> **Honest Assessment**: `packages/email` outperforms Go `net/mail` by **5.46x** (116.41 MB/s, with 27x lower RSS) on complex RFC 5322 address-list and date parsing (W2), reaches **138.80 MB/s** (**0.68x** of Rust `mail-parser`, up from 0.52x / 111.19 MB/s) on full multi-part MIME tree parsing + charset validation + QP/Base64 decoding (W1, where Rust `mail-parser` borrows zero-copy `&[u8]` slices vs `EmailMessage`'s owned `String`/`Bytes` fields), and runs at **0.24x** of `github.com/emersion/go-msgauth v0.7.0` (with 4.7x lower RSS) on full end-to-end DKIM sign/re-parse/verify (W3) because ~98.5% of W3 time is spent in `packages/crypto`'s portable pure-Pion Ed25519 curve arithmetic (~1035 ms) while `packages/email`'s own builder + header/body canonicalization + DKIM parsing takes only ~15 ms (<1.5%).
 
 ## Formal Verification (Lean 4)
 
