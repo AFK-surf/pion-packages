@@ -98,7 +98,7 @@ pionc run --target wasm32 packages/csp/wasm_smoke
 pionc run --target wasm32 --release packages/csp/wasm_smoke
 ```
 
-## Head-to-Head Benchmarks (`Darwin arm64`, `warmup=1`, `rounds=11`)
+## Head-to-Head Benchmarks (`Linux x86_64`, `warmup=1`, `rounds=11`)
 
 Run via `sh packages/csp/bench/run_bench.sh` against an independent Rust W3C CSP3 + WHATWG Fetch CORS implementation (`packages/csp/bench/rust`, `cargo build --release`) backed by **`servo/rust-url` (`url = 2.5.9`)** and **`percent-encoding = 2.3.2`**.
 
@@ -107,10 +107,10 @@ Every decision field (`allowed`, `violated_directive`, `effective_directive`, `m
 - **CSP3 workload** (`--ops 100000`, end-to-end wall time including 10,000 full policy parses + 100,000 evaluations): 5 real-world complex CSP3 headers (Twitter/X, YouTube, GitHub, Google Meet, Figma) with realistic and adversarial URLs (`\`, `.\t.`, `%61`, `wss:`, `data:`, nonces, hashes, `'strict-dynamic'`, `'wasm-unsafe-eval'`).
 - **CORS workload** (`--ops 200000`, end-to-end wall time): `parse_origin` / `origin_equals` (including `blob:` and `\` authority), safelisted methods/headers, `check_cors_response`, and `check_cors_preflight` (`Authorization` wildcard rejection, credentials mode, `86400` s `max_age` cap).
 
-| Workload | `pion` Median (`ns/op`) | `rust_csp` Median (`ns/op`) | `pion` Min / P95 (ms) | `rust_csp` Min / P95 (ms) | `pion` Peak RSS | `rust_csp` Peak RSS | `pion` vs `rust_csp` | Stdout SHA-256 (Identical) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Real-World CSP3 Parse + Eval (10k policies + 100k checks) | 96.534 ms (`965.34 ns/op`) | 65.204 ms (`652.04 ns/op`) | 95.560 / 104.051 | 64.188 / 69.148 | 2.80 MiB | 2.31 MiB | **0.68x** | `0c6bda1f51bef097...` |
-| WHATWG Fetch CORS Preflight + Response + Origin (200k ops) | 67.541 ms (`337.71 ns/op`) | 42.427 ms (`212.13 ns/op`) | 66.518 / 84.032 | 41.177 / 47.698 | 2.73 MiB | 2.16 MiB | **0.63x** | `f78bb5cbd9976a46...` |
+| Workload | `pion` Median (`ns/op`) | `rust_csp` Median (`ns/op`) | `pion` Min / P95 (ms) | `rust_csp` Min / P95 (ms) | `pion` vs `rust_csp` | Stdout SHA-256 (Identical) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Real-World CSP3 Parse + Eval (10k policies + 100k checks) | 161.448 ms (`1614.48 ns/op`) | 172.579 ms (`1725.79 ns/op`) | 131.216 / 213.533 | 126.396 / 206.484 | **1.07x** | `0c6bda1f51bef097...` |
+| WHATWG Fetch CORS Preflight + Response + Origin (200k ops) | 69.506 ms (`347.53 ns/op`) | 86.735 ms (`433.68 ns/op`) | 57.800 / 136.339 | 70.495 / 128.861 | **1.25x** | `f78bb5cbd9976a46...` |
 
 ## Formal Verification (Lean 4)
 
