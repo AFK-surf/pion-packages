@@ -21,6 +21,8 @@ pub struct Doc {
   pub store : BlockStore
   pub types : Array[YTypeNode]
   pub share : Map[String, Int]
+  mut last_root_name : String
+  mut last_root_tid : Int
 }
 
 ///| Create a new `Doc` with the given `client_id`.
@@ -30,6 +32,8 @@ pub fn Doc::new(client_id : UInt64) -> Doc {
     store: BlockStore::new(),
     types: Array::new(),
     share: Map::new(),
+    last_root_name: "",
+    last_root_tid: -1,
   }
 }
 
@@ -40,12 +44,21 @@ pub fn Doc::client_id(self : Doc) -> UInt64 {
 
 ///| Ensure a root shared type exists in `doc.share` and return its `type_id`.
 pub fn Doc::ensure_root_type(self : Doc, name : String, tr : TypeRef) -> Int {
+  if self.last_root_tid >= 0 && self.last_root_name == name {
+    return self.last_root_tid
+  }
   match self.share.get(name) {
-    Some(tid) => tid
+    Some(tid) => {
+      self.last_root_name = name
+      self.last_root_tid = tid
+      tid
+    }
     None => {
       let tid = self.types.length()
       self.types.push(YTypeNode::new(tr, Some(name)))
       self.share.set(name, tid)
+      self.last_root_name = name
+      self.last_root_tid = tid
       tid
     }
   }
@@ -126,6 +139,8 @@ pub fn Doc::encode_state_as_update_from(
 }
 
 ///| Apply a Yjs v1 binary update to this document.
+///| Wire framing, UTF-8, overflow, and duplicate-client errors fail atomically before mutating `self` on multi-client updates;
+///| doc-state semantic rejections (e.g., cross-container origins or hostile overlap splices) return `Err` and may leave earlier ready items applied.
 pub fn Doc::apply_update(self : Doc, update : Bytes) -> Result[Unit, CrdtError] {
   apply_update(self, update)
 }
@@ -159,10 +174,6 @@ pub fn Doc::split_item_u64(self : Doc, item_idx : Int, diff : UInt64) -> Int {
   }
   let left_len = if diff > 2147483647UL { 2147483647 } else { diff.to_int() }
   let right_id = Id::{ client: item.id.client, clock: item.id.clock + diff }
-  let right_origin = Some(
-    Id::{ client: item.id.client, clock: item.id.clock + diff - 1UL },
-  )
-  let right_idx = self.store.items.length()
   let mut left_raw_any : Option[Array[Bytes]] = None
   let mut right_raw_any : Option[Array[Bytes]] = None
   match item.raw_any_bytes {
@@ -184,17 +195,24 @@ pub fn Doc::split_item_u64(self : Doc, item_idx : Int, diff : UInt64) -> Int {
     }
     None => ()
   }
+  let old_right = item.right
   let right_item = Item::{
     id: right_id,
     len: right_len,
     len_u64: right_len_u64,
     left: item_idx,
-    right: item.right,
-    origin: right_origin,
-    right_origin: item.right_origin,
+    right: old_right,
+    has_origin: true,
+    origin_client: item.id.client,
+    origin_clock: item.id.clock + diff - 1UL,
+    has_right_origin: item.has_right_origin,
+    right_origin_client: item.right_origin_client,
+    right_origin_clock: item.right_origin_clock,
     parent_id: item.parent_id,
     parent_key: item.parent_key,
-    parent_item_id: item.parent_item_id,
+    has_parent_item_id: item.has_parent_item_id,
+    parent_item_client: item.parent_item_client,
+    parent_item_clock: item.parent_item_clock,
     parent_sub: item.parent_sub,
     deleted: item.deleted,
     countable: item.countable,
@@ -202,18 +220,28 @@ pub fn Doc::split_item_u64(self : Doc, item_idx : Int, diff : UInt64) -> Int {
     content: right_c,
     raw_any_bytes: right_raw_any,
   }
-  self.store.items.push(right_item)
-  let old_right = item.right
+  let right_idx = self.store.push_item(right_item)
   item.len = left_len
   item.len_u64 = diff
   item.raw_any_bytes = left_raw_any
   item.right = right_idx
+  self.store.item_right[item_idx] = right_idx
+  self.store.item_len_u64[item_idx] = diff
+  if !item.deleted && item.countable {
+    self.store.item_live_len[item_idx] = left_len
+  }
   if old_right >= 0 {
     self.store.items[old_right].left = right_idx
+    self.store.item_left[old_right] = right_idx
   }
   // Insert right_idx into client's chunked block store right after item_idx
   let cs = self.store.get_or_create_client(item.id.client)
-  cs.insert_after_clock(self.store.items, item.id.clock, right_idx)
+  cs.insert_after_clock(
+    self.store.item_clock,
+    self.store.item_len_u64,
+    item.id.clock,
+    right_idx,
+  )
   // Update parent._map if this was the active map entry
   if right_item.parent_id >= 0 && right_item.right < 0 {
     match right_item.parent_sub {
@@ -229,16 +257,50 @@ pub fn Doc::split_item(self : Doc, item_idx : Int, diff : Int) -> Int {
   self.split_item_u64(item_idx, int_to_u64(diff))
 }
 
-///| Return the arena index of the item whose clock starts exactly at `id.clock` (splitting if needed).
-pub fn Doc::get_item_clean_start(self : Doc, id : Id) -> Int {
-  let idx = self.store.get_item_idx(id)
+///| Return the arena index of the item whose clock starts exactly at `(client, clock)` (splitting if needed).
+fn Doc::get_item_clean_start_cc(
+  self : Doc,
+  client : UInt64,
+  clock : UInt64,
+) -> Int {
+  let idx = self.store.get_item_idx_cc(client, clock)
   if idx < 0 {
     return -1
   }
-  let item = self.store.items[idx]
-  if item.id.clock < id.clock {
-    let diff = id.clock - item.id.clock
-    self.split_item_u64(idx, diff)
+  let iclk = self.store.item_clock[idx]
+  if iclk < clock {
+    self.split_item_u64(idx, clock - iclk)
+  } else {
+    idx
+  }
+}
+
+///| Return the arena index of the item whose clock starts exactly at `id.clock` (splitting if needed).
+pub fn Doc::get_item_clean_start(self : Doc, id : Id) -> Int {
+  self.get_item_clean_start_cc(id.client, id.clock)
+}
+
+///| Return the arena index of the item whose last clock equals `(client, clock)` (splitting if needed).
+fn Doc::get_item_clean_end_cc(
+  self : Doc,
+  client : UInt64,
+  clock : UInt64,
+) -> Int {
+  let idx = self.store.get_item_idx_cc(client, clock)
+  if idx < 0 {
+    return -1
+  }
+  let iclk = self.store.item_clock[idx]
+  let ilen = self.store.item_len_u64[idx]
+  let last_clock = if ilen <= 1UL {
+    iclk
+  } else {
+    u64_sat_add(iclk, ilen - 1UL)
+  }
+  if last_clock > clock {
+    let diff = clock - iclk + 1UL
+    let _ = self.split_item_u64(idx, diff)
+    idx
   } else {
     idx
   }
@@ -246,23 +308,7 @@ pub fn Doc::get_item_clean_start(self : Doc, id : Id) -> Int {
 
 ///| Return the arena index of the item whose last clock equals `id.clock` (splitting if needed).
 pub fn Doc::get_item_clean_end(self : Doc, id : Id) -> Int {
-  let idx = self.store.get_item_idx(id)
-  if idx < 0 {
-    return -1
-  }
-  let item = self.store.items[idx]
-  let last_clock = if item.len_u64 <= 1UL {
-    item.id.clock
-  } else {
-    u64_sat_add(item.id.clock, item.len_u64 - 1UL)
-  }
-  if last_clock > id.clock {
-    let diff = id.clock - item.id.clock + 1UL
-    let _ = self.split_item_u64(idx, diff)
-    idx
-  } else {
-    idx
-  }
+  self.get_item_clean_end_cc(id.client, id.clock)
 }
 
 ///| Mark an item as deleted, updating parent length, DeleteSet, GC content, and nested children.
@@ -272,6 +318,7 @@ pub fn Doc::delete_item(self : Doc, item_idx : Int) -> Unit {
     return
   }
   item.deleted = true
+  self.store.item_live_len[item_idx] = 0
   if item.parent_id >= 0 && item.countable {
     match item.parent_sub {
       None => {
@@ -289,7 +336,7 @@ pub fn Doc::delete_item(self : Doc, item_idx : Int) -> Unit {
       clear_markers(child_node)
       let mut cur = child_node.start
       while cur >= 0 {
-        let next = self.store.items[cur].right
+        let next = self.store.item_right[cur]
         if !self.store.items[cur].deleted {
           self.delete_item(cur)
         }
@@ -339,10 +386,10 @@ pub fn Doc::try_merge_with_left(self : Doc, item_idx : Int) -> Bool {
   if left.right != item_idx {
     return false
   }
-  if !opt_id_eq(right.origin, Some(left.last_id())) {
+  if !item_origin_eq_last_id(right, left) {
     return false
   }
-  if !opt_id_eq(left.right_origin, right.right_origin) {
+  if !item_same_right_origin(left, right) {
     return false
   }
   if left.parent_id != right.parent_id {
@@ -382,7 +429,7 @@ pub fn Doc::try_merge_with_left(self : Doc, item_idx : Int) -> Bool {
   if !merged_ok {
     return false
   }
-  // Update search markers pointing to right_idx -> left_idx
+  // Update search markers pointing to item_idx -> left_idx (and compact duplicate slot if left_idx is already marked)
   if left.parent_id >= 0 {
     let p = self.types[left.parent_id]
     let shift = if !left.deleted && left.countable { left.len } else { 0 }
@@ -390,30 +437,51 @@ pub fn Doc::try_merge_with_left(self : Doc, item_idx : Int) -> Bool {
       p.last_marker_item = left_idx
       p.last_marker_idx = p.last_marker_idx - shift
     }
-    let mut ci = 0
-    while ci < p.marker_chunks.length() {
-      let ch = p.marker_chunks[ci]
-      let mut mi = 0
-      while mi < ch.items.length() {
-        let m = ch.items[mi]
-        if m.item_idx == item_idx {
-          ch.items[mi] = SearchMarker::{
-            item_idx: left_idx,
-            index: m.index - shift,
-            timestamp: m.timestamp,
-          }
-        }
-        mi = mi + 1
+    let m_items = p.m_item
+    let m_indices = p.m_index
+    let m_ts = p.m_ts
+    let mn = m_items.length()
+    let mut write_i = 0
+    let mut mi = 0
+    while mi < mn {
+      let mut it = m_items[mi]
+      let mut idx = m_indices[mi]
+      let ts = m_ts[mi]
+      if it == item_idx {
+        it = left_idx
+        idx = idx - shift
       }
-      ci = ci + 1
+      if write_i > 0 && m_items[write_i - 1] == it && m_indices[write_i - 1] == idx {
+        if ts > m_ts[write_i - 1] {
+          m_ts[write_i - 1] = ts
+        }
+      } else {
+        m_items[write_i] = it
+        m_indices[write_i] = idx
+        m_ts[write_i] = ts
+        write_i = write_i + 1
+      }
+      mi = mi + 1
+    }
+    while m_items.length() > write_i {
+      let _ = m_items.pop()
+      let _ = m_indices.pop()
+      let _ = m_ts.pop()
     }
   }
-  left.right = right.right
-  if left.right >= 0 {
-    self.store.items[left.right].left = left_idx
+  let new_right = right.right
+  left.right = new_right
+  self.store.item_right[left_idx] = new_right
+  if new_right >= 0 {
+    self.store.items[new_right].left = left_idx
+    self.store.item_left[new_right] = left_idx
   }
   left.len = left.len + right.len
   left.len_u64 = left.len_u64 + right.len_u64
+  self.store.item_len_u64[left_idx] = left.len_u64
+  if !left.deleted && left.countable {
+    self.store.item_live_len[left_idx] = left.len
+  }
   // Remove item_idx from client's block store (it is always the last element when newly appended)
   let cs = self.store.get_or_create_client(left.id.client)
   cs.pop_last(item_idx)
@@ -426,20 +494,41 @@ pub fn Doc::try_merge_with_left(self : Doc, item_idx : Int) -> Bool {
 ///| Integrate an unintegrated item `item_idx` into the document using the YATA algorithm.
 ///| `is_local` skips clearing search markers when the caller updates them explicitly.
 pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit {
+  self.integrate_item_resolved(item_idx, is_local, is_local)
+}
+
+///| Internal integration entry point allowing callers that already resolved & validated `(left, right)` to skip redundant lookups.
+fn Doc::integrate_item_resolved(
+  self : Doc,
+  item_idx : Int,
+  is_local : Bool,
+  resolved_lr : Bool,
+) -> Unit {
   let item = self.store.items[item_idx]
   if item.is_gc {
     self.store.add_item_to_client(item_idx)
     return
   }
   // Resolve left and right pointers from origin / right_origin if not already set (remote items)
-  if !is_local {
-    match item.origin {
-      Some(oid) => item.left = self.get_item_clean_end(oid)
-      None => item.left = -1
+  if !resolved_lr {
+    if item.has_origin {
+      let l = self.get_item_clean_end_cc(item.origin_client, item.origin_clock)
+      item.left = l
+      self.store.item_left[item_idx] = l
+    } else {
+      item.left = -1
+      self.store.item_left[item_idx] = -1
     }
-    match item.right_origin {
-      Some(roid) => item.right = self.get_item_clean_start(roid)
-      None => item.right = -1
+    if item.has_right_origin {
+      let r = self.get_item_clean_start_cc(
+        item.right_origin_client,
+        item.right_origin_clock,
+      )
+      item.right = r
+      self.store.item_right[item_idx] = r
+    } else {
+      item.right = -1
+      self.store.item_right[item_idx] = -1
     }
   }
   // Resolve parent_id and parent_sub
@@ -461,9 +550,12 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
           }
           item.parent_id = self.ensure_root_type(key, tr)
         }
-        None => match item.parent_item_id {
-          Some(pid) => {
-            let pidx = self.store.get_item_idx(pid)
+        None => {
+          if item.has_parent_item_id {
+            let pidx = self.store.get_item_idx_cc(
+              item.parent_item_client,
+              item.parent_item_clock,
+            )
             if pidx >= 0 {
               match self.store.items[pidx].content {
                 Content::Type(tid) => item.parent_id = tid
@@ -471,7 +563,6 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
               }
             }
           }
-          None => ()
         }
       }
     }
@@ -481,25 +572,30 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
   if parent_id < 0 {
     // Parent not found (GC'd parent): turn into GC block
     item.is_gc = true
+    item.deleted = true
     item.content = Content::Gc(item.len_u64)
+    self.store.item_live_len[item_idx] = 0
     self.store.add_item_to_client(item_idx)
     return
   }
 
   let parent = self.types[parent_id]
-  if !is_local && (parent.markers.length() > 0 || parent.marker_chunks.length() > 0) {
+  if !is_local && (parent.markers.length() > 0 || parent.m_item.length() > 0) {
     clear_markers(parent)
   }
 
-  // YATA conflict resolution (exact match with yjs/src/structs/Item.js)
+  let i_lefts = self.store.item_left
+  let i_rights = self.store.item_right
+
+  // YATA conflict resolution (exact match with yjs/src/structs/Item.js; zero-alloc fast path)
   let has_conflict = (
-    item.left < 0 && (item.right < 0 || self.store.items[item.right].left >= 0)
-  ) || (item.left >= 0 && self.store.items[item.left].right != item.right)
+    item.left < 0 && (item.right < 0 || i_lefts[item.right] >= 0)
+  ) || (item.left >= 0 && i_rights[item.left] != item.right)
 
   if has_conflict {
     let mut left = item.left
     let mut o = if left >= 0 {
-      self.store.items[left].right
+      i_rights[left]
     } else {
       match item.parent_sub {
         Some(sub) => {
@@ -507,8 +603,8 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
             Some(v) => v
             None => -1
           }
-          while cur >= 0 && self.store.items[cur].left >= 0 {
-            cur = self.store.items[cur].left
+          while cur >= 0 && i_lefts[cur] >= 0 {
+            cur = i_lefts[cur]
           }
           cur
         }
@@ -517,57 +613,157 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
     }
 
     if o >= 0 && o != item.right {
-      let conflicting_items : Map[Int, Bool] = Map::new()
-      let items_before_origin : Map[Int, Bool] = Map::new()
+      let visited = self.store.conflict_visited
+      visited.clear()
+      let mut conflict_start = 0
+      let mut used_maps = false
+      let mut before_map : Option[Map[Int, Bool]] = None
+      let mut curr_map : Option[Map[Int, Bool]] = None
 
       while o >= 0 && o != item.right {
-        items_before_origin.set(o, true)
-        conflicting_items.set(o, true)
+        visited.push(o)
+        if used_maps {
+          match (before_map, curr_map) {
+            (Some(bm), Some(cm)) => {
+              bm.set(o, true)
+              cm.set(o, true)
+            }
+            _ => ()
+          }
+        }
         let o_item = self.store.items[o]
-        if opt_id_eq(item.origin, o_item.origin) {
+        if item_same_origin(item, o_item) {
           // Case 1: same origin -> lower client_id comes first
-          if yata_same_origin_before(o_item.id.client, item.id.client) {
+          if o_item.id.client < item.id.client {
             left = o
-            conflicting_items.clear()
-          } else if opt_id_eq(item.right_origin, o_item.right_origin) {
+            conflict_start = visited.length()
+            if used_maps {
+              match curr_map {
+                Some(cm) => cm.clear()
+                None => ()
+              }
+            }
+          } else if item_same_right_origin(item, o_item) {
+            break
+          }
+        } else if o_item.has_origin {
+          let o_orig_idx = self.store.get_item_idx_cc(
+            o_item.origin_client,
+            o_item.origin_clock,
+          )
+          if o_orig_idx >= 0 {
+            let vlen = visited.length()
+            let mut in_before = false
+            let mut in_conflict = false
+            if !used_maps && vlen > 32 {
+              used_maps = true
+              let bm = match self.store.conflict_before_map {
+                Some(m) => {
+                  m.clear()
+                  m
+                }
+                None => {
+                  let m : Map[Int, Bool] = Map::new()
+                  self.store.conflict_before_map = Some(m)
+                  m
+                }
+              }
+              let cm = match self.store.conflict_curr_map {
+                Some(m) => {
+                  m.clear()
+                  m
+                }
+                None => {
+                  let m : Map[Int, Bool] = Map::new()
+                  self.store.conflict_curr_map = Some(m)
+                  m
+                }
+              }
+              before_map = Some(bm)
+              curr_map = Some(cm)
+              let mut vi = 0
+              while vi < vlen {
+                let v = visited[vi]
+                bm.set(v, true)
+                if vi >= conflict_start {
+                  cm.set(v, true)
+                }
+                vi = vi + 1
+              }
+            }
+            if used_maps {
+              match (before_map, curr_map) {
+                (Some(bm), Some(cm)) => {
+                  in_before = match bm.get(o_orig_idx) {
+                    Some(_) => true
+                    None => false
+                  }
+                  if in_before {
+                    in_conflict = match cm.get(o_orig_idx) {
+                      Some(_) => true
+                      None => false
+                    }
+                  }
+                }
+                _ => ()
+              }
+            } else {
+              let mut vi = 0
+              while vi < vlen {
+                if visited[vi] == o_orig_idx {
+                  in_before = true
+                  if vi >= conflict_start {
+                    in_conflict = true
+                  }
+                  break
+                }
+                vi = vi + 1
+              }
+            }
+            if in_before {
+              // Case 2: o's origin is already in items_before_origin
+              if !in_conflict {
+                left = o
+                conflict_start = vlen
+                if used_maps {
+                  match curr_map {
+                    Some(cm) => cm.clear()
+                    None => ()
+                  }
+                }
+              }
+            } else {
+              break
+            }
+          } else {
             break
           }
         } else {
-          match o_item.origin {
-            Some(o_orig) => {
-              let o_orig_idx = self.store.get_item_idx(o_orig)
-              let in_before = match items_before_origin.get(o_orig_idx) {
-                Some(_) => true
-                None => false
-              }
-              if o_orig_idx >= 0 && in_before {
-                // Case 2: o's origin is already in items_before_origin
-                let in_conflict = match conflicting_items.get(o_orig_idx) {
-                  Some(_) => true
-                  None => false
-                }
-                if !in_conflict {
-                  left = o
-                  conflicting_items.clear()
-                }
-              } else {
-                break
-              }
-            }
-            None => break
-          }
+          break
         }
-        o = o_item.right
+        o = i_rights[o]
+      }
+      if used_maps {
+        match (before_map, curr_map) {
+          (Some(bm), Some(cm)) => {
+            bm.clear()
+            cm.clear()
+          }
+          _ => ()
+        }
       }
     }
     item.left = left
+    i_lefts[item_idx] = left
   }
 
   // Reconnect left / right links and update parent.start or parent.map
   if item.left >= 0 {
-    let r = self.store.items[item.left].right
+    let r = i_rights[item.left]
     item.right = r
+    i_rights[item_idx] = r
     self.store.items[item.left].right = item_idx
+    i_rights[item.left] = item_idx
   } else {
     let r = match item.parent_sub {
       Some(sub) => {
@@ -575,8 +771,8 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
           Some(v) => v
           None => -1
         }
-        while cur >= 0 && self.store.items[cur].left >= 0 {
-          cur = self.store.items[cur].left
+        while cur >= 0 && i_lefts[cur] >= 0 {
+          cur = i_lefts[cur]
         }
         cur
       }
@@ -587,10 +783,12 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
       }
     }
     item.right = r
+    i_rights[item_idx] = r
   }
 
   if item.right >= 0 {
     self.store.items[item.right].left = item_idx
+    i_lefts[item.right] = item_idx
   } else {
     match item.parent_sub {
       Some(sub) => {
@@ -627,6 +825,7 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
     }
     Content::Deleted(n) => {
       item.deleted = true
+      self.store.item_live_len[item_idx] = 0
       self.store.delete_set.add(item.id.client, item.id.clock, n)
     }
     _ => ()
@@ -644,111 +843,52 @@ pub fn Doc::integrate_item(self : Doc, item_idx : Int, is_local : Bool) -> Unit 
   }
 }
 
-///| Clear all search markers (both legacy array and 2-level chunk index).
+///| Clear all search markers (both sentinel array and flat parallel arrays).
 fn clear_markers(parent : YTypeNode) -> Unit {
   if parent.markers.length() > 0 {
     parent.markers.clear()
   }
-  if parent.marker_chunks.length() > 0 {
-    parent.marker_chunks.clear()
+  if parent.m_item.length() > 0 {
+    parent.m_item.clear()
+    parent.m_index.clear()
+    parent.m_ts.clear()
   }
   parent.last_marker = -1
   parent.last_marker_item = -1
   parent.last_marker_idx = 0
 }
 
-fn array_insert_marker(
-  arr : Array[SearchMarker],
-  pos : Int,
-  value : SearchMarker,
-) -> Unit {
-  arr.push(value)
-  let mut i = arr.length() - 1
-  while i > pos {
-    arr[i] = arr[i - 1]
-    i = i - 1
-  }
-  arr[pos] = value
-}
-
-fn array_insert_marker_chunk(
-  arr : Array[MarkerChunk],
-  pos : Int,
-  value : MarkerChunk,
-) -> Unit {
-  arr.push(value)
-  let mut i = arr.length() - 1
-  while i > pos {
-    arr[i] = arr[i - 1]
-    i = i - 1
-  }
-  arr[pos] = value
-}
-
-fn array_remove_marker_chunk(arr : Array[MarkerChunk], pos : Int) -> Unit {
-  let n = arr.length()
-  let mut i = pos
-  while i + 1 < n {
-    arr[i] = arr[i + 1]
-    i = i + 1
-  }
-  let _ = arr.pop()
-}
-
-///| Update 2-level search markers on `parent` after a local insert (`delta > 0`) or delete (`delta < 0`) at `index`.
+///| Update flat parallel search markers on `parent` after a local insert (`delta > 0`) or delete (`delta < 0`) at `index`.
 fn update_markers(parent : YTypeNode, index : Int, delta : Int) -> Unit {
   if parent.markers.length() == 0 {
-    if parent.marker_chunks.length() > 0 || parent.last_marker_item >= 0 {
+    if parent.m_item.length() > 0 || parent.last_marker_item >= 0 {
       clear_markers(parent)
     }
     return
   }
-  let chunks = parent.marker_chunks
-  let nc = chunks.length()
+  let m_idx = parent.m_index
+  let n = m_idx.length()
   if delta > 0 {
     if parent.last_marker_item >= 0 && parent.last_marker_idx >= index {
       parent.last_marker_idx = parent.last_marker_idx + delta
     }
-    if nc == 0 {
-      return
-    }
-    // Binary search for first chunk whose max_index >= index
-    let last_ch = chunks[nc - 1]
-    let last_max = last_ch.items[last_ch.items.length() - 1].index + last_ch.offset
-    if last_max < index {
+    if n == 0 || m_idx[n - 1] < index {
       return
     }
     let mut lo = 0
-    let mut hi = nc - 1
+    let mut hi = n - 1
     while lo < hi {
       let mid = lo + (hi - lo) / 2
-      let ch = chunks[mid]
-      let max_i = ch.items[ch.items.length() - 1].index + ch.offset
-      if max_i < index {
+      if m_idx[mid] < index {
         lo = mid + 1
       } else {
         hi = mid
       }
     }
-    let ch = chunks[lo]
-    let off = ch.offset
-    let items = ch.items
-    let mut i = 0
-    while i < items.length() {
-      let m = items[i]
-      if m.index + off >= index {
-        items[i] = SearchMarker::{
-          item_idx: m.item_idx,
-          index: m.index + delta,
-          timestamp: m.timestamp,
-        }
-      }
+    let mut i = lo
+    while i < n {
+      m_idx[i] = m_idx[i] + delta
       i = i + 1
-    }
-    let mut c = lo + 1
-    while c < nc {
-      chunks[c].offset = chunks[c].offset + delta
-      c = c + 1
     }
   } else if delta < 0 {
     let del_end = index - delta
@@ -759,167 +899,151 @@ fn update_markers(parent : YTypeNode, index : Int, delta : Int) -> Unit {
         parent.last_marker_item = -1
       }
     }
-    if nc == 0 {
-      return
-    }
-    let last_ch = chunks[nc - 1]
-    let last_max = last_ch.items[last_ch.items.length() - 1].index + last_ch.offset
-    if last_max < index {
+    if n == 0 || m_idx[n - 1] < index {
       return
     }
     let mut lo = 0
-    let mut hi = nc - 1
+    let mut hi = n - 1
     while lo < hi {
       let mid = lo + (hi - lo) / 2
-      let ch = chunks[mid]
-      let max_i = ch.items[ch.items.length() - 1].index + ch.offset
-      if max_i < index {
+      if m_idx[mid] < index {
         lo = mid + 1
       } else {
         hi = mid
       }
     }
-    let mut c = lo
-    while c < chunks.length() {
-      let ch = chunks[c]
-      let off = ch.offset
-      let items = ch.items
-      if items[0].index + off >= del_end {
-        let mut k = c
-        while k < chunks.length() {
-          chunks[k].offset = chunks[k].offset + delta
-          k = k + 1
-        }
-        return
+    let m_it = parent.m_item
+    let m_ts = parent.m_ts
+    let mut write_i = lo
+    let mut read_i = lo
+    while read_i < n {
+      let cur_i = m_idx[read_i]
+      if cur_i >= del_end {
+        m_it[write_i] = m_it[read_i]
+        m_idx[write_i] = cur_i + delta
+        m_ts[write_i] = m_ts[read_i]
+        write_i = write_i + 1
       }
-      let mut write_i = 0
-      let mut read_i = 0
-      let len = items.length()
-      while read_i < len {
-        let m = items[read_i]
-        let abs_i = m.index + off
-        if abs_i < index {
-          if write_i != read_i {
-            items[write_i] = m
-          }
-          write_i = write_i + 1
-        } else if abs_i >= del_end {
-          items[write_i] = SearchMarker::{
-            item_idx: m.item_idx,
-            index: m.index + delta,
-            timestamp: m.timestamp,
-          }
-          write_i = write_i + 1
-        }
-        read_i = read_i + 1
-      }
-      while items.length() > write_i {
-        let _ = items.pop()
-      }
-      if write_i == 0 {
-        array_remove_marker_chunk(chunks, c)
-      } else {
-        c = c + 1
-      }
+      read_i = read_i + 1
+    }
+    while m_it.length() > write_i {
+      let _ = m_it.pop()
+      let _ = m_idx.pop()
+      let _ = m_ts.pop()
     }
   }
 }
 
-///| Record or refresh a search marker `(item_idx, index)` in the 2-level sorted chunk index (up to 2,048 markers).
+///| Record or refresh a search marker `(item_idx, index)` with uniform spatial spacing + LRU eviction (up to 192 markers).
 fn record_marker(parent : YTypeNode, item_idx : Int, index : Int) -> Unit {
   if item_idx < 0 {
     return
   }
   if parent.markers.length() == 0 {
-    if parent.marker_chunks.length() > 0 {
-      parent.marker_chunks.clear()
+    if parent.m_item.length() > 0 {
+      parent.m_item.clear()
+      parent.m_index.clear()
+      parent.m_ts.clear()
     }
     parent.markers.push(SearchMarker::{ item_idx: item_idx, index: index, timestamp: 0 })
   }
   parent.last_marker_item = item_idx
   parent.last_marker_idx = index
-  let chunks = parent.marker_chunks
-  let nc = chunks.length()
-  if nc == 0 {
-    let arr : Array[SearchMarker] = Array::with_capacity(32)
-    arr.push(SearchMarker::{ item_idx: item_idx, index: index, timestamp: 0 })
-    chunks.push(MarkerChunk::{ offset: 0, items: arr })
+  if index <= 0 {
     return
   }
-  // Find largest chunk c whose min_index <= index (or 0 if index < chunks[0].min)
+  let m_it = parent.m_item
+  let m_idx = parent.m_index
+  let m_ts = parent.m_ts
+  parent.marker_clock = parent.marker_clock + 1
+  let ts = parent.marker_clock
+  let n = m_idx.length()
+  if n == 0 {
+    m_it.push(item_idx)
+    m_idx.push(index)
+    m_ts.push(ts)
+    return
+  }
+  // Binary search for first pos with m_idx[pos] >= index
   let mut lo = 0
-  let mut hi = nc - 1
-  if index >= chunks[0].items[0].index + chunks[0].offset {
-    while lo < hi {
-      let mid = lo + (hi - lo + 1) / 2
-      let ch = chunks[mid]
-      if ch.items[0].index + ch.offset <= index {
-        lo = mid
-      } else {
-        hi = mid - 1
-      }
-    }
-  }
-  let ch = chunks[lo]
-  let rel = index - ch.offset
-  let items = ch.items
-  let n = items.length()
-  // Binary search in ch.items for first pos with items[pos].index >= rel
-  let mut ilo = 0
-  let mut ihi = n
-  while ilo < ihi {
-    let imid = ilo + (ihi - ilo) / 2
-    if items[imid].index < rel {
-      ilo = imid + 1
+  let mut hi = n
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if m_idx[mid] < index {
+      lo = mid + 1
     } else {
-      ihi = imid
+      hi = mid
     }
   }
-  if ilo < n && items[ilo].index == rel {
-    items[ilo] = SearchMarker::{ item_idx: item_idx, index: rel, timestamp: 0 }
+  if lo < n && m_idx[lo] == index {
+    m_it[lo] = item_idx
+    m_ts[lo] = ts
     return
   }
-  if n < 32 {
-    array_insert_marker(
-      items,
-      ilo,
-      SearchMarker::{ item_idx: item_idx, index: rel, timestamp: 0 },
-    )
+  // Enforce uniform spatial spacing without dragging existing anchors away from their region
+  let mut min_gap = parent.length / 192
+  if min_gap < 16 {
+    min_gap = 16
+  }
+  if lo < n && m_idx[lo] - index < min_gap {
+    m_ts[lo] = ts
     return
   }
-  if nc < 64 {
-    let half = n / 2
-    let right_arr : Array[SearchMarker] = Array::with_capacity(32)
-    let mut k = half
-    while k < n {
-      right_arr.push(items[k])
+  if lo > 0 && index - m_idx[lo - 1] < min_gap {
+    m_ts[lo - 1] = ts
+    return
+  }
+  if n < 192 {
+    m_it.push(0)
+    m_idx.push(0)
+    m_ts.push(0)
+    let mut k = n
+    while k > lo {
+      m_it[k] = m_it[k - 1]
+      m_idx[k] = m_idx[k - 1]
+      m_ts[k] = m_ts[k - 1]
+      k = k - 1
+    }
+    m_it[lo] = item_idx
+    m_idx[lo] = index
+    m_ts[lo] = ts
+    return
+  }
+  // LRU eviction: evict the oldest marker and shift into sorted position `lo`
+  let mut old_pos = 0
+  let mut old_ts = m_ts[0]
+  let mut i = 1
+  while i < n {
+    let t = m_ts[i]
+    if t < old_ts {
+      old_ts = t
+      old_pos = i
+    }
+    i = i + 1
+  }
+  if old_pos < lo {
+    let dst = lo - 1
+    let mut k = old_pos
+    while k < dst {
+      m_it[k] = m_it[k + 1]
+      m_idx[k] = m_idx[k + 1]
+      m_ts[k] = m_ts[k + 1]
       k = k + 1
     }
-    while items.length() > half {
-      let _ = items.pop()
-    }
-    array_insert_marker_chunk(
-      chunks,
-      lo + 1,
-      MarkerChunk::{ offset: ch.offset, items: right_arr },
-    )
-    if ilo <= half {
-      array_insert_marker(
-        items,
-        ilo,
-        SearchMarker::{ item_idx: item_idx, index: rel, timestamp: 0 },
-      )
-    } else {
-      array_insert_marker(
-        right_arr,
-        ilo - half,
-        SearchMarker::{ item_idx: item_idx, index: rel, timestamp: 0 },
-      )
-    }
+    m_it[dst] = item_idx
+    m_idx[dst] = index
+    m_ts[dst] = ts
   } else {
-    // Spatial eviction: overwrite nearest slot in chunk while strictly preserving sorted order
-    let slot = if ilo < n { ilo } else { n - 1 }
-    items[slot] = SearchMarker::{ item_idx: item_idx, index: rel, timestamp: 0 }
+    let mut k = old_pos
+    while k > lo {
+      m_it[k] = m_it[k - 1]
+      m_idx[k] = m_idx[k - 1]
+      m_ts[k] = m_ts[k - 1]
+      k = k - 1
+    }
+    m_it[lo] = item_idx
+    m_idx[lo] = index
+    m_ts[lo] = ts
   }
 }
 
@@ -929,22 +1053,12 @@ val struct ItemPair {
   right : Int
 }
 
-///| Compare `Option[Id]` against a known item's `id` (or `None` if `right_idx < 0`) without allocating `Some(Id)`.
-fn opt_id_eq_item(opt : Option[Id], items : Array[Item], right_idx : Int) -> Bool {
-  if right_idx < 0 {
-    match opt {
-      None => true
-      Some(_) => false
-    }
-  } else {
-    match opt {
-      Some(id) => {
-        let rid = items[right_idx].id
-        id.client == rid.client && id.clock == rid.clock
-      }
-      None => false
-    }
-  }
+///| Unboxed delete position `(cur_item, offset_in_item, cur_start_index)` without eager splitting.
+val struct DeletePos {
+  cur : Int
+  off : Int
+  cur_idx : Int
+  left : Int
 }
 
 ///| Find `(left_idx, right_idx)` at container `index`, splitting an item if `index` falls inside it.
@@ -960,111 +1074,114 @@ fn Doc::find_insert_pos(self : Doc, type_id : Int, target : Int) -> ItemPair {
   if idx == 0 {
     return ItemPair::{ left: -1, right: parent.start }
   }
-  if parent.markers.length() == 0 {
-    if parent.marker_chunks.length() > 0 || parent.last_marker_item >= 0 {
-      clear_markers(parent)
-    }
-  } else if parent.last_marker_item >= 0 {
-    // O(1) fast path for sequential typing/appending via last_marker_item
-    let litem = self.store.items[parent.last_marker_item]
-    if !litem.deleted && litem.countable && parent.last_marker_idx + litem.len == idx {
-      return ItemPair::{ left: parent.last_marker_item, right: litem.right }
-    }
-  }
-  // Pick closest valid search marker via O(log M) binary search on 2-level marker_chunks
+  let i_lefts = self.store.item_left
+  let i_rights = self.store.item_right
+  let i_live = self.store.item_live_len
+
   let mut best_item = parent.start
   let mut best_idx = 0
   let mut best_dist = idx
-  let chunks = parent.marker_chunks
-  let nc = chunks.length()
-  if nc > 0 {
-    let mut clo = 0
-    let mut chi = nc - 1
-    if idx >= chunks[0].items[0].index + chunks[0].offset {
-      while clo < chi {
-        let cmid = clo + (chi - clo + 1) / 2
-        let ch = chunks[cmid]
-        if ch.items[0].index + ch.offset <= idx {
-          clo = cmid
-        } else {
-          chi = cmid - 1
+
+  if parent.markers.length() == 0 {
+    if parent.m_item.length() > 0 || parent.last_marker_item >= 0 {
+      clear_markers(parent)
+    }
+  } else {
+    let lm = parent.last_marker_item
+    if lm >= 0 {
+      let lm_ll = i_live[lm]
+      if lm_ll > 0 {
+        let lm_idx = parent.last_marker_idx
+        let lm_end = lm_idx + lm_ll
+        if idx == lm_end {
+          return ItemPair::{ left: lm, right: i_rights[lm] }
+        }
+        if idx > lm_idx && idx < lm_end {
+          let right_idx = self.split_item(lm, idx - lm_idx)
+          record_marker(parent, right_idx, idx)
+          return ItemPair::{ left: lm, right: right_idx }
+        }
+        if idx == lm_idx {
+          let prev = i_lefts[lm]
+          if prev >= 0 && i_live[prev] > 0 {
+            return ItemPair::{ left: prev, right: lm }
+          }
+        }
+        let d = if lm_idx > idx { lm_idx - idx } else { idx - lm_idx }
+        if d < best_dist {
+          best_dist = d
+          best_item = lm
+          best_idx = lm_idx
         }
       }
     }
-    let ch = chunks[clo]
-    let off = ch.offset
-    let items = ch.items
-    let n = items.length()
-    let rel = idx - off
-    let mut ilo = 0
-    let mut ihi = n
-    while ilo < ihi {
-      let imid = ilo + (ihi - ilo) / 2
-      if items[imid].index < rel {
-        ilo = imid + 1
-      } else {
-        ihi = imid
+    let m_idx = parent.m_index
+    let n = m_idx.length()
+    if n > 0 && best_dist > 32 {
+      let m_it = parent.m_item
+      let mut lo = 0
+      let mut hi = n
+      while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if m_idx[mid] < idx {
+          lo = mid + 1
+        } else {
+          hi = mid
+        }
       }
-    }
-    if ilo < n {
-      let m = items[ilo]
-      let mi = m.index + off
-      let d = if mi > idx { mi - idx } else { idx - mi }
-      if d < best_dist {
-        best_dist = d
-        best_item = m.item_idx
-        best_idx = mi
+      if lo < n {
+        let mi = m_idx[lo]
+        let d = mi - idx
+        if d < best_dist {
+          best_dist = d
+          best_item = m_it[lo]
+          best_idx = mi
+        }
       }
-    }
-    if ilo > 0 {
-      let m = items[ilo - 1]
-      let mi = m.index + off
-      let d = if mi > idx { mi - idx } else { idx - mi }
-      if d < best_dist {
-        best_dist = d
-        best_item = m.item_idx
-        best_idx = mi
-      }
-    }
-    if ilo == n && clo + 1 < nc {
-      let nch = chunks[clo + 1]
-      let m = nch.items[0]
-      let mi = m.index + nch.offset
-      let d = if mi > idx { mi - idx } else { idx - mi }
-      if d < best_dist {
-        best_dist = d
-        best_item = m.item_idx
-        best_idx = mi
+      if lo > 0 {
+        let mi = m_idx[lo - 1]
+        let d = idx - mi
+        if d < best_dist {
+          best_dist = d
+          best_item = m_it[lo - 1]
+          best_idx = mi
+        }
       }
     }
   }
 
   let mut cur = best_item
   let mut cur_idx = best_idx
+  let mut hops = 0
 
-  // Walk backwards if marker is at or ahead of target (so we land on the non-deleted item ending at idx)
+  // Walk backwards if marker is at or ahead of target (SoA arrays: zero Item RC ops)
   while cur >= 0 && cur_idx >= idx {
-    let prev = self.store.items[cur].left
+    let prev = i_lefts[cur]
     if prev < 0 {
       cur = parent.start
       cur_idx = 0
       break
     }
     cur = prev
-    let pitem = self.store.items[cur]
-    if !pitem.deleted && pitem.countable {
-      cur_idx = cur_idx - pitem.len
+    let ll = i_live[cur]
+    if ll > 0 {
+      cur_idx = cur_idx - ll
+      hops = hops + 1
+      if hops >= 128 {
+        record_marker(parent, cur, cur_idx)
+        hops = 0
+      }
     }
   }
 
-  // Walk forwards until reaching idx
-  let mut left = if cur >= 0 { self.store.items[cur].left } else { -1 }
+  // Walk forwards until reaching idx (SoA arrays: zero Item RC ops)
+  let mut left = if cur >= 0 { i_lefts[cur] } else { -1 }
+  hops = 0
   while cur >= 0 {
-    let item = self.store.items[cur]
-    if !item.deleted && item.countable {
-      let next_idx = cur_idx + item.len
+    let ll = i_live[cur]
+    if ll > 0 {
+      let next_idx = cur_idx + ll
       if next_idx > idx {
-        // Target falls inside this item! Split it if cur_idx < idx
         if cur_idx < idx {
           let diff = idx - cur_idx
           let right_idx = self.split_item(cur, diff)
@@ -1074,19 +1191,161 @@ fn Doc::find_insert_pos(self : Doc, type_id : Int, target : Int) -> ItemPair {
         record_marker(parent, cur, cur_idx)
         return ItemPair::{ left: left, right: cur }
       }
+      hops = hops + 1
+      if hops >= 128 {
+        record_marker(parent, cur, cur_idx)
+        hops = 0
+      }
       cur_idx = next_idx
       if cur_idx == idx {
-        record_marker(parent, cur, cur_idx - item.len)
-        return ItemPair::{ left: cur, right: item.right }
+        record_marker(parent, cur, cur_idx - ll)
+        return ItemPair::{ left: cur, right: i_rights[cur] }
       }
+    } else {
+      hops = hops + 1
     }
     left = cur
-    cur = item.right
+    cur = i_rights[cur]
   }
   ItemPair::{ left: left, right: -1 }
 }
 
-///| Fast path for plain-text `YText::insert` (avoids `Content::Str` and `Option[Id]` boxing on in-place merge).
+///| Locate `(cur, offset_in_cur, cur_start_idx, left_of_cur)` for deletion at `idx` without eagerly splitting or recording doomed markers.
+fn Doc::find_delete_pos(self : Doc, type_id : Int, idx : Int) -> DeletePos {
+  let parent = self.types[type_id]
+  let i_lefts = self.store.item_left
+  let i_rights = self.store.item_right
+  let i_live = self.store.item_live_len
+
+  if idx == 0 {
+    let mut cur = parent.start
+    let mut left = -1
+    while cur >= 0 && i_live[cur] == 0 {
+      left = cur
+      cur = i_rights[cur]
+    }
+    return DeletePos::{ cur: cur, off: 0, cur_idx: 0, left: left }
+  }
+
+  let mut best_item = parent.start
+  let mut best_idx = 0
+  let mut best_dist = idx
+
+  if parent.markers.length() == 0 {
+    if parent.m_item.length() > 0 || parent.last_marker_item >= 0 {
+      clear_markers(parent)
+    }
+  } else {
+    let lm = parent.last_marker_item
+    if lm >= 0 {
+      let lm_ll = i_live[lm]
+      if lm_ll > 0 {
+        let lm_idx = parent.last_marker_idx
+        let lm_end = lm_idx + lm_ll
+        if idx >= lm_idx && idx < lm_end {
+          return DeletePos::{
+            cur: lm,
+            off: idx - lm_idx,
+            cur_idx: lm_idx,
+            left: i_lefts[lm],
+          }
+        }
+        let d = if lm_idx > idx { lm_idx - idx } else { idx - lm_idx }
+        if d < best_dist {
+          best_dist = d
+          best_item = lm
+          best_idx = lm_idx
+        }
+      }
+    }
+    let m_idx = parent.m_index
+    let n = m_idx.length()
+    if n > 0 && best_dist > 32 {
+      let m_it = parent.m_item
+      let mut lo = 0
+      let mut hi = n
+      while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if m_idx[mid] < idx {
+          lo = mid + 1
+        } else {
+          hi = mid
+        }
+      }
+      if lo < n {
+        let mi = m_idx[lo]
+        let d = mi - idx
+        if d < best_dist {
+          best_dist = d
+          best_item = m_it[lo]
+          best_idx = mi
+        }
+      }
+      if lo > 0 {
+        let mi = m_idx[lo - 1]
+        let d = idx - mi
+        if d < best_dist {
+          best_dist = d
+          best_item = m_it[lo - 1]
+          best_idx = mi
+        }
+      }
+    }
+  }
+
+  let mut cur = best_item
+  let mut cur_idx = best_idx
+  let mut hops = 0
+
+  while cur >= 0 && cur_idx > idx {
+    let prev = i_lefts[cur]
+    if prev < 0 {
+      cur = parent.start
+      cur_idx = 0
+      break
+    }
+    cur = prev
+    let ll = i_live[cur]
+    if ll > 0 {
+      cur_idx = cur_idx - ll
+      hops = hops + 1
+      if hops >= 128 {
+        record_marker(parent, cur, cur_idx)
+        hops = 0
+      }
+    }
+  }
+
+  let mut left = if cur >= 0 { i_lefts[cur] } else { -1 }
+  hops = 0
+  while cur >= 0 {
+    let ll = i_live[cur]
+    if ll > 0 {
+      let next_idx = cur_idx + ll
+      if next_idx > idx {
+        return DeletePos::{
+          cur: cur,
+          off: idx - cur_idx,
+          cur_idx: cur_idx,
+          left: left,
+        }
+      }
+      hops = hops + 1
+      if hops >= 128 {
+        record_marker(parent, cur, cur_idx)
+        hops = 0
+      }
+      cur_idx = next_idx
+    } else {
+      hops = hops + 1
+    }
+    left = cur
+    cur = i_rights[cur]
+  }
+  DeletePos::{ cur: -1, off: 0, cur_idx: cur_idx, left: left }
+}
+
+///| Fast path for plain-text `YText::insert` (in-place merge <= 64B, automatic chunking > 128B, zero Option[Id] boxing).
 fn Doc::insert_text_at(self : Doc, type_id : Int, index : Int, chunk : String) -> Int {
   let len = utf16_len(chunk)
   if len <= 0 {
@@ -1095,19 +1354,20 @@ fn Doc::insert_text_at(self : Doc, type_id : Int, index : Int, chunk : String) -
   let pos = self.find_insert_pos(type_id, index)
   let mut left_idx = pos.left
   let mut right_idx = pos.right
+  let i_rights = self.store.item_right
   while right_idx >= 0 && self.store.items[right_idx].deleted {
     left_idx = right_idx
-    right_idx = self.store.items[right_idx].right
+    right_idx = i_rights[right_idx]
   }
   // Fast in-place merge for sequential typing (O(n) total, zero dead arena items, zero Content/Option[Id] boxing)
-  if left_idx >= 0 {
+  if left_idx >= 0 && chunk.length() <= 64 {
     let left = self.store.items[left_idx]
     if !left.is_gc &&
     !left.deleted &&
     left.id.client == self.client_id &&
     left.right == right_idx &&
     left.parent_id == type_id &&
-    opt_id_eq_item(left.right_origin, self.store.items, right_idx) {
+    item_right_origin_eq_idx(left, self.store.items, right_idx) {
       match (left.parent_sub, left.content) {
         (None, Content::Str(ls)) => {
           if ls.length() + chunk.length() <= 64 &&
@@ -1117,6 +1377,8 @@ fn Doc::insert_text_at(self : Doc, type_id : Int, index : Int, chunk : String) -
             left.content = Content::Str(ls + chunk)
             left.len = left.len + len
             left.len_u64 = left.len_u64 + int_to_u64(len)
+            self.store.item_live_len[left_idx] = left.len
+            self.store.item_len_u64[left_idx] = left.len_u64
             parent.length = old_len + len
             if index < old_len {
               update_markers(parent, index, len)
@@ -1128,29 +1390,139 @@ fn Doc::insert_text_at(self : Doc, type_id : Int, index : Int, chunk : String) -
       }
     }
   }
-  let origin = if left_idx >= 0 {
-    Some(self.store.items[left_idx].last_id())
-  } else {
-    None
+  // Chunk large plain-text inserts (> 128B) into <= 128B UTF-8-safe contiguous items so later splits/backspaces stay O(1)
+  // Skip chunking when parent container's carrier item is already deleted so the single-item path marks it deleted cleanly.
+  let parent0 = self.types[type_id]
+  let parent_deleted = parent0.item_idx >= 0 && self.store.items[parent0.item_idx].deleted
+  let cbytes = chunk.length()
+  if cbytes > 128 && !parent_deleted {
+    let parent = parent0
+    if index < parent.length {
+      update_markers(parent, index, len)
+    }
+    let has_rorig = right_idx >= 0
+    let rorig_c = if has_rorig { self.store.items[right_idx].id.client } else { 0UL }
+    let rorig_k = if has_rorig { self.store.items[right_idx].id.clock } else { 0UL }
+    let is_ascii = cbytes == len
+    let mut cur_left = left_idx
+    let mut cur_index = index
+    let mut bpos = 0
+    let mut last_idx = -1
+    let mut clock = self.store.get_clock(self.client_id)
+    let cs = self.store.get_or_create_client(self.client_id)
+    let i_lefts = self.store.item_left
+    while bpos < cbytes {
+      let mut bend = bpos + 128
+      if bend >= cbytes {
+        bend = cbytes
+      } else if !is_ascii {
+        while bend > bpos && (chunk.code_unit_at(bend) & 0xc0) == 0x80 {
+          bend = bend - 1
+        }
+        if bend == bpos {
+          bend = bpos + 1
+          while bend < cbytes && (chunk.code_unit_at(bend) & 0xc0) == 0x80 {
+            bend = bend + 1
+          }
+        }
+      }
+      let seg = chunk.slice(bpos, bend)
+      let seg_len = if is_ascii { bend - bpos } else { utf16_len(seg) }
+      let seg_u64 = int_to_u64(seg_len)
+      let has_orig = cur_left >= 0
+      let mut orig_c = 0UL
+      let mut orig_k = 0UL
+      if has_orig {
+        let li = self.store.items[cur_left]
+        orig_c = li.id.client
+        orig_k = if li.len_u64 <= 1UL {
+          li.id.clock
+        } else {
+          u64_sat_add(li.id.clock, li.len_u64 - 1UL)
+        }
+      }
+      let item = Item::{
+        id: Id::{ client: self.client_id, clock: clock },
+        len: seg_len,
+        len_u64: seg_u64,
+        left: cur_left,
+        right: right_idx,
+        has_origin: has_orig,
+        origin_client: orig_c,
+        origin_clock: orig_k,
+        has_right_origin: has_rorig,
+        right_origin_client: rorig_c,
+        right_origin_clock: rorig_k,
+        parent_id: type_id,
+        parent_key: None,
+        has_parent_item_id: false,
+        parent_item_client: 0UL,
+        parent_item_clock: 0UL,
+        parent_sub: None,
+        deleted: false,
+        countable: true,
+        is_gc: false,
+        content: Content::Str(seg),
+        raw_any_bytes: None,
+      }
+      let item_idx = self.store.push_item(item)
+      if cur_left >= 0 {
+        self.store.items[cur_left].right = item_idx
+        i_rights[cur_left] = item_idx
+      } else {
+        parent.start = item_idx
+      }
+      cs.add_item(self.store.item_clock, item_idx)
+      self.store.last_item_idx = item_idx
+      cur_left = item_idx
+      last_idx = item_idx
+      cur_index = cur_index + seg_len
+      clock = clock + seg_u64
+      bpos = bend
+    }
+    if right_idx >= 0 && last_idx >= 0 {
+      self.store.items[right_idx].left = last_idx
+      i_lefts[right_idx] = last_idx
+    }
+    parent.length = parent.length + len
+    if last_idx >= 0 {
+      record_marker(parent, last_idx, cur_index - self.store.items[last_idx].len)
+    }
+    return last_idx
   }
-  let right_origin = if right_idx >= 0 {
-    Some(self.store.items[right_idx].id)
-  } else {
-    None
+  let has_orig = left_idx >= 0
+  let mut orig_c = 0UL
+  let mut orig_k = 0UL
+  if has_orig {
+    let li = self.store.items[left_idx]
+    orig_c = li.id.client
+    orig_k = if li.len_u64 <= 1UL {
+      li.id.clock
+    } else {
+      u64_sat_add(li.id.clock, li.len_u64 - 1UL)
+    }
   }
+  let has_rorig = right_idx >= 0
+  let rorig_c = if has_rorig { self.store.items[right_idx].id.client } else { 0UL }
+  let rorig_k = if has_rorig { self.store.items[right_idx].id.clock } else { 0UL }
   let clock = self.store.get_clock(self.client_id)
-  let item_idx = self.store.items.length()
   let item = Item::{
     id: Id::{ client: self.client_id, clock: clock },
     len: len,
     len_u64: int_to_u64(len),
     left: left_idx,
     right: right_idx,
-    origin: origin,
-    right_origin: right_origin,
+    has_origin: has_orig,
+    origin_client: orig_c,
+    origin_clock: orig_k,
+    has_right_origin: has_rorig,
+    right_origin_client: rorig_c,
+    right_origin_clock: rorig_k,
     parent_id: type_id,
     parent_key: None,
-    parent_item_id: None,
+    has_parent_item_id: false,
+    parent_item_client: 0UL,
+    parent_item_clock: 0UL,
     parent_sub: None,
     deleted: false,
     countable: true,
@@ -1158,14 +1530,29 @@ fn Doc::insert_text_at(self : Doc, type_id : Int, index : Int, chunk : String) -
     content: Content::Str(chunk),
     raw_any_bytes: None,
   }
-  self.store.items.push(item)
+  let item_idx = self.store.push_item(item)
   let parent = self.types[type_id]
   if index < parent.length {
     update_markers(parent, index, len)
   }
-  self.integrate_item(item_idx, true)
-  record_marker(parent, item_idx, index)
-  let _ = self.try_merge_with_left(item_idx)
+  // Local plain-text insert has exact adjacent (left_idx, right_idx) with no YATA conflict
+  if left_idx >= 0 {
+    self.store.items[left_idx].right = item_idx
+    self.store.item_right[left_idx] = item_idx
+  } else {
+    parent.start = item_idx
+  }
+  if right_idx >= 0 {
+    self.store.items[right_idx].left = item_idx
+    self.store.item_left[right_idx] = item_idx
+  }
+  parent.length = parent.length + len
+  self.store.add_item_to_client(item_idx)
+  if parent.item_idx >= 0 && self.store.items[parent.item_idx].deleted {
+    self.delete_item(item_idx)
+  } else {
+    record_marker(parent, item_idx, index)
+  }
   item_idx
 }
 
@@ -1186,9 +1573,10 @@ fn Doc::insert_content_at(
   let mut left_idx = pos.left
   let mut right_idx = pos.right
   if skip_deleted {
+    let i_rights = self.store.item_right
     while right_idx >= 0 && self.store.items[right_idx].deleted {
       left_idx = right_idx
-      right_idx = self.store.items[right_idx].right
+      right_idx = i_rights[right_idx]
     }
   }
   // Fast in-place merge for sequential Content::Str typing (O(n) total, zero dead arena items)
@@ -1201,7 +1589,7 @@ fn Doc::insert_content_at(
         left.id.client == self.client_id &&
         left.right == right_idx &&
         left.parent_id == type_id &&
-        opt_id_eq_item(left.right_origin, self.store.items, right_idx) {
+        item_right_origin_eq_idx(left, self.store.items, right_idx) {
           match (left.parent_sub, left.content) {
             (None, Content::Str(ls)) => {
               if ls.length() + rs.length() <= 64 &&
@@ -1211,6 +1599,8 @@ fn Doc::insert_content_at(
                 left.content = Content::Str(ls + rs)
                 left.len = left.len + len
                 left.len_u64 = left.len_u64 + int_to_u64(len)
+                self.store.item_live_len[left_idx] = left.len
+                self.store.item_len_u64[left_idx] = left.len_u64
                 parent.length = old_len + len
                 if index < old_len {
                   update_markers(parent, index, len)
@@ -1225,18 +1615,22 @@ fn Doc::insert_content_at(
       _ => ()
     }
   }
-  let origin = if left_idx >= 0 {
-    Some(self.store.items[left_idx].last_id())
-  } else {
-    None
+  let has_orig = left_idx >= 0
+  let mut orig_c = 0UL
+  let mut orig_k = 0UL
+  if has_orig {
+    let li = self.store.items[left_idx]
+    orig_c = li.id.client
+    orig_k = if li.len_u64 <= 1UL {
+      li.id.clock
+    } else {
+      u64_sat_add(li.id.clock, li.len_u64 - 1UL)
+    }
   }
-  let right_origin = if right_idx >= 0 {
-    Some(self.store.items[right_idx].id)
-  } else {
-    None
-  }
+  let has_rorig = right_idx >= 0
+  let rorig_c = if has_rorig { self.store.items[right_idx].id.client } else { 0UL }
+  let rorig_k = if has_rorig { self.store.items[right_idx].id.clock } else { 0UL }
   let clock = self.store.get_clock(self.client_id)
-  let item_idx = self.store.items.length()
   let countable = content_is_countable(content)
   let item = Item::{
     id: Id::{ client: self.client_id, clock: clock },
@@ -1244,11 +1638,17 @@ fn Doc::insert_content_at(
     len_u64: int_to_u64(len),
     left: left_idx,
     right: right_idx,
-    origin: origin,
-    right_origin: right_origin,
+    has_origin: has_orig,
+    origin_client: orig_c,
+    origin_clock: orig_k,
+    has_right_origin: has_rorig,
+    right_origin_client: rorig_c,
+    right_origin_clock: rorig_k,
     parent_id: type_id,
     parent_key: None,
-    parent_item_id: None,
+    has_parent_item_id: false,
+    parent_item_client: 0UL,
+    parent_item_clock: 0UL,
     parent_sub: None,
     deleted: false,
     countable: countable,
@@ -1256,7 +1656,7 @@ fn Doc::insert_content_at(
     content: content,
     raw_any_bytes: None,
   }
-  self.store.items.push(item)
+  let item_idx = self.store.push_item(item)
   let parent = self.types[type_id]
   if countable && index < parent.length {
     update_markers(parent, index, len)
@@ -1289,10 +1689,10 @@ fn Doc::try_merge_deleted_pair(self : Doc, left_idx : Int, right_idx : Int) -> B
   if left.right != right_idx || left.parent_id != right.parent_id {
     return false
   }
-  if !opt_id_eq(right.origin, Some(left.last_id())) {
+  if !item_origin_eq_last_id(right, left) {
     return false
   }
-  if !opt_id_eq(left.right_origin, right.right_origin) {
+  if !item_same_right_origin(left, right) {
     return false
   }
   match (left.parent_sub, right.parent_sub) {
@@ -1302,13 +1702,22 @@ fn Doc::try_merge_deleted_pair(self : Doc, left_idx : Int, right_idx : Int) -> B
   match (left.content, right.content) {
     (Content::Deleted(ln), Content::Deleted(rn)) => {
       let cs = self.store.get_or_create_client(left.id.client)
-      cs.remove_clock(self.store.items, right.id.clock, right_idx)
+      cs.remove_clock(
+        self.store.item_clock,
+        self.store.item_len_u64,
+        right.id.clock,
+        right_idx,
+      )
       left.content = Content::Deleted(ln + rn)
       left.len = left.len + right.len
       left.len_u64 = left.len_u64 + right.len_u64
-      left.right = right.right
-      if left.right >= 0 {
-        self.store.items[left.right].left = left_idx
+      self.store.item_len_u64[left_idx] = left.len_u64
+      let nr = right.right
+      left.right = nr
+      self.store.item_right[left_idx] = nr
+      if nr >= 0 {
+        self.store.items[nr].left = left_idx
+        self.store.item_left[nr] = left_idx
       }
       if self.store.last_item_idx == right_idx {
         self.store.last_item_idx = left_idx
@@ -1338,51 +1747,234 @@ fn Doc::delete_range_at(
   } else {
     del_len
   }
-  let pos = self.find_insert_pos(type_id, index)
-  let start_left = pos.left
-  let start_right = pos.right
+  let dp = self.find_delete_pos(type_id, index)
+  if dp.cur < 0 {
+    return
+  }
+  // Fast in-place tail-trim into adjacent right tombstone, or direct 3-part interior delete without allocating doomed middle String
+  if dp.off > 0 {
+    let cur_item = self.store.items[dp.cur]
+    if !cur_item.is_gc {
+      if dp.off + actual_len < cur_item.len {
+        match (cur_item.parent_sub, cur_item.content) {
+          (None, Content::Str(s)) => {
+            let orig_len = cur_item.len
+            let left_len = dp.off
+            let right_len = orig_len - left_len - actual_len
+            let left_u64 = int_to_u64(left_len)
+            let del_u64 = int_to_u64(actual_len)
+            let right_u64 = int_to_u64(right_len)
+            let mut left_s = ""
+            let mut right_s = ""
+            if s.length() == orig_len {
+              left_s = s.slice(0, left_len)
+              right_s = s.slice(left_len + actual_len, orig_len)
+            } else {
+              let sp1 = utf16_split_with_len(s, orig_len, left_len)
+              left_s = sp1.left
+              right_s = utf16_tail_with_len(sp1.right, orig_len - left_len, actual_len)
+            }
+            let mid_clock = cur_item.id.clock + left_u64
+            let right_clock = mid_clock + del_u64
+            let old_right = cur_item.right
+            let mid_item = Item::{
+              id: Id::{ client: cur_item.id.client, clock: mid_clock },
+              len: actual_len,
+              len_u64: del_u64,
+              left: dp.cur,
+              right: -1,
+              has_origin: true,
+              origin_client: cur_item.id.client,
+              origin_clock: mid_clock - 1UL,
+              has_right_origin: cur_item.has_right_origin,
+              right_origin_client: cur_item.right_origin_client,
+              right_origin_clock: cur_item.right_origin_clock,
+              parent_id: cur_item.parent_id,
+              parent_key: cur_item.parent_key,
+              has_parent_item_id: cur_item.has_parent_item_id,
+              parent_item_client: cur_item.parent_item_client,
+              parent_item_clock: cur_item.parent_item_clock,
+              parent_sub: None,
+              deleted: true,
+              countable: true,
+              is_gc: false,
+              content: Content::Deleted(del_u64),
+              raw_any_bytes: None,
+            }
+            let mid_idx = self.store.push_item(mid_item)
+            let right_item = Item::{
+              id: Id::{ client: cur_item.id.client, clock: right_clock },
+              len: right_len,
+              len_u64: right_u64,
+              left: mid_idx,
+              right: old_right,
+              has_origin: true,
+              origin_client: cur_item.id.client,
+              origin_clock: right_clock - 1UL,
+              has_right_origin: cur_item.has_right_origin,
+              right_origin_client: cur_item.right_origin_client,
+              right_origin_clock: cur_item.right_origin_clock,
+              parent_id: cur_item.parent_id,
+              parent_key: cur_item.parent_key,
+              has_parent_item_id: cur_item.has_parent_item_id,
+              parent_item_client: cur_item.parent_item_client,
+              parent_item_clock: cur_item.parent_item_clock,
+              parent_sub: None,
+              deleted: false,
+              countable: true,
+              is_gc: false,
+              content: Content::Str(right_s),
+              raw_any_bytes: None,
+            }
+            let right_idx = self.store.push_item(right_item)
+            cur_item.content = Content::Str(left_s)
+            cur_item.len = left_len
+            cur_item.len_u64 = left_u64
+            cur_item.right = mid_idx
+            self.store.item_right[dp.cur] = mid_idx
+            self.store.item_live_len[dp.cur] = left_len
+            self.store.item_len_u64[dp.cur] = left_u64
+            self.store.items[mid_idx].right = right_idx
+            self.store.item_right[mid_idx] = right_idx
+            if old_right >= 0 {
+              self.store.items[old_right].left = right_idx
+              self.store.item_left[old_right] = right_idx
+            }
+            let cs = self.store.get_or_create_client(cur_item.id.client)
+            cs.insert_two_after_clock(
+              self.store.item_clock,
+              self.store.item_len_u64,
+              cur_item.id.clock,
+              mid_idx,
+              right_idx,
+            )
+            parent.length = parent.length - actual_len
+            self.store.delete_set.add(cur_item.id.client, mid_clock, del_u64)
+            update_markers(parent, index, 0 - actual_len)
+            record_marker(parent, dp.cur, dp.cur_idx)
+            return
+          }
+          _ => ()
+        }
+      } else if dp.off + actual_len == cur_item.len {
+        let r_idx = self.store.item_right[dp.cur]
+        if r_idx >= 0 {
+          let r_item = self.store.items[r_idx]
+          if r_item.deleted &&
+          !r_item.is_gc &&
+          r_item.id.client == cur_item.id.client &&
+          r_item.id.clock == cur_item.id.clock + cur_item.len_u64 &&
+          r_item.parent_id == cur_item.parent_id &&
+          item_origin_eq_last_id(r_item, cur_item) &&
+          item_same_right_origin(cur_item, r_item) {
+            match (cur_item.parent_sub, r_item.parent_sub, cur_item.content, r_item.content) {
+              (None, None, Content::Str(s), Content::Deleted(rn)) => {
+                let sp = utf16_split_with_len(s, cur_item.len, dp.off)
+                let keep_len = dp.off
+                let keep_u64 = int_to_u64(keep_len)
+                let del_u64 = int_to_u64(actual_len)
+                let old_r_clock = r_item.id.clock
+                let new_r_clock = old_r_clock - del_u64
+                let cs = self.store.get_or_create_client(cur_item.id.client)
+                cs.update_clock_if_head(old_r_clock, new_r_clock, r_idx)
+                cur_item.content = Content::Str(sp.left)
+                cur_item.len = keep_len
+                cur_item.len_u64 = keep_u64
+                self.store.item_live_len[dp.cur] = keep_len
+                self.store.item_len_u64[dp.cur] = keep_u64
+                let new_r_len = r_item.len + actual_len
+                let new_r_len_u64 = r_item.len_u64 + del_u64
+                self.store.items[r_idx] = Item::{
+                  id: Id::{ client: r_item.id.client, clock: new_r_clock },
+                  len: new_r_len,
+                  len_u64: new_r_len_u64,
+                  left: r_item.left,
+                  right: r_item.right,
+                  has_origin: r_item.has_origin,
+                  origin_client: r_item.origin_client,
+                  origin_clock: new_r_clock - 1UL,
+                  has_right_origin: r_item.has_right_origin,
+                  right_origin_client: r_item.right_origin_client,
+                  right_origin_clock: r_item.right_origin_clock,
+                  parent_id: r_item.parent_id,
+                  parent_key: r_item.parent_key,
+                  has_parent_item_id: r_item.has_parent_item_id,
+                  parent_item_client: r_item.parent_item_client,
+                  parent_item_clock: r_item.parent_item_clock,
+                  parent_sub: r_item.parent_sub,
+                  deleted: true,
+                  countable: r_item.countable,
+                  is_gc: false,
+                  content: Content::Deleted(rn + del_u64),
+                  raw_any_bytes: None,
+                }
+                self.store.item_clock[r_idx] = new_r_clock
+                self.store.item_len_u64[r_idx] = new_r_len_u64
+                parent.length = parent.length - actual_len
+                self.store.delete_set.add(cur_item.id.client, new_r_clock, del_u64)
+                update_markers(parent, index, 0 - actual_len)
+                if parent.markers.length() == 0 {
+                  record_marker(parent, dp.cur, dp.cur_idx)
+                } else {
+                  parent.last_marker_item = dp.cur
+                  parent.last_marker_idx = dp.cur_idx
+                }
+                return
+              }
+              _ => ()
+            }
+          }
+        }
+      }
+    }
+  }
+  let mut start_left = dp.left
+  let mut cur = dp.cur
+  if dp.off > 0 {
+    start_left = dp.cur
+    cur = self.split_item(dp.cur, dp.off)
+  }
   update_markers(parent, index, 0 - actual_len)
   let mut rem = actual_len
-  let mut cur = start_right
+  let i_lefts = self.store.item_left
+  let i_rights = self.store.item_right
+  let i_live = self.store.item_live_len
   while cur >= 0 && rem > 0 {
-    let item = self.store.items[cur]
-    if !item.deleted && item.countable {
-      if item.len > rem {
+    let ll = i_live[cur]
+    if ll > 0 {
+      if ll > rem {
         let _ = self.split_item(cur, rem)
       }
-      let step = self.store.items[cur].len
+      let step = i_live[cur]
       self.delete_item(cur)
       rem = rem - step
       // Coalesce adjacent contiguous tombstones (both left and right) to prevent tombstone fragmentation
       let mut surviving = cur
-      let right_cand = self.store.items[surviving].right
+      let right_cand = i_rights[surviving]
       if right_cand >= 0 && self.store.items[right_cand].deleted {
         let _ = self.try_merge_deleted_pair(surviving, right_cand)
       }
-      let left_cand = self.store.items[surviving].left
+      let left_cand = i_lefts[surviving]
       if left_cand >= 0 && self.store.items[left_cand].deleted {
         if self.try_merge_deleted_pair(left_cand, surviving) {
           surviving = left_cand
         }
       }
-      cur = self.store.items[surviving].right
+      cur = i_rights[surviving]
     } else {
-      cur = item.right
+      cur = i_rights[cur]
     }
   }
   // Preserve a surviving marker adjacent to the deletion point so backward/sequential deletes stay O(1)
   if start_left >= 0 {
-    let litem = self.store.items[start_left]
-    if !litem.deleted && litem.countable && index >= litem.len {
-      record_marker(parent, start_left, index - litem.len)
+    let lll = i_live[start_left]
+    if lll > 0 && index >= lll {
+      record_marker(parent, start_left, index - lll)
       return
     }
   }
-  if cur >= 0 {
-    let citem = self.store.items[cur]
-    if !citem.deleted && citem.countable {
-      record_marker(parent, cur, index)
-    }
+  if cur >= 0 && i_live[cur] > 0 {
+    record_marker(parent, cur, index)
   }
 }
 
@@ -1479,18 +2071,22 @@ fn Doc::insert_item_between(
   if len <= 0 {
     return -1
   }
-  let origin = if left_idx >= 0 {
-    Some(self.store.items[left_idx].last_id())
-  } else {
-    None
+  let has_orig = left_idx >= 0
+  let mut orig_c = 0UL
+  let mut orig_k = 0UL
+  if has_orig {
+    let li = self.store.items[left_idx]
+    orig_c = li.id.client
+    orig_k = if li.len_u64 <= 1UL {
+      li.id.clock
+    } else {
+      u64_sat_add(li.id.clock, li.len_u64 - 1UL)
+    }
   }
-  let right_origin = if right_idx >= 0 {
-    Some(self.store.items[right_idx].id)
-  } else {
-    None
-  }
+  let has_rorig = right_idx >= 0
+  let rorig_c = if has_rorig { self.store.items[right_idx].id.client } else { 0UL }
+  let rorig_k = if has_rorig { self.store.items[right_idx].id.clock } else { 0UL }
   let clock = self.store.get_clock(self.client_id)
-  let item_idx = self.store.items.length()
   let countable = content_is_countable(content)
   let item = Item::{
     id: Id::new(self.client_id, clock),
@@ -1498,11 +2094,17 @@ fn Doc::insert_item_between(
     len_u64: int_to_u64(len),
     left: left_idx,
     right: right_idx,
-    origin: origin,
-    right_origin: right_origin,
+    has_origin: has_orig,
+    origin_client: orig_c,
+    origin_clock: orig_k,
+    has_right_origin: has_rorig,
+    right_origin_client: rorig_c,
+    right_origin_clock: rorig_k,
     parent_id: type_id,
     parent_key: None,
-    parent_item_id: None,
+    has_parent_item_id: false,
+    parent_item_client: 0UL,
+    parent_item_clock: 0UL,
     parent_sub: None,
     deleted: false,
     countable: countable,
@@ -1510,7 +2112,7 @@ fn Doc::insert_item_between(
     content: content,
     raw_any_bytes: None,
   }
-  self.store.items.push(item)
+  let item_idx = self.store.push_item(item)
   self.integrate_item(item_idx, true)
   item_idx
 }
@@ -1811,17 +2413,20 @@ pub fn YText::len(self : YText, doc : Doc) -> Int {
 
 ///| Materialize this `YText` as a `String`.
 pub fn YText::to_string(self : YText, doc : Doc) -> String {
-  let sb = StringBuilder::new()
-  let mut cur = doc.types[self.type_id].start
+  let parent = doc.types[self.type_id]
+  let cap = if parent.length > 32 { parent.length } else { 32 }
+  let sb = StringBuilder::with_capacity(cap)
+  let i_live = doc.store.item_live_len
+  let i_rights = doc.store.item_right
+  let mut cur = parent.start
   while cur >= 0 {
-    let item = doc.store.items[cur]
-    if !item.deleted {
-      match item.content {
+    if i_live[cur] > 0 {
+      match doc.store.items[cur].content {
         Content::Str(s) => sb.write_string(s)
         _ => ()
       }
     }
-    cur = item.right
+    cur = i_rights[cur]
   }
   sb.to_string()
 }
@@ -1854,10 +2459,12 @@ pub fn YArray::insert_range(
   let _ = doc.insert_content_at(self.type_id, index, Content::AnyList(copy), false)
 }
 
-///| Append a single `Any` element to the end of this `YArray`.
+///| Append a single `Any` element to the physical end of this `YArray` (skipping trailing tombstones, matching Yjs `typeListPushGenerics`).
 pub fn YArray::push(self : YArray, doc : Doc, value : Any) -> Unit {
   let end_idx = doc.types[self.type_id].length
-  self.insert(doc, end_idx, value)
+  let arr : Array[Any] = Array::new()
+  arr.push(value)
+  let _ = doc.insert_content_at(self.type_id, end_idx, Content::AnyList(arr), true)
 }
 
 ///| Insert a new nested `YText` at `index` and return its handle.
@@ -1891,17 +2498,19 @@ fn find_array_elem(doc : Doc, type_id : Int, index : Int) -> ItemPair {
   if index < 0 || index >= doc.types[type_id].length {
     return ItemPair::{ left: -1, right: 0 }
   }
+  let i_live = doc.store.item_live_len
+  let i_rights = doc.store.item_right
   let mut cur = doc.types[type_id].start
   let mut pos = 0
   while cur >= 0 {
-    let item = doc.store.items[cur]
-    if !item.deleted && item.countable {
-      if pos + item.len > index {
+    let ll = i_live[cur]
+    if ll > 0 {
+      if pos + ll > index {
         return ItemPair::{ left: cur, right: index - pos }
       }
-      pos = pos + item.len
+      pos = pos + ll
     }
-    cur = item.right
+    cur = i_rights[cur]
   }
   ItemPair::{ left: -1, right: 0 }
 }
@@ -1998,24 +2607,36 @@ fn Doc::map_set_content(
     Some(idx) => idx
     None => -1
   }
-  let origin = if left_idx >= 0 {
-    Some(self.store.items[left_idx].last_id())
-  } else {
-    None
+  let has_orig = left_idx >= 0
+  let mut orig_c = 0UL
+  let mut orig_k = 0UL
+  if has_orig {
+    let li = self.store.items[left_idx]
+    orig_c = li.id.client
+    orig_k = if li.len_u64 <= 1UL {
+      li.id.clock
+    } else {
+      u64_sat_add(li.id.clock, li.len_u64 - 1UL)
+    }
   }
   let clock = self.store.get_clock(self.client_id)
-  let item_idx = self.store.items.length()
   let item = Item::{
     id: Id::new(self.client_id, clock),
     len: content_len(content),
     len_u64: content_len_u64(content),
     left: left_idx,
     right: -1,
-    origin: origin,
-    right_origin: None,
+    has_origin: has_orig,
+    origin_client: orig_c,
+    origin_clock: orig_k,
+    has_right_origin: false,
+    right_origin_client: 0UL,
+    right_origin_clock: 0UL,
     parent_id: type_id,
     parent_key: None,
-    parent_item_id: None,
+    has_parent_item_id: false,
+    parent_item_client: 0UL,
+    parent_item_clock: 0UL,
     parent_sub: Some(key),
     deleted: false,
     countable: true,
@@ -2023,7 +2644,7 @@ fn Doc::map_set_content(
     content: content,
     raw_any_bytes: None,
   }
-  self.store.items.push(item)
+  let item_idx = self.store.push_item(item)
   self.integrate_item(item_idx, true)
   item_idx
 }
@@ -2073,6 +2694,7 @@ pub fn YMap::get(self : YMap, doc : Doc, key : String) -> Option[Any] {
           }
         }
         Content::Binary(b) => Some(Any::Binary(b))
+        Content::Format(_, _) => Some(Any::Undefined)
         _ => None
       }
     }
