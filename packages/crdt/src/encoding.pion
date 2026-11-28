@@ -1151,6 +1151,144 @@ fn write_doc_item_single_sb(
   }
 }
 
+///| Encode all structs for one client starting at `(start_chunk, start_pos)` into `bsb` and append its wire block to `sb`.
+fn encode_client_blocks_sb(
+  sb : StringBuilder,
+  bsb : StringBuilder,
+  str_buf : StringBuilder,
+  doc : Doc,
+  c : UInt64,
+  target_clock : UInt64,
+  cs : ClientStore,
+  start_chunk : Int,
+  start_pos : Int,
+  items : Array[Item],
+  i_rights : Array[Int],
+  i_lens : Array[UInt64],
+) -> Unit {
+  let chunks = cs.chunks
+  let n_chunks = chunks.length()
+  let mut run_count = 0
+  let mut ci_c = start_chunk
+  let mut pi_c = start_pos
+  let mut is_first = true
+  while ci_c < n_chunks {
+    let chunk = chunks[ci_c]
+    let clen = chunk.length()
+    if pi_c >= clen {
+      ci_c = ci_c + 1
+      pi_c = 0
+      continue
+    }
+    let first_idx = chunk[pi_c]
+    let first_item = items[first_idx]
+    let off = if is_first {
+      is_first = false
+      target_clock - first_item.id.clock
+    } else {
+      0UL
+    }
+    let mut prev_idx = first_idx
+    pi_c = pi_c + 1
+    if pi_c >= clen {
+      ci_c = ci_c + 1
+      pi_c = 0
+    }
+    while ci_c < n_chunks && pi_c >= chunks[ci_c].length() {
+      ci_c = ci_c + 1
+      pi_c = 0
+    }
+    let mut has_next = ci_c < n_chunks
+    let can_first_merge = if !has_next {
+      false
+    } else {
+      let nxt0 = chunks[ci_c][pi_c]
+      if !first_item.is_gc && i_rights[prev_idx] != nxt0 {
+        false
+      } else {
+        can_wire_merge(doc, prev_idx, nxt0)
+      }
+    }
+    if !can_first_merge {
+      write_doc_item_single_sb(bsb, doc, first_item, off)
+    } else if first_item.is_gc {
+      let mut total = first_item.len_u64 - off
+      while has_next {
+        let nxt_idx = chunks[ci_c][pi_c]
+        if !can_wire_merge(doc, prev_idx, nxt_idx) {
+          break
+        }
+        total = total + i_lens[nxt_idx]
+        prev_idx = nxt_idx
+        pi_c = pi_c + 1
+        while ci_c < n_chunks && pi_c >= chunks[ci_c].length() {
+          ci_c = ci_c + 1
+          pi_c = 0
+        }
+        has_next = ci_c < n_chunks
+      }
+      bsb.write_byte((0).to_byte())
+      put_var_uint_sb(bsb, total)
+    } else {
+      match first_item.content {
+        Content::Deleted(n) => {
+          let mut total = n - off
+          while has_next {
+            let nxt_idx = chunks[ci_c][pi_c]
+            if i_rights[prev_idx] != nxt_idx || !can_wire_merge(doc, prev_idx, nxt_idx) {
+              break
+            }
+            total = total + i_lens[nxt_idx]
+            prev_idx = nxt_idx
+            pi_c = pi_c + 1
+            while ci_c < n_chunks && pi_c >= chunks[ci_c].length() {
+              ci_c = ci_c + 1
+              pi_c = 0
+            }
+            has_next = ci_c < n_chunks
+          }
+          write_doc_item_header_sb(bsb, doc, first_item, off, 1)
+          put_var_uint_sb(bsb, total)
+        }
+        Content::Str(s0) => {
+          str_buf.reset()
+          if off == 0UL {
+            str_buf.write_string(s0)
+          } else {
+            str_buf.write_string(utf16_tail_with_len(s0, first_item.len, off.to_int()))
+          }
+          while has_next {
+            let nxt_idx = chunks[ci_c][pi_c]
+            if i_rights[prev_idx] != nxt_idx || !can_wire_merge(doc, prev_idx, nxt_idx) {
+              break
+            }
+            match items[nxt_idx].content {
+              Content::Str(sn) => str_buf.write_string(sn)
+              _ => ()
+            }
+            prev_idx = nxt_idx
+            pi_c = pi_c + 1
+            while ci_c < n_chunks && pi_c >= chunks[ci_c].length() {
+              ci_c = ci_c + 1
+              pi_c = 0
+            }
+            has_next = ci_c < n_chunks
+          }
+          write_doc_item_header_sb(bsb, doc, first_item, off, 4)
+          put_var_uint_sb(bsb, int_to_u64(str_buf.length()))
+          bsb.write_builder(str_buf)
+        }
+        _ => write_doc_item_single_sb(bsb, doc, first_item, off)
+      }
+    }
+    run_count = run_count + 1
+  }
+  put_var_uint_sb(sb, int_to_u64(run_count))
+  put_var_uint_sb(sb, c)
+  put_var_uint_sb(sb, target_clock)
+  sb.write_builder(bsb)
+}
+
 ///| Internal Yjs v1 update encoder taking an optional in-memory `StateVector`.
 fn encode_state_as_update_impl(
   doc : Doc,
@@ -1211,7 +1349,7 @@ fn encode_state_as_update_impl(
   let sb = StringBuilder::with_capacity(est_cap)
   put_var_uint_sb(sb, int_to_u64(n_write))
   if n_write > 0 {
-    let mut str_run : Option[Array[String]] = None
+    let mut shared_str_buf : Option[StringBuilder] = None
     let mut shared_body : Option[StringBuilder] = None
     i = 0
     while i < n_write {
@@ -1247,7 +1385,7 @@ fn encode_state_as_update_impl(
           i = i + 1
           continue
         }
-        // Single-pass encode into reusable `shared_body` (avoids a second full pass over items)
+        // Single-pass encode into reusable `shared_body` + `shared_str_buf`
         let bsb = match shared_body {
           Some(b) => {
             b.reset()
@@ -1264,145 +1402,28 @@ fn encode_state_as_update_impl(
             b
           }
         }
-        let mut run_count = 0
-        let mut ci_c = start_cp.chunk
-        let mut pi_c = start_cp.pos
-        let mut is_first = true
-        while ci_c < n_chunks {
-          let chunk = cs.chunks[ci_c]
-          let clen = chunk.length()
-          if pi_c >= clen {
-            ci_c = ci_c + 1
-            pi_c = 0
-            continue
+        let str_buf = match shared_str_buf {
+          Some(b) => b
+          None => {
+            let b = StringBuilder::with_capacity(64)
+            shared_str_buf = Some(b)
+            b
           }
-          let first_idx = chunk[pi_c]
-          let first_item = items[first_idx]
-          let off = if is_first {
-            is_first = false
-            target_clock - first_item.id.clock
-          } else {
-            0UL
-          }
-          let mut prev_idx = first_idx
-          pi_c = pi_c + 1
-          if pi_c >= clen {
-            ci_c = ci_c + 1
-            pi_c = 0
-          }
-          while ci_c < n_chunks && pi_c >= cs.chunks[ci_c].length() {
-            ci_c = ci_c + 1
-            pi_c = 0
-          }
-          let mut has_next = ci_c < n_chunks
-          let can_first_merge = if !has_next {
-            false
-          } else {
-            let nxt0 = cs.chunks[ci_c][pi_c]
-            if !first_item.is_gc && i_rights[prev_idx] != nxt0 {
-              false
-            } else {
-              can_wire_merge(doc, prev_idx, nxt0)
-            }
-          }
-          if !can_first_merge {
-            write_doc_item_single_sb(bsb, doc, first_item, off)
-          } else if first_item.is_gc {
-            let mut total = first_item.len_u64 - off
-            while has_next {
-              let nxt_idx = cs.chunks[ci_c][pi_c]
-              if !can_wire_merge(doc, prev_idx, nxt_idx) {
-                break
-              }
-              total = total + i_lens[nxt_idx]
-              prev_idx = nxt_idx
-              pi_c = pi_c + 1
-              while ci_c < n_chunks && pi_c >= cs.chunks[ci_c].length() {
-                ci_c = ci_c + 1
-                pi_c = 0
-              }
-              has_next = ci_c < n_chunks
-            }
-            bsb.write_byte((0).to_byte())
-            put_var_uint_sb(bsb, total)
-          } else {
-            match first_item.content {
-              Content::Deleted(n) => {
-                let mut total = n - off
-                while has_next {
-                  let nxt_idx = cs.chunks[ci_c][pi_c]
-                  if i_rights[prev_idx] != nxt_idx || !can_wire_merge(doc, prev_idx, nxt_idx) {
-                    break
-                  }
-                  total = total + i_lens[nxt_idx]
-                  prev_idx = nxt_idx
-                  pi_c = pi_c + 1
-                  while ci_c < n_chunks && pi_c >= cs.chunks[ci_c].length() {
-                    ci_c = ci_c + 1
-                    pi_c = 0
-                  }
-                  has_next = ci_c < n_chunks
-                }
-                write_doc_item_header_sb(bsb, doc, first_item, off, 1)
-                put_var_uint_sb(bsb, total)
-              }
-              Content::Str(s0) => {
-                let sr = match str_run {
-                  Some(a) => {
-                    a.clear()
-                    a
-                  }
-                  None => {
-                    let a : Array[String] = Array::new()
-                    str_run = Some(a)
-                    a
-                  }
-                }
-                let head_s = if off == 0UL {
-                  s0
-                } else {
-                  utf16_tail_with_len(s0, first_item.len, off.to_int())
-                }
-                sr.push(head_s)
-                let mut total_bytes = head_s.length()
-                while has_next {
-                  let nxt_idx = cs.chunks[ci_c][pi_c]
-                  if i_rights[prev_idx] != nxt_idx || !can_wire_merge(doc, prev_idx, nxt_idx) {
-                    break
-                  }
-                  match items[nxt_idx].content {
-                    Content::Str(sn) => {
-                      sr.push(sn)
-                      total_bytes = total_bytes + sn.length()
-                    }
-                    _ => ()
-                  }
-                  prev_idx = nxt_idx
-                  pi_c = pi_c + 1
-                  while ci_c < n_chunks && pi_c >= cs.chunks[ci_c].length() {
-                    ci_c = ci_c + 1
-                    pi_c = 0
-                  }
-                  has_next = ci_c < n_chunks
-                }
-                write_doc_item_header_sb(bsb, doc, first_item, off, 4)
-                put_var_uint_sb(bsb, int_to_u64(total_bytes))
-                let mut si = 0
-                let sn_len = sr.length()
-                while si < sn_len {
-                  bsb.write_string(sr[si])
-                  si = si + 1
-                }
-              }
-              _ => write_doc_item_single_sb(bsb, doc, first_item, off)
-            }
-          }
-          run_count = run_count + 1
         }
-        put_var_uint_sb(sb, int_to_u64(run_count))
-        put_var_uint_sb(sb, c)
-        put_var_uint_sb(sb, target_clock)
-        sb.write_builder(bsb)
+        encode_client_blocks_sb(
+          sb,
+          bsb,
+          str_buf,
+          doc,
+          c,
+          target_clock,
+          cs,
+          start_cp.chunk,
+          start_cp.pos,
+          items,
+          i_rights,
+          i_lens,
+        )
       }
       i = i + 1
     }
