@@ -1,0 +1,1300 @@
+///| Correctness, hardening, SearchMarker invariant, and live-edit parity tests
+///| ported from `y-octo` (`hardening.rs`, `search_marker.rs`, `live_edit.rs`,
+///| `list/mod.rs`, `text/mod.rs`, `store.rs`).
+
+struct YoctoLcg {
+  mut s : UInt64
+}
+
+fn YoctoLcg::next(self : YoctoLcg) -> Int {
+  self.s = (self.s * 6364136223846793005UL + 1442695040888963407UL) & 0xffffffffffffffffUL
+  ((self.s >> 33) & 0x7fffffffUL).to_int()
+}
+
+fn yocto_sync(src : Doc, dst : Doc) -> Unit {
+  let sv = dst.encode_state_vector()
+  let upd = match src.encode_state_as_update_from(sv) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "encode_state_as_update_from failed: " + e.message)
+      Bytes::new(0)
+    }
+  }
+  match dst.apply_update(upd) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "apply_update failed: " + e.message)
+  }
+}
+
+fn yocto_wire_update(
+  client_blocks : Array[(UInt64, UInt64, Array[Bytes])],
+) -> Bytes {
+  let enc = Encoder::new()
+  enc.write_var_uint(int_to_u64(client_blocks.length()))
+  let mut i = 0
+  while i < client_blocks.length() {
+    let (client, clock, structs) = client_blocks[i]
+    enc.write_var_uint(int_to_u64(structs.length()))
+    enc.write_var_uint(client)
+    enc.write_var_uint(clock)
+    let mut j = 0
+    while j < structs.length() {
+      enc.write_bytes(structs[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  enc.write_var_uint(0UL)
+  enc.to_bytes()
+}
+
+fn yocto_wire_in_root(tag : Int, root : String, sub : Option[String]) -> Encoder {
+  let enc = Encoder::new()
+  let has_sub = match sub {
+    Some(_) => 0x20
+    None => 0
+  }
+  enc.write_uint8(tag | has_sub)
+  enc.write_var_uint(1UL)
+  enc.write_var_string(root)
+  match sub {
+    Some(k) => enc.write_var_string(k)
+    None => ()
+  }
+  enc
+}
+
+fn yocto_wire_in_item(tag : Int, parent_c : UInt64, parent_k : UInt64, sub : String) -> Encoder {
+  let enc = Encoder::new()
+  enc.write_uint8(tag | 0x20)
+  enc.write_var_uint(0UL)
+  enc.write_var_uint(parent_c)
+  enc.write_var_uint(parent_k)
+  enc.write_var_string(sub)
+  enc
+}
+
+///| Verify every SearchMarker (m_item/m_index + last_marker_item/idx) and every SoA mirror array against a full linear scan from `parent.start`.
+fn assert_markers_and_soa_match_linear_scan(doc : Doc, type_id : Int) -> Unit {
+  let parent = doc.types[type_id]
+  let items = doc.store.items
+  let i_lefts = doc.store.item_left
+  let i_rights = doc.store.item_right
+  let i_live = doc.store.item_live_len
+  let i_clk = doc.store.item_clock
+  let i_len = doc.store.item_len_u64
+
+  // Verify SoA mirrors on all items
+  let total_items = items.length()
+  debug_assert(i_lefts.length() == total_items, "item_left length mismatch")
+  debug_assert(i_rights.length() == total_items, "item_right length mismatch")
+  debug_assert(i_live.length() == total_items, "item_live_len length mismatch")
+  debug_assert(i_clk.length() == total_items, "item_clock length mismatch")
+  debug_assert(i_len.length() == total_items, "item_len_u64 length mismatch")
+
+  // Build exact linear index map for this container
+  let linear_idx : Map[Int, Int] = Map::new()
+  let mut cur = parent.start
+  let mut prev = -1
+  let mut seen = 0
+  while cur >= 0 {
+    let it = items[cur]
+    debug_assert(it.left == prev, "doubly-linked list left pointer mismatch")
+    debug_assert(i_lefts[cur] == it.left, "SoA item_left mismatch")
+    debug_assert(i_rights[cur] == it.right, "SoA item_right mismatch")
+    debug_assert(i_clk[cur] == it.id.clock, "SoA item_clock mismatch")
+    debug_assert(i_len[cur] == it.len_u64, "SoA item_len_u64 mismatch")
+    let exp_ll = if !it.deleted && it.countable { it.len } else { 0 }
+    debug_assert(i_live[cur] == exp_ll, "SoA item_live_len mismatch")
+    if exp_ll > 0 {
+      linear_idx.set(cur, seen)
+      seen = seen + exp_ll
+    }
+    prev = cur
+    cur = it.right
+  }
+  debug_assert(seen == parent.length, "parent.length mismatch vs linear scan")
+
+  // Verify sorted parallel marker arrays
+  let m_it = parent.m_item
+  let m_idx = parent.m_index
+  let m_ts = parent.m_ts
+  let mn = m_it.length()
+  debug_assert(m_idx.length() == mn && m_ts.length() == mn, "marker parallel arrays length mismatch")
+  if parent.markers.length() > 0 {
+    let mut i = 0
+    while i < mn {
+      let midx = m_idx[i]
+      let mitem = m_it[i]
+      debug_assert(midx > 0, "marker index must be > 0")
+      if i > 0 {
+        debug_assert(m_idx[i - 1] < midx, "marker indices must be strictly increasing")
+      }
+      match linear_idx.get(mitem) {
+        Some(actual) => {
+          debug_assert(
+            actual == midx,
+            "marker index mismatch: marker=" + midx.to_string() + " linear=" + actual.to_string(),
+          )
+        }
+        None => debug_assert(false, "marker points to deleted or unreachable item")
+      }
+      i = i + 1
+    }
+    if parent.last_marker_item >= 0 {
+      match linear_idx.get(parent.last_marker_item) {
+        Some(actual) => {
+          debug_assert(
+            actual == parent.last_marker_idx,
+            "last_marker_idx mismatch: cached=" +
+            parent.last_marker_idx.to_string() +
+            " linear=" +
+            actual.to_string(),
+          )
+        }
+        None => debug_assert(false, "last_marker_item points to deleted or unreachable item")
+      }
+    }
+  }
+}
+
+// --- Hardening Tests (ported from y-octo/src/doc/tests/hardening.rs) ---
+
+test "yocto_hardening_overlapping_item_cannot_adopt_its_parent_carrier" {
+  let doc = Doc::new(1UL)
+  let c = yocto_wire_in_root(7, "root", Some("k"))
+  c.write_var_uint(1UL) // KIND_MAP
+  match doc.apply_update(yocto_wire_update([(5UL, 0UL, [c.to_bytes()])])) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "carrier apply failed: " + e.message)
+  }
+
+  // Same-client parent (5, 0) cannot precede overlapping item (5, 0..2): remainder kept as GC
+  let ov = yocto_wire_in_item(4, 5UL, 0UL, "k")
+  ov.write_var_string("ab")
+  match doc.apply_update(yocto_wire_update([(5UL, 0UL, [ov.to_bytes()])])) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "overlapping apply failed: " + e.message)
+  }
+  debug_assert(doc.store.get_clock(5UL) == 2UL, "clock should advance to 2")
+  let rem_idx = doc.store.get_item_idx(Id::new(5UL, 1UL))
+  debug_assert(rem_idx >= 0 && doc.store.items[rem_idx].is_gc, "remainder must be GC")
+  let root = doc.get_map("root")
+  match root.get_map(doc, "k") {
+    Some(m) => debug_assert(m.len(doc) == 0, "carrier map must remain alive and empty")
+    None => debug_assert(false, "carrier map must stay the map value")
+  }
+}
+
+test "yocto_hardening_overlapping_item_cannot_splice_containers" {
+  let doc = Doc::new(1UL)
+  let carrier = yocto_wire_in_root(7, "root", Some("m"))
+  carrier.write_var_uint(1UL) // KIND_MAP
+  let elem = yocto_wire_in_root(8, "list", None)
+  elem.write_var_uint(1UL)
+  elem.write_uint8(125)
+  elem.write_var_int(7L)
+  match doc.apply_update(yocto_wire_update([
+    (1UL, 0UL, [carrier.to_bytes()]),
+    (2UL, 0UL, [elem.to_bytes()]),
+  ])) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "setup failed: " + e.message)
+  }
+
+  let ov = yocto_wire_in_item(4, 1UL, 0UL, "k")
+  ov.write_var_string("xy")
+  match doc.apply_update(yocto_wire_update([(2UL, 0UL, [ov.to_bytes()])])) {
+    Ok(()) => debug_assert(false, "cross-container overlap must be rejected")
+    Err(e) => debug_assert(e.code == "INVALID_PARENT", "expected INVALID_PARENT, got " + e.code)
+  }
+  let list = doc.get_array("list")
+  debug_assert(list.len(doc) == 1, "list length must stay 1")
+  match list.get(doc, 0) {
+    Some(v) => debug_assert(any_eq(v, Any::Int(7L)), "list element 7 must survive")
+    None => debug_assert(false, "missing list element")
+  }
+  match doc.get_map("root").get_map(doc, "m") {
+    Some(m) => debug_assert(m.len(doc) == 0, "map carrier must survive empty")
+    None => debug_assert(false, "map carrier missing")
+  }
+}
+
+test "yocto_hardening_origins_must_share_a_container" {
+  let doc = Doc::new(1UL)
+  let a = yocto_wire_in_root(4, "a", None)
+  a.write_var_string("a")
+  let b = yocto_wire_in_root(4, "b", None)
+  b.write_var_string("b")
+  let a_bytes = a.to_bytes()
+  let b_bytes = b.to_bytes()
+  match doc.apply_update(yocto_wire_update([(1UL, 0UL, [a_bytes]), (2UL, 0UL, [b_bytes])])) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "setup failed: " + e.message)
+  }
+
+  let bridge = Encoder::new()
+  bridge.write_uint8(4 | 0x80 | 0x40)
+  bridge.write_var_uint(1UL)
+  bridge.write_var_uint(0UL)
+  bridge.write_var_uint(2UL)
+  bridge.write_var_uint(0UL)
+  bridge.write_var_string("c")
+  let bridge_bytes = bridge.to_bytes()
+
+  match doc.apply_update(yocto_wire_update([(3UL, 0UL, [bridge_bytes])])) {
+    Ok(()) => debug_assert(false, "cross-container origins must be rejected")
+    Err(e) => debug_assert(e.code == "INVALID_PARENT", "expected INVALID_PARENT")
+  }
+  debug_assert(doc.get_text("a").to_string(doc) == "a", "root a untouched")
+  debug_assert(doc.get_text("b").to_string(doc) == "b", "root b untouched")
+
+  // Same snapshot applied from scratch must also reject
+  let doc2 = Doc::new(9UL)
+  let snap = yocto_wire_update([
+    (1UL, 0UL, [a_bytes]),
+    (2UL, 0UL, [b_bytes]),
+    (3UL, 0UL, [bridge_bytes]),
+  ])
+  match doc2.apply_update(snap) {
+    Ok(()) => debug_assert(false, "snapshot with cross-container bridge must be rejected")
+    Err(e) => debug_assert(e.code == "INVALID_PARENT", "expected INVALID_PARENT on snapshot")
+  }
+}
+
+test "yocto_hardening_same_client_dependencies_precede_the_item" {
+  let first = yocto_wire_in_root(4, "t", None)
+  first.write_var_string("a")
+  let first_bytes = first.to_bytes()
+
+  // Self-anchored right origin (1, 1) on item (1, 1)
+  let self_anch = Encoder::new()
+  self_anch.write_uint8(4 | 0x40)
+  self_anch.write_var_uint(1UL)
+  self_anch.write_var_uint(1UL)
+  self_anch.write_var_string("b")
+  let doc = Doc::new(9UL)
+  match doc.apply_update(yocto_wire_update([(1UL, 0UL, [first_bytes, self_anch.to_bytes()])])) {
+    Ok(()) => debug_assert(false, "self-anchored right_origin must be rejected")
+    Err(e) => debug_assert(e.code == "INVALID_PARENT", "expected INVALID_PARENT")
+  }
+
+  // Own child referencing self (1, 1) -> turns into GC while first survives
+  let own_child = yocto_wire_in_item(4, 1UL, 1UL, "k")
+  own_child.write_var_string("b")
+  let doc2 = Doc::new(9UL)
+  match doc2.apply_update(yocto_wire_update([(1UL, 0UL, [first_bytes, own_child.to_bytes()])])) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "own_child apply failed: " + e.message)
+  }
+  let idx2 = doc2.store.get_item_idx(Id::new(1UL, 1UL))
+  debug_assert(idx2 >= 0 && doc2.store.items[idx2].is_gc, "own_child must become GC")
+  debug_assert(doc2.get_text("t").to_string(doc2) == "a", "first text must survive")
+
+  // Child at (1, 0) referencing future map at (1, 1) -> child becomes GC, map integrates empty
+  let child = yocto_wire_in_item(4, 1UL, 1UL, "k")
+  child.write_var_string("b")
+  let mp = yocto_wire_in_root(7, "m", Some("x"))
+  mp.write_var_uint(1UL)
+  let doc3 = Doc::new(9UL)
+  match doc3.apply_update(yocto_wire_update([(1UL, 0UL, [child.to_bytes(), mp.to_bytes()])])) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "future parent apply failed: " + e.message)
+  }
+  let idx3 = doc3.store.get_item_idx(Id::new(1UL, 0UL))
+  debug_assert(idx3 >= 0 && doc3.store.items[idx3].is_gc, "child of future parent must become GC")
+  match doc3.get_map("m").get_map(doc3, "x") {
+    Some(m) => debug_assert(m.len(doc3) == 0, "map must integrate empty after dropped child")
+    None => debug_assert(false, "map must integrate")
+  }
+}
+
+test "yocto_hardening_honest_overlap_still_integrates" {
+  let src = Doc::new(1UL)
+  let t = src.get_text("t")
+  t.insert(src, 0, "ab")
+  let first = src.encode_state_as_update()
+  t.insert(src, 2, "cd")
+  src.get_map("m").set(src, "k", Any::Str("v"))
+  let full = src.encode_state_as_update()
+
+  let dst = Doc::new(2UL)
+  match dst.apply_update(first) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  match dst.apply_update(full) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  match dst.apply_update(full) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(dst.get_text("t").to_string(dst) == "abcd", "text mismatch")
+  match dst.get_map("m").get(dst, "k") {
+    Some(v) => debug_assert(any_eq(v, Any::Str("v")), "map value mismatch")
+    None => debug_assert(false, "map value missing")
+  }
+  debug_assert(dst.store.get_clock(1UL) == src.store.get_clock(1UL), "clock mismatch")
+}
+
+test "yocto_hardening_format_map_values_read_as_undefined" {
+  let explicit = yocto_wire_in_root(6, "m", Some("k"))
+  explicit.write_var_string("bold")
+  explicit.write_var_string("true")
+
+  let val_item = yocto_wire_in_root(8, "m", Some("j"))
+  val_item.write_var_uint(1UL)
+  val_item.write_uint8(125)
+  val_item.write_var_int(1L)
+
+  let inherited = Encoder::new()
+  inherited.write_uint8(6 | 0x80)
+  inherited.write_var_uint(2UL)
+  inherited.write_var_uint(0UL)
+  inherited.write_var_string("italic")
+  inherited.write_var_string("null")
+
+  let bytes = yocto_wire_update([
+    (1UL, 0UL, [explicit.to_bytes()]),
+    (2UL, 0UL, [val_item.to_bytes(), inherited.to_bytes()]),
+  ])
+  let doc = Doc::new(9UL)
+  match doc.apply_update(bytes) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  let m = doc.get_map("m")
+  match m.get(doc, "k") {
+    Some(v) => debug_assert(any_eq(v, Any::Undefined), "format map value k should read as Undefined")
+    None => debug_assert(false, "missing k")
+  }
+  match m.get(doc, "j") {
+    Some(v) => debug_assert(any_eq(v, Any::Undefined), "inherited format map value j should read as Undefined")
+    None => debug_assert(false, "missing j")
+  }
+  debug_assert(m.len(doc) == 2, "map len must be 2")
+}
+
+test "yocto_hardening_declared_counts_beyond_input_fail_early" {
+  let enc = Encoder::new()
+  enc.write_var_uint(1UL)
+  enc.write_var_uint(1999999UL)
+  enc.write_var_uint(1UL)
+  enc.write_var_uint(0UL)
+  let doc = Doc::new(1UL)
+  match doc.apply_update(enc.to_bytes()) {
+    Ok(()) => debug_assert(false, "declared struct count beyond buffer must fail")
+    Err(e) => debug_assert(e.code == "EOF", "expected EOF, got " + e.code)
+  }
+}
+
+test "yocto_hardening_duplicate_client_blocks_are_rejected" {
+  let a = yocto_wire_in_root(4, "t", None)
+  a.write_var_string("a")
+  let b = Encoder::new()
+  b.write_uint8(4 | 0x80)
+  b.write_var_uint(1UL)
+  b.write_var_uint(0UL)
+  b.write_var_string("b")
+  let a_bytes = a.to_bytes()
+  let b_bytes = b.to_bytes()
+
+  // Two separate client blocks for client 1 -> must fail
+  let dup = yocto_wire_update([(1UL, 0UL, [a_bytes]), (1UL, 1UL, [b_bytes])])
+  let doc = Doc::new(9UL)
+  match doc.apply_update(dup) {
+    Ok(()) => debug_assert(false, "duplicate client blocks must be rejected")
+    Err(e) => debug_assert(e.code == "INVALID_UPDATE", "expected INVALID_UPDATE, got " + e.code)
+  }
+
+  // Same two structs in a single client block -> succeeds
+  let ok_bytes = yocto_wire_update([(1UL, 0UL, [a_bytes, b_bytes])])
+  let doc2 = Doc::new(9UL)
+  match doc2.apply_update(ok_bytes) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(doc2.get_text("t").to_string(doc2) == "ab", "single block must produce ab")
+}
+
+test "yocto_hardening_update_any_nesting_is_bounded" {
+  // Depth 128 succeeds
+  let enc128 = yocto_wire_in_root(8, "a", None)
+  enc128.write_var_uint(1UL)
+  let mut i = 0
+  while i < 128 {
+    enc128.write_uint8(117)
+    enc128.write_var_uint(1UL)
+    i = i + 1
+  }
+  enc128.write_uint8(126)
+  let d1 = Doc::new(1UL)
+  match d1.apply_update(yocto_wire_update([(1UL, 0UL, [enc128.to_bytes()])])) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, "depth 128 must succeed: " + e.message)
+  }
+
+  // Depth 129 rejected
+  let enc129 = yocto_wire_in_root(8, "a", None)
+  enc129.write_var_uint(1UL)
+  i = 0
+  while i < 129 {
+    enc129.write_uint8(117)
+    enc129.write_var_uint(1UL)
+    i = i + 1
+  }
+  enc129.write_uint8(126)
+  let d2 = Doc::new(1UL)
+  match d2.apply_update(yocto_wire_update([(1UL, 0UL, [enc129.to_bytes()])])) {
+    Ok(()) => debug_assert(false, "depth 129 must be rejected")
+    Err(e) => debug_assert(e.code == "DEPTH_LIMIT", "expected DEPTH_LIMIT, got " + e.code)
+  }
+}
+
+test "yocto_hardening_subdocument_options_of_any_shape" {
+  // Various subdoc Any option payloads (empty obj, null, int, undefined) must decode & roundtrip cleanly
+  let opts_list : Array[Any] = [
+    Any::Obj(Map::new()),
+    Any::Null,
+    Any::Int(0L),
+    Any::Undefined,
+  ]
+  let mut i = 0
+  while i < opts_list.length() {
+    let item = yocto_wire_in_root(9, "m", Some("d"))
+    item.write_var_string("sub-guid")
+    item.write_any(opts_list[i])
+    let wire = yocto_wire_update([(1UL, 0UL, [item.to_bytes()])])
+    let doc = Doc::new(2UL)
+    match doc.apply_update(wire) {
+      Ok(()) => ()
+      Err(e) => debug_assert(false, "subdoc option shape failed: " + e.message)
+    }
+    let re = doc.encode_state_as_update()
+    let doc2 = Doc::new(3UL)
+    match doc2.apply_update(re) {
+      Ok(()) => ()
+      Err(e) => debug_assert(false, "subdoc reencode failed: " + e.message)
+    }
+    debug_assert(doc2.store.get_clock(1UL) == 1UL, "subdoc clock preserved")
+    i = i + 1
+  }
+}
+
+// --- SearchMarker Invariant Tests (ported from y-octo/src/doc/types/list/search_marker.rs) ---
+
+test "yocto_search_marker_flaky_insert_sequence" {
+  let doc = Doc::new(1UL)
+  let text = doc.get_text("test")
+  text.insert(doc, 0, "0")
+  text.insert(doc, 1, "1")
+  text.insert(doc, 0, "0")
+  debug_assert(text.to_string(doc) == "001", "expected 001")
+  assert_markers_and_soa_match_linear_scan(doc, text.type_id)
+}
+
+test "yocto_randomized_marker_invariants_match_linear_scan" {
+  let rng = YoctoLcg::{ s: 0x5EEDCAFEUL }
+  let doc = Doc::new(1UL)
+  let peer = Doc::new(2UL)
+  let text = doc.get_text("t")
+  let peer_text = peer.get_text("t")
+  let emoji = match hex_to_bytes("f09f9880") {
+    Ok(b) => b.to_string()
+    Err(_) => "E"
+  }
+  let cjk = match hex_to_bytes("e4b8ad") {
+    Ok(b) => b.to_string()
+    Err(_) => "C"
+  }
+
+  let mut step = 0
+  while step < 300 {
+    let op = rng.next() % 6
+    if op == 0 {
+      let cur_len = text.len(doc)
+      let pos = rng.next() % (cur_len + 1)
+      let s = if rng.next() % 5 == 0 { emoji } else { "xy" }
+      text.insert(doc, pos, s)
+    } else if op == 1 || op == 2 {
+      let burst = 1 + (rng.next() % 8)
+      let mut b = 0
+      while b < burst {
+        let cur_len = text.len(doc)
+        if cur_len == 0 || rng.next() % 10 < 7 {
+          let pos = rng.next() % (cur_len + 1)
+          let pick = rng.next() % 3
+          let s = if pick == 0 { "a" } else if pick == 1 { "bc" } else { cjk }
+          text.insert(doc, pos, s)
+        } else {
+          let pos = rng.next() % cur_len
+          let max_d = cur_len - pos
+          let want = 1 + (rng.next() % 4)
+          let del = if want > max_d { max_d } else { want }
+          text.delete(doc, pos, del)
+        }
+        b = b + 1
+      }
+    } else if op == 3 {
+      let cur_len = text.len(doc)
+      if cur_len > 0 {
+        let pos = rng.next() % cur_len
+        let max_d = cur_len - pos
+        let want = 1 + (rng.next() % 5)
+        let del = if want > max_d { max_d } else { want }
+        text.delete(doc, pos, del)
+      }
+    } else if op == 4 {
+      // Large paste > 128B exercising chunked insert + interior delete
+      let cur_len = text.len(doc)
+      let pos = rng.next() % (cur_len + 1)
+      let mut big = "0123456789abcdef"
+      big = big + big + big + big + big + big + big + big + big // 144 bytes
+      text.insert(doc, pos, big)
+      if text.len(doc) > 20 {
+        let dp = rng.next() % (text.len(doc) - 5)
+        text.delete(doc, dp, 3)
+      }
+    } else {
+      // Remote peer edit + round-trip sync
+      yocto_sync(doc, peer)
+      let plen = peer_text.len(peer)
+      let pos = rng.next() % (plen + 1)
+      peer_text.insert(peer, pos, "R" + step.to_string())
+      yocto_sync(peer, doc)
+    }
+    assert_markers_and_soa_match_linear_scan(doc, text.type_id)
+    step = step + 1
+  }
+  yocto_sync(doc, peer)
+  yocto_sync(peer, doc)
+  debug_assert(text.to_string(doc) == peer_text.to_string(peer), "final peer convergence mismatch")
+  assert_markers_and_soa_match_linear_scan(doc, text.type_id)
+  assert_markers_and_soa_match_linear_scan(peer, peer_text.type_id)
+}
+
+test "yocto_sequential_append_and_backward_delete_marker_invariants" {
+  let doc = Doc::new(1UL)
+  let text = doc.get_text("t")
+  let mut i = 0
+  while i < 1000 {
+    text.insert(doc, i, "a")
+    i = i + 1
+  }
+  debug_assert(text.len(doc) == 1000, "len 1000")
+  assert_markers_and_soa_match_linear_scan(doc, text.type_id)
+
+  // Odd backward deletes (exercises 3-part interior delete + non-dragging markers)
+  let mut p = 999
+  while p >= 0 {
+    if p % 2 == 1 {
+      text.delete(doc, p, 1)
+    }
+    p = p - 1
+  }
+  debug_assert(text.len(doc) == 500, "len 500")
+  assert_markers_and_soa_match_linear_scan(doc, text.type_id)
+
+  // Tail backspace to empty (exercises in-place tail-trim + tombstone merge)
+  while text.len(doc) > 0 {
+    text.delete(doc, text.len(doc) - 1, 1)
+  }
+  debug_assert(text.len(doc) == 0 && text.to_string(doc) == "", "must be empty")
+  assert_markers_and_soa_match_linear_scan(doc, text.type_id)
+}
+
+// --- Live Edit Oracle Tests (ported from y-octo/src/doc/tests/live_edit.rs) ---
+
+test "yocto_live_text_index_edits_after_remote_changes" {
+  let mut seed = 0
+  while seed < 25 {
+    let rng = YoctoLcg::{ s: (seed + 1).to_int64().to_uint64() * 0x9e3779b97f4a7c15UL }
+    let local = Doc::new(1UL)
+    let remote = Doc::new(2UL)
+    let text = local.get_text("text")
+    let remote_text = remote.get_text("text")
+    let mut model = ""
+
+    let mut step = 0
+    while step < 80 {
+      yocto_sync(local, remote)
+      let roll = rng.next() % 10
+      let mlen = model.length()
+      if roll < 3 {
+        if roll == 0 && mlen > 0 {
+          let pos = rng.next() % mlen
+          let max_d = mlen - pos
+          let want = 1 + (rng.next() % 4)
+          let del = if want > max_d { max_d } else { want }
+          remote_text.delete(remote, pos, del)
+          model = model.slice(0, pos) + model.slice(pos + del, mlen)
+        } else {
+          let pos = rng.next() % (mlen + 1)
+          let s = "<r" + step.to_string() + ">"
+          remote_text.insert(remote, pos, s)
+          model = model.slice(0, pos) + s + model.slice(pos, mlen)
+        }
+        yocto_sync(remote, local)
+      } else if roll < 5 && mlen > 0 {
+        let pos = rng.next() % mlen
+        let max_d = mlen - pos
+        let want = 1 + (rng.next() % 4)
+        let del = if want > max_d { max_d } else { want }
+        text.delete(local, pos, del)
+        model = model.slice(0, pos) + model.slice(pos + del, mlen)
+      } else {
+        let pos = rng.next() % (mlen + 1)
+        let s = "[l" + step.to_string() + "]"
+        text.insert(local, pos, s)
+        model = model.slice(0, pos) + s + model.slice(pos, mlen)
+      }
+      debug_assert(text.to_string(local) == model, "text oracle mismatch at seed " + seed.to_string())
+      step = step + 1
+    }
+    assert_markers_and_soa_match_linear_scan(local, text.type_id)
+    seed = seed + 1
+  }
+}
+
+test "yocto_live_array_index_edits_after_remote_changes" {
+  let mut seed = 0
+  while seed < 25 {
+    let rng = YoctoLcg::{ s: (seed + 101).to_int64().to_uint64() * 0x9e3779b97f4a7c15UL }
+    let local = Doc::new(1UL)
+    let remote = Doc::new(2UL)
+    let arr = local.get_array("array")
+    let remote_arr = remote.get_array("array")
+    let model : Array[Int64] = Array::new()
+
+    let mut step = 0
+    while step < 80 {
+      yocto_sync(local, remote)
+      let roll = rng.next() % 10
+      let mlen = model.length()
+      if roll < 3 {
+        if roll == 0 && mlen > 0 {
+          let pos = rng.next() % mlen
+          let max_d = mlen - pos
+          let want = 1 + (rng.next() % 3)
+          let del = if want > max_d { max_d } else { want }
+          remote_arr.delete(remote, pos, del)
+          let mut k = pos
+          while k + del < mlen {
+            model[k] = model[k + del]
+            k = k + 1
+          }
+          let mut p = 0
+          while p < del {
+            let _ = model.pop()
+            p = p + 1
+          }
+        } else {
+          let pos = rng.next() % (mlen + 1)
+          let v = 0L - step.to_int64()
+          remote_arr.insert(remote, pos, Any::BigInt(v))
+          model.push(0L)
+          let mut k = model.length() - 1
+          while k > pos {
+            model[k] = model[k - 1]
+            k = k - 1
+          }
+          model[pos] = v
+        }
+        yocto_sync(remote, local)
+      } else if roll < 5 && mlen > 0 {
+        let pos = rng.next() % mlen
+        let max_d = mlen - pos
+        let want = 1 + (rng.next() % 3)
+        let del = if want > max_d { max_d } else { want }
+        arr.delete(local, pos, del)
+        let mut k = pos
+        while k + del < mlen {
+          model[k] = model[k + del]
+          k = k + 1
+        }
+        let mut p = 0
+        while p < del {
+          let _ = model.pop()
+          p = p + 1
+        }
+      } else {
+        let pos = rng.next() % (mlen + 1)
+        let v = step.to_int64()
+        arr.insert(local, pos, Any::BigInt(v))
+        model.push(0L)
+        let mut k = model.length() - 1
+        while k > pos {
+          model[k] = model[k - 1]
+          k = k - 1
+        }
+        model[pos] = v
+      }
+      let actual = arr.to_array(local)
+      debug_assert(actual.length() == model.length(), "array length mismatch")
+      let mut j = 0
+      while j < model.length() {
+        debug_assert(any_eq(actual[j], Any::BigInt(model[j])), "array element mismatch")
+        j = j + 1
+      }
+      step = step + 1
+    }
+    seed = seed + 1
+  }
+}
+
+test "yocto_live_indexed_array_read_skips_deleted_nested_value" {
+  let src = Doc::new(1UL)
+  let arr = src.get_array("array")
+  arr.push(src, Any::Str("before"))
+  let _ = arr.insert_text(src, 1)
+  arr.push(src, Any::Str("after"))
+  arr.delete(src, 1, 1)
+
+  let peer = Doc::new(2UL)
+  yocto_sync(src, peer)
+  let parr = peer.get_array("array")
+  debug_assert(parr.len(peer) == 2, "len must be 2")
+  match parr.get(peer, 1) {
+    Some(v) => debug_assert(any_eq(v, Any::Str("after")), "index 1 must skip deleted nested text")
+    None => debug_assert(false, "missing index 1")
+  }
+}
+
+test "yocto_live_reordered_nested_update_saved_before_parent" {
+  let src1 = Doc::new(101UL)
+  let m1 = src1.get_map("map")
+  let _ = m1.set_text(src1, "child")
+  let parent_update = src1.encode_state_as_update()
+  let parent_sv = src1.encode_state_vector()
+
+  // Second client edits nested text after receiving parent
+  let src2 = Doc::new(202UL)
+  match src2.apply_update(parent_update) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  match src2.get_map("map").get_text(src2, "child") {
+    Some(t) => t.insert(src2, 0, "nested")
+    None => debug_assert(false, "missing child text")
+  }
+  let child_update = match src2.encode_state_as_update_from(parent_sv) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, e.message)
+      Bytes::new(0)
+    }
+  }
+
+  // Relay receives child BEFORE parent, then saves its state to a fresh doc
+  let relay = Doc::new(303UL)
+  match relay.apply_update(child_update) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(relay.store.pending_updates.length() > 0, "relay must hold pending update")
+
+  let restored = Doc::new(404UL)
+  match restored.apply_update(relay.encode_state_as_update()) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(restored.store.pending_updates.length() > 0, "restored must preserve pending update")
+  match restored.apply_update(parent_update) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(restored.store.pending_updates.length() == 0, "pending must drain once parent arrives")
+  match restored.get_map("map").get_text(restored, "child") {
+    Some(t) => debug_assert(t.to_string(restored) == "nested", "nested text must resolve")
+    None => debug_assert(false, "missing restored child text")
+  }
+}
+
+// --- Tombstone Anchor & Store Edge-Case Tests (ported from list/mod.rs, text/mod.rs, store.rs) ---
+
+test "yocto_concurrent_push_after_trailing_tombstone_matches_yjs" {
+  let d9 = Doc::new(9UL)
+  let d2 = Doc::new(2UL)
+  let a9 = d9.get_array("a")
+  let a2 = d2.get_array("a")
+
+  a9.push(d9, Any::Str("A")) // (9, 0)
+  d9.get_map("other").set(d9, "k", Any::Int(1L)) // (9, 1)
+  a9.push(d9, Any::Str("B")) // (9, 2)
+  yocto_sync(d9, d2)
+
+  a9.delete(d9, 1, 1) // trailing tombstone (9, 2)
+  a9.push(d9, Any::Str("X")) // must anchor after (9, 2), right_origin = None
+  a2.push(d2, Any::Str("Y")) // anchors after (9, 2), right_origin = None
+
+  let x_idx = d9.store.get_item_idx(Id::new(9UL, 3UL))
+  debug_assert(x_idx >= 0, "X must exist")
+  let x_item = d9.store.items[x_idx]
+  debug_assert(
+    x_item.has_origin && x_item.origin_client == 9UL && x_item.origin_clock == 2UL,
+    "X origin must be trailing tombstone (9, 2)",
+  )
+  debug_assert(!x_item.has_right_origin, "X right_origin must be None")
+
+  yocto_sync(d9, d2)
+  yocto_sync(d2, d9)
+  let v9 = a9.to_array(d9)
+  let v2 = a2.to_array(d2)
+  debug_assert(v9.length() == 3 && v2.length() == 3, "expected 3 elements")
+  debug_assert(any_eq(v9[0], Any::Str("A")) && any_eq(v2[0], Any::Str("A")), "elem 0 == A")
+  debug_assert(any_eq(v9[1], Any::Str("Y")) && any_eq(v2[1], Any::Str("Y")), "elem 1 == Y")
+  debug_assert(any_eq(v9[2], Any::Str("X")) && any_eq(v2[2], Any::Str("X")), "elem 2 == X")
+}
+
+test "yocto_insert_before_leading_tombstone_converges" {
+  let c0 = Doc::new(10UL)
+  let t0 = c0.get_text("text")
+  let c1 = Doc::new(11UL)
+  let t1 = c1.get_text("text")
+  let c2 = Doc::new(12UL)
+  let t2 = c2.get_text("text")
+
+  t0.insert(c0, 0, "a")
+  yocto_sync(c0, c1)
+  t1.insert(c1, 1, "b")
+
+  t0.insert(c0, 1, "c")
+  t0.delete(c0, 0, 1)
+
+  yocto_sync(c0, c2)
+  t2.insert(c2, 0, "d")
+
+  yocto_sync(c1, c2)
+  yocto_sync(c2, c1)
+  yocto_sync(c1, c0)
+  yocto_sync(c0, c1)
+  yocto_sync(c0, c2)
+
+  let s0 = t0.to_string(c0)
+  let s1 = t1.to_string(c1)
+  let s2 = t2.to_string(c2)
+  debug_assert(s0 == s1 && s1 == s2, "all 3 peers must converge: " + s0 + " vs " + s1 + " vs " + s2)
+}
+
+test "yocto_splitting_last_value_of_map_key_keeps_key_on_it" {
+  let doc = Doc::new(2UL)
+  let mp = doc.get_map("map")
+  mp.set(doc, "k", Any::Int(1L))
+  mp.set(doc, "k", Any::Int(2L))
+
+  let peer = Doc::new(1UL)
+  yocto_sync(doc, peer)
+  peer.get_map("map").set(peer, "k", Any::Str("peer"))
+
+  mp.set(doc, "k", Any::Int(3L))
+  mp.delete(doc, "k")
+
+  // Peer's value lands before (2, 2) and is deleted (loses to right sibling)
+  yocto_sync(peer, doc)
+  debug_assert(!mp.contains_key(doc, "k"), "k should still be deleted after peer value loses")
+
+  mp.set(doc, "k", Any::Str("local"))
+  match mp.get(doc, "k") {
+    Some(v) => debug_assert(any_eq(v, Any::Str("local")), "local must win")
+    None => debug_assert(false, "local missing")
+  }
+  yocto_sync(doc, peer)
+  match peer.get_map("map").get(peer, "k") {
+    Some(v) => debug_assert(any_eq(v, Any::Str("local")), "peer must converge to local")
+    None => debug_assert(false, "peer missing local")
+  }
+}
+
+test "yocto_split_node_utf16_surrogate_pair_preserves_links_and_origin" {
+  let doc = Doc::new(1UL)
+  let t = doc.get_text("t")
+  // "a😀b" = 61 F0 9F 98 80 62 (4 UTF-16 code units)
+  let s = match hex_to_bytes("61f09f988062") {
+    Ok(b) => b.to_string()
+    Err(_) => ""
+  }
+  t.insert(doc, 0, s)
+  let left_idx = doc.store.get_item_idx(Id::new(1UL, 0UL))
+  let right_idx = doc.split_item(left_idx, 2)
+  let a = doc.store.items[left_idx]
+  let b = doc.store.items[right_idx]
+  debug_assert(a.len == 2 && b.len == 2, "split lengths must be (2, 2)")
+  debug_assert(a.right == right_idx && b.left == left_idx, "links preserved")
+  debug_assert(b.has_origin && b.origin_client == 1UL && b.origin_clock == 1UL, "origin_clock == 1")
+  let rep = match hex_to_bytes("efbfbd") {
+    Ok(x) => x.to_string()
+    Err(_) => ""
+  }
+  match (a.content, b.content) {
+    (Content::Str(ls), Content::Str(rs)) => {
+      debug_assert(ls == "a" + rep, "left half must be a + U+FFFD")
+      debug_assert(rs == rep + "b", "right half must be U+FFFD + b")
+    }
+    _ => debug_assert(false, "expected Content::Str halves")
+  }
+}
+
+test "yocto_wire_delete_set_includes_tombstones_received_in_structs" {
+  let src = Doc::new(1UL)
+  let t = src.get_text("t")
+  t.insert(src, 0, "hello world")
+  t.delete(src, 5, 6)
+  let snap = src.encode_state_as_update()
+
+  let recv = Doc::new(2UL)
+  match recv.apply_update(snap) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(recv.get_text("t").to_string(recv) == "hello", "recv text mismatch")
+
+  // Re-encoding recv from a doc that already had "hello world" (before delete) must still deliver the delete!
+  let old = Doc::new(3UL)
+  old.get_text("t").insert(old, 0, "hello world")
+  let old_base = Doc::new(1UL)
+  old_base.get_text("t").insert(old_base, 0, "hello world")
+  let sv_before_del = old_base.encode_state_vector()
+  let dels = match recv.encode_state_as_update_from(sv_before_del) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, e.message)
+      Bytes::new(0)
+    }
+  }
+  match old_base.apply_update(dels) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(old_base.get_text("t").to_string(old_base) == "hello", "delete set must propagate tombstones")
+}
+
+test "yocto_mid_struct_state_vector_diff_matches_full_sync" {
+  let src = Doc::new(1UL)
+  let t = src.get_text("t")
+  t.insert(src, 0, "abcdefghij") // single 10-char struct
+
+  let peer = Doc::new(2UL)
+  let sv_enc = Encoder::new()
+  sv_enc.write_var_uint(1UL)
+  sv_enc.write_var_uint(1UL)
+  sv_enc.write_var_uint(4UL) // mid-struct clock!
+  let tail = match src.encode_state_as_update_from(sv_enc.to_bytes()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, e.message)
+      Bytes::new(0)
+    }
+  }
+  // Apply first 4 chars, then mid-struct tail
+  let prefix_doc = Doc::new(1UL)
+  prefix_doc.get_text("t").insert(prefix_doc, 0, "abcd")
+  match peer.apply_update(prefix_doc.encode_state_as_update()) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  match peer.apply_update(tail) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  debug_assert(peer.get_text("t").to_string(peer) == "abcdefghij", "mid-struct diff must reconstruct full text")
+}
+
+test "yocto_remote_root_survives_full_delete_and_reinsert" {
+  let src = Doc::new(1UL)
+  let st = src.get_text("remote_root")
+  st.insert(src, 0, "hi")
+  let create_u = src.encode_state_as_update()
+
+  let dst = Doc::new(2UL)
+  match dst.apply_update(create_u) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  st.delete(src, 0, 2)
+  let del_u = src.encode_state_as_update()
+  match dst.apply_update(del_u) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  let dt = dst.get_text("remote_root")
+  debug_assert(dt.to_string(dst) == "", "deleted text must be empty")
+  dt.insert(dst, 0, "ok")
+  debug_assert(dt.to_string(dst) == "ok", "reinsert into remote root must succeed")
+}
+
+// =============================================================================
+// 5. Hardening & streaming regressions (multi-client atomicity, fallback dup,
+//    deleted nested chunked insert, nested type dedup, DeleteSet, introsort)
+// =============================================================================
+
+fn rv_root_str(root : String, s : String) -> Bytes {
+  let e = yocto_wire_in_root(4, root, None)
+  e.write_var_string(s)
+  e.to_bytes()
+}
+
+fn rv_str_after(oc : UInt64, ok : UInt64, s : String) -> Bytes {
+  let e = Encoder::new()
+  e.write_uint8(4 | 0x80)
+  e.write_var_uint(oc)
+  e.write_var_uint(ok)
+  e.write_var_string(s)
+  e.to_bytes()
+}
+
+test "yocto_hardening_duplicate_client_after_streaming_fallback_rejected" {
+  let upd = yocto_wire_update(
+    [
+      (5UL, 0UL, [rv_root_str("t", "a")]),
+      (3UL, 0UL, [rv_str_after(99UL, 0UL, "x")]),
+      (5UL, 1UL, [rv_str_after(5UL, 0UL, "b")]),
+    ],
+  )
+  let doc = Doc::new(9UL)
+  match doc.apply_update(upd) {
+    Ok(()) => debug_assert(false, "duplicate client 5 after fallback must be rejected")
+    Err(e) => {
+      debug_assert(e.code == "INVALID_UPDATE", "expected INVALID_UPDATE, got " + e.code)
+      debug_assert(doc.get_text("t").to_string(doc) == "", "rejected update must not mutate doc")
+    }
+  }
+}
+
+test "yocto_hardening_chunked_insert_into_deleted_nested_text" {
+  let mut big = ""
+  let mut i = 0
+  while i < 20 {
+    big = big + "0123456789"
+    i = i + 1
+  }
+  let mut round = 0
+  while round < 2 {
+    let s = if round == 0 { "small" } else { big }
+    let d1 = Doc::new(1UL)
+    let arr = d1.get_array("a")
+    let t = arr.insert_text(d1, 0)
+    let d2 = Doc::new(2UL)
+    yocto_sync(d1, d2)
+    arr.delete(d1, 0, 1)
+    t.insert(d1, 0, s)
+    yocto_sync(d1, d2)
+    debug_assert(t.len(d1) == 0, "local len after insert into deleted parent must be 0")
+    debug_assert(t.to_string(d1) == "", "local text after insert into deleted parent must be empty")
+    let fresh = Doc::new(3UL)
+    yocto_sync(d1, fresh)
+    round = round + 1
+  }
+}
+
+test "yocto_hardening_malformed_multi_client_update_is_atomic" {
+  let bad = Encoder::new()
+  bad.write_uint8(4 | 0x80)
+  bad.write_var_uint(5UL)
+  bad.write_var_uint(0UL)
+  bad.write_var_uint(3UL)
+  bad.write_uint8(0x41)
+  let enc = Encoder::new()
+  enc.write_var_uint(2UL)
+  enc.write_var_uint(1UL)
+  enc.write_var_uint(5UL)
+  enc.write_var_uint(0UL)
+  enc.write_bytes(rv_root_str("t", "a"))
+  enc.write_var_uint(1UL)
+  enc.write_var_uint(3UL)
+  enc.write_var_uint(0UL)
+  enc.write_bytes(bad.to_bytes())
+  let doc = Doc::new(9UL)
+  match doc.apply_update(enc.to_bytes()) {
+    Ok(()) => debug_assert(false, "truncated multi-client update must fail")
+    Err(_) => {
+      debug_assert(doc.get_text("t").to_string(doc) == "", "failed update must leave doc untouched")
+      debug_assert(doc.store.get_clock(5UL) == 0UL, "client 5 clock must remain 0")
+    }
+  }
+}
+
+test "yocto_hardening_reapply_known_nested_type_no_type_leak" {
+  let d1 = Doc::new(1UL)
+  let arr = d1.get_array("a")
+  let t = arr.insert_text(d1, 0)
+  t.insert(d1, 0, "hi")
+  let upd = d1.encode_state_as_update()
+  let d2 = Doc::new(2UL)
+  match d2.apply_update(upd) {
+    Ok(()) => ()
+    Err(e) => debug_assert(false, e.message)
+  }
+  let n0 = d2.types.length()
+  let mut k = 0
+  while k < 10 {
+    match d2.apply_update(upd) {
+      Ok(()) => ()
+      Err(e) => debug_assert(false, e.message)
+    }
+    k = k + 1
+  }
+  debug_assert(d2.types.length() == n0, "re-applying known nested type must not grow doc.types")
+}
+
+test "yocto_deleteset_external_push_sort_and_merge" {
+  let ds = DeleteSet::new()
+  ds.add(1UL, 10UL, 2UL)
+  match ds.clients.get(1L) {
+    Some(arr) => arr.push(DeleteItem::{ clock: 0UL, len: 1UL })
+    None => ()
+  }
+  ds.sort_and_merge()
+  match ds.clients.get(1L) {
+    Some(arr) => debug_assert(arr[0].clock == 0UL && arr[1].clock == 10UL, "sort_and_merge must normalize external pushes")
+    None => debug_assert(false, "missing client 1")
+  }
+}
+
+test "yocto_introsort_adversarial_and_item_origin_accessors" {
+  // Adversarial anti-midpoint-quicksort sequence (organ-pipe / killer pattern)
+  let n = 512
+  let arr : Array[UInt64] = Array::with_capacity(n)
+  let mut i = 0
+  while i < n {
+    let v = if i % 2 == 0 { int_to_u64(i) } else { int_to_u64(n - i) }
+    arr.push(v)
+    i = i + 1
+  }
+  sort_u64_desc(arr)
+  i = 1
+  while i < n {
+    debug_assert(arr[i - 1] >= arr[i], "sort_u64_desc must produce non-increasing order")
+    i = i + 1
+  }
+  let doc = Doc::new(1UL)
+  let t = doc.get_text("t")
+  t.insert(doc, 0, "a")
+  t.insert(doc, 0, "b")
+  let it = doc.store.items[1]
+  match it.right_origin() {
+    Some(rid) => debug_assert(rid.client == 1UL && rid.clock == 0UL, "Item::right_origin accessor mismatch")
+    None => debug_assert(false, "expected right_origin")
+  }
+  match it.origin() {
+    None => ()
+    Some(_) => debug_assert(false, "expected None origin")
+  }
+}
+
+fn rv_piece(rng : YoctoLcg, tag : String) -> String {
+  let kind = rng.next() % 4
+  let n = if kind == 0 { 130 + rng.next() % 300 } else { 1 + rng.next() % 6 }
+  let mut s = tag
+  let mut i = 0
+  while i < n {
+    let c = rng.next() % 7
+    s = s + (if c == 0 { "é" } else if c == 1 { "😀" } else if c == 2 { "中" } else { "x" })
+    i = i + 1
+  }
+  s
+}
+
+test "yocto_fuzz_three_peers_big_unicode_chunked_roundtrip" {
+  let mut seed = 0
+  while seed < 30 {
+    let rng = YoctoLcg::{ s: (seed + 7).to_int64().to_uint64() * 0x9e3779b97f4a7c15UL }
+    let docs = [Doc::new(1UL), Doc::new(2UL), Doc::new(3UL)]
+    let mut step = 0
+    while step < 120 {
+      let di = rng.next() % 3
+      let d = docs[di]
+      let t = d.get_text("t")
+      let len = t.len(d)
+      let r = rng.next() % 10
+      if r < 4 && len > 0 {
+        let pos = rng.next() % len
+        let max_d = len - pos
+        let want = if rng.next() % 3 == 0 { 1 + rng.next() % 200 } else { 1 + rng.next() % 4 }
+        t.delete(d, pos, if want > max_d { max_d } else { want })
+      } else {
+        t.insert(d, rng.next() % (len + 1), rv_piece(rng, "<" + step.to_string() + ">"))
+      }
+      if rng.next() % 4 == 0 {
+        let a = rng.next() % 3
+        let b = rng.next() % 3
+        if a != b {
+          yocto_sync(docs[a], docs[b])
+        }
+      }
+      step = step + 1
+    }
+    let mut a = 0
+    while a < 3 {
+      let mut b = 0
+      while b < 3 {
+        if a != b {
+          yocto_sync(docs[a], docs[b])
+        }
+        b = b + 1
+      }
+      a = a + 1
+    }
+    let s0 = docs[0].get_text("t").to_string(docs[0])
+    debug_assert(s0 == docs[1].get_text("t").to_string(docs[1]), "3-peer diverge 0/1")
+    debug_assert(s0 == docs[2].get_text("t").to_string(docs[2]), "3-peer diverge 0/2")
+    let fresh = Doc::new(99UL)
+    match fresh.apply_update(docs[0].encode_state_as_update()) {
+      Ok(()) => ()
+      Err(e) => debug_assert(false, e.message)
+    }
+    debug_assert(fresh.get_text("t").to_string(fresh) == s0, "fresh roundtrip mismatch")
+    seed = seed + 1
+  }
+}
+
+test "yocto_array_insert_at_marker_after_tombstone_anchors_before_tombstone" {
+  // Regression: after deleting items before a live item `X` (recording marker at `X`),
+  // inserting into YArray at `X`'s index must anchor BEFORE the tombstones (matching Yjs),
+  // not after them.
+  let d0 = Doc::new(10UL)
+  let d1 = Doc::new(17UL)
+  let a0 = d0.get_array("a")
+  a0.push(d0, Any::Int(1L))
+  a0.push(d0, Any::Int(2L))
+  a0.push(d0, Any::Int(3L))
+  yocto_sync(d0, d1)
+  // d0 deletes index 1 (leaves tombstone between 1 and 3); d1 concurrently inserts 99 at index 2 (after 2, before 3)
+  let a1 = d1.get_array("a")
+  a0.delete(d0, 1, 1)
+  // Force marker on item `3` (now at index 1) by deleting index 0? No: delete index 0 leaves tombstone at start,
+  // or insert+delete at index 1 leaves marker at `1` or `3`. Explicitly force marker on `3` (idx=1):
+  a0.delete(d0, 0, 1)
+  // Now item `3` is at index 0; reinsert at 0 to have [10, tombstone(1), tombstone(2), 3]
+  a0.insert(d0, 0, Any::Int(10L))
+  // Now index 1 is item `3` preceded by tombstones(1, 2). Delete index 1? Instead sync d1's insert between tombstones:
+  a1.insert(d1, 2, Any::Int(99L))
+  // On d0, read/touch marker at index 1 (item `3`) and insert 68 at index 1:
+  // item `68` must anchor after `10` (BEFORE tombstones 1, 2), so 68 precedes 99 (which anchored after tombstone 2).
+  let d0_p = d0.types[a0.type_id]
+  let mut cur = d0_p.start
+  while cur >= 0 {
+    if !d0.store.items[cur].deleted && cur != d0_p.start {
+      // item `3` at index 1
+      d0_p.last_marker_item = cur
+      d0_p.last_marker_idx = 1
+      break
+    }
+    cur = d0.store.items[cur].right
+  }
+  a0.insert(d0, 1, Any::Int(68L))
+  yocto_sync(d0, d1)
+  yocto_sync(d1, d0)
+  // Expected order: [10, 68, 99, 3] because 68 anchored before tombstones(1,2) while 99 anchored after tombstone(2)
+  debug_assert(a0.len(d0) == 4, "expected len 4")
+  match (a0.get(d0, 0), a0.get(d0, 1), a0.get(d0, 2), a0.get(d0, 3)) {
+    (Some(Any::Int(v0)), Some(Any::Int(v1)), Some(Any::Int(v2)), Some(Any::Int(v3))) => {
+      debug_assert(
+        v0 == 10L && v1 == 68L && v2 == 99L && v3 == 3L,
+        "expected [10, 68, 99, 3]: YArray insert must anchor before tombstones",
+      )
+    }
+    _ => debug_assert(false, "expected 4 Int elements in YArray")
+  }
+}

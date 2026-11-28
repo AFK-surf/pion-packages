@@ -106,6 +106,61 @@ fn utf16_split_val(s : String, offset : Int) -> StrPair {
   StrPair::{ left: s, right: "" }
 }
 
+fn utf16_split_with_len(s : String, total_utf16 : Int, offset : Int) -> StrPair {
+  let n = s.length()
+  if offset <= 0 {
+    return StrPair::{ left: "", right: s }
+  }
+  if offset >= total_utf16 {
+    return StrPair::{ left: s, right: "" }
+  }
+  // O(1) ASCII fast path: byte length == UTF-16 code unit length iff all bytes are < 0x80
+  if n == total_utf16 {
+    return StrPair::{ left: s.slice(0, offset), right: s.slice(offset, n) }
+  }
+  // Reverse scan when split point is in the second half (keeps tail backspaces O(tail))
+  if offset > total_utf16 / 2 {
+    let rem = total_utf16 - offset
+    let mut i = n
+    let mut seen = 0
+    while i > 0 {
+      i = i - 1
+      let b = s.code_unit_at(i)
+      if (b & 0xc0) != 0x80 {
+        let step_u = if b >= 0xf0 { 2 } else { 1 }
+        seen = seen + step_u
+        if seen == rem {
+          return StrPair::{ left: s.slice(0, i), right: s.slice(i, n) }
+        }
+        if seen > rem {
+          let rep = replacement_char_str()
+          let next_i = if i + 4 <= n { i + 4 } else { n }
+          return StrPair::{
+            left: s.slice(0, i) + rep,
+            right: rep + s.slice(next_i, n),
+          }
+        }
+      }
+    }
+    return StrPair::{ left: "", right: s }
+  }
+  utf16_split_val(s, offset)
+}
+
+fn utf16_tail_with_len(s : String, total_utf16 : Int, offset : Int) -> String {
+  let n = s.length()
+  if offset <= 0 {
+    return s
+  }
+  if offset >= total_utf16 {
+    return ""
+  }
+  if n == total_utf16 {
+    return s.slice(offset, n)
+  }
+  utf16_split_with_len(s, total_utf16, offset).right
+}
+
 ///| Split a UTF-8 `String` at UTF-16 code unit `offset`.
 ///| If `offset` falls inside a 4-byte UTF-8 sequence (UTF-16 surrogate pair),
 ///| each half is replaced with U+FFFD (matching yjs wire encoding and Rust yrs).
@@ -240,6 +295,7 @@ pub struct DeleteSet {
   mut cached_client : Int64
   mut has_cached : Bool
   mut cached_arr : Array[DeleteItem]
+  mut dirty : Bool
 }
 
 ///| Create an empty `DeleteSet`.
@@ -249,7 +305,50 @@ pub fn DeleteSet::new() -> DeleteSet {
     cached_client: 0L,
     has_cached: false,
     cached_arr: Array::new(),
+    dirty: false,
   }
+}
+
+///| Append `[clock, clock + len)` into a client's delete array with forward & backward coalescing.
+///| Returns true if the array may now be unsorted or overlapping.
+fn delete_arr_push(arr : Array[DeleteItem], clock : UInt64, len : UInt64) -> Bool {
+  let n = arr.length()
+  if n > 0 {
+    let last = arr[n - 1]
+    if clock >= last.clock {
+      let delta = clock - last.clock
+      if delta == last.len {
+        arr[n - 1] = DeleteItem::{
+          clock: last.clock,
+          len: u64_sat_add(last.len, len),
+        }
+        return false
+      }
+      if delta > last.len {
+        arr.push(DeleteItem::{ clock: clock, len: len })
+        return false
+      }
+      arr.push(DeleteItem::{ clock: clock, len: len })
+      return true
+    } else if last.clock - clock == len {
+      arr[n - 1] = DeleteItem::{
+        clock: clock,
+        len: u64_sat_add(last.len, len),
+      }
+      if n >= 2 {
+        let prev = arr[n - 2]
+        if clock <= prev.clock || clock - prev.clock <= prev.len {
+          return true
+        }
+      }
+      return false
+    } else {
+      arr.push(DeleteItem::{ clock: clock, len: len })
+      return true
+    }
+  }
+  arr.push(DeleteItem::{ clock: clock, len: len })
+  false
 }
 
 ///| Record `[clock, clock + len)` as deleted for `client`.
@@ -264,19 +363,9 @@ pub fn DeleteSet::add(
   }
   let key = client.to_int64()
   if self.has_cached && self.cached_client == key {
-    let arr = self.cached_arr
-    let n = arr.length()
-    if n > 0 {
-      let last = arr[n - 1]
-      if clock >= last.clock && clock - last.clock == last.len {
-        arr[n - 1] = DeleteItem::{
-          clock: last.clock,
-          len: u64_sat_add(last.len, len),
-        }
-        return
-      }
+    if delete_arr_push(self.cached_arr, clock, len) {
+      self.dirty = true
     }
-    arr.push(DeleteItem::{ clock: clock, len: len })
     return
   }
   match self.clients.get(key) {
@@ -284,18 +373,9 @@ pub fn DeleteSet::add(
       self.cached_client = key
       self.has_cached = true
       self.cached_arr = arr
-      let n = arr.length()
-      if n > 0 {
-        let last = arr[n - 1]
-        if clock >= last.clock && clock - last.clock == last.len {
-          arr[n - 1] = DeleteItem::{
-            clock: last.clock,
-            len: u64_sat_add(last.len, len),
-          }
-          return
-        }
+      if delete_arr_push(arr, clock, len) {
+        self.dirty = true
       }
-      arr.push(DeleteItem::{ clock: clock, len: len })
     }
     None => {
       let arr : Array[DeleteItem] = Array::new()
@@ -308,98 +388,194 @@ pub fn DeleteSet::add(
   }
 }
 
-///| Sort a `DeleteItem` array by `clock` ascending (quicksort with insertion sort cutoff).
-fn sort_delete_items(arr : Array[DeleteItem], lo : Int, hi : Int) -> Unit {
-  if hi - lo <= 16 {
-    let mut i = lo + 1
-    while i <= hi {
-      let key = arr[i]
-      let mut j = i - 1
-      while j >= lo && arr[j].clock > key.clock {
-        arr[j + 1] = arr[j]
-        j = j - 1
+///| Compute introsort recursion depth limit `2 * floor(log2(n))`.
+fn introsort_depth_limit(n : Int) -> Int {
+  let mut d = 0
+  let mut x = n
+  while x > 1 {
+    x = x >> 1
+    d = d + 1
+  }
+  d * 2
+}
+
+///| Iterative max-heapsort fallback for `DeleteItem` ascending by `clock` (O(n log n) worst-case, O(1) stack).
+fn heapsort_delete_items(arr : Array[DeleteItem], lo : Int, hi : Int) -> Unit {
+  let n = hi - lo + 1
+  let mut start = n / 2 - 1
+  while start >= 0 {
+    let mut root = start
+    while root * 2 + 1 < n {
+      let mut largest = root
+      let l = root * 2 + 1
+      let r = l + 1
+      if arr[lo + l].clock > arr[lo + largest].clock {
+        largest = l
       }
-      arr[j + 1] = key
-      i = i + 1
+      if r < n && arr[lo + r].clock > arr[lo + largest].clock {
+        largest = r
+      }
+      if largest == root {
+        break
+      }
+      let tmp = arr[lo + root]
+      arr[lo + root] = arr[lo + largest]
+      arr[lo + largest] = tmp
+      root = largest
     }
-    return
+    start = start - 1
   }
-  let mid = lo + (hi - lo) / 2
-  let pivot = arr[mid].clock
-  let mut i = lo
-  let mut j = hi
-  while i <= j {
-    while arr[i].clock < pivot {
-      i = i + 1
+  let mut end = n - 1
+  while end > 0 {
+    let tmp = arr[lo]
+    arr[lo] = arr[lo + end]
+    arr[lo + end] = tmp
+    let mut root = 0
+    while root * 2 + 1 < end {
+      let mut largest = root
+      let l = root * 2 + 1
+      let r = l + 1
+      if arr[lo + l].clock > arr[lo + largest].clock {
+        largest = l
+      }
+      if r < end && arr[lo + r].clock > arr[lo + largest].clock {
+        largest = r
+      }
+      if largest == root {
+        break
+      }
+      let t2 = arr[lo + root]
+      arr[lo + root] = arr[lo + largest]
+      arr[lo + largest] = t2
+      root = largest
     }
-    while arr[j].clock > pivot {
-      j = j - 1
-    }
-    if i <= j {
-      let tmp = arr[i]
-      arr[i] = arr[j]
-      arr[j] = tmp
-      i = i + 1
-      j = j - 1
-    }
-  }
-  if lo < j {
-    sort_delete_items(arr, lo, j)
-  }
-  if i < hi {
-    sort_delete_items(arr, i, hi)
+    end = end - 1
   }
 }
 
-///| Sort and merge overlapping/adjacent delete ranges per client.
+///| Sort a `DeleteItem` array by `clock` ascending (introsort: tail-loop larger half, O(log n) stack, heapsort fallback).
+fn sort_delete_items(
+  arr : Array[DeleteItem],
+  lo_in : Int,
+  hi_in : Int,
+  depth_in : Int,
+) -> Unit {
+  let mut lo = lo_in
+  let mut hi = hi_in
+  let mut depth = depth_in
+  while hi - lo > 16 {
+    if depth <= 0 {
+      heapsort_delete_items(arr, lo, hi)
+      return
+    }
+    depth = depth - 1
+    let mid = lo + (hi - lo) / 2
+    let pivot = arr[mid].clock
+    let mut i = lo
+    let mut j = hi
+    while i <= j {
+      while arr[i].clock < pivot {
+        i = i + 1
+      }
+      while arr[j].clock > pivot {
+        j = j - 1
+      }
+      if i <= j {
+        let tmp = arr[i]
+        arr[i] = arr[j]
+        arr[j] = tmp
+        i = i + 1
+        j = j - 1
+      }
+    }
+    let left_len = j - lo
+    let right_len = hi - i
+    if left_len < right_len {
+      if lo < j {
+        sort_delete_items(arr, lo, j, depth)
+      }
+      lo = i
+    } else {
+      if i < hi {
+        sort_delete_items(arr, i, hi, depth)
+      }
+      hi = j
+    }
+  }
+  let mut i = lo + 1
+  while i <= hi {
+    let key = arr[i]
+    let mut j = i - 1
+    while j >= lo && arr[j].clock > key.clock {
+      arr[j + 1] = arr[j]
+      j = j - 1
+    }
+    arr[j + 1] = key
+    i = i + 1
+  }
+}
+
+///| Sort and merge overlapping/adjacent delete ranges for a single client key `k`.
+fn DeleteSet::sort_and_merge_one(self : DeleteSet, k : Int64) -> Unit {
+  match self.clients.get(k) {
+    Some(arr) => {
+      let n = arr.length()
+      if n > 1 {
+        let mut clean = true
+        let mut si = 1
+        while si < n {
+          let prev = arr[si - 1]
+          let cur = arr[si]
+          if cur.clock <= prev.clock || cur.clock - prev.clock <= prev.len {
+            clean = false
+            break
+          }
+          si = si + 1
+        }
+        if !clean {
+          sort_delete_items(arr, 0, n - 1, introsort_depth_limit(n))
+          let merged : Array[DeleteItem] = Array::with_capacity(n)
+          let mut cur = arr[0]
+          let mut i = 1
+          while i < n {
+            let nxt = arr[i]
+            if delete_item_can_merge(cur, nxt) {
+              cur = delete_item_merge(cur, nxt)
+            } else {
+              merged.push(cur)
+              cur = nxt
+            }
+            i = i + 1
+          }
+          merged.push(cur)
+          self.clients.set(k, merged)
+          if self.has_cached && self.cached_client == k {
+            self.cached_arr = merged
+          }
+        }
+      }
+    }
+    None => ()
+  }
+}
+
+///| Sort and merge overlapping/adjacent delete ranges per client (always runs even if `clients` was mutated externally).
 pub fn DeleteSet::sort_and_merge(self : DeleteSet) -> Unit {
   let ks = self.clients.keys()
   let mut ci = 0
   while ci < ks.length() {
-    let k = ks[ci]
-    match self.clients.get(k) {
-      Some(arr) => {
-        let n = arr.length()
-        if n > 1 {
-          // Fast path: check if already strictly sorted and disjoint (common for wire DeleteSets)
-          let mut clean = true
-          let mut si = 1
-          while si < n {
-            let prev = arr[si - 1]
-            let cur = arr[si]
-            if cur.clock <= prev.clock || cur.clock - prev.clock <= prev.len {
-              clean = false
-              break
-            }
-            si = si + 1
-          }
-          if !clean {
-            sort_delete_items(arr, 0, n - 1)
-            let merged : Array[DeleteItem] = Array::with_capacity(n)
-            let mut cur = arr[0]
-            let mut i = 1
-            while i < n {
-              let nxt = arr[i]
-              if delete_item_can_merge(cur, nxt) {
-                cur = delete_item_merge(cur, nxt)
-              } else {
-                merged.push(cur)
-                cur = nxt
-              }
-              i = i + 1
-            }
-            merged.push(cur)
-            self.clients.set(k, merged)
-            if self.has_cached && self.cached_client == k {
-              self.cached_arr = merged
-            }
-          }
-        }
-      }
-      None => ()
-    }
+    self.sort_and_merge_one(ks[ci])
     ci = ci + 1
   }
+  self.dirty = false
+}
+
+///| Internal fast path: sort and merge only when `add()` marked the delete set dirty.
+fn DeleteSet::ensure_sorted(self : DeleteSet) -> Unit {
+  if !self.dirty {
+    return
+  }
+  self.sort_and_merge()
 }
 
 ///| Merge another `DeleteSet` into `self`.
@@ -597,7 +773,7 @@ fn content_split_in_place(item : Item, offset : Int) -> Content {
       Content::Deleted(n - off)
     }
     Content::Str(s) => {
-      let sp = utf16_split_val(s, offset)
+      let sp = utf16_split_with_len(s, item.len, offset)
       item.content = Content::Str(sp.left)
       Content::Str(sp.right)
     }
@@ -706,24 +882,100 @@ pub fn content_split(c : Content, offset : Int) -> (Content, Content) {
   }
 }
 
-///| Flat arena node for a YATA item or GC block.
+///| Flat arena node for a YATA item or GC block (unboxed origins: zero Option[Id] heap boxing).
 pub struct Item {
   pub id : Id
   pub mut len : Int
   pub mut len_u64 : UInt64
   pub mut left : Int
   pub mut right : Int
-  pub mut origin : Option[Id]
-  pub mut right_origin : Option[Id]
+  mut has_origin : Bool
+  mut origin_client : UInt64
+  mut origin_clock : UInt64
+  mut has_right_origin : Bool
+  mut right_origin_client : UInt64
+  mut right_origin_clock : UInt64
   pub mut parent_id : Int
   pub mut parent_key : Option[String]
-  pub mut parent_item_id : Option[Id]
+  mut has_parent_item_id : Bool
+  mut parent_item_client : UInt64
+  mut parent_item_clock : UInt64
   pub mut parent_sub : Option[String]
   pub mut deleted : Bool
   pub countable : Bool
   pub mut is_gc : Bool
   pub mut content : Content
   pub mut raw_any_bytes : Option[Array[Bytes]]
+}
+
+///| Return the left origin `Id` of `self`, if present.
+pub fn Item::origin(self : Item) -> Option[Id] {
+  if self.has_origin {
+    Some(Id::{ client: self.origin_client, clock: self.origin_clock })
+  } else {
+    None
+  }
+}
+
+///| Return the right origin `Id` of `self`, if present.
+pub fn Item::right_origin(self : Item) -> Option[Id] {
+  if self.has_right_origin {
+    Some(Id::{ client: self.right_origin_client, clock: self.right_origin_clock })
+  } else {
+    None
+  }
+}
+
+///| Return the parent item `Id` of `self` (for nested containers), if present.
+pub fn Item::parent_item_id(self : Item) -> Option[Id] {
+  if self.has_parent_item_id {
+    Some(Id::{ client: self.parent_item_client, clock: self.parent_item_clock })
+  } else {
+    None
+  }
+}
+
+fn item_same_origin(a : Item, b : Item) -> Bool {
+  if a.has_origin != b.has_origin {
+    return false
+  }
+  !a.has_origin || (a.origin_client == b.origin_client && a.origin_clock == b.origin_clock)
+}
+
+fn item_same_right_origin(a : Item, b : Item) -> Bool {
+  if a.has_right_origin != b.has_right_origin {
+    return false
+  }
+  !a.has_right_origin ||
+  (a.right_origin_client == b.right_origin_client && a.right_origin_clock == b.right_origin_clock)
+}
+
+fn item_origin_eq_last_id(right : Item, left : Item) -> Bool {
+  if !right.has_origin || right.origin_client != left.id.client {
+    return false
+  }
+  let lc = if left.len_u64 <= 1UL {
+    left.id.clock
+  } else {
+    u64_sat_add(left.id.clock, left.len_u64 - 1UL)
+  }
+  right.origin_clock == lc
+}
+
+fn item_right_origin_eq_idx(
+  left : Item,
+  items : Array[Item],
+  right_idx : Int,
+) -> Bool {
+  if right_idx < 0 {
+    !left.has_right_origin
+  } else {
+    if !left.has_right_origin {
+      return false
+    }
+    let rid = items[right_idx].id
+    left.right_origin_client == rid.client && left.right_origin_clock == rid.clock
+  }
 }
 
 ///| Compute the last `Id` covered by an item starting at `id` with length `len_u64` without wraparound.
@@ -748,12 +1000,6 @@ pub val struct SearchMarker {
   pub timestamp : Int
 }
 
-///| Sorted chunk of up to 32 `SearchMarker`s with a lazy block offset for O(sqrt(M)) updates & O(log M) lookup.
-struct MarkerChunk {
-  mut offset : Int
-  items : Array[SearchMarker]
-}
-
 ///| Shared container metadata stored in `Doc.types`.
 pub struct YTypeNode {
   pub type_ref : TypeRef
@@ -768,7 +1014,9 @@ pub struct YTypeNode {
   pub mut marker_clock : Int
   pub mut last_marker : Int
   pub mut has_format : Bool
-  marker_chunks : Array[MarkerChunk]
+  m_item : Array[Int]
+  m_index : Array[Int]
+  m_ts : Array[Int]
   mut last_marker_item : Int
   mut last_marker_idx : Int
 }
@@ -788,7 +1036,9 @@ pub fn YTypeNode::new(type_ref : TypeRef, root_name : Option[String]) -> YTypeNo
     marker_clock: 0,
     last_marker: -1,
     has_format: false,
-    marker_chunks: Array::new(),
+    m_item: Array::new(),
+    m_index: Array::new(),
+    m_ts: Array::new(),
     last_marker_item: -1,
     last_marker_idx: 0,
   }
@@ -800,17 +1050,22 @@ val struct ClientPos {
   pos : Int
 }
 
-///| 2-level chunked block index for a single client (O(1) append, O(log N) lookup, O(1) amortized split).
+///| 2-level chunked block index for a single client (O(1) append, O(log N) lookup via SoA clock arrays, O(1) amortized split).
 struct ClientStore {
   chunks : Array[Array[Int]]
   clocks : Array[UInt64]
+  mut total_len : Int
 }
 
 fn ClientStore::new() -> ClientStore {
-  ClientStore::{ chunks: Array::new(), clocks: Array::new() }
+  ClientStore::{ chunks: Array::new(), clocks: Array::new(), total_len: 0 }
 }
 
-fn ClientStore::get_clock(self : ClientStore, items : Array[Item]) -> UInt64 {
+fn ClientStore::get_clock(
+  self : ClientStore,
+  item_clock : Array[UInt64],
+  item_len_u64 : Array[UInt64],
+) -> UInt64 {
   let nc = self.chunks.length()
   if nc == 0 {
     return 0UL
@@ -820,13 +1075,14 @@ fn ClientStore::get_clock(self : ClientStore, items : Array[Item]) -> UInt64 {
   if n == 0 {
     return 0UL
   }
-  let last = items[last_chunk[n - 1]]
-  u64_sat_add(last.id.clock, last.len_u64)
+  let lidx = last_chunk[n - 1]
+  u64_sat_add(item_clock[lidx], item_len_u64[lidx])
 }
 
 fn ClientStore::find_pos(
   self : ClientStore,
-  items : Array[Item],
+  item_clock : Array[UInt64],
+  item_len_u64 : Array[UInt64],
   clock : UInt64,
 ) -> ClientPos {
   let nc = self.chunks.length()
@@ -838,9 +1094,11 @@ fn ClientStore::find_pos(
   if last_n == 0 {
     return ClientPos::{ chunk: -1, pos: -1 }
   }
-  let last = items[last_chunk[last_n - 1]]
-  if clock >= last.id.clock {
-    if last.len_u64 > 0UL && clock - last.id.clock < last.len_u64 {
+  let lidx = last_chunk[last_n - 1]
+  let lclk = item_clock[lidx]
+  if clock >= lclk {
+    let llen = item_len_u64[lidx]
+    if llen > 0UL && clock - lclk < llen {
       return ClientPos::{ chunk: nc - 1, pos: last_n - 1 }
     }
     return ClientPos::{ chunk: -1, pos: -1 }
@@ -863,11 +1121,11 @@ fn ClientStore::find_pos(
   let mut hi = chunk.length() - 1
   while lo <= hi {
     let mid = lo + (hi - lo) / 2
-    let item = items[chunk[mid]]
-    let ic = item.id.clock
+    let midx = chunk[mid]
+    let ic = item_clock[midx]
     if clock < ic {
       hi = mid - 1
-    } else if clock - ic >= item.len_u64 {
+    } else if clock - ic >= item_len_u64[midx] {
       lo = mid + 1
     } else {
       return ClientPos::{ chunk: clo, pos: mid }
@@ -878,26 +1136,28 @@ fn ClientStore::find_pos(
 
 fn ClientStore::add_item(
   self : ClientStore,
-  items : Array[Item],
+  item_clock : Array[UInt64],
   item_idx : Int,
 ) -> Unit {
   let nc = self.chunks.length()
   if nc == 0 {
-    let c : Array[Int] = Array::with_capacity(64)
+    let c : Array[Int] = Array::new()
     c.push(item_idx)
     self.chunks.push(c)
-    self.clocks.push(items[item_idx].id.clock)
+    self.clocks.push(item_clock[item_idx])
+    self.total_len = self.total_len + 1
     return
   }
   let last = self.chunks[nc - 1]
-  if last.length() >= 512 {
-    let c : Array[Int] = Array::with_capacity(512)
+  if last.length() >= 96 {
+    let c : Array[Int] = Array::with_capacity(96)
     c.push(item_idx)
     self.chunks.push(c)
-    self.clocks.push(items[item_idx].id.clock)
+    self.clocks.push(item_clock[item_idx])
   } else {
     last.push(item_idx)
   }
+  self.total_len = self.total_len + 1
 }
 
 fn array_insert_chunk(
@@ -926,19 +1186,21 @@ fn array_insert_u64(arr : Array[UInt64], pos : Int, value : UInt64) -> Unit {
 
 fn ClientStore::insert_after_clock(
   self : ClientStore,
-  items : Array[Item],
+  item_clock : Array[UInt64],
+  item_len_u64 : Array[UInt64],
   clock : UInt64,
   right_idx : Int,
 ) -> Unit {
-  let cp = self.find_pos(items, clock)
+  let cp = self.find_pos(item_clock, item_len_u64, clock)
   if cp.chunk < 0 {
     return
   }
   let chunk = self.chunks[cp.chunk]
   array_insert_int(chunk, cp.pos + 1, right_idx)
-  if chunk.length() >= 512 {
+  self.total_len = self.total_len + 1
+  if chunk.length() >= 96 {
     let half = chunk.length() / 2
-    let right_chunk : Array[Int] = Array::with_capacity(512)
+    let right_chunk : Array[Int] = Array::with_capacity(96)
     let mut i = half
     while i < chunk.length() {
       right_chunk.push(chunk[i])
@@ -947,7 +1209,50 @@ fn ClientStore::insert_after_clock(
     while chunk.length() > half {
       let _ = chunk.pop()
     }
-    let right_clock = items[right_chunk[0]].id.clock
+    let right_clock = item_clock[right_chunk[0]]
+    array_insert_chunk(self.chunks, cp.chunk + 1, right_chunk)
+    array_insert_u64(self.clocks, cp.chunk + 1, right_clock)
+  }
+}
+
+///| Insert two consecutive split pieces (`mid_idx`, `right_idx`) directly after `clock` in one lookup + shift.
+fn ClientStore::insert_two_after_clock(
+  self : ClientStore,
+  item_clock : Array[UInt64],
+  item_len_u64 : Array[UInt64],
+  clock : UInt64,
+  mid_idx : Int,
+  right_idx : Int,
+) -> Unit {
+  let cp = self.find_pos(item_clock, item_len_u64, clock)
+  if cp.chunk < 0 {
+    return
+  }
+  let chunk = self.chunks[cp.chunk]
+  let pos = cp.pos + 1
+  let old_n = chunk.length()
+  chunk.push(0)
+  chunk.push(0)
+  let mut i = old_n - 1
+  while i >= pos {
+    chunk[i + 2] = chunk[i]
+    i = i - 1
+  }
+  chunk[pos] = mid_idx
+  chunk[pos + 1] = right_idx
+  self.total_len = self.total_len + 2
+  if chunk.length() >= 96 {
+    let half = chunk.length() / 2
+    let right_chunk : Array[Int] = Array::with_capacity(96)
+    let mut j = half
+    while j < chunk.length() {
+      right_chunk.push(chunk[j])
+      j = j + 1
+    }
+    while chunk.length() > half {
+      let _ = chunk.pop()
+    }
+    let right_clock = item_clock[right_chunk[0]]
     array_insert_chunk(self.chunks, cp.chunk + 1, right_chunk)
     array_insert_u64(self.clocks, cp.chunk + 1, right_clock)
   }
@@ -962,6 +1267,7 @@ fn ClientStore::pop_last(self : ClientStore, item_idx : Int) -> Unit {
   let n = last.length()
   if n > 0 && last[n - 1] == item_idx {
     let _ = last.pop()
+    self.total_len = self.total_len - 1
     if last.length() == 0 {
       let _ = self.chunks.pop()
       let _ = self.clocks.pop()
@@ -971,11 +1277,12 @@ fn ClientStore::pop_last(self : ClientStore, item_idx : Int) -> Unit {
 
 fn ClientStore::remove_clock(
   self : ClientStore,
-  items : Array[Item],
+  item_clock : Array[UInt64],
+  item_len_u64 : Array[UInt64],
   clock : UInt64,
   expected_idx : Int,
 ) -> Unit {
-  let cp = self.find_pos(items, clock)
+  let cp = self.find_pos(item_clock, item_len_u64, clock)
   if cp.chunk < 0 {
     return
   }
@@ -990,6 +1297,7 @@ fn ClientStore::remove_clock(
     i = i + 1
   }
   let _ = chunk.pop()
+  self.total_len = self.total_len - 1
   if chunk.length() == 0 {
     let nc = self.chunks.length()
     let mut c = cp.chunk
@@ -1001,14 +1309,53 @@ fn ClientStore::remove_clock(
     let _ = self.chunks.pop()
     let _ = self.clocks.pop()
   } else if cp.pos == 0 {
-    self.clocks[cp.chunk] = items[chunk[0]].id.clock
+    self.clocks[cp.chunk] = item_clock[chunk[0]]
   }
 }
 
-///| Arena-based Yjs `StructStore` holding all items, per-client sorted block lists, and `DeleteSet`.
+///| Update `self.clocks[c]` when `expected_idx` sits at index 0 of chunk `c` and its start clock decreased in place.
+fn ClientStore::update_clock_if_head(
+  self : ClientStore,
+  old_clock : UInt64,
+  new_clock : UInt64,
+  expected_idx : Int,
+) -> Unit {
+  let nc = self.chunks.length()
+  if nc == 0 {
+    return
+  }
+  if self.clocks[nc - 1] == old_clock {
+    let last_ch = self.chunks[nc - 1]
+    if last_ch.length() > 0 && last_ch[0] == expected_idx {
+      self.clocks[nc - 1] = new_clock
+    }
+    return
+  }
+  if old_clock > self.clocks[nc - 1] || old_clock < self.clocks[0] {
+    return
+  }
+  let mut lo = 0
+  let mut hi = nc - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let mc = self.clocks[mid]
+    if mc == old_clock {
+      let ch = self.chunks[mid]
+      if ch.length() > 0 && ch[0] == expected_idx {
+        self.clocks[mid] = new_clock
+      }
+      return
+    } else if old_clock < mc {
+      hi = mid - 1
+    } else {
+      lo = mid + 1
+    }
+  }
+}
+
+///| Arena-based Yjs `StructStore` holding all items, SoA hot traversal arrays, per-client block lists, and `DeleteSet`.
 pub struct BlockStore {
   pub items : Array[Item]
-  pub clients : Map[Int64, Array[Int]]
   pub delete_set : DeleteSet
   pub pending_updates : Array[Bytes]
   client_stores : Map[Int64, ClientStore]
@@ -1016,13 +1363,21 @@ pub struct BlockStore {
   mut has_cached_client : Bool
   mut cached_store : ClientStore
   mut last_item_idx : Int
+  item_left : Array[Int]
+  item_right : Array[Int]
+  item_live_len : Array[Int]
+  item_clock : Array[UInt64]
+  item_len_u64 : Array[UInt64]
+  conflict_visited : Array[Int]
+  mut conflict_before_map : Option[Map[Int, Bool]]
+  mut conflict_curr_map : Option[Map[Int, Bool]]
+  ascii_cache : Array[String]
 }
 
 ///| Create an empty `BlockStore`.
 pub fn BlockStore::new() -> BlockStore {
   BlockStore::{
     items: Array::new(),
-    clients: Map::new(),
     delete_set: DeleteSet::new(),
     pending_updates: Array::new(),
     client_stores: Map::new(),
@@ -1030,7 +1385,29 @@ pub fn BlockStore::new() -> BlockStore {
     has_cached_client: false,
     cached_store: ClientStore::new(),
     last_item_idx: -1,
+    item_left: Array::new(),
+    item_right: Array::new(),
+    item_live_len: Array::new(),
+    item_clock: Array::new(),
+    item_len_u64: Array::new(),
+    conflict_visited: Array::new(),
+    conflict_before_map: None,
+    conflict_curr_map: None,
+    ascii_cache: Array::new(),
   }
+}
+
+///| Append an `Item` to the arena and synchronize all parallel SoA arrays, returning its arena index.
+fn BlockStore::push_item(self : BlockStore, item : Item) -> Int {
+  let idx = self.items.length()
+  let ll = if !item.deleted && item.countable { item.len } else { 0 }
+  self.items.push(item)
+  self.item_left.push(item.left)
+  self.item_right.push(item.right)
+  self.item_live_len.push(ll)
+  self.item_clock.push(item.id.clock)
+  self.item_len_u64.push(item.len_u64)
+  idx
 }
 
 fn BlockStore::get_or_create_client(
@@ -1063,14 +1440,14 @@ fn BlockStore::get_or_create_client(
 pub fn BlockStore::get_clock(self : BlockStore, client : UInt64) -> UInt64 {
   let key = client.to_int64()
   if self.has_cached_client && self.cached_client == key {
-    return self.cached_store.get_clock(self.items)
+    return self.cached_store.get_clock(self.item_clock, self.item_len_u64)
   }
   match self.client_stores.get(key) {
     Some(cs) => {
       self.cached_client = key
       self.has_cached_client = true
       self.cached_store = cs
-      cs.get_clock(self.items)
+      cs.get_clock(self.item_clock, self.item_len_u64)
     }
     None => 0UL
   }
@@ -1087,9 +1464,11 @@ pub fn BlockStore::find_index_ss(
   if n == 0 {
     return -1
   }
-  let last = self.items[structs[n - 1]]
-  if clock >= last.id.clock {
-    if last.len_u64 > 0UL && clock - last.id.clock < last.len_u64 {
+  let lidx = structs[n - 1]
+  let lclk = self.item_clock[lidx]
+  if clock >= lclk {
+    let llen = self.item_len_u64[lidx]
+    if llen > 0UL && clock - lclk < llen {
       return n - 1
     }
     return -1
@@ -1098,11 +1477,11 @@ pub fn BlockStore::find_index_ss(
   let mut hi = n - 2
   while lo <= hi {
     let mid = lo + (hi - lo) / 2
-    let item = self.items[structs[mid]]
-    let ic = item.id.clock
+    let midx = structs[mid]
+    let ic = self.item_clock[midx]
     if clock < ic {
       hi = mid - 1
-    } else if clock - ic >= item.len_u64 {
+    } else if clock - ic >= self.item_len_u64[midx] {
       lo = mid + 1
     } else {
       return mid
@@ -1114,16 +1493,17 @@ pub fn BlockStore::find_index_ss(
 ///| Look up the arena index of the item containing `id`, or `-1` if absent.
 pub fn BlockStore::get_item_idx(self : BlockStore, id : Id) -> Int {
   if self.last_item_idx >= 0 {
-    let li = self.items[self.last_item_idx]
-    if li.id.client == id.client &&
-    id.clock >= li.id.clock &&
-    id.clock - li.id.clock < li.len_u64 {
-      return self.last_item_idx
+    let lidx = self.last_item_idx
+    let lclk = self.item_clock[lidx]
+    if id.clock >= lclk &&
+    id.clock - lclk < self.item_len_u64[lidx] &&
+    self.items[lidx].id.client == id.client {
+      return lidx
     }
   }
   let key = id.client.to_int64()
   if self.has_cached_client && self.cached_client == key {
-    let cp = self.cached_store.find_pos(self.items, id.clock)
+    let cp = self.cached_store.find_pos(self.item_clock, self.item_len_u64, id.clock)
     if cp.chunk < 0 {
       return -1
     }
@@ -1134,7 +1514,46 @@ pub fn BlockStore::get_item_idx(self : BlockStore, id : Id) -> Int {
       self.cached_client = key
       self.has_cached_client = true
       self.cached_store = cs
-      let cp = cs.find_pos(self.items, id.clock)
+      let cp = cs.find_pos(self.item_clock, self.item_len_u64, id.clock)
+      if cp.chunk < 0 {
+        -1
+      } else {
+        cs.chunks[cp.chunk][cp.pos]
+      }
+    }
+    None => -1
+  }
+}
+
+///| Look up the arena index of the item containing `(client, clock)`, or `-1` if absent (zero `Id` construction).
+fn BlockStore::get_item_idx_cc(
+  self : BlockStore,
+  client : UInt64,
+  clock : UInt64,
+) -> Int {
+  if self.last_item_idx >= 0 {
+    let lidx = self.last_item_idx
+    let lclk = self.item_clock[lidx]
+    if clock >= lclk &&
+    clock - lclk < self.item_len_u64[lidx] &&
+    self.items[lidx].id.client == client {
+      return lidx
+    }
+  }
+  let key = client.to_int64()
+  if self.has_cached_client && self.cached_client == key {
+    let cp = self.cached_store.find_pos(self.item_clock, self.item_len_u64, clock)
+    if cp.chunk < 0 {
+      return -1
+    }
+    return self.cached_store.chunks[cp.chunk][cp.pos]
+  }
+  match self.client_stores.get(key) {
+    Some(cs) => {
+      self.cached_client = key
+      self.has_cached_client = true
+      self.cached_store = cs
+      let cp = cs.find_pos(self.item_clock, self.item_len_u64, clock)
       if cp.chunk < 0 {
         -1
       } else {
@@ -1149,7 +1568,7 @@ pub fn BlockStore::get_item_idx(self : BlockStore, id : Id) -> Int {
 pub fn BlockStore::add_item_to_client(self : BlockStore, item_idx : Int) -> Unit {
   let item = self.items[item_idx]
   let cs = self.get_or_create_client(item.id.client)
-  cs.add_item(self.items, item_idx)
+  cs.add_item(self.item_clock, item_idx)
   self.last_item_idx = item_idx
 }
 
@@ -1164,18 +1583,270 @@ pub fn array_insert_int(arr : Array[Int], pos : Int, value : Int) -> Unit {
   arr[pos] = value
 }
 
-///| Sort `Array[UInt64]` descending (Yjs encodes clients in descending client_id order).
-pub fn sort_u64_desc(arr : Array[UInt64]) -> Unit {
-  let n = arr.length()
-  let mut i = 1
-  while i < n {
+///| Iterative min-heapsort fallback for `Array[UInt64]` descending (O(n log n) worst-case, O(1) stack).
+fn heapsort_u64_desc(arr : Array[UInt64], lo : Int, hi : Int) -> Unit {
+  let n = hi - lo + 1
+  let mut start = n / 2 - 1
+  while start >= 0 {
+    let mut root = start
+    while root * 2 + 1 < n {
+      let mut smallest = root
+      let l = root * 2 + 1
+      let r = l + 1
+      if arr[lo + l] < arr[lo + smallest] {
+        smallest = l
+      }
+      if r < n && arr[lo + r] < arr[lo + smallest] {
+        smallest = r
+      }
+      if smallest == root {
+        break
+      }
+      let tmp = arr[lo + root]
+      arr[lo + root] = arr[lo + smallest]
+      arr[lo + smallest] = tmp
+      root = smallest
+    }
+    start = start - 1
+  }
+  let mut end = n - 1
+  while end > 0 {
+    let tmp = arr[lo]
+    arr[lo] = arr[lo + end]
+    arr[lo + end] = tmp
+    let mut root = 0
+    while root * 2 + 1 < end {
+      let mut smallest = root
+      let l = root * 2 + 1
+      let r = l + 1
+      if arr[lo + l] < arr[lo + smallest] {
+        smallest = l
+      }
+      if r < end && arr[lo + r] < arr[lo + smallest] {
+        smallest = r
+      }
+      if smallest == root {
+        break
+      }
+      let t2 = arr[lo + root]
+      arr[lo + root] = arr[lo + smallest]
+      arr[lo + smallest] = t2
+      root = smallest
+    }
+    end = end - 1
+  }
+}
+
+///| Introsort helper for `Array[UInt64]` descending (O(log n) stack, O(n log n) worst-case).
+fn sort_u64_desc_range(
+  arr : Array[UInt64],
+  lo_in : Int,
+  hi_in : Int,
+  depth_in : Int,
+) -> Unit {
+  let mut lo = lo_in
+  let mut hi = hi_in
+  let mut depth = depth_in
+  while hi - lo > 16 {
+    if depth <= 0 {
+      heapsort_u64_desc(arr, lo, hi)
+      return
+    }
+    depth = depth - 1
+    let mid = lo + (hi - lo) / 2
+    let pivot = arr[mid]
+    let mut i = lo
+    let mut j = hi
+    while i <= j {
+      while arr[i] > pivot {
+        i = i + 1
+      }
+      while arr[j] < pivot {
+        j = j - 1
+      }
+      if i <= j {
+        let tmp = arr[i]
+        arr[i] = arr[j]
+        arr[j] = tmp
+        i = i + 1
+        j = j - 1
+      }
+    }
+    let left_len = j - lo
+    let right_len = hi - i
+    if left_len < right_len {
+      if lo < j {
+        sort_u64_desc_range(arr, lo, j, depth)
+      }
+      lo = i
+    } else {
+      if i < hi {
+        sort_u64_desc_range(arr, i, hi, depth)
+      }
+      hi = j
+    }
+  }
+  let mut i = lo + 1
+  while i <= hi {
     let key = arr[i]
     let mut j = i - 1
-    while j >= 0 && arr[j] < key {
+    while j >= lo && arr[j] < key {
       arr[j + 1] = arr[j]
       j = j - 1
     }
     arr[j + 1] = key
     i = i + 1
+  }
+}
+
+///| Sort `Array[UInt64]` descending (Yjs encodes clients in descending client_id order).
+pub fn sort_u64_desc(arr : Array[UInt64]) -> Unit {
+  let n = arr.length()
+  if n > 1 {
+    sort_u64_desc_range(arr, 0, n - 1, introsort_depth_limit(n))
+  }
+}
+
+///| Iterative min-heapsort fallback for parallel `(keys, vals)` descending by `keys`.
+fn heapsort_u64_pairs_desc(
+  keys : Array[UInt64],
+  vals : Array[UInt64],
+  lo : Int,
+  hi : Int,
+) -> Unit {
+  let n = hi - lo + 1
+  let mut start = n / 2 - 1
+  while start >= 0 {
+    let mut root = start
+    while root * 2 + 1 < n {
+      let mut smallest = root
+      let l = root * 2 + 1
+      let r = l + 1
+      if keys[lo + l] < keys[lo + smallest] {
+        smallest = l
+      }
+      if r < n && keys[lo + r] < keys[lo + smallest] {
+        smallest = r
+      }
+      if smallest == root {
+        break
+      }
+      let tk = keys[lo + root]
+      keys[lo + root] = keys[lo + smallest]
+      keys[lo + smallest] = tk
+      let tv = vals[lo + root]
+      vals[lo + root] = vals[lo + smallest]
+      vals[lo + smallest] = tv
+      root = smallest
+    }
+    start = start - 1
+  }
+  let mut end = n - 1
+  while end > 0 {
+    let tk = keys[lo]
+    keys[lo] = keys[lo + end]
+    keys[lo + end] = tk
+    let tv = vals[lo]
+    vals[lo] = vals[lo + end]
+    vals[lo + end] = tv
+    let mut root = 0
+    while root * 2 + 1 < end {
+      let mut smallest = root
+      let l = root * 2 + 1
+      let r = l + 1
+      if keys[lo + l] < keys[lo + smallest] {
+        smallest = l
+      }
+      if r < end && keys[lo + r] < keys[lo + smallest] {
+        smallest = r
+      }
+      if smallest == root {
+        break
+      }
+      let tk2 = keys[lo + root]
+      keys[lo + root] = keys[lo + smallest]
+      keys[lo + smallest] = tk2
+      let tv2 = vals[lo + root]
+      vals[lo + root] = vals[lo + smallest]
+      vals[lo + smallest] = tv2
+      root = smallest
+    }
+    end = end - 1
+  }
+}
+
+///| Introsort helper for parallel `(keys, vals)` descending by `keys` (O(log n) stack, O(n log n) worst-case).
+fn sort_u64_pairs_desc_range(
+  keys : Array[UInt64],
+  vals : Array[UInt64],
+  lo_in : Int,
+  hi_in : Int,
+  depth_in : Int,
+) -> Unit {
+  let mut lo = lo_in
+  let mut hi = hi_in
+  let mut depth = depth_in
+  while hi - lo > 16 {
+    if depth <= 0 {
+      heapsort_u64_pairs_desc(keys, vals, lo, hi)
+      return
+    }
+    depth = depth - 1
+    let mid = lo + (hi - lo) / 2
+    let pivot = keys[mid]
+    let mut i = lo
+    let mut j = hi
+    while i <= j {
+      while keys[i] > pivot {
+        i = i + 1
+      }
+      while keys[j] < pivot {
+        j = j - 1
+      }
+      if i <= j {
+        let tk = keys[i]
+        keys[i] = keys[j]
+        keys[j] = tk
+        let tv = vals[i]
+        vals[i] = vals[j]
+        vals[j] = tv
+        i = i + 1
+        j = j - 1
+      }
+    }
+    let left_len = j - lo
+    let right_len = hi - i
+    if left_len < right_len {
+      if lo < j {
+        sort_u64_pairs_desc_range(keys, vals, lo, j, depth)
+      }
+      lo = i
+    } else {
+      if i < hi {
+        sort_u64_pairs_desc_range(keys, vals, i, hi, depth)
+      }
+      hi = j
+    }
+  }
+  let mut i = lo + 1
+  while i <= hi {
+    let k = keys[i]
+    let v = vals[i]
+    let mut j = i - 1
+    while j >= lo && keys[j] < k {
+      keys[j + 1] = keys[j]
+      vals[j + 1] = vals[j]
+      j = j - 1
+    }
+    keys[j + 1] = k
+    vals[j + 1] = v
+    i = i + 1
+  }
+}
+
+fn sort_u64_pairs_desc(keys : Array[UInt64], vals : Array[UInt64]) -> Unit {
+  let n = keys.length()
+  if n > 1 {
+    sort_u64_pairs_desc_range(keys, vals, 0, n - 1, introsort_depth_limit(n))
   }
 }
