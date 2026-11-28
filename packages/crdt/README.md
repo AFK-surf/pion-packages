@@ -10,10 +10,10 @@ A pure Pion implementation of the **Yjs / YATA** collaborative CRDT engine with 
   - Shared types: `YText` (UTF-16 code unit indexing for full JS/Yjs interoperability, including CJK & emoji surrogate pairs, plus `format` attributes), `YArray` (primitive `Any` + nested `YText`/`YArray`/`YMap`), and `YMap` (LWW by higher `client_id` + nested shared types).
   - Run-length encoded `DeleteSet` with automatic sort-and-merge.
 - **Yjs v1 Sync Protocol (`src/encoding.pion`)**:
-  - `encode_state_vector` / `decode_state_vector`
-  - `encode_state_as_update` / `encode_state_as_update_from` (incremental delta sync)
+  - `encode_state_vector` / `decode_state_vector` / `Doc::state_vector`
+  - `encode_state_as_update` / `encode_state_as_update_sv` / `Doc::encode_state_as_update_from` / `Doc::encode_state_as_update_from_sv` (binary and in-memory `StateVector` incremental delta sync)
   - `apply_update` (idempotent, handles duplicate, fragmented, and out-of-order causal deliveries & out-of-order deletes via pending queue)
-  - `merge_updates` & `diff_update` (operates directly on decoded wire blocks + DeleteSets without requiring base state).
+  - `merge_updates`, `diff_update`, & `diff_update_sv` (operates directly on decoded wire blocks + DeleteSets without requiring base state).
 
 ## Quick Example
 
